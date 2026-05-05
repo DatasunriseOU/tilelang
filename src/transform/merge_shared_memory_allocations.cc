@@ -131,9 +131,32 @@ public:
     // can contain legacy TileLang buffer handles during this migration.
   }
 
+  void VisitStmt_(const SBlockNode *op) final {
+    // CPPMEGA: MergeSharedMemoryAllocations runs after TileLang has converted
+    // semantic blocks to executable statements.  If a later pass leaves an
+    // SBlock around, only its executable body matters here.  Do not walk block
+    // metadata (`iter_vars`, `alloc_buffers`, regions, match buffers): apache's
+    // default visitor assumes fully-normalized SBlock invariants and can crash
+    // on migration-era TileLang metadata.
+    if (op->init.defined()) {
+      this->VisitStmt(op->init.value());
+    }
+    this->VisitStmt(op->body);
+  }
+
+  void VisitStmt_(const SBlockRealizeNode *op) final {
+    if (!is_one(op->predicate)) {
+      this->VisitExpr(op->predicate);
+    }
+    this->VisitStmt(op->block);
+  }
+
   void VisitStmt(const Stmt &stmt) override {
     if (const auto *op = stmt.as<AllocateNode>()) {
       VisitStmt_(op);
+    } else if (const auto *op = stmt.as<LetStmtNode>()) {
+      this->VisitExpr(op->value);
+      this->VisitStmt(op->body);
     } else {
       StmtExprVisitor::VisitStmt(stmt);
     }
@@ -218,9 +241,33 @@ public:
     // metadata traversal can trip on legacy TileLang buffer objects.
   }
 
+  void VisitStmt_(const SBlockNode *op) final {
+    // See AllocateCollector above.  Liveness needs executable effects, not
+    // block metadata; preserving metadata traversal out of this pass avoids
+    // apache SBlock invariant assumptions during the migration.
+    if (op->init.defined()) {
+      this->VisitStmt(op->init.value());
+    }
+    this->VisitStmt(op->body);
+  }
+
+  void VisitStmt_(const SBlockRealizeNode *op) final {
+    VisitNewScopeBody(op, [&]() {
+      if (!is_one(op->predicate)) {
+        this->VisitExpr(op->predicate);
+      }
+      this->VisitStmt(op->block);
+    });
+  }
+
   void VisitStmt(const Stmt &stmt) override {
     if (const auto *op = stmt.as<AllocateNode>()) {
       VisitStmt_(op);
+    } else if (const auto *op = stmt.as<LetStmtNode>()) {
+      VisitNewScopeBody(op, [&]() {
+        this->VisitExpr(op->value);
+        this->VisitStmt(op->body);
+      });
     } else {
       StmtExprVisitor::VisitStmt(stmt);
     }
@@ -332,6 +379,10 @@ public:
   }
 
   template <typename T> void VisitNewScope(const T *op) {
+    VisitNewScopeBody(op, [&]() { StmtExprVisitor::VisitStmt_(op); });
+  }
+
+  template <typename T, typename F> void VisitNewScopeBody(const T *op, F f) {
     scope_.push_back(StmtEntry());
     StmtEntry e;
     e.stmt = op;
@@ -339,7 +390,7 @@ public:
     int64_t begin_index = static_cast<int64_t>(linear_seq_.size());
     // before scope.
     linear_seq_.push_back(e);
-    StmtExprVisitor::VisitStmt_(op);
+    f();
     // after scope.
     e.touched = std::move(scope_.back().touched);
     scope_.pop_back();
@@ -514,8 +565,27 @@ private:
     // vars touched by alignment-sensitive intrinsics, not declaration metadata.
   }
 
+  void VisitStmt_(const SBlockNode *op) final {
+    if (op->init.defined()) {
+      this->VisitStmt(op->init.value());
+    }
+    this->VisitStmt(op->body);
+  }
+
+  void VisitStmt_(const SBlockRealizeNode *op) final {
+    if (!is_one(op->predicate)) {
+      this->VisitExpr(op->predicate);
+    }
+    this->VisitStmt(op->block);
+  }
+
   void VisitStmt(const Stmt &stmt) override {
     if (const auto *op = stmt.as<AllocateNode>()) {
+      this->VisitStmt(op->body);
+      return;
+    }
+    if (const auto *op = stmt.as<LetStmtNode>()) {
+      this->VisitExpr(op->value);
       this->VisitStmt(op->body);
       return;
     }
@@ -665,22 +735,63 @@ private:
       }
       return Evaluate(0);
     }
-    return StmtExprMutator::VisitStmt_(op);
+    // Avoid default BufferDef mutation for unrelated buffers.  This pass only
+    // rewrites selected shared allocations into the merged arena, and apache's
+    // metadata visitor is too strict for some TileLang migration-era buffers.
+    return ffi::GetRef<Stmt>(op);
   }
 
   Stmt VisitStmt(const Stmt &stmt) override {
     if (const auto *op = stmt.as<AllocateNode>()) {
       return VisitStmt_(op);
     }
+    if (const auto *op = stmt.as<LetStmtNode>()) {
+      PrimExpr value = this->VisitExpr(op->value);
+      Stmt body = this->VisitStmt(op->body);
+      if (value.same_as(op->value) && body.same_as(op->body)) {
+        return ffi::GetRef<Stmt>(op);
+      }
+      return LetStmt(op->var, value, body);
+    }
     return StmtExprMutator::VisitStmt(stmt);
   }
 
   Stmt VisitStmt_(const DeclBufferNode *op) final {
-    auto node = Downcast<DeclBuffer>(StmtExprMutator::VisitStmt_(op));
-    auto new_buf = GetUpdatedBuffer(node->buffer);
-    if (!new_buf.same_as(node->buffer)) {
-      node.CopyOnWrite()->buffer = new_buf;
+    auto new_buf = GetUpdatedBuffer(op->buffer);
+    if (new_buf.same_as(op->buffer)) {
+      return ffi::GetRef<Stmt>(op);
     }
+    auto node = ffi::GetRef<DeclBuffer>(op);
+    node.CopyOnWrite()->buffer = new_buf;
+    return std::move(node);
+  }
+
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    ffi::Optional<Stmt> init = std::nullopt;
+    if (op->init.defined()) {
+      init = this->VisitStmt(op->init.value());
+    }
+    Stmt body = this->VisitStmt(op->body);
+    if (init.same_as(op->init) && body.same_as(op->body)) {
+      return ffi::GetRef<Stmt>(op);
+    }
+    auto node = ffi::GetRef<SBlock>(op);
+    node.CopyOnWrite()->init = std::move(init);
+    node.CopyOnWrite()->body = std::move(body);
+    return std::move(node);
+  }
+
+  Stmt VisitStmt_(const SBlockRealizeNode *op) final {
+    PrimExpr predicate =
+        is_one(op->predicate) ? op->predicate : this->VisitExpr(op->predicate);
+    Stmt block_stmt = this->VisitStmt(op->block);
+    SBlock block = Downcast<SBlock>(block_stmt);
+    if (predicate.same_as(op->predicate) && block.same_as(op->block)) {
+      return ffi::GetRef<Stmt>(op);
+    }
+    auto node = ffi::GetRef<SBlockRealize>(op);
+    node.CopyOnWrite()->predicate = std::move(predicate);
+    node.CopyOnWrite()->block = std::move(block);
     return std::move(node);
   }
 
