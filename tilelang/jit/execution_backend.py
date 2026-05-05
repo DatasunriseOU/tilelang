@@ -80,7 +80,13 @@ def resolve_execution_backend(requested: str | None, target: Target) -> str:
         if is_cutedsl_target(target):
             return "cutedsl"
         kind = _target_kind(target)
-        if kind == "cuda" or kind == "metal" or kind == "hip":
+        if kind == "metal":
+            # Apache TVM's Metal PackedFunc ABI expects raw MTLBuffer handles,
+            # while TileLang's runtime passes Torch MPS tensors.  Keep explicit
+            # tvm_ffi available, but default Metal execution through the Torch
+            # adapter until the raw-handle bridge is restored.
+            choice = "torch"
+        elif kind == "cuda" or kind == "hip":
             choice = "tvm_ffi"
         else:
             choice = "cython"

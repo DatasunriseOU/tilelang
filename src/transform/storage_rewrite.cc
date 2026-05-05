@@ -373,6 +373,19 @@ public:
     }
   }
 
+  void VisitStmt_(const BindNode *op) final {
+    scope_.push_back(StmtEntry());
+    // Apache tirx::Bind can carry BufferLoad values; track them as a statement
+    // scope so local reuse checks do not see the load at allocation depth.
+    StmtExprVisitor::VisitStmt_(op);
+    StmtEntry e = scope_.back();
+    scope_.pop_back();
+    if (!e.touched.empty()) {
+      e.stmt = op;
+      linear_seq_.push_back(e);
+    }
+  }
+
   void VisitExpr_(const VarNode *buf) final {
     // Directly reference to the variable count as a read.
     auto it = alloc_info_.find(buf);
