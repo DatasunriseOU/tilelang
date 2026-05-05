@@ -45,8 +45,8 @@ using namespace tirx;
 using namespace tirx::transform;
 
 // CPPMEGA: Collect buffer-data Vars that have a backing definition (AllocBuffer,
-// SBlock alloc_buffers/match_buffers, DeclBuffer) and the ghost buffers that
-// are referenced via BufferLoad/BufferStore without ever being defined. The
+// SBlock alloc_buffers/match_buffers) and the ghost buffers that are referenced
+// via BufferLoad/BufferStore without ever being defined. The
 // latter occurs when LayoutInference / LowerTileOp rewrites a fragment buffer
 // (e.g. ``C_local``) into a smaller per-thread "local" buffer at the *outer*
 // "root" SBlock via a layout_map annotation but never adds a corresponding
@@ -72,7 +72,9 @@ public:
   }
 
   void VisitStmt_(const DeclBufferNode *op) final {
-    defined_vars_.insert(op->buffer->data);
+    // Apache/tirx treats DeclBuffer as a view over existing storage, not a
+    // storage definition. Counting it as defined suppresses the ghost allocate
+    // that MakePackedAPI later requires for fragment/shared scratch handles.
     StmtExprVisitor::VisitStmt_(op);
   }
 
@@ -209,7 +211,7 @@ Buffer FindCanonicalInputBuffer(const Buffer &buffer,
 }
 
 bool MatchesCanonicalInputDataVar(const Var &data, DataType elem_dtype,
-                                  const Buffer &canonical) {
+                                   const Buffer &canonical) {
   if (!canonical.defined() || !IsGlobalBuffer(canonical)) {
     return false;
   }
@@ -238,6 +240,15 @@ Buffer FindCanonicalInputBufferForDataVar(
     match = candidate;
   }
   return match;
+}
+
+bool IsDeviceScratchBuffer(const Buffer &buffer) {
+  if (!buffer.defined()) {
+    return false;
+  }
+  std::string scope = buffer.scope();
+  return scope == "shared" || scope == "shared.dyn" || scope == "local" ||
+         scope == "local.fragment" || scope == "metal.simdgroup";
 }
 
 class InputBufferCanonicalizer : public StmtExprMutator {
@@ -332,12 +343,25 @@ public:
         continue;
       }
       const SBlockNode *owner = path.back();
+      const Buffer &buffer = ghost_buffers_.at(kv.first);
       // A non-global ghost buffer allocated at host root is not a valid
-      // device-local allocation; leave it visible to downstream diagnostics.
+      // device-local allocation. When the LCA collapses to the host wrapper,
+      // recover only static device scratch buffers whose uses still identify a
+      // unique device block. This keeps API/global buffers fail-closed while
+      // restoring the SBlock::alloc_buffers definition that SplitHostDevice
+      // expects for shared/local scratch storage.
       if (IsHostMainBlock(owner)) {
-        continue;
+        if (!IsDeviceScratchBuffer(buffer) || ambiguous_device_owners_.count(kv.first)) {
+          continue;
+        }
+        auto owner_it = unique_device_owners_.find(kv.first);
+        if (owner_it == unique_device_owners_.end() ||
+            IsHostMainBlock(owner_it->second)) {
+          continue;
+        }
+        owner = owner_it->second;
       }
-      placements_[owner].push_back(ghost_buffers_.at(kv.first));
+      placements_[owner].push_back(buffer);
     }
   }
 
@@ -356,6 +380,7 @@ private:
     auto it = owner_paths_.find(var);
     if (it == owner_paths_.end()) {
       owner_paths_.emplace(var, block_stack_);
+      RecordUniqueDeviceOwner(var);
       return;
     }
     std::vector<const SBlockNode *> &path = it->second;
@@ -365,12 +390,44 @@ private:
       ++common;
     }
     path.resize(common);
+    RecordUniqueDeviceOwner(var);
+  }
+
+  void RecordUniqueDeviceOwner(const Var &var) {
+    const SBlockNode *candidate = nullptr;
+    for (const SBlockNode *block : block_stack_) {
+      if (IsDeviceMainBlock(block)) {
+        candidate = block;
+        break;
+      }
+    }
+    if (candidate == nullptr) {
+      for (auto it = block_stack_.rbegin(); it != block_stack_.rend(); ++it) {
+        if (!IsHostMainBlock(*it)) {
+          candidate = *it;
+          break;
+        }
+      }
+    }
+    if (candidate == nullptr) {
+      return;
+    }
+    auto it = unique_device_owners_.find(var);
+    if (it == unique_device_owners_.end()) {
+      unique_device_owners_.emplace(var, candidate);
+    } else if (it->second != candidate) {
+      ambiguous_device_owners_.insert(var);
+    }
   }
 
   std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> ghost_buffers_;
   std::unordered_map<Var, std::vector<const SBlockNode *>, ObjectPtrHash,
-                     ObjectPtrEqual>
+                      ObjectPtrEqual>
       owner_paths_;
+  std::unordered_map<Var, const SBlockNode *, ObjectPtrHash, ObjectPtrEqual>
+      unique_device_owners_;
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>
+      ambiguous_device_owners_;
   std::vector<const SBlockNode *> block_stack_;
 };
 
