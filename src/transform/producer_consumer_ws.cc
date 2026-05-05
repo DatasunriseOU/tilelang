@@ -23,11 +23,11 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/cast.h>
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include "../op/builtin.h"
 #include "../op/copy.h"
@@ -39,11 +39,14 @@
 #include "../target/utils.h"
 #include "common/mbarrier.h"
 #include "multi_version_buffer_rewriter.h"
+#include "vendored/let_stmt.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 namespace {
 
@@ -90,7 +93,7 @@ struct PhaseCounter {
 
   Stmt WrapLoopWithAlloc(Stmt loop) const {
     Stmt body = SeqStmt({Init(), std::move(loop)});
-    body = DeclBuffer(buf, body);
+    body = SeqStmt::Flatten(Array<Stmt>{DeclBuffer(buf), body});
     return Allocate(buf->data, buf->dtype, buf->shape, const_true(), body);
   }
 
@@ -339,10 +342,10 @@ static const CallNode *GetEvaluateCallInSimpleWrapper(const Stmt &stmt) {
   if (const auto *let = stmt.as<LetStmtNode>()) {
     return GetEvaluateCallInSimpleWrapper(let->body);
   }
-  if (const auto *block = stmt.as<BlockNode>()) {
+  if (const auto *block = stmt.as<SBlockNode>()) {
     return GetEvaluateCallInSimpleWrapper(block->body);
   }
-  if (const auto *realize = stmt.as<BlockRealizeNode>()) {
+  if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
     return GetEvaluateCallInSimpleWrapper(realize->block->body);
   }
   return nullptr;
@@ -357,17 +360,17 @@ public:
   }
 
 private:
-  void VisitStmt_(const BlockRealizeNode *op) final {
+  void VisitStmt_(const SBlockRealizeNode *op) final {
     CollectBuffers(op->block);
     StmtExprVisitor::VisitStmt_(op);
   }
 
-  void VisitStmt_(const BlockNode *op) final {
-    CollectBuffers(ffi::GetRef<Block>(op));
+  void VisitStmt_(const SBlockNode *op) final {
+    CollectBuffers(ffi::GetRef<SBlock>(op));
     StmtExprVisitor::VisitStmt_(op);
   }
 
-  void CollectBuffers(const Block &block) {
+  void CollectBuffers(const SBlock &block) {
     for (const auto &buffer : block->alloc_buffers) {
       result_.emplace(buffer->data, buffer);
     }
@@ -393,12 +396,16 @@ private:
     return IsFragmentBuffer(buffer) || IsLocalBuffer(buffer, true);
   }
 
-  void VisitStmt_(const LetStmtNode *op) final {
-    VisitExpr(op->value);
-    summary_.def_vars.insert(op->var);
-    bound_vars_.insert(op->var);
-    VisitStmt(op->body);
-    bound_vars_.erase(op->var);
+  void VisitStmt(const Stmt &stmt) final {
+    if (const auto *op = stmt.as<LetStmtNode>()) {
+      VisitExpr(op->value);
+      summary_.def_vars.insert(op->var);
+      bound_vars_.insert(op->var);
+      VisitStmt(op->body);
+      bound_vars_.erase(op->var);
+      return;
+    }
+    StmtExprVisitor::VisitStmt(stmt);
   }
 
   void VisitStmt_(const ForNode *op) final {
@@ -980,11 +987,11 @@ static bool CollectPreludeStmtsToPipelineLoop(const Stmt &stmt,
     return CollectPreludeStmtsToPipelineLoop(let->body, pipeline_loop,
                                              prelude_stmts);
   }
-  if (const auto *realize = stmt.as<BlockRealizeNode>()) {
+  if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
     return CollectPreludeStmtsToPipelineLoop(realize->block->body,
                                              pipeline_loop, prelude_stmts);
   }
-  if (const auto *block = stmt.as<BlockNode>()) {
+  if (const auto *block = stmt.as<SBlockNode>()) {
     return CollectPreludeStmtsToPipelineLoop(block->body, pipeline_loop,
                                              prelude_stmts);
   }
@@ -1087,7 +1094,7 @@ public:
 private:
   // --- Track threadIdx.x binding ---
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::thread_extent) {
+    if (op->attr_key == tirx::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
       if (iv->thread_tag == "threadIdx.x") {
         thread_iv_ = iv;
@@ -1109,11 +1116,11 @@ private:
   }
 
   // --- Find the block containing the pipeline loop ---
-  Stmt VisitStmt_(const BlockRealizeNode *op) final {
+  Stmt VisitStmt_(const SBlockRealizeNode *op) final {
     if (!thread_iv_.defined())
       return StmtExprMutator::VisitStmt_(op);
 
-    const Block &orig_block = op->block;
+    const SBlock &orig_block = op->block;
 
     // Find the pipelined loop.
     const ForNode *pipeline_loop = FindPipelineLoop(orig_block->body);
@@ -1131,7 +1138,7 @@ private:
     // Flatten the loop body.
     Array<Stmt> flat_stmts;
     Stmt loop_body = pipeline_loop->body;
-    if (auto *realize = loop_body.as<BlockRealizeNode>()) {
+    if (auto *realize = loop_body.as<SBlockRealizeNode>()) {
       loop_body = realize->block->body;
     }
     // Unwrap LetStmt chain that dominates the whole loop body.
@@ -1185,7 +1192,7 @@ private:
   }
 
   Stmt
-  BuildWSBlock(const BlockRealizeNode *orig_realize, const Block &orig_block,
+  BuildWSBlock(const SBlockRealizeNode *orig_realize, const SBlock &orig_block,
                const ForNode *pipeline_loop, int num_stages,
                const Array<Stmt> &flat_stmts,
                const std::vector<TileStmtKind> &kinds,
@@ -1831,7 +1838,7 @@ private:
         replaced.stmt, thread_iv_->var, consumer_extent);
 
     // --- Update block ---
-    Block new_block = orig_block;
+    SBlock new_block = orig_block;
     auto *block_ptr = new_block.CopyOnWrite();
     block_ptr->body = new_block_body;
     for (const auto &buffer : producer_private_buffers) {
@@ -1861,7 +1868,7 @@ private:
     ws_transformed_ = true;
 
     // Rebuild BlockRealize.
-    BlockRealize new_realize = ffi::GetRef<BlockRealize>(orig_realize);
+    SBlockRealize new_realize = ffi::GetRef<SBlockRealize>(orig_realize);
     new_realize.CopyOnWrite()->block = new_block;
     return new_realize;
   }
@@ -1884,10 +1891,10 @@ private:
     if (auto *let = stmt.as<LetStmtNode>()) {
       return FindPipelineLoop(let->body);
     }
-    if (auto *realize = stmt.as<BlockRealizeNode>()) {
+    if (auto *realize = stmt.as<SBlockRealizeNode>()) {
       return FindPipelineLoop(realize->block->body);
     }
-    if (auto *block = stmt.as<BlockNode>()) {
+    if (auto *block = stmt.as<SBlockNode>()) {
       return FindPipelineLoop(block->body);
     }
     if (auto *attr = stmt.as<AttrStmtNode>()) {
@@ -2158,25 +2165,25 @@ private:
       }
       return {LetStmt(let->var, let->value, result.stmt), true};
     }
-    if (auto *realize = stmt.as<BlockRealizeNode>()) {
+    if (auto *realize = stmt.as<SBlockRealizeNode>()) {
       ReplaceResult result = ReplacePipelineLoopInStmt(
           realize->block->body, pipeline_loop, ws_body, consumer_extent);
       if (!result.found) {
         return {stmt, false};
       }
-      Block block = realize->block;
+      SBlock block = realize->block;
       block.CopyOnWrite()->body = result.stmt;
-      BlockRealize new_realize = ffi::GetRef<BlockRealize>(realize);
+      SBlockRealize new_realize = ffi::GetRef<SBlockRealize>(realize);
       new_realize.CopyOnWrite()->block = block;
       return {new_realize, true};
     }
-    if (auto *block = stmt.as<BlockNode>()) {
+    if (auto *block = stmt.as<SBlockNode>()) {
       ReplaceResult result = ReplacePipelineLoopInStmt(
           block->body, pipeline_loop, ws_body, consumer_extent);
       if (!result.found) {
         return {stmt, false};
       }
-      Block new_block = ffi::GetRef<Block>(block);
+      SBlock new_block = ffi::GetRef<SBlock>(block);
       new_block.CopyOnWrite()->body = result.stmt;
       return {new_block, true};
     }
@@ -2323,11 +2330,11 @@ private:
     StmtExprVisitor::VisitExpr_(op);
   }
 
-  void VisitStmt_(const BlockNode *op) final {
+  void VisitStmt_(const SBlockNode *op) final {
     // Collect layout_map entries so we can cross-check TMA copy targets.
     if (op->annotations.count("layout_map")) {
       auto anno = op->annotations.Get("layout_map");
-      if (auto gmap = anno->as<Map<ObjectRef, ObjectRef>>(); gmap.has_value()) {
+      if (auto gmap = anno->as<Map<ffi::ObjectRef, ffi::ObjectRef>>(); gmap.has_value()) {
         for (const auto &[key, val] : gmap.value()) {
           Layout layout;
           if (auto l = val.as<Layout>(); l.has_value())
@@ -2377,7 +2384,7 @@ private:
 // ---------------------------------------------------------------------------
 
 tvm::transform::Pass ProducerConsumerWarpSpecialized() {
-  using namespace tir::transform;
+  using namespace tirx::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     // Skip if disabled.
     if (ctx->GetConfig(kDisableWarpSpecialized, Optional<Bool>())
@@ -2412,14 +2419,14 @@ tvm::transform::Pass ProducerConsumerWarpSpecialized() {
       // conditional loop body), strip pipeline annotations so that
       // PipelinePlanning / InjectSoftwarePipeline do not generate
       // broken non-WS TMA pipeline code.
-      class StripPipelineAnnotation : public tir::StmtExprMutator {
+      class StripPipelineAnnotation : public tirx::StmtExprMutator {
       public:
-        tir::Stmt VisitStmt_(const tir::ForNode *op) final {
-          auto stmt = tir::StmtExprMutator::VisitStmt_(op);
-          const auto *for_node = stmt.as<tir::ForNode>();
+        tirx::Stmt VisitStmt_(const tirx::ForNode *op) final {
+          auto stmt = tirx::StmtExprMutator::VisitStmt_(op);
+          const auto *for_node = stmt.as<tirx::ForNode>();
           ICHECK(for_node);
           if (for_node->annotations.count("num_stages")) {
-            tir::For new_for = Downcast<tir::For>(stmt);
+            tirx::For new_for = Downcast<tirx::For>(stmt);
             auto *n = new_for.CopyOnWrite();
             n->annotations.erase("num_stages");
             return std::move(new_for);

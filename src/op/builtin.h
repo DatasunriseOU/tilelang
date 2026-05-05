@@ -47,7 +47,7 @@ static constexpr const char *kPipelineMbarPhaseExpr =
 static constexpr const char *kLocalVarInit = "tl.local_var_init";
 // A PrimFunc-level attribute carrying a list of handle Vars
 // that must NOT be marked with the restrict qualifier in codegen.
-// Type: Array<tir::Var>
+// Type: Array<tirx::Var>
 static constexpr const char *kNonRestrictParams = "tl.non_restrict_params";
 // A PrimFunc-level attribute carrying the minimum number of thread blocks
 // per SM (multiprocessor).  When present it is emitted as the second
@@ -65,7 +65,7 @@ static constexpr const char *kLexicalAllocScope = "lexical_alloc_scope";
 } // namespace attr
 
 inline Optional<PrimExpr>
-GetAnnotatedMbarPhaseExpr(const Map<String, ObjectRef> &annotations) {
+GetAnnotatedMbarPhaseExpr(const Map<String, ffi::ObjectRef> &annotations) {
   if (auto val = annotations.Get(attr::kPipelineMbarPhaseExpr)) {
     if (val.value()->IsInstance<PrimExprNode>()) {
       return Downcast<PrimExpr>(val.value());

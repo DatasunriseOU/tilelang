@@ -7,9 +7,9 @@
 #include "finalize_reducer.h"
 
 #include <tvm/arith/iter_affine_map.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/op_attr_types.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/op_attr_types.h>
 
 #include "../target/utils.h"
 #include "utils.h"
@@ -17,7 +17,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 /**
  * @brief Construct a FinalizeReducerOp from TL operator arguments and a buffer
@@ -32,7 +32,7 @@ using namespace tir;
  * and `args[1]` is an integer encoding a `ReducerOpType` (e.g., Sum/Max/Min).
  */
 FinalizeReducerOp::FinalizeReducerOp(Array<PrimExpr> args,
-                                     Map<String, ObjectRef> annotations) {
+                                     Map<String, ffi::ObjectRef> annotations) {
   auto node = tvm::ffi::make_object<FinalizeReducerOpNode>();
   auto reducer_access = NormalizeToAccessRegion(args[0], kAccessReadWrite);
   reducer_access.region =

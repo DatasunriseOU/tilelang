@@ -163,6 +163,17 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     Returns:
         IRModule: The transformed module, ready for target-specific optimization passes.
     """
+    # CPPMEGA: Lower TileLang's vendored `tilelang::tl_tir::LetStmt` and
+    # `tilelang::tl_tir::Allocate` IR nodes to apache TIR equivalents
+    # (Bind+SeqStmt, AllocBuffer+SeqStmt) BEFORE any apache TIR pass runs.
+    # Apache StmtVisitor/StmtMutator/StmtFunctor have no entry for the vendored
+    # nodes and will crash with "NodeFunctor calls un-registered function".
+    # `tir.transform.BindTarget` below is the first apache-side pass in this
+    # pipeline, so the converters must precede it. They are idempotent on
+    # already-lowered IR, so re-running them later in host/device codegen is
+    # safe.
+    mod = tilelang.transform.LowerTileLangLetStmt()(mod)
+    mod = tilelang.transform.LowerTileLangAllocate()(mod)
     mod = tir.transform.BindTarget(target)(mod)
 
     if should_force_let_inline():
@@ -231,6 +242,13 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
 
 def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     pass_ctx = tilelang.transform.get_pass_context()
+    # CPPMEGA: Defensive re-run of vendored-IR converters in case any TileLang
+    # pass in `LowerAndLegalize` re-introduced `tilelang::tl_tir::LetStmt` or
+    # `tilelang::tl_tir::Allocate` nodes. This guarantees the IR contains only
+    # apache-compatible nodes before the first apache TIR pass below
+    # (`tir.transform.NarrowDataType`, `tir.transform.Simplify`, etc.).
+    mod = tilelang.transform.LowerTileLangLetStmt()(mod)
+    mod = tilelang.transform.LowerTileLangAllocate()(mod)
     # Lower the shared.tmem into specific initialization slot
     mod = tilelang.transform.LowerSharedTmem()(mod)
     # which may be introduced by the LegalizeSafeMemoryAccess
@@ -281,6 +299,13 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     if allow_global_thread_synchronization():
         mod = tilelang.transform.ThreadSync("global")(mod)
     mod = tilelang.transform.AnnotateDeviceRegions()(mod)
+    # CPPMEGA: SplitHostDevice uses apache `tirx::StmtMutator` which has no
+    # dispatch entry for `tilelang::tl_tir::LetStmt` / `tilelang::tl_tir::Allocate`.
+    # Several preceding TileLang passes (e.g. LowerThreadAllreduce, LowerLDGSTG,
+    # LowerHopperIntrin, AnnotateDeviceRegions) may re-emit vendored nodes, so
+    # we lower them again here to guarantee a clean IR for the apache visitor.
+    mod = tilelang.transform.LowerTileLangLetStmt()(mod)
+    mod = tilelang.transform.LowerTileLangAllocate()(mod)
     mod = tilelang.transform.SplitHostDevice()(mod)
 
     # Mark the function contains pdl_sync or pdl_trigger

@@ -7,25 +7,29 @@
 
 #include <tvm/ir/op.h>
 #include <tvm/target/codegen.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/function.h>
-#include <tvm/tir/op_attr_types.h>
-#include <tvm/tir/stmt.h>
-#include <tvm/tir/stmt_functor.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/function.h>
+#include <tvm/tirx/op_attr_types.h>
+#include <tvm/tirx/stmt.h>
+#include <tvm/tirx/stmt_functor.h>
 
 #include <string>
 #include <unordered_map>
 
 // from tvm/src/
 #include "target/source/codegen_source_base.h"
-#include "tir/transforms/ir_utils.h"
+#include "tirx/transform/ir_utils.h"
+#include "../transform/vendored/let_stmt.h"
 
 namespace tvm {
 namespace codegen {
 
-using namespace tir;
+using namespace tirx;
+// Use TileLang vendored LetStmt (with `body` field). See vendored/let_stmt.h.
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 /*!
  * \brief A base class to generate simple Python code.
  */

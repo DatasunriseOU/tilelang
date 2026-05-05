@@ -10,7 +10,7 @@ namespace tvm {
 namespace codegen {
 
 static std::string GetDeviceGlobalSymbol(const GlobalVar &gvar,
-                                         const tir::PrimFunc &f) {
+                                         const tirx::PrimFunc &f) {
   if (auto global_symbol = f->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol)) {
     return static_cast<std::string>(global_symbol.value());
   }
@@ -21,10 +21,10 @@ static void ValidateUniqueDeviceGlobalSymbols(const IRModule &mod) {
   std::unordered_map<std::string, std::string> symbol_to_gvar;
 
   for (auto kv : mod->functions) {
-    ICHECK(kv.second->IsInstance<tir::PrimFuncNode>())
+    ICHECK(kv.second->IsInstance<tirx::PrimFuncNode>())
         << "Can only lower IR Module with PrimFuncs";
     auto gvar = Downcast<GlobalVar>(kv.first);
-    auto f = Downcast<tir::PrimFunc>(kv.second);
+    auto f = Downcast<tirx::PrimFunc>(kv.second);
     std::string global_symbol = GetDeviceGlobalSymbol(gvar, f);
 
     auto [it, inserted] =
@@ -44,9 +44,9 @@ ExtractFuncInfo(const IRModule &mod) {
   std::unordered_map<std::string, runtime::FunctionInfo> fmap;
 
   for (auto kv : mod->functions) {
-    ICHECK(kv.second->IsInstance<tir::PrimFuncNode>())
+    ICHECK(kv.second->IsInstance<tirx::PrimFuncNode>())
         << "Can only lower IR Module with PrimFuncs";
-    auto f = Downcast<tir::PrimFunc>(kv.second);
+    auto f = Downcast<tirx::PrimFunc>(kv.second);
 
     runtime::FunctionInfo info;
     for (size_t i = 0; i < f->params.size(); ++i) {
@@ -77,7 +77,7 @@ ExtractFuncInfo(const IRModule &mod) {
       info.launch_param_tags.push_back(runtime::launch_param::kClusterDimZ);
     }
     if (auto opt = f->GetAttr<ffi::Array<ffi::String>>(
-            tir::attr::kKernelLaunchParams)) {
+            tirx::attr::kKernelLaunchParams)) {
       for (const auto &tag : opt.value()) {
         if (tag != runtime::launch_param::kClusterDimX &&
             tag != runtime::launch_param::kClusterDimY &&

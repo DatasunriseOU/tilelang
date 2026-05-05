@@ -32,7 +32,7 @@
 
 #include "target/source/codegen_c.h"
 #include "tvm/target/codegen.h"
-#include "tvm/tir/expr.h"
+#include "tvm/tirx/expr.h"
 
 namespace tvm {
 namespace tl {
@@ -49,8 +49,8 @@ public:
   void InitGlobalContext();
 
   void AddFunction(const tvm::GlobalVar &gvar,
-                   const tvm::tir::PrimFunc &f) override;
-  void AddFunction(const tvm::GlobalVar &gvar, const tvm::tir::PrimFunc &f,
+                   const tvm::tirx::PrimFunc &f) override;
+  void AddFunction(const tvm::GlobalVar &gvar, const tvm::tirx::PrimFunc &f,
                    bool emit_fwd_func_decl);
   /*!
    * \brief Add functions from the (unordered) range to the current module in a
@@ -67,20 +67,20 @@ public:
   void PrintFuncPrefix(std::ostream &os) final;            // NOLINT(*)
 
   // overload visitor functions
-  void VisitExpr_(const tvm::tir::BroadcastNode *op,
+  void VisitExpr_(const tvm::tirx::BroadcastNode *op,
                   std::ostream &os) final; // NOLINT(*)
-  void VisitExpr_(const tvm::tir::CallNode *op,
+  void VisitExpr_(const tvm::tirx::CallNode *op,
                   std::ostream &os) override; // NOLINT(*)
   // overload min and max to use the ternary operator, so we don't rely on the
   // standard library implementations
-  void VisitExpr_(const tvm::tir::MinNode *op,
+  void VisitExpr_(const tvm::tirx::MinNode *op,
                   std::ostream &os) final; // NOLINT(*)
-  void VisitExpr_(const tvm::tir::MaxNode *op,
+  void VisitExpr_(const tvm::tirx::MaxNode *op,
                   std::ostream &os) final; // NOLINT(*)
 
-  void VisitStmt_(const tvm::tir::AssertStmtNode *op) final; // NOLINT(*)
+  void VisitStmt_(const tvm::tirx::AssertStmtNode *op) final; // NOLINT(*)
 
-  void VisitStmt_(const tvm::tir::AttrStmtNode *op) final; // NOLINT(*)
+  void VisitStmt_(const tvm::tirx::AttrStmtNode *op) final; // NOLINT(*)
 
   void GenerateForwardFunctionDeclarations(
       tvm::ffi::String global_symbol,
@@ -106,10 +106,10 @@ private:
 
   bool is_in_metal_context = false;
 
-  std::string GetPackedName(const tvm::tir::CallNode *op);
+  std::string GetPackedName(const tvm::tirx::CallNode *op);
   void PrintGetFuncFromBackend(const std::string &func_name,
                                const std::string &packed_func_name);
-  void PrintCallPacked(const tvm::tir::CallNode *op);
+  void PrintCallPacked(const tvm::tirx::CallNode *op);
   /*!
    * \brief Print ternary conditional operator implementing binary `op`
    * Forces the operands to be in SSA form.

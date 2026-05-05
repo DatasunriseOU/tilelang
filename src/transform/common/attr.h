@@ -6,7 +6,7 @@
 #ifndef TVM_TL_TRANSFORM_COMMON_ATTR_H_
 #define TVM_TL_TRANSFORM_COMMON_ATTR_H_
 
-#include "tvm/tir/stmt.h"
+#include "tvm/tirx/stmt.h"
 #include <string>
 
 namespace tvm {
@@ -16,11 +16,11 @@ constexpr const char *HostMainBlockName = "root";
 
 constexpr const char *DeviceMainBlockName = "tilelang_root";
 
-inline bool IsHostMainBlock(const tir::BlockNode *node) {
+inline bool IsHostMainBlock(const tirx::SBlockNode *node) {
   return node->name_hint == HostMainBlockName;
 }
 
-inline bool IsDeviceMainBlock(const tir::BlockNode *node) {
+inline bool IsDeviceMainBlock(const tirx::SBlockNode *node) {
   return node->name_hint == DeviceMainBlockName;
 }
 

@@ -25,7 +25,10 @@
 #include "./common/thread_sync_types.h"
 #include "arith/ir_mutator_with_analyzer.h"
 #include "runtime/thread_storage_scope.h"
-#include "tir/transforms/ir_utils.h"
+#include "tirx/transform/ir_utils.h"
+#include "vendored/let_stmt.h"
+#include "vendored/tl_runtime_symbols.h"
+#include "vendored/z3_prover_stub.h"
 #include <algorithm>
 #include <string>
 #include <tvm/arith/analyzer.h>
@@ -33,13 +36,13 @@
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/attrs.h>
-#include <tvm/target/target_info.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include "vendored/target_info.h"
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -47,9 +50,11 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 using namespace ffi;
 using arith::IRMutatorWithAnalyzer;
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 using runtime::StorageRank;
 using runtime::StorageScope;
 
@@ -129,10 +134,10 @@ private:
       }
       return false;
     }
-    if (const auto *block = stmt.as<BlockNode>()) {
+    if (const auto *block = stmt.as<SBlockNode>()) {
       return IsWaitGroupStmt(block->body);
     }
-    if (const auto *realize = stmt.as<BlockRealizeNode>()) {
+    if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
       if (is_one(realize->predicate)) {
         return IsWaitGroupStmt(realize->block->body);
       }
@@ -169,10 +174,10 @@ private:
       }
       return false;
     }
-    if (const auto *block = stmt.as<BlockNode>()) {
+    if (const auto *block = stmt.as<SBlockNode>()) {
       return IsStorageSyncStmt(block->body);
     }
-    if (const auto *realize = stmt.as<BlockRealizeNode>()) {
+    if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
       if (is_one(realize->predicate)) {
         return IsStorageSyncStmt(realize->block->body);
       }
@@ -247,7 +252,7 @@ public:
     return StmtExprMutator::VisitStmt_(op);
   }
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tvm::tir::attr::thread_extent) {
+    if (op->attr_key == tvm::tirx::attr::thread_extent) {
       bool temp = true;
       std::swap(temp, in_thread_env_);
       thread_extents_.push_back(op);
@@ -320,6 +325,10 @@ private:
   }
 
   // private functions.
+  // Restored from cppmega-mlx-tilelang-stack-c fork (matches
+  // 3rdparty/tvm/src/tir/transforms/thread_storage_sync.cc:402-417).
+  // Symbol + builtin are vendored TileLang-side via
+  // `vendored/tl_runtime_symbols.h` and `vendored/global_barrier_builtin.cc`.
   Stmt InitGlobalBarrier(const AttrStmtNode *op) {
     ICHECK(op != nullptr);
     Array<PrimExpr> pargs = {
@@ -330,12 +339,12 @@ private:
     for (const auto &kv : rw_stats_) {
       const auto &e = kv.second;
       if (e.read_count != 0 && e.write_count != 0) {
-        body = AttrStmt(kv.first, tvm::tir::attr::volatile_scope, 1, body);
+        body = AttrStmt(kv.first, tvm::tirx::attr::volatile_scope, 1, body);
       }
     }
     rw_stats_.clear();
     Stmt kinit = Evaluate(
-        Call(DataType::Int(32), builtin::tvm_global_barrier_kinit(), {}));
+        Call(DataType::Int(32), tirx::builtin::tvm_global_barrier_kinit(), {}));
     body = SeqStmt({kinit, body});
     body = AttrStmt(op->node, op->attr_key, op->value, body);
     return SeqStmt({prep, body});
@@ -491,7 +500,7 @@ private:
     // This handles constraints like `tx % 4 == 0` that const_int_bound cannot
     // detect. Z3 enumeration will return the exact count of satisfying values.
     int64_t z3_count =
-        analyzer_->z3_prover.CountSatisfyingValues(iv->var, extent);
+        arith::Z3Prover(analyzer_).CountSatisfyingValues(iv->var, extent);
     if (z3_count > 0) {
       return static_cast<size_t>(z3_count);
     }
@@ -501,7 +510,7 @@ private:
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tvm::tir::attr::thread_extent) {
+    if (op->attr_key == tvm::tirx::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
       if (iv->thread_tag == "threadIdx.x") {
         tx_ = iv;
@@ -606,7 +615,7 @@ public:
     int64_t thread_extent = *extent_opt;
     {
       With<arith::ConstraintContext> ctx(analyzer_, expr);
-      auto count = analyzer_->z3_prover.CountSatisfyingValues(
+      auto count = arith::Z3Prover(analyzer_).CountSatisfyingValues(
           iv->var, thread_extent, /*min_consecutive=*/warp_size_);
       if (count < 0) {
         // ThreadPartialSyncRewriter cannot safely lower this condition.
@@ -839,37 +848,71 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
     allow_append_ = false;
   }
 
-  void VisitStmt_(const LetStmtNode *op) final {
+  // CPPMEGA: apache replaced `tir::LetStmt` with `tirx::BindNode` (a
+  // body-less binding that lives inside a SeqStmt). The default
+  // `StmtVisitor::VisitStmt_(const BindNode*)` visits `op->value` but does
+  // *not* set the `allow_append_` flag, which causes any `BufferLoad` inside
+  // the value (e.g. `T.Cast("float32", A_shared[i, k])` produced by
+  // TileLang's eager-mode `T.copy` lowering for FP8 paths) to trip the
+  // `ICHECK(allow_append_)` at line ~790. Mirror the BufferStore/Evaluate
+  // pattern: open the access window for the value, then close it. We also
+  // record the let-variable's thread/uniformity properties so subsequent
+  // statements in the enclosing scope can resolve `op->var` (mirrors the
+  // vendored-`LetStmtNode` override below; a `Bind` has no body, so the
+  // property persists for the remainder of the surrounding SeqStmt rather
+  // than being scope-restored).
+  void VisitStmt_(const BindNode *op) override {
     allow_append_ = true;
     ICHECK_EQ(curr_stmt_.access.size(), 0U);
     curr_stmt_.stmt = op;
     this->VisitExpr(op->value);
-    // push to the scope
-    scope_.back().push_back(curr_stmt_);
-    // clear access entry.
-    curr_stmt_.access.clear();
-    allow_append_ = false;
-    // traverse body block
-    {
-      auto let_prop = AnalyzeExprProperty(op->value);
-      auto it = let_var_properties_.find(op->var.get());
-      bool had_prev = it != let_var_properties_.end();
-      ConditionThreadProperty prev_prop;
-      if (had_prev) {
-        prev_prop = it->second;
-      }
-      let_var_properties_[op->var.get()] = let_prop;
-      auto guard = MakeGuard(op->var, op->value);
-      this->VisitStmt(op->body);
-      if (had_prev) {
-        let_var_properties_[op->var.get()] = prev_prop;
-      } else {
-        let_var_properties_.erase(op->var.get());
-      }
+    if (!curr_stmt_.access.empty()) {
+      scope_.back().push_back(curr_stmt_);
+      curr_stmt_.access.clear();
     }
+    allow_append_ = false;
+    let_var_properties_[op->var.get()] = AnalyzeExprProperty(op->value);
   }
-  void VisitStmt_(const BlockNode *op) final {
-    auto block = Downcast<Block>(op);
+
+  // NOTE: apache/tvm StmtFunctor vtable does not dispatch to vendored
+  // `tilelang::tl_tir::LetStmtNode`. Override the top-level `VisitStmt(const
+  // Stmt&)` and intercept the vendored type before falling back to the
+  // built-in vtable.
+  void VisitStmt(const Stmt &stmt) override {
+    if (const auto *op = stmt.as<LetStmtNode>()) {
+      allow_append_ = true;
+      ICHECK_EQ(curr_stmt_.access.size(), 0U);
+      curr_stmt_.stmt = op;
+      this->VisitExpr(op->value);
+      // push to the scope
+      scope_.back().push_back(curr_stmt_);
+      // clear access entry.
+      curr_stmt_.access.clear();
+      allow_append_ = false;
+      // traverse body block
+      {
+        auto let_prop = AnalyzeExprProperty(op->value);
+        auto it = let_var_properties_.find(op->var.get());
+        bool had_prev = it != let_var_properties_.end();
+        ConditionThreadProperty prev_prop;
+        if (had_prev) {
+          prev_prop = it->second;
+        }
+        let_var_properties_[op->var.get()] = let_prop;
+        auto guard = MakeGuard(op->var, op->value);
+        this->VisitStmt(op->body);
+        if (had_prev) {
+          let_var_properties_[op->var.get()] = prev_prop;
+        } else {
+          let_var_properties_.erase(op->var.get());
+        }
+      }
+      return;
+    }
+    ConstrVisitor::VisitStmt(stmt);
+  }
+  void VisitStmt_(const SBlockNode *op) final {
+    auto block = Downcast<SBlock>(op);
     for (const auto &buffer : block->alloc_buffers) {
       ICHECK(buffer->IsInstance<BufferNode>());
       buffer_data_to_buffer_.Set(buffer->data, buffer);
@@ -877,12 +920,15 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
     ConstrVisitor::VisitStmt_(op);
   }
   void VisitStmt_(const AttrStmtNode *op) override {
-    if (op->attr_key == tvm::tir::attr::coproc_scope) {
+    // CPPMEGA: apache replaced `coproc_scope` (VTA-specific coprocessor
+    // region) with the more general `compute_scope`. Functionally equivalent
+    // for TileLang's sync analysis (both demarcate a sync-relevant region).
+    if (op->attr_key == tvm::tirx::attr::compute_scope) {
       IterVar iv = Downcast<IterVar>(op->node);
       env_threads_.push_back(iv);
       ConstrVisitor::VisitStmt_(op);
       env_threads_.pop_back();
-    } else if (op->attr_key == tvm::tir::attr::thread_extent) {
+    } else if (op->attr_key == tvm::tirx::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
       env_threads_.push_back(iv);
       ICHECK_NE(iv->thread_tag.length(), 0U);
@@ -988,7 +1034,7 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
     }
 
     if (op->else_case) {
-      auto guard = MakeGuard(tir::Not(op->condition));
+      auto guard = MakeGuard(tirx::Not(op->condition));
       scope_.push_back(std::vector<StmtEntry>());
       {
         this->VisitStmt(op->else_case.value());
@@ -1217,7 +1263,7 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
               for (size_t j = i + 1; j < shape.size(); ++j) {
                 PrimExpr dim = shape[j];
                 if (dim.dtype() != index_dtype) {
-                  dim = tir::Cast(index_dtype, dim);
+                  dim = tirx::Cast(index_dtype, dim);
                 }
                 stride = stride * dim;
               }
@@ -1608,7 +1654,7 @@ private:
       output << "  Constraint: {";
       arith::Analyzer analyzer_;
       access.cset.Populate(analyzer_);
-      output << analyzer_.z3_prover.GetSMTLIB2(std::nullopt);
+      output << arith::Z3Prover(analyzer_).GetSMTLIB2(std::nullopt);
       output << "}\n";
     }
 
@@ -1761,11 +1807,11 @@ private:
       }
 
       // Check P => C: ¬P ∨ C
-      bool prev_implies_curr = analyzer.z3_prover.CanProve(
-          tir::Or(tir::Not(prev_constr), curr_constr));
+      bool prev_implies_curr = arith::Z3Prover(analyzer).CanProve(
+          tirx::Or(tirx::Not(prev_constr), curr_constr));
       // Check C => P: ¬C ∨ P
-      bool curr_implies_prev = analyzer.z3_prover.CanProve(
-          tir::Or(tir::Not(curr_constr), prev_constr));
+      bool curr_implies_prev = arith::Z3Prover(analyzer).CanProve(
+          tirx::Or(tirx::Not(curr_constr), prev_constr));
 
       if (prev_implies_curr && curr_implies_prev) {
         // If constraints are equivalent, they are not in conflict
@@ -1840,7 +1886,7 @@ private:
           Var curr_var(std::string(thread_names[idx]) + "2",
                        old_curr_var.dtype());
           thread_condition =
-              tir::Or(thread_condition, tir::NE(prev_var, curr_var));
+              tirx::Or(thread_condition, tirx::NE(prev_var, curr_var));
           prev_sub.Set(old_prev_var, prev_var);
           curr_sub.Set(old_curr_var, curr_var);
         }
@@ -1880,15 +1926,15 @@ private:
           if (prev_indice_bytes.dtype().bits() <
               curr_indice_bytes.dtype().bits()) {
             prev_indice_bytes =
-                tir::Cast(curr_indice_bytes.dtype(), prev_indice_bytes);
+                tirx::Cast(curr_indice_bytes.dtype(), prev_indice_bytes);
           } else {
             curr_indice_bytes =
-                tir::Cast(prev_indice_bytes.dtype(), curr_indice_bytes);
+                tirx::Cast(prev_indice_bytes.dtype(), curr_indice_bytes);
           }
         }
         ICHECK(prev_indice_bytes.dtype() == curr_indice_bytes.dtype());
         provably_disjoint =
-            analyzer.CanProve(tir::NE(prev_indice_bytes, curr_indice_bytes));
+            analyzer.CanProve(tirx::NE(prev_indice_bytes, curr_indice_bytes));
       } else {
         try {
           auto prev_min = analyzer.Simplify(
@@ -1900,7 +1946,7 @@ private:
           auto curr_max = analyzer.Simplify(
               Substitute(curr.touched[i].max() * curr_dtype.bytes(), curr_sub));
           provably_disjoint = analyzer.CanProve(analyzer.Simplify(
-              tir::Or(prev_min > curr_max, curr_min > prev_max)));
+              tirx::Or(prev_min > curr_max, curr_min > prev_max)));
         } catch (const std::exception &e) {
           auto prev_bound = analyzer.const_int_bound(prev_indice_bytes);
           auto curr_bound = analyzer.const_int_bound(curr_indice_bytes);
@@ -1915,7 +1961,7 @@ private:
         // if (!provably_disjoint) {
         //   LOG(WARNING) << analyzer.z3_prover.GetStats();
         //   LOG(WARNING) <<
-        //   analyzer.z3_prover.GetSMTLIB2(tir::Not(tir::Or(prev_min >
+        //   analyzer.z3_prover.GetSMTLIB2(tirx::Not(tirx::Or(prev_min >
         //   curr_max, curr_min > prev_max)));
         // }
       }
@@ -1966,7 +2012,7 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
   return func;
 }
 
-using namespace tir::transform;
+using namespace tirx::transform;
 
 namespace transform {
 

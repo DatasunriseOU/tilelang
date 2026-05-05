@@ -13,7 +13,7 @@ namespace tvm {
 
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 enum class GemmWarpPolicyType : uint8_t {
   kSquare = 0,
@@ -71,13 +71,13 @@ inline const char *GemmInstToString(GemmInst inst) {
   }
 }
 
-class GemmWarpPolicyNode : public Object {
+class GemmWarpPolicyNode : public ffi::Object {
 public:
   mutable int m_warp{0};
   mutable int n_warp{0};
   int policy_type;
 
-  TVM_FFI_DECLARE_OBJECT_INFO("tl.GemmWarpPolicy", GemmWarpPolicyNode, Object);
+  TVM_FFI_DECLARE_OBJECT_INFO("tl.GemmWarpPolicy", GemmWarpPolicyNode, ffi::Object);
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
@@ -103,9 +103,9 @@ public:
   bool isFree() const { return policy_type == int(GemmWarpPolicyType::kFree); }
 };
 
-class GemmWarpPolicy : public ObjectRef {
+class GemmWarpPolicy : public ffi::ObjectRef {
 public:
-  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(GemmWarpPolicy, ObjectRef,
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(GemmWarpPolicy, ffi::ObjectRef,
                                              GemmWarpPolicyNode);
 
   explicit GemmWarpPolicy(GemmWarpPolicyType policy_type) {
@@ -134,7 +134,7 @@ public:
   bool checkWgmma() const;
   bool allowTcgen5Mma(Target target) const;
   bool allowWgmma(int block_size, Target target) const;
-  tir::Buffer a_, b_, c_;
+  tirx::Buffer a_, b_, c_;
   // BufferRegion for A, B and C
   BufferRegion aRegion_, bRegion_, cRegion_;
   bool transA_, transB_;
@@ -142,7 +142,7 @@ public:
   int strideA_, strideB_;
   int offsetA_, offsetB_;
   PrimExpr clearAccum_ = const_false();
-  tir::BufferLoad mbar_; // mbar is optional, only used for TCGEN5MMA
+  tirx::BufferLoad mbar_; // mbar is optional, only used for TCGEN5MMA
   Array<PrimExpr> cCoords_;
   // k_pack please ref to bitblas/tl/mfma_macro_generator.py::k_pack
   // only will be enabled under cdna mfma instructions
@@ -151,7 +151,7 @@ public:
   bool isWgmma_ = false;
   bool isTcgen05_ = false;
   mutable GemmWarpPolicy policy_;
-  Map<String, ObjectRef> annotations_;
+  Map<String, ffi::ObjectRef> annotations_;
   BufferRegion sfaRegion_, sfbRegion_;
   PrimExpr sfAId_, sfBId_;
 
@@ -208,7 +208,7 @@ class Gemm : public TileOperator {
 public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(Gemm, TileOperator, GemmNode);
   TVM_DLL Gemm(Array<PrimExpr> args,
-               Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
+               Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 

@@ -31,7 +31,9 @@ if not os.path.exists(THIRD_PARTY_ROOT):
     DEV = True
     tl_dev_root = os.path.dirname(TL_ROOT)
 
-    dev_lib_root = os.path.join(tl_dev_root, "build")
+    dev_lib_root = os.environ.get("TILELANG_DEV_BUILD_ROOT")
+    if dev_lib_root is None:
+        dev_lib_root = os.path.join(tl_dev_root, "build")
     # In dev builds, place artifacts under build/lib and point search path there
     # to avoid adding the entire build root to sys.path.
     TL_LIBS = [os.path.join(dev_lib_root, "lib"), os.path.join(dev_lib_root, "tvm")]

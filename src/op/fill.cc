@@ -6,9 +6,9 @@
 
 #include "fill.h"
 
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/op_attr_types.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/op_attr_types.h>
 
 #include "../layout/tcgen05_layout.h"
 #include "../target/utils.h"
@@ -21,7 +21,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 /**
  * @brief Construct a Fill operator node from call arguments and a buffer map.
@@ -57,7 +57,7 @@ using namespace tir;
  * lanes) and will terminate (via CHECK/ICHECK) if inputs are unsupported or out
  * of bounds.
  */
-Fill::Fill(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
+Fill::Fill(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {
   ObjectPtr<FillNode> node = tvm::ffi::make_object<FillNode>();
 
   AccessRegion dst_access = NormalizeToAccessRegion(args[0], kAccessWrite);

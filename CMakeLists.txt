@@ -21,11 +21,12 @@ endif()
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.gitmodules" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+# CPPMEGA local: skip submodule init — manually managed (apache/tvm latest, custom tvm-ffi pin)
+if(FALSE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.gitmodules" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
   find_package(Git QUIET)
   if(Git_FOUND)
     execute_process(
-      COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
+      COMMAND ${GIT_EXECUTABLE} submodule update --init
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
       RESULT_VARIABLE TILELANG_GIT_SUBMODULE_RESULT
     )
@@ -176,6 +177,7 @@ file(GLOB TILE_LANG_SRCS
   src/layout/*.cc
   src/transform/*.cc
   src/transform/common/*.cc
+  src/transform/vendored/*.cc
   src/op/*.cc
   src/target/utils.cc
   src/target/codegen_c_host.cc
@@ -190,7 +192,7 @@ list(APPEND TILE_LANG_SRCS
   src/runtime/error_helpers.cc
 )
 
-set(TILELANG_OUTPUT_TARGETS tilelang tvm)
+set(TILELANG_OUTPUT_TARGETS tilelang tvm_compiler)
 
 # Track if the user explicitly selected a backend via cache options.
 set(TILELANG_BACKEND_USER_SELECTED OFF)
@@ -257,7 +259,7 @@ add_subdirectory(${TVM_SOURCE} tvm EXCLUDE_FROM_ALL)
 
 # Provide the custom LogMessageImpl / LogFatalImpl implementation to TVM,
 # since TVM_LOG_CUSTOMIZE=1 requires them to be supplied by the user.
-target_sources(tvm_objs PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/logging.cc")
+# target_sources(tvm_runtime_objs PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/tilelang_logging_impl.cc")  # disabled with TVM_LOG_CUSTOMIZE
 if(TILELANG_RELEASE_BUILD)
   target_compile_definitions(tvm_objs PRIVATE TILELANG_RELEASE_BUILD=1)
 endif()
@@ -275,13 +277,27 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif()
 
 target_include_directories(tilelang_objs PRIVATE ${TILE_LANG_INCLUDES})
-target_compile_definitions(tilelang_objs PRIVATE TVM_LOG_CUSTOMIZE=1)
+# CPPMEGA: force-include compat shim so old ICHECK macros alias to TVM_FFI_ICHECK family
+target_compile_options(tilelang_objs PRIVATE "-include" "${CMAKE_CURRENT_SOURCE_DIR}/src/transform/vendored/tl_compat.h")
+# CPPMEGA: disable custom logging (incompatible with apache/tvm latest tvm-ffi API)
+# target_compile_definitions(tilelang_objs PRIVATE TVM_LOG_CUSTOMIZE=1)
 if(TILELANG_RELEASE_BUILD)
   target_compile_definitions(tilelang_objs PRIVATE TILELANG_RELEASE_BUILD=1)
 endif()
 
 add_library(tilelang SHARED $<TARGET_OBJECTS:tilelang_objs>)
-target_link_libraries(tilelang PUBLIC tvm)
+target_link_libraries(tilelang PUBLIC tvm_compiler)
+
+# CPPMEGA: vendored Z3 prover (src/transform/vendored/z3_prover.cc) needs
+# z3++.h headers and libz3 at link time. The find_package(Z3) above defines
+# z3::libz3 (the imported shared library) but did not previously feed it
+# into TileLang because the original sync rewriter used a stub. Wire it in
+# now so the partial-sync optimization paths actually solve.
+if(USE_Z3 AND USE_PYPI_Z3)
+  target_include_directories(tilelang_objs PRIVATE
+    "$<TARGET_PROPERTY:z3::libz3,INTERFACE_INCLUDE_DIRECTORIES>")
+  target_link_libraries(tilelang PRIVATE z3::libz3)
+endif()
 
 # Place dev build outputs under build/lib for consistency
 set_target_properties(tilelang PROPERTIES
@@ -327,9 +343,9 @@ if(USE_Z3 AND USE_PYPI_Z3)
   get_target_property(Z3_LIBRARY_PATH z3::libz3 IMPORTED_LOCATION)
   install(FILES "${Z3_LIBRARY_PATH}" DESTINATION "${CMAKE_BINARY_DIR}/lib")
   if(APPLE)
-    set_target_properties(tvm PROPERTIES BUILD_RPATH "@loader_path")
+    set_target_properties(tvm_compiler PROPERTIES BUILD_RPATH "@loader_path")
   else()
-    set_target_properties(tvm PROPERTIES BUILD_RPATH "\$ORIGIN")
+    set_target_properties(tvm_compiler PROPERTIES BUILD_RPATH "\$ORIGIN")
   endif()
 endif()
 

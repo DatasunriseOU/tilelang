@@ -24,43 +24,60 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/target/target_info.h>
-#include <tvm/tir/buffer.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include "vendored/target_info.h"
+#include <tvm/tirx/buffer.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include "runtime/thread_storage_scope.h"
-#include "tir/transforms/ir_utils.h"
+#include "tirx/transform/ir_utils.h"
+#include "vendored/let_stmt.h"
 
 namespace tvm {
 namespace tl {
-using namespace tir;
+using namespace tirx;
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 using runtime::StorageRank;
 using runtime::StorageScope;
 
 class StorageAccessInfoLower : public StmtExprMutator {
 public:
-  Stmt VisitStmt_(const AllocateNode *op) final {
-    auto scope = StorageScope::Create(GetPtrStorageScope(op->buffer_var));
+  // CPPMEGA: apache/tvm latest replaced AllocateNode with AllocBufferNode and
+  // dropped the body field. The original pass also stripped DeclBuffer when
+  // the storage info had no head_address; with no `body` to return we instead
+  // emit an Evaluate(0) stub so the surrounding SeqStmt can absorb the slot.
+  Stmt VisitStmt_(const AllocBufferNode *op) final {
+    const Buffer &buf = op->buffer;
+    auto scope = StorageScope::Create(GetPtrStorageScope(buf->data));
     if (!scope.tag.empty() && scope.tag != ".dyn" && scope.tag != ".var" &&
         scope.tag != ".barrier" && scope.tag != ".cluster_barrier" &&
         scope.tag != ".fragment" && scope.tag.find(".descriptor") != 0) {
-      auto info = GetMemoryInfo(GetPtrStorageScope(op->buffer_var));
+      auto info = GetMemoryInfo(GetPtrStorageScope(buf->data));
       ICHECK(info.defined())
           << "Cannot find memory info of " << scope.to_string();
-      ICHECK(storage_info_.find(op->buffer_var.get()) == storage_info_.end())
+      ICHECK(storage_info_.find(buf->data.get()) == storage_info_.end())
           << "Double allocation of " << scope.to_string();
-      storage_info_[op->buffer_var.get()] = info;
+      storage_info_[buf->data.get()] = info;
 
       // Lower allocate to device allocate when needed.
       Stmt stmt = StmtExprMutator::VisitStmt_(op);
-      op = stmt.as<AllocateNode>();
+      const auto *new_op = stmt.as<AllocBufferNode>();
+      const Buffer &new_buf = new_op ? new_op->buffer : buf;
       if (info->head_address.defined()) {
-        return LetStmt(op->buffer_var, info->head_address, op->body);
+        // CPPMEGA: this pass runs in `host_codegen`/`device_codegen`
+        // AFTER the `LowerTileLangLetStmt` converter, then is followed by
+        // apache `tir.transform.Simplify` and target-specific codegen which
+        // dispatch on tirx node types via `StmtFunctor` vtable. Emitting a
+        // vendored `tilelang::tl_tir::LetStmt` here would crash apache's
+        // visitor with `NodeFunctor calls un-registered function`. Use the
+        // apache-equivalent `SeqStmt({Bind(var, value), Evaluate(0)})`
+        // directly — see split_host_device.cc:385 for the same pattern.
+        return SeqStmt({Bind(new_buf->data, info->head_address), Evaluate(0)});
       } else {
-        return op->body;
+        return Evaluate(0);
       }
     } else {
       return StmtExprMutator::VisitStmt_(op);
@@ -71,7 +88,8 @@ public:
     auto node = Downcast<DeclBuffer>(StmtExprMutator::VisitStmt_(op));
     if (auto it = storage_info_.find(node->buffer->data.get());
         it != storage_info_.end() && !it->second->head_address.defined()) {
-      return node->body;
+      // CPPMEGA: DeclBuffer no longer has a body; emit a no-op stub.
+      return Evaluate(0);
     } else {
       return std::move(node);
     }
@@ -132,7 +150,7 @@ Stmt LowerStorageAccessInfo(Stmt stmt) {
 }
 
 namespace transform {
-using namespace tir::transform;
+using namespace tirx::transform;
 
 Pass LowerDeviceStorageAccessInfo() {
   auto pass_func = [](PrimFunc f, const IRModule &m, const PassContext &ctx) {

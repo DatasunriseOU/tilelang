@@ -12,7 +12,7 @@
 
 namespace tvm {
 namespace tl {
-using namespace tir;
+using namespace tirx;
 
 /// Copy instruction types for different memory access patterns
 enum class CopyInst : uint8_t {
@@ -122,7 +122,7 @@ class CopyNode : public TileOperatorNode {
 public:
   Buffer src, dst;                   // Source and destination buffers
   Array<Range> src_range, dst_range; // Ranges for each dimension in src and dst
-  Map<String, ObjectRef> annotations; // Annotations for the copy operation
+  Map<String, ffi::ObjectRef> annotations; // Annotations for the copy operation
   // Supported annotation keys:
   //   - "coalesced_width": IntImm, width for coalesced memory access
   //   - "disable_tma": Bool, whether to disable TMA acceleration
@@ -440,7 +440,7 @@ public:
    * \param annotations  Annotations map from the Call node.
    */
   TVM_DLL Copy(Array<PrimExpr> args,
-               Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
+               Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
 
   /*!
    * \brief Get the TVM Op handle corresponding to this Copy op.
@@ -466,7 +466,7 @@ public:
   int eviction_policy_;                // Cache eviction policy
   PrimExpr nhw_step_;                  // Step size in NHW dimensions
   PrimExpr c_step_;                    // Step size in channel dimension
-  Map<String, ObjectRef> annotations_; // Annotations from Call node
+  Map<String, ffi::ObjectRef> annotations_; // Annotations from Call node
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.Conv2DIm2Col", Conv2DIm2ColOpNode,
                                     TileOperatorNode);
@@ -509,7 +509,7 @@ public:
                                              Conv2DIm2ColOpNode);
   TVM_DLL
   Conv2DIm2ColOp(Array<PrimExpr> args,
-                 Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
+                 Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 

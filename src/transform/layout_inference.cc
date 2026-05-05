@@ -4,12 +4,12 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/index_map.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
-#include <tvm/tir/utils.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/index_map.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
+#include <tvm/s_tir/utils.h>
 
 #include <algorithm>
 #include <deque>
@@ -31,12 +31,12 @@
 #include "common/union_find.h"
 #include "layout_reducer.h"
 #include "parallel_loop_layout_validator.h"
-#include "tir/transforms/ir_utils.h"
+#include "tirx/transform/ir_utils.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 namespace {
 
@@ -80,7 +80,7 @@ Optional<Buffer> FindLayoutAnchorBuffer(const Array<Buffer> &buffers,
 class ThreadBindingCollector : public StmtExprVisitor {
 public:
   void VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::thread_extent) {
+    if (op->attr_key == tirx::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
       thread_binding_[iv->var.get()] = iv;
     }
@@ -91,7 +91,7 @@ public:
   std::unordered_map<const VarNode *, IterVar> thread_binding_;
 };
 
-using namespace tir;
+using namespace tirx;
 using arith::IRMutatorWithAnalyzer;
 using arith::IRVisitorWithAnalyzer;
 
@@ -563,7 +563,11 @@ private:
       // Compute thread_var_ and thread_bounds_
       thread_var_vec_.push_back(thread_var_);
       thread_bounds_vec_.push_back(CurrentThreadBounds());
-      analyzer_vec_.push_back(analyzer_.Clone());
+      // CPPMEGA: arith::Analyzer::Clone() removed in apache/tvm latest. Push
+      // a fresh analyzer; we lose accumulated bounds state but that is
+      // acceptable here since `cur_analyzer` is only used for per-op
+      // simplification afterwards.
+      analyzer_vec_.push_back(std::make_unique<arith::Analyzer>());
 
       // Compute buffer oob for each buffer in the op
       if (const auto *copy = p.as<CopyNode>()) {
@@ -734,14 +738,18 @@ private:
       infer_list_.push_back(std::move(infer));
       thread_var_vec_.push_back(thread_var_);
       thread_bounds_vec_.push_back(CurrentThreadBounds());
-      analyzer_vec_.push_back(analyzer_.Clone());
+      // CPPMEGA: arith::Analyzer::Clone() removed in apache/tvm latest. Push
+      // a fresh analyzer; we lose accumulated bounds state but that is
+      // acceptable here since `cur_analyzer` is only used for per-op
+      // simplification afterwards.
+      analyzer_vec_.push_back(std::make_unique<arith::Analyzer>());
       buffer_oob_vec_.push_back(false);
     } else {
       IRVisitorWithAnalyzer::VisitStmt(op->body);
     }
   }
 
-  void VisitStmt_(const BlockNode *op) final {
+  void VisitStmt_(const SBlockNode *op) final {
     for (auto buffer : op->alloc_buffers) {
       if (buffer_data_to_buffers_.count(buffer->data)) {
         auto buffers = buffer_data_to_buffers_[buffer->data];
@@ -794,7 +802,7 @@ private:
   }
 
   void VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::thread_extent) {
+    if (op->attr_key == tirx::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
       if (iv->thread_tag == "threadIdx.x") {
         ICHECK(iv->dom->extent.as<IntImmNode>());
@@ -804,7 +812,7 @@ private:
     IRVisitorWithAnalyzer::VisitStmt_(op);
   }
 
-  void VisitStmt_(const LetStmtNode *op) final {
+  void VisitStmt_(const BindNode *op) final {
     // Record Let variable to its bound expression.
     // This enables tracking fragment buffer accesses through let bindings.
     let_var_to_expr_.Set(op->var, op->value);
@@ -934,7 +942,7 @@ private:
             floating_buffers_(floating_buffers) {}
 
       void VisitStmt_(const AttrStmtNode *op) final {
-        if (op->attr_key == tir::attr::thread_extent) {
+        if (op->attr_key == tirx::attr::thread_extent) {
           IterVar iv = Downcast<IterVar>(op->node);
           if (iv->thread_tag == "threadIdx.x") {
             thread_var_ = iv;
@@ -1219,8 +1227,8 @@ private:
    * @return Stmt The (possibly modified) Block statement with the layout-map
    * annotation set.
    */
-  Stmt VisitStmt_(const BlockNode *op) final {
-    Block block = Downcast<Block>(IRMutatorWithAnalyzer::VisitStmt_(op));
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    SBlock block = Downcast<SBlock>(IRMutatorWithAnalyzer::VisitStmt_(op));
 
     for (auto buffer : block->alloc_buffers) {
       if (buffer.scope() == "local.framgent") {
@@ -1275,7 +1283,7 @@ private:
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::thread_extent) {
+    if (op->attr_key == tirx::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
     }
     return IRMutatorWithAnalyzer::VisitStmt_(op);
@@ -1286,7 +1294,7 @@ private:
 };
 
 tvm::transform::Pass LayoutInference() {
-  using namespace tir::transform;
+  using namespace tirx::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     ThreadBindingCollector collector;
     collector(f->body);

@@ -5,26 +5,29 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/buffer.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
-#include <tvm/tir/utils.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/buffer.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
+#include <tvm/s_tir/utils.h>
 
 #include <optional>
 #include <utility>
 
 #include "arith/ir_mutator_with_analyzer.h"
-#include "tir/analysis/control_flow_graph.h"
-#include "tir/analysis/var_use_def_analysis.h"
+#include "tirx/analysis/control_flow_graph.h"
+#include "tirx/analysis/var_use_def_analysis.h"
+#include "vendored/let_stmt.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 using namespace ffi;
 using namespace arith;
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 struct SimplifyConfigNode : public AttrsNodeReflAdapter<SimplifyConfigNode> {
   bool transitively_prove_inequalities{};
@@ -115,7 +118,7 @@ CollectUsedBuffers(const PrimFunc &func) {
       VisitBuffer(op->buffer);
       StmtExprVisitor::VisitStmt_(op);
     }
-    void VisitStmt_(const BlockNode *op) override {
+    void VisitStmt_(const SBlockNode *op) override {
       for (const auto &buffer : op->alloc_buffers) {
         for (const auto &it : func->buffer_map) {
           if (it.second.get()->data.same_as(buffer.get()->data)) {
@@ -311,7 +314,12 @@ private:
   Stmt VisitStmt(const Stmt &stmt) override {
     Optional<Stmt> cache = this->current_stmt_;
     this->current_stmt_ = stmt;
-    Stmt output = Parent::VisitStmt(stmt);
+    Stmt output;
+    if (const auto *let = stmt.as<LetStmtNode>()) {
+      output = VisitStmt_(let);
+    } else {
+      output = Parent::VisitStmt(stmt);
+    }
     this->current_stmt_ = std::move(cache);
     return output;
   }
@@ -342,7 +350,9 @@ private:
     return SideEffect(op->value) <= CallEffectKind::kPure;
   }
 
-  Stmt VisitStmt_(const LetStmtNode *op) override {
+  // CPPMEGA: vendored LetStmt is not in apache StmtFunctor dispatch, so this
+  // cannot `override`. Trigger via VisitStmt(const Stmt&) instead.
+  Stmt VisitStmt_(const LetStmtNode *op) {
     PrimExpr value = this->VisitExpr(op->value);
     bool remove_buffer_alias = false;
     // TileLang emits aliases like `X_shared = buffer[0:128, 0:32]` to annotate
@@ -461,7 +471,7 @@ private:
     if (const BufferLoadNode *load = store->value.as<BufferLoadNode>()) {
       if (load->buffer->data.same_as(store->buffer->data) &&
           ArrayDeepEqual(load->indices, store->indices) &&
-          tir::ExprDeepEqual()(load->buffer->elem_offset,
+          tirx::ExprDeepEqual()(load->buffer->elem_offset,
                                store->buffer->elem_offset) &&
           ArrayDeepEqual(load->buffer->shape, store->buffer->shape) &&
           ArrayDeepEqual(load->buffer->strides, store->buffer->strides)) {
@@ -491,7 +501,7 @@ private:
       return false;
     }
     for (size_t i = 0; i < lhs.size(); i++) {
-      if (!tir::ExprDeepEqual()(lhs[i], rhs[i])) {
+      if (!tirx::ExprDeepEqual()(lhs[i], rhs[i])) {
         return false;
       }
     }
@@ -535,7 +545,7 @@ private:
   std::unordered_set<const BufferNode *> used_buffers_;
 };
 
-using namespace tir::transform;
+using namespace tirx::transform;
 
 tvm::transform::Pass Simplify(bool simplify_arguments = true) {
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {

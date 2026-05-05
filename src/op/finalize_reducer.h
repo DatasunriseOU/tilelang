@@ -20,11 +20,11 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 class FinalizeReducerOpNode : public TileOperatorNode {
 public:
-  tir::Buffer reducer;
+  tirx::Buffer reducer;
   ReducerOpType op;
   // Batch size for batched AllReduce (1 = scalar path, same as T.reduce
   // default).
@@ -54,7 +54,7 @@ public:
                                              FinalizeReducerOpNode);
   TVM_DLL FinalizeReducerOp(
       Array<PrimExpr> args,
-      Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
+      Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 

@@ -4,19 +4,22 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include "../op/builtin.h"
 #include "../runtime/runtime.h"
+#include "vendored/let_stmt.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 #if (CUDA_MAJOR_VERSION >= 12)
 class LowerHopperIntrin : public StmtExprMutator {
@@ -127,7 +130,7 @@ public:
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::thread_extent) {
+    if (op->attr_key == tirx::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
       if (iv->thread_tag == "threadIdx.x") {
         auto body = StmtExprMutator::VisitStmt(op->body);
@@ -185,7 +188,7 @@ private:
   bool disable_shuffle_elect_;
 };
 
-using namespace tir::transform;
+using namespace tirx::transform;
 
 tvm::transform::Pass LowerHopperIntrin() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {

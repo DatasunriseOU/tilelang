@@ -5,14 +5,15 @@
 
 #include <tvm/ffi/cast.h>
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include "../op/builtin.h"
 #include "runtime/thread_storage_scope.h"
-#include "tir/transforms/ir_utils.h"
+#include "tirx/transform/ir_utils.h"
+#include "vendored/let_stmt.h"
 #include <functional>
 #include <unordered_set>
 #include <vector>
@@ -20,7 +21,9 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 namespace {
 
@@ -69,27 +72,27 @@ Stmt RewriteWarpSpecializationBody(const Stmt &stmt, F &&rewrite_if,
     return LetStmt(let_node->var, let_node->value, new_body);
   }
 
-  if (const auto *realize = stmt.as<BlockRealizeNode>()) {
-    const Block &block = realize->block;
+  if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
+    const SBlock &block = realize->block;
     Stmt new_body =
         RewriteWarpSpecializationBody(block->body, rewrite_if, rewrote);
     if (new_body.same_as(block->body)) {
       return stmt;
     }
-    Block new_block(block->iter_vars, block->reads, block->writes,
+    SBlock new_block(block->iter_vars, block->reads, block->writes,
                     block->name_hint, new_body, block->init,
                     block->alloc_buffers, block->match_buffers,
                     block->annotations);
-    return BlockRealize(realize->iter_values, realize->predicate, new_block);
+    return SBlockRealize(realize->iter_values, realize->predicate, new_block);
   }
 
-  if (const auto *block = stmt.as<BlockNode>()) {
+  if (const auto *block = stmt.as<SBlockNode>()) {
     Stmt new_body =
         RewriteWarpSpecializationBody(block->body, rewrite_if, rewrote);
     if (new_body.same_as(block->body)) {
       return stmt;
     }
-    return Block(block->iter_vars, block->reads, block->writes,
+    return SBlock(block->iter_vars, block->reads, block->writes,
                  block->name_hint, new_body, block->init, block->alloc_buffers,
                  block->match_buffers, block->annotations);
   }
@@ -202,7 +205,7 @@ private:
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::thread_extent &&
+    if (op->attr_key == tirx::attr::thread_extent &&
         Downcast<IterVar>(op->node)->thread_tag == "threadIdx.x") {
       thread_iv_ = Downcast<IterVar>(op->node);
       need_update_thread_extent_ = false;
@@ -275,7 +278,7 @@ private:
   bool need_update_thread_extent_ = false;
 };
 
-using namespace tir::transform;
+using namespace tirx::transform;
 
 tvm::transform::Pass AnnotateWarpGroupRegAlloc() {
   auto pass_func = [](PrimFunc f, const IRModule &m,

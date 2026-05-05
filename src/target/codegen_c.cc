@@ -22,7 +22,7 @@
  */
 #include "codegen_c.h"
 
-#include <tvm/runtime/module.h>
+#include <tvm/ffi/extra/module.h>
 #include <tvm/target/codegen.h>
 
 #include <string>
@@ -259,11 +259,11 @@ void CodeGenTileLangC::AddFunction(const PrimFunc &f) {
   auto global_symbol = f->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol);
   ICHECK(global_symbol)
       << "CodeGenC: Expect PrimFunc to have the global_symbol attribute";
-  bool no_alias = f->HasNonzeroAttr(tir::attr::kNoAlias);
+  bool no_alias = f->HasNonzeroAttr(tirx::attr::kNoAlias);
   std::unordered_set<const VarNode *> non_restrict;
   if (auto opt =
-          f->GetAttr<ffi::Array<tir::Var>>(tl::attr::kNonRestrictParams)) {
-    for (const tir::Var &v : opt.value())
+          f->GetAttr<ffi::Array<tirx::Var>>(tl::attr::kNonRestrictParams)) {
+    for (const tirx::Var &v : opt.value())
       non_restrict.insert(v.get());
   }
 
@@ -273,7 +273,7 @@ void CodeGenTileLangC::AddFunction(const PrimFunc &f) {
   this->stream << " " << static_cast<std::string>(global_symbol.value()) << "(";
 
   for (size_t i = 0; i < f->params.size(); ++i) {
-    tir::Var v = f->params[i];
+    tirx::Var v = f->params[i];
     std::string vid = AllocVarID(v.get());
     if (i != 0)
       stream << ", ";
@@ -389,7 +389,8 @@ void CodeGenTileLangC::VisitExpr_(const CallNode *op,
     size_t unit = sizeof(TVMFFIAny);
     size_t size = 0;
     if (type == "shape") {
-      size = (num->value * sizeof(runtime::tvm_index_t) + unit - 1) / unit;
+      // CPPMEGA: tvm::runtime::tvm_index_t was removed; DLTensor shape is int64_t.
+      size = (num->value * sizeof(int64_t) + unit - 1) / unit;
     } else if (type == "arg_value") {
       size = (num->value * sizeof(TVMFFIAny) + unit - 1) / unit;
     } else if (type == "arg_tcode") {
@@ -425,39 +426,59 @@ void CodeGenTileLangC::VisitExpr_(const CallNode *op,
 }
 
 void CodeGenTileLangC::VisitStmt_(const AssertStmtNode *op) { // NOLINT(*)
+  // CPPMEGA: apache/tvm replaced AssertStmt(cond, message, body) with
+  // AssertStmt(cond, error_kind, message_parts) — body is gone (it now follows
+  // in the surrounding SeqStmt). Concatenate message_parts for the error string.
   if (emit_asserts_) {
     std::string cond = PrintExpr(op->condition);
     PrintIndent();
     stream << "if (!(" << cond << ")) {\n";
     int assert_if_scope = this->BeginScope();
     PrintIndent();
-    stream << "TVMAPISetLastError(\"" << op->message.as<StringImmNode>()->value
-           << "\");\n";
+    std::string msg;
+    for (const auto &part : op->message_parts) {
+      msg += part->value.operator std::string();
+    }
+    stream << "TVMAPISetLastError(\"" << msg << "\");\n";
     PrintIndent();
     stream << "return -1;\n";
     this->EndScope(assert_if_scope);
     PrintIndent();
     stream << "}\n";
   }
-  this->PrintStmt(op->body);
 }
 
-void CodeGenTileLangC::VisitStmt_(const AllocateNode *op) {
-  ICHECK(!is_zero(op->condition));
-  std::string vid = AllocVarID(op->buffer_var.get());
+void CodeGenTileLangC::VisitStmt_(const AllocBufferNode *op) {
+  // CPPMEGA: apache/tvm latest replaced AllocateNode (raw fields buffer_var/dtype/
+  // extents/condition/body) with AllocBufferNode { Buffer buffer; annotations }.
+  // The buffer object carries the Var/dtype/shape directly, and the body is now the
+  // following stmt in the surrounding SeqStmt context (no body field on AllocBuffer).
+  const Buffer &buf = op->buffer;
+  std::string vid = AllocVarID(buf->data.get());
 
   this->PrintIndent();
-  std::string scope = GetPtrStorageScope(op->buffer_var);
+  std::string scope = GetPtrStorageScope(buf->data);
 
-  PrintType(op->dtype, stream);
-  size_t constant_size = op->ConstantAllocationSize();
-  ICHECK_GT(constant_size, 0)
+  PrintType(buf->dtype, stream);
+  // Compute the constant flat allocation size from the Buffer's shape.
+  int64_t alloc_size = 1;
+  bool size_is_const = true;
+  for (const auto &dim : buf->shape) {
+    if (const auto *imm = dim.as<IntImmNode>()) {
+      alloc_size *= imm->value;
+    } else {
+      size_is_const = false;
+      break;
+    }
+  }
+  ffi::Optional<int64_t> opt_size;
+  if (size_is_const && alloc_size > 0) opt_size = alloc_size;
+  ICHECK(opt_size.has_value() && opt_size.value() > 0)
       << "Can only handle constant size stack allocation for now";
 
-  stream << ' ' << vid << '[' << constant_size << "];\n";
+  stream << ' ' << vid << '[' << opt_size.value() << "];\n";
 
-  RegisterHandleType(op->buffer_var.get(), op->dtype);
-  this->PrintStmt(op->body);
+  RegisterHandleType(buf->data.get(), buf->dtype);
 }
 
 void CodeGenTileLangC::VisitExpr_(const MinNode *op,

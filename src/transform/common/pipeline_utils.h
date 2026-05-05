@@ -10,12 +10,12 @@
 #ifndef TVM_TL_TRANSFORM_COMMON_PIPELINE_UTILS_H_
 #define TVM_TL_TRANSFORM_COMMON_PIPELINE_UTILS_H_
 
-#include <tvm/tir/stmt.h>
+#include <tvm/tirx/stmt.h>
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 // ---------------------------------------------------------------------------
 // Pipeline annotation attribute keys
@@ -53,7 +53,7 @@ static constexpr const char *kPipelineAsyncProducerGroups =
  * Checks (in order):
  *   1. "num_stages" — user-provided stage count
  *   2. "tl_pipelined_num_stages" — set by InjectSoftwarePipeline
- *   3. tir::attr::software_pipeline_stage — max(stage) + 1
+ *   3. tirx::attr::software_pipeline_stage — max(stage) + 1
  *
  * \return The stage count, or nullopt if the loop is not pipelined.
  */
@@ -69,7 +69,7 @@ inline Optional<Integer> GetPipelineNumStages(const ForNode *loop) {
     }
   }
   if (auto stages_anno =
-          loop->annotations.Get(tir::attr::software_pipeline_stage)) {
+          loop->annotations.Get(tirx::attr::software_pipeline_stage)) {
     auto stages = Downcast<Array<Integer>>(stages_anno.value());
     int max_stage = -1;
     for (const auto &stage : stages) {

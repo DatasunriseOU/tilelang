@@ -11,7 +11,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 /// Node class for transpose operations: dst[j, i] = src[i, j]
 class TransposeNode : public TileOperatorNode {
@@ -60,7 +60,7 @@ public:
                                              TransposeNode);
   TVM_DLL
   Transpose(Array<PrimExpr> args,
-            Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
+            Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 

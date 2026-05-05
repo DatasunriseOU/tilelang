@@ -25,20 +25,20 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include <unordered_set>
 
 #include "runtime/thread_storage_scope.h"
-#include "tir/transforms/ir_utils.h"
+#include "tirx/transform/ir_utils.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 struct UnrollLoopConfigNode
     : public AttrsNodeReflAdapter<UnrollLoopConfigNode> {
@@ -298,7 +298,7 @@ Stmt UnrollLoop(Stmt stmt, UnrollLoopConfig cfg) {
 
 namespace transform {
 
-using namespace tir::transform;
+using namespace tirx::transform;
 
 Pass UnrollLoop() {
   auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {

@@ -5,9 +5,9 @@
 
 #include "transpose.h"
 
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/op_attr_types.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/op_attr_types.h>
 
 #include "../target/utils.h"
 #include "../transform/common/loop_fusion_utils.h"
@@ -18,9 +18,9 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
-Transpose::Transpose(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
+Transpose::Transpose(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {
   ObjectPtr<TransposeNode> node = tvm::ffi::make_object<TransposeNode>();
   auto src_access = NormalizeToAccessRegion(args[0], kAccessRead);
   auto dst_access = NormalizeToAccessRegion(args[1], kAccessWrite);

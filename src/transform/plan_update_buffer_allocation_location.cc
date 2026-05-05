@@ -23,17 +23,18 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
-#include <tvm/tir/var.h>
+#include <tvm/s_tir/analysis.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
+#include <tvm/tirx/var.h>
 
 #include "../op/utils.h"
-#include "tir/transforms/ir_utils.h"
+#include "tirx/transform/ir_utils.h"
 
 // Forward-declare tir's var-level LCA helper which has no public header.
 namespace tvm {
-namespace tir {
+namespace tirx {
 ffi::Map<Var, ffi::Optional<Stmt>>
 DetectBufferVarAccessLCA(const PrimFunc &func);
 }
@@ -42,14 +43,14 @@ DetectBufferVarAccessLCA(const PrimFunc &func);
 namespace tvm {
 namespace tl {
 
-using namespace tir;
-using namespace tir::transform;
+using namespace tirx;
+using namespace tirx::transform;
 
 // Use TVM's tir analysis API for LCA detection.
 
 class CollectManagedAllocations : public StmtExprVisitor {
 public:
-  void VisitStmt_(const BlockNode *op) final {
+  void VisitStmt_(const SBlockNode *op) final {
     for (const auto &buf : op->alloc_buffers) {
       managed_allocations.insert(buf->data.get());
     }
@@ -83,7 +84,7 @@ private:
                      buf) != buffer_alloc_recorder_.end();
   }
 
-  void VisitStmt_(const BlockNode *op) final {
+  void VisitStmt_(const SBlockNode *op) final {
     for (const Buffer &buffer : op->alloc_buffers) {
       buffer_alloc_recorder_.push_back(buffer);
     }
@@ -137,7 +138,7 @@ public:
       for_header_vars_;
 
 private:
-  void VisitStmt_(const BlockRealizeNode *op) final {
+  void VisitStmt_(const SBlockRealizeNode *op) final {
     parent_scope_[op->block.get()] = scope_stack_.back();
     scope_stack_.push_back(op->block.get());
     if (!is_one(op->predicate)) {
@@ -188,9 +189,9 @@ public:
   explicit BufferAllocationLocator(const PrimFunc &func) {
     // Use TVM's tir LCA detection implementation
     ffi::Map<Buffer, ffi::Optional<Stmt>> buffer_lca =
-        tir::DetectBufferAccessLCA(func);
+        s_tir::DetectBufferAccessLCA(func);
     ffi::Map<Var, ffi::Optional<Stmt>> var_lca =
-        tir::DetectBufferVarAccessLCA(func);
+        tirx::DetectBufferVarAccessLCA(func);
 
     // The buffer_alloc_recorder Array is used to keep the buffer allocation
     // order since the buffer_lca Map is unordered.
@@ -343,7 +344,7 @@ private:
     return node;
   }
 
-  Stmt VisitStmt_(const BlockNode *op) final {
+  Stmt VisitStmt_(const SBlockNode *op) final {
     ICHECK(!op->init.defined());
     ffi::Array<Buffer> alloc_buffers;
     ffi::Array<Buffer> preserved_barrier_buffers;
@@ -368,7 +369,7 @@ private:
       PushBinding(target_var, match_buffer->buffer);
     }
     Stmt stmt = StmtMutator::VisitStmt_(op);
-    op = stmt.as<BlockNode>();
+    op = stmt.as<SBlockNode>();
     ICHECK(op != nullptr);
 
     // No longer consider buffers created by match_buffer inside the block when
@@ -388,7 +389,7 @@ private:
       PopBinding(buf->data);
     }
 
-    ObjectPtr<BlockNode> n = CopyOnWrite(op);
+    ObjectPtr<SBlockNode> n = CopyOnWrite(op);
     n->alloc_buffers = std::move(alloc_buffers);
     // Erase buffer allocated inside the block from access region.
     n->reads = RemoveRedundantBufferRegion(n->reads);
@@ -396,29 +397,26 @@ private:
     return Stmt(n);
   }
 
-  Stmt VisitStmt_(const BufferRealizeNode *op) final {
-    ICHECK(false)
-        << "Internal Error: BufferRealizeNode is not allowed in TensorIR.";
-    throw;
-  }
+  // CPPMEGA: BufferRealizeNode no longer exists in apache/tvm latest; the
+  // legacy guard against it can simply be removed.
 
   Stmt InjectOpaqueBlock(Stmt body, const ffi::Array<Buffer> &alloc_buffers) {
     ICHECK(!alloc_buffers.empty());
-    Block opaque_block(/*iter_vars=*/{},
+    SBlock opaque_block(/*iter_vars=*/{},
                        /*reads=*/{},
                        /*writes=*/{},
                        /*name_hint=*/"",
                        /*body=*/std::move(body),
                        /*init=*/std::nullopt,
                        /*alloc_buffers=*/alloc_buffers);
-    ObjectPtr<BlockNode> n = CopyOnWrite(opaque_block.get());
+    ObjectPtr<SBlockNode> n = CopyOnWrite(opaque_block.get());
     // Snapshot to a Var->Buffer map using the innermost binding for each Var.
     ffi::Map<Var, Buffer> var_map = SnapshotVarMap();
     ffi::Array<ffi::Array<BufferRegion>> access =
-        GetBlockReadWriteRegion(opaque_block, var_map);
+        s_tir::GetSBlockReadWriteRegion(opaque_block, var_map);
     n->reads = access[0];
     n->writes = access[1];
-    BlockRealize realize({}, Bool(true), Block(n));
+    SBlockRealize realize({}, Bool(true), SBlock(n));
     return realize;
   }
 

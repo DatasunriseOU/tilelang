@@ -23,7 +23,7 @@
 #include "codegen_metal.h"
 
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/transform.h>
 
 #include <algorithm>
 #include <sstream>
@@ -32,7 +32,10 @@
 #include <utility>
 
 #include "../op/builtin.h"
-#include "runtime/metal/metal_module.h"
+// CPPMEGA: apache renamed metal codegen entry header. The new
+// `MetalModuleCreateWithFallback` factory lives in `target/metal/` and
+// accepts `ffi::Map<String, Bytes>` smap + `ffi::Map<String, String>` source.
+#include "target/metal/metal_fallback_module.h"
 #include "runtime/thread_storage_scope.h"
 #include "target/build_common.h"
 
@@ -157,7 +160,7 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
   ICHECK_EQ(name_supply_->FreshName("blockIdx"), "blockIdx");
   int work_dim = 0;
   auto launch_params =
-      func->GetAttr<ffi::Array<ffi::String>>(tir::attr::kKernelLaunchParams)
+      func->GetAttr<ffi::Array<ffi::String>>(tirx::attr::kKernelLaunchParams)
           .value();
   for (const auto &tag : launch_params) {
     if (tag != runtime::launch_param::kUseDynamicSharedMemoryTag) {
@@ -214,6 +217,24 @@ void CodeGenTileLangMetal::PrintType(DataType t,
   if (t == DataType::Bool()) {
     os << "bool";
     return;
+  }
+  // CPPMEGA: explicit fail-closed branches for native FP8 (e4m3/e5m2/...) and
+  // FP4 (e2m1fn) Metal storage. Without these, an arbitrary downstream pass
+  // may be the first to choke on the unmapped dtype, hiding the underlying
+  // "Metal codegen does not support native sub-byte/8-bit float storage"
+  // contract from users. Mirrors stack-c's structural shape (PR #2144 / #2145
+  // / #2147): only the 8-bit unsigned-byte storage emulation + LUT decode is
+  // safe on Metal today, and only when explicitly opted into via the
+  // uint8-boundary helpers in tilelang.intrinsics.metal_quant. Native dtypes
+  // routed through the codegen surface are intentionally rejected here so the
+  // caller sees a clear "Cannot convert type ... to Metal type" diagnostic
+  // rather than a cryptic IR-level ICHECK from storage_rewrite or simdgroup
+  // lowering. See docs/mlx_port_master_plan.md (Metal FP8/FP4 fail-closed).
+  if (t.is_float8()) {
+    LOG(FATAL) << "Cannot convert type " << t << " to Metal type";
+  }
+  if (t.is_float4()) {
+    LOG(FATAL) << "Cannot convert type " << t << " to Metal type";
   }
   if (t.is_float() && t.bits() == 16 && lanes > 4 && lanes <= 8 &&
       lanes % 2 == 0) {
@@ -358,12 +379,12 @@ void CodeGenTileLangMetal::VisitStmt_(const AllocateNode *op) {
         << "Vector local.var allocation is not supported.";
     ICHECK_EQ(constant_size, 1)
         << "Only scalar local.var allocation is supported.";
-    PrimExpr init = tir::make_const(op->dtype, 0);
+    PrimExpr init = tirx::make_const(op->dtype, 0);
     auto init_it = op->annotations.find(tl::attr::kLocalVarInit);
     if (init_it != op->annotations.end()) {
       PrimExpr user_init = Downcast<PrimExpr>((*init_it).second);
       if (!user_init.dtype().is_void() && user_init.dtype() != op->dtype) {
-        user_init = tir::Cast(op->dtype, user_init);
+        user_init = tirx::Cast(op->dtype, user_init);
       }
       init = user_init;
     }
@@ -540,10 +561,13 @@ void CodeGenTileLangMetal::VisitExpr_(const FloatImmNode *op,
 
 ffi::Module BuildTileLangMetal(IRModule mod, Target target) {
   bool output_ssa = false;
-  mod = tir::transform::PointerValueTypeRewrite()(std::move(mod));
+  mod = tirx::transform::PointerValueTypeRewrite()(std::move(mod));
 
   std::ostringstream source_maker;
-  std::unordered_map<std::string, std::string> smap;
+  // CPPMEGA: apache's new MetalModuleCreateWithFallback expects
+  // `ffi::Map<String, Bytes>` for smap and `ffi::Map<String, String>` for
+  // source.
+  ffi::Map<ffi::String, ffi::Bytes> smap;
   const auto fmetal_compile =
       tvm::ffi::Function::GetGlobal("tvm_callback_metal_compile");
   std::string fmt = fmetal_compile ? "metallib" : "metal";
@@ -572,10 +596,14 @@ ffi::Module BuildTileLangMetal(IRModule mod, Target target) {
     if (fmetal_compile) {
       fsource = (*fmetal_compile)(fsource, target).cast<std::string>();
     }
-    smap[func_name] = fsource;
+    smap.Set(func_name, ffi::Bytes(std::move(fsource)));
   }
 
-  return MetalModuleCreate(smap, ExtractFuncInfo(mod), fmt, source_maker.str());
+  ffi::Map<ffi::String, ffi::String> source;
+  source.Set("metal", source_maker.str());
+  return target::MetalModuleCreateWithFallback(
+      std::move(smap), ffi::String(fmt), ExtractFuncInfo(mod),
+      std::move(source));
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {

@@ -10,10 +10,10 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ir/op.h>
 #include <tvm/target/target.h>
-#include <tvm/tir/buffer.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/op_attr_types.h>
-#include <tvm/tir/stmt.h>
+#include <tvm/tirx/buffer.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/op_attr_types.h>
+#include <tvm/tirx/stmt.h>
 #include <utility>
 #include <vector>
 
@@ -22,7 +22,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 using AddWorkspaceCallback = std::function<PrimExpr(int, DataType)>;
 using AllocMBarrierCallback = std::function<int(int arrive_count)>;
@@ -122,7 +122,7 @@ struct LayoutInferArgs {
 
 class TileOperator;
 
-class TileOperatorNode : public Object {
+class TileOperatorNode : public ffi::Object {
 public:
   virtual Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const = 0;
 
@@ -143,15 +143,15 @@ public:
     access_regions_ = std::move(access_regions);
   }
 
-  TVM_FFI_DECLARE_OBJECT_INFO("tl.TileOperator", TileOperatorNode, Object);
+  TVM_FFI_DECLARE_OBJECT_INFO("tl.TileOperator", TileOperatorNode, ffi::Object);
 
 protected:
   std::vector<AccessRegion> access_regions_;
 };
 
-class TileOperator : public ObjectRef {
+class TileOperator : public ffi::ObjectRef {
 public:
-  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(TileOperator, ObjectRef,
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(TileOperator, ffi::ObjectRef,
                                              TileOperatorNode);
 };
 
@@ -161,7 +161,7 @@ TileOperator ParseOperator(Call call);
 TileOperator ParseOperator(Stmt stmt);
 
 using OpBuilderFunc =
-    ffi::TypedFunction<TileOperator(Array<PrimExpr>, Map<String, ObjectRef>)>;
+    ffi::TypedFunction<TileOperator(Array<PrimExpr>, Map<String, ffi::ObjectRef>)>;
 
 #define TIR_REGISTER_TL_TILE_OP(Entry, OpName)                                 \
   const Op &Entry::Get() {                                                     \
@@ -172,7 +172,7 @@ using OpBuilderFunc =
       .set_attr<TScriptPrinterName>("TScriptPrinterName", #OpName)             \
       .set_attr<OpBuilderFunc>(                                                \
           "TLOpBuilder",                                                       \
-          [](Array<PrimExpr> args, Map<String, ObjectRef> annotations) {       \
+          [](Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {       \
             return Entry(args, annotations);                                   \
           })
 

@@ -9,6 +9,25 @@ from tvm.tir import (
 )
 from tvm.tir.transform import prim_func_pass
 
+# CPPMEGA: apache/tvm renamed `tir.LetStmt` (a Stmt with a `body` field) to
+# `tirx.Bind` (body-less; subsequent stmts in the enclosing SeqStmt are the
+# body). The compatibility shim in `tvm/tir/__init__.py` aliases `LetStmt` to
+# `tirx.Let` — but `tirx.Let` is the *expression* form, whose third argument
+# is a `PrimExpr`, not a `Stmt`. Calling `LetStmt(var, val, body_stmt)` from
+# this pass therefore raises:
+#   TypeError: Mismatched type on argument #2 ... Expected `ir.PrimExpr`
+#   but got `tirx.BufferStore`
+# The apache-equivalent of legacy `LetStmt(var, val, body)` (Stmt form) is
+# `SeqStmt([Bind(var, val), body])`. Use that wrapper instead of the broken
+# `LetStmt` alias.
+from tvm.tirx import Bind as _CppmegaBind
+from tvm.tirx import SeqStmt as _CppmegaSeqStmt
+
+
+def _cppmega_let_stmt(var, value, body):
+    """Build a Stmt-form let binding (var = value; body) using apache IR."""
+    return _CppmegaSeqStmt([_CppmegaBind(var, value), body])
+
 
 @tir.functor.mutator
 class HoistBroadcastValuesMutator(PyStmtExprMutator):
@@ -56,7 +75,9 @@ class HoistBroadcastValuesMutator(PyStmtExprMutator):
             # Order: Traverse in reverse to ensure the first definition wraps the outermost layer.
             # Structure generated: Let my_var = val In BufferStore(...)
             for var, val in reversed(self.pending_defs):
-                new_stmt = LetStmt(var, val, new_stmt)
+                # CPPMEGA: see _cppmega_let_stmt above — `LetStmt` alias is
+                # broken in apache/tvm, use SeqStmt([Bind, body]) instead.
+                new_stmt = _cppmega_let_stmt(var, val, new_stmt)
 
         # 6. Restore the saved state.
         self.hoist_enabled = saved_hoist_enabled
@@ -87,13 +108,15 @@ class HoistBroadcastValuesMutator(PyStmtExprMutator):
         new_body = self.visit_stmt(op.body)
 
         # 7. Create the new LetStmt.
-        new_stmt = LetStmt(op.var, new_value, new_body)
+        # CPPMEGA: see _cppmega_let_stmt above.
+        new_stmt = _cppmega_let_stmt(op.var, new_value, new_body)
 
         # 8. Check if there are variables waiting to be defined from the value expression.
         if value_pending_defs:
             # 9. Wrap the current statement with LetStmt.
             for var, val in reversed(value_pending_defs):
-                new_stmt = LetStmt(var, val, new_stmt)
+                # CPPMEGA: see _cppmega_let_stmt above.
+                new_stmt = _cppmega_let_stmt(var, val, new_stmt)
 
         # 10. Restore the saved state.
         self.hoist_enabled = saved_hoist_enabled

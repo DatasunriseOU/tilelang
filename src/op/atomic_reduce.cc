@@ -6,9 +6,9 @@
 
 #include "./atomic_reduce.h"
 #include "utils.h"
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/op_attr_types.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/op_attr_types.h>
 
 #include "../layout/layout.h"
 #include "../target/utils.h"
@@ -20,13 +20,13 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 // ============================================================================
 // AtomicMax Implementation
 // ============================================================================
 
-AtomicMax::AtomicMax(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
+AtomicMax::AtomicMax(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {
   ICHECK(args.size() >= 2)
       << "AtomicMax expects at least 2 arguments (src, dst), got "
       << args.size();
@@ -67,7 +67,7 @@ const Op &AtomicMaxNode::GetElemOp() const { return atomic_max_elem_op(); }
 // AtomicMin Implementation
 // ============================================================================
 
-AtomicMin::AtomicMin(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
+AtomicMin::AtomicMin(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {
   ICHECK(args.size() >= 2)
       << "AtomicMin expects at least 2 arguments (src, dst), got "
       << args.size();
@@ -232,12 +232,12 @@ For AtomicOpBaseNode::MakeSIMTLoop(arith::Analyzer *analyzer) const {
 
   // Use the appropriate elem_op based on the derived type (via virtual call)
   Call atomic_call =
-      tvm::tir::Call(dst->dtype, GetElemOp(), new_args, annotations);
+      tvm::tirx::Call(dst->dtype, GetElemOp(), new_args, annotations);
 
-  Stmt body = tvm::tir::Evaluate(atomic_call);
+  Stmt body = tvm::tirx::Evaluate(atomic_call);
 
   for (int i = loop_vars.size() - 1; i >= 0; i--) {
-    Map<String, ObjectRef> loop_annotations;
+    Map<String, ffi::ObjectRef> loop_annotations;
     if (i == 0) {
       if (annotations.count(attr::kCoalescedWidth)) {
         loop_annotations.Set(attr::kCoalescedWidth,

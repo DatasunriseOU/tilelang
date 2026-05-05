@@ -7,15 +7,15 @@
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/transform.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 #include <unordered_set>
 
 namespace tvm {
 namespace tl {
-using namespace tir;
+using namespace tirx;
 using namespace ffi;
 
 /*!
@@ -112,7 +112,7 @@ private:
  * written inside the function body. This can be used by codegen to emit
  * `const` qualifiers to enable read-only caching (e.g., __ldg on CUDA).
  */
-static tir::PrimFunc MarkReadOnlyParams(tir::PrimFunc f) {
+static tirx::PrimFunc MarkReadOnlyParams(tirx::PrimFunc f) {
   // Gather handle params and their corresponding buffer data vars (aliases).
   std::unordered_set<const VarNode *> param_or_data_vars;
   // Map back from data var to parameter index for result attribution.
@@ -170,7 +170,7 @@ static tir::PrimFunc MarkReadOnlyParams(tir::PrimFunc f) {
 }
 
 namespace transform {
-using namespace tir::transform;
+using namespace tirx::transform;
 
 Pass AnnotateReadOnlyParams() {
   auto pass_func = [](PrimFunc f, const IRModule &m,

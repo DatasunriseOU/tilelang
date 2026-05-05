@@ -12,13 +12,13 @@
  */
 
 #include "region.h"
-#include <tvm/tir/op.h>
+#include <tvm/tirx/op.h>
 
 namespace tvm {
 namespace tl {
-using namespace tir;
+using namespace tirx;
 
-RegionOp::RegionOp(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
+RegionOp::RegionOp(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {
   size_t n = args.size();
   size_t ndim = n - 2;
   auto load = args[0].as<BufferLoadNode>();

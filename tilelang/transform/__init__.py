@@ -390,6 +390,63 @@ def LowerDeviceStorageAccessInfo():
     return _ffi_api.LowerDeviceStorageAccessInfo()  # type: ignore
 
 
+def LowerTileLangLetStmt():
+    """Lower TileLang's vendored ``tilelang.LetStmt`` IR node into the
+    tirx-equivalent ``SeqStmt({tirx::Bind(var, value), body})``.
+
+    apache/tvm renamed ``tir::LetStmt`` to ``tirx::Bind`` and removed the
+    ``body`` field. TileLang vendors the legacy 3-arg ``LetStmt(var, value,
+    body)`` node under the type key ``tilelang.LetStmt`` so the existing
+    transform/op code can keep working without per-site rewrites. This pass
+    converts those nodes to apache-compatible IR and MUST run before any
+    apache/tvm tirx pass touches the IR.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass. No-op if no ``tilelang.LetStmt`` nodes are found.
+    """
+    return _ffi_api.LowerTileLangLetStmt()  # type: ignore
+
+
+def LowerTileLangAllocate():
+    """Lower TileLang's vendored ``tilelang.Allocate`` IR node into the
+    tirx-equivalent ``SeqStmt({AllocBuffer(buffer), body})`` (optionally
+    wrapped in ``IfThenElse(condition, ...)`` when the predicate is
+    non-trivial).
+
+    apache/tvm replaced the legacy 6-field
+    ``Allocate(buffer_var, dtype, extents, condition, body, annotations)``
+    stmt with the body-less ``AllocBuffer(Buffer, annotations)``. TileLang
+    vendors the legacy node so its many call sites compile unchanged; this
+    pass converts those nodes to apache-compatible IR and MUST run before
+    any apache/tvm tirx pass touches the IR.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass. No-op if no ``tilelang.Allocate`` nodes are found.
+    """
+    return _ffi_api.LowerTileLangAllocate()  # type: ignore
+
+
+def CombineContextCall():
+    """Combine context calls in the host module.
+
+    Vendored TileLang implementation registered as
+    ``tl.transform.CombineContextCall`` (see
+    ``src/transform/combine_context_call.cc``). Replaces the upstream
+    ``tir.transform.CombineContextCall`` that was removed in apache/tvm
+    after the tirx refactor.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.CombineContextCall()  # type: ignore
+
+
 def ConfigIndexBitwidth():
     """Config index bitwidth.
 

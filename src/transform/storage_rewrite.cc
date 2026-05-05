@@ -27,13 +27,16 @@
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/attrs.h>
 #include <tvm/ir/type.h>
-#include <tvm/target/target_info.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include "vendored/target_info.h"
+#include "vendored/tl_attr.h"
+#include <tvm/s_tir/stmt.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
+#include <list>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -42,15 +45,18 @@
 #include "../op/builtin.h"
 #include "arith/int_operator.h"
 #include "runtime/thread_storage_scope.h"
-#include "tir/ir/buffer_common.h"
-#include "tir/transforms/ir_utils.h"
+#include "tirx/ir/buffer_common.h"
+#include "tirx/transform/ir_utils.h"
+#include "vendored/let_stmt.h"
 
 namespace tvm {
 namespace tl {
 
 using runtime::StorageRank;
 using runtime::StorageScope;
-using namespace tir;
+using namespace tirx;
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 /*!
  * \brief Perform data type legalization on the given BufferLoadNode pointer.
@@ -112,13 +118,21 @@ private:
   }
 
 public:
-  void VisitStmt_(const AllocateNode *op) final {
+  // CPPMEGA: vendored TileLang Allocate is not in apache StmtFunctor dispatch.
+  void VisitStmt_(const AllocateNode *op) {
     if (IsDynamicSharedMemory(op->buffer_var)) {
       dyn_shmem_allocs_[op->buffer_var.get()] = op;
     } else if (IsStaticSharedMemory(op->buffer_var)) {
       static_shmem_allocs_[op->buffer_var.get()] = op;
     }
-    StmtExprVisitor::VisitStmt_(op);
+    this->VisitStmt(op->body);
+  }
+  void VisitStmt(const Stmt &stmt) override {
+    if (const auto *op = stmt.as<AllocateNode>()) {
+      VisitStmt_(op);
+    } else {
+      StmtExprVisitor::VisitStmt(stmt);
+    }
   }
   // The dynamic mapping from the original buffer var to its allocate
   std::unordered_map<const VarNode *, const AllocateNode *> dyn_shmem_allocs_;
@@ -166,7 +180,7 @@ public:
     const AllocateNode *alloc{nullptr};
   };
 
-  void VisitStmt_(const AllocateNode *op) final {
+  void VisitStmt_(const AllocateNode *op) {
     size_t level = scope_.size();
     const VarNode *buf = op->buffer_var.get();
 
@@ -179,7 +193,7 @@ public:
     entry.num_physical_dimensions = op->extents.size();
     alloc_info_[buf] = entry;
 
-    StmtExprVisitor::VisitStmt_(op);
+    this->VisitStmt(op->body);
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
@@ -277,13 +291,13 @@ public:
 
   void VisitStmt_(const AttrStmtNode *op) final {
     // Only record the outer most thread extent.
-    if (op->attr_key == tir::attr::thread_extent && !in_thread_env_) {
+    if (op->attr_key == tirx::attr::thread_extent && !in_thread_env_) {
       in_thread_env_ = true;
       VisitNewScope(op);
       in_thread_env_ = false;
-    } else if (op->attr_key == tir::attr::extern_scope) {
+    } else if (op->attr_key == tirx::attr::extern_scope) {
       VisitNewScope(op);
-    } else if (op->attr_key == tir::attr::virtual_thread) {
+    } else if (op->attr_key == s_tir::attr::virtual_thread) {
       VisitNewScope(op);
     } else if (op->attr_key == tl::attr::kLexicalAllocScope) {
       VisitNewScope(op);
@@ -300,7 +314,34 @@ public:
 
   void VisitStmt_(const AssertStmtNode *op) final { VisitNewScope(op); }
 
-  void VisitStmt_(const LetStmtNode *op) final { VisitNewScope(op); }
+  // apache/tvm StmtFunctor vtable does not dispatch to vendored
+  // `tilelang::tl_tir::LetStmtNode`; intercept via top-level VisitStmt.
+  void VisitStmt(const Stmt &n) override {
+    if (const auto *op = n.as<LetStmtNode>()) {
+      scope_.push_back(StmtEntry());
+      StmtEntry e;
+      e.stmt = op;
+      int64_t begin_index = static_cast<int64_t>(linear_seq_.size());
+      linear_seq_.push_back(e);
+      // Manually traverse value/body since base vtable can't dispatch.
+      this->VisitExpr(op->value);
+      this->VisitStmt(op->body);
+      e.touched = std::move(scope_.back().touched);
+      scope_.pop_back();
+      int64_t end_index = static_cast<int64_t>(linear_seq_.size());
+      ICHECK_GT(end_index, begin_index);
+      e.scope_pair_offset = begin_index - end_index;
+      linear_seq_.push_back(e);
+      ICHECK_NE(end_index, 0U);
+      linear_seq_[begin_index].scope_pair_offset = end_index - begin_index;
+      return;
+    }
+    if (const auto *op = n.as<AllocateNode>()) {
+      VisitStmt_(op);
+      return;
+    }
+    StmtExprVisitor::VisitStmt(n);
+  }
 
   // linearized access sequence.
   std::vector<StmtEntry> linear_seq_;
@@ -403,8 +444,8 @@ public:
 
   void VisitStmt_(const AttrStmtNode *op) final {
     // always reject extern code
-    if (op->attr_key == tir::attr::extern_scope ||
-        op->attr_key == tir::attr::volatile_scope) {
+    if (op->attr_key == tirx::attr::extern_scope ||
+        op->attr_key == tilelang::tl_attr::volatile_scope) {
       result_ = false;
       return;
     }
@@ -432,7 +473,7 @@ public:
           << "Store/Load occur to the same buffer " << buf->name_hint
           << " with differing number of indices";
       for (size_t i = 0; i < store_->indices.size(); i++) {
-        if (!tir::ExprDeepEqual()(store_->indices[i], op->indices[i])) {
+        if (!tirx::ExprDeepEqual()(store_->indices[i], op->indices[i])) {
           result_ = false;
           return;
         }
@@ -575,10 +616,10 @@ public:
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::thread_extent ||
-        op->attr_key == tir::attr::virtual_thread ||
+    if (op->attr_key == tirx::attr::thread_extent ||
+        op->attr_key == s_tir::attr::virtual_thread ||
         op->attr_key == tl::attr::kLexicalAllocScope ||
-        tir::attr::IsPragmaKey(op->attr_key)) {
+        tirx::attr::IsPragmaKey(op->attr_key)) {
       // remake all the allocation at the attach scope.
       if (attach_map_.count(op)) {
         auto &svec = attach_map_[op];
@@ -589,7 +630,7 @@ public:
       } else {
         return StmtExprMutator::VisitStmt_(op);
       }
-    } else if (op->attr_key == tir::attr::volatile_scope) {
+    } else if (op->attr_key == tilelang::tl_attr::volatile_scope) {
       Stmt stmt = StmtExprMutator::VisitStmt_(op);
       op = stmt.as<AttrStmtNode>();
       auto it = alloc_map_.find(op->node.as<VarNode>());
@@ -617,14 +658,17 @@ public:
     }
   }
 
-  Stmt VisitStmt_(const AllocateNode *op) final {
+  Stmt VisitStmt_(const AllocateNode *op) {
     return this->VisitStmt(op->body);
   }
 
   Stmt VisitStmt_(const DeclBufferNode *op) final {
     if (hoisted_buffer_decls_.count(op->buffer.get()) ||
         !all_buffers_accessed_.count(op->buffer.get())) {
-      return this->VisitStmt(op->body);
+      // CPPMEGA: DeclBufferNode lost its body field; the SeqStmt visitor
+      // will continue visiting the next stmt after this one, so we just
+      // emit a no-op to drop this DeclBuffer.
+      return Evaluate(0);
     }
     auto node = Downcast<DeclBuffer>(StmtExprMutator::VisitStmt_(op));
 
@@ -785,12 +829,32 @@ private:
           // simply use the original allocation.
           Map<String, ffi::Any> annotations =
               MakeAllocateAnnotations(e->alloc_var);
-          e->alloc_nest.push_back(Allocate(
-              e->alloc_var, alloc_type, e->allocs[0]->extents,
-              e->allocs[0]->condition, Evaluate(0), std::move(annotations)));
+          // CPPMEGA: emit apache `AllocBuffer` instead of vendored
+          // `tl_tir::Allocate`. apache `StmtFunctor` has no dispatch entry
+          // for `tilelang.Allocate`; downstream apache passes
+          // (tir.transform.Simplify, RenormalizeSplitPattern, RemoveNoOp,
+          // HoistIfThenElse, ...) crash with "NodeFunctor calls
+          // un-registered function on type tilelang.Allocate". MergeNest
+          // accepts `AllocBuffer` natively (see ir_utils.cc:73).
+          // The legacy condition was always `const_true()` here in practice
+          // because merge candidates have already been filtered, but if
+          // non-trivial we honor it via IfThenElse later in the nest fold.
+          Buffer alloc_buf_obj(/*data=*/e->alloc_var,
+                               /*dtype=*/alloc_type,
+                               /*shape=*/e->allocs[0]->extents,
+                               /*strides=*/{},
+                               /*elem_offset=*/PrimExpr(),
+                               /*name=*/e->alloc_var->name_hint,
+                               /*data_alignment=*/0,
+                               /*offset_factor=*/0,
+                               /*buffer_type=*/BufferType::kDefault);
+          e->alloc_nest.push_back(
+              AllocBuffer(alloc_buf_obj, std::move(annotations)));
           if (auto ptr = e->allocs[0]->body.as<DeclBufferNode>()) {
-            e->alloc_nest.push_back(DeclBuffer(
-                RemapBuffer(ptr->buffer, e->alloc_var), Evaluate(0)));
+            // CPPMEGA: DeclBuffer is body-less in apache/tvm; drop the trailing
+            // Evaluate(0).
+            e->alloc_nest.push_back(
+                DeclBuffer(RemapBuffer(ptr->buffer, e->alloc_var)));
             hoisted_buffer_decls_.insert(ptr->buffer.get());
           }
           if (IsSpecialTaggedMemory(e->scope)) {
@@ -845,9 +909,20 @@ private:
           combo_size = analyzer_.Simplify(combo_size);
           Map<String, ffi::Any> annotations =
               MakeAllocateAnnotations(e->alloc_var);
+          // CPPMEGA: emit apache `AllocBuffer` instead of vendored
+          // `tl_tir::Allocate`. See rationale at the all_allocs_identical
+          // site above.
+          Buffer alloc_buf_combo(/*data=*/e->alloc_var,
+                                 /*dtype=*/alloc_type,
+                                 /*shape=*/{combo_size},
+                                 /*strides=*/{},
+                                 /*elem_offset=*/PrimExpr(),
+                                 /*name=*/e->alloc_var->name_hint,
+                                 /*data_alignment=*/0,
+                                 /*offset_factor=*/0,
+                                 /*buffer_type=*/BufferType::kDefault);
           e->alloc_nest.push_back(
-              Allocate(e->alloc_var, alloc_type, {combo_size}, const_true(),
-                       Evaluate(0), std::move(annotations)));
+              AllocBuffer(alloc_buf_combo, std::move(annotations)));
           if (IsSpecialTaggedMemory(e->scope)) {
             MemoryInfo info = GetMemoryInfo(e->scope.to_string());
             if (info.defined()) {
@@ -897,9 +972,19 @@ private:
     PrimExpr alloc_size = make_const(e->allocs[0]->extents[0].dtype(),
                                      (total_bits + type_bits - 1) / type_bits);
     Map<String, ffi::Any> annotations = MakeAllocateAnnotations(e->alloc_var);
-    e->alloc_nest.push_back(Allocate(e->alloc_var, e->elem_type, {alloc_size},
-                                     const_true(), Evaluate(0),
-                                     std::move(annotations)));
+    // CPPMEGA: emit apache `AllocBuffer` instead of vendored
+    // `tl_tir::Allocate`. See rationale at line ~895 (NewAlloc).
+    Buffer alloc_buf_tag(/*data=*/e->alloc_var,
+                         /*dtype=*/e->elem_type,
+                         /*shape=*/{alloc_size},
+                         /*strides=*/{},
+                         /*elem_offset=*/PrimExpr(),
+                         /*name=*/e->alloc_var->name_hint,
+                         /*data_alignment=*/0,
+                         /*offset_factor=*/0,
+                         /*buffer_type=*/BufferType::kDefault);
+    e->alloc_nest.push_back(
+        AllocBuffer(alloc_buf_tag, std::move(annotations)));
     if (info.defined()) {
       ICHECK_LE(total_bits, info->max_num_bits)
           << "Allocation exceed bound of memory tag " << e->scope.to_string();
@@ -1038,9 +1123,9 @@ private:
       // enter/exit new scope
       if (s.stmt->IsInstance<AttrStmtNode>()) {
         const auto *op = reinterpret_cast<const AttrStmtNode *>(s.stmt);
-        if (op->attr_key == tir::attr::thread_extent ||
-            op->attr_key == tir::attr::virtual_thread ||
-            tir::attr::IsPragmaKey(op->attr_key)) {
+        if (op->attr_key == tirx::attr::thread_extent ||
+            op->attr_key == s_tir::attr::virtual_thread ||
+            tirx::attr::IsPragmaKey(op->attr_key)) {
           PlanNewScope(op);
         } else if (op->attr_key == tl::attr::kLexicalAllocScope) {
           if (s.scope_pair_offset > 0) {
@@ -1070,7 +1155,7 @@ private:
             lexical_scope_stack_.pop_back();
           }
         } else {
-          ICHECK(op->attr_key == tir::attr::extern_scope);
+          ICHECK(op->attr_key == tirx::attr::extern_scope);
         }
       } else if (s.stmt->IsInstance<ForNode>()) {
         const auto *op = reinterpret_cast<const ForNode *>(s.stmt);
@@ -1267,11 +1352,10 @@ struct BufferVarInfo {
     kPrimFuncParam = (1 << 0),
     kPrimFuncBufferMap = (1 << 1),
     kAllocateNode = (1 << 2),
-    kAllocateConstNode = (1 << 3),
     kLetNode = (1 << 4),
   };
 
-  // The tir::Var that represents this buffer.
+  // The tirx::Var that represents this buffer.
   Var var;
 
   // The data type of an element of the buffer.
@@ -1361,7 +1445,7 @@ public:
    * missing a type annotation, assume that it has the same underlying
    * type as it is later accessed, with scalar element types.
    */
-  VectorTypeAccessChecker(const Array<tir::Var> &params,
+  VectorTypeAccessChecker(const Array<tirx::Var> &params,
                           const Map<Var, Buffer> &buffer_map,
                           bool allow_untyped_pointers = false,
                           bool detect_scalar_read_patterns = true)
@@ -1419,22 +1503,39 @@ public:
     StmtExprVisitor::VisitExpr_(op);
   }
 
-  void VisitStmt_(const AllocateNode *op) final {
+  void VisitStmt_(const AllocateNode *op) {
     const Array<PrimExpr> &extents = op->extents;
     PrimExpr extent = extents[extents.size() - 1];
     OnArrayDeclaration(op->buffer_var, op->dtype, extent,
                        BufferVarInfo::kAllocateNode);
 
+    this->VisitStmt(op->body);
+  }
+
+  // CPPMEGA: After tl.LowerTileLangAllocate runs, the vendored TileLang
+  // Allocate (with body) is rewritten into `SeqStmt({AllocBuffer(buf), body})`.
+  // Register the buffer var here so that subsequent BufferLoad/Store accesses
+  // pass the "occurred before its declaration" check.
+  void VisitStmt_(const tirx::AllocBufferNode *op) final {
+    const tirx::Buffer &buf = op->buffer;
+    PrimExpr extent =
+        !buf->shape.empty() ? buf->shape[buf->shape.size() - 1] : 0;
+    OnArrayDeclaration(buf->data, buf->dtype, extent,
+                       BufferVarInfo::kAllocateNode);
     StmtExprVisitor::VisitStmt_(op);
   }
 
-  void VisitStmt_(const AllocateConstNode *op) final {
-    const Array<PrimExpr> &extents = op->extents;
+  // CPPMEGA: lower_opaque_block also emits a standalone DeclBuffer alongside
+  // the AllocBuffer (apache made DeclBuffer body-less). Register the buffer
+  // var on encounter so accesses inside the enclosing SeqStmt are tracked even
+  // when only a DeclBuffer is in scope (e.g., function-parameter buffers
+  // re-decl'd by sub-passes).
+  void VisitStmt_(const tirx::DeclBufferNode *op) final {
+    const tirx::Buffer &buf = op->buffer;
     PrimExpr extent =
-        !extents.empty() ? extents[extents.size() - 1] : NullValue<PrimExpr>();
-    OnArrayDeclaration(op->buffer_var, op->dtype, extent,
-                       BufferVarInfo::kAllocateConstNode);
-
+        !buf->shape.empty() ? buf->shape[buf->shape.size() - 1] : 0;
+    OnArrayDeclaration(buf->data, buf->dtype, extent,
+                       BufferVarInfo::kAllocateNode);
     StmtExprVisitor::VisitStmt_(op);
   }
 
@@ -1443,9 +1544,24 @@ public:
     StmtExprVisitor::VisitExpr_(op);
   }
 
-  void VisitStmt_(const LetStmtNode *op) final {
-    HandleLetNode(op->var);
-    StmtExprVisitor::VisitStmt_(op);
+  // apache/tvm StmtFunctor vtable does not dispatch to vendored
+  // `tilelang::tl_tir::{LetStmtNode,AllocateNode}`; intercept via top-level
+  // VisitStmt.
+  void VisitStmt(const Stmt &n) override {
+    if (const auto *op = n.as<LetStmtNode>()) {
+      HandleLetNode(op->var);
+      this->VisitExpr(op->value);
+      this->VisitStmt(op->body);
+      return;
+    }
+    if (const auto *op = n.as<AllocateNode>()) {
+      VisitStmt_(op);
+      return;
+    }
+    // AllocBufferNode / DeclBufferNode dispatch is handled by the apache/tvm
+    // StmtFunctor vtable (these are real tirx nodes), so no manual interception
+    // is required here.
+    StmtExprVisitor::VisitStmt(n);
   }
 
   void HandleLetNode(const Var &let_var) {
@@ -1526,6 +1642,25 @@ public:
   void OnArrayAccess(DataType value_dtype, const VarNode *buffer,
                      const Array<PrimExpr> &indices, bool is_buffer_load) {
     auto it = info_map_.find(buffer);
+    if (it == info_map_.end()) {
+      // CPPMEGA: lenient registration on miss. Some upstream passes
+      // (e.g. lower_tile_op's layout remap) introduce free-standing
+      // `T.Buffer(...)` aliases that reference a Var without an
+      // accompanying Allocate / AllocBuffer / DeclBuffer / Let. The
+      // legacy storage_rewrite tolerated this because the Allocate's
+      // body-recursion implicitly declared the var. With apache/tvm's
+      // body-less AllocBuffer, that lexical guarantee is gone. When
+      // `allow_untyped_pointers_` is set (PointerValueTypeRewrite is
+      // invoked this way from `tl.StorageRewrite`), treat the access as
+      // declaring a let-style pointer of the access dtype so subsequent
+      // uses are accepted. The rewriter will leave such buffers alone.
+      if (allow_untyped_pointers_) {
+        Var var(ffi::GetRef<Var>(buffer));
+        OnArrayDeclaration(var, value_dtype, /*extent=*/0,
+                           BufferVarInfo::kLetNode);
+        it = info_map_.find(buffer);
+      }
+    }
     ICHECK(it != info_map_.end())
         << "Load/Store of buffer " << buffer->name_hint << " (" << buffer
         << ") occurred before its declaration.";
@@ -1689,7 +1824,7 @@ public:
       const std::unordered_map<const VarNode *, BufferVarInfo> &info_map,
       bool rewrite_params = true, bool rewrite_buffer_map = true,
       bool rewrite_allocate_node = true, bool rewrite_indices = true,
-      bool rewrite_let_node = true, bool rewrite_allocate_const_node = true,
+      bool rewrite_let_node = true,
       bool rewrite_scalar_read_to_vector_shuffle = true)
       : rewrite_indices_(rewrite_indices) {
     int rewrite_mask = 0;
@@ -1704,9 +1839,6 @@ public:
     }
     if (rewrite_let_node) {
       rewrite_mask |= BufferVarInfo::kLetNode;
-    }
-    if (rewrite_allocate_const_node) {
-      rewrite_mask |= BufferVarInfo::kAllocateConstNode;
     }
 
     // Rewrite any buffer variables whose preferred type isn't their current
@@ -1812,16 +1944,25 @@ public:
     return std::move(modified);
   }
 
-  Stmt VisitStmt_(const LetStmtNode *op) final {
-    auto it = rewrite_map_.find(op->var.get());
-    PrimExpr value = this->VisitExpr(op->value);
-    Stmt body = this->VisitStmt(op->body);
-    Var var = (it == rewrite_map_.end()) ? op->var : it->second.new_buffer_var;
-    if (var.same_as(op->var) && value.same_as(op->value) &&
-        body.same_as(op->body)) {
-      return tvm::ffi::GetRef<Stmt>(op);
+  // apache/tvm StmtFunctor vtable does not dispatch to vendored
+  // `tilelang::tl_tir::{LetStmtNode,AllocateNode}`; intercept here.
+  Stmt VisitStmt(const Stmt &n) override {
+    if (const auto *op = n.as<LetStmtNode>()) {
+      auto it = rewrite_map_.find(op->var.get());
+      PrimExpr value = this->VisitExpr(op->value);
+      Stmt body = this->VisitStmt(op->body);
+      Var var =
+          (it == rewrite_map_.end()) ? op->var : it->second.new_buffer_var;
+      if (var.same_as(op->var) && value.same_as(op->value) &&
+          body.same_as(op->body)) {
+        return tvm::ffi::GetRef<Stmt>(op);
+      }
+      return LetStmt(var, value, body);
     }
-    return LetStmt(var, value, body);
+    if (const auto *op = n.as<AllocateNode>()) {
+      return VisitStmt_(op);
+    }
+    return StmtExprMutator::VisitStmt(n);
   }
 
   Buffer RemapBuffer(Buffer buf) {
@@ -1871,7 +2012,7 @@ public:
       PrimExpr extent = op->args[3];
       PrimExpr flag = op->args[4];
 
-      PrimExpr e_dtype = tir::TypeAnnotation(info.new_element_dtype);
+      PrimExpr e_dtype = tirx::TypeAnnotation(info.new_element_dtype);
       int factor = info.factor();
       extent = extent / make_const(extent.dtype(), factor);
       index = index / make_const(index.dtype(), factor);
@@ -1884,13 +2025,44 @@ public:
     }
   }
 
-  Stmt VisitStmt_(const AllocateNode *op) final {
-    Stmt stmt = StmtExprMutator::VisitStmt_(op);
-    op = stmt.as<AllocateNode>();
+  Stmt VisitStmt_(const AllocateNode *op) {
+    Stmt body = this->VisitStmt(op->body);
+
+    // CPPMEGA: emit apache `AllocBuffer + SeqStmt` instead of vendored
+    // `tl_tir::Allocate`. apache `StmtFunctor` has no dispatch entry for
+    // `tilelang.Allocate`; downstream apache passes (tir.transform.Simplify,
+    // RemoveNoOp, HoistIfThenElse, etc.) crash with "NodeFunctor calls
+    // un-registered function on type tilelang.Allocate". Mirrors
+    // `lower_allocate.cc` converter logic.
+    auto build_alloc_seq = [&](Var buf_var, DataType dtype,
+                               Array<PrimExpr> extents, PrimExpr condition,
+                               Stmt inner_body,
+                               Map<String, ffi::Any> annotations) -> Stmt {
+      Buffer alloc_buf_obj(/*data=*/buf_var,
+                           /*dtype=*/dtype,
+                           /*shape=*/extents,
+                           /*strides=*/{},
+                           /*elem_offset=*/PrimExpr(),
+                           /*name=*/buf_var->name_hint,
+                           /*data_alignment=*/0,
+                           /*offset_factor=*/0,
+                           /*buffer_type=*/BufferType::kDefault);
+      Stmt seq =
+          SeqStmt({AllocBuffer(alloc_buf_obj, annotations), inner_body});
+      bool trivial = false;
+      if (const auto *imm = condition.as<IntImmNode>()) {
+        trivial = (imm->value != 0);
+      }
+      if (!trivial) {
+        seq = IfThenElse(condition, seq);
+      }
+      return seq;
+    };
 
     auto it = rewrite_map_.find(op->buffer_var.get());
     if (it == rewrite_map_.end()) {
-      return stmt;
+      return build_alloc_seq(op->buffer_var, op->dtype, op->extents,
+                             op->condition, body, op->annotations);
     }
 
     const auto &info = it->second;
@@ -1903,32 +2075,9 @@ public:
                 last_extent / make_const(last_extent.dtype(), info.factor()));
     DLOG(INFO) << "Allocate with " << new_buffer_var << " and "
                << info.new_element_dtype << " extents: " << extents;
-    return Allocate(new_buffer_var, info.new_element_dtype, extents,
-                    op->condition, op->body, op->annotations);
+    return build_alloc_seq(new_buffer_var, info.new_element_dtype, extents,
+                           op->condition, body, op->annotations);
   }
-
-  Stmt VisitStmt_(const AllocateConstNode *op) final {
-    Stmt stmt = StmtExprMutator::VisitStmt_(op);
-    op = stmt.as<AllocateConstNode>();
-
-    auto it = rewrite_map_.find(op->buffer_var.get());
-    if (it == rewrite_map_.end()) {
-      return stmt;
-    }
-
-    const auto &info = it->second;
-
-    Var new_buffer_var = info.new_buffer_var;
-
-    int factor = info.new_element_dtype.lanes() / op->dtype.lanes();
-
-    Array<PrimExpr> extents = op->extents;
-    extents.Set(extents.size() - 1, extents[extents.size() - 1] /
-                                        make_const(extents[0].dtype(), factor));
-    return AllocateConst(new_buffer_var, info.new_element_dtype, extents,
-                         op->data, op->body);
-  }
-
   /* Update the parameters and all remaining variable references
    *
    * Should be called after calling operator() on the body of the
@@ -2002,7 +2151,6 @@ PrimFunc PointerValueTypeRewrite(
     PrimFunc f, bool allow_untyped_pointers = false, bool rewrite_params = true,
     bool rewrite_buffer_map = true, bool rewrite_allocate_node = true,
     bool rewrite_indices = true, bool rewrite_let_node = true,
-    bool rewrite_allocate_const_node = true,
     bool rewrite_scalar_read_to_vector_shuffle = true) {
   VectorTypeAccessChecker checker(f->params, f->buffer_map,
                                   allow_untyped_pointers,
@@ -2012,7 +2160,7 @@ PrimFunc PointerValueTypeRewrite(
   VectorTypeRewriter rewriter(
       checker.info_map_, rewrite_params, rewrite_buffer_map,
       rewrite_allocate_node, rewrite_indices, rewrite_let_node,
-      rewrite_allocate_const_node, rewrite_scalar_read_to_vector_shuffle);
+      rewrite_scalar_read_to_vector_shuffle);
   PrimFuncNode *n = f.CopyOnWrite();
   n->body = rewriter(std::move(n->body));
   rewriter.Finalize(&f);
@@ -2020,7 +2168,7 @@ PrimFunc PointerValueTypeRewrite(
   return f;
 }
 
-using namespace tir::transform;
+using namespace tirx::transform;
 namespace transform {
 Pass StorageRewrite() {
   auto pass_func = [](PrimFunc f, const IRModule &m, PassContext ctx) {
@@ -2052,13 +2200,8 @@ Pass StorageRewrite() {
         std::move(n->body), detect_inplace, enable_reuse,
         reuse_require_exact_matched_dtype, std::move(local_var_init_map));
     // Parameters may not be rewritten, but internal allocations may.
-    // Vectorization of AllocateConst is currently disabled, as it has
-    // indexing issues for types that include padding (e.g. int8x3
-    // padded out to 32 bits) would require either rewriting
-    // AllocateConst::data, or would require the code generators to
-    // handle vectorized constants.
     return PointerValueTypeRewrite(std::move(f), true, false, false, false,
-                                   true, true, false, false);
+                                   true, true, false);
   };
   return CreatePrimFuncPass(pass_func, 0, "tir.StorageRewrite", {});
 }

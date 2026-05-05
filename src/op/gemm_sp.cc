@@ -6,10 +6,10 @@
 
 #include "gemm_sp.h"
 
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/op_attr_types.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/op_attr_types.h>
+#include <tvm/tirx/transform.h>
 
 #include "../target/utils.h"
 #include "builtin.h"
@@ -84,7 +84,7 @@ GemmSPWarpPolicyNode::computeWarpPartition(int M, int N, int block_size,
  *
  * @note An ICHECK failure is raised if a provided kPack is not 1 or 2.
  */
-GemmSP::GemmSP(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
+GemmSP::GemmSP(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {
   ObjectPtr<GemmSPNode> node = tvm::ffi::make_object<GemmSPNode>();
   auto a_access = NormalizeToAccessRegion(args[0], kAccessRead);
   auto e_access = NormalizeToAccessRegion(args[1], kAccessRead);

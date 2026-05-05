@@ -5,11 +5,11 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include "../op/builtin.h"
 #include "merge_if_stmt.h"
@@ -17,7 +17,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 namespace {
 
@@ -178,7 +178,7 @@ tvm::transform::Pass FuseMBarrierArriveExpectTx() {
                       const tvm::transform::PassContext &) {
     return MBarrierArriveExpectTxFuser::Rewrite(std::move(f));
   };
-  return tir::transform::CreatePrimFuncPass(
+  return tirx::transform::CreatePrimFuncPass(
       pass_func, 0, "tl.FuseMBarrierArriveExpectTx", {});
 }
 

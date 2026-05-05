@@ -11,6 +11,14 @@
 
 Tile Language (**tile-lang**) is a concise domain-specific language designed to streamline the development of high-performance GPU/CPU kernels (e.g., GEMM, Dequant GEMM, FlashAttention, LinearAttention). By employing a Pythonic syntax with an underlying compiler infrastructure on top of [TVM](https://tvm.apache.org/), tile-lang allows developers to focus on productivity without sacrificing the low-level optimizations necessary for state-of-the-art performance.
 
+## Apache TVM Migration Work Note
+
+This checkout is being migrated to the native Apache TVM API line in `3rdparty/tvm` and should be pushed as a whole to `https://github.com/DatasunriseOU/tilelang`, including the TVM submodule pin. The purpose is not to preserve TileLang-only TVM fork shims indefinitely, but to adapt TileLang's C++ passes, runtime hooks, Python lowering path, and tests to the upstream Apache TVM API drift as directly and reviewably as possible.
+
+Reference trees such as `/private/tmp/cppmega-mlx-tilelang-stack-c` and `/private/tmp/tl_pr_c` may be used to understand the older working TileLang+TVM behavior and local patches. When the old fork disagrees with the current Apache design, the migration should prefer the new Apache API shape and keep compatibility wrappers narrow, documented, and removable.
+
+The working bar for this migration is a clean local build plus the relevant TileLang test suite passing against the bundled Apache TVM checkout. Any remaining incompatibility should be documented with the exact failing command, error, and API boundary before the branch is considered ready.
+
 <img src=./images/MatmulExample.png />
 
 ## Latest News

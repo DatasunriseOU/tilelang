@@ -7,9 +7,9 @@
 #include "./atomic_add.h"
 #include "./copy.h"
 #include "utils.h"
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/op_attr_types.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/op_attr_types.h>
 
 #include "../layout/layout.h"
 #include "../target/utils.h"
@@ -20,7 +20,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 /**
  * @brief Construct an AtomicAdd operator from call arguments and annotations.
@@ -40,7 +40,7 @@ using namespace tir;
  * - The constructor checks that args[0] and args[1] are region-compatible.
  * - The constructed node is stored in this->data_.
  */
-AtomicAdd::AtomicAdd(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
+AtomicAdd::AtomicAdd(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {
   ICHECK(args.size() >= 2)
       << "AtomicAdd expects at least 2 arguments (src, dst), got "
       << args.size();
@@ -206,12 +206,12 @@ For AtomicAddNode::MakeSIMTLoop(arith::Analyzer *analyzer) const {
   auto annotations = this->annotations;
   annotations.erase("use_tma");
   Call atomicadd_call =
-      tvm::tir::Call(dst->dtype, atomic_add_elem_op(), new_args, annotations);
+      tvm::tirx::Call(dst->dtype, atomic_add_elem_op(), new_args, annotations);
 
-  Stmt body = tvm::tir::Evaluate(atomicadd_call);
+  Stmt body = tvm::tirx::Evaluate(atomicadd_call);
 
   for (int i = loop_vars.size() - 1; i >= 0; i--) {
-    Map<String, ObjectRef> loop_annotations;
+    Map<String, ffi::ObjectRef> loop_annotations;
     if (i == 0) {
       if (annotations.count(attr::kCoalescedWidth)) {
         loop_annotations.Set(attr::kCoalescedWidth,

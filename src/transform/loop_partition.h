@@ -25,8 +25,8 @@
 #ifndef TVM_TL_LOOP_PARTITION_H_
 #define TVM_TL_LOOP_PARTITION_H_
 
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt.h>
 
 #include "../layout/layout.h"
 #include "../op/operator.h"
@@ -34,7 +34,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 For PartitionLoop(For op, Var thread_var, arith::Analyzer *analyzer,
                   const Fragment &loop_layout);

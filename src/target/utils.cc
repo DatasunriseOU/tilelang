@@ -7,7 +7,7 @@
 
 #include "../support/ffi_aliases.h"
 #include "dlpack/dlpack.h"
-#include <tvm/node/node.h>
+#include <tvm/ffi/object.h>
 
 namespace tvm {
 namespace tl {

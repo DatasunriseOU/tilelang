@@ -22,11 +22,11 @@
  * \brief Common utilities for TL transforms
  */
 
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
-#include <tvm/tir/utils.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
+#include <tvm/s_tir/utils.h>
 
 #include <queue>
 
@@ -38,7 +38,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 using arith::IRMutatorWithAnalyzer;
 
 class FragmentAccessDetector : public StmtExprVisitor {

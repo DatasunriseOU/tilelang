@@ -26,10 +26,10 @@
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include <algorithm>
 #include <functional>
@@ -44,13 +44,16 @@
 #include "../op/builtin.h"
 #include "../target/utils.h"
 #include "runtime/thread_storage_scope.h"
-#include "tir/transforms/ir_utils.h"
-#include "tvm/tir/function.h"
+#include "tirx/transform/ir_utils.h"
+#include "tvm/tirx/function.h"
+#include "vendored/let_stmt.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 using runtime::StorageRank;
 using runtime::StorageScope;
@@ -74,13 +77,22 @@ static bool IsStaticSharedMemory(Var buffer_var) {
  */
 class AllocateCollector : public StmtExprVisitor {
 public:
-  void VisitStmt_(const AllocateNode *op) final {
+  // CPPMEGA: vendored Allocate is not in apache StmtFunctor dispatch — manual
+  // intercept via VisitStmt(const Stmt&).
+  void VisitStmt_(const AllocateNode *op) {
     if (IsDynamicSharedMemory(op->buffer_var)) {
       dyn_shmem_allocs_[op->buffer_var.get()] = op;
     } else if (IsStaticSharedMemory(op->buffer_var)) {
       static_shmem_allocs_[op->buffer_var.get()] = op;
     }
-    StmtExprVisitor::VisitStmt_(op);
+    this->VisitStmt(op->body);
+  }
+  void VisitStmt(const Stmt &stmt) override {
+    if (const auto *op = stmt.as<AllocateNode>()) {
+      VisitStmt_(op);
+    } else {
+      StmtExprVisitor::VisitStmt(stmt);
+    }
   }
   // The dynamic mapping from the original buffer var to its allocate
   std::unordered_map<const VarNode *, const AllocateNode *> dyn_shmem_allocs_;
@@ -143,14 +155,21 @@ public:
     }
   }
 
-  void VisitStmt_(const AllocateNode *op) final {
+  void VisitStmt_(const AllocateNode *op) {
     size_t level = scope_.size();
     const VarNode *buf = op->buffer_var.get();
     // Record the allocation site and depth so liveness can reason about the
     // original scope.
     alloc_info_[buf].alloc = op;
     alloc_info_[buf].level = level;
-    StmtExprVisitor::VisitStmt_(op);
+    this->VisitStmt(op->body);
+  }
+  void VisitStmt(const Stmt &stmt) override {
+    if (const auto *op = stmt.as<AllocateNode>()) {
+      VisitStmt_(op);
+    } else {
+      StmtExprVisitor::VisitStmt(stmt);
+    }
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
@@ -272,13 +291,13 @@ public:
 
   void VisitStmt_(const AttrStmtNode *op) final {
     // Only record the outer most thread extent.
-    if (op->attr_key == tir::attr::thread_extent && !in_thread_env_) {
+    if (op->attr_key == tirx::attr::thread_extent && !in_thread_env_) {
       in_thread_env_ = true;
       VisitNewScope(op);
       in_thread_env_ = false;
-    } else if (op->attr_key == tir::attr::extern_scope) {
+    } else if (op->attr_key == tirx::attr::extern_scope) {
       VisitNewScope(op);
-    } else if (op->attr_key == tir::attr::virtual_thread) {
+    } else if (op->attr_key == tirx::attr::virtual_thread) {
       VisitNewScope(op);
     } else if (op->attr_key == "kWarpSpecializationScope") {
       VisitWarpSpecializationBody(op->body);
@@ -466,7 +485,7 @@ public:
 
 private:
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::thread_extent && !allocated_) {
+    if (op->attr_key == tirx::attr::thread_extent && !allocated_) {
       // Allocate one dynamic shared memory allocation at the beginning of
       // thread scope
 
@@ -501,19 +520,60 @@ private:
       }
 
       allocated_ = true;
-      Allocate new_body(merged_buf_var_, DataType::UInt(8),
-                        {merged_alloc_size_}, const_true(),
-                        StmtExprMutator::VisitStmt(op->body));
+      // CPPMEGA: emit apache `AllocBuffer + SeqStmt` instead of the vendored
+      // `tl_tir::Allocate`. apache `StmtFunctor` has no dispatch entry for
+      // `tilelang.Allocate`; downstream passes
+      // (tilelang.transform.Simplify only intercepts LetStmt, then
+      // tir.transform.* and the host/device codegen entry points) would
+      // crash with "NodeFunctor calls un-registered function on type
+      // tilelang.Allocate". Mirrors apache's own merge_shared_memory_allocations
+      // (3rdparty/tvm/src/s_tir/transform/merge_shared_memory_allocations.cc:341).
+      Buffer merged_buf(merged_buf_var_, DataType::UInt(8),
+                        {merged_alloc_size_}, {}, PrimExpr(),
+                        merged_buf_var_->name_hint, 0, 0, BufferType::kDefault);
+      Stmt visited_body = StmtExprMutator::VisitStmt(op->body);
+      Stmt new_body =
+          SeqStmt::Flatten(AllocBuffer(merged_buf), visited_body);
       return AttrStmt(op->node, op->attr_key, op->value, new_body, op->span);
     }
     return StmtMutator::VisitStmt_(op);
   }
 
-  Stmt VisitStmt_(const AllocateNode *op) final {
+  Stmt VisitStmt_(const AllocateNode *op) {
     if (IsAppropriateSharedMemory(op->buffer_var)) {
-      return StmtExprMutator::VisitStmt(op->body);
+      return this->VisitStmt(op->body);
     }
-    return StmtExprMutator::VisitStmt_(op);
+    Stmt body = this->VisitStmt(op->body);
+    // CPPMEGA: emit apache `AllocBuffer + SeqStmt` instead of vendored
+    // `tl_tir::Allocate`. See rationale at the merged-buffer site above.
+    Buffer alloc_buf_obj(/*data=*/op->buffer_var,
+                         /*dtype=*/op->dtype,
+                         /*shape=*/op->extents,
+                         /*strides=*/{},
+                         /*elem_offset=*/PrimExpr(),
+                         /*name=*/op->buffer_var->name_hint,
+                         /*data_alignment=*/0,
+                         /*offset_factor=*/0,
+                         /*buffer_type=*/BufferType::kDefault,
+                         /*axis_separators=*/{},
+                         /*span=*/op->span);
+    Stmt seq = SeqStmt({AllocBuffer(alloc_buf_obj, op->annotations, op->span),
+                        body},
+                       op->span);
+    bool trivial = false;
+    if (const auto *imm = op->condition.as<IntImmNode>()) {
+      trivial = (imm->value != 0);
+    }
+    if (!trivial) {
+      seq = IfThenElse(op->condition, seq, std::nullopt, op->span);
+    }
+    return seq;
+  }
+  Stmt VisitStmt(const Stmt &stmt) override {
+    if (const auto *op = stmt.as<AllocateNode>()) {
+      return VisitStmt_(op);
+    }
+    return StmtExprMutator::VisitStmt(stmt);
   }
 
   Stmt VisitStmt_(const DeclBufferNode *op) final {
@@ -1459,7 +1519,7 @@ Stmt MergeSharedMemoryAllocations(Stmt stmt, bool merge_static_smem,
   return stmt;
 }
 
-using namespace tir::transform;
+using namespace tirx::transform;
 
 namespace transform {
 

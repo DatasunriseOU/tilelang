@@ -15,7 +15,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 class NormalizeIterException : public std::exception {
 public:

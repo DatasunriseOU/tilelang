@@ -107,7 +107,8 @@ def _rewrite_scope(body, var_map):
                 return tir.Allocate(new_var, stmt.dtype, stmt.extents, stmt.condition, new_body, stmt.annotations)
         return None
 
-    return tir.stmt_functor.ir_transform(body, _pre_order, None, ["tir.Block", "tir.Allocate"])
+    # CPPMEGA: Apache renamed tir.Block -> tirx.SBlock and tir.Allocate -> tirx.AllocBuffer
+    return tir.stmt_functor.ir_transform(body, _pre_order, None, ["tirx.SBlock", "tirx.AllocBuffer"])
 
 
 def _metal_fragment_to_simdgroup(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.PrimFunc:

@@ -1,10 +1,11 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/s_tir/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include "../op/builtin.h"
 #include "../op/copy.h"
@@ -12,11 +13,13 @@
 #include "../op/region.h"
 #include "../op/utils.h"
 #include "common/pipeline_utils.h"
+#include "vendored/let_stmt.h"
 #include <algorithm>
 #include <functional>
 #include <limits>
 #include <numeric>
 #include <queue>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -27,7 +30,9 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 /*!
  * \brief Check whether two regions have intersections.
@@ -217,7 +222,7 @@ private:
       pending_tcgen05_smem_reads_.clear();
       pending_tcgen05_c_buf_ = Optional<Buffer>();
       StmtExprVisitor::VisitExpr_(op);
-    } else if (op->op.same_as(tir::builtin::if_then_else())) {
+    } else if (op->op.same_as(tirx::builtin::if_then_else())) {
       const PrimExpr &then_expr = args[1];
       const PrimExpr &else_expr = args[2];
       this->VisitExpr(then_expr);
@@ -616,7 +621,7 @@ private:
         conditional = true;
         return;
       }
-      if (const auto *realize = node.as<BlockRealizeNode>()) {
+      if (const auto *realize = node.as<SBlockRealizeNode>()) {
         if (!is_one(realize->predicate)) {
           conditional = true;
         }
@@ -893,7 +898,7 @@ private:
     for (int stage_id : sorted_async_stage_ids) {
       async_stages.push_back(Integer(stage_id));
     }
-    annotations->Set(tir::attr::software_pipeline_async_stages,
+    annotations->Set(tirx::attr::software_pipeline_async_stages,
                      Array<Integer>(async_stages));
     return true;
   }
@@ -949,10 +954,10 @@ private:
   PipelineStageInfo
   MakePipelineStageInfo(Stmt stmt, int idx,
                         AsyncDependencyChainBuilder &chain_builder) {
-    Block block(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{}, /*name_hint=*/"",
+    SBlock block(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{}, /*name_hint=*/"",
                 /*body*/ std::move(stmt));
     Array<Array<BufferRegion>> access =
-        GetBlockReadWriteRegion(block, buffer_data_to_buffer_);
+        s_tir::GetSBlockReadWriteRegion(block, buffer_data_to_buffer_);
     auto collector =
         BufferRegionCollector(buffer_data_to_buffer_, chain_builder, target_);
     collector(block);
@@ -1011,24 +1016,24 @@ private:
           annotations.Set(key, value);
         }
       }
-      annotations.Set(tir::attr::software_pipeline_order, order_anno.value());
+      annotations.Set(tirx::attr::software_pipeline_order, order_anno.value());
 
       for (const auto &[key, value] : loop->annotations) {
         if (key != "tl_pipeline_stage") {
           annotations.Set(key, value);
         }
       }
-      annotations.Set(tir::attr::software_pipeline_stage, stage_anno.value());
+      annotations.Set(tirx::attr::software_pipeline_stage, stage_anno.value());
       if (TargetHasAsyncCopy(target_) && use_async_copy_) {
         // Legacy explicit stage/order annotations do not carry per-statement
         // async producer metadata yet, so keep the previous stage-level
         // behavior as a fallback for these loops.
-        annotations.Set(tir::attr::software_pipeline_async_stages,
+        annotations.Set(tirx::attr::software_pipeline_async_stages,
                         Array<Integer>{0});
       }
       Stmt pipeline_body_root{nullptr};
       const SeqStmtNode *pipeline_body_seq = nullptr;
-      if (const auto *realize = loop->body.as<BlockRealizeNode>()) {
+      if (const auto *realize = loop->body.as<SBlockRealizeNode>()) {
         const auto &block = realize->block;
         for (const auto &buffer : block->alloc_buffers) {
           ICHECK(buffer->IsInstance<BufferNode>());
@@ -1098,7 +1103,7 @@ private:
       return StmtExprMutator::VisitStmt_(stripped.get());
     }
     Stmt pipeline_body_root{nullptr};
-    if (const auto *realize = loop->body.as<BlockRealizeNode>()) {
+    if (const auto *realize = loop->body.as<SBlockRealizeNode>()) {
       const auto &block = realize->block;
       for (const auto &buffer : block->alloc_buffers) {
         ICHECK(buffer->IsInstance<BufferNode>());
@@ -1966,8 +1971,8 @@ private:
       stages.push_back(pinfo.stage);
     }
 
-    annotations.Set(tir::attr::software_pipeline_stage, Array<Integer>(stages));
-    annotations.Set(tir::attr::software_pipeline_order, Array<Integer>(orders));
+    annotations.Set(tirx::attr::software_pipeline_stage, Array<Integer>(stages));
+    annotations.Set(tirx::attr::software_pipeline_order, Array<Integer>(orders));
 
     // Propagate per-statement TMA eligibility so InjectSoftwarePipeline can
     // rewrite TMA copies to use pipeline-level barrier management.
@@ -2051,7 +2056,7 @@ private:
         for (int stage_id : sorted_async_stage_ids) {
           async_stages.push_back(Integer(stage_id));
         }
-        annotations.Set(tir::attr::software_pipeline_async_stages,
+        annotations.Set(tirx::attr::software_pipeline_async_stages,
                         Array<Integer>(async_stages));
       }
     }
@@ -2062,18 +2067,18 @@ private:
     // Rebuild any wrapper layers (IfThenElse, LetStmt, BlockRealize)
     // between the loop body and the SeqStmt.
     Stmt new_loop_body;
-    if (const auto *realize = loop->body.as<BlockRealizeNode>()) {
+    if (const auto *realize = loop->body.as<SBlockRealizeNode>()) {
       const auto &block = realize->block;
       // Rebuild: body_root → ... → new_body_seq
       // We need to reconstruct the chain from block->body to the SeqStmt.
       Stmt rebuilt_inner =
           RebuildBodyWrapper(block->body, pipeline_body_seq, new_body_seq);
-      Block new_block(block->iter_vars, block->reads, block->writes,
+      SBlock new_block(block->iter_vars, block->reads, block->writes,
                       block->name_hint, rebuilt_inner, block->init,
                       block->alloc_buffers, block->match_buffers,
                       block->annotations);
       new_loop_body =
-          BlockRealize(realize->iter_values, realize->predicate, new_block);
+          SBlockRealize(realize->iter_values, realize->predicate, new_block);
     } else {
       new_loop_body =
           RebuildBodyWrapper(loop->body, pipeline_body_seq, new_body_seq);
@@ -2083,11 +2088,11 @@ private:
                new_loop_body, loop->thread_binding, annotations);
   }
 
-  Stmt VisitStmt_(const BlockNode *op) final {
+  Stmt VisitStmt_(const SBlockNode *op) final {
     for (const auto &buffer : op->alloc_buffers) {
       buffer_data_to_buffer_.Set(buffer->data, buffer);
     }
-    Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
+    SBlock block = Downcast<SBlock>(StmtExprMutator::VisitStmt_(op));
     for (const auto &buffer : op->alloc_buffers) {
       buffer_data_to_buffer_.erase(buffer->data);
     }
@@ -2125,10 +2130,10 @@ private:
 };
 
 tvm::transform::Pass PipelinePlanning() {
-  using namespace tir::transform;
+  using namespace tirx::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
     bool use_async_copy =
-        ctx->GetConfig<Bool>("tir.use_async_copy", Bool(true)).value();
+        ctx->GetConfig<Bool>("tirx.use_async_copy", Bool(true)).value();
     PrimFuncNode *fptr = f.CopyOnWrite();
     fptr->body = PipelinePlanner::Substitute(f, use_async_copy);
     return f;

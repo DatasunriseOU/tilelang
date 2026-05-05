@@ -205,6 +205,11 @@ def host_codegen(host_mod: tvm.IRModule, target_host: Target, target: Target | N
         MarkHostMetalContext is applied so that the generated host code
         contains the Metal/MPS synchronisation logic.
     """
+    # Lower TileLang's vendored `tilelang.LetStmt` IR node to the tirx
+    # equivalent (`SeqStmt({Bind(var, value), body})`) before any apache/tvm
+    # pass traverses the IR — apache codegen does not know our custom node.
+    host_mod = tilelang.transform.LowerTileLangLetStmt()(host_mod)
+    host_mod = tilelang.transform.LowerTileLangAllocate()(host_mod)
     host_mod = tir.transform.BindTarget(target_host)(host_mod)
     host_mod = tir.transform.FP8StorageLegalize()(host_mod)
     host_mod = tir.transform.BF16StorageLegalize()(host_mod)
@@ -212,7 +217,7 @@ def host_codegen(host_mod: tvm.IRModule, target_host: Target, target: Target | N
     host_mod = tir.transform.LowerCustomDatatypes()(host_mod)
     host_mod = tilelang.transform.LowerIntrin()(host_mod)
     host_mod = tilelang.transform.LowerDeviceStorageAccessInfo()(host_mod)
-    host_mod = tir.transform.CombineContextCall()(host_mod)
+    host_mod = tilelang.transform.CombineContextCall()(host_mod)
     if target is not None and target.kind.name == "metal":
         host_mod = MarkHostMetalContext()(host_mod)
     if target_host.kind.name == "llvm":
@@ -225,6 +230,10 @@ def host_codegen(host_mod: tvm.IRModule, target_host: Target, target: Target | N
 
 
 def device_codegen(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
+    # Lower TileLang's vendored `tilelang.LetStmt` to tirx Bind+SeqStmt before
+    # any apache/tvm tirx pass touches the IR.
+    device_mod = tilelang.transform.LowerTileLangLetStmt()(device_mod)
+    device_mod = tilelang.transform.LowerTileLangAllocate()(device_mod)
     device_mod = tilelang.transform.LowerDeviceStorageAccessInfo()(device_mod)
     device_mod = tilelang.transform.LowerIntrin()(device_mod)
     device_mod = tir.transform.Simplify()(device_mod)
@@ -244,6 +253,9 @@ def device_codegen(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
 
 
 def device_codegen_without_compile(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
+    # Lower vendored TileLang LetStmt before apache/tvm tirx passes run.
+    device_mod = tilelang.transform.LowerTileLangLetStmt()(device_mod)
+    device_mod = tilelang.transform.LowerTileLangAllocate()(device_mod)
     device_mod = tilelang.transform.LowerDeviceStorageAccessInfo()(device_mod)
     device_mod = tilelang.transform.LowerIntrin()(device_mod)
     device_mod = tir.transform.Simplify()(device_mod)
@@ -304,11 +316,16 @@ def lower(
     # Before lowering, do semantic check
     PreLowerSemanticCheck(mod)
 
-    # Phase 1: Lower and legalize the IR
-    mod = LowerAndLegalize(mod, target)
+    # CPPMEGA: apache/tvm latest requires an ambient Target context for passes
+    # that invoke the arith analyzer (e.g. LayoutInference -> const_int_bound
+    # calls Target::Current() with allow_not_defined=false). Wrap the lowering
+    # pipeline in `with target` so Target::Current() resolves correctly.
+    with target:
+        # Phase 1: Lower and legalize the IR
+        mod = LowerAndLegalize(mod, target)
 
-    # Phase 2: Optimize the IR for the target
-    mod = OptimizeForTarget(mod, target)
+        # Phase 2: Optimize the IR for the target
+        mod = OptimizeForTarget(mod, target)
 
     host_mod = tir.transform.Filter(_is_host_call)(mod)
     device_mod = tir.transform.Filter(_is_device_call)(mod)

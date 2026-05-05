@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <sstream>
 #include <tvm/ffi/function.h>
-#include <tvm/node/node.h>
+#include <tvm/ffi/object.h>
 #include <vector>
 
 namespace tvm {

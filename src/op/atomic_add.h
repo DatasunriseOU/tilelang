@@ -11,7 +11,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 /*!
  * \brief Node class for atomic addition operations.
@@ -79,7 +79,7 @@ public:
                                              AtomicAddNode);
   TVM_DLL
   AtomicAdd(Array<PrimExpr> args,
-            Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
+            Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 

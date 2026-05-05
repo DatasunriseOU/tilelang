@@ -4,11 +4,11 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
-#include <tvm/tir/utils.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
+#include <tvm/s_tir/utils.h>
 #include <unordered_map>
 #include <vector>
 
@@ -27,11 +27,14 @@
 #include "common/pipeline_utils.h"
 #include "layout_reducer.h"
 #include "loop_partition.h"
+#include "vendored/let_stmt.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 static Buffer makeBufferWithLayout(const Buffer &buffer, const Layout &layout,
                                    Map<Var, Var> &var_remap) {
@@ -100,8 +103,8 @@ public:
 private:
   using arith::IRMutatorWithAnalyzer::IRMutatorWithAnalyzer;
 
-  Stmt VisitStmt_(const BlockNode *op) final {
-    auto block = Downcast<Block>(arith::IRMutatorWithAnalyzer::VisitStmt_(op));
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    auto block = Downcast<SBlock>(arith::IRMutatorWithAnalyzer::VisitStmt_(op));
     if (op->annotations.count(attr::kLayoutMap)) {
       block.CopyOnWrite()->annotations.Set(attr::kLayoutMap, layout_remap_);
     }
@@ -136,7 +139,7 @@ public:
 private:
   using arith::IRMutatorWithAnalyzer::IRMutatorWithAnalyzer;
 
-  Stmt VisitStmt_(const BlockNode *op) final {
+  Stmt VisitStmt_(const SBlockNode *op) final {
     if (op->annotations.count(attr::kSafeValueMap)) {
       return RewritePaddingMap(op);
     }
@@ -148,7 +151,7 @@ private:
    * \param op The block node to rewrite.
    * \return The rewritten block.
    */
-  Stmt RewritePaddingMap(const BlockNode *op) {
+  Stmt RewritePaddingMap(const SBlockNode *op) {
     auto safe_value_map = op->annotations.Get(attr::kSafeValueMap);
     if (!safe_value_map) {
       LOG(FATAL) << "Padding map annotation is missing";
@@ -158,7 +161,7 @@ private:
     Map<Var, PrimExpr> new_safe_value_map = RemapPaddingMap(
         Downcast<Map<Var, PrimExpr>>(safe_value_map.value()), var_remap);
 
-    auto block = Downcast<Block>(IRMutatorWithAnalyzer::VisitStmt_(op));
+    auto block = Downcast<SBlock>(IRMutatorWithAnalyzer::VisitStmt_(op));
     auto block_ptr = block.CopyOnWrite();
     block_ptr->annotations.Set(attr::kSafeValueMap, new_safe_value_map);
     return block;
@@ -258,14 +261,14 @@ public:
         Array<PrimExpr> arrive_counts;
         bool injected{false};
 
-        Stmt VisitStmt_(const BlockRealizeNode *op) final {
+        Stmt VisitStmt_(const SBlockRealizeNode *op) final {
           if (injected)
             return StmtMutator::VisitStmt_(op);
           if (op->block->name_hint == "root") {
             return StmtMutator::VisitStmt_(op);
           }
           injected = true;
-          Block block = op->block;
+          SBlock block = op->block;
           auto block_ptr = block.CopyOnWrite();
           block_ptr->alloc_buffers.push_back(barrier_buf);
           Map<Var, Array<PrimExpr>> barrier_init_map;
@@ -275,7 +278,7 @@ public:
           }
           barrier_init_map.Set(barrier_buf->data, arrive_counts);
           block_ptr->annotations.Set("barrier_init", barrier_init_map);
-          auto realize = tvm::ffi::GetRef<BlockRealize>(op);
+          auto realize = tvm::ffi::GetRef<SBlockRealize>(op);
           auto realize_ptr = realize.CopyOnWrite();
           realize_ptr->block = block;
           return realize;
@@ -296,7 +299,7 @@ public:
 private:
   using arith::IRMutatorWithAnalyzer::IRMutatorWithAnalyzer;
 
-  Stmt VisitStmt_(const BlockNode *op) final {
+  Stmt VisitStmt_(const SBlockNode *op) final {
     // Record the mapping from buffer data var to buffer for later lookup
     for (auto buffer : op->alloc_buffers) {
       buffer_map_.insert({buffer->data, buffer});
@@ -331,7 +334,7 @@ private:
     // Begin a new workspace collection frame for this block scope
     workspace_stack_.emplace_back();
 
-    auto block = Downcast<Block>(arith::IRMutatorWithAnalyzer::VisitStmt_(op));
+    auto block = Downcast<SBlock>(arith::IRMutatorWithAnalyzer::VisitStmt_(op));
     auto block_ptr = block.CopyOnWrite();
     for (size_t i = 0; i < block->alloc_buffers.size(); i++) {
       auto buffer = block->alloc_buffers[i];
@@ -717,7 +720,7 @@ private:
     return Optional<Layout>();
   }
 
-  PrimExpr VisitExpr_(const tir::CallNode *op) final {
+  PrimExpr VisitExpr_(const tirx::CallNode *op) final {
     if (op->op.same_as(tl::tma_load()) ||
         op->op.same_as(tl::tma_load_im2col()) ||
         op->op.same_as(tl::tma_store())) {
@@ -977,28 +980,31 @@ private:
     return var;
   }
 
-  Stmt VisitStmt_(const LetStmtNode *op) final {
-    PrimExpr value = this->VisitExpr(op->value);
-    bool recorded = false;
-    if (value->IsInstance<BufferLoadNode>()) {
-      let_bindings_[op->var] = value;
-      recorded = true;
+  // Top-level VisitStmt override: apache/tvm StmtFunctor's vtable does not
+  // dispatch to vendored `tilelang.LetStmt`. Intercept it here before the
+  // base vtable is consulted.
+  Stmt VisitStmt(const Stmt &stmt) override {
+    if (const auto *op = stmt.as<LetStmtNode>()) {
+      PrimExpr value = this->VisitExpr(op->value);
+      bool recorded = false;
+      if (value->IsInstance<BufferLoadNode>()) {
+        let_bindings_[op->var] = value;
+        recorded = true;
+      }
+      if (SideEffect(value) <= CallEffectKind::kPure) {
+        analyzer_->Bind(op->var, value);
+      }
+      Stmt body = this->VisitStmt(op->body);
+      if (recorded) {
+        let_bindings_.erase(op->var);
+      }
+      if (value.same_as(op->value) && body.same_as(op->body)) {
+        return stmt;
+      } else {
+        return LetStmt(op->var, value, body);
+      }
     }
-    if (SideEffect(value) <= CallEffectKind::kPure) {
-      analyzer_->Bind(op->var, value);
-    }
-    Stmt body = this->VisitStmt(op->body);
-    if (recorded) {
-      let_bindings_.erase(op->var);
-    }
-    if (value.same_as(op->value) && body.same_as(op->body)) {
-      return tvm::ffi::GetRef<Stmt>(op);
-    } else {
-      auto n = this->CopyOnWrite(op);
-      n->value = value;
-      n->body = body;
-      return Stmt(n);
-    }
+    return arith::IRMutatorWithAnalyzer::VisitStmt(stmt);
   }
 
   /**
@@ -1085,7 +1091,7 @@ private:
     if (op->attr_key == kPipelineContextNumStages) {
       return VisitStmt(op->body);
     }
-    if (op->attr_key == tir::attr::thread_extent) {
+    if (op->attr_key == tirx::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
       ICHECK_NE(iv->thread_tag.length(), 0U);
       if (iv->thread_tag == "threadIdx.x") {
@@ -1384,7 +1390,7 @@ private:
 
 namespace transform {
 
-using namespace tir::transform;
+using namespace tirx::transform;
 
 tvm::transform::Pass LowerTileOp() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {

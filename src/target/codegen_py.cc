@@ -82,7 +82,7 @@ void CodeGenTileLangPY::PrintFunctionSignature_(
     std::ostream &os) { // NOLINT(*)
   os << "def " << function_name << "(";
   for (size_t i = 0; i < func->params.size(); ++i) {
-    tir::Var v = func->params[i];
+    tirx::Var v = func->params[i];
     if (i > 0) {
       os << ", ";
     }

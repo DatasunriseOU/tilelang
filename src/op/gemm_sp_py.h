@@ -16,12 +16,12 @@ namespace tvm {
 
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 class GemmSPPyNode : public TileOperatorNode {
 public:
   bool CheckWGMMA() const;
-  tir::Buffer A, E, B, C;
+  tirx::Buffer A, E, B, C;
   // pointer to the A, E, B, C
   BufferRegion aRegion_, eRegion_, bRegion_, cRegion_;
   bool trans_A, trans_B, trans_E;
@@ -87,7 +87,7 @@ public:
                                              GemmSPPyNode);
   TVM_DLL
   GemmSPPy(Array<PrimExpr> args,
-           Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
+           Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 

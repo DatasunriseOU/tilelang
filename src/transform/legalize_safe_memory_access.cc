@@ -4,11 +4,11 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
-#include <tvm/tir/utils.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
+#include <tvm/s_tir/utils.h>
 
 #include <utility>
 
@@ -21,7 +21,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 using arith::IRMutatorWithAnalyzer;
 
 // SafeMemChecker for a BufferLoad/BufferStore node:
@@ -120,7 +120,7 @@ struct SafeMemChecker : public StmtExprVisitor {
       try {
         can_prove_upper = analyzer_->CanProve(
             upper_bound_cond, arith::ProofStrength::kSymbolicBound);
-      } catch (const Error &e) {
+      } catch (const ffi::Error &e) {
         // Some layout-lowered sparse/global indices contain arithmetic that
         // defeats interval reasoning.  Safe-memory legalization should remain
         // conservative in that case and emit an explicit runtime guard instead
@@ -157,7 +157,7 @@ struct SafeMemChecker : public StmtExprVisitor {
       try {
         can_prove_lower = analyzer_->CanProve(
             lower_bound_cond, arith::ProofStrength::kSymbolicBound);
-      } catch (const Error &e) {
+      } catch (const ffi::Error &e) {
         can_prove_lower = false;
       }
 
@@ -191,9 +191,9 @@ struct SafeMemChecker : public StmtExprVisitor {
       if (const auto *call = obj.as<CallNode>()) {
         if (const auto *op_node = call->op.as<OpNode>()) {
           String name = op_node->name;
-          if (name == "tir.bitwise_and" || name == "tir.bitwise_or" ||
-              name == "tir.bitwise_xor" || name == "tir.shift_left" ||
-              name == "tir.shift_right") {
+          if (name == "tirx.bitwise_and" || name == "tirx.bitwise_or" ||
+              name == "tirx.bitwise_xor" || name == "tirx.shift_left" ||
+              name == "tirx.shift_right") {
             fragile = true;
           }
         }
@@ -379,7 +379,7 @@ private:
     ICHECK(!conditions.empty());
     PrimExpr combined = conditions[0];
     for (size_t i = 1; i < conditions.size(); ++i) {
-      combined = tir::And(combined, conditions[i]);
+      combined = tirx::And(combined, conditions[i]);
     }
     return analyzer_->Simplify(combined);
   }
@@ -419,7 +419,7 @@ private:
     // store.
     if (analyzer_->CanProveEqual(safe_value, make_zero(dst_dtype))) {
       PrimExpr predicate = existing_predicate.defined()
-                               ? analyzer_->Simplify(tir::And(
+                               ? analyzer_->Simplify(tirx::And(
                                      existing_predicate.value(), combined))
                                : combined;
       Array<PrimExpr> new_args{call->args[0], call->args[1], call->args[2]};
@@ -476,7 +476,7 @@ private:
     return evaluate;
   }
 
-  Stmt VisitStmt_(const BlockNode *op) final {
+  Stmt VisitStmt_(const SBlockNode *op) final {
     for (auto buffer : op->alloc_buffers) {
       buffer_data_to_buffer_.Set(buffer->data, buffer);
     }
@@ -514,7 +514,7 @@ private:
 
 // Create a pass that legalizes vectorized loops in the IRModule
 tvm::transform::Pass LegalizeSafeMemoryAccess() {
-  using namespace tir::transform;
+  using namespace tirx::transform;
   // Define the transformation function to be applied
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
     bool disable_safe_memory_legalize =

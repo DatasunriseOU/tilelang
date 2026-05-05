@@ -24,13 +24,13 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/op_attr_types.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/op_attr_types.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include <optional>
 #include <unordered_map>
@@ -42,14 +42,18 @@
 #include "../op/utils.h"
 #include "../target/utils.h"
 #include "arith/scalable_expression.h"
-#include "tir/analysis/check_contains.h"
+#include "tirx/analysis/check_contains.h"
 #include "tvm/ffi/cast.h"
+#include "vendored/let_stmt.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 using namespace ffi;
+// Use TileLang vendored LetStmt (with `body` field). See vendored/let_stmt.h.
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 /*!
  * \brief Perform data type legalization on the given BufferLoadNode pointer.
@@ -301,6 +305,14 @@ public:
     // to let the top-level Vectorize handle it
     if (need_scalarize_) {
       return stmt;
+    }
+    // CPPMEGA: vendored TileLang LetStmt/Allocate are not in apache's
+    // StmtFunctor dispatch — manual intercept here.
+    if (const auto *op = stmt.as<LetStmtNode>()) {
+      return VisitStmt_(op);
+    }
+    if (const auto *op = stmt.as<AllocateNode>()) {
+      return VisitStmt_(op);
     }
     return StmtMutator::VisitStmt(stmt);
   }
@@ -984,8 +996,8 @@ public:
     LOG(FATAL) << "A while loop inside a vectorized loop not supported.";
   }
 
-  // LetStmt
-  Stmt VisitStmt_(const LetStmtNode *op) final {
+  // LetStmt (vendored)
+  Stmt VisitStmt_(const LetStmtNode *op) {
     PrimExpr value = this->VisitExpr(op->value);
     ICHECK(!let_var_map_.count(op->var))
         << "SSA violation, a single var is binded twice";
@@ -1009,8 +1021,8 @@ public:
     }
   }
 
-  // Allocate
-  Stmt VisitStmt_(const AllocateNode *op) final {
+  // Allocate (vendored)
+  Stmt VisitStmt_(const AllocateNode *op) {
     // Mutate the condition
     PrimExpr condition = this->VisitExpr(op->condition);
     if (condition.dtype().is_scalable_or_fixed_length_vector()) {
@@ -1018,8 +1030,35 @@ public:
                    << op->buffer_var->name_hint;
       return Scalarize(tvm::ffi::GetRef<Stmt>(op));
     }
-
-    return StmtMutator::VisitStmt_(op);
+    Stmt body = this->VisitStmt(op->body);
+    // CPPMEGA: emit apache `AllocBuffer + SeqStmt` instead of the vendored
+    // `tl_tir::Allocate`. apache `StmtFunctor` has no dispatch entry for
+    // `tilelang.Allocate`; downstream apache passes (`tir.transform.Simplify`,
+    // `tir.transform.RemoveNoOp`, `tir.transform.HoistIfThenElse`, ...) would
+    // crash with "NodeFunctor calls un-registered function on type
+    // tilelang.Allocate". Mirrors `lower_allocate.cc` converter logic.
+    Buffer alloc_buf_obj(/*data=*/op->buffer_var,
+                         /*dtype=*/op->dtype,
+                         /*shape=*/op->extents,
+                         /*strides=*/{},
+                         /*elem_offset=*/PrimExpr(),
+                         /*name=*/op->buffer_var->name_hint,
+                         /*data_alignment=*/0,
+                         /*offset_factor=*/0,
+                         /*buffer_type=*/BufferType::kDefault,
+                         /*axis_separators=*/{},
+                         /*span=*/op->span);
+    Stmt seq = SeqStmt({AllocBuffer(alloc_buf_obj, op->annotations, op->span),
+                        body},
+                       op->span);
+    bool trivial = false;
+    if (const auto *imm = condition.as<IntImmNode>()) {
+      trivial = (imm->value != 0);
+    }
+    if (!trivial) {
+      seq = IfThenElse(condition, seq, std::nullopt, op->span);
+    }
+    return seq;
   }
 
   // scalarize the statement
@@ -1160,7 +1199,11 @@ private:
 };
 
 inline bool TargetHasSVE() {
-  return Target::Current()->GetFeature<Bool>("has_sve").value_or(false);
+  // CPPMEGA: Target::GetFeature<> was removed in apache/tvm latest. SVE is
+  // ARM-only and currently not relevant for TileLang's CUDA/HIP/Metal targets,
+  // so we return false unconditionally. Reintroduce per-target probing if SVE
+  // support becomes a hard requirement.
+  return false;
 }
 
 class LoopVectorizer : public StmtMutator {
@@ -1200,7 +1243,7 @@ public:
 Stmt SkipVectorize(Stmt stmt) { return VectorizeSkipper()(std::move(stmt)); }
 
 tvm::transform::Pass VectorizeLoop(bool enable_vectorize = true) {
-  using namespace tir::transform;
+  using namespace tirx::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     auto *n = f.CopyOnWrite();
     if (enable_vectorize) {

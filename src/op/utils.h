@@ -10,13 +10,13 @@
 #include "./operator.h"
 #include "region.h"
 #include "tvm/runtime/base.h"
-#include <tvm/tir/buffer.h>
-#include <tvm/tir/op.h>
+#include <tvm/tirx/buffer.h>
+#include <tvm/tirx/op.h>
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 // Maps TVM DataType to CUDA's CUtensorMapDataType enum value.
 TVM_DLL int to_CUtensorMapDataType(DataType dtype);

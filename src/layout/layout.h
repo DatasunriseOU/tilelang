@@ -10,7 +10,7 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/arith/iter_affine_map.h>
 #include <tvm/ffi/object.h>
-#include <tvm/tir/buffer.h>
+#include <tvm/tirx/buffer.h>
 #include <utility>
 
 #include "../support/ffi_aliases.h"
@@ -18,7 +18,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 // Common layout-related exceptions
 class LayoutConflictException : public std::exception {
@@ -42,7 +42,7 @@ private:
 class Layout;
 class Fragment;
 
-class LayoutNode : public Object {
+class LayoutNode : public ffi::Object {
 public:
   LayoutNode() = default;
   LayoutNode(Array<PrimExpr> input_size, Array<PrimExpr> forward_index);
@@ -104,7 +104,7 @@ public:
   virtual bool IsEqual(const LayoutNode *other, bool skip_index = false) const;
 
   static void RegisterReflection();
-  TVM_FFI_DECLARE_OBJECT_INFO("tl.Layout", LayoutNode, Object);
+  TVM_FFI_DECLARE_OBJECT_INFO("tl.Layout", LayoutNode, ffi::Object);
   static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
       kTVMFFISEqHashKindTreeNode;
 
@@ -118,12 +118,12 @@ protected:
 /*!
  * \brief Layout reference class.
  */
-class Layout : public ObjectRef {
+class Layout : public ffi::ObjectRef {
 public:
   TVM_DLL Layout(Array<IterVar> forward_var, Array<PrimExpr> forward_index);
   TVM_DLL Layout(Array<PrimExpr> input_size, Array<PrimExpr> forward_index);
 
-  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(Layout, ObjectRef, LayoutNode);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(Layout, ffi::ObjectRef, LayoutNode);
 };
 
 class FragmentNode : public LayoutNode {

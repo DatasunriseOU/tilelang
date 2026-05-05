@@ -10,21 +10,21 @@
 #include "tvm/ffi/optional.h"
 #include "tvm/ir/expr.h"
 #include "tvm/ir/transform.h"
-#include "tvm/node/structural_hash.h"
-#include "tvm/tir/builtin.h"
-#include "tvm/tir/expr.h"
-#include "tvm/tir/op.h"
-#include "tvm/tir/stmt.h"
-#include "tvm/tir/stmt_functor.h"
-#include "tvm/tir/transform.h"
+#include "tvm/ffi/extra/structural_hash.h"
+#include "tvm/tirx/builtin.h"
+#include "tvm/tirx/expr.h"
+#include "tvm/tirx/op.h"
+#include "tvm/tirx/stmt.h"
+#include "tvm/tirx/stmt_functor.h"
+#include "tvm/tirx/transform.h"
 
 #include <sstream>
 
 namespace tvm::tl {
-using namespace tir;
+using namespace tirx;
 
-class AssumeInjector : public tvm::tir::StmtExprMutator {
-  using Base = tvm::tir::StmtExprMutator;
+class AssumeInjector : public tvm::tirx::StmtExprMutator {
+  using Base = tvm::tirx::StmtExprMutator;
 
 public:
   AssumeInjector(PrimFunc f) : f(f) {}
@@ -52,7 +52,10 @@ private:
       size_t h = sh(e);
       auto &bucket = buckets[h];
       auto it = std::find_if(bucket.begin(), bucket.end(), [&](size_t y) {
-        return se(e, items[y].expr, true);
+        // CPPMEGA: ffi::StructuralEqual::operator() drops the map_free_vars
+        // argument; call the static Equal() directly to keep the original
+        // semantics (map_free_vars=true, skip_tensor_content=true).
+        return tvm::ffi::StructuralEqual::Equal(e, items[y].expr, true, true);
       });
       if (it == bucket.end()) {
         auto index = items.size();
@@ -84,7 +87,9 @@ private:
       size_t h = sh(stride);
       auto &bucket = stride_div_buckets[h];
       auto it = std::find_if(bucket.begin(), bucket.end(), [&](size_t y) {
-        return se(stride, stride_div_items[y].stride, true);
+        return tvm::ffi::StructuralEqual::Equal(stride,
+                                                stride_div_items[y].stride,
+                                                true, true);
       });
       if (it == bucket.end()) {
         auto index = stride_div_items.size();
@@ -124,7 +129,7 @@ private:
             ss << ", ";
           ss << "`" << e.buffers[i]->name << "`";
         }
-        body = AttrStmt(simplified, tir::attr::tilelang_assume,
+        body = AttrStmt(simplified, tirx::attr::tilelang_assume,
                         StringImm(ss.str()), body);
       }
       // Inject stride divisibility assumes for sub-byte dtypes.
@@ -141,7 +146,7 @@ private:
             ss << ", ";
           ss << "`" << e.buffers[i]->name << "`";
         }
-        body = AttrStmt(cond, tir::attr::tilelang_assume, StringImm(ss.str()),
+        body = AttrStmt(cond, tirx::attr::tilelang_assume, StringImm(ss.str()),
                         body);
       }
       return body;
@@ -149,11 +154,20 @@ private:
   };
 
   Stmt VisitStmt_(const DeclBufferNode *op) final {
-    auto body = VisitStmt(op->body);
+    // CPPMEGA: apache/tvm DeclBufferNode lost its `body` field (DeclBuffer is
+    // now a standalone stmt in the surrounding SeqStmt). Visiting only the
+    // declaration is sufficient — the assume injection that previously wrapped
+    // the body must instead be performed on the SeqStmt context (handled by
+    // VisitStmt_(SeqStmtNode)). Here we simply return a fresh DeclBuffer.
     AssumeCreator c;
     c.addBuffer(op->buffer);
     c.addBufferStrides(op->buffer);
-    return DeclBuffer(op->buffer, c.build(body), op->span);
+    Stmt declared = DeclBuffer(op->buffer, op->span);
+    if (c.items.empty() && c.stride_div_items.empty()) {
+      return declared;
+    }
+    Stmt assumes = c.build(Evaluate(0));
+    return SeqStmt({assumes, declared});
   }
 
   Stmt VisitStmt_(const SeqStmtNode *op) final {
@@ -190,7 +204,7 @@ private:
         Stmt body = g.stmts.size() == 1 ? g.stmts[0] : SeqStmt(g.stmts);
         std::stringstream ss;
         ss << "Assume: " << *(g.e);
-        AttrStmt attr = AttrStmt(*g.e, tir::attr::tilelang_assume,
+        AttrStmt attr = AttrStmt(*g.e, tirx::attr::tilelang_assume,
                                  StringImm(ss.str()), body);
         groups[i - 1].stmts.push_back(attr);
       } else {
@@ -202,7 +216,7 @@ private:
     // return SeqStmt(groups[0].stmts);
   }
 
-  Stmt VisitStmt_(const BlockNode *op) final {
+  Stmt VisitStmt_(const SBlockNode *op) final {
     auto body = VisitStmt(op->body);
     AssumeCreator c;
 
@@ -223,7 +237,7 @@ private:
       c.addBufferStrides(item->buffer);
     }
 
-    return Block(op->iter_vars, op->reads, op->writes, op->name_hint,
+    return SBlock(op->iter_vars, op->reads, op->writes, op->name_hint,
                  c.build(body), op->init, op->alloc_buffers, op->match_buffers,
                  op->annotations, op->span);
   }
@@ -231,7 +245,7 @@ private:
   PrimFunc f;
 };
 
-using namespace tir::transform;
+using namespace tirx::transform;
 
 tvm::transform::Pass InjectAssumes() {
   auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {

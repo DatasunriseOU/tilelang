@@ -10,23 +10,24 @@
 #include <tvm/ffi/object.h>
 
 #include "support/ffi_aliases.h"
+#include "transform/vendored/let_stmt.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/script/ir_builder/tir/ir.h>
-#include <tvm/tir/analysis.h>
+#include <tvm/tirx/script/builder/ir.h>
+#include <tvm/tirx/analysis.h>
 
 #include <utility>
 
 namespace tvm {
 namespace tl {
 
-using namespace script::ir_builder::tir;
+using namespace script::ir_builder::tirx;
 
 static Var CreateEnvThread(String name, String thread_tag, DataType dtype) {
-  using namespace tvm::tir;
+  using namespace tvm::tirx;
   using namespace tvm::script::ir_builder;
   IterVar iter_var(Range{nullptr}, Var(std::move(name), dtype),
-                   tvm::tir::IterVarType::kThreadIndex, std::move(thread_tag));
+                   tvm::tirx::IterVarType::kThreadIndex, std::move(thread_tag));
   Var var = iter_var->var;
   if (Optional<PrimFuncFrame> opt_frame =
           IRBuilder::Current()->FindFrame<PrimFuncFrame>()) {
@@ -38,7 +39,7 @@ static Var CreateEnvThread(String name, String thread_tag, DataType dtype) {
 }
 
 static ForFrame MakeIterVarFrame(const std::string &name, const PrimExpr &dom) {
-  using namespace tvm::tir;
+  using namespace tvm::tirx;
   Var var = Var(name, dom->dtype);
   // Create a frame that represents a loop over the given domain.
   ObjectPtr<ForFrameNode> n = tvm::ffi::make_object<ForFrameNode>();
@@ -61,7 +62,7 @@ static ForFrame MakeIterVarFrame(const std::string &name, const PrimExpr &dom) {
 
 ForFrame ParallelFor(const Array<PrimExpr> &extents,
                      const Map<String, tvm::ffi::Any> &annotations) {
-  using namespace tvm::tir;
+  using namespace tvm::tirx;
   ObjectPtr<ForFrameNode> n = tvm::ffi::make_object<ForFrameNode>();
   n->vars.reserve(extents.size());
   n->doms.reserve(extents.size());
@@ -106,7 +107,7 @@ ForFrame PipelinedFor(PrimExpr start, const PrimExpr &stop, int num_stages,
                       const Array<PrimExpr> &stages,
                       const Array<Array<PrimExpr>> &sync,
                       const Array<Array<PrimExpr>> &groups) {
-  using namespace tvm::tir;
+  using namespace tvm::tirx;
   ObjectPtr<ForFrameNode> n = tvm::ffi::make_object<ForFrameNode>();
   DataType dtype = stop.dtype();
   n->vars.push_back(Var("v", dtype));
@@ -138,7 +139,7 @@ ForFrame PipelinedFor(PrimExpr start, const PrimExpr &stop, int num_stages,
 
 ForFrame PersistentFor(const Array<PrimExpr> &domain, const PrimExpr &wave_size,
                        const PrimExpr &index, PrimExpr group_size) {
-  using namespace tvm::tir;
+  using namespace tvm::tirx;
   ICHECK(!domain.empty());
   ObjectPtr<ForFrameNode> n = tvm::ffi::make_object<ForFrameNode>();
   n->vars.reserve(domain.size());
@@ -182,10 +183,10 @@ ForFrame PersistentFor(const Array<PrimExpr> &domain, const PrimExpr &wave_size,
     }
     idxs.Set(0, rem);
 
-    auto out_if = tvm::tir::IfThenElse(
+    auto out_if = tvm::tirx::IfThenElse(
         domain_size <= (loop_var * wave_size + index),
-        tvm::tir::Evaluate(
-            tvm::tir::Call(DataType::Handle(), tvm::tl::loop_break(), {})),
+        tvm::tirx::Evaluate(
+            tvm::tirx::Call(DataType::Handle(), tvm::tl::loop_break(), {})),
         Stmt());
 
     arith::Analyzer analyzer;
@@ -199,10 +200,11 @@ ForFrame PersistentFor(const Array<PrimExpr> &domain, const PrimExpr &wave_size,
                      /*thread_binding=*/std::nullopt, /*annotations=*/anno,
                      /*step=*/step);
     for (int i = 0; i < vars.size() - 1; ++i) {
-      outer = tvm::tir::LetStmt(vars[i], idxs[i + 1], outer);
+      outer = ::tilelang::tl_tir::LetStmt(vars[i], idxs[i + 1], outer);
     }
-    outer = tvm::tir::LetStmt(vars[vars.size() - 1],
-                              idxs[0] * group_size + idxs[vars.size()], outer);
+    outer = ::tilelang::tl_tir::LetStmt(
+        vars[vars.size() - 1],
+        idxs[0] * group_size + idxs[vars.size()], outer);
     return outer;
   };
 
@@ -316,12 +318,12 @@ KernelLaunchFrame KernelLaunch(const Array<PrimExpr> &grid_size,
   }
 
   if (attrs.defined()) {
-    auto empty_block = tvm::script::ir_builder::tir::Block(DeviceMainBlockName);
+    auto empty_block = tvm::script::ir_builder::tirx::Block(DeviceMainBlockName);
     empty_block->annotations = attrs;
     n->frames.push_back(empty_block);
   } else {
     n->frames.push_back(
-        tvm::script::ir_builder::tir::Block(DeviceMainBlockName));
+        tvm::script::ir_builder::tirx::Block(DeviceMainBlockName));
   }
 
   return KernelLaunchFrame(n);
@@ -404,7 +406,7 @@ WarpSpecializeFrame WarpSpecialize(const Array<IntImm> &warp_group_ids,
     PrimExpr range_cond = (thread_idx >= min_bound) && (thread_idx < max_bound);
 
     if (condition.defined()) {
-      condition = tir::Or(condition, range_cond);
+      condition = tirx::Or(condition, range_cond);
     } else {
       condition = range_cond;
     }

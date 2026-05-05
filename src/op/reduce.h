@@ -12,7 +12,7 @@ namespace tvm {
 
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 /// Supported reduction operation types
 enum class ReduceTypeEnum : uint8_t {
@@ -27,10 +27,10 @@ enum class ReduceTypeEnum : uint8_t {
 };
 
 /// Node class representing a reduction type
-class ReduceTypeNode : public Object {
+class ReduceTypeNode : public ffi::Object {
 public:
   int type{-1}; ///< Internal type identifier
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.ReduceType", ReduceTypeNode, Object);
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.ReduceType", ReduceTypeNode, ffi::Object);
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
@@ -49,9 +49,9 @@ public:
 };
 
 /// Wrapper class for reduction type with string-based construction
-class ReduceType : public ObjectRef {
+class ReduceType : public ffi::ObjectRef {
 public:
-  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(ReduceType, ObjectRef,
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(ReduceType, ffi::ObjectRef,
                                              ReduceTypeNode);
   TVM_DLL ReduceType(std::string type) {
     auto node = tvm::ffi::make_object<ReduceTypeNode>();
@@ -81,7 +81,7 @@ public:
 /// Node class for reduction operations
 class ReduceOpNode : public TileOperatorNode {
 public:
-  tir::Buffer src, dst; ///< Source and destination buffers
+  tirx::Buffer src, dst; ///< Source and destination buffers
   // Optional: keep the original regions used to construct this op
   BufferRegion srcRegion_, dstRegion_;
   int dim;         ///< Dimension to reduce along
@@ -142,14 +142,14 @@ public:
                                              ReduceOpNode);
   TVM_DLL
   ReduceOp(Array<PrimExpr> args,
-           Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
+           Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 
 /// Node class for cumulative sum operations
 class CumSumOpNode : public TileOperatorNode {
 public:
-  tir::Buffer src, dst; ///< Source and destination buffers
+  tirx::Buffer src, dst; ///< Source and destination buffers
   // Optional: keep the original regions used to construct this op
   BufferRegion srcRegion_, dstRegion_;
   int dim;      ///< Dimension along which to compute cumulative sum
@@ -182,7 +182,7 @@ public:
                                              CumSumOpNode);
   TVM_DLL
   CumSumOp(Array<PrimExpr> args,
-           Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
+           Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 

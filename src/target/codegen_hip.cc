@@ -5,8 +5,8 @@
 #include "codegen_hip.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
-#include <tvm/tir/index_map.h>
-#include <tvm/tir/op.h>
+#include <tvm/tirx/index_map.h>
+#include <tvm/tirx/op.h>
 
 #include <cmath>
 #include <cstdint>
@@ -156,10 +156,10 @@ void CodeGenTileLangHIP::PrintFuncPrefix(std::ostream &os) {
   os << "extern \"C\" __global__ ";
 }
 
-class LaunchConfigExtractor : public tir::StmtVisitor {
+class LaunchConfigExtractor : public tirx::StmtVisitor {
 private:
   void VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::thread_extent) {
+    if (op->attr_key == tirx::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
       if (iv->var->name_hint == "threadIdx.x" ||
           iv->thread_tag == "threadIdx.x") {
@@ -230,8 +230,8 @@ std::string CodeGenTileLangHIP::Finish() {
   return CodeGenC::Finish();
 }
 
-void CodeGenTileLangHIP::VisitStmt_(const tir::ForNode *op) {
-  if (op->kind == tir::ForKind::kUnrolled) {
+void CodeGenTileLangHIP::VisitStmt_(const tirx::ForNode *op) {
+  if (op->kind == tirx::ForKind::kUnrolled) {
     PrintIndent();
     stream << "#pragma unroll\n";
   }
@@ -1448,7 +1448,7 @@ void CodeGenTileLangHIP::VisitStmt_(const AttrStmtNode *op) {
     std::string func_name;
     int panel_size = 0;
     if (const auto *call = op->value.as<CallNode>()) {
-      if (call->op.same_as(tir::builtin::tvm_tuple()) &&
+      if (call->op.same_as(tirx::builtin::tvm_tuple()) &&
           call->args.size() >= 2) {
         const auto *name_node = call->args[0].as<StringImmNode>();
         const auto *size_node = call->args[1].as<IntImmNode>();
@@ -1494,12 +1494,12 @@ void CodeGenTileLangHIP::VisitStmt_(const AllocateNode *op) {
     if (scope == "local.var") {
       // Single-element variable: emit an initializer so the value is defined.
       // Default to 0; respect the user-provided tl.local_var_init annotation.
-      PrimExpr init = tir::make_const(op->dtype, 0);
+      PrimExpr init = tirx::make_const(op->dtype, 0);
       auto init_it = op->annotations.find(tl::attr::kLocalVarInit);
       if (init_it != op->annotations.end()) {
         PrimExpr user_init = Downcast<PrimExpr>((*init_it).second);
         if (!user_init.dtype().is_void() && user_init.dtype() != op->dtype) {
-          user_init = tir::Cast(op->dtype, user_init);
+          user_init = tirx::Cast(op->dtype, user_init);
         }
         init = user_init;
       }
@@ -1848,11 +1848,11 @@ void CodeGenTileLangHIP::AddFunction(const PrimFunc &f) {
   auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
   ICHECK(global_symbol.has_value())
       << "CodeGenC: Expect PrimFunc to have the global_symbol attribute";
-  bool no_alias = f->HasNonzeroAttr(tir::attr::kNoAlias);
+  bool no_alias = f->HasNonzeroAttr(tirx::attr::kNoAlias);
   std::unordered_set<const VarNode *> non_restrict;
   if (auto opt =
-          f->GetAttr<ffi::Array<tir::Var>>(tl::attr::kNonRestrictParams)) {
-    for (const tir::Var &v : opt.value())
+          f->GetAttr<ffi::Array<tirx::Var>>(tl::attr::kNonRestrictParams)) {
+    for (const tirx::Var &v : opt.value())
       non_restrict.insert(v.get());
   }
 
@@ -1862,7 +1862,7 @@ void CodeGenTileLangHIP::AddFunction(const PrimFunc &f) {
   this->stream << " " << static_cast<std::string>(global_symbol.value()) << "(";
 
   for (size_t i = 0; i < f->params.size(); ++i) {
-    tir::Var v = f->params[i];
+    tirx::Var v = f->params[i];
     std::string vid = AllocVarID(v.get());
     if (i != 0)
       stream << ", ";

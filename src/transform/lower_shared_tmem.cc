@@ -5,22 +5,25 @@
  */
 #include "../op/builtin.h"
 #include "../target/utils.h"
+#include "vendored/let_stmt.h"
 #include "tvm/ir/type.h"
-#include "tvm/tir/builtin.h"
-#include "tvm/tir/expr.h"
-#include "tvm/tir/stmt.h"
+#include "tvm/tirx/builtin.h"
+#include "tvm/tirx/expr.h"
+#include "tvm/tirx/stmt.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 #include <unordered_set>
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 using VarSet = std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>;
 
@@ -43,9 +46,9 @@ static std::pair<VarSet, bool> CollectFallthroughDeallocs(const Stmt &stmt) {
     return CollectFallthroughDeallocs(n->body);
   if (auto *n = stmt.as<AttrStmtNode>())
     return CollectFallthroughDeallocs(n->body);
-  if (auto *n = stmt.as<BlockNode>())
+  if (auto *n = stmt.as<SBlockNode>())
     return CollectFallthroughDeallocs(n->body);
-  if (auto *n = stmt.as<BlockRealizeNode>())
+  if (auto *n = stmt.as<SBlockRealizeNode>())
     return CollectFallthroughDeallocs(n->block->body);
   if (auto *n = stmt.as<ForNode>())
     return CollectFallthroughDeallocs(n->body);
@@ -122,8 +125,8 @@ private:
     return num_cols_allocated;
   }
 
-  Stmt VisitStmt_(const BlockNode *op) final {
-    Block block = tvm::ffi::GetRef<Block>(op);
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    SBlock block = tvm::ffi::GetRef<SBlock>(op);
     Array<Buffer> alloc_buffers = op->alloc_buffers;
     if (op->annotations.count(attr::kLayoutMap)) {
       auto layout_map = op->annotations.Get(attr::kLayoutMap);
@@ -222,7 +225,7 @@ private:
 
     // If block has use_2cta attr, add use_2cta: 1 to tmem alloc/dealloc call
     // annotations.
-    Map<String, ObjectRef> tmem_call_ann;
+    Map<String, ffi::ObjectRef> tmem_call_ann;
     if (op->annotations.count("use_2cta")) {
       PrimExpr val = Downcast<PrimExpr>(op->annotations["use_2cta"]);
       // Bool in TVM is a subclass of IntImm, so only check IntImm.
@@ -380,7 +383,7 @@ private:
       auto new_buffer_access = new_buffer.access_ptr(1, DataType::Handle(), 1,
                                                      PrimExpr(0), PrimExpr(1));
 
-      Map<String, ObjectRef> ann;
+      Map<String, ffi::ObjectRef> ann;
       auto ann_it = tmem_call_annotations_.find(buffer_data);
       if (ann_it != tmem_call_annotations_.end()) {
         ann = ann_it->second;
@@ -411,7 +414,7 @@ private:
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::thread_extent) {
+    if (op->attr_key == tirx::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
       if (iv->thread_tag == "threadIdx.x") {
         ICHECK(iv->dom->extent.as<IntImmNode>());
@@ -434,7 +437,7 @@ private:
   std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> buffer_map_;
   std::unordered_map<Var, int, ObjectPtrHash, ObjectPtrEqual>
       tmem_num_cols_allocated_;
-  std::unordered_map<Var, Map<String, ObjectRef>, ObjectPtrHash, ObjectPtrEqual>
+  std::unordered_map<Var, Map<String, ffi::ObjectRef>, ObjectPtrHash, ObjectPtrEqual>
       tmem_call_annotations_;
   Map<Buffer, Layout> layout_map_;
 };
@@ -447,7 +450,7 @@ PrimFunc LowerSharedTmem(PrimFunc f) {
 }
 
 namespace transform {
-using namespace tir::transform;
+using namespace tirx::transform;
 
 tvm::transform::Pass LowerSharedTmem() {
   auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {

@@ -4,14 +4,14 @@
  */
 #include "../op/builtin.h"
 #include "tvm/ir/type.h"
-#include "tvm/tir/expr.h"
-#include "tvm/tir/stmt.h"
+#include "tvm/tirx/expr.h"
+#include "tvm/tirx/stmt.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include <utility>
 
@@ -23,7 +23,7 @@ namespace attr {
 constexpr const char *kBarrierInit = "barrier_init";
 } // namespace attr
 
-using namespace tir;
+using namespace tirx;
 
 class SharedBarrierRewriter : public StmtExprMutator {
 public:
@@ -36,8 +36,8 @@ private:
   SharedBarrierRewriter(bool disable_shuffle_elect)
       : disable_shuffle_elect_(disable_shuffle_elect) {}
 
-  Stmt VisitStmt_(const BlockNode *op) final {
-    Block block = tvm::ffi::GetRef<Block>(op);
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    SBlock block = tvm::ffi::GetRef<SBlock>(op);
     Array<Buffer> alloc_buffers = op->alloc_buffers;
 
     // Record the mapping from buffer data var to buffer for later lookup
@@ -174,7 +174,7 @@ private:
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::thread_extent) {
+    if (op->attr_key == tirx::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
       if (iv->thread_tag == "threadIdx.x") {
         ICHECK(iv->dom->extent.as<IntImmNode>());
@@ -204,7 +204,7 @@ PrimFunc LowerSharedBarrier(PrimFunc f, bool disable_shuffle_elect) {
 }
 
 namespace transform {
-using namespace tir::transform;
+using namespace tirx::transform;
 
 tvm::transform::Pass LowerSharedBarrier() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {

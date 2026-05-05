@@ -5,10 +5,10 @@
 
 #include "reduce.h"
 
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/op_attr_types.h>
-#include <tvm/tir/stmt_functor.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/op_attr_types.h>
+#include <tvm/tirx/stmt_functor.h>
 
 #include "../layout/layout.h"
 #include "../layout/utils.h"
@@ -16,22 +16,22 @@
 #include "../target/utils.h"
 #include "../transform/loop_partition.h"
 #include "builtin.h"
-#include "tir/transforms/ir_utils.h"
+#include "tirx/transform/ir_utils.h"
 #include "tvm/ir/expr.h"
-#include "tvm/tir/expr.h"
-#include "tvm/tir/stmt.h"
+#include "tvm/tirx/expr.h"
+#include "tvm/tirx/stmt.h"
 #include "utils.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 // NormalizeToBufferRegion moved to src/op/utils.{h,cc}
 
 // MakeAccessPtrFromRegion moved to src/op/utils.{h,cc}
 
-ReduceOp::ReduceOp(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
+ReduceOp::ReduceOp(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {
   ObjectPtr<ReduceOpNode> node = tvm::ffi::make_object<ReduceOpNode>();
   // Accept BufferRegion/BufferLoad for src/dst
   auto src_access = NormalizeToAccessRegion(args[0], kAccessRead);
@@ -401,7 +401,7 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       reduce_local =
           For(src_var_compressed[i]->var, 0, src_var_compressed[i]->dom->extent,
               ForKind::kUnrolled, reduce_local, std::nullopt,
-              {{tir::attr::pragma_unroll_explicit, Bool(false)}});
+              {{tirx::attr::pragma_unroll_explicit, Bool(false)}});
     }
     stmts.push_back(reduce_local);
 
@@ -612,8 +612,9 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
       Stmt body = phases.size() > 1 ? SeqStmt(phases) : phases[0];
       if (need_duplicate) {
-        body = Allocate(clear_buffer->data, clear_buffer->dtype,
-                        clear_buffer->shape, const_true(), body);
+        // CPPMEGA: apache/tvm latest replaced Allocate(buffer_var, dtype, shape, cond, body)
+        // with AllocBuffer(buffer) as a standalone scope-introducing stmt in SeqStmt context.
+        body = SeqStmt({AllocBuffer(clear_buffer), body});
       }
       return body;
 
@@ -719,8 +720,8 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       }
 
       if (need_duplicate) {
-        body = Allocate(clear_buffer->data, clear_buffer->dtype,
-                        clear_buffer->shape, const_true(), body);
+        // CPPMEGA: see comment above re Allocate→AllocBuffer migration.
+        body = SeqStmt({AllocBuffer(clear_buffer), body});
       }
       return body;
     }
@@ -785,7 +786,7 @@ static BufferRegion ConvertBufferToBufferRegion(const Buffer &buf) {
   return BufferRegion(buf, ranges);
 }
 
-CumSumOp::CumSumOp(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
+CumSumOp::CumSumOp(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {
   /// CumSum constructor arguments:
   /// - src: input buffer
   /// - dst: output buffer

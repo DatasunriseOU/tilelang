@@ -7,7 +7,7 @@
 #define TVM_TL_OP_PARALLEL_H_
 
 #include <tvm/target/target.h>
-#include <tvm/tir/stmt_functor.h>
+#include <tvm/tirx/stmt_functor.h>
 
 #include <unordered_map>
 
@@ -25,7 +25,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 class ParallelOpNode;
 

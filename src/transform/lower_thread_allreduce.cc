@@ -24,22 +24,25 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/target/target.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include <unordered_set>
 #include <utility>
 
 #include "runtime/thread_storage_scope.h"
-#include "tir/transforms/ir_utils.h"
-#include "tir/transforms/update_pointer_storage_scope.h"
+#include "tirx/transform/ir_utils.h"
+#include "tirx/transform/update_pointer_storage_scope.h"
+#include "vendored/let_stmt.h"
 
 namespace tvm {
 namespace tl {
-using namespace tir;
+using namespace tirx;
 using namespace ffi;
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 using runtime::StorageRank;
 using runtime::StorageScope;
@@ -65,13 +68,23 @@ private:
   }
 
 public:
-  void VisitStmt_(const AllocateNode *op) final {
+  // CPPMEGA: vendored `tilelang::tl_tir::Allocate` is not in apache's
+  // StmtFunctor dispatch table, so a normal `VisitStmt_` override would never
+  // fire. Intercept it manually via VisitStmt(const Stmt&).
+  void VisitStmt_(const AllocateNode *op) {
     if (IsDynamicSharedMemory(op->buffer_var)) {
       dyn_shmem_allocs_[op->buffer_var.get()] = op;
     } else if (IsStaticSharedMemory(op->buffer_var)) {
       static_shmem_allocs_[op->buffer_var.get()] = op;
     }
-    StmtExprVisitor::VisitStmt_(op);
+    this->VisitStmt(op->body);
+  }
+  void VisitStmt(const Stmt &stmt) override {
+    if (const auto *op = stmt.as<AllocateNode>()) {
+      VisitStmt_(op);
+    } else {
+      StmtExprVisitor::VisitStmt(stmt);
+    }
   }
   // The dynamic mapping from the original buffer var to its allocate
   std::unordered_map<const VarNode *, const AllocateNode *> dyn_shmem_allocs_;
@@ -96,12 +109,12 @@ public:
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::thread_extent) {
+    if (op->attr_key == tirx::attr::thread_extent) {
       thread_extents_.push_back(op);
       Stmt ret = StmtExprMutator::VisitStmt_(op);
       thread_extents_.pop_back();
       return ret;
-    } else if (op->attr_key == tir::attr::reduce_scope) {
+    } else if (op->attr_key == tirx::attr::reduce_scope) {
       const CommReducerNode *combiner = op->node.as<CommReducerNode>();
       ICHECK(combiner);
       reduce_combiner_.push_back(combiner);
@@ -122,8 +135,10 @@ public:
       return stmt;
     }
   }
-  Stmt VisitStmt_(const AllocateNode *op) final {
-    auto node = Downcast<Allocate>(StmtExprMutator::VisitStmt_(op));
+  Stmt VisitStmt_(const AllocateNode *op) {
+    Stmt body = this->VisitStmt(op->body);
+    Allocate node(op->buffer_var, op->dtype, op->extents, op->condition, body,
+                  op->annotations);
 
     if (auto it = alloc_remap_.find(node->buffer_var.get());
         it != alloc_remap_.end()) {
@@ -136,11 +151,17 @@ public:
 
       if (buf.scope() == shared_scope) {
         // Use volatile access to shared buffer.
-        write_ptr->body =
-            AttrStmt(buf->data, tir::attr::volatile_scope, 1, write_ptr->body);
+        write_ptr->body = AttrStmt(buf->data, tirx::attr::volatile_scope, 1,
+                                   write_ptr->body);
       }
     }
     return std::move(node);
+  }
+  Stmt VisitStmt(const Stmt &stmt) override {
+    if (const auto *op = stmt.as<AllocateNode>()) {
+      return VisitStmt_(op);
+    }
+    return StmtExprMutator::VisitStmt(stmt);
   }
 
   Optional<Buffer> GetRemappedBuffer(const Buffer &buf) {
@@ -535,7 +556,7 @@ private:
     // Fix all local allocations as all statements are built.
     Stmt body = SeqStmt::Flatten(seq);
     for (const Buffer &buf : new_alloc_bufs) {
-      body = DeclBuffer(buf, body);
+      body = SeqStmt::Flatten(Array<Stmt>{DeclBuffer(buf), body});
       body = Allocate(buf->data, buf->dtype, buf->shape,
                       const_true(buf->dtype.lanes()), body);
     }
@@ -925,7 +946,7 @@ private:
 };
 
 namespace transform {
-using namespace tir::transform;
+using namespace tirx::transform;
 
 tvm::transform::Pass LowerThreadAllreduce() {
   auto pass_func = [](PrimFunc f, const IRModule &m, const PassContext &ctx) {

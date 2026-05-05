@@ -2,15 +2,15 @@
 #include "arith/ir_mutator_with_analyzer.h"
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/data_type_rewriter.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/builtin.h>
+#include "tirx/ir/data_type_rewriter.h"
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/transform.h>
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 using namespace arith;
 class ConfigIndexBitwidthRewriter : public IndexDataTypeRewriter {
 public:
@@ -165,7 +165,7 @@ private:
 };
 
 tvm::transform::Pass ConfigIndexBitwidth() {
-  using namespace tir::transform;
+  using namespace tirx::transform;
   auto pass_func = [](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     auto *n = f.CopyOnWrite();
     // Get pass config `tl.config_index_bitwidth`

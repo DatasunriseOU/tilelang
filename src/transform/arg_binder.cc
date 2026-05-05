@@ -5,26 +5,32 @@
 #include "arg_binder.h"
 
 #include <tvm/runtime/device_api.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/op.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/op.h>
 
 #include <sstream>
 #include <unordered_set>
 
 #include "../runtime/error_helpers.h"
-#include "tir/transforms/ir_utils.h"
+#include "tirx/transform/ir_utils.h"
 #include "tvm/arith/int_solver.h"
 #include "tvm/ffi/cast.h"
 #include "tvm/ffi/container/array.h"
-#include "tvm/tir/stmt.h"
-#include "tvm/tir/stmt_functor.h"
+#include "tvm/tirx/stmt.h"
+#include "tvm/tirx/stmt_functor.h"
+#include "vendored/let_stmt.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+// Use TileLang vendored LetStmt (with `body` field) instead of apache/tvm's
+// stripped tirx::LetStmt. LowerTileLangLetStmt converts to tirx::Bind+SeqStmt
+// before apache/tvm sees it.
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 void BinderAddAssert(arith::Analyzer *ana, PrimExpr cond,
                      const std::string &arg_name, std::vector<Stmt> *asserts,
@@ -53,7 +59,7 @@ void BinderAddAssert(arith::Analyzer *ana, PrimExpr cond,
     }
 
     // If cond is an equality, prefer structured packed error with expect/got
-    if (const auto *eq = scond.as<tvm::tir::EQNode>()) {
+    if (const auto *eq = scond.as<tvm::tirx::EQNode>()) {
       PrimExpr lhs = eq->a;
       PrimExpr rhs = eq->b;
       // Choose rhs as expected and lhs as got for better semantics in most
@@ -410,9 +416,9 @@ void ArgBinder::BindDLTensors(
     if (is_used) {
       init_nest_.emplace_back(
           AssertStmt(!is_null_var,
-                     tvm::tir::StringImm(
-                         arg_name + " is expected to have non-NULL pointer"),
-                     nop));
+                     tvm::tirx::StringImm("RuntimeError"),
+                     ffi::Array<tvm::tirx::StringImm>{tvm::tirx::StringImm(
+                         arg_name + " is expected to have non-NULL pointer")}));
     }
   }
 
@@ -438,7 +444,7 @@ void ArgBinder::BindDLTensors(
                     TVMArrayGet(DataType::Handle(), handle, builtin::kArrShape),
                     make_zero(DataType::Handle())),
                 nop));
-    init_nest_.emplace_back(DeclBuffer(buf_shape, nop));
+    init_nest_.emplace_back(DeclBuffer(buf_shape));
 
     // Save for later use in shape binding
     shape_buffer_map[arg_name] = buf_shape;
@@ -737,7 +743,9 @@ void ArgBinder::BindDLTensors(
                 }
 
                 init_nest_.emplace_back(AssertStmt(
-                    any_nonnull, tvm::tir::StringImm(err_msg.str()), nop));
+                    any_nonnull, tvm::tirx::StringImm("RuntimeError"),
+                    ffi::Array<tvm::tirx::StringImm>{
+                        tvm::tirx::StringImm(err_msg.str())}));
               }
 
               // Build cascaded if_then_else: if !is_null_a then a.shape[k] else
@@ -837,7 +845,7 @@ void ArgBinder::BindDLTensors(
             decl_buffer({IntImm(DataType::Int(32), buffer->strides.size())},
                         tvm_shape_type, arg_name + ".strides");
         def_handle_dtype_.Set(buf_strides->data,
-                              tir::TypeAnnotation(tvm_shape_type));
+                              tirx::TypeAnnotation(tvm_shape_type));
         init_nest_.emplace_back(
             LetStmt(buf_strides->data,
                     tvm::if_then_else(Not(is_null),
@@ -845,7 +853,7 @@ void ArgBinder::BindDLTensors(
                                                   builtin::kArrStrides),
                                       make_zero(DataType::Handle())),
                     nop));
-        init_nest_.emplace_back(DeclBuffer(buf_strides, nop));
+        init_nest_.emplace_back(DeclBuffer(buf_strides));
         PrimExpr v_strides_is_null =
             Call(DataType::Bool(1), builtin::isnullptr(), {buf_strides->data});
 
@@ -884,7 +892,7 @@ void ArgBinder::BindDLTensors(
           decl_buffer({IntImm(DataType::Int(32), buffer->strides.size())},
                       tvm_shape_type, arg_name + ".strides");
       def_handle_dtype_.Set(buf_strides->data,
-                            tir::TypeAnnotation(tvm_shape_type));
+                            tirx::TypeAnnotation(tvm_shape_type));
       init_nest_.emplace_back(
           LetStmt(buf_strides->data,
                   tvm::if_then_else(Not(is_null),
@@ -892,7 +900,7 @@ void ArgBinder::BindDLTensors(
                                                 builtin::kArrStrides),
                                     make_zero(DataType::Handle())),
                   nop));
-      init_nest_.emplace_back(DeclBuffer(buf_strides, nop));
+      init_nest_.emplace_back(DeclBuffer(buf_strides));
       PrimExpr v_strides_is_null =
           Call(DataType::Bool(1), builtin::isnullptr(), {buf_strides->data});
 
@@ -1112,10 +1120,10 @@ void ArgBinder::BindDLTensors(
 
       // mark alignment of external bufs
       init_nest_.emplace_back(
-          AttrStmt(vptr, tir::attr::storage_alignment,
+          AttrStmt(vptr, tirx::attr::storage_alignment,
                    IntImm(DataType::Int(32), buffer->data_alignment), nop));
 
-      def_handle_dtype_.Set(vptr, tir::TypeAnnotation(buffer->dtype));
+      def_handle_dtype_.Set(vptr, tirx::TypeAnnotation(buffer->dtype));
     }
   }
 }

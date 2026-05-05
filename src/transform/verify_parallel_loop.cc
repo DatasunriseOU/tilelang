@@ -1,22 +1,23 @@
 #include "../op/utils.h"
 #include "common/constr_visitor.h"
 #include "layout_reducer.h"
+#include "vendored/z3_prover_stub.h"
 #include "tvm/arith/analyzer.h"
 #include "tvm/ffi/base_details.h"
 #include "tvm/ffi/object.h"
 #include "tvm/ir/expr.h"
-#include "tvm/tir/op.h"
-#include "tvm/tir/stmt.h"
-#include "tvm/tir/var.h"
+#include "tvm/tirx/op.h"
+#include "tvm/tirx/stmt.h"
+#include "tvm/tirx/var.h"
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 namespace tvm::tl {
 
-using namespace tir;
+using namespace tirx;
 
 namespace {
 using tvm::tl::ConstrSet;
@@ -51,12 +52,12 @@ struct ParallelLoopVerifier : public ConstrVisitor {
     }
     cset.Extend(cset.Substitute(subs));
     for (const auto &idx : op->indices) {
-      cset.AddConstr(idx == tir::Substitute(idx, subs));
+      cset.AddConstr(idx == tirx::Substitute(idx, subs));
     }
     arith::Analyzer analyzer;
     cset.Populate(analyzer);
     // If we can prove the values are the same, then no data race can happen.
-    if (analyzer.CanProve(op->value == tir::Substitute(op->value, subs))) {
+    if (analyzer.CanProve(op->value == tirx::Substitute(op->value, subs))) {
       StmtExprVisitor::VisitStmt_(op);
       return;
     }
@@ -74,14 +75,14 @@ struct ParallelLoopVerifier : public ConstrVisitor {
                    << "`"
                    << "is written by multiple threads in loop " << failed_vars
                    << ", Example:\n"
-                   << analyzer.z3_prover.GetModel(failed_var_expr)
+                   << arith::Z3Prover(analyzer).GetModel(failed_var_expr)
                    << "If you believe this is a false positive, pass "
                       "`PassKey.TL_DISABLE_DATA_RACE_CHECK` to pass key to "
                       "disable this check.";
     }
     StmtExprVisitor::VisitStmt_(op);
   }
-  void VisitStmt_(const BlockNode *op) override {
+  void VisitStmt_(const SBlockNode *op) override {
     if (op->annotations.count(attr::kReducerInfo)) {
       auto map = op->annotations.Get(attr::kReducerInfo)
                      ->as<Map<Var, Map<String, String>>>();
@@ -94,7 +95,7 @@ struct ParallelLoopVerifier : public ConstrVisitor {
   }
 };
 
-using namespace tir::transform;
+using namespace tirx::transform;
 
 tvm::transform::Pass VerifyParallelLoop() {
   auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {

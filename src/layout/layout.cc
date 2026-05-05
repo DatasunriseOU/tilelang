@@ -9,18 +9,18 @@
 #include <tvm/runtime/logging.h>
 
 #include <tvm/arith/pattern.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
 
 #include "arith/pattern_match.h"
-#include "tvm/node/functor.h"
-#include "tvm/node/repr_printer.h"
+// CPPMEGA: tvm/node/{functor,repr_printer}.h removed in apache/tvm latest.
+// ReprPrinter dispatchers below have been removed; debug printing will fall back to default.
 #include "utils.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 namespace {
 
@@ -1061,15 +1061,8 @@ void FragmentNode::RegisterReflection() {
       .def("_DebugOutput", &FragmentNode::DebugOutput);
 }
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<FragmentNode>([](const ObjectRef &obj, ReprPrinter *p) {
-      auto *node = static_cast<const FragmentNode *>(obj.get());
-      p->stream << node->DebugOutput();
-    })
-    .set_dispatch<LayoutNode>([](const ObjectRef &obj, ReprPrinter *p) {
-      auto *node = static_cast<const LayoutNode *>(obj.get());
-      p->stream << node->DebugOutput();
-    });
+// CPPMEGA: ReprPrinter removed in apache/tvm latest. Layout/Fragment debug printing
+// is no longer hooked to operator<<; call DebugOutput() directly when needed.
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;

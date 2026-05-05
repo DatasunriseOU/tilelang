@@ -30,19 +30,22 @@
 #include "arith/int_operator.h"
 #include "arith/ir_visitor_with_analyzer.h"
 #include "common/loop_vectorization_utils.h"
-#include "tvm/tir/analysis.h"
-#include "tvm/tir/var.h"
+#include "tvm/tirx/analysis.h"
+#include "tvm/tirx/var.h"
+#include "vendored/let_stmt.h"
 #include <iostream>
 #include <optional>
 #include <tvm/arith/iter_affine_map.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/stmt_functor.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/stmt_functor.h>
 #include <vector>
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 /*!
  * \brief Check if buffer strides represent a contiguous (row-major) layout.
@@ -622,7 +625,7 @@ private:
         << "tvm_access_ptr requires at least 3 args";
 
     // args[0] is TypeAnnotation(dtype[/lanes]); dtype() encodes the element
-    // type. See tvm::tir::Buffer::access_ptr implementation.
+    // type. See tvm::tirx::Buffer::access_ptr implementation.
     DataType dtype = node->args[0].dtype();
     Var data_var;
     if (auto data_var_node = node->args[1].as<VarNode>()) {
@@ -819,25 +822,28 @@ private:
   // binds let variables, but this causes issues when the same variable name
   // appears multiple times with different values (e.g., in pipelined loops
   // where the body is duplicated). For this case, we allow the analyzer to
-  // override the binding. Check the impl of
-  // IRMutatorWithAnalyzer::VisitStmt_(LetStmtNode*) in:
-  // tvm/src/arith/ir_mutator_with_analyzer.cc
-  Stmt VisitStmt_(const LetStmtNode *op) final {
-    PrimExpr value = this->VisitExpr(op->value);
-    if (SideEffect(value) <= CallEffectKind::kPure) {
-      // Allow override to handle duplicated loop bodies in pipelined loops
-      analyzer_->Bind(op->var, value, /*allow_override=*/true);
+  // override the binding.
+  //
+  // apache/tvm StmtFunctor vtable does not dispatch to the vendored
+  // `tilelang::tl_tir::LetStmtNode`. Override the top-level
+  // `VisitStmt(const Stmt&)` to intercept the vendored type before the
+  // built-in vtable dispatch.
+  Stmt VisitStmt(const Stmt &stmt) override {
+    if (const auto *op = stmt.as<LetStmtNode>()) {
+      PrimExpr value = this->VisitExpr(op->value);
+      if (SideEffect(value) <= CallEffectKind::kPure) {
+        // Allow override to handle duplicated loop bodies in pipelined loops
+        analyzer_->Bind(op->var, value, /*allow_override=*/true);
+      }
+      // Continue visiting the body to collect vectorization info
+      Stmt body = this->VisitStmt(op->body);
+      if (value.same_as(op->value) && body.same_as(op->body)) {
+        return ffi::GetRef<Stmt>(op);
+      } else {
+        return LetStmt(op->var, std::move(value), std::move(body), op->span);
+      }
     }
-    // Continue visiting the body to collect vectorization info
-    Stmt body = this->VisitStmt(op->body);
-    if (value.same_as(op->value) && body.same_as(op->body)) {
-      return ffi::GetRef<Stmt>(op);
-    } else {
-      auto n = this->CopyOnWrite(op);
-      n->value = std::move(value);
-      n->body = std::move(body);
-      return Stmt(n);
-    }
+    return arith::IRMutatorWithAnalyzer::VisitStmt(stmt);
   }
 
   int vector_load_bits_max_;

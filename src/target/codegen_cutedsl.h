@@ -6,8 +6,8 @@
 #define TVM_TL_TARGET_CODEGEN_CUTEDSL_H_
 
 #include <tvm/target/codegen.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/op.h>
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/op.h>
 
 #include <string>
 #include <unordered_map>

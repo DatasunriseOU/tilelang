@@ -7,18 +7,17 @@
 #include "utils.h"
 #include "tvm/arith/iter_affine_map.h"
 #include "tvm/ffi/container/map.h"
-#include "tvm/node/functor.h"
-#include "tvm/node/repr_printer.h"
-#include "tvm/node/structural_equal.h"
+// CPPMEGA: tvm/node/{functor,repr_printer}.h removed in apache/tvm latest.
+#include "tvm/ffi/extra/structural_equal.h"
 
 #include <sstream>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 using namespace arith;
 
 bool CanProveDivisible(const PrimExpr &lhs, const PrimExpr &rhs) {
@@ -202,25 +201,8 @@ struct IterExprPP {
   }
 };
 
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .clear_dispatch<IterMarkNode>()
-    .set_dispatch<IterMarkNode>([](const ObjectRef &obj, ReprPrinter *p) {
-      auto *node = static_cast<const IterMarkNode *>(obj.get());
-      IterExprPP pp(tvm::ffi::GetRef<IterMark>(node));
-      p->stream << pp;
-    })
-    .clear_dispatch<IterSumExprNode>()
-    .set_dispatch<IterSumExprNode>([](const ObjectRef &obj, ReprPrinter *p) {
-      auto *node = static_cast<const IterSumExprNode *>(obj.get());
-      IterExprPP pp(tvm::ffi::GetRef<IterSumExpr>(node));
-      p->stream << pp;
-    })
-    .clear_dispatch<IterSplitExprNode>()
-    .set_dispatch<IterSplitExprNode>([](const ObjectRef &obj, ReprPrinter *p) {
-      auto *node = static_cast<const IterSplitExprNode *>(obj.get());
-      IterExprPP pp(tvm::ffi::GetRef<IterSplitExpr>(node));
-      p->stream << pp;
-    });
+// CPPMEGA: ReprPrinter removed in apache/tvm latest. IterMark/IterSumExpr/IterSplitExpr
+// debug printing falls back to default; use IterExprPP directly when needed.
 
 // Heuristic: detect per-iterator gaps ("unused" pieces) even when the iterator
 // appears in fused forms across multiple index expressions. We first normalize

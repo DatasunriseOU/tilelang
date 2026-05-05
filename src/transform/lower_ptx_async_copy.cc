@@ -4,12 +4,12 @@
  */
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/target/target.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -21,13 +21,17 @@
 #include "../op/utils.h"
 #include "../target/utils.h"
 #include "ptx_async_copy_injector.h"
-#include "tir/ir/buffer_common.h"
-#include "tvm/tir/stmt.h"
+#include "tirx/ir/buffer_common.h"
+#include "tvm/tirx/stmt.h"
+#include "vendored/let_stmt.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+// Use TileLang vendored LetStmt (with `body` field). See vendored/let_stmt.h.
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 class PTXAsyncCopyInjector : public StmtMutator {
 public:
@@ -55,7 +59,7 @@ public:
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::async_scope) {
+    if (op->attr_key == tirx::attr::async_scope) {
       ++explicit_async_scope_depth_;
       Stmt body = this->VisitStmt(op->body);
       --explicit_async_scope_depth_;
@@ -451,7 +455,7 @@ private:
         return PrimExpr();
       }
       if (const auto *rhs_broadcast = rhs.as<BroadcastNode>()) {
-        return tir::Add(lhs_ramp->base, rhs_broadcast->value);
+        return tirx::Add(lhs_ramp->base, rhs_broadcast->value);
       }
     }
     if (const auto *rhs_ramp = rhs.as<RampNode>()) {
@@ -459,7 +463,7 @@ private:
         return PrimExpr();
       }
       if (const auto *lhs_broadcast = lhs.as<BroadcastNode>()) {
-        return tir::Add(rhs_ramp->base, lhs_broadcast->value);
+        return tirx::Add(rhs_ramp->base, lhs_broadcast->value);
       }
     }
     return PrimExpr();
@@ -637,7 +641,7 @@ private:
     if (const auto *loop = stmt.as<ForNode>()) {
       return AnalyzeCopyRegion(loop->body);
     }
-    if (const auto *block = stmt.as<BlockNode>()) {
+    if (const auto *block = stmt.as<SBlockNode>()) {
       if (block->init.defined()) {
         out = MergeCopyRegionAnalysis(out,
                                       AnalyzeCopyRegion(block->init.value()));
@@ -645,11 +649,11 @@ private:
       out = MergeCopyRegionAnalysis(out, AnalyzeCopyRegion(block->body));
       return out;
     }
-    if (const auto *realize = stmt.as<BlockRealizeNode>()) {
+    if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
       // Treat the predicate as pure control flow (no side effects). We only
       // care whether the realized body is a pure copy region so we can hoist
       // the final commit+wait out of sequential loop nests.
-      const BlockNode *block = realize->block.get();
+      const SBlockNode *block = realize->block.get();
       if (block->init.defined()) {
         out = MergeCopyRegionAnalysis(out,
                                       AnalyzeCopyRegion(block->init.value()));
@@ -696,7 +700,7 @@ private:
   bool uncommitted_sync_copies_{false};
 };
 
-using namespace tir::transform;
+using namespace tirx::transform;
 
 PTXAsyncCopyInjectResult
 InjectPTXAsyncCopy(const Stmt &body, bool enable_auto_async_copy,

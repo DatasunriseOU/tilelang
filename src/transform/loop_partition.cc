@@ -24,7 +24,7 @@
 
 #include "loop_partition.h"
 
-#include <tvm/tir/stmt_functor.h>
+#include <tvm/tirx/stmt_functor.h>
 
 #include <utility>
 
@@ -34,7 +34,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 class BufferIndiceSimplify : public StmtExprMutator {
 public:
@@ -177,7 +177,7 @@ private:
       }
       For new_for = tvm::ffi::GetRef<For>(node);
       auto for_ptr = new_for.CopyOnWrite();
-      for_ptr->annotations.Set(tir::attr::pragma_unroll_explicit, Bool(false));
+      for_ptr->annotations.Set(tirx::attr::pragma_unroll_explicit, Bool(false));
       for_ptr->kind = ForKind::kUnrolled;
       return new_for;
     }
@@ -272,8 +272,9 @@ Stmt LowerParallelLoop(For loop, const Fragment &loop_layout, Var thread_var,
                        arith::Analyzer *analyzer, const LayoutMap &layout_map,
                        Optional<PrimExpr> predicate, bool parallel_loop,
                        bool should_vectorize) {
-  // Save analyzer state to prevent conflicted bindings during vectorization
-  auto saved_analyzer = analyzer->Clone();
+  // CPPMEGA: arith::Analyzer::Clone() removed; use a fresh analyzer instance
+  // for the vectorization pass to avoid mutating the caller's analyzer state.
+  auto saved_analyzer = std::make_unique<arith::Analyzer>();
 
   For result_loop = loop;
   // Strip parallel-loop layout/predicate annotations on the original loop.

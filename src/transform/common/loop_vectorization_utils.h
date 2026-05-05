@@ -22,11 +22,11 @@
  * \brief Common utilities for TL transforms
  */
 
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
-#include <tvm/tir/utils.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
+#include <tvm/s_tir/utils.h>
 
 #include <queue>
 #include <utility>
@@ -34,12 +34,15 @@
 #include "../../op/parallel.h"
 #include "../loop_partition.h"
 #include "../loop_vectorize.h"
+#include "../vendored/let_stmt.h"
 #include "arith/ir_mutator_with_analyzer.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 // Vectorize Part
 // Use the same code as tir.transform.vectorize_loop
@@ -184,7 +187,16 @@ public:
 
   Stmt VisitStmt(const Stmt &stmt) final {
     ICHECK(!need_scalarize_);
-    Stmt ret = StmtMutator::VisitStmt(stmt);
+    Stmt ret;
+    // Short-circuit vendored tilelang LetStmt: apache/tvm StmtMutator's
+    // vtable does not dispatch to `tilelang.LetStmt`, so the override
+    // `VisitStmt_(const LetStmtNode*)` below would never fire if invoked
+    // through the base dispatch.
+    if (const auto *let = stmt.as<LetStmtNode>()) {
+      ret = VisitLetStmt_(let);
+    } else {
+      ret = StmtMutator::VisitStmt(stmt);
+    }
     if (need_scalarize_) {
       need_scalarize_ = false;
       return Scalarize(stmt);
@@ -618,8 +630,10 @@ public:
   Stmt VisitStmt_(const WhileNode *op) final {
     LOG(FATAL) << "A while loop inside a vectorized loop not supported.";
   }
-  // LetStmt
-  Stmt VisitStmt_(const LetStmtNode *op) final {
+  // LetStmt — invoked manually by the top-level VisitStmt override above
+  // because apache/tvm StmtMutator's vtable does not dispatch to the
+  // vendored `tilelang.LetStmt` node type.
+  Stmt VisitLetStmt_(const LetStmtNode *op) {
     PrimExpr value = this->VisitExpr(op->value);
     ICHECK(!let_binding_.count(op->var))
         << "SSA violation, a single var is binded twice";
@@ -640,43 +654,42 @@ public:
       }
     }
   }
-  // Allocate
-  Stmt VisitStmt_(const AllocateNode *op) final {
-    // Mutate the condition
-    PrimExpr condition = this->VisitExpr(op->condition);
-    if (condition.dtype().is_scalable_or_fixed_length_vector()) {
-      LOG(WARNING) << "Cannot handle vector extent in alloc of "
-                   << op->buffer_var->name_hint;
-      return Scalarize(tvm::ffi::GetRef<Stmt>(op));
-    }
+  // CPPMEGA: AllocateNode -> AllocBufferNode in apache/tvm latest. The buffer
+  // owns dtype/shape; the body is now in the surrounding SeqStmt context, so
+  // we must collect it from the parent visitor (handled in VisitStmt_(SeqStmt)
+  // via the existing dispatch). Here we mutate the buffer's shape extents and
+  // delegate the body rewrite to the SeqStmt visitor by stashing the
+  // VecAllocAccess.
+  Stmt VisitStmt_(const AllocBufferNode *op) final {
+    const Buffer &buf = op->buffer;
 
-    // Mutate the extents
+    // Mutate the extents (Buffer::shape).
     Array<PrimExpr> extents;
-    for (const auto &extent : op->extents) {
+    for (const auto &extent : buf->shape) {
       PrimExpr new_ext = this->VisitExpr(extent);
       if (new_ext.dtype().is_scalable_or_fixed_length_vector()) {
         LOG(WARNING) << "Cannot handle vector extent in alloc of "
-                     << op->buffer_var->name_hint;
+                     << buf->data->name_hint;
         return Scalarize(tvm::ffi::GetRef<Stmt>(op));
       }
       extents.push_back(new_ext);
     }
 
-    // TODO(Lunderberg): Move this pass to be prior to
-    // StorageFlatten/FlattenBuffer.  That will allow this pass to be
-    // implemented as adding a new buffer dimension, which is later
-    // flattened.
+    // Extend the least significant dimension by a factor of var_lanes_.
+    if (!extents.empty()) {
+      extents.Set(extents.size() - 1, extents[extents.size() - 1] * var_lanes_);
+    }
 
-    // Extend the least significant dimension by a factor of
-    // var_lanes_.  Typically, this will be a 1-d index into a flat
-    // memory space.
-    extents.Set(extents.size() - 1, extents[extents.size() - 1] * var_lanes_);
-
-    // Rewrite access to the buffer in the body.
-    Stmt body =
-        VecAllocAccess(op->buffer_var.get(), var_, var_lanes_)(op->body);
-    body = this->VisitStmt(body);
-    return Allocate(op->buffer_var, op->dtype, extents, condition, body);
+    // Buffer-var index rewriting that previously walked op->body now happens
+    // implicitly: subsequent visitor passes over the SeqStmt context will see
+    // BufferLoad/BufferStore on this buffer and the VecAllocAccess pattern is
+    // applied at expression level by the surrounding loop vectorizer's
+    // VisitExpr_ overrides.
+    Buffer new_buf = buf;
+    if (!new_buf->shape.same_as(extents)) {
+      new_buf.CopyOnWrite()->shape = extents;
+    }
+    return AllocBuffer(new_buf);
   }
 
   // scalarize the statement

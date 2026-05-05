@@ -29,12 +29,12 @@
 #define TVM_TL_OP_REGION_H_
 
 #include "./operator.h"
-#include <tvm/tir/buffer.h>
+#include <tvm/tirx/buffer.h>
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 class RegionOpNode : public TileOperatorNode {
 public:
@@ -83,7 +83,7 @@ public:
    */
   TVM_DLL
   RegionOp(Array<PrimExpr> args,
-           Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
+           Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 

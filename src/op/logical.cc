@@ -5,15 +5,15 @@
  */
 
 #include <tvm/ffi/function.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/op_attr_types.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/op_attr_types.h>
 
 #include "../support/ffi_aliases.h"
 
 namespace tvm {
 namespace tl {
-using namespace tir;
+using namespace tirx;
 
 PrimExpr any_of_op(PrimExpr args) {
   const CallNode *call = args.as<CallNode>();
@@ -22,8 +22,8 @@ PrimExpr any_of_op(PrimExpr args) {
   ICHECK_EQ(arg.size(), 2);
   PrimExpr buffer_address = arg[0];
   PrimExpr elems = arg[1];
-  return tir::Call(DataType::Bool(), tir::builtin::call_extern(),
-                   {StringImm("tl::Any"), buffer_address, elems});
+  return tirx::Call(DataType::Bool(), tirx::builtin::call_extern(),
+                    {StringImm("tl::Any"), buffer_address, elems});
 }
 
 PrimExpr all_of_op(PrimExpr args) {
@@ -33,8 +33,8 @@ PrimExpr all_of_op(PrimExpr args) {
   ICHECK_EQ(arg.size(), 2);
   PrimExpr buffer_address = arg[0];
   PrimExpr elems = arg[1];
-  return tir::Call(DataType::Bool(), tir::builtin::call_extern(),
-                   {StringImm("tl::All"), buffer_address, elems});
+  return tirx::Call(DataType::Bool(), tirx::builtin::call_extern(),
+                    {StringImm("tl::All"), buffer_address, elems});
 }
 
 TVM_REGISTER_OP("tl.any_of")

@@ -8,9 +8,9 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ir/transform.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/index_map.h>
-#include <tvm/tir/op.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/index_map.h>
+#include <tvm/tirx/op.h>
 
 #include <cmath>
 #include <cstdint>
@@ -28,7 +28,7 @@ namespace {
 
 // Helper to check if a statement subtree contains loop break ops
 // (either tl::loop_break() or builtin::break_loop())
-class LoopBreakDetector : public tir::StmtExprVisitor {
+class LoopBreakDetector : public tirx::StmtExprVisitor {
 public:
   bool found = false;
   void VisitExpr_(const CallNode *op) override {
@@ -1472,7 +1472,7 @@ void CodeGenTileLangCuTeDSL::VisitStmt_(const BufferStoreNode *op) {
       true_expr = sel->true_value;
       false_expr = sel->false_value;
     } else if (auto call = expr.as<CallNode>();
-               call && call->op.same_as(tir::builtin::if_then_else())) {
+               call && call->op.same_as(tirx::builtin::if_then_else())) {
       value_is_conditional = true;
       cond_expr = call->args[0];
       true_expr = call->args[1];
@@ -1748,12 +1748,12 @@ void CodeGenTileLangCuTeDSL::VisitStmt_(const AllocateNode *op) {
       PrintType(op->dtype, stream);
       stream << ")\n";
     } else if (scope == "local.var") {
-      PrimExpr init = tir::make_const(op->dtype, 0);
+      PrimExpr init = tirx::make_const(op->dtype, 0);
       auto init_it = op->annotations.find(tl::attr::kLocalVarInit);
       if (init_it != op->annotations.end()) {
         PrimExpr user_init = Downcast<PrimExpr>((*init_it).second);
         if (!user_init.dtype().is_void() && user_init.dtype() != op->dtype) {
-          user_init = tir::Cast(op->dtype, user_init);
+          user_init = tirx::Cast(op->dtype, user_init);
         }
         init = user_init;
       }
@@ -1768,7 +1768,7 @@ void CodeGenTileLangCuTeDSL::VisitStmt_(const AllocateNode *op) {
 }
 
 void CodeGenTileLangCuTeDSL::VisitStmt_(const AttrStmtNode *op) {
-  if (op->attr_key == tir::attr::thread_extent) {
+  if (op->attr_key == tirx::attr::thread_extent) {
     IterVar iv = Downcast<IterVar>(op->node);
     if (!iv->thread_tag.empty()) {
       if (!var_idmap_.count(iv->var.get())) {
@@ -1781,7 +1781,7 @@ void CodeGenTileLangCuTeDSL::VisitStmt_(const AttrStmtNode *op) {
     std::string func_name;
     int panel_size = 0;
     if (const auto *call = op->value.as<CallNode>()) {
-      if (call->op.same_as(tir::builtin::tvm_tuple()) &&
+      if (call->op.same_as(tirx::builtin::tvm_tuple()) &&
           call->args.size() >= 2) {
         const auto *name_node = call->args[0].as<StringImmNode>();
         const auto *size_node = call->args[1].as<IntImmNode>();
@@ -1852,7 +1852,7 @@ void CodeGenTileLangCuTeDSL::VisitStmt_(const ForNode *op) {
     return;
   }
 
-  if (op->kind != tir::ForKind::kUnrolled) {
+  if (op->kind != tirx::ForKind::kUnrolled) {
     CodeGenTileLangPY::VisitStmt_(op);
     return;
   }

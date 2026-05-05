@@ -24,9 +24,9 @@
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/target/target.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/transform.h>
 
 #include <limits>
 #include <unordered_set>
@@ -36,7 +36,7 @@
 
 namespace tvm {
 namespace tl {
-using namespace tir;
+using namespace tirx;
 using namespace ffi;
 
 class IntrinInjecter : public tvm::arith::IRMutatorWithAnalyzer {
@@ -63,7 +63,8 @@ public:
       if (Op::HasAttrMap(pattern)) {
         attr_maps_.push_back(Op::GetAttrMap<FLowerGeneral>(pattern));
         if (fma_ == nullptr) {
-          fma_ = (*attr_maps_.rbegin()).get(Op::Get("tir.fma"), nullptr);
+          // CPPMEGA: apache/tvm latest renamed `tir.fma` -> `tirx.fma`.
+          fma_ = (*attr_maps_.rbegin()).get(Op::Get("tirx.fma"), nullptr);
         }
       }
   }
@@ -184,7 +185,7 @@ public:
         // equivalent to rdiv + (rmod >= 0 ? 0: -1);
         return rdiv + (rmod >> make_const(dtype, dtype.bits() - 1));
       } else {
-        return tir::Select(rmod >= 0, rdiv, rdiv - make_const(dtype, 1));
+        return tirx::Select(rmod >= 0, rdiv, rdiv - make_const(dtype, 1));
       }
 
     } else {
@@ -194,13 +195,13 @@ public:
       } else {
         // uncommon case
         DLOG(INFO) << "LowerFloorDiv: Cannot decide the sign of divisor";
-        auto rmod = tir::Var("rmod", dtype);
-        auto rdiv = tir::Var("rdiv", dtype);
+        auto rmod = tirx::Var("rmod", dtype);
+        auto rdiv = tirx::Var("rdiv", dtype);
         // b >= 0 => (rmod >=0 ? rdiv : rdiv - 1)
         // b < 0  => (rmod <= 0 ? rdiv : rdiv - 1)
-        PrimExpr let_rdiv = tir::Let(
+        PrimExpr let_rdiv = tirx::Let(
             rdiv, truncdiv(op->a, op->b),
-            tir::Select((op->b >= 0 && rmod >= 0) || (op->b < 0 && rmod <= 0),
+            tirx::Select((op->b >= 0 && rmod >= 0) || (op->b < 0 && rmod <= 0),
                         rdiv, rdiv - make_const(dtype, 1)));
         return Let(rmod, truncmod(op->a, op->b), let_rdiv);
       }
@@ -292,7 +293,7 @@ public:
         // -> rmod >= 0 ? 0 : b
         return rmod + (op->b & (rmod >> make_const(dtype, dtype.bits() - 1)));
       } else {
-        return tir::Select(rmod >= 0, rmod, rmod + op->b);
+        return tirx::Select(rmod >= 0, rmod, rmod + op->b);
       }
 
     } else {
@@ -304,7 +305,7 @@ public:
         // uncommon case
         DLOG(INFO)
             << "LowerFloorMod: Cannot decide the sign of divsor and divident";
-        auto rmod = tir::Var("rmod", dtype);
+        auto rmod = tirx::Var("rmod", dtype);
         // b > 0 && rmod >= 0 -> rmod
         // b > 0 && rmod < 0  -> rmod + b
         // b < 0 && rmod < 0 -> rmod
@@ -413,8 +414,8 @@ Stmt LowerIntrinStmt(Stmt stmt, const std::string &target) {
 
 namespace transform {
 
-tir::transform::Pass LowerIntrin() {
-  using namespace tir::transform;
+tirx::transform::Pass LowerIntrin() {
+  using namespace tirx::transform;
   auto pass_func = [](PrimFunc f, IRModule m, PassContext ctx) {
     auto *n = f.CopyOnWrite();
     auto target = f->GetAttr<Target>(tvm::attr::kTarget);

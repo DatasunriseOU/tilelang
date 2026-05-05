@@ -6,7 +6,7 @@
 #include "parallel.h"
 
 #include <algorithm>
-#include <tvm/tir/op.h>
+#include <tvm/tirx/op.h>
 
 #include "../layout/layout.h"
 #include "arith/int_operator.h"
@@ -20,7 +20,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 namespace {
 
@@ -635,7 +635,7 @@ ParallelOpNode::ComputeLoopLayoutFromBuffer(const Buffer &buffer,
     try {
       result = Fragment(loop_vars_, {}, loop_var_to_thread, rep_iter)
                    ->BindThreadRange(T.thread_bounds);
-    } catch (const tvm::runtime::Error &err) {
+    } catch (const tvm::ffi::Error &err) {
       std::ostringstream msg;
       msg << "Layout inference for buffer `" << buffer->name
           << "` failed inside `T.parallel` loop.";

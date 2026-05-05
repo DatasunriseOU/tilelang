@@ -6,14 +6,16 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/stmt.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include "../support/ffi_aliases.h"
 
 namespace tvm {
 namespace tir {
+using namespace ::tvm::tirx;  // CPPMEGA: TileLang-local namespace tir block — alias for unqualified IR names
 
 class ClusterPlanner {
 public:
@@ -23,10 +25,11 @@ public:
     for (const auto &[_, buffer] : f->buffer_map) {
       buffer_data_to_buffer_.Set(buffer->data, buffer);
     }
-    Block block(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{}, /*name_hint=*/"",
-                /*body*/ f->body);
+    tvm::tirx::SBlock block(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{},
+                            /*name_hint=*/"",
+                            /*body*/ f->body);
     Array<Array<BufferRegion>> access =
-        GetBlockReadWriteRegion(block, buffer_data_to_buffer_);
+        tvm::tirx::GetSBlockReadWriteRegion(block, buffer_data_to_buffer_);
     auto reads = access[0];
 
     BlockIdxVisitor blockIdx_visitor;
@@ -98,7 +101,7 @@ private:
   public:
     BlockIdxVisitor() {};
     void VisitStmt_(const AttrStmtNode *attr) final {
-      if (attr->attr_key == attr::thread_extent) {
+      if (attr->attr_key == tvm::tirx::attr::thread_extent) {
         IterVar iv = Downcast<IterVar>(attr->node);
         String tag = iv->thread_tag;
         if (tag == "blockIdx.x" || tag == "blockIdx.y" || tag == "blockIdx.z")
@@ -119,10 +122,10 @@ PrimFunc ClusterPlanning(PrimFunc f) { return ClusterPlanner::Substitute(f); }
 namespace transform {
 
 tvm::transform::Pass ClusterPlanning() {
-  auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
-    return ClusterPlanning(std::move(f));
+  auto pass_func = [=](PrimFunc f, IRModule m, ::tvm::transform::PassContext ctx) {
+    return ::tvm::tir::ClusterPlanning(std::move(f));
   };
-  return CreatePrimFuncPass(pass_func, 0, "tl.ClusterPlanning", {});
+  return tirx::transform::CreatePrimFuncPass(pass_func, 0, "tl.ClusterPlanning", {});
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {

@@ -4,14 +4,14 @@
  */
 
 #include "utils.h"
-#include "tvm/tir/expr.h"
+#include "tvm/tirx/expr.h"
 
-#include <tvm/tir/builtin.h>
+#include <tvm/tirx/builtin.h>
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 bool IsBufferLikeExpr(const PrimExpr &expr) {
   if (expr.as<BufferLoadNode>() || expr.as<BufferRegionNode>()) {
@@ -109,7 +109,7 @@ PrimExpr MakeAccessPtrFromRegion(const BufferRegion &region, int rw_mask,
   }
 
   // ptype and return handle
-  PrimExpr ptype = tir::TypeAnnotation(buf->dtype);
+  PrimExpr ptype = tirx::TypeAnnotation(buf->dtype);
   Array<PrimExpr> acc_args{ptype, buf->data, offset, extent,
                            IntImm(DataType::Int(32), rw_mask)};
   return Call(DataType::Handle(), builtin::tvm_access_ptr(), acc_args);
@@ -139,7 +139,7 @@ PrimExpr MakeAccessPtrFromBufferLoad(const BufferLoad &load, int rw_mask) {
   PrimExpr extent = make_const(DataType::Int(32), 1);
 
   // Build access_ptr
-  PrimExpr ptype = tir::TypeAnnotation(buf->dtype);
+  PrimExpr ptype = tirx::TypeAnnotation(buf->dtype);
   Array<PrimExpr> acc_args{ptype, buf->data, offset, extent,
                            IntImm(DataType::Int(32), rw_mask)};
   return Call(DataType::Handle(), builtin::tvm_access_ptr(), acc_args);

@@ -25,8 +25,8 @@
 #define TVM_TL_TRANSFORM_ARG_BINDER_H_
 
 #include <tvm/arith/analyzer.h>
-#include <tvm/tir/buffer.h>
-#include <tvm/tir/expr.h>
+#include <tvm/tirx/buffer.h>
+#include <tvm/tirx/expr.h>
 
 #include <string>
 #include <unordered_map>
@@ -36,7 +36,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 /*!
  * \brief Helper utility to generate match and bind of arguments.
@@ -145,7 +145,7 @@ public:
    *     initialization list.  Any bindings implemented as a variable
    *     replacement will be stored in the `var_def` map.
    *
-   *     A `tir::LetStmt` is usually generated when binding to a
+   *     A `tirx::LetStmt` is usually generated when binding to a
    *     `DLTensor`.  This requires loading values from memory, which
    *     should only be performed once.  If the binding to a
    *     `DLTensor` were implemented as a variable replacement, it

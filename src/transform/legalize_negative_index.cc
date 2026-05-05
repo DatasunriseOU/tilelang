@@ -5,9 +5,9 @@
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include <unordered_map>
 #include <variant>
@@ -19,7 +19,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 using arith::IRVisitorWithAnalyzer;
 
 enum class IndexSignState { kNonNegative, kNegative, kUnknown };
@@ -222,7 +222,7 @@ PrimFunc LegalizeNegativeIndex(PrimFunc func) {
 }
 
 tvm::transform::Pass LegalizeNegativeIndexPass() {
-  using namespace tir::transform;
+  using namespace tirx::transform;
   auto pass_func = [](PrimFunc f, const IRModule &, PassContext) {
     return LegalizeNegativeIndex(std::move(f));
   };

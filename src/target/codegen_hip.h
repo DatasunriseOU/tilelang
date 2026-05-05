@@ -7,8 +7,8 @@
 
 #include <tvm/target/codegen.h>
 #include <tvm/target/target.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/op.h>
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/op.h>
 
 #include <string>
 #include <unordered_map>

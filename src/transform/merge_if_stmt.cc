@@ -6,18 +6,18 @@
 #include "merge_if_stmt.h"
 
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include "../op/builtin.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 class MergeIfStmtRewriter : public StmtExprMutator {
 public:
@@ -121,7 +121,7 @@ PrimFunc MergeIfStmtSubstitute(PrimFunc &f) {
 
 Stmt ApplyMergeIfStmt(Stmt stmt) { return MergeIfStmtRewriter::Apply(stmt); }
 
-using namespace tir::transform;
+using namespace tirx::transform;
 tvm::transform::Pass MergeIfStmt() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     return MergeIfStmtRewriter::Substitute(f);

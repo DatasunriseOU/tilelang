@@ -11,11 +11,11 @@
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/expr.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include "../op/gemm.h"
 #include "../op/operator.h"
@@ -24,7 +24,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 namespace attr {
 constexpr const char *kUse2Cta = "use_2cta";
@@ -39,7 +39,7 @@ static bool HasValidClusterDimsFor2Cta(const Stmt &body) {
   PostOrderVisit(body, [&](const ObjectRef &node) {
     if (found)
       return;
-    if (const auto *block = node.as<BlockNode>()) {
+    if (const auto *block = node.as<SBlockNode>()) {
       if (block->annotations.count("cluster_dims")) {
         if (auto arr = block->annotations.Get("cluster_dims")
                            ->try_cast<Array<Integer>>()) {
@@ -102,26 +102,26 @@ public:
   explicit Tcgen5_2SmAnnotator() {}
 
 private:
-  Stmt VisitStmt_(const BlockRealizeNode *op) final {
+  Stmt VisitStmt_(const SBlockRealizeNode *op) final {
     Stmt new_realize = StmtExprMutator::VisitStmt_(op);
     if (root_block_annotated_)
       return new_realize;
-    const auto *realize = new_realize.as<BlockRealizeNode>();
+    const auto *realize = new_realize.as<SBlockRealizeNode>();
     ICHECK(realize);
-    Block block = realize->block;
-    BlockNode *n = block.CopyOnWrite();
+    SBlock block = realize->block;
+    SBlockNode *n = block.CopyOnWrite();
     // Set block attr: {use_2cta: 1}
     // lower_shared_tmem.cc will depend on this to allocate/deallocate tmem with
     // 2cta.
     n->annotations.Set(attr::kUse2Cta, IntImm(DataType::Int(32), 1));
     root_block_annotated_ = true;
-    return BlockRealize(realize->iter_values, realize->predicate, block);
+    return SBlockRealize(realize->iter_values, realize->predicate, block);
   }
 
   bool root_block_annotated_ = false;
 };
 
-using namespace tir::transform;
+using namespace tirx::transform;
 
 tvm::transform::Pass LowerBlackwell2SM() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {

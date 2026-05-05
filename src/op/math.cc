@@ -5,15 +5,15 @@
  */
 
 #include <tvm/ffi/function.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/op_attr_types.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/op_attr_types.h>
 
 #include "../support/ffi_aliases.h"
 
 namespace tvm {
 namespace tl {
-using namespace tir;
+using namespace tirx;
 
 PrimExpr pow_of_int_op(PrimExpr args) {
   const CallNode *call = args.as<CallNode>();
@@ -24,7 +24,7 @@ PrimExpr pow_of_int_op(PrimExpr args) {
   PrimExpr exp = arg[1];
   String pow_of_int_name =
       "tl::pow_of_int<" + std::to_string(exp.as<IntImmNode>()->value) + ">";
-  return tir::Call(base.dtype(), tir::builtin::call_extern(),
+  return tirx::Call(base.dtype(), tirx::builtin::call_extern(),
                    {StringImm(pow_of_int_name), base});
 }
 

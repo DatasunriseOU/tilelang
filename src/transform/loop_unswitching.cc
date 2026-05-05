@@ -15,12 +15,13 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include "../op/builtin.h"
+#include "vendored/let_stmt.h"
 
 #include <unordered_map>
 #include <unordered_set>
@@ -28,7 +29,9 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 /*!
  * \brief Collect buffer data vars that are written in a statement
@@ -424,13 +427,23 @@ public:
     return StmtExprMutator::VisitStmt_(op);
   }
 
-  Stmt VisitStmt_(const LetStmtNode *op) final {
-    // Remove LetStmts for hoisted variables (they are now bound outside the
-    // loop)
-    if (hoisted_vars.count(op->var.get())) {
-      return VisitStmt(op->body);
+  Stmt VisitStmt(const Stmt &stmt) final {
+    if (const auto *op = stmt.as<LetStmtNode>()) {
+      // Remove LetStmts for hoisted variables (they are now bound outside the
+      // loop)
+      if (hoisted_vars.count(op->var.get())) {
+        return VisitStmt(op->body);
+      }
+      // Recurse manually since apache StmtFunctor vtable doesn't dispatch on
+      // the vendored LetStmtNode.
+      auto value = VisitExpr(op->value);
+      auto body = VisitStmt(op->body);
+      if (value.same_as(op->value) && body.same_as(op->body)) {
+        return stmt;
+      }
+      return LetStmt(op->var, value, body, op->span);
     }
-    return StmtExprMutator::VisitStmt_(op);
+    return StmtExprMutator::VisitStmt(stmt);
   }
 };
 
@@ -483,16 +496,23 @@ public:
       : loop_var(loop_var), written_vars(written_vars),
         disallowed_vars(disallowed_vars) {}
 
-  void VisitStmt_(const LetStmtNode *op) final {
-    // Track ALL Let bindings to detect when a condition uses a variable
-    // that is defined inside the loop with a loop-variant value.
-    // This is necessary because variables like i_s may be bound to expressions
-    // containing the loop variable (e.g., if_then_else(...k...)), and
-    // conditions using such variables should not be hoisted.
-    let_bindings_[op->var.get()] = op->value;
-    StmtVisitor::VisitStmt_(op);
-    // Remove the binding when leaving scope
-    let_bindings_.erase(op->var.get());
+  void VisitStmt(const Stmt &stmt) final {
+    if (const auto *op = stmt.as<LetStmtNode>()) {
+      // Track ALL Let bindings to detect when a condition uses a variable
+      // that is defined inside the loop with a loop-variant value.
+      // This is necessary because variables like i_s may be bound to
+      // expressions containing the loop variable (e.g., if_then_else(...k...)),
+      // and conditions using such variables should not be hoisted.
+      let_bindings_[op->var.get()] = op->value;
+      // Manually recurse: apache StmtFunctor vtable doesn't dispatch on the
+      // vendored LetStmtNode.
+      this->VisitExpr(op->value);
+      this->VisitStmt(op->body);
+      // Remove the binding when leaving scope
+      let_bindings_.erase(op->var.get());
+      return;
+    }
+    StmtVisitor::VisitStmt(stmt);
   }
 
   void VisitStmt_(const IfThenElseNode *op) final {
@@ -638,7 +658,7 @@ Stmt ApplyLoopUnswitching(Stmt stmt, bool allow_non_trivial_else) {
   return LoopUnswitcher(allow_non_trivial_else)(std::move(stmt));
 }
 
-using namespace tir::transform;
+using namespace tirx::transform;
 
 tvm::transform::Pass LoopUnswitching() {
   auto pass_func = [](PrimFunc f, const IRModule &m, const PassContext &ctx) {

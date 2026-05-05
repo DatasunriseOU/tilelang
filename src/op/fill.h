@@ -12,12 +12,12 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 /// Node class for fill operations
 class FillNode : public TileOperatorNode {
 public:
-  tir::Buffer dst;     ///< Destination buffer to fill
+  tirx::Buffer dst;     ///< Destination buffer to fill
   PrimExpr value;      ///< Value to fill with
   Array<Range> region; ///< Region to fill within the buffer
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.Fill", FillNode, TileOperatorNode);
@@ -46,7 +46,7 @@ class Fill : public TileOperator {
 public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(Fill, TileOperator, FillNode);
   TVM_DLL Fill(Array<PrimExpr> args,
-               Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
+               Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 

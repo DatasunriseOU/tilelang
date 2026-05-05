@@ -5,8 +5,9 @@
  */
 #include <tvm/arith/analyzer.h>
 #include <tvm/target/target.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/transform.h>
+#include <tvm/s_tir/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/transform.h>
 
 #include <functional>
 #include <map>
@@ -25,13 +26,16 @@
 #include "common/mbarrier.h"
 #include "common/pipeline_utils.h"
 #include "support/utils.h"
-#include "tir/schedule/utils.h"
-#include "tir/transforms/ir_utils.h"
+#include "s_tir/schedule/utils.h"
+#include "tirx/transform/ir_utils.h"
+#include "vendored/let_stmt.h"
 
 namespace tvm {
 namespace tl {
-using namespace tir;
+using namespace tirx;
 using namespace ffi;
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 namespace software_pipeline {
 
 namespace {
@@ -192,7 +196,7 @@ private:
     StmtExprVisitor::VisitExpr_(op);
   }
 
-  void VisitStmt_(const BlockNode *op) final {
+  void VisitStmt_(const SBlockNode *op) final {
     // Also collect buffers allocated in nested blocks within the pipeline body
     for (const auto &buffer : op->alloc_buffers) {
       used_buffers_.insert(buffer);
@@ -247,25 +251,25 @@ private:
  * \param buffer_data_to_buffer The map from buffer data to buffer.
  * \return The result block.
  */
-Block MakeBlock(const Stmt &body,
+SBlock MakeBlock(const Stmt &body,
                 const Map<Var, Buffer> &buffer_data_to_buffer) {
-  Block block;
-  if (const BlockRealizeNode *block_realize = body.as<BlockRealizeNode>()) {
+  SBlock block;
+  if (const SBlockRealizeNode *block_realize = body.as<SBlockRealizeNode>()) {
     if (is_one(block_realize->predicate)) {
       block = block_realize->block;
     }
   }
   if (!block.defined()) {
-    block = Block(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{},
+    block = SBlock(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{},
                   /*name_hint=*/"", /*body*/ body);
   }
   Array<Array<BufferRegion>> access =
-      GetBlockReadWriteRegion(block, buffer_data_to_buffer);
+      s_tir::GetSBlockReadWriteRegion(block, buffer_data_to_buffer);
   TileOpAccessCollector collector;
   collector(block->body);
   Array<BufferRegion> tile_reads = collector.GetReads();
   Array<BufferRegion> tile_writes = collector.GetWrites();
-  BlockNode *n = block.CopyOnWrite();
+  SBlockNode *n = block.CopyOnWrite();
   n->reads = access[0];
   n->reads.insert(n->reads.end(), tile_reads.begin(), tile_reads.end());
   n->writes = access[1];
@@ -281,7 +285,7 @@ struct PipelineAnnotation {
   int async_group_id{-1};
 };
 
-using PipelineInfo = std::unordered_map<Block, PipelineAnnotation,
+using PipelineInfo = std::unordered_map<SBlock, PipelineAnnotation,
                                         ObjectPtrHash, ObjectPtrEqual>;
 
 struct BufferAccessInfo {
@@ -301,10 +305,10 @@ bool ContainsExplicitAsyncIntrinsics(const Stmt &stmt) {
       return;
     }
     if (const auto *attr = obj.as<AttrStmtNode>()) {
-      if (attr->attr_key == tir::attr::async_scope ||
-          attr->attr_key == tir::attr::async_commit_queue_scope ||
-          attr->attr_key == tir::attr::async_wait_queue_scope ||
-          attr->attr_key == tir::attr::async_wait_inflight_count) {
+      if (attr->attr_key == tirx::attr::async_scope ||
+          attr->attr_key == tirx::attr::async_commit_queue_scope ||
+          attr->attr_key == tirx::attr::async_wait_queue_scope ||
+          attr->attr_key == tirx::attr::async_wait_inflight_count) {
         found = true;
         return;
       }
@@ -418,7 +422,7 @@ public:
 
 private:
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::async_commit_queue_scope) {
+    if (op->attr_key == tirx::attr::async_commit_queue_scope) {
       Stmt body = VisitStmt(op->body);
       Stmt commit =
           Evaluate(Call(DataType::Handle(), builtin::ptx_commit_group(), {}));
@@ -427,11 +431,11 @@ private:
       }
       return SeqStmt({body, commit});
     }
-    if (op->attr_key == tir::attr::async_wait_queue_scope) {
+    if (op->attr_key == tirx::attr::async_wait_queue_scope) {
       auto wait_attrs = GetAsyncWaitAttributes(op);
       Stmt body = op->body;
       if (const auto *inner = op->body.as<AttrStmtNode>()) {
-        if (inner->attr_key == tir::attr::async_wait_inflight_count) {
+        if (inner->attr_key == tirx::attr::async_wait_inflight_count) {
           body = inner->body;
         }
       }
@@ -443,7 +447,7 @@ private:
       }
       return SeqStmt({wait, body});
     }
-    if (op->attr_key == tir::attr::async_wait_inflight_count) {
+    if (op->attr_key == tirx::attr::async_wait_inflight_count) {
       return VisitStmt(op->body);
     }
     return StmtExprMutator::VisitStmt_(op);
@@ -535,12 +539,12 @@ private:
     return Call(call->dtype, call->op, new_args, call->annotations, call->span);
   }
 
-  Stmt VisitStmt_(const BlockNode *op) final {
+  Stmt VisitStmt_(const SBlockNode *op) final {
     for (const Buffer &alloc_buffer : op->alloc_buffers) {
       buffer_data_to_buffer_.Set(alloc_buffer->data, alloc_buffer);
     }
-    Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
-    BlockNode *n = block.CopyOnWrite();
+    SBlock block = Downcast<SBlock>(StmtExprMutator::VisitStmt_(op));
+    SBlockNode *n = block.CopyOnWrite();
     n->reads.MutateByApply([this](const BufferRegion &buffer_region) {
       return RewritePipelineBufferRegion(buffer_region);
     });
@@ -715,9 +719,9 @@ public:
       stmt = AttrStmt(Integer(0), kPipelineContextNumStages,
                       Downcast<PrimExpr>(pipeline_num_stages.value()), stmt);
     }
-    Block block = MakeBlock(stmt, buffer_data_to_buffer_);
+    SBlock block = MakeBlock(stmt, buffer_data_to_buffer_);
     block.CopyOnWrite()->alloc_buffers = std::move(alloc_buffers);
-    return BlockRealize({}, Bool(true), block);
+    return SBlockRealize({}, Bool(true), block);
   }
 
   /*!
@@ -739,7 +743,7 @@ private:
     std::unordered_map<Buffer, BufferAccessInfo, ObjectPtrHash, ObjectPtrEqual>
         infos;
     for (const auto &pair : pipeline_info_) {
-      const Block &block = pair.first;
+      const SBlock &block = pair.first;
       int stage = pair.second.stage;
       max_stage_ = std::max(max_stage_, stage);
 
@@ -820,7 +824,7 @@ private:
       // stage(block_j) and the access regions of block_i and block_j overlap.
       bool need_multi_version = false;
       for (const auto &pair1 : pipeline_info_) {
-        const Block &writer_block = pair1.first;
+        const SBlock &writer_block = pair1.first;
         const auto &writer_info = pair1.second;
 
         auto it1 = std::find_if(writer_block->writes.begin(),
@@ -833,7 +837,7 @@ private:
         }
 
         for (const auto &pair2 : pipeline_info_) {
-          const Block &reader_block = pair2.first;
+          const SBlock &reader_block = pair2.first;
           const auto &reader_info = pair2.second;
           auto it2 = std::find_if(
               reader_block->reads.begin(), reader_block->reads.end(),
@@ -865,7 +869,7 @@ private:
    * \return The resized buffer.
    */
   Buffer RewriteAllocBuffer(const Buffer &buffer, int num_versions) {
-    ObjectPtr<BufferNode> new_buffer =
+    tvm::ffi::ObjectPtr<BufferNode> new_buffer =
         tvm::ffi::make_object<BufferNode>(*(buffer.get()));
     new_buffer->shape.insert(new_buffer->shape.begin(), PrimExpr(num_versions));
     if (!new_buffer->strides.empty()) {
@@ -1000,10 +1004,10 @@ private:
         }
         return effect;
       }
-      if (const auto *block = stmt.as<BlockNode>()) {
+      if (const auto *block = stmt.as<SBlockNode>()) {
         return Analyze(block->body);
       }
-      if (const auto *realize = stmt.as<BlockRealizeNode>()) {
+      if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
         if (!is_one(realize->predicate)) {
           return DeterministicNoWaitCommitEffect::Unknown();
         }
@@ -1126,15 +1130,15 @@ private:
   }
 
   static bool IsAsyncCommitQueueScope(const AttrStmtNode *attr) {
-    return attr && attr->attr_key == tir::attr::async_commit_queue_scope;
+    return attr && attr->attr_key == tirx::attr::async_commit_queue_scope;
   }
 
   static bool IsAsyncWaitQueueScope(const AttrStmtNode *attr) {
-    return attr && attr->attr_key == tir::attr::async_wait_queue_scope;
+    return attr && attr->attr_key == tirx::attr::async_wait_queue_scope;
   }
 
   static bool IsAsyncWaitInflightCount(const AttrStmtNode *attr) {
-    return attr && attr->attr_key == tir::attr::async_wait_inflight_count;
+    return attr && attr->attr_key == tirx::attr::async_wait_inflight_count;
   }
 
   static int
@@ -1224,10 +1228,10 @@ private:
       }
       return AnalyzeHeadAsyncSync(seq->seq[0], seq_mode);
     }
-    if (const auto *block = stmt.as<BlockNode>()) {
+    if (const auto *block = stmt.as<SBlockNode>()) {
       return AnalyzeHeadAsyncSync(block->body, seq_mode);
     }
-    if (const auto *realize = stmt.as<BlockRealizeNode>()) {
+    if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
       if (is_one(realize->predicate)) {
         return AnalyzeHeadAsyncSync(realize->block->body, seq_mode);
       }
@@ -1363,24 +1367,24 @@ private:
       }
       return stmt;
     }
-    if (const auto *block = stmt.as<BlockNode>()) {
+    if (const auto *block = stmt.as<SBlockNode>()) {
       Stmt inner =
           RewriteWaitStaticInSimpleWrapper(block->body, new_wait_n, changed);
       if (*changed) {
-        Block new_block = Downcast<Block>(stmt);
+        SBlock new_block = Downcast<SBlock>(stmt);
         new_block.CopyOnWrite()->body = inner;
         return new_block;
       }
       return stmt;
     }
-    if (const auto *realize = stmt.as<BlockRealizeNode>()) {
+    if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
       if (is_one(realize->predicate)) {
         Stmt inner = RewriteWaitStaticInSimpleWrapper(realize->block->body,
                                                       new_wait_n, changed);
         if (*changed) {
-          Block new_block = realize->block;
+          SBlock new_block = realize->block;
           new_block.CopyOnWrite()->body = inner;
-          return BlockRealize(realize->iter_values, realize->predicate,
+          return SBlockRealize(realize->iter_values, realize->predicate,
                               new_block, realize->span);
         }
       }
@@ -1426,10 +1430,10 @@ private:
       }
       return std::nullopt;
     }
-    if (const auto *block = stmt.as<BlockNode>()) {
+    if (const auto *block = stmt.as<SBlockNode>()) {
       return TryGetFirstStaticWaitCount(block->body);
     }
-    if (const auto *realize = stmt.as<BlockRealizeNode>()) {
+    if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
       if (is_one(realize->predicate)) {
         return TryGetFirstStaticWaitCount(realize->block->body);
       }
@@ -1472,24 +1476,24 @@ private:
       }
       return stmt;
     }
-    if (const auto *block = stmt.as<BlockNode>()) {
+    if (const auto *block = stmt.as<SBlockNode>()) {
       Stmt new_body =
           RewriteHeadStaticWaitInWrapper(block->body, new_wait_n, changed);
       if (*changed) {
-        Block new_block = Downcast<Block>(stmt);
+        SBlock new_block = Downcast<SBlock>(stmt);
         new_block.CopyOnWrite()->body = new_body;
         return new_block;
       }
       return stmt;
     }
-    if (const auto *realize = stmt.as<BlockRealizeNode>()) {
+    if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
       if (is_one(realize->predicate)) {
         Stmt new_body = RewriteHeadStaticWaitInWrapper(realize->block->body,
                                                        new_wait_n, changed);
         if (*changed) {
-          Block new_block = realize->block;
+          SBlock new_block = realize->block;
           new_block.CopyOnWrite()->body = new_body;
-          return BlockRealize(realize->iter_values, realize->predicate,
+          return SBlockRealize(realize->iter_values, realize->predicate,
                               new_block, realize->span);
         }
       }
@@ -1539,24 +1543,24 @@ private:
       }
       return stmt;
     }
-    if (const auto *block = stmt.as<BlockNode>()) {
+    if (const auto *block = stmt.as<SBlockNode>()) {
       Stmt new_body =
           RewriteFirstStaticWaitInWrapper(block->body, new_wait_n, changed);
       if (*changed) {
-        Block new_block = Downcast<Block>(stmt);
+        SBlock new_block = Downcast<SBlock>(stmt);
         new_block.CopyOnWrite()->body = new_body;
         return new_block;
       }
       return stmt;
     }
-    if (const auto *realize = stmt.as<BlockRealizeNode>()) {
+    if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
       if (is_one(realize->predicate)) {
         Stmt new_body = RewriteFirstStaticWaitInWrapper(realize->block->body,
                                                         new_wait_n, changed);
         if (*changed) {
-          Block new_block = realize->block;
+          SBlock new_block = realize->block;
           new_block.CopyOnWrite()->body = new_body;
-          return BlockRealize(realize->iter_values, realize->predicate,
+          return SBlockRealize(realize->iter_values, realize->predicate,
                               new_block, realize->span);
         }
       }
@@ -1684,24 +1688,24 @@ private:
       }
       return stmt;
     }
-    if (const auto *block = stmt.as<BlockNode>()) {
+    if (const auto *block = stmt.as<SBlockNode>()) {
       Stmt new_body = RelaxLoopWaitsInSimpleWrapper(
           block->body, pre_outstanding_lb, changed);
       if (*changed) {
-        Block new_block = Downcast<Block>(stmt);
+        SBlock new_block = Downcast<SBlock>(stmt);
         new_block.CopyOnWrite()->body = new_body;
         return new_block;
       }
       return stmt;
     }
-    if (const auto *realize = stmt.as<BlockRealizeNode>()) {
+    if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
       if (is_one(realize->predicate)) {
         Stmt new_body = RelaxLoopWaitsInSimpleWrapper(
             realize->block->body, pre_outstanding_lb, changed);
         if (*changed) {
-          Block new_block = realize->block;
+          SBlock new_block = realize->block;
           new_block.CopyOnWrite()->body = new_body;
-          return BlockRealize(realize->iter_values, realize->predicate,
+          return SBlockRealize(realize->iter_values, realize->predicate,
                               new_block, realize->span);
         }
       }
@@ -1910,8 +1914,8 @@ private:
     std::map<int, std::map<int, PrimExpr>> waits_before_stmt;
     auto make_wait_stmt = [](int stage_id, PrimExpr wait_count, Stmt body) {
       auto zero = make_zero(DataType::Int(32));
-      return AttrStmt(zero, tir::attr::async_wait_queue_scope, stage_id,
-                      AttrStmt(zero, tir::attr::async_wait_inflight_count,
+      return AttrStmt(zero, tirx::attr::async_wait_queue_scope, stage_id,
+                      AttrStmt(zero, tirx::attr::async_wait_inflight_count,
                                wait_count, body));
     };
     auto merge_wait_before_stmt = [&](int insert_before, int stage_id,
@@ -1999,7 +2003,7 @@ private:
           group_stmts.size() == 1 ? group_stmts[0] : SeqStmt(group_stmts);
       Stmt commit_queue_scope =
           AttrStmt(make_zero(DataType::Int(32)),
-                   tir::attr::async_commit_queue_scope, stage_id, group_body);
+                   tirx::attr::async_commit_queue_scope, stage_id, group_body);
       if (!is_one(predicate) && !ana_normalized->CanProve(predicate)) {
         PrimExpr simplified_predicate = ana_normalized->Simplify(predicate);
         if (!is_zero(simplified_predicate)) {
@@ -2026,7 +2030,7 @@ private:
     Optional<Integer> pipeline_num_stages =
         GetPipelineNumStages(pipeline_loop_.get());
     auto make_nop = []() {
-      return BlockRealize({}, Bool(true), MakeBlock(Evaluate(0), {}));
+      return SBlockRealize({}, Bool(true), MakeBlock(Evaluate(0), {}));
     };
 
     if (unroll_loop) {
@@ -2090,7 +2094,7 @@ private:
     std::map<int, AsyncStateLocal> async_states_local;
     std::unordered_map<const BufferNode *, int> buffer_to_commit_group;
 
-    for (const Block &block : ordered_stmts_) {
+    for (const SBlock &block : ordered_stmts_) {
       const auto &pipeline_anno = pipeline_info_.at(block);
       int stage = pipeline_anno.stage;
       PrimExpr inbound = Bool(true);
@@ -2100,7 +2104,7 @@ private:
             pipeline_loop_->min <= skewed_loop_var,
             (skewed_loop_var < pipeline_loop_->min + pipeline_loop_->extent));
 
-      Block new_block = Downcast<Block>(
+      SBlock new_block = Downcast<SBlock>(
           PipelineBodyRewriter(buffer_data_to_buffer_, buffer_remap_,
                                pipeline_loop_, max_stage_ != 1)(block));
 
@@ -2121,10 +2125,10 @@ private:
       if (is_zero(inbound)) {
         continue;
       }
-      new_block = Downcast<Block>(Substitute(
+      new_block = Downcast<SBlock>(Substitute(
           new_block, {{pipeline_loop_->loop_var, normalized_access_index}}));
 
-      Stmt rewritten_stmt = BlockRealize({}, inbound, new_block);
+      Stmt rewritten_stmt = SBlockRealize({}, inbound, new_block);
       rewritten_stmt = WrapLoopDependentWrappers(std::move(rewritten_stmt),
                                                  normalized_access_index);
       rewritten_stmt = WrapPipelineStageContext(std::move(rewritten_stmt),
@@ -2174,7 +2178,7 @@ private:
         rewritten_stmt =
             SimtProducerAnnotator::Annotate(rewritten_stmt, target_);
         rewritten_stmt = AttrStmt(make_zero(DataType::Int(32)),
-                                  tir::attr::async_scope, 1, rewritten_stmt);
+                                  tirx::attr::async_scope, 1, rewritten_stmt);
       }
       if (pipeline_mbar_phase) {
         rewritten_stmt = TileOpMbarPhaseAnnotator::Annotate(
@@ -2219,9 +2223,9 @@ private:
       Map<String, Any> preserved_annotations;
       for (const auto &kv : pipeline_loop_->annotations) {
         const String &key = kv.first;
-        if (kv.first != tir::attr::software_pipeline_stage &&
-            kv.first != tir::attr::software_pipeline_order &&
-            kv.first != tir::attr::software_pipeline_async_stages &&
+        if (kv.first != tirx::attr::software_pipeline_stage &&
+            kv.first != tirx::attr::software_pipeline_order &&
+            kv.first != tirx::attr::software_pipeline_async_stages &&
             kv.first != kPipelineAsyncProducers &&
             kv.first != kPipelineAsyncProducerGroups &&
             kv.first != kPipelineTmaCopies && kv.first != "num_stages") {
@@ -2238,7 +2242,7 @@ private:
                      unroll_loop ? ForKind::kUnrolled : pipeline_loop_->kind,
                      std::move(new_loop), std::nullopt, preserved_annotations);
     }
-    Stmt result = BlockRealize({}, Bool(true),
+    Stmt result = SBlockRealize({}, Bool(true),
                                MakeBlock(new_loop, buffer_data_to_buffer_));
     if (pipeline_num_stages) {
       if (pipeline_num_stages.value()->value > 1) {
@@ -2262,7 +2266,7 @@ private:
   int max_stage_ = -1;
   Map<Buffer, Buffer> buffer_remap_;
   Optional<Target> target_;
-  Array<Block> ordered_stmts_;
+  Array<SBlock> ordered_stmts_;
   std::vector<LetWrapper> loop_var_let_wrappers_;
   std::vector<IfWrapper> loop_var_if_wrappers_;
   std::map<int, AsyncStateGlobal> async_states_;
@@ -2275,19 +2279,19 @@ private:
  * source to the destination. \param[out] dep_dst2src Optional, a map to store
  * dependency edges from the destination to the source.
  */
-void BuildDependencyGraph(const Array<Block> &blocks,
-                          std::unordered_map<Block, Array<Block>, ObjectPtrHash,
+void BuildDependencyGraph(const Array<SBlock> &blocks,
+                          std::unordered_map<SBlock, Array<SBlock>, ObjectPtrHash,
                                              ObjectPtrEqual> *dep_src2dst,
-                          std::unordered_map<Block, Array<Block>, ObjectPtrHash,
+                          std::unordered_map<SBlock, Array<SBlock>, ObjectPtrHash,
                                              ObjectPtrEqual> *dep_dst2src) {
-  std::unordered_map<Var, Array<Block>, ObjectPtrHash, ObjectPtrEqual>
+  std::unordered_map<Var, Array<SBlock>, ObjectPtrHash, ObjectPtrEqual>
       buffer_writers;
 
-  for (const Block &block : blocks) {
+  for (const SBlock &block : blocks) {
     for (const BufferRegion &read : block->reads) {
       auto it = buffer_writers.find(read->buffer->data);
       if (it != buffer_writers.end()) {
-        for (const Block &writer : it->second) {
+        for (const SBlock &writer : it->second) {
           if (dep_src2dst != nullptr) {
             (*dep_src2dst)[writer].push_back(block);
           }
@@ -2359,7 +2363,7 @@ private:
 class BarrierBufferCollector : public StmtExprVisitor {
 public:
   static std::vector<Buffer>
-  Collect(const Array<Block> &blocks,
+  Collect(const Array<SBlock> &blocks,
           const Map<Var, Buffer> &buffer_data_to_buffer) {
     BarrierBufferCollector c(buffer_data_to_buffer);
     for (const auto &block : blocks) {
@@ -2457,7 +2461,7 @@ public:
 
     // Rewrite barrier refs inside annotations (e.g., tma_copy "barrier").
     bool anno_changed = false;
-    Map<String, ObjectRef> new_annos = call->annotations;
+    Map<String, ffi::ObjectRef> new_annos = call->annotations;
     for (const auto &[key, val] : call->annotations) {
       if (auto load = val.as<BufferLoadNode>()) {
         auto it = old_to_new_.find(load->buffer.get());
@@ -2492,7 +2496,7 @@ public:
           arith::Analyzer analyzer;
           PrimExpr user_parity = call->args[1];
           PrimExpr user_parity_at_min = analyzer.Simplify(
-              tir::Substitute(user_parity, {{loop_var_, loop_min_}}));
+              tirx::Substitute(user_parity, {{loop_var_, loop_min_}}));
           // New parity = (iteration_block + offset) % 2
           PrimExpr offset = IntImm(DataType::Int(32), 0);
           if (const int64_t *imm = as_const_int(user_parity_at_min)) {
@@ -2527,7 +2531,7 @@ private:
 /// Returns a map of old→new barrier buffers for outer block alloc_buffers
 /// update.
 Map<Buffer, Buffer> ExpandPipelineBarriers(
-    Array<Block> &original_order, PipelineInfo &pipeline_info,
+    Array<SBlock> &original_order, PipelineInfo &pipeline_info,
     Map<Var, Buffer> &buffer_data_to_buffer,
     std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>
         &allocated_buffers,
@@ -2600,7 +2604,7 @@ Map<Buffer, Buffer> ExpandPipelineBarriers(
   std::unordered_map<const BufferNode *, PrimExpr> old_shapes;
   for (const Buffer &buf : barriers) {
     old_shapes[buf.get()] = buf->shape[0];
-    ObjectPtr<BufferNode> new_node =
+    tvm::ffi::ObjectPtr<BufferNode> new_node =
         tvm::ffi::make_object<BufferNode>(*(buf.get()));
     new_node->shape = {PrimExpr(num_stages) * buf->shape[0]};
     Buffer new_buf(new_node);
@@ -2618,7 +2622,7 @@ Map<Buffer, Buffer> ExpandPipelineBarriers(
   BarrierIndexRewriter rewriter(old_to_new, old_shapes, stage_expr,
                                 parity_cycle, loop_var, loop_min);
   for (size_t i = 0; i < original_order.size(); ++i) {
-    Block old_block = original_order[i];
+    SBlock old_block = original_order[i];
     Stmt new_body = rewriter(old_block->body);
     if (!new_body.same_as(old_block->body)) {
       // Also rewrite alloc_buffers in the block (barriers may be allocated
@@ -2628,7 +2632,7 @@ Map<Buffer, Buffer> ExpandPipelineBarriers(
         auto it = old_to_new.find(ab.get());
         new_allocs.push_back(it != old_to_new.end() ? it->second : ab);
       }
-      Block new_block(old_block->iter_vars, old_block->reads, old_block->writes,
+      SBlock new_block(old_block->iter_vars, old_block->reads, old_block->writes,
                       old_block->name_hint, new_body, old_block->init,
                       new_allocs, old_block->match_buffers,
                       old_block->annotations);
@@ -2673,7 +2677,7 @@ Map<Buffer, Buffer> ExpandPipelineBarriers(
  * \return The newly created barrier buffer (undefined if no TMA copies).
  */
 Buffer RewritePipelineTmaBarriers(
-    Array<Block> &original_order, PipelineInfo &pipeline_info,
+    Array<SBlock> &original_order, PipelineInfo &pipeline_info,
     const Array<Integer> &tma_copies, Map<Var, Buffer> &buffer_data_to_buffer,
     std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>
         &allocated_buffers,
@@ -2711,13 +2715,13 @@ Buffer RewritePipelineTmaBarriers(
       continue;
 
     bool is_last = (static_cast<int>(i) == last_tma_idx);
-    Block old_block = original_order[i];
+    SBlock old_block = original_order[i];
     CopyToTmaCopyRewriter rewriter(barrier_buf,
                                    /*barrier_id=*/IntImm(DataType::Int(32), 0),
                                    /*emit_arrive=*/is_last);
     Stmt new_body = rewriter(old_block->body);
 
-    Block new_block(old_block->iter_vars, old_block->reads, old_block->writes,
+    SBlock new_block(old_block->iter_vars, old_block->reads, old_block->writes,
                     old_block->name_hint, new_body, old_block->init,
                     old_block->alloc_buffers, old_block->match_buffers,
                     old_block->annotations);
@@ -2735,7 +2739,7 @@ Buffer RewritePipelineTmaBarriers(
   for (size_t i = 0; i < original_order.size(); i++) {
     if (waits_inserted)
       break;
-    Block old_block = original_order[i];
+    SBlock old_block = original_order[i];
     int stage = pipeline_info.at(old_block).stage;
     if (stage == 0)
       continue; // still in producer stage
@@ -2754,7 +2758,7 @@ Buffer RewritePipelineTmaBarriers(
     wait_stmts.push_back(old_block->body);
     Stmt new_body = SeqStmt(wait_stmts);
 
-    Block new_block(old_block->iter_vars, old_block->reads, old_block->writes,
+    SBlock new_block(old_block->iter_vars, old_block->reads, old_block->writes,
                     old_block->name_hint, new_body, old_block->init,
                     old_block->alloc_buffers, old_block->match_buffers,
                     old_block->annotations);
@@ -2796,12 +2800,12 @@ private:
    * stage(B) and order(A) < order(B)
    */
   void ValidatePipelineBody(const PipelineInfo &pipeline_info,
-                            const Array<Block> &original_order) {
+                            const Array<SBlock> &original_order) {
     std::unordered_set<int> used_orders;
     std::unordered_map<int, int> stage_max_order;
-    std::unordered_map<int, const Block *> order_to_block;
-    std::unordered_map<const Block *, int> block_to_stage;
-    for (const Block &block : original_order) {
+    std::unordered_map<int, const SBlock *> order_to_block;
+    std::unordered_map<const SBlock *, int> block_to_stage;
+    for (const SBlock &block : original_order) {
       const auto &stmt_info = pipeline_info.at(block);
       int order = stmt_info.order;
       CHECK(!used_orders.count(order))
@@ -2810,15 +2814,15 @@ private:
       used_orders.insert(order);
     }
 
-    std::unordered_map<Block, Array<Block>, ObjectPtrHash, ObjectPtrEqual>
+    std::unordered_map<SBlock, Array<SBlock>, ObjectPtrHash, ObjectPtrEqual>
         dep_src2dst;
     BuildDependencyGraph(original_order, &dep_src2dst, nullptr);
 
     for (const auto &pair : dep_src2dst) {
-      const Block &src = pair.first;
+      const SBlock &src = pair.first;
       const auto &src_info = pipeline_info.at(src);
-      const Array<Block> &dsts = pair.second;
-      for (const Block &dst : dsts) {
+      const Array<SBlock> &dsts = pair.second;
+      for (const SBlock &dst : dsts) {
         const auto &dst_info = pipeline_info.at(dst);
         CHECK_LE(src_info.stage, dst_info.stage)
             << "ValueError: statement " << dst << " in stage " << dst_info.stage
@@ -2852,9 +2856,9 @@ private:
     Map<String, Any> preserved_annotations;
     for (const auto &kv : annotations) {
       const String &key = kv.first;
-      if (key != tir::attr::software_pipeline_stage &&
-          key != tir::attr::software_pipeline_order &&
-          key != tir::attr::software_pipeline_async_stages &&
+      if (key != tirx::attr::software_pipeline_stage &&
+          key != tirx::attr::software_pipeline_order &&
+          key != tirx::attr::software_pipeline_async_stages &&
           key != kPipelineAsyncProducers &&
           key != kPipelineAsyncProducerGroups && key != kPipelineTmaCopies &&
           key != "num_stages" && key != "tl_pipelined_num_stages") {
@@ -2871,14 +2875,14 @@ private:
       return for_node;
     }
     // Step 2: Find the body and buffer allocations of the pipeline. The body
-    // can be direct child of the for-loop. If the for-loop has BlockRealize as
+    // can be direct child of the for-loop. If the for-loop has SBlockRealize as
     // its child, the pipeline body will be the child of the block.
     Stmt pipeline_body_root{nullptr};
     bool pipeline_body_from_block = false;
     Array<Buffer> pipeline_allocs;
     Array<Buffer>
         block_local_allocs; // buffers allocated in the pipeline block itself
-    if (const auto *realize = for_node->body.as<BlockRealizeNode>()) {
+    if (const auto *realize = for_node->body.as<SBlockRealizeNode>()) {
       const auto &block = realize->block;
       for (const auto &buffer : block->alloc_buffers) {
         ICHECK(buffer->IsInstance<BufferNode>());
@@ -2995,17 +2999,17 @@ private:
     // Step 3: Blockize the components of the pipeline. Each child of the
     // pipelined loop will be converted into a block.
     PipelineInfo pipeline_info;
-    Array<Block> original_order; // pipeline body blocks in the original order
+    Array<SBlock> original_order; // pipeline body blocks in the original order
 
     auto f_add_child = [&](const Stmt &child) {
       original_order.push_back(MakeBlock(child, buffer_data_to_buffer_));
     };
     for (size_t i = 0; i < pipeline_body_seq->seq.size(); i++) {
       const Stmt &child = pipeline_body_seq->seq[i];
-      const auto *nested_block_realize = child.as<BlockRealizeNode>();
+      const auto *nested_block_realize = child.as<SBlockRealizeNode>();
       if (nested_block_realize && is_one(nested_block_realize->predicate) &&
           nested_block_realize->block->body->IsInstance<SeqStmtNode>()) {
-        const Block &nested_pipeline_block = nested_block_realize->block;
+        const SBlock &nested_pipeline_block = nested_block_realize->block;
         ICHECK(nested_pipeline_block->match_buffers
                    .empty()); // match_buffer should have been lowered
         for (const auto &buffer : nested_pipeline_block->alloc_buffers) {
@@ -3023,9 +3027,9 @@ private:
     pipeline_allocs = collector.Collect(SeqStmt(pipeline_body_seq->seq));
 
     auto pipeline_stages = Downcast<Array<Integer>>(
-        op->annotations.at(tir::attr::software_pipeline_stage));
+        op->annotations.at(tirx::attr::software_pipeline_stage));
     auto pipeline_orders = Downcast<Array<Integer>>(
-        op->annotations.at(tir::attr::software_pipeline_order));
+        op->annotations.at(tirx::attr::software_pipeline_order));
     CHECK_EQ(pipeline_stages.size(), original_order.size())
         << "PrimFunc " << global_symbol_ << " has original order "
         << original_order.Map(
@@ -3041,7 +3045,7 @@ private:
 
     std::unordered_set<int> pipeline_async_stages;
     if (auto async_annot =
-            op->annotations.Get(tir::attr::software_pipeline_async_stages)) {
+            op->annotations.Get(tirx::attr::software_pipeline_async_stages)) {
       for (const Integer &stage :
            Downcast<Array<Integer>>(async_annot.value())) {
         pipeline_async_stages.insert(static_cast<int>(stage->value));
@@ -3100,7 +3104,7 @@ private:
     ValidatePipelineBody(pipeline_info, original_order);
 
     if (!HasOverlappableStages(pipeline_info)) {
-      if (const auto *realize = op->body.as<BlockRealizeNode>()) {
+      if (const auto *realize = op->body.as<SBlockRealizeNode>()) {
         const auto &block = realize->block;
         for (const auto &buffer : block->alloc_buffers) {
           buffer_data_to_buffer_.erase(buffer->data);
@@ -3188,10 +3192,10 @@ private:
     // Add nested block allocs to local_allocs
     for (size_t i = 0; i < pipeline_body_seq->seq.size(); i++) {
       const Stmt &child = pipeline_body_seq->seq[i];
-      const auto *nested_block_realize = child.as<BlockRealizeNode>();
+      const auto *nested_block_realize = child.as<SBlockRealizeNode>();
       if (nested_block_realize && is_one(nested_block_realize->predicate) &&
           nested_block_realize->block->body->IsInstance<SeqStmtNode>()) {
-        const Block &nested_pipeline_block = nested_block_realize->block;
+        const SBlock &nested_pipeline_block = nested_block_realize->block;
         for (const auto &buffer : nested_pipeline_block->alloc_buffers) {
           local_allocs.push_back(buffer);
         }
@@ -3228,9 +3232,9 @@ private:
     // counts across the expanded slots.
     {
       auto [outer_attrs, inner_stmt] = unwrap_outer_attrs(pipeline);
-      BlockRealize br = Downcast<BlockRealize>(inner_stmt);
-      Block block = br->block;
-      BlockNode *bn = block.CopyOnWrite();
+      SBlockRealize br = Downcast<SBlockRealize>(inner_stmt);
+      SBlock block = br->block;
+      SBlockNode *bn = block.CopyOnWrite();
 
       Map<Var, Array<PrimExpr>> barrier_init_map;
       if (bn->annotations.count("barrier_init")) {
@@ -3280,7 +3284,7 @@ private:
       if (changed) {
         bn->annotations.Set("barrier_init", updated_init);
         pipeline = rewrap_outer_attrs(
-            BlockRealize(br->iter_values, br->predicate, block, br->span),
+            SBlockRealize(br->iter_values, br->predicate, block, br->span),
             outer_attrs);
       }
     }
@@ -3298,14 +3302,14 @@ private:
     if (!rewrap_fns.empty()) {
       if (pipeline_body_from_block) {
         auto [outer_attrs, inner_stmt] = unwrap_outer_attrs(pipeline);
-        BlockRealize pipeline_realize = Downcast<BlockRealize>(inner_stmt);
-        Block pipeline_block = pipeline_realize->block;
+        SBlockRealize pipeline_realize = Downcast<SBlockRealize>(inner_stmt);
+        SBlock pipeline_block = pipeline_realize->block;
         {
-          BlockNode *block_node = pipeline_block.CopyOnWrite();
+          SBlockNode *block_node = pipeline_block.CopyOnWrite();
           block_node->body = apply_wrappers(block_node->body);
         }
         pipeline = rewrap_outer_attrs(
-            BlockRealize(pipeline_realize->iter_values,
+            SBlockRealize(pipeline_realize->iter_values,
                          pipeline_realize->predicate, pipeline_block,
                          pipeline_realize->span),
             outer_attrs);
@@ -3316,7 +3320,7 @@ private:
 
     pipeline = AsyncCommitWaitAttrLowerer::Lower(pipeline);
 
-    if (const auto *realize = op->body.as<BlockRealizeNode>()) {
+    if (const auto *realize = op->body.as<SBlockRealizeNode>()) {
       const auto &block = realize->block;
       for (const auto &buffer : block->alloc_buffers) {
         buffer_data_to_buffer_.erase(buffer->data);
@@ -3326,7 +3330,7 @@ private:
     return pipeline;
   }
 
-  Stmt VisitStmt_(const BlockNode *op) final {
+  Stmt VisitStmt_(const SBlockNode *op) final {
     for (const auto &buffer : op->alloc_buffers) {
       buffer_data_to_buffer_.Set(buffer->data, buffer);
       allocated_buffers_.insert(buffer);
@@ -3334,7 +3338,7 @@ private:
 
     bool outer_flag = subtree_modified_;
     subtree_modified_ = false;
-    Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
+    SBlock block = Downcast<SBlock>(StmtExprMutator::VisitStmt_(op));
     bool children_modified = subtree_modified_;
     // Propagate to parent: if this subtree was modified, parent should know.
     subtree_modified_ = outer_flag || children_modified;
@@ -3398,7 +3402,7 @@ private:
         new_init.Set(var, counts);
       }
       if (init_changed) {
-        BlockNode *bn = block.CopyOnWrite();
+        SBlockNode *bn = block.CopyOnWrite();
         bn->annotations.Set("barrier_init", new_init);
         bn->alloc_buffers = new_alloc_buffers;
         allocs_changed = false; // already applied
@@ -3429,7 +3433,7 @@ private:
       }
       // Also collect data vars from all nested blocks.
       PostOrderVisit(block->body, [&](const ObjectRef &obj) {
-        if (auto *inner = obj.as<BlockNode>()) {
+        if (auto *inner = obj.as<SBlockNode>()) {
           for (const auto &buf : inner->alloc_buffers) {
             local_data_vars.insert(buf->data.get());
           }
@@ -3474,7 +3478,7 @@ private:
         return false;
       };
       Array<Array<BufferRegion>> access =
-          GetBlockReadWriteRegion(block, buffer_data_to_buffer_);
+          s_tir::GetSBlockReadWriteRegion(block, buffer_data_to_buffer_);
       auto sanitize = [&](const Array<BufferRegion> &regions) {
         Array<BufferRegion> out;
         for (const auto &br : regions) {
@@ -3489,7 +3493,7 @@ private:
         }
         return out;
       };
-      BlockNode *n = block.CopyOnWrite();
+      SBlockNode *n = block.CopyOnWrite();
       n->reads = sanitize(access[0]);
       n->writes = sanitize(access[1]);
       n->alloc_buffers = std::move(new_alloc_buffers);
@@ -3503,8 +3507,8 @@ private:
   }
 
   bool HasPipelineAnnotation(const ForNode *op) const {
-    auto it1 = op->annotations.find(tir::attr::software_pipeline_stage);
-    auto it2 = op->annotations.find(tir::attr::software_pipeline_order);
+    auto it1 = op->annotations.find(tirx::attr::software_pipeline_stage);
+    auto it2 = op->annotations.find(tirx::attr::software_pipeline_order);
     bool has_stage = it1 != op->annotations.end();
     bool has_order = it2 != op->annotations.end();
     if (has_stage && has_order) {
@@ -3541,8 +3545,8 @@ private:
  * \brief Transform annotated loops into pipelined one that parallelize
  * producers and consumers. \return The IR transform pass.
  */
-tir::transform::Pass InjectSoftwarePipeline() {
-  using namespace tir::transform;
+tirx::transform::Pass InjectSoftwarePipeline() {
+  using namespace tirx::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     auto *fptr = f.CopyOnWrite();
     fptr->body = software_pipeline::PipelineInjector::Inject(f);

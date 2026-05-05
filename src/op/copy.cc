@@ -18,16 +18,16 @@
 #include "utils.h"
 
 #include "builtin.h"
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/op_attr_types.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/op_attr_types.h>
+#include <tvm/tirx/transform.h>
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 namespace {
 
@@ -66,7 +66,7 @@ static int64_t TMAElementsForBytes(int64_t bytes, DataType dtype) {
   return bytes * 8 / dtype.bits();
 }
 
-PrimExpr GetCopyMbarPhaseExpr(const Map<String, ObjectRef> &annotations,
+PrimExpr GetCopyMbarPhaseExpr(const Map<String, ffi::ObjectRef> &annotations,
                               const LowerArgs &T) {
   PrimExpr phase = T.mbar_phase_expr;
   if (auto explicit_phase = GetAnnotatedMbarPhaseExpr(annotations)) {
@@ -81,7 +81,7 @@ PrimExpr GetCopyMbarPhaseExpr(const Map<String, ObjectRef> &annotations,
 // args[0]: source region, args[1]: destination region
 // annotations: Map containing coalesced_width, disable_tma, eviction_policy,
 // etc.
-Copy::Copy(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
+Copy::Copy(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {
   ObjectPtr<CopyNode> node = tvm::ffi::make_object<CopyNode>();
   auto src_access = NormalizeToAccessRegion(args[0], kAccessRead);
   auto dst_access = NormalizeToAccessRegion(args[1], kAccessWrite);
@@ -290,7 +290,7 @@ For CopyNode::MakeSIMTLoop(arith::Analyzer *analyzer) const {
   }
 
   for (int i = loop_vars.size() - 1; i >= 0; i--) {
-    Map<String, ObjectRef> loop_annotations;
+    Map<String, ffi::ObjectRef> loop_annotations;
 
     // Only attach the parallel related annotations on the outermost loop (i ==
     // 0)
@@ -1165,7 +1165,7 @@ Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
       // conflict.
       bool dst_depends_on_thread = false;
       for (const auto &range : dst_range) {
-        if (tir::UsesVar(range->min, [&](const VarNode *v) {
+        if (tirx::UsesVar(range->min, [&](const VarNode *v) {
               return v == T.thread_var.get();
             })) {
           dst_depends_on_thread = true;
@@ -1409,7 +1409,7 @@ Stmt CopyNode::LowerTmemCopy(const LowerArgs &T,
   if (src.scope() != "shared.tmem" && dst.scope() != "shared.tmem") {
     return Stmt();
   }
-  ICHECK(TargetHasTmem(T.target)) << "Target " << T.target->ToDebugString()
+  ICHECK(TargetHasTmem(T.target)) << "Target " << T.target->str()
                                   << " does not support tensor memory copy";
 
   // Decide copy type
@@ -1928,7 +1928,7 @@ Stmt CopyNode::LowerBulkCopy(const LowerArgs &T, arith::Analyzer *analyzer,
     if (!is_load)
       args.push_back(need_reduce);
     args.push_back(GetEvictionPolicy());
-    Map<String, ObjectRef> ann_loop;
+    Map<String, ffi::ObjectRef> ann_loop;
     if (is_cluster_barrier && TargetIsSm100(T.target) && is_load) {
       ann_loop.Set("use_2cta", IntImm(DataType::Int(32), 1));
     }
@@ -1944,7 +1944,7 @@ Stmt CopyNode::LowerBulkCopy(const LowerArgs &T, arith::Analyzer *analyzer,
     if (!is_load)
       args.push_back(need_reduce);
     args.push_back(GetEvictionPolicy());
-    Map<String, ObjectRef> ann;
+    Map<String, ffi::ObjectRef> ann;
     if (TargetIsSm100(T.target) && is_load &&
         (annotations.find("use_2cta") != annotations.end() ||
          is_cluster_barrier)) {
@@ -2248,7 +2248,7 @@ Array<PrimExpr> TMADesc::EncodeCallArgs() const {
 // args: src, dst, nhw_step, c_step, kernel, stride, dilation, padding,
 // eviction_policy
 Conv2DIm2ColOp::Conv2DIm2ColOp(Array<PrimExpr> args,
-                               Map<String, ObjectRef> annotations) {
+                               Map<String, ffi::ObjectRef> annotations) {
   ObjectPtr<Conv2DIm2ColOpNode> node =
       tvm::ffi::make_object<Conv2DIm2ColOpNode>();
   auto src_access = NormalizeToAccessRegion(args[0], kAccessRead);
@@ -2541,8 +2541,8 @@ TVM_REGISTER_OP("tl.tileop.async_copy")
     .set_attr<TScriptPrinterName>("TScriptPrinterName", "async_copy")
     .set_attr<OpBuilderFunc>("TLOpBuilder",
                              [](Array<PrimExpr> args,
-                                Map<String, ObjectRef> annotations) {
-                               Map<String, ObjectRef> ann = annotations;
+                                Map<String, ffi::ObjectRef> annotations) {
+                               Map<String, ffi::ObjectRef> ann = annotations;
                                ann.Set("is_async_copy",
                                        IntImm(DataType::Int(32), 1));
                                return Copy(args, ann);
@@ -2557,8 +2557,8 @@ TVM_REGISTER_OP("tl.tileop.tma_copy")
     .set_attr<TScriptPrinterName>("TScriptPrinterName", "tma_copy")
     .set_attr<OpBuilderFunc>("TLOpBuilder",
                              [](Array<PrimExpr> args,
-                                Map<String, ObjectRef> annotations) {
-                               Map<String, ObjectRef> ann = annotations;
+                                Map<String, ffi::ObjectRef> annotations) {
+                               Map<String, ffi::ObjectRef> ann = annotations;
                                ann.Set("is_tma_copy",
                                        IntImm(DataType::Int(32), 1));
                                return Copy(args, ann);

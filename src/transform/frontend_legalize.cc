@@ -23,16 +23,20 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include "arith/ir_mutator_with_analyzer.h"
+#include "vendored/let_stmt.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+// Use TileLang vendored LetStmt (with `body` field). See vendored/let_stmt.h.
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 class LetInliner : public arith::IRMutatorWithAnalyzer {
 public:
@@ -66,9 +70,20 @@ private:
     }
   }
 
-  Stmt VisitStmt_(const LetStmtNode *node) final {
+  // CPPMEGA: vendored `tl_tir::LetStmt` is not part of apache/tvm's TIR class
+  // hierarchy any more, so we cannot mark this `final` (the base mutator has
+  // no matching virtual to override). Instead we intercept LetStmt in
+  // `VisitStmt(const Stmt&)` below — that visitor is virtual on the base.
+  Stmt VisitStmt_(const LetStmtNode *node) {
     let_bindings_[node->var.get()] = node->value;
     return arith::IRMutatorWithAnalyzer::VisitStmt(node->body);
+  }
+
+  Stmt VisitStmt(const Stmt &stmt) override {
+    if (const auto *node = stmt.as<LetStmtNode>()) {
+      return VisitStmt_(node);
+    }
+    return arith::IRMutatorWithAnalyzer::VisitStmt(stmt);
   }
 
   PrimExpr VisitExpr_(const LetNode *node) final {
@@ -80,7 +95,7 @@ private:
   std::unordered_map<const VarNode *, PrimExpr> let_bindings_;
 };
 
-using namespace tir::transform;
+using namespace tirx::transform;
 
 Pass LetInline() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {

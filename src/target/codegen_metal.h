@@ -53,7 +53,13 @@ public:
   void PrintVecElemStore(const std::string &vec, DataType t, int i,
                          const std::string &value) final;
   // overload visitor
-  void VisitStmt_(const AllocateNode *op) final;    // NOLINT(*)
+  // CPPMEGA: drop `final` — `AllocateNode` here resolves to the vendored
+  // `tilelang::tl_tir::AllocateNode`, so this overload does NOT actually
+  // override a virtual base method. With `final` on a non-virtual function,
+  // clang errors that it hides the apache base virtuals (WhileNode/IfThenElse
+  // etc. all in codegen_c.h). The vendored type is dispatched via the short-
+  // circuit `VisitStmt(const Stmt&)` pattern established elsewhere.
+  void VisitStmt_(const AllocateNode *op);          // NOLINT(*)
   void VisitStmt_(const BufferStoreNode *op) final; // NOLINT(*)
   void VisitExpr_(const BufferLoadNode *op,
                   std::ostream &os) final;                          // NOLINT(*)

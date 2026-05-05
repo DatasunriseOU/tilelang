@@ -23,21 +23,21 @@
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/attrs.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include <string>
 #include <utility>
 
 #include "../op/builtin.h"
 #include "common/attr.h"
-#include "tir/transforms/ir_utils.h"
+#include "tirx/transform/ir_utils.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
-using namespace tir::attr;
+using namespace tirx;
+using namespace tirx::attr;
 /*!
  * \brief Remove Block to ensure that the TIR can not be scheduled again.
  */
@@ -63,13 +63,13 @@ public:
   }
 
 private:
-  Stmt VisitStmt_(const BlockRealizeNode *op) final {
+  Stmt VisitStmt_(const SBlockRealizeNode *op) final {
     // We have convert blocks into opaque blocks in previous passes.
     ICHECK(op->iter_values.empty())
         << "Non-opaque blocks are not allowed in FlattenBuffer. Please "
            "call pass ConvertBlocksToOpaque before.";
     // Step 1. Visit the body
-    Block new_block = Downcast<Block>(this->VisitStmt(op->block));
+    SBlock new_block = Downcast<SBlock>(this->VisitStmt(op->block));
     PrimExpr predicate = this->VisitExpr(op->predicate);
     // Step 2. Transform the `predicate` to if-then-else
     Stmt body = new_block->body;
@@ -82,11 +82,19 @@ private:
     HandleAnnotations(new_block->annotations, &pragma_attrs, /*is_block=*/true,
                       new_block->alloc_buffers);
 
-    // Step 4. Handle allocations in reverse order
+    // CPPMEGA: emit apache `AllocBuffer + SeqStmt` directly instead of the
+    // vendored `tl_tir::Allocate`. apache `StmtFunctor` has no dispatch entry
+    // for `tilelang.Allocate`, and several passes after this one
+    // (`tir.transform.NarrowDataType`, `tir.transform.Simplify`, ...) crash
+    // with "NodeFunctor calls un-registered function on type tilelang.Allocate".
+    // Mirrors the rewrite that `tl.transform.LowerTileLangAllocate` would
+    // perform — see `lower_allocate.cc::LowerTileLangAllocateMutator`.
     for (size_t i = new_block->alloc_buffers.size(); i > 0; --i) {
       const Buffer &buffer = new_block->alloc_buffers[i - 1];
       Array<PrimExpr> allocation_shape = GetBufferAllocationShape(buffer);
-      body = DeclBuffer(buffer, std::move(body));
+      // DeclBuffer no longer has a body in apache/tvm; emit it as a
+      // standalone stmt followed by `body` via SeqStmt.
+      body = SeqStmt::Flatten(Array<Stmt>{DeclBuffer(buffer), body});
       Map<String, ffi::Any> allocate_annotations;
       auto it = storage_align_.find(buffer->data);
       if (it != storage_align_.end()) {
@@ -95,15 +103,26 @@ private:
           tuple.Set<0>(-1);
           allocate_aligns.push_back(tuple);
         }
-        allocate_annotations.Set(tir::attr::buffer_dim_align, allocate_aligns);
+        allocate_annotations.Set(tirx::attr::buffer_dim_align, allocate_aligns);
       }
       auto init_it = local_var_init_map_.find(buffer->data);
       if (init_it != local_var_init_map_.end()) {
         const PrimExpr &init = (*init_it).second;
         allocate_annotations.Set(tl::attr::kLocalVarInit, init);
       }
-      body = Allocate(buffer->data, buffer->dtype, allocation_shape,
-                      const_true(), std::move(body), allocate_annotations);
+      // Build a Buffer using the (possibly stride-corrected) allocation shape;
+      // matches the legacy `Allocate(buffer_var, dtype, allocation_shape, ...)`
+      // semantics. condition is `const_true()` (trivial) so no IfThenElse wrap.
+      Buffer alloc_buf_obj(/*data=*/buffer->data,
+                           /*dtype=*/buffer->dtype,
+                           /*shape=*/allocation_shape,
+                           /*strides=*/{},
+                           /*elem_offset=*/PrimExpr(),
+                           /*name=*/buffer->data->name_hint,
+                           /*data_alignment=*/0,
+                           /*offset_factor=*/0,
+                           /*buffer_type=*/BufferType::kDefault);
+      body = SeqStmt({AllocBuffer(alloc_buf_obj, allocate_annotations), body});
     }
     // Step 5. Materialize a lexical scope boundary only for blocks that were
     // explicitly marked by an earlier semantic lowering pass (for example
@@ -120,8 +139,8 @@ private:
     }
     return body;
   }
-  Stmt VisitStmt_(const BlockNode *op) final {
-    Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    SBlock block = Downcast<SBlock>(StmtExprMutator::VisitStmt_(op));
     if (block->annotations.count("stmt_group")) {
       return block->body;
     }
@@ -173,7 +192,7 @@ private:
       return true;
     }
     if (annotations.size() == 1) {
-      auto it = annotations.find(tir::attr::pragma_unroll_explicit);
+      auto it = annotations.find(tirx::attr::pragma_unroll_explicit);
       if (it != annotations.end()) {
         return true;
       }
@@ -204,8 +223,8 @@ private:
                      /*thread_tag=*/thread_tag);
     String attr_key = (thread_tag == "vthread" || thread_tag == "vthread.x" ||
                        thread_tag == "vthread.y" || thread_tag == "vthread.z")
-                          ? tir::attr::virtual_thread
-                          : tir::attr::thread_extent;
+                          ? tirx::attr::virtual_thread
+                          : tirx::attr::thread_extent;
     return AttrStmt(/*node=*/std::move(iter_var),
                     /*attr_key=*/std::move(attr_key),
                     /*value=*/std::move(extent),
@@ -245,7 +264,7 @@ private:
     pragma_attrs->clear();
     for (const auto &kv : annotations) {
       const String &key = kv.first;
-      if (tir::attr::IsPragmaKey(key) || tl::attr::IsCodeBlockKey(key)) {
+      if (tirx::attr::IsPragmaKey(key) || tl::attr::IsCodeBlockKey(key)) {
         pragma_attrs->emplace_back(key, ConvertAttrValue(key, kv.second));
       } else if (key == tl::attr::kLocalVarInit) {
         if (auto local_init_map = kv.second.try_cast<Map<Var, PrimExpr>>()) {
@@ -326,8 +345,8 @@ PrimFunc TLLowerOpaqueBlock(PrimFunc f) {
   return OpaqueBlockLower::Rewrite(std::move(f));
 }
 
-tir::transform::Pass LowerOpaqueBlock() {
-  using namespace tir::transform;
+tirx::transform::Pass LowerOpaqueBlock() {
+  using namespace tirx::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     return TLLowerOpaqueBlock(std::move(f));
   };

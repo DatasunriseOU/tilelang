@@ -14,7 +14,7 @@ namespace tvm {
 
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 class GemmSPWarpPolicyNode : public GemmWarpPolicyNode {
 public:
@@ -33,9 +33,9 @@ public:
   }
 };
 
-class GemmSPWarpPolicy : public ObjectRef {
+class GemmSPWarpPolicy : public ffi::ObjectRef {
 public:
-  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(GemmSPWarpPolicy, ObjectRef,
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(GemmSPWarpPolicy, ffi::ObjectRef,
                                              GemmSPWarpPolicyNode);
 
   explicit GemmSPWarpPolicy(GemmWarpPolicyType policy_type) {
@@ -62,7 +62,7 @@ public:
 class GemmSPNode : public TileOperatorNode {
 public:
   BufferRegion aRegion_, bRegion_, cRegion_, eRegion_;
-  tir::Buffer a_, b_, c_, e_;
+  tirx::Buffer a_, b_, c_, e_;
   bool transA_, transB_;
   int m_, n_, k_;
   bool clearAccum_ = false;
@@ -111,7 +111,7 @@ class GemmSP : public TileOperator {
 public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(GemmSP, TileOperator, GemmSPNode);
   TVM_DLL GemmSP(Array<PrimExpr> args,
-                 Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
+                 Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 

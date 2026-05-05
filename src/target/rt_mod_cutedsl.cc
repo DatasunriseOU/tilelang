@@ -11,9 +11,9 @@ ExtractFuncInfo(const IRModule &mod) {
   std::unordered_map<std::string, runtime::FunctionInfo> fmap;
 
   for (auto kv : mod->functions) {
-    ICHECK(kv.second->IsInstance<tir::PrimFuncNode>())
+    ICHECK(kv.second->IsInstance<tirx::PrimFuncNode>())
         << "Can only lower IR Module with PrimFuncs";
-    auto f = Downcast<tir::PrimFunc>(kv.second);
+    auto f = Downcast<tirx::PrimFunc>(kv.second);
 
     runtime::FunctionInfo info;
     for (size_t i = 0; i < f->params.size(); ++i) {
@@ -27,7 +27,7 @@ ExtractFuncInfo(const IRModule &mod) {
       info.arg_types.push_back(f->params[i].dtype());
     }
     if (auto opt = f->GetAttr<ffi::Array<ffi::String>>(
-            tir::attr::kKernelLaunchParams)) {
+            tirx::attr::kKernelLaunchParams)) {
       for (const auto &tag : opt.value()) {
         info.launch_param_tags.push_back(tag);
       }
