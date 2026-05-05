@@ -58,6 +58,8 @@ using ::tilelang::tl_tir::LetStmtNode;
 using runtime::StorageRank;
 using runtime::StorageScope;
 
+namespace {
+
 static bool IsDynamicSharedMemory(Var buffer_var) {
   StorageScope storage_scope =
       runtime::StorageScope::Create(GetPtrStorageScope(std::move(buffer_var)));
@@ -151,12 +153,16 @@ public:
     this->VisitStmt(op->block);
   }
 
+  void VisitStmt_(const EvaluateNode *op) final { this->VisitExpr(op->value); }
+
   void VisitStmt(const Stmt &stmt) override {
     if (const auto *op = stmt.as<AllocateNode>()) {
       VisitStmt_(op);
     } else if (const auto *op = stmt.as<LetStmtNode>()) {
       this->VisitExpr(op->value);
       this->VisitStmt(op->body);
+    } else if (const auto *op = stmt.as<EvaluateNode>()) {
+      this->VisitExpr(op->value);
     } else {
       StmtExprVisitor::VisitStmt(stmt);
     }
@@ -268,6 +274,8 @@ public:
         this->VisitExpr(op->value);
         this->VisitStmt(op->body);
       });
+    } else if (const auto *op = stmt.as<EvaluateNode>()) {
+      VisitStmt_(op);
     } else {
       StmtExprVisitor::VisitStmt(stmt);
     }
@@ -275,8 +283,14 @@ public:
 
   void VisitStmt_(const BufferStoreNode *op) final {
     scope_.push_back(StmtEntry());
-    // visit subexpr
-    StmtExprVisitor::VisitStmt_(op);
+    // Visit children explicitly.  A qualified base-call here bypasses this
+    // migration pass's VisitStmt guard and can land on apache's default
+    // tirx.Evaluate/tilelang node dispatch.
+    this->VisitBufferUse(op->buffer);
+    this->VisitExpr(op->value);
+    for (const PrimExpr &index : op->indices) {
+      this->VisitExpr(index);
+    }
     // Add write access.
     const VarNode *buf = op->buffer->data.get();
     auto it = alloc_info_.find(buf);
@@ -304,8 +318,7 @@ public:
 
   void VisitStmt_(const EvaluateNode *op) final {
     scope_.push_back(StmtEntry());
-    // visit subexpr
-    StmtExprVisitor::VisitStmt_(op);
+    this->VisitExpr(op->value);
     StmtEntry e = scope_.back();
     scope_.pop_back();
     if (!e.touched.empty()) {
@@ -350,6 +363,18 @@ public:
     }
   }
 
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(builtin::address_of()) && op->args.size() == 1U) {
+      if (const auto *load = op->args[0].as<BufferLoadNode>()) {
+        for (const PrimExpr &index : load->indices) {
+          this->VisitExpr(index);
+        }
+        return;
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
   void VisitExpr_(const VarNode *buf) final {
     // Directly reference to the variable count as a read.
     auto it = alloc_info_.find(buf);
@@ -378,8 +403,49 @@ public:
     }
   }
 
-  template <typename T> void VisitNewScope(const T *op) {
-    VisitNewScopeBody(op, [&]() { StmtExprVisitor::VisitStmt_(op); });
+  void VisitNewScope(const AttrStmtNode *op) {
+    VisitNewScopeBody(op, [&]() {
+      this->VisitExpr(op->value);
+      this->VisitStmt(op->body);
+    });
+  }
+
+  void VisitNewScope(const IfThenElseNode *op) {
+    VisitNewScopeBody(op, [&]() {
+      this->VisitExpr(op->condition);
+      this->VisitStmt(op->then_case);
+      if (op->else_case.defined()) {
+        this->VisitStmt(op->else_case.value());
+      }
+    });
+  }
+
+  void VisitNewScope(const ForNode *op) {
+    VisitNewScopeBody(op, [&]() {
+      this->VisitExpr(op->min);
+      this->VisitExpr(op->extent);
+      if (op->step.has_value()) {
+        this->VisitExpr(op->step.value());
+      }
+      this->VisitStmt(op->body);
+    });
+  }
+
+  void VisitNewScope(const WhileNode *op) {
+    VisitNewScopeBody(op, [&]() {
+      this->VisitExpr(op->condition);
+      this->VisitStmt(op->body);
+    });
+  }
+
+  void VisitNewScope(const AssertStmtNode *op) {
+    VisitNewScopeBody(op, [&]() {
+      this->VisitExpr(op->condition);
+      this->VisitExpr(op->error_kind);
+      for (const StringImm &message_part : op->message_parts) {
+        this->VisitExpr(message_part);
+      }
+    });
   }
 
   template <typename T, typename F> void VisitNewScopeBody(const T *op, F f) {
@@ -418,7 +484,8 @@ public:
     } else if (op->attr_key == "kWarpSpecializationScope") {
       VisitWarpSpecializationBody(op->body);
     } else {
-      StmtExprVisitor::VisitStmt_(op);
+      this->VisitExpr(op->value);
+      this->VisitStmt(op->body);
     }
   }
 
@@ -481,7 +548,7 @@ private:
       VisitWarpSpecializationBody(let_node->body);
       return;
     }
-    StmtExprVisitor::VisitStmt(stmt);
+    this->VisitStmt(stmt);
   }
 
   // Wrapper function to determine if the shared memory allocation for a
@@ -530,7 +597,7 @@ private:
     }
   }
 
-  void VisitExpr_(const CallNode *op) {
+  void VisitExpr_(const CallNode *op) final {
     if (op->op.same_as(tl::tl_gemm()) || op->op.same_as(tl::tl_gemm_sp()) ||
         op->op.same_as(tl::tma_load()) || op->op.same_as(tl::tma_store()) ||
         op->op.same_as(tl::initialize_wgmma_descriptor()) ||
@@ -545,12 +612,12 @@ private:
     }
   }
 
-  void VisitExpr_(const VarNode *op) {
+  void VisitExpr_(const VarNode *op) final {
     MarkSharedVarIfNeeded(op);
     StmtExprVisitor::VisitExpr_(op);
   }
 
-  void VisitExpr_(const BufferLoadNode *op) {
+  void VisitExpr_(const BufferLoadNode *op) final {
     // If we encounter address_of(BufferLoad(...)) or any direct BufferLoad
     // within an alignment scope, make sure we mark the underlying shared var.
     if (op && under_alignment_scope_) {
@@ -579,6 +646,8 @@ private:
     this->VisitStmt(op->block);
   }
 
+  void VisitStmt_(const EvaluateNode *op) final { this->VisitExpr(op->value); }
+
   void VisitStmt(const Stmt &stmt) override {
     if (const auto *op = stmt.as<AllocateNode>()) {
       this->VisitStmt(op->body);
@@ -587,6 +656,10 @@ private:
     if (const auto *op = stmt.as<LetStmtNode>()) {
       this->VisitExpr(op->value);
       this->VisitStmt(op->body);
+      return;
+    }
+    if (const auto *op = stmt.as<EvaluateNode>()) {
+      this->VisitExpr(op->value);
       return;
     }
     StmtExprVisitor::VisitStmt(stmt);
@@ -682,7 +755,7 @@ private:
       Buffer merged_buf(merged_buf_var_, DataType::UInt(8),
                         {merged_alloc_size_}, {}, PrimExpr(),
                         merged_buf_var_->name_hint, 0, 0, BufferType::kDefault);
-      Stmt visited_body = StmtExprMutator::VisitStmt(op->body);
+      Stmt visited_body = this->VisitStmt(op->body);
       ffi::Map<ffi::String, ffi::Any> annotations;
       if (has_volatile_alloc_) {
         annotations.Set(tirx::attr::kVolatile, Bool(true));
@@ -752,6 +825,13 @@ private:
         return ffi::GetRef<Stmt>(op);
       }
       return LetStmt(op->var, value, body);
+    }
+    if (const auto *op = stmt.as<EvaluateNode>()) {
+      PrimExpr value = this->VisitExpr(op->value);
+      if (value.same_as(op->value)) {
+        return ffi::GetRef<Stmt>(op);
+      }
+      return Evaluate(value, op->span);
     }
     return StmtExprMutator::VisitStmt(stmt);
   }
@@ -824,24 +904,25 @@ private:
   }
 
   Buffer GetUpdatedBuffer(Buffer buffer) {
-    auto key = buffer.get();
-    auto it = buffer_remap_.find(key);
-    if (it != buffer_remap_.end()) {
+    Buffer original_buffer = buffer;
+    auto it = merged_buffer_remap_.find(original_buffer);
+    if (it != merged_buffer_remap_.end()) {
       return it->second;
     }
 
+    Buffer updated_buffer = buffer;
     if (IsAppropriateSharedMemory(buffer->data)) {
       ICHECK_EQ(buffer->shape.size(), 1)
           << "Buffer " << buffer << " has shape " << buffer->shape << ".  "
           << "MergeSharedMemoryAllocations expects flat memory buffers, "
           << "and is to be run after "
           << "StorageFlatten (TE schedules) or FlattenBuffer (TIR schedules)";
-      auto writer = buffer.CopyOnWrite();
+      auto writer = updated_buffer.CopyOnWrite();
       writer->data = merged_buf_var_;
     }
 
-    buffer_remap_[key] = buffer;
-    return buffer;
+    merged_buffer_remap_[original_buffer] = updated_buffer;
+    return updated_buffer;
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
@@ -1188,18 +1269,6 @@ private:
     std::vector<const VarNode *> kill;
   };
 
-  void PlanAlignment(const Stmt &stmt) {
-    DLOG(INFO) << "PlanAlignment";
-    PostOrderVisit(stmt, [&](const ObjectRef &node) {
-      if (const auto *call = node.as<CallNode>()) {
-        if (call->op.same_as(tl::tl_gemm()) ||
-            call->op.same_as(tl::tl_gemm_sp())) {
-          DLOG(INFO) << "PostOrderVisit CallNode tl_gemm and tl_gemm_sp: "
-                     << call->op;
-        }
-      }
-    });
-  }
   /*!
    * \brief Liveness analysis to find gen and kill point of each variable.
    * \param seq the linear pattern of storage access
@@ -1307,6 +1376,10 @@ private:
       }
     }
 
+    // Do not append kill points into event_map_ while iterating it.  In
+    // particular, last_stmt_at_level may be the same statement whose kill vector
+    // is being erased below, and push_back would invalidate the active iterator.
+    std::vector<std::pair<const Object *, const VarNode *>> pending_kill_moves;
     for (auto &event_pair : event_map_) {
       const Object *stmt = event_pair.first;
       EventEntry &event = event_pair.second;
@@ -1396,13 +1469,16 @@ private:
             }
           }
           if (last_stmt_at_level) {
-            event_map_[last_stmt_at_level].kill.push_back(buffer);
+            pending_kill_moves.emplace_back(last_stmt_at_level, buffer);
             visited_buffers.insert(buffer);
           }
         } else {
           ++it;
         }
       }
+    }
+    for (const auto &move : pending_kill_moves) {
+      event_map_[move.first].kill.push_back(move.second);
     }
 
     std::vector<const Object *> stmt_keys;
@@ -1728,7 +1804,8 @@ private:
   std::unordered_map<const VarNode *, PrimExpr> buffer_byte_offsets_;
   // The mapping from the original buffer objects to their location in the
   // merged buffer.
-  std::unordered_map<const BufferNode *, Buffer> buffer_remap_;
+  std::unordered_map<Buffer, Buffer, ObjectPtrHash, ObjectPtrEqual>
+      merged_buffer_remap_;
   // The flag indicating whether the merged buffer has been allocated
   bool allocated_{false};
   // Whether any merged allocation was marked volatile.
@@ -1739,11 +1816,21 @@ private:
   std::unordered_map<const VarNode *, int> shmem_alignment_map_;
 };
 
+} // namespace
+
 Stmt MergeSharedMemoryAllocations(Stmt stmt, bool merge_static_smem,
                                   bool enable_aggressive_merge,
                                   int align_bytes = 16, bool verbose = false) {
   AllocateCollector collector;
   collector(stmt);
+  // Host wrapper PrimFuncs can reach this pass after SplitHostDevice with a
+  // plain tirx.Evaluate body and no shared allocations.  There is nothing to
+  // merge in that case, and skipping the rest avoids driving migration-era
+  // mixed IR through apache's strict statement dispatch tables.
+  if (collector.dyn_shmem_allocs_.size() <= 1 &&
+      (!merge_static_smem || collector.static_shmem_allocs_.size() <= 1)) {
+    return stmt;
+  }
   if (collector.dyn_shmem_allocs_.size() > 1) {
     SharedMemoryRewriter rewriter(collector.dyn_shmem_allocs_, true, verbose,
                                   align_bytes);

@@ -19,6 +19,16 @@ Reference trees such as `/private/tmp/cppmega-mlx-tilelang-stack-c` and `/privat
 
 The working bar for this migration is a clean local build plus the relevant TileLang test suite passing against the bundled Apache TVM checkout. Any remaining incompatibility should be documented with the exact failing command, error, and API boundary before the branch is considered ready.
 
+### Vendored TVM Compatibility Surfaces
+
+This branch keeps the Apache TVM API shape as the target and only vendors the TileLang-era pieces that are still needed to bridge old IR into the new pipeline. The temporary `src/transform/vendored/allocate.*` and `src/transform/vendored/let_stmt.*` nodes model legacy body-carrying `Allocate` and `LetStmt`; `lower_allocate.cc` and `lower_let_stmt.cc` must lower them to Apache-native `AllocBuffer + SeqStmt` and `Bind + SeqStmt` before strict Apache TIR passes run.
+
+Because Apache `StmtFunctor` dispatch tables cannot be extended globally after finalization, local passes that may still see vendored allocation nodes use explicit guarded traversal such as `allocate_visit_passthrough.h` instead of relying on default visitors. The global-barrier compatibility path is similarly narrow: `global_barrier_builtin.cc` and `tl_runtime_symbols.h` reintroduce only the IR/codegen symbols TileLang still emits while the runtime backing is being reconciled with upstream TVM.
+
+The broader compatibility shims should stay small and removable. `tl_attr.h` and `tl_compat.h` carry local attr keys, launch-parameter tags, old DLTensor field names, object/type aliases, and the legacy allocation namespace bridge. `CMakeLists.txt` wires the migration by building vendored sources, linking the Apache TVM compiler target, force-including `tl_compat.h`, disabling the old recursive TVM submodule pin path, and using the PyPI Z3 flow expected by current Apache TVM.
+
+Pipeline order is part of the contract. `LowerTileLangLetStmt` must run before `LowerTileLangAllocate`, and both must execute before Apache TIR passes in lower/legalize, target optimization, and host/device codegen. If a new drift exposes `tilelang.Allocate` or `tilelang.LetStmt` inside an Apache pass, fix the lowering boundary or add a local guarded traversal; do not broaden the vendored nodes into a second permanent TVM dialect.
+
 <img src=./images/MatmulExample.png />
 
 ## Latest News
