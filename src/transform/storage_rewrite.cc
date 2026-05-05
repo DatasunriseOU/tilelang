@@ -155,6 +155,106 @@ public:
 // The storage need to be kept alive between allocate and last access.
 // The free point is only inserted at the same scope of allocate.
 //
+struct AllocationRef {
+  const AllocateNode *legacy_alloc{nullptr};
+  const AllocBufferNode *alloc_buffer{nullptr};
+
+  static AllocationRef Legacy(const AllocateNode *op) {
+    return AllocationRef{op, nullptr};
+  }
+
+  static AllocationRef Apache(const AllocBufferNode *op) {
+    return AllocationRef{nullptr, op};
+  }
+
+  explicit operator bool() const {
+    return legacy_alloc != nullptr || alloc_buffer != nullptr;
+  }
+
+  const Var &buffer_var() const {
+    if (legacy_alloc != nullptr) {
+      return legacy_alloc->buffer_var;
+    }
+    ICHECK(alloc_buffer != nullptr);
+    return alloc_buffer->buffer->data;
+  }
+
+  DataType dtype() const {
+    if (legacy_alloc != nullptr) {
+      return legacy_alloc->dtype;
+    }
+    ICHECK(alloc_buffer != nullptr);
+    return alloc_buffer->buffer->dtype;
+  }
+
+  const Array<PrimExpr> &extents() const {
+    if (legacy_alloc != nullptr) {
+      return legacy_alloc->extents;
+    }
+    ICHECK(alloc_buffer != nullptr);
+    return alloc_buffer->buffer->shape;
+  }
+
+  const Map<String, ffi::Any> &annotations() const {
+    if (legacy_alloc != nullptr) {
+      return legacy_alloc->annotations;
+    }
+    ICHECK(alloc_buffer != nullptr);
+    return alloc_buffer->annotations;
+  }
+
+  Span span() const {
+    if (legacy_alloc != nullptr) {
+      return legacy_alloc->span;
+    }
+    ICHECK(alloc_buffer != nullptr);
+    return alloc_buffer->span;
+  }
+
+  bool is_volatile() const {
+    return alloc_buffer != nullptr &&
+           alloc_buffer->annotations.count(tirx::attr::kVolatile);
+  }
+
+  int64_t ConstantAllocationSize() const {
+    int64_t result = 1;
+    for (const PrimExpr &extent : extents()) {
+      if (const auto *imm = extent.as<IntImmNode>()) {
+        result *= imm->value;
+      } else {
+        return -1;
+      }
+    }
+    return result;
+  }
+
+  Buffer MakeBuffer(const Var &data, DataType alloc_type,
+                    Array<PrimExpr> shape) const {
+    if (alloc_buffer != nullptr) {
+      Buffer buf = alloc_buffer->buffer;
+      auto writer = buf.CopyOnWrite();
+      writer->data = data;
+      writer->dtype = alloc_type;
+      writer->shape = std::move(shape);
+      writer->name = data->name_hint;
+      return buf;
+    }
+    ICHECK(legacy_alloc != nullptr);
+    return Buffer(/*data=*/data, /*dtype=*/alloc_type, /*shape=*/std::move(shape),
+                  /*strides=*/{}, /*elem_offset=*/PrimExpr(),
+                  /*name=*/data->name_hint, /*data_alignment=*/0,
+                  /*offset_factor=*/0, /*buffer_type=*/BufferType::kDefault,
+                  /*axis_separators=*/{}, span());
+  }
+
+  const DeclBufferNode *LegacyDeclBuffer() const {
+    if (legacy_alloc == nullptr) {
+      return nullptr;
+    }
+    return legacy_alloc->body.as<DeclBufferNode>();
+  }
+};
+
 class LinearAccessPatternFinder final : public StmtExprVisitor {
 public:
   /*! \brief record the touch hist of statement. */
@@ -177,7 +277,7 @@ public:
     // scope level
     size_t level{0};
     // allocation stmt
-    const AllocateNode *alloc{nullptr};
+    AllocationRef alloc;
   };
 
   void VisitStmt_(const AllocateNode *op) {
@@ -185,7 +285,7 @@ public:
     const VarNode *buf = op->buffer_var.get();
 
     AllocEntry entry;
-    entry.alloc = op;
+    entry.alloc = AllocationRef::Legacy(op);
     entry.level = level;
     // Since StorageRewrite occurs after StorageFlatten/FlattenBuffer,
     // all allocations specify the extent of physical dimensions, and
@@ -194,6 +294,19 @@ public:
     alloc_info_[buf] = entry;
 
     this->VisitStmt(op->body);
+  }
+
+  void VisitStmt_(const AllocBufferNode *op) final {
+    size_t level = scope_.size();
+    const VarNode *buf = op->buffer->data.get();
+
+    AllocEntry entry;
+    entry.alloc = AllocationRef::Apache(op);
+    entry.level = level;
+    entry.num_physical_dimensions = op->buffer->shape.size();
+    alloc_info_[buf] = entry;
+
+    StmtExprVisitor::VisitStmt_(op);
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
@@ -675,8 +788,15 @@ public:
       Buffer buf = RemapBuffer(op->buffer, it->second->alloc_var);
       return DeclBuffer(buf);
     }
-    // Unused allocation.
-    return Evaluate(0);
+    // CPPMEGA: This TileLang pass still plans storage reuse primarily from
+    // legacy body-carrying AllocateNode inputs.  Apache/tirx plans over
+    // AllocBufferNode directly, so its "not in alloc_map" case really means
+    // unused.  Until this pass is fully ported to AllocBuffer-based planning,
+    // an unmatched AllocBuffer may be the only real storage definition for
+    // device scratch created by LowerOpaqueBlock.  Preserve it fail-closed
+    // instead of dropping storage and leaking the scratch Var into
+    // SplitHostDevice/MakePackedAPI as an undefined ABI parameter.
+    return Downcast<AllocBuffer>(StmtExprMutator::VisitStmt_(op));
   }
 
   Stmt VisitStmt_(const DeclBufferNode *op) final {
@@ -709,10 +829,10 @@ private:
     StorageScope scope;
     // The physical dimensionality of the allocations.  Since
     // StorageRewrite is applied after StorageFlatten/FlattenBuffer,
-    // this is size of `AllocateNode::extents`.  If moved
+    // this is the number of physical extent dimensions.
     size_t ndim{};
     // Allocs that shares this entry.
-    std::vector<const AllocateNode *> allocs;
+    std::vector<AllocationRef> allocs;
     // The children of this entry, not including itself.
     std::vector<StorageEntry *> merged_children;
     // The replacement Allocate, if any.  May also include associated
@@ -722,6 +842,8 @@ private:
     Var alloc_var;
     // The allocation element type.
     DataType elem_type;
+    // Whether any constituent allocation was marked volatile.
+    bool is_volatile{false};
     // This is non-zero if this allocate is folded into another one
     // the address(in bits) becomes alloc_var + bits_offset;
     // can be effectively converted to the element type.
@@ -772,6 +894,18 @@ private:
     }
     return annotations;
   }
+  Map<String, ffi::Any> MergeAllocAnnotations(
+      const Map<String, ffi::Any> &base, const Var &buffer_var) const {
+    Map<String, ffi::Any> annotations;
+    for (const auto &kv : base) {
+      annotations.Set(kv.first, kv.second);
+    }
+    Map<String, ffi::Any> generated = MakeAllocateAnnotations(buffer_var);
+    for (const auto &kv : generated) {
+      annotations.Set(kv.first, kv.second);
+    }
+    return annotations;
+  }
   // Remap the index
   PrimExpr RemapIndex(DataType dtype, PrimExpr index, StorageEntry *e) {
     if (e->bits_offset == 0)
@@ -815,27 +949,27 @@ private:
           continue;
         }
         // Get the allocation size;
-        e->alloc_var = e->allocs[0]->buffer_var;
-        DataType alloc_type = e->allocs[0]->dtype;
-        for (const AllocateNode *op : e->allocs) {
-          if (op->dtype.lanes() > alloc_type.lanes()) {
-            alloc_type = op->dtype;
+        e->alloc_var = e->allocs[0].buffer_var();
+        DataType alloc_type = e->allocs[0].dtype();
+        for (const AllocationRef &op : e->allocs) {
+          if (op.dtype().lanes() > alloc_type.lanes()) {
+            alloc_type = op.dtype();
           }
         }
 
         bool all_allocs_identical = std::all_of(
             e->allocs.begin() + 1, e->allocs.end(),
-            [&](const AllocateNode *op) -> bool {
-              const AllocateNode *first = *e->allocs.begin();
-              if (op->dtype != first->dtype) {
+            [&](const AllocationRef &op) -> bool {
+              const AllocationRef &first = e->allocs.front();
+              if (op.dtype() != first.dtype()) {
                 return false;
               }
-              if (op->extents.size() != first->extents.size()) {
+              if (op.extents().size() != first.extents().size()) {
                 return false;
               }
               ExprDeepEqual expr_equal;
-              for (size_t i = 0; i < op->extents.size(); i++) {
-                if (!expr_equal(op->extents[i], first->extents[i])) {
+              for (size_t i = 0; i < op.extents().size(); i++) {
+                if (!expr_equal(op.extents()[i], first.extents()[i])) {
                   return false;
                 }
               }
@@ -845,7 +979,7 @@ private:
         if (all_allocs_identical) {
           // simply use the original allocation.
           Map<String, ffi::Any> annotations =
-              MakeAllocateAnnotations(e->alloc_var);
+              MergeAllocAnnotations(e->allocs[0].annotations(), e->alloc_var);
           // CPPMEGA: emit apache `AllocBuffer` instead of vendored
           // `tl_tir::Allocate`. apache `StmtFunctor` has no dispatch entry
           // for `tilelang.Allocate`; downstream apache passes
@@ -856,18 +990,12 @@ private:
           // The legacy condition was always `const_true()` here in practice
           // because merge candidates have already been filtered, but if
           // non-trivial we honor it via IfThenElse later in the nest fold.
-          Buffer alloc_buf_obj(/*data=*/e->alloc_var,
-                               /*dtype=*/alloc_type,
-                               /*shape=*/e->allocs[0]->extents,
-                               /*strides=*/{},
-                               /*elem_offset=*/PrimExpr(),
-                               /*name=*/e->alloc_var->name_hint,
-                               /*data_alignment=*/0,
-                               /*offset_factor=*/0,
-                               /*buffer_type=*/BufferType::kDefault);
+          Buffer alloc_buf_obj =
+              e->allocs[0].MakeBuffer(e->alloc_var, alloc_type,
+                                       e->allocs[0].extents());
           e->alloc_nest.push_back(
               AllocBuffer(alloc_buf_obj, std::move(annotations)));
-          if (auto ptr = e->allocs[0]->body.as<DeclBufferNode>()) {
+          if (auto ptr = e->allocs[0].LegacyDeclBuffer()) {
             // CPPMEGA: DeclBuffer is body-less in apache/tvm; drop the trailing
             // Evaluate(0).
             e->alloc_nest.push_back(
@@ -886,16 +1014,16 @@ private:
         } else {
           // Build a merged allocation
           PrimExpr combo_size;
-          for (const AllocateNode *op : e->allocs) {
-            ICHECK_EQ(op->extents.size(), 1)
-                << "Buffer var " << op->buffer_var->name_hint
+          for (const AllocationRef &op : e->allocs) {
+            ICHECK_EQ(op.extents().size(), 1)
+                << "Buffer var " << op.buffer_var()->name_hint
                 << " was identified as a reusable allocation, but has "
-                << op->extents.size() << " physical dimensions.  "
+                << op.extents().size() << " physical dimensions.  "
                 << "Currently, only flat 1-d memory spaces should be "
                    "identified as reusable "
                    "allocations.";
-            PrimExpr sz = op->extents[0];
-            auto nbits = op->dtype.bits() * op->dtype.lanes();
+            PrimExpr sz = op.extents()[0];
+            auto nbits = op.dtype().bits() * op.dtype().lanes();
             if (const auto *imm = sz.as<IntImmNode>()) {
               if (imm->value > std::numeric_limits<int>::max() / nbits) {
                 LOG(WARNING) << "The allocation requires : " << imm->value
@@ -925,19 +1053,12 @@ private:
           }
           combo_size = analyzer_.Simplify(combo_size);
           Map<String, ffi::Any> annotations =
-              MakeAllocateAnnotations(e->alloc_var);
+              MergeAllocAnnotations(e->allocs[0].annotations(), e->alloc_var);
           // CPPMEGA: emit apache `AllocBuffer` instead of vendored
           // `tl_tir::Allocate`. See rationale at the all_allocs_identical
           // site above.
-          Buffer alloc_buf_combo(/*data=*/e->alloc_var,
-                                 /*dtype=*/alloc_type,
-                                 /*shape=*/{combo_size},
-                                 /*strides=*/{},
-                                 /*elem_offset=*/PrimExpr(),
-                                 /*name=*/e->alloc_var->name_hint,
-                                 /*data_alignment=*/0,
-                                 /*offset_factor=*/0,
-                                 /*buffer_type=*/BufferType::kDefault);
+          Buffer alloc_buf_combo =
+              e->allocs[0].MakeBuffer(e->alloc_var, alloc_type, {combo_size});
           e->alloc_nest.push_back(
               AllocBuffer(alloc_buf_combo, std::move(annotations)));
           if (IsSpecialTaggedMemory(e->scope)) {
@@ -974,7 +1095,7 @@ private:
     if (total_bits % align != 0) {
       total_bits += align - (total_bits % align);
     }
-    e->alloc_var = e->allocs[0]->buffer_var;
+    e->alloc_var = e->allocs[0].buffer_var();
     for (StorageEntry *child : e->merged_children) {
       ICHECK_NE(child->const_nbits, 0U);
       ICHECK_NE(total_bits, 0U);
@@ -986,20 +1107,14 @@ private:
       }
     }
     uint64_t type_bits = e->elem_type.bits() * e->elem_type.lanes();
-    PrimExpr alloc_size = make_const(e->allocs[0]->extents[0].dtype(),
+    PrimExpr alloc_size = make_const(e->allocs[0].extents()[0].dtype(),
                                      (total_bits + type_bits - 1) / type_bits);
-    Map<String, ffi::Any> annotations = MakeAllocateAnnotations(e->alloc_var);
+    Map<String, ffi::Any> annotations =
+        MergeAllocAnnotations(e->allocs[0].annotations(), e->alloc_var);
     // CPPMEGA: emit apache `AllocBuffer` instead of vendored
     // `tl_tir::Allocate`. See rationale at line ~895 (NewAlloc).
-    Buffer alloc_buf_tag(/*data=*/e->alloc_var,
-                         /*dtype=*/e->elem_type,
-                         /*shape=*/{alloc_size},
-                         /*strides=*/{},
-                         /*elem_offset=*/PrimExpr(),
-                         /*name=*/e->alloc_var->name_hint,
-                         /*data_alignment=*/0,
-                         /*offset_factor=*/0,
-                         /*buffer_type=*/BufferType::kDefault);
+    Buffer alloc_buf_tag =
+        e->allocs[0].MakeBuffer(e->alloc_var, e->elem_type, {alloc_size});
     e->alloc_nest.push_back(
         AllocBuffer(alloc_buf_tag, std::move(annotations)));
     if (info.defined()) {
@@ -1097,7 +1212,7 @@ private:
         for (const VarNode *var : it->second.gen) {
           ICHECK(alloc_info.count(var));
           const AllocEntry &entry = alloc_info.at(var);
-          const AllocateNode *alloc = entry.alloc;
+          const AllocationRef &alloc = entry.alloc;
           auto storage_scope = StorageScope::Create(
               GetPtrStorageScope(tvm::ffi::GetRef<Var>(var)));
           StorageEntry *dst_entry = nullptr;
@@ -1112,11 +1227,11 @@ private:
                 if (src_entry->scope == storage_scope &&
                     src_entry->attach_scope_ ==
                         effective_scope(storage_scope) &&
-                    src_entry->elem_type == alloc->dtype.element_of() &&
+                    src_entry->elem_type == alloc.dtype().element_of() &&
                     visitor.Check(s.stmt, var, src)) {
                   uint64_t const_nbits =
-                      static_cast<uint64_t>(alloc->ConstantAllocationSize()) *
-                      alloc->dtype.bits() * alloc->dtype.lanes();
+                      static_cast<uint64_t>(alloc.ConstantAllocationSize()) *
+                      alloc.dtype().bits() * alloc.dtype().lanes();
                   if (src_entry->const_nbits == const_nbits && !inplace_found) {
                     // successfully inplace
                     dst_entry = src_entry;
@@ -1199,43 +1314,44 @@ private:
     }
   }
   // Allocate new storage entry.
-  StorageEntry *NewAlloc(const AllocateNode *op, const Object *attach_scope,
+  StorageEntry *NewAlloc(const AllocationRef &op, const Object *attach_scope,
                          const StorageScope &scope, size_t const_nbits) {
-    ICHECK(op != nullptr);
+    ICHECK(op);
     // Reuse not successful, allocate a new buffer.
     auto entry = std::make_unique<StorageEntry>();
     entry->attach_scope_ = attach_scope;
     entry->scope = scope;
-    entry->elem_type = op->dtype.element_of();
+    entry->elem_type = op.dtype().element_of();
     entry->const_nbits = const_nbits;
+    entry->is_volatile = op.is_volatile();
     StorageEntry *e = entry.get();
     alloc_vec_.emplace_back(std::move(entry));
     return e;
   }
 
-  static uint64_t ConstantAllocationNBits(const AllocateNode *op) {
-    uint64_t op_elem_bits = op->dtype.bits() * op->dtype.lanes();
-    return static_cast<uint64_t>(op->ConstantAllocationSize() * op_elem_bits);
+  static uint64_t ConstantAllocationNBits(const AllocationRef &op) {
+    uint64_t op_elem_bits = op.dtype().bits() * op.dtype().lanes();
+    return static_cast<uint64_t>(op.ConstantAllocationSize() * op_elem_bits);
   }
 
-  static bool IsUntaggedNonReusableAlloc(const AllocateNode *op,
-                                         const StorageScope &scope) {
+  static bool IsUntaggedNonReusableAlloc(const AllocationRef &op,
+                                          const StorageScope &scope) {
     uint64_t const_nbits = ConstantAllocationNBits(op);
     bool is_known_size = (const_nbits != 0);
     return scope.tag.empty() &&
-           (scope.rank >= StorageRank::kWarp || op->dtype.is_handle() ||
+           (scope.rank >= StorageRank::kWarp || op.dtype().is_handle() ||
             (is_known_size && const_nbits <= 32));
   }
 
-  StorageEntry *FindAlloc(const AllocateNode *op, const Object *attach_scope,
-                          const StorageScope &scope,
-                          size_t num_physical_dimensions, bool enable_reuse,
-                          bool reuse_require_exact_matched_dtype) {
-    ICHECK(op != nullptr);
+  StorageEntry *FindAlloc(const AllocationRef &op, const Object *attach_scope,
+                           const StorageScope &scope,
+                           size_t num_physical_dimensions, bool enable_reuse,
+                           bool reuse_require_exact_matched_dtype) {
+    ICHECK(op);
     // skip plan for local variable,
     // compiler can do a better job with register allocation.
     const uint64_t match_range = 16;
-    uint64_t op_elem_bits = op->dtype.bits() * op->dtype.lanes();
+    uint64_t op_elem_bits = op.dtype().bits() * op.dtype().lanes();
     uint64_t const_nbits = ConstantAllocationNBits(op);
 
     // If the size of the array isn't known at compile-time, it must
@@ -1272,9 +1388,9 @@ private:
         if (e->bits_offset % op_elem_bits != 0)
           continue;
         // must check element type to avoid type mismatch in codegen
-        if (e->elem_type != op->dtype.element_of())
+        if (e->elem_type != op.dtype().element_of())
           continue;
-        if (reuse_require_exact_matched_dtype && e->elem_type != op->dtype) {
+        if (reuse_require_exact_matched_dtype && e->elem_type != op.dtype()) {
           continue;
         }
         e->const_nbits = std::max(const_nbits, e->const_nbits);
@@ -1289,9 +1405,9 @@ private:
           continue;
         if (e->scope != scope)
           continue;
-        if (e->elem_type != op->dtype.element_of())
+        if (e->elem_type != op.dtype().element_of())
           continue;
-        if (reuse_require_exact_matched_dtype && e->elem_type != op->dtype) {
+        if (reuse_require_exact_matched_dtype && e->elem_type != op.dtype()) {
           continue;
         }
         e->const_nbits = std::max(const_nbits, e->const_nbits);
@@ -1306,7 +1422,7 @@ private:
           continue;
         if (e->scope != scope)
           continue;
-        if (e->elem_type != op->dtype.element_of())
+        if (e->elem_type != op.dtype().element_of())
           continue;
         sym_free_list_.erase(it);
         return e;

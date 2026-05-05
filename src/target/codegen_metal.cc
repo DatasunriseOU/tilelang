@@ -40,6 +40,15 @@
 #include "target/build_common.h"
 
 namespace tvm {
+
+namespace tl {
+PrimFunc PointerValueTypeRewrite(
+    PrimFunc f, bool allow_untyped_pointers = false, bool rewrite_params = true,
+    bool rewrite_buffer_map = true, bool rewrite_alloc_buffer_node = true,
+    bool rewrite_indices = true, bool rewrite_let_node = true,
+    bool rewrite_scalar_read_to_vector_shuffle = true);
+} // namespace tl
+
 namespace codegen {
 
 void CodeGenTileLangMetal::InitFuncState(const PrimFunc &f) {
@@ -105,6 +114,19 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
       break;
     this->stream << "  ";
     std::string vid = AllocVarID(v.get());
+    auto it_buf = func->buffer_map.find(v);
+    if (it_buf != func->buffer_map.end()) {
+      const Buffer &buf = (*it_buf).second;
+      if (!buf->data.same_as(v)) {
+        // Apache codegen prints BufferLoad/Store through Buffer.data, while
+        // the Metal ABI only exposes the handle param.  Keep the alias local
+        // to external buffer_map params; scratch buffers are still declared by
+        // AllocBuffer/Allocate nodes.
+        var_idmap_[buf->data.get()] = vid;
+        alloc_storage_scope_[buf->data.get()] = "global";
+        RegisterHandleType(buf->data.get(), buf->dtype);
+      }
+    }
     auto it = alloc_storage_scope_.find(v.get());
     if (it != alloc_storage_scope_.end()) {
       PrintStorageScope(it->second, this->stream);
@@ -231,6 +253,15 @@ void CodeGenTileLangMetal::PrintType(DataType t,
   // rather than a cryptic IR-level ICHECK from storage_rewrite or simdgroup
   // lowering. See docs/mlx_port_master_plan.md (Metal FP8/FP4 fail-closed).
   if (t.is_float8()) {
+    if (t.is_float8_e4m3() || t.is_float8_e5m2()) {
+      os << "uchar";
+      if (lanes >= 2 && lanes <= 4) {
+        os << lanes;
+      } else {
+        ICHECK_EQ(lanes, 1);
+      }
+      return;
+    }
     LOG(FATAL) << "Cannot convert type " << t << " to Metal type";
   }
   if (t.is_float4()) {
@@ -341,7 +372,7 @@ void CodeGenTileLangMetal::PrintStorageScope(const std::string &scope,
     os << "device ";
   } else if (scope == "shared" || scope == "shared.dyn") {
     os << "threadgroup ";
-  } else if (scope == "local") {
+  } else if (scope == "local" || scope == "local.fragment") {
     os << "thread ";
   } else {
     LOG(FATAL) << "Unknown storage scope `" << scope << "`";
@@ -561,7 +592,17 @@ void CodeGenTileLangMetal::VisitExpr_(const FloatImmNode *op,
 
 ffi::Module BuildTileLangMetal(IRModule mod, Target target) {
   bool output_ssa = false;
-  mod = tirx::transform::PointerValueTypeRewrite()(std::move(mod));
+  auto pass_func = [](PrimFunc f, const IRModule &m,
+                      const tirx::transform::PassContext &ctx) -> PrimFunc {
+    // CPPMEGA: TileLang lowering may leave free-standing T.Buffer aliases
+    // without a lexical DeclBuffer/AllocBuffer.  The TileLang-aware helper
+    // keeps Apache's vector-type rewrite but permits those aliases in the same
+    // way `tl.StorageRewrite` does, scoped only to the TileLang Metal builder.
+    return tl::PointerValueTypeRewrite(std::move(f), true);
+  };
+  mod = tirx::transform::CreatePrimFuncPass(
+            pass_func, 0, "tl.TileLangMetalPointerValueTypeRewrite", {})(
+      std::move(mod));
 
   std::ostringstream source_maker;
   // CPPMEGA: apache's new MetalModuleCreateWithFallback expects
