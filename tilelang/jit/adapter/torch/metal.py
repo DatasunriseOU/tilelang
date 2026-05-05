@@ -58,9 +58,10 @@ class MetalKernelAdapter(BaseKernelAdapter):
         launch_info = cls._parse_launch_info(device_kernel_source)
         adapter.block_info = list(launch_info["block_info"])
         adapter.grid_info = list(launch_info["grid_info"])
-        adapter.arg_order = launch_info.get("arg_order")
-        if adapter.arg_order is None:
-            adapter.arg_order = cls._extract_arg_order(func_or_mod, None, adapter.kernel_name, device_kernel_source)
+        # Recompute rather than trusting serialized metadata.  Source-only Metal
+        # caches may outlive adapter-side ABI fixes, and stale arg_order values
+        # silently launch kernels with outputs bound to the wrong buffers.
+        adapter.arg_order = cls._extract_arg_order(func_or_mod, None, adapter.kernel_name, device_kernel_source)
         BaseKernelAdapter.__init__(adapter, func_or_mod, params=params, result_idx=result_idx)
         return adapter
 
@@ -151,9 +152,9 @@ class MetalKernelAdapter(BaseKernelAdapter):
         if not source_param_aliases:
             return []
 
-        device_param_names = cls._device_param_names(device_mod, kernel_name)
+        device_param_names = cls._parse_msl_buffer_param_names(kernel_source, kernel_name)
         if not device_param_names:
-            device_param_names = cls._parse_msl_buffer_param_names(kernel_source, kernel_name)
+            device_param_names = cls._device_param_names(device_mod, kernel_name)
         if not device_param_names:
             return list(range(len(source_param_aliases)))
 
@@ -177,14 +178,21 @@ class MetalKernelAdapter(BaseKernelAdapter):
             return []
 
         param_aliases: list[set[str]] = []
+        alias_counts: dict[str, int] = {}
         for var in func_or_mod.params:
             aliases = {cls._tir_name(var)}
             if var in func_or_mod.buffer_map:
                 buffer = func_or_mod.buffer_map[var]
                 aliases.add(str(buffer.name))
-                aliases.add(cls._tir_name(buffer.data))
+                cls._add_deduplicated_alias(aliases, alias_counts, cls._tir_name(buffer.data))
             param_aliases.append(aliases)
         return param_aliases
+
+    @staticmethod
+    def _add_deduplicated_alias(aliases: set[str], alias_counts: dict[str, int], name: str) -> None:
+        index = alias_counts.get(name, 0)
+        aliases.add(name if index == 0 else f"{name}_{index}")
+        alias_counts[name] = index + 1
 
     @classmethod
     def _device_param_names(cls, device_mod: tvm.IRModule | None, kernel_name: str) -> list[str]:
