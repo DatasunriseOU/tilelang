@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import json
 import logging
 import errno
@@ -425,9 +426,10 @@ class KernelCache:
         # even when the singleton instance is reused.
         KernelCache._create_dirs()
         cache_path = self._get_cache_path(key)
+        execution_backend = self._get_kernel_execution_backend(kernel)
 
         # Another process already wrote a complete entry — nothing to do.
-        if self._is_complete_cache_dir(cache_path):
+        if self._is_complete_cache_dir(cache_path, execution_backend):
             return
 
         # Staging dir lives under CACHE_DIR/<namespace>/.staging (same filesystem) so
@@ -440,13 +442,14 @@ class KernelCache:
 
         try:
             # Save kernel source code
-            self._save_kernel_source_code_to_disk(kernel, staging_path, verbose)
+            self._save_kernel_source_code_to_disk(kernel, staging_path, verbose, execution_backend)
 
             # Save wrapped kernel source code
             self._save_wrapper_kernel_code_to_disk(kernel, staging_path, verbose)
 
-            # Save the kernel library
-            self._save_so_cubin_to_disk(kernel, staging_path, verbose)
+            # Torch/Metal kernels are source-only and are compiled by torch.mps.
+            if not self._is_source_only_backend(execution_backend):
+                self._save_so_cubin_to_disk(kernel, staging_path, verbose)
 
             # Save kernel parameters
             params_path = os.path.join(staging_path, self.params_path)
@@ -454,13 +457,13 @@ class KernelCache:
                 self.logger.debug(f"Saving kernel parameters to disk: {params_path}")
             KernelCache._safe_write_file(params_path, "wb", lambda file: cloudpickle.dump(kernel.params, file))
 
-            missing_files = self._get_missing_complete_cache_files(staging_path)
+            missing_files = self._get_missing_complete_cache_files(staging_path, execution_backend)
             if missing_files:
                 missing_names = ", ".join(os.path.basename(path) for path in missing_files)
                 raise RuntimeError(f"Incomplete cache staging directory is missing required file(s): {missing_names}")
 
             # Repair stale/incomplete entries before making the new directory visible.
-            self._remove_incomplete_cache_dir(cache_path)
+            self._remove_incomplete_cache_dir(cache_path, execution_backend)
 
             # Atomic rename — makes the complete directory visible in one step.
             try:
@@ -508,7 +511,7 @@ class KernelCache:
         kernel_lib_path = os.path.join(cache_path, self.kernel_lib_path)
         params_path = os.path.join(cache_path, self.params_path)
 
-        required_files = self._get_required_files(cache_path)
+        required_files = self._get_required_files_for_backend(cache_path, execution_backend)
 
         if not all([os.path.exists(file) for file in required_files]):
             return None
@@ -556,12 +559,22 @@ class KernelCache:
         except Exception:
             self.logger.exception("Error clearing disk cache")
 
-    def _save_kernel_source_code_to_disk(self, kernel: JITKernel, cache_path: str, verbose: bool = False):
+    def _save_kernel_source_code_to_disk(
+        self,
+        kernel: JITKernel,
+        cache_path: str,
+        verbose: bool = False,
+        execution_backend: str | None = None,
+    ):
         device_kernel_path = os.path.join(cache_path, self.device_kernel_path)
         if verbose:
             self.logger.debug(f"Saving kernel source code to file: {device_kernel_path}")
-        if kernel.kernel_source is not None:
-            KernelCache._safe_write_file(device_kernel_path, "w", lambda file: file.write(kernel.kernel_source))
+        if self._is_source_only_backend(execution_backend):
+            kernel_source = kernel.adapter.get_kernel_source_with_launch_info()
+            KernelCache._safe_write_file(device_kernel_path, "w", lambda file: file.write(kernel_source))
+        elif kernel.kernel_source is not None:
+            kernel_source = kernel.kernel_source
+            KernelCache._safe_write_file(device_kernel_path, "w", lambda file: file.write(kernel_source))
 
     def _save_wrapper_kernel_code_to_disk(self, kernel: JITKernel, cache_path: str, verbose: bool = False):
         host_kernel_path = os.path.join(cache_path, self.host_kernel_path)
@@ -576,30 +589,46 @@ class KernelCache:
             self.logger.debug(f"Saving kernel library to file: {kernel_lib_path}")
         KernelCache._safe_write_file(kernel_lib_path, "wb", lambda file: file.write(KernelCache._load_binary(src_lib_path)))
 
-    def _get_required_files(self, cache_path: str) -> list[str]:
+    @staticmethod
+    def _is_source_only_backend(execution_backend: str | None) -> bool:
+        return execution_backend == "torch"
+
+    def _get_kernel_execution_backend(self, kernel: JITKernel) -> str:
+        return getattr(kernel, "execution_backend", self.execution_backend)
+
+    def _get_required_files_for_backend(self, cache_path: str, execution_backend: str | None = None) -> list[str]:
+        if len(inspect.signature(self._get_required_files).parameters) == 1:
+            return self._get_required_files(cache_path)
+        return self._get_required_files(cache_path, execution_backend)
+
+    def _get_required_files(self, cache_path: str, execution_backend: str | None = None) -> list[str]:
+        device_kernel_path = os.path.join(cache_path, self.device_kernel_path)
+        host_kernel_path = os.path.join(cache_path, self.host_kernel_path)
         kernel_lib_path = os.path.join(cache_path, self.kernel_lib_path)
         params_path = os.path.join(cache_path, self.params_path)
+        if self._is_source_only_backend(execution_backend):
+            return [device_kernel_path, host_kernel_path, params_path]
         return [kernel_lib_path, params_path]
 
-    def _get_complete_cache_files(self, cache_path: str) -> list[str]:
+    def _get_complete_cache_files(self, cache_path: str, execution_backend: str | None = None) -> list[str]:
         return list(
             dict.fromkeys(
                 [
                     os.path.join(cache_path, self.device_kernel_path),
                     os.path.join(cache_path, self.host_kernel_path),
-                    *self._get_required_files(cache_path),
+                    *self._get_required_files_for_backend(cache_path, execution_backend),
                 ]
             )
         )
 
-    def _get_missing_complete_cache_files(self, cache_path: str) -> list[str]:
-        return [file for file in self._get_complete_cache_files(cache_path) if not os.path.exists(file)]
+    def _get_missing_complete_cache_files(self, cache_path: str, execution_backend: str | None = None) -> list[str]:
+        return [file for file in self._get_complete_cache_files(cache_path, execution_backend) if not os.path.exists(file)]
 
-    def _is_complete_cache_dir(self, cache_path: str) -> bool:
-        return os.path.isdir(cache_path) and not self._get_missing_complete_cache_files(cache_path)
+    def _is_complete_cache_dir(self, cache_path: str, execution_backend: str | None = None) -> bool:
+        return os.path.isdir(cache_path) and not self._get_missing_complete_cache_files(cache_path, execution_backend)
 
-    def _remove_incomplete_cache_dir(self, cache_path: str) -> bool:
-        if not os.path.isdir(cache_path) or self._is_complete_cache_dir(cache_path):
+    def _remove_incomplete_cache_dir(self, cache_path: str, execution_backend: str | None = None) -> bool:
+        if not os.path.isdir(cache_path) or self._is_complete_cache_dir(cache_path, execution_backend):
             return False
         shutil.rmtree(cache_path)
         return True

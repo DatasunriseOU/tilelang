@@ -168,6 +168,13 @@ endforeach()
 # tvm tries to detect gtest by default, but may fail if its header is not installed.
 set(USE_GTEST OFF)
 
+# TileLang is built as a separate dylib but still derives from and calls Apache
+# TVM internal C++ classes (tirx mutators, codegen, arith helpers, etc.).  Those
+# classes are not all marked TVM_DLL, so hiding TVM private symbols leaves
+# libtilelang with unresolved references on Darwin.
+set(HIDE_PRIVATE_SYMBOLS OFF CACHE STRING
+    "TileLang links against TVM internal C++ APIs; keep them visible." FORCE)
+
 # Include directories for TileLang
 set(TILE_LANG_INCLUDES ${TVM_INCLUDES})
 

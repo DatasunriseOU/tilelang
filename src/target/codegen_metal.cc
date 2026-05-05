@@ -603,6 +603,36 @@ void CodeGenTileLangMetal::VisitStmt_(const AllocBufferNode *op) {
   }
 }
 
+void CodeGenTileLangMetal::VisitStmt_(const AttrStmtNode *op) {
+  if (op->attr_key == "pragma_unroll_factor") {
+    const auto *factor = op->value.as<IntImmNode>();
+    ICHECK(factor) << "pragma_unroll_factor expects an IntImm value";
+    const auto *loop_var = op->node.as<VarNode>();
+    ICHECK(loop_var) << "pragma_unroll_factor expects a loop var node";
+    unroll_factor_[loop_var] = Downcast<IntImm>(op->value);
+  }
+  CodeGenC::VisitStmt_(op);
+}
+
+void CodeGenTileLangMetal::VisitStmt_(const ForNode *op) {
+  if (op->kind == ForKind::kUnrolled) {
+    PrintIndent();
+    auto ann = op->annotations.find("pragma_unroll_factor");
+    auto it = unroll_factor_.find(op->loop_var.get());
+    if (ann != op->annotations.end()) {
+      const auto *factor = (*ann).second.as<IntImmNode>();
+      ICHECK(factor) << "pragma_unroll_factor expects an IntImm value";
+      stream << "#pragma unroll "
+             << PrintExpr(Downcast<IntImm>((*ann).second)) << "\n";
+    } else if (it != unroll_factor_.end()) {
+      stream << "#pragma unroll " << PrintExpr(it->second) << "\n";
+    } else {
+      stream << "#pragma unroll\n";
+    }
+  }
+  CodeGenC::VisitStmt_(op);
+}
+
 void CodeGenTileLangMetal::VisitExpr_(const BufferLoadNode *op,
                                        std::ostream &os) { // NOLINT(*)
   std::string scope;

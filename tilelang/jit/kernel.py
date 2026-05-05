@@ -387,6 +387,15 @@ class JITKernel(Generic[_P, _T]):
                 pass_configs=pass_configs,
                 compile_flags=compile_flags,
             )
+        elif execution_backend == "torch":
+            assert is_metal_target(target)
+            adapter = MetalKernelAdapter.from_database(
+                params=params,
+                result_idx=result_idx,
+                func_or_mod=func_or_mod,
+                device_kernel_source=device_kernel_source,
+                verbose=self.verbose,
+            )
         elif execution_backend == "cutedsl":
             adapter = CuTeDSLKernelAdapter.from_database(
                 params=params,

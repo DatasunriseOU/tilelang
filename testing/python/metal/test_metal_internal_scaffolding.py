@@ -537,7 +537,7 @@ def _fp4_e2m1fn_to_float_cpu(bits: int, nibble_index: int) -> float:
 
 
 def _e8m0_to_float_cpu(bits: int) -> float:
-    return 0.0 if bits == 255 else 2.0 ** (bits - 127)
+    return 0.0 if bits in (0, 255) else 2.0 ** (bits - 127)
 
 
 def _deepseek_synthetic_inputs():
