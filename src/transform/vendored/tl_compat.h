@@ -146,7 +146,7 @@ constexpr const char* tilelang_assume = "tilelang.assume";
 // transform passes that still build the old AST. The IR must be lowered
 // (tl.transform.LowerTileLangAllocate) to apache `AllocBuffer` before
 // codegen — see `vendored/allocate.h`.
-#include "/tmp/tl_apache_tvm_swap/src/transform/vendored/allocate.h"
+#include "allocate.h"
 namespace tvm {
 namespace tirx {
 using Allocate = ::tilelang::tl_tir::Allocate;

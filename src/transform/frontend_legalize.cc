@@ -28,6 +28,7 @@
 #include <tvm/tirx/transform.h>
 
 #include "arith/ir_mutator_with_analyzer.h"
+#include "vendored/allocate_visit_passthrough.h"
 #include "vendored/let_stmt.h"
 
 namespace tvm {
@@ -82,6 +83,9 @@ private:
   Stmt VisitStmt(const Stmt &stmt) override {
     if (const auto *node = stmt.as<LetStmtNode>()) {
       return VisitStmt_(node);
+    }
+    if (auto out = ::tilelang::tl_tir::TryVisitAllocateMutator(this, stmt)) {
+      return *out;
     }
     return arith::IRMutatorWithAnalyzer::VisitStmt(stmt);
   }

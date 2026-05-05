@@ -27,6 +27,7 @@
 #include "common/pipeline_utils.h"
 #include "layout_reducer.h"
 #include "loop_partition.h"
+#include "vendored/allocate_visit_passthrough.h"
 #include "vendored/let_stmt.h"
 
 namespace tvm {
@@ -1003,6 +1004,9 @@ private:
       } else {
         return LetStmt(op->var, value, body);
       }
+    }
+    if (auto out = ::tilelang::tl_tir::TryVisitAllocateMutator(this, stmt)) {
+      return *out;
     }
     return arith::IRMutatorWithAnalyzer::VisitStmt(stmt);
   }

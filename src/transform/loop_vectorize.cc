@@ -32,6 +32,7 @@
 #include "common/loop_vectorization_utils.h"
 #include "tvm/tirx/analysis.h"
 #include "tvm/tirx/var.h"
+#include "vendored/allocate_visit_passthrough.h"
 #include "vendored/let_stmt.h"
 #include <iostream>
 #include <optional>
@@ -842,6 +843,9 @@ private:
       } else {
         return LetStmt(op->var, std::move(value), std::move(body), op->span);
       }
+    }
+    if (auto out = ::tilelang::tl_tir::TryVisitAllocateMutator(this, stmt)) {
+      return *out;
     }
     return arith::IRMutatorWithAnalyzer::VisitStmt(stmt);
   }

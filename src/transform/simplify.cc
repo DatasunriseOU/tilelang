@@ -18,6 +18,7 @@
 #include "arith/ir_mutator_with_analyzer.h"
 #include "tirx/analysis/control_flow_graph.h"
 #include "tirx/analysis/var_use_def_analysis.h"
+#include "vendored/allocate_visit_passthrough.h"
 #include "vendored/let_stmt.h"
 
 namespace tvm {
@@ -317,6 +318,9 @@ private:
     Stmt output;
     if (const auto *let = stmt.as<LetStmtNode>()) {
       output = VisitStmt_(let);
+    } else if (auto out =
+                   ::tilelang::tl_tir::TryVisitAllocateMutator(this, stmt)) {
+      output = *out;
     } else {
       output = Parent::VisitStmt(stmt);
     }

@@ -662,6 +662,23 @@ public:
     return this->VisitStmt(op->body);
   }
 
+  Stmt VisitStmt_(const AllocBufferNode *op) final {
+    // AllocBuffer combines the allocation and its buffer declaration.  The
+    // replacement allocation has already been hoisted by PrepareNewAlloc.
+    if (auto it = alloc_map_.find(op->buffer->data.get());
+        it != alloc_map_.end()) {
+      if (it->second->alloc_var.get() == op->buffer->data.get()) {
+        // Winner allocation: strip the original duplicate AllocBuffer.
+        return Evaluate(0);
+      }
+      // Merged allocation: keep only a buffer declaration aliasing the winner.
+      Buffer buf = RemapBuffer(op->buffer, it->second->alloc_var);
+      return DeclBuffer(buf);
+    }
+    // Unused allocation.
+    return Evaluate(0);
+  }
+
   Stmt VisitStmt_(const DeclBufferNode *op) final {
     if (hoisted_buffer_decls_.count(op->buffer.get()) ||
         !all_buffers_accessed_.count(op->buffer.get())) {
@@ -1118,6 +1135,8 @@ private:
           }
           dst_entry->allocs.emplace_back(alloc);
           alloc_map_[var] = dst_entry;
+          non_reusable_alloc_vars_[var] =
+              IsUntaggedNonReusableAlloc(alloc, storage_scope);
         }
       }
       // enter/exit new scope
@@ -1194,6 +1213,20 @@ private:
     return e;
   }
 
+  static uint64_t ConstantAllocationNBits(const AllocateNode *op) {
+    uint64_t op_elem_bits = op->dtype.bits() * op->dtype.lanes();
+    return static_cast<uint64_t>(op->ConstantAllocationSize() * op_elem_bits);
+  }
+
+  static bool IsUntaggedNonReusableAlloc(const AllocateNode *op,
+                                         const StorageScope &scope) {
+    uint64_t const_nbits = ConstantAllocationNBits(op);
+    bool is_known_size = (const_nbits != 0);
+    return scope.tag.empty() &&
+           (scope.rank >= StorageRank::kWarp || op->dtype.is_handle() ||
+            (is_known_size && const_nbits <= 32));
+  }
+
   StorageEntry *FindAlloc(const AllocateNode *op, const Object *attach_scope,
                           const StorageScope &scope,
                           size_t num_physical_dimensions, bool enable_reuse,
@@ -1203,8 +1236,7 @@ private:
     // compiler can do a better job with register allocation.
     const uint64_t match_range = 16;
     uint64_t op_elem_bits = op->dtype.bits() * op->dtype.lanes();
-    uint64_t const_nbits =
-        static_cast<uint64_t>(op->ConstantAllocationSize() * op_elem_bits);
+    uint64_t const_nbits = ConstantAllocationNBits(op);
 
     // If the size of the array isn't known at compile-time, it must
     // have its own allocation with size determined at runtime.
@@ -1215,14 +1247,12 @@ private:
     // more in-depth algorithms.
     bool is_flat_memory_space = (num_physical_dimensions == 1);
 
-    // disable reuse of small arrays, they will be lowered to registers in LLVM
-    // This rules only apply if we are using non special memory
-    bool is_small_array =
-        (scope.tag.empty()) &&
-        (scope.rank >= StorageRank::kWarp || op->dtype.is_handle() ||
-         (is_known_size && const_nbits <= 32));
+    // Disable reuse of untagged local/handle/small arrays; small arrays are
+    // lowered to registers in LLVM.
+    bool is_non_reusable_untagged_alloc = IsUntaggedNonReusableAlloc(op, scope);
 
-    if (!enable_reuse || is_small_array || !is_flat_memory_space) {
+    if (!enable_reuse || is_non_reusable_untagged_alloc ||
+        !is_flat_memory_space) {
       return NewAlloc(op, attach_scope, scope, const_nbits);
     }
 
@@ -1290,17 +1320,14 @@ private:
     ICHECK(it != alloc_map_.end());
     StorageEntry *e = it->second;
     ICHECK_NE(e->allocs.size(), 0U);
+    auto non_reusable_it = non_reusable_alloc_vars_.find(var);
+    ICHECK(non_reusable_it != non_reusable_alloc_vars_.end());
 
-    // disable reuse of small arrays, they will be lowered to registers in LLVM
-    // This rules only apply if we are using non special memory
-    if (e->scope.tag.empty()) {
-      // Disable sharing of local memory.
-      if (e->scope.rank >= StorageRank::kWarp ||
-          e->allocs[0]->dtype.is_handle())
-        return;
-      // disable reuse of small arrays
-      if (e->const_nbits > 0 && e->const_nbits <= 32)
-        return;
+    // Mirror FindAlloc's allocation-local reuse predicate. The StorageEntry
+    // size can grow after reuse, so do not use e->const_nbits to decide whether
+    // the allocation currently being freed is reusable.
+    if (non_reusable_it->second) {
+      return;
     }
     // normal free.
     if (e->const_nbits != 0) {
@@ -1328,6 +1355,9 @@ private:
   std::unordered_map<const Object *, std::vector<StorageEntry *>> attach_map_;
   // The allocation assign map
   std::unordered_map<const VarNode *, StorageEntry *> alloc_map_;
+  // Allocation-local free-list exclusion. StorageEntry state can be shared and
+  // grow after reuse, so keep this decision per original buffer var.
+  std::unordered_map<const VarNode *, bool> non_reusable_alloc_vars_;
   // The allocations
   std::vector<std::unique_ptr<StorageEntry>> alloc_vec_;
   // The buffer objects being remapped
@@ -1351,7 +1381,8 @@ struct BufferVarInfo {
   enum DeclarationLocation : uint8_t {
     kPrimFuncParam = (1 << 0),
     kPrimFuncBufferMap = (1 << 1),
-    kAllocateNode = (1 << 2),
+    kAllocBufferNode = (1 << 2),
+    kDeclBufferNode = (1 << 3),
     kLetNode = (1 << 4),
   };
 
@@ -1507,7 +1538,7 @@ public:
     const Array<PrimExpr> &extents = op->extents;
     PrimExpr extent = extents[extents.size() - 1];
     OnArrayDeclaration(op->buffer_var, op->dtype, extent,
-                       BufferVarInfo::kAllocateNode);
+                       BufferVarInfo::kAllocBufferNode);
 
     this->VisitStmt(op->body);
   }
@@ -1521,7 +1552,7 @@ public:
     PrimExpr extent =
         !buf->shape.empty() ? buf->shape[buf->shape.size() - 1] : 0;
     OnArrayDeclaration(buf->data, buf->dtype, extent,
-                       BufferVarInfo::kAllocateNode);
+                       BufferVarInfo::kAllocBufferNode);
     StmtExprVisitor::VisitStmt_(op);
   }
 
@@ -1535,7 +1566,7 @@ public:
     PrimExpr extent =
         !buf->shape.empty() ? buf->shape[buf->shape.size() - 1] : 0;
     OnArrayDeclaration(buf->data, buf->dtype, extent,
-                       BufferVarInfo::kAllocateNode);
+                       BufferVarInfo::kDeclBufferNode);
     StmtExprVisitor::VisitStmt_(op);
   }
 
@@ -1811,8 +1842,9 @@ public:
    * have their data variable be rewritten from scalar types to vectorized
    * types.
    *
-   * @param rewrite_allocate_node Whether the buffer variable associated with
-   * AllocateNodes should be rewritten from scalar types to vectorized types.
+   * @param rewrite_alloc_buffer_node Whether the buffer variable associated
+   * with AllocBufferNodes should be rewritten from scalar types to vectorized
+   * types.
    *
    * @param rewrite_indices Whether the indices to the Load and Store nodes
    * should be rewritten to correspond to the new buffer_var type.
@@ -1823,7 +1855,7 @@ public:
   VectorTypeRewriter(
       const std::unordered_map<const VarNode *, BufferVarInfo> &info_map,
       bool rewrite_params = true, bool rewrite_buffer_map = true,
-      bool rewrite_allocate_node = true, bool rewrite_indices = true,
+      bool rewrite_alloc_buffer_node = true, bool rewrite_indices = true,
       bool rewrite_let_node = true,
       bool rewrite_scalar_read_to_vector_shuffle = true)
       : rewrite_indices_(rewrite_indices) {
@@ -1834,8 +1866,8 @@ public:
     if (rewrite_buffer_map) {
       rewrite_mask |= BufferVarInfo::kPrimFuncBufferMap;
     }
-    if (rewrite_allocate_node) {
-      rewrite_mask |= BufferVarInfo::kAllocateNode;
+    if (rewrite_alloc_buffer_node) {
+      rewrite_mask |= BufferVarInfo::kAllocBufferNode;
     }
     if (rewrite_let_node) {
       rewrite_mask |= BufferVarInfo::kLetNode;
@@ -1942,6 +1974,16 @@ public:
     auto [modified, shuffle_index] = VisitBufferAccess(std::move(node));
     ICHECK(shuffle_index < 0);
     return std::move(modified);
+  }
+
+  Stmt VisitStmt_(const AllocBufferNode *op) final {
+    Buffer new_buf = RemapBuffer(op->buffer);
+    if (new_buf.same_as(op->buffer)) {
+      return tvm::ffi::GetRef<Stmt>(op);
+    }
+    auto node = CopyOnWrite(op);
+    node->buffer = std::move(new_buf);
+    return Stmt(node);
   }
 
   // apache/tvm StmtFunctor vtable does not dispatch to vendored
@@ -2149,7 +2191,7 @@ private:
 // versions if each access into a buffer is the same vector type.
 PrimFunc PointerValueTypeRewrite(
     PrimFunc f, bool allow_untyped_pointers = false, bool rewrite_params = true,
-    bool rewrite_buffer_map = true, bool rewrite_allocate_node = true,
+    bool rewrite_buffer_map = true, bool rewrite_alloc_buffer_node = true,
     bool rewrite_indices = true, bool rewrite_let_node = true,
     bool rewrite_scalar_read_to_vector_shuffle = true) {
   VectorTypeAccessChecker checker(f->params, f->buffer_map,
@@ -2159,7 +2201,7 @@ PrimFunc PointerValueTypeRewrite(
 
   VectorTypeRewriter rewriter(
       checker.info_map_, rewrite_params, rewrite_buffer_map,
-      rewrite_allocate_node, rewrite_indices, rewrite_let_node,
+      rewrite_alloc_buffer_node, rewrite_indices, rewrite_let_node,
       rewrite_scalar_read_to_vector_shuffle);
   PrimFuncNode *n = f.CopyOnWrite();
   n->body = rewriter(std::move(n->body));
@@ -2200,7 +2242,7 @@ Pass StorageRewrite() {
         std::move(n->body), detect_inplace, enable_reuse,
         reuse_require_exact_matched_dtype, std::move(local_var_init_map));
     // Parameters may not be rewritten, but internal allocations may.
-    return PointerValueTypeRewrite(std::move(f), true, false, false, false,
+    return PointerValueTypeRewrite(std::move(f), true, false, false, true,
                                    true, true, false);
   };
   return CreatePrimFuncPass(pass_func, 0, "tir.StorageRewrite", {});

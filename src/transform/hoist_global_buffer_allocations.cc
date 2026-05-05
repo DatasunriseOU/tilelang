@@ -24,6 +24,7 @@
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 #include <tvm/tirx/var.h>
@@ -84,8 +85,23 @@ public:
     StmtExprVisitor::VisitStmt_(op);
   }
 
+  void VisitExpr_(const CallNode *op) final {
+    StmtExprVisitor::VisitExpr_(op);
+    if (!op->op.same_as(builtin::tvm_access_ptr()) || op->args.size() < 2) {
+      return;
+    }
+    if (const auto *data = op->args[1].as<VarNode>()) {
+      DataType elem_dtype = op->args[0].defined() ? op->args[0].dtype()
+                                                  : DataType::Void();
+      RecordAccessPtrUse(ffi::GetRef<Var>(data), elem_dtype);
+    }
+  }
+
   // Map of buffer-data Var -> Buffer for any buffer ever referenced.
   std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> used_buffers_;
+  // Map of raw tvm_access_ptr data Var -> pointed-to element dtype.
+  std::unordered_map<Var, DataType, ObjectPtrHash, ObjectPtrEqual>
+      used_access_ptr_vars_;
   std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> defined_vars_;
 
 private:
@@ -93,6 +109,165 @@ private:
     if (!buf.defined()) return;
     used_buffers_.emplace(buf->data, buf);
   }
+
+  void RecordAccessPtrUse(const Var &data, DataType elem_dtype) {
+    if (ambiguous_access_ptr_vars_.count(data)) {
+      return;
+    }
+    auto it = used_access_ptr_vars_.find(data);
+    if (it == used_access_ptr_vars_.end()) {
+      used_access_ptr_vars_.emplace(data, elem_dtype);
+    } else if (it->second.is_void()) {
+      it->second = elem_dtype;
+    } else if (elem_dtype.is_void()) {
+      return;
+    } else if (it->second != elem_dtype) {
+      used_access_ptr_vars_.erase(it);
+      ambiguous_access_ptr_vars_.insert(data);
+    }
+  }
+
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>
+      ambiguous_access_ptr_vars_;
+};
+
+bool PrimExprDeepEqual(const PrimExpr &lhs, const PrimExpr &rhs) {
+  if (lhs.defined() != rhs.defined()) {
+    return false;
+  }
+  return !lhs.defined() || ExprDeepEqual()(lhs, rhs);
+}
+
+bool PrimExprArrayDeepEqual(const ffi::Array<PrimExpr> &lhs,
+                            const ffi::Array<PrimExpr> &rhs) {
+  if (lhs.size() != rhs.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < lhs.size(); ++i) {
+    if (!PrimExprDeepEqual(lhs[i], rhs[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool IntImmArrayDeepEqual(const ffi::Array<IntImm> &lhs,
+                          const ffi::Array<IntImm> &rhs) {
+  if (lhs.size() != rhs.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < lhs.size(); ++i) {
+    if (!ExprDeepEqual()(lhs[i], rhs[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool MatchesCanonicalInputBuffer(const Buffer &buffer,
+                                 const Buffer &canonical) {
+  if (!buffer.defined() || !canonical.defined()) {
+    return false;
+  }
+  if (!IsGlobalBuffer(buffer) || !IsGlobalBuffer(canonical)) {
+    return false;
+  }
+  if (buffer->data->name_hint != canonical->data->name_hint ||
+      buffer->data.dtype() != canonical->data.dtype()) {
+    return false;
+  }
+  if (buffer->name != canonical->name || buffer->dtype != canonical->dtype ||
+      buffer->data_alignment != canonical->data_alignment ||
+      buffer->offset_factor != canonical->offset_factor ||
+      buffer->buffer_type != canonical->buffer_type) {
+    return false;
+  }
+  return PrimExprArrayDeepEqual(buffer->shape, canonical->shape) &&
+         PrimExprArrayDeepEqual(buffer->strides, canonical->strides) &&
+         PrimExprDeepEqual(buffer->elem_offset, canonical->elem_offset) &&
+         IntImmArrayDeepEqual(buffer->axis_separators,
+                              canonical->axis_separators);
+}
+
+Buffer FindCanonicalInputBuffer(const Buffer &buffer,
+                                const ffi::Map<Var, Buffer> &buffer_map) {
+  Buffer match;
+  for (const auto &kv : buffer_map) {
+    const Buffer &candidate = kv.second;
+    if (!MatchesCanonicalInputBuffer(buffer, candidate)) {
+      continue;
+    }
+    if (match.defined()) {
+      // Multiple identical parameter buffers are ambiguous. Leave the IR
+      // unchanged so the later UndefinedVars check reports the real problem.
+      return Buffer();
+    }
+    match = candidate;
+  }
+  return match;
+}
+
+bool MatchesCanonicalInputDataVar(const Var &data, DataType elem_dtype,
+                                  const Buffer &canonical) {
+  if (!canonical.defined() || !IsGlobalBuffer(canonical)) {
+    return false;
+  }
+  if (data->name_hint != canonical->data->name_hint ||
+      data.dtype() != canonical->data.dtype()) {
+    return false;
+  }
+  if (!elem_dtype.is_void() && elem_dtype != canonical->dtype) {
+    return false;
+  }
+  return true;
+}
+
+Buffer FindCanonicalInputBufferForDataVar(
+    const Var &data, DataType elem_dtype,
+    const ffi::Map<Var, Buffer> &buffer_map) {
+  Buffer match;
+  for (const auto &kv : buffer_map) {
+    const Buffer &candidate = kv.second;
+    if (!MatchesCanonicalInputDataVar(data, elem_dtype, candidate)) {
+      continue;
+    }
+    if (match.defined()) {
+      return Buffer();
+    }
+    match = candidate;
+  }
+  return match;
+}
+
+class InputBufferCanonicalizer : public StmtExprMutator {
+public:
+  explicit InputBufferCanonicalizer(
+      const std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual>
+          &canonical_buffers)
+      : canonical_buffers_(canonical_buffers) {}
+
+private:
+  Buffer VisitBufferUse(const Buffer &buffer) final {
+    if (buffer.defined()) {
+      auto it = canonical_buffers_.find(buffer->data);
+      if (it != canonical_buffers_.end()) {
+        return it->second;
+      }
+    }
+    return StmtExprMutator::VisitBufferUse(buffer);
+  }
+
+  PrimExpr VisitExpr_(const VarNode *op) final {
+    Var var = ffi::GetRef<Var>(op);
+    auto it = canonical_buffers_.find(var);
+    if (it != canonical_buffers_.end()) {
+      return it->second->data;
+    }
+    return var;
+  }
+
+  const std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual>
+      &canonical_buffers_;
 };
 
 class GlobalBufferAllocationsHoister : public StmtMutator {
@@ -132,18 +307,52 @@ PrimFunc HoistGlobalBufferAllocations(PrimFunc func) {
   auto fptr = func.CopyOnWrite();
   // CPPMEGA: Collect ghost buffers (referenced via BufferLoad/Store but never
   // defined by any Alloc/Decl/match site or as a function parameter handle).
-  GhostBufferCollector collector;
-  collector(fptr->body);
+  auto collect_buffers = [&]() {
+    GhostBufferCollector collector;
+    collector(fptr->body);
+    for (const auto &kv : fptr->buffer_map) {
+      if (kv.second.defined()) {
+        collector.defined_vars_.insert(kv.second->data);
+      }
+    }
+    return collector;
+  };
+
   // Function parameter Vars are also "defined" for the purposes of binding.
   std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> param_vars(
       fptr->params.begin(), fptr->params.end());
-  // Buffer data Vars exposed via buffer_map (match_buffer on params) are
-  // defined too.
-  for (const auto &kv : fptr->buffer_map) {
-    if (kv.second.defined()) {
-      collector.defined_vars_.insert(kv.second->data);
+
+  GhostBufferCollector collector = collect_buffers();
+  std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual>
+      canonical_buffers;
+  for (const auto &kv : collector.used_buffers_) {
+    const Var &v = kv.first;
+    const Buffer &buf = kv.second;
+    if (collector.defined_vars_.count(v) || param_vars.count(v)) continue;
+
+    Buffer canonical = FindCanonicalInputBuffer(buf, fptr->buffer_map);
+    if (canonical.defined()) {
+      canonical_buffers.emplace(v, canonical);
     }
   }
+  for (const auto &kv : collector.used_access_ptr_vars_) {
+    const Var &v = kv.first;
+    DataType elem_dtype = kv.second;
+    if (collector.defined_vars_.count(v) || param_vars.count(v)) continue;
+    if (canonical_buffers.count(v)) continue;
+
+    Buffer canonical =
+        FindCanonicalInputBufferForDataVar(v, elem_dtype, fptr->buffer_map);
+    if (canonical.defined()) {
+      canonical_buffers.emplace(v, canonical);
+    }
+  }
+
+  if (!canonical_buffers.empty()) {
+    fptr->body = InputBufferCanonicalizer(canonical_buffers)(fptr->body);
+    collector = collect_buffers();
+  }
+
   ffi::Array<Buffer> ghost_buffers;
   for (const auto &kv : collector.used_buffers_) {
     const Var &v = kv.first;
