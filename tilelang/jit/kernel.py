@@ -458,7 +458,7 @@ class JITKernel(Generic[_P, _T]):
         str
             The source code of the compiled kernel function.
         """
-        if self.execution_backend in {"cython", "nvrtc", "tvm_ffi", "cutedsl"}:
+        if self.execution_backend in {"cython", "nvrtc", "tvm_ffi", "cutedsl", "torch"}:
             return self.adapter.get_kernel_source(kernel_only=kernel_only)
         return self.artifact.kernel_source
 
