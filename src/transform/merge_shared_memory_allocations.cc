@@ -126,7 +126,9 @@ public:
     } else if (IsStaticSharedMemory(op->buffer->data)) {
       static_shmem_allocs_[op->buffer->data.get()] = MakeSharedAllocInfo(op);
     }
-    StmtExprVisitor::VisitStmt_(op);
+    // Apache AllocBuffer is bodyless.  The default visitor only walks Buffer
+    // definition metadata, which is not needed for allocation collection and
+    // can contain legacy TileLang buffer handles during this migration.
   }
 
   void VisitStmt(const Stmt &stmt) override {
@@ -211,7 +213,9 @@ public:
     const VarNode *buf = op->buffer->data.get();
     alloc_info_[buf].defined = true;
     alloc_info_[buf].level = level;
-    StmtExprVisitor::VisitStmt_(op);
+    // Apache AllocBuffer has no body.  Do not descend into Buffer definition
+    // metadata here; liveness only needs the allocation site, and default
+    // metadata traversal can trip on legacy TileLang buffer objects.
   }
 
   void VisitStmt(const Stmt &stmt) override {
@@ -270,6 +274,11 @@ public:
     const VarNode *buf = op->buffer->data.get();
     auto it = alloc_info_.find(buf);
     if (it != alloc_info_.end() && it->second.defined) {
+      if (scope_.empty()) {
+        // AllocBuffer/DeclBuffer metadata can visit the backing Var before any
+        // statement frame exists. That declaration is not a live buffer use.
+        return;
+      }
       // Earlier we required `alloc_level < scope_.size()`, assuming every load
       // would occur strictly inside a nested scope.  In practice the lowering
       // pipeline may materialise reads in the very same frame that owns the
@@ -298,6 +307,12 @@ public:
     // Directly reference to the variable count as a read.
     auto it = alloc_info_.find(buf);
     if (it != alloc_info_.end() && it->second.defined) {
+      if (scope_.empty()) {
+        // AllocBuffer metadata visits its own data Var after registration.
+        // That declaration is not a live use, and apache's liveness model only
+        // records touches inside statement/scope frames.
+        return;
+      }
       // Same rationale as the BufferLoad path above: direct references can be
       // emitted at the allocation level after flattening, so accept them and
       // record the touch for liveness planning.
@@ -492,6 +507,19 @@ private:
       MarkSharedVarIfNeeded(data_var);
     }
     StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const AllocBufferNode *op) final {
+    // Apache AllocBuffer is bodyless. Alignment planning only needs shared
+    // vars touched by alignment-sensitive intrinsics, not declaration metadata.
+  }
+
+  void VisitStmt(const Stmt &stmt) override {
+    if (const auto *op = stmt.as<AllocateNode>()) {
+      this->VisitStmt(op->body);
+      return;
+    }
+    StmtExprVisitor::VisitStmt(stmt);
   }
 
   bool under_alignment_scope_{false};
@@ -722,43 +750,69 @@ private:
                    op->args[4]});
     } else if (op->op.same_as(builtin::ptx_cp_async()) ||
                op->op.same_as(tl::ptx_cp_async())) {
-      ICHECK(op->args.size() == 3U || op->args.size() == 4U)
-          << "ptx_cp_async expects 3 or 4 arguments (dst_access_ptr, "
-             "src_access_ptr, count[, predicate])";
-
-      // Extract dst_access_ptr and check if it needs merging
-      Call dst_access_ptr = Downcast<Call>(op->args[0]);
-      ICHECK(dst_access_ptr->op.same_as(builtin::tvm_access_ptr()))
-          << "First argument must be tvm_access_ptr";
-
-      // tvm_access_ptr(ptype, data, offset, extent, rw_mask)
-      Var buffer = Downcast<Var>(dst_access_ptr->args[1]);
-      if (!IsAppropriateSharedMemory(buffer)) {
-        return StmtExprMutator::VisitExpr_(op);
-      }
-
       DataType dtype = op->dtype;
-      DataType ptr_dtype = dst_access_ptr->args[0].dtype();
-      PrimExpr extra_offset = GetBufferOffset(buffer, ptr_dtype);
-      PrimExpr offset = this->VisitExpr(dst_access_ptr->args[2]);
+      if (op->args.size() == 3U || op->args.size() == 4U) {
+        const auto *dst_access_ptr = op->args[0].as<CallNode>();
+        if (dst_access_ptr == nullptr ||
+            !dst_access_ptr->op.same_as(builtin::tvm_access_ptr()) ||
+            dst_access_ptr->args.size() != 5U ||
+            !dst_access_ptr->args[1].as<VarNode>()) {
+          return StmtExprMutator::VisitExpr_(op);
+        }
 
-      // Create new dst_access_ptr with merged buffer and adjusted offset
-      auto new_dst_access_ptr =
-          Call(DataType::Handle(), builtin::tvm_access_ptr(),
-               {
-                   dst_access_ptr->args[0], // ptype
-                   merged_buf_var_,         // merged buffer
-                   extra_offset + offset,   // adjusted offset
-                   dst_access_ptr->args[3], // extent
-                   dst_access_ptr->args[4]  // rw_mask
-               });
+        // tvm_access_ptr(ptype, data, offset, extent, rw_mask)
+        Var buffer = Downcast<Var>(dst_access_ptr->args[1]);
+        if (!IsAppropriateSharedMemory(buffer)) {
+          return StmtExprMutator::VisitExpr_(op);
+        }
 
-      Array<PrimExpr> cp_async_args = {new_dst_access_ptr, op->args[1],
-                                       op->args[2]};
-      if (op->args.size() == 4U) {
-        cp_async_args.push_back(op->args[3]);
+        DataType ptr_dtype = dst_access_ptr->args[0].dtype();
+        PrimExpr extra_offset = GetBufferOffset(buffer, ptr_dtype);
+        PrimExpr offset = this->VisitExpr(dst_access_ptr->args[2]);
+
+        // Create new dst_access_ptr with merged buffer and adjusted offset.
+        auto new_dst_access_ptr =
+            Call(DataType::Handle(), builtin::tvm_access_ptr(),
+                 {
+                     dst_access_ptr->args[0], // ptype
+                     merged_buf_var_,         // merged buffer
+                     extra_offset + offset,   // adjusted offset
+                     dst_access_ptr->args[3], // extent
+                     dst_access_ptr->args[4]  // rw_mask
+                 });
+
+        Array<PrimExpr> cp_async_args = {new_dst_access_ptr, op->args[1],
+                                         op->args[2]};
+        if (op->args.size() == 4U) {
+          cp_async_args.push_back(op->args[3]);
+        }
+        return Call(dtype, op->op, cp_async_args);
       }
-      return Call(dtype, op->op, cp_async_args);
+
+      if (op->op.same_as(builtin::ptx_cp_async()) &&
+          (op->args.size() == 5U || op->args.size() == 6U) &&
+          op->args[0].as<VarNode>()) {
+        Var buffer = Downcast<Var>(op->args[0]);
+        if (!IsAppropriateSharedMemory(buffer)) {
+          return StmtExprMutator::VisitExpr_(op);
+        }
+        PrimExpr extra_offset = GetBufferOffset(buffer, dtype);
+        PrimExpr offset = this->VisitExpr(op->args[1]);
+        int index_factor = dtype.bytes();
+        Array<PrimExpr> cp_async_args = {
+            merged_buf_var_,
+            mul(extra_offset + offset, PrimExpr(index_factor)),
+            op->args[2],
+            op->args[3],
+            op->args[4],
+        };
+        if (op->args.size() == 6U) {
+          cp_async_args.push_back(op->args[5]);
+        }
+        return Call(dtype, op->op, cp_async_args);
+      }
+
+      return StmtExprMutator::VisitExpr_(op);
     } else {
       return StmtExprMutator::VisitExpr_(op);
     }
@@ -1355,17 +1409,19 @@ private:
 
     std::vector<BufInfo> buf_infos;
     buf_infos.reserve(shmem_allocs_.size());
-    // Build a BufInfo for all allocations that participate in liveness.
+    // Build a BufInfo for every collected allocation.  Some buffers are only
+    // passed by pointer to an intrinsic, so they may not produce gen/kill
+    // events in the flattened liveness stream.  They still must be removed and
+    // remapped, otherwise lower_device_kernel_launch sees multiple
+    // `shared.dyn` AllocBuffers.
     for (const VarNode *var : sorted_vars) {
       auto start_it = start_index.find(var);
-      if (start_it == start_index.end()) {
-        continue;
-      }
 
       BufInfo info;
       info.var = var;
       info.name = var->name_hint;
-      info.start = start_it->second;
+      info.start =
+          start_it == start_index.end() ? seq_len : start_it->second;
       info.end = std::max(end_index[var], info.start + 1);
       info.alignment = align_bytes_;
       auto align_it = shmem_alignment_map_.find(var);

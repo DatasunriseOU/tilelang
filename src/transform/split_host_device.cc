@@ -309,6 +309,22 @@ private:
     }
     buffers_to_declare = new_buffers_to_declare;
 
+    std::unordered_set<const tirx::VarNode *> param_set;
+    for (const auto &param : params) {
+      param_set.insert(param.get());
+    }
+
+    Map<tirx::Var, tirx::Buffer> device_buffer_map;
+    Array<tirx::Buffer> body_buffers_to_declare;
+    for (const auto &buf : buffers_to_declare) {
+      if (param_set.count(buf->data.get())) {
+        device_buffer_map.Set(buf->data, buf);
+      } else {
+        body_buffers_to_declare.push_back(buf);
+      }
+    }
+    buffers_to_declare = body_buffers_to_declare;
+
     // CodeGenCPU is used for some device-side targets, such as
     // "ext_dev", and expects to be able to return a int32_t status
     // code.
@@ -350,7 +366,8 @@ private:
       }
     }
 
-    tirx::PrimFunc device_func(params, body, kernel_ret_type);
+    tirx::PrimFunc device_func(params, body, kernel_ret_type,
+                               device_buffer_map);
     Map<String, ffi::Any> device_attrs = {
         {tvm::attr::kTarget, device_target},
         {tirx::attr::kNoAlias, true},

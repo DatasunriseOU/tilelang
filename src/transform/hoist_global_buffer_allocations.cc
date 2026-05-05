@@ -31,6 +31,7 @@
 
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "../op/utils.h"
 #include "common/attr.h"
@@ -257,31 +258,134 @@ private:
     return StmtExprMutator::VisitBufferUse(buffer);
   }
 
-  PrimExpr VisitExpr_(const VarNode *op) final {
-    Var var = ffi::GetRef<Var>(op);
-    auto it = canonical_buffers_.find(var);
-    if (it != canonical_buffers_.end()) {
-      return it->second->data;
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    if (!op->op.same_as(builtin::tvm_access_ptr()) || op->args.size() < 2) {
+      return StmtExprMutator::VisitExpr_(op);
     }
-    return var;
+
+    ffi::Array<PrimExpr> args;
+    for (size_t i = 0; i < op->args.size(); ++i) {
+      PrimExpr arg = this->VisitExpr(op->args[i]);
+      if (i == 1) {
+        if (const auto *var = arg.as<VarNode>()) {
+          auto it = canonical_buffers_.find(ffi::GetRef<Var>(var));
+          if (it != canonical_buffers_.end()) {
+            arg = it->second->data;
+          }
+        }
+      }
+      args.push_back(arg);
+    }
+    return Call(op->dtype, op->op, args);
   }
 
   const std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual>
       &canonical_buffers_;
 };
 
+class GhostBufferPlacementPlanner : public StmtExprVisitor {
+public:
+  explicit GhostBufferPlacementPlanner(const ffi::Array<Buffer> &ghost_buffers) {
+    for (const Buffer &buf : ghost_buffers) {
+      ghost_buffers_.emplace(buf->data, buf);
+    }
+  }
+
+  void VisitStmt_(const SBlockRealizeNode *op) final {
+    if (!is_one(op->predicate)) {
+      this->VisitExpr(op->predicate);
+    }
+    block_stack_.push_back(op->block.get());
+    this->VisitStmt(op->block->body);
+    block_stack_.pop_back();
+  }
+
+  void VisitStmt_(const SBlockNode *op) final {
+    block_stack_.push_back(op);
+    this->VisitStmt(op->body);
+    block_stack_.pop_back();
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    RecordBufferUse(op->buffer);
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    RecordBufferUse(op->buffer);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(builtin::tvm_access_ptr()) && op->args.size() >= 2) {
+      if (const auto *data = op->args[1].as<VarNode>()) {
+        RecordBufferVarUse(ffi::GetRef<Var>(data));
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void BuildPlacements() {
+    for (const auto &kv : owner_paths_) {
+      const std::vector<const SBlockNode *> &path = kv.second;
+      if (path.empty()) {
+        continue;
+      }
+      const SBlockNode *owner = path.back();
+      // A non-global ghost buffer allocated at host root is not a valid
+      // device-local allocation; leave it visible to downstream diagnostics.
+      if (IsHostMainBlock(owner)) {
+        continue;
+      }
+      placements_[owner].push_back(ghost_buffers_.at(kv.first));
+    }
+  }
+
+  std::unordered_map<const SBlockNode *, ffi::Array<Buffer>> placements_;
+
+private:
+  void RecordBufferUse(const Buffer &buf) {
+    if (!buf.defined()) return;
+    RecordBufferVarUse(buf->data);
+  }
+
+  void RecordBufferVarUse(const Var &var) {
+    if (!ghost_buffers_.count(var) || block_stack_.empty()) {
+      return;
+    }
+    auto it = owner_paths_.find(var);
+    if (it == owner_paths_.end()) {
+      owner_paths_.emplace(var, block_stack_);
+      return;
+    }
+    std::vector<const SBlockNode *> &path = it->second;
+    size_t common = 0;
+    size_t limit = std::min(path.size(), block_stack_.size());
+    while (common < limit && path[common] == block_stack_[common]) {
+      ++common;
+    }
+    path.resize(common);
+  }
+
+  std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> ghost_buffers_;
+  std::unordered_map<Var, std::vector<const SBlockNode *>, ObjectPtrHash,
+                     ObjectPtrEqual>
+      owner_paths_;
+  std::vector<const SBlockNode *> block_stack_;
+};
+
 class GlobalBufferAllocationsHoister : public StmtMutator {
 public:
+  explicit GlobalBufferAllocationsHoister(
+      std::unordered_map<const SBlockNode *, ffi::Array<Buffer>>
+          ghost_buffer_placements)
+      : ghost_buffer_placements_(std::move(ghost_buffer_placements)) {}
+
   Stmt VisitStmt_(const SBlockNode *op) final {
     auto node = Downcast<SBlock>(StmtMutator::VisitStmt_(op));
 
     if (IsHostMainBlock(op)) {
       for (const auto &buf : global_buffers_) {
-        node.CopyOnWrite()->alloc_buffers.push_back(buf);
-      }
-      // CPPMEGA: Also materialize ghost local buffers (used but never
-      // allocated) here so MakePackedAPI's UndefinedVars check succeeds.
-      for (const auto &buf : ghost_buffers_) {
         node.CopyOnWrite()->alloc_buffers.push_back(buf);
       }
     } else {
@@ -296,11 +400,21 @@ public:
       node.CopyOnWrite()->alloc_buffers = std::move(new_alloc_buffers);
     }
 
+    auto placement_it = ghost_buffer_placements_.find(op);
+    if (placement_it != ghost_buffer_placements_.end()) {
+      for (const auto &buf : placement_it->second) {
+        node.CopyOnWrite()->alloc_buffers.push_back(buf);
+      }
+    }
+
     return node;
   }
 
   ffi::Array<Buffer> global_buffers_;
-  ffi::Array<Buffer> ghost_buffers_;
+
+private:
+  std::unordered_map<const SBlockNode *, ffi::Array<Buffer>>
+      ghost_buffer_placements_;
 };
 
 PrimFunc HoistGlobalBufferAllocations(PrimFunc func) {
@@ -373,8 +487,11 @@ PrimFunc HoistGlobalBufferAllocations(PrimFunc func) {
     ghost_buffers.push_back(buf);
   }
 
-  GlobalBufferAllocationsHoister hoister;
-  hoister.ghost_buffers_ = std::move(ghost_buffers);
+  GhostBufferPlacementPlanner planner(ghost_buffers);
+  planner(fptr->body);
+  planner.BuildPlacements();
+
+  GlobalBufferAllocationsHoister hoister(std::move(planner.placements_));
   fptr->body = hoister(fptr->body);
   return func;
 }
