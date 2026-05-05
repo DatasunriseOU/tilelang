@@ -60,6 +60,7 @@ public:
   // etc. all in codegen_c.h). The vendored type is dispatched via the short-
   // circuit `VisitStmt(const Stmt&)` pattern established elsewhere.
   void VisitStmt_(const AllocateNode *op);          // NOLINT(*)
+  void VisitStmt_(const AllocBufferNode *op) final; // NOLINT(*)
   void VisitStmt_(const BufferStoreNode *op) final; // NOLINT(*)
   void VisitExpr_(const BufferLoadNode *op,
                   std::ostream &os) final;                          // NOLINT(*)
@@ -67,6 +68,8 @@ public:
   void VisitExpr_(const BroadcastNode *op, std::ostream &os) final; // NOLINT(*)
   void VisitExpr_(const CallNode *op, std::ostream &os) final;      // NOLINT(*)
   void VisitExpr_(const FloatImmNode *op, std::ostream &os) final;  // NOLINT(*)
+  std::string CastFromTo(std::string value, DataType from,
+                         DataType target) final;
 
   // reuse parent's function.
   using CodeGenC::PrintType;

@@ -51,6 +51,58 @@ PrimFunc PointerValueTypeRewrite(
 
 namespace codegen {
 
+namespace {
+
+class MetalBodyBufferAliasCollector final : public StmtExprVisitor {
+public:
+  explicit MetalBodyBufferAliasCollector(
+      std::unordered_map<std::string, const VarNode *> param_aliases)
+      : param_aliases_(std::move(param_aliases)) {}
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    MaybeCollect(op->buffer);
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    MaybeCollect(op->buffer);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  struct Alias {
+    const VarNode *param_var{nullptr};
+    DataType dtype;
+  };
+
+  const std::unordered_map<const VarNode *, Alias> &aliases() const {
+    return aliases_;
+  }
+
+private:
+  void MaybeCollect(const Buffer &buffer) {
+    const VarNode *data = buffer->data.get();
+    if (aliases_.count(data)) {
+      return;
+    }
+    auto it = param_aliases_.find(data->name_hint);
+    if (it == param_aliases_.end() || it->second == data) {
+      return;
+    }
+    if (!data->type_annotation.as<PointerTypeNode>()) {
+      return;
+    }
+    std::string scope = GetPtrStorageScope(buffer->data);
+    if (scope == "global") {
+      aliases_[data] = Alias{it->second, buffer->dtype};
+    }
+  }
+
+  std::unordered_map<std::string, const VarNode *> param_aliases_;
+  std::unordered_map<const VarNode *, Alias> aliases_;
+};
+
+} // namespace
+
 void CodeGenTileLangMetal::InitFuncState(const PrimFunc &f) {
   CodeGenC::InitFuncState(f);
   // analyze the data;
@@ -64,6 +116,34 @@ void CodeGenTileLangMetal::InitFuncState(const PrimFunc &f) {
 CodeGenTileLangMetal::CodeGenTileLangMetal(Target target) : target_(target) {
   decl_stream << "#include <metal_stdlib>\n";
   decl_stream << "using namespace metal;\n\n";
+  decl_stream << "static inline half __tvm_fp8_e4m3_to_half(uchar x) {\n"
+              << "  uint raw = uint(x);\n"
+              << "  uint abs = raw & 0x7fu;\n"
+              << "  if (abs == 0u) return half(0.0f);\n"
+              << "  uint exp = (raw >> 3) & 0x0fu;\n"
+              << "  uint mant = raw & 0x07u;\n"
+              << "  if (exp == 0x0fu && mant == 0x07u) return half(as_type<float>(0x7fc00000u));\n"
+              << "  float mag = (exp == 0u)\n"
+              << "      ? (float(mant) * 0.125f * exp2(-6.0f))\n"
+              << "      : ((1.0f + float(mant) * 0.125f) * exp2(float(int(exp) - 7)));\n"
+              << "  return half((raw & 0x80u) != 0u ? -mag : mag);\n"
+              << "}\n\n";
+  decl_stream << "static inline half __tvm_fp8_e5m2_to_half(uchar x) {\n"
+              << "  uint raw = uint(x);\n"
+              << "  uint abs = raw & 0x7fu;\n"
+              << "  if (abs == 0u) return half(0.0f);\n"
+              << "  uint exp = (raw >> 2) & 0x1fu;\n"
+              << "  uint mant = raw & 0x03u;\n"
+              << "  if (exp == 0x1fu) {\n"
+              << "    float inf = as_type<float>((raw & 0x80u) != 0u ? 0xff800000u : 0x7f800000u);\n"
+              << "    float nan = as_type<float>(0x7fc00000u);\n"
+              << "    return half(mant == 0u ? inf : nan);\n"
+              << "  }\n"
+              << "  float mag = (exp == 0u)\n"
+              << "      ? (float(mant) * 0.25f * exp2(-14.0f))\n"
+              << "      : ((1.0f + float(mant) * 0.25f) * exp2(float(int(exp) - 15)));\n"
+              << "  return half((raw & 0x80u) != 0u ? -mag : mag);\n"
+              << "}\n\n";
   decl_stream << "union __TVMArgUnion {\n"
               << " int v_int[2];\n"
               << "};\n\n";
@@ -108,15 +188,18 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
                     "high number of "
                     "buffers in the kernel";
   }
+  std::unordered_map<std::string, const VarNode *> external_buffer_aliases;
   for (size_t i = 0; i < func->params.size(); ++i, ++num_buffer) {
     Var v = func->params[i];
     if (!v.dtype().is_handle())
       break;
     this->stream << "  ";
     std::string vid = AllocVarID(v.get());
+    external_buffer_aliases.emplace(v->name_hint, v.get());
     auto it_buf = func->buffer_map.find(v);
     if (it_buf != func->buffer_map.end()) {
       const Buffer &buf = (*it_buf).second;
+      external_buffer_aliases[buf->data->name_hint] = v.get();
       if (!buf->data.same_as(v)) {
         // Apache codegen prints BufferLoad/Store through Buffer.data, while
         // the Metal ABI only exposes the handle param.  Keep the alias local
@@ -205,6 +288,24 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
   // the function scope.
   stream << ") {\n";
   int func_scope = this->BeginScope();
+  MetalBodyBufferAliasCollector alias_collector(std::move(external_buffer_aliases));
+  alias_collector(func->body);
+  for (const auto &kv : alias_collector.aliases()) {
+    auto param_it = var_idmap_.find(kv.second.param_var);
+    ICHECK(param_it != var_idmap_.end())
+        << "Metal body buffer alias matched param without a codegen id: "
+        << kv.first->name_hint;
+    if (!var_idmap_.count(kv.first)) {
+      // FlattenBuffer/PointerValueTypeRewrite may create a body-local Buffer.data
+      // Var that is pointer-distinct from both the ABI param and buffer_map
+      // entry.  Source codegen is pointer-identity based, so register that
+      // external alias to the already emitted Metal parameter before printing
+      // the body.  Scratch/local buffers are excluded by the global-scope check.
+      var_idmap_[kv.first] = param_it->second;
+      alloc_storage_scope_[kv.first] = "global";
+      RegisterHandleType(kv.first, kv.second.dtype);
+    }
+  }
   this->PrintStmt(func->body);
   this->EndScope(func_scope);
   this->PrintIndent();
@@ -254,10 +355,14 @@ void CodeGenTileLangMetal::PrintType(DataType t,
   // lowering. See docs/mlx_port_master_plan.md (Metal FP8/FP4 fail-closed).
   if (t.is_float8()) {
     if (t.is_float8_e4m3() || t.is_float8_e5m2()) {
-      os << "uchar";
+      if (lanes == 8 || lanes == 16) {
+        os << "uint" << lanes / 4;
+      } else {
+        os << "uchar";
+      }
       if (lanes >= 2 && lanes <= 4) {
         os << lanes;
-      } else {
+      } else if (!(lanes == 8 || lanes == 16)) {
         ICHECK_EQ(lanes, 1);
       }
       return;
@@ -349,6 +454,8 @@ void CodeGenTileLangMetal::PrintVecElemLoad(const std::string &vec, DataType t,
                                             std::ostream &os) { // NOLINT(*)
   if (t.is_float16() && t.lanes() > 4) {
     os << "((thread half*)(&" << vec << "))[" << i << "]";
+  } else if (t.is_float8() && t.lanes() > 4) {
+    os << "((thread uchar*)(&" << vec << "))[" << i << "]";
   } else {
     os << vec << "[" << i << "]";
   }
@@ -359,6 +466,9 @@ void CodeGenTileLangMetal::PrintVecElemStore(const std::string &vec, DataType t,
   this->PrintIndent();
   if (t.is_float16() && t.lanes() > 4) {
     stream << "((thread half*)(&" << vec << "))[" << i << "] = " << value
+           << ";\n";
+  } else if (t.is_float8() && t.lanes() > 4) {
+    stream << "((thread uchar*)(&" << vec << "))[" << i << "] = " << value
            << ";\n";
   } else {
     stream << vec << "[" << i << "]"
@@ -374,6 +484,9 @@ void CodeGenTileLangMetal::PrintStorageScope(const std::string &scope,
     os << "threadgroup ";
   } else if (scope == "local" || scope == "local.fragment") {
     os << "thread ";
+  } else if (scope == "metal.simdgroup") {
+    // The actual simdgroup matrix declaration is emitted by the allocation
+    // visitor; this branch only keeps incidental scope printing from aborting.
   } else {
     LOG(FATAL) << "Unknown storage scope `" << scope << "`";
   }
@@ -431,8 +544,67 @@ void CodeGenTileLangMetal::VisitStmt_(const AllocateNode *op) {
   this->PrintStmt(op->body);
 }
 
+void CodeGenTileLangMetal::VisitStmt_(const AllocBufferNode *op) {
+  ICHECK(op->buffer.defined());
+  std::string vid = AllocVarID(op->buffer->data.get());
+
+  this->PrintIndent();
+  size_t constant_size = 1;
+  for (const auto &dim : op->buffer->shape) {
+    const IntImmNode *dim_imm = dim.as<IntImmNode>();
+    ICHECK(dim_imm) << "Can only handle constant size stack allocation for now";
+    constant_size *= dim_imm->value;
+  }
+  ICHECK_GT(constant_size, 0)
+      << "Can only handle constant size stack allocation for now";
+
+  auto scope = GetPtrStorageScope(op->buffer->data);
+  alloc_storage_scope_[op->buffer->data.get()] = scope;
+  DataType dtype = op->buffer->dtype;
+  if (scope == "metal.simdgroup") {
+    ICHECK(dtype == DataType::Float(16) || dtype == DataType::Float(32) ||
+           dtype == DataType::BFloat(16))
+        << "Only float16, float32, and bfloat16 are supported, but got "
+        << dtype;
+    ICHECK(constant_size % 64 == 0)
+        << "Only 8x8 matrix is supported, but got " << constant_size
+        << " bytes\n";
+
+    std::ostringstream dtype_os;
+    PrintType(dtype, dtype_os);
+    std::string dtype_str = dtype_os.str();
+    simdgroup_dtype_[op->buffer->data.get()] = dtype_str;
+    stream << "simdgroup_" << dtype_str << "8x8 " << vid << '['
+           << constant_size / 64 << "];\n";
+  } else if (scope == "local.var") {
+    ICHECK(dtype.is_scalar()) << "Vector local.var allocation is not supported.";
+    ICHECK_EQ(constant_size, 1)
+        << "Only scalar local.var allocation is supported.";
+    PrimExpr init = tirx::make_const(dtype, 0);
+    auto init_it = op->annotations.find(tl::attr::kLocalVarInit);
+    if (init_it != op->annotations.end()) {
+      PrimExpr user_init = Downcast<PrimExpr>((*init_it).second);
+      if (!user_init.dtype().is_void() && user_init.dtype() != dtype) {
+        user_init = tirx::Cast(dtype, user_init);
+      }
+      init = user_init;
+    }
+    PrintType(dtype, stream);
+    stream << ' ' << vid << " = " << PrintExpr(init) << ";\n";
+  } else {
+    PrintStorageScope(scope, stream);
+    PrintType(dtype, stream);
+    stream << ' ' << vid << '[' << constant_size << "];\n";
+  }
+
+  RegisterHandleType(op->buffer->data.get(), dtype);
+  if (op->annotations.count(tirx::attr::kVolatile)) {
+    MarkVolatile(op->buffer->data.get());
+  }
+}
+
 void CodeGenTileLangMetal::VisitExpr_(const BufferLoadNode *op,
-                                      std::ostream &os) { // NOLINT(*)
+                                       std::ostream &os) { // NOLINT(*)
   std::string scope;
   auto it = alloc_storage_scope_.find(op->buffer->data.get());
   if (it != alloc_storage_scope_.end()) {
@@ -588,6 +760,30 @@ void CodeGenTileLangMetal::VisitExpr_(const FloatImmNode *op,
   }
   MarkConst(temp.str());
   os << temp.str();
+}
+
+std::string CodeGenTileLangMetal::CastFromTo(std::string value, DataType from,
+                                             DataType target) {
+  if (from == target) {
+    return value;
+  }
+  if (from.is_scalar() && from.is_float8() &&
+      (target.is_float16() || target == DataType::Float(32))) {
+    const char *helper = nullptr;
+    if (from.is_float8_e4m3()) {
+      helper = "__tvm_fp8_e4m3_to_half";
+    } else if (from.is_float8_e5m2()) {
+      helper = "__tvm_fp8_e5m2_to_half";
+    }
+    if (helper != nullptr) {
+      std::string decoded = std::string(helper) + "(" + value + ")";
+      if (target == DataType::Float(32)) {
+        return "((float)" + decoded + ")";
+      }
+      return decoded;
+    }
+  }
+  return CodeGenC::CastFromTo(std::move(value), from, target);
 }
 
 ffi::Module BuildTileLangMetal(IRModule mod, Target target) {
