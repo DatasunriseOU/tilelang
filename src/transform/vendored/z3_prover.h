@@ -96,6 +96,15 @@ class Z3Prover {
   void SetBitVectorMode(int width);
   int GetBitVectorWidth() const;
 
+  // CPPMEGA z3-stack fix-A6: per-pass solver reset. Clears memo/scope
+  // stack and rebuilds the solver while preserving the current
+  // `bv_width_`. Use this between pass invocations instead of
+  // `SetBitVectorMode(currentWidth)` (which is a no-op due to the
+  // mode-equality fast-path and therefore does NOT clear state).
+  // Currently has no in-tree caller; provided for future pass drivers
+  // that want a clean proof context without flipping mode.
+  void Reset();
+
  private:
   std::unique_ptr<Z3ProverImpl> impl_;
 };

@@ -426,20 +426,13 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     solver.set("rlimit", rlimit_in);
   }
 
-  void SetBitVectorMode(int width) {
-    ICHECK(width == 0 || width == 32 || width == 64)
-        << "Z3Prover::SetBitVectorMode only supports width in {0, 32, 64}, "
-        << "got " << width;
-    if (width == bv_width_) return;
-    bv_width_ = width;
-    // Re-arm one-shot warnings: switching mode is effectively a new
-    // proving context, and a wrap that was suppressed under BV32 may be
-    // worth surfacing again under BV64 (or vice-versa).
+  // CPPMEGA fix-A6: factored solver-rebuild helper. Used by both
+  // `SetBitVectorMode` (when the mode actually changes) and the new
+  // public `Reset()` (per-pass reseed). Centralizing the rebuild
+  // sequence avoids drift between the two paths.
+  void RebuildSolver_() {
     bv_truncation_warned_ = false;
     bv_range_warned_ = false;
-    // Invalidate any pre-existing variable / sub-expression encodings —
-    // they were declared at the old sort. Reset the solver and scope
-    // stack so the caller starts from a clean slate.
     memo_.clear();
     side_effect_exprs_.clear();
     solver = CreateSolver(*ctx);
@@ -449,6 +442,29 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     scope_stack_.push_back({});
     ns = Namespace{};
   }
+
+  void SetBitVectorMode(int width) {
+    ICHECK(width == 0 || width == 32 || width == 64)
+        << "Z3Prover::SetBitVectorMode only supports width in {0, 32, 64}, "
+        << "got " << width;
+    // CPPMEGA fix-A6: same-width fast-path. Mode-equality short-circuits
+    // the full solver rebuild — important because compile-time blowup
+    // was traced to passes calling `SetBitVectorMode(32)` redundantly
+    // on every CanProve. The condition also covers width=0 → width=0
+    // (Int → Int) which previously rebuilt unnecessarily.
+    if (width == bv_width_) return;
+    bv_width_ = width;
+    // Mode change: invalidate any pre-existing variable / sub-expression
+    // encodings (declared at the old sort) by rebuilding the solver.
+    RebuildSolver_();
+  }
+
+  // CPPMEGA fix-A6: public per-pass reset. Callers (pass drivers) that
+  // want to start a fresh proof context without flipping bv_width
+  // should use `Reset()` instead of `SetBitVectorMode(currentWidth)` —
+  // the latter is a no-op (see fast-path above) and would NOT actually
+  // clear memo / scope stack. `Reset()` does. Bv_width is preserved.
+  void Reset() { RebuildSolver_(); }
 
   int GetBitVectorWidth() const { return bv_width_; }
 
@@ -968,6 +984,8 @@ void Z3Prover::SetBitVectorMode(int width) {
 int Z3Prover::GetBitVectorWidth() const {
   return impl_->GetBitVectorWidth();
 }
+// CPPMEGA z3-stack fix-A6: forwarder for the per-pass reset.
+void Z3Prover::Reset() { impl_->Reset(); }
 
 // ---------------------------------------------------------------------------
 // Per-Analyzer cache. `thread_local` because the Z3 context inside
