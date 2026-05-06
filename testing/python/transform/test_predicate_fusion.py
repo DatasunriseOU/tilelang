@@ -206,5 +206,21 @@ def test_z3_timeout_keeps_nested():
     assert fused is not None
 
 
+def test_repeated_pass_no_solver_leak():
+    """fix-B2 regression: run the pass repeatedly. The previous manual
+    `EnterConstraint` recovery vector could leak solver scope frames if
+    any push or `CanProve` threw. With ConstraintScope RAII, repeated
+    runs over the same kind of pattern must not accumulate stale
+    assertions in the solver, and must not crash.
+    """
+    func = _simple_fusion_func()
+    last = None
+    for _ in range(8):
+        last = _run_pass(func, enable=True)
+        assert last is not None
+    # Final result must still be a valid PrimFunc.
+    assert last is not None
+
+
 if __name__ == "__main__":
     tilelang.testing.main()

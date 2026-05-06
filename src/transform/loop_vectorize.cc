@@ -34,6 +34,7 @@
 #include "tvm/tirx/var.h"
 #include "vendored/allocate_visit_passthrough.h"
 #include "vendored/let_stmt.h"
+#include "vendored/z3_constraint_scope.h"
 #include "vendored/z3_prover.h"
 #include <iostream>
 #include <optional>
@@ -940,15 +941,16 @@ static bool Z3CanProveAlignedAccess(const Buffer &buffer,
         free_vars.insert(v);
       }
     });
-    std::vector<std::function<void()>> recoverers;
+    // CPPMEGA fix-B2 (idea712): use ConstraintScope RAII so EnterConstraint
+    // push/pop is balanced even on early-return / exception. The previous
+    // manual recoverers vector leaked solver scope frames if any
+    // EnterConstraint or CanProve below threw.
+    std::vector<::tilelang::tlz3::ConstraintScope> scopes;
     for (const VarNode *v : free_vars) {
       Var var = ffi::GetRef<Var>(v);
       DataType dt = var.dtype();
       if (!dt.is_int() && !dt.is_uint()) {
-        // Non-int free var — cannot bit-bound. Bail.
-        for (auto it = recoverers.rbegin(); it != recoverers.rend(); ++it) {
-          (*it)();
-        }
+        // Non-int free var — cannot bit-bound. Bail. RAII unwinds scopes.
         return false;
       }
       PrimExpr lo = make_const(dt, 0);
@@ -963,7 +965,7 @@ static bool Z3CanProveAlignedAccess(const Buffer &buffer,
                 (FloorMod(var, make_const(dt, vector_size)) ==
                  make_const(dt, 0));
       }
-      recoverers.push_back(z3.EnterConstraint(bound));
+      scopes.emplace_back(z3, bound);
     }
 
     PrimExpr goal =
@@ -977,9 +979,7 @@ static bool Z3CanProveAlignedAccess(const Buffer &buffer,
     } catch (...) {
       proved = false;
     }
-    for (auto it = recoverers.rbegin(); it != recoverers.rend(); ++it) {
-      (*it)();
-    }
+    // ConstraintScope destructors run in reverse order at scope exit.
     return proved;
   } catch (...) {
     return false;

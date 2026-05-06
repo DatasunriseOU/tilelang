@@ -76,6 +76,7 @@
 
 #include "../op/builtin.h"
 #include "vendored/let_stmt.h"
+#include "vendored/z3_constraint_scope.h"
 #include "vendored/z3_prover.h"
 
 namespace tvm {
@@ -176,7 +177,10 @@ bool Z3ProvesInnerWellDefined(const Stmt &inner_body, arith::Analyzer *analyzer)
       vc(idx);
       vc(extent);
       // Push bound constraints for each free var.
-      std::vector<std::function<void()>> recoverers;
+      // CPPMEGA fix-B2 (idea712): RAII via ConstraintScope. The previous
+      // manual recoverers vector leaked solver scope frames if any
+      // EnterConstraint / CanProve below threw mid-loop.
+      std::vector<::tilelang::tlz3::ConstraintScope> scopes;
       bool too_many_vars = false;
       for (const VarNode *v : vc.vars) {
         Var var = ffi::GetRef<Var>(v);
@@ -188,8 +192,8 @@ bool Z3ProvesInnerWellDefined(const Stmt &inner_body, arith::Analyzer *analyzer)
         PrimExpr lo = make_const(dt, 0);
         PrimExpr hi = make_const(dt, int64_t(1) << 31);
         PrimExpr bound = (var >= lo) && (var < hi);
-        recoverers.push_back(z3.EnterConstraint(bound));
-        if (recoverers.size() > 8) {
+        scopes.emplace_back(z3, bound);
+        if (scopes.size() > 8) {
           // Don't blow up the solver — give up on highly-symbolic bodies.
           too_many_vars = true;
           break;
@@ -206,10 +210,7 @@ bool Z3ProvesInnerWellDefined(const Stmt &inner_body, arith::Analyzer *analyzer)
           ok = false;
         }
       }
-      // Pop in reverse order.
-      for (auto it = recoverers.rbegin(); it != recoverers.rend(); ++it) {
-        (*it)();
-      }
+      // ConstraintScope destructors run in reverse at scope exit.
       return ok;
     };
 
