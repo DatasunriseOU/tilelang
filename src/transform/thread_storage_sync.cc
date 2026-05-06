@@ -1666,33 +1666,63 @@ private:
     ConstrSet prev_cset{prev.cset};
     ConstrSet curr_cset{curr.cset};
 
-    // Build fresh thread vars in lock-step with FindConflict's RAW/WAR path.
-    const char *thread_names[] = {"tx", "ty", "tz"};
+    // CPPMEGA: Z3 idea #11 bug fix — tag-based axis mapping.
+    //
+    // The original positional indexing `prev.threads.size() + idx - 3`
+    // assumed the IterVar ordering `[z, y, x]` in `threads`, *and* that all
+    // three axes are present. For 2-D launches (n_dims == 2) this maps
+    // idx=1 → tx slot, idx=2 → ty slot — but the actual y- and x-axis
+    // IterVars end up assigned to `ty_w` and `tz_w` respectively, leaving
+    // `tx_w` undefined. The function then early-returns false at the
+    // tx_w/tx_r defined-ness check, so the barrier is never elided for any
+    // 2-D launch (which is exactly the launch shape used by sparse_mla and
+    // topk_selector on Apple).
+    //
+    // The fix: scan `threads` by `thread_tag` and bind by axis identity,
+    // not by position.
+    auto find_axis = [](const Array<IterVar> &v,
+                        const char *tag) -> Optional<IterVar> {
+      for (const IterVar &iv : v) {
+        if (std::string(iv->thread_tag).find(tag) != std::string::npos) {
+          return iv;
+        }
+      }
+      return std::nullopt;
+    };
+    auto tx_p_iv = find_axis(prev.threads, "threadIdx.x");
+    auto tx_c_iv = find_axis(curr.threads, "threadIdx.x");
+    if (!tx_p_iv.has_value() || !tx_c_iv.has_value()) {
+      // No threadIdx.x in scope on either side — cannot reason about
+      // simdgroup membership at all. Keep the barrier.
+      return false;
+    }
+    auto ty_p_iv = find_axis(prev.threads, "threadIdx.y");
+    auto ty_c_iv = find_axis(curr.threads, "threadIdx.y");
+    auto tz_p_iv = find_axis(prev.threads, "threadIdx.z");
+    auto tz_c_iv = find_axis(curr.threads, "threadIdx.z");
+
     ffi::Map<Var, PrimExpr> prev_sub, curr_sub;
     Var tx_w, tx_r, ty_w, ty_r, tz_w, tz_r;
-    Var *w_vars[3] = {&tx_w, &ty_w, &tz_w};
-    Var *r_vars[3] = {&tx_r, &ty_r, &tz_r};
-    int n_dims = static_cast<int>(std::min(prev.threads.size(),
-                                           curr.threads.size()));
-    if (n_dims > 3)
-      n_dims = 3;
-    for (int idx = 0; idx < 3; ++idx) {
-      if (idx >= 3 - n_dims) {
-        size_t pos_p = prev.threads.size() + idx - 3;
-        size_t pos_c = curr.threads.size() + idx - 3;
-        Var old_p = prev.threads[pos_p]->var;
-        Var old_c = curr.threads[pos_c]->var;
-        Var fresh_w(std::string(thread_names[idx]) + "_w", old_p.dtype());
-        Var fresh_r(std::string(thread_names[idx]) + "_r", old_c.dtype());
-        *w_vars[idx] = fresh_w;
-        *r_vars[idx] = fresh_r;
-        prev_sub.Set(old_p, fresh_w);
-        curr_sub.Set(old_c, fresh_r);
-      }
-    }
+
+    auto bind_axis = [&](const Optional<IterVar> &p_iv,
+                         const Optional<IterVar> &c_iv, const char *name,
+                         Var *w_out, Var *r_out) {
+      if (!p_iv.has_value() || !c_iv.has_value()) return;
+      Var old_p = p_iv.value()->var;
+      Var old_c = c_iv.value()->var;
+      Var fresh_w(std::string(name) + "_w", old_p.dtype());
+      Var fresh_r(std::string(name) + "_r", old_c.dtype());
+      *w_out = fresh_w;
+      *r_out = fresh_r;
+      prev_sub.Set(old_p, fresh_w);
+      curr_sub.Set(old_c, fresh_r);
+    };
+    bind_axis(tx_p_iv, tx_c_iv, "tx", &tx_w, &tx_r);
+    bind_axis(ty_p_iv, ty_c_iv, "ty", &ty_w, &ty_r);
+    bind_axis(tz_p_iv, tz_c_iv, "tz", &tz_w, &tz_r);
 
     if (!tx_w.defined() || !tx_r.defined()) {
-      // No threadIdx.x in scope — cannot reason about simdgroup membership.
+      // Defensive: bind_axis on tx must have populated these.
       return false;
     }
 
