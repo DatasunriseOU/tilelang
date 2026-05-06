@@ -263,10 +263,30 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     this->is_assume = is_assume_in;
     solver.add(VisitBool(constraint));
     this->is_assume = false;
-    auto side_effect_exprs = std::move(side_effect_exprs_);
-    side_effect_exprs_.clear();
+    // CPPMEGA fix-A4: snapshot `side_effect_exprs_` into a local. The
+    // member is then explicitly cleared so subsequent
+    // VisitBool/ConvertInt calls (between EnterConstraint and the
+    // returned recovery lambda firing) start with a fresh accumulator.
+    // The recovery lambda below captures the snapshot by VALUE — this
+    // is critical because:
+    //   (1) the `side_effect_exprs_` member is rewritten by every
+    //       subsequent VisitBool/ConvertInt that runs while the
+    //       constraint is on the stack, so a `[this, &]` capture would
+    //       see the wrong set at lambda-fire time, and
+    //   (2) the lambda may outlive the local snapshot — the caller
+    //       hands the std::function back up the call stack, so a
+    //       reference-to-local capture is a use-after-scope.
+    // We move out of the member to avoid an extra copy, then explicitly
+    // copy into the lambda capture (the `=` form spells it out).
+    std::vector<PrimExpr> side_effect_exprs = std::move(side_effect_exprs_);
+    side_effect_exprs_.clear();  // moved-from is valid-but-unspecified;
+                                 // make the member explicitly empty.
     if (is_assume_in) {
-      return [this, side_effect_exprs]() {
+      // Capture-by-value (explicit): `side_effect_exprs` is copied into
+      // the lambda. The original local will go out of scope at the end
+      // of EnterConstraint; the lambda's copy survives until the
+      // recovery fires.
+      return [this, side_effect_exprs = std::move(side_effect_exprs)]() {
         solver.pop();
         for (const auto& expr : side_effect_exprs) {
           memo_.erase(expr);
@@ -274,6 +294,12 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
         scope_stack_.pop_back();
       };
     } else {
+      // Non-is_assume path: side effects are erased *now* (the local
+      // snapshot is consumed before the lambda is constructed), so the
+      // lambda only needs `this`. Doing the erase here matches the
+      // pre-fix behavior and keeps the constraint scope's solver state
+      // tight (we don't carry the side_effect set forward into the
+      // recovery closure).
       for (const auto& expr : side_effect_exprs) {
         memo_.erase(expr);
       }
