@@ -5,7 +5,7 @@
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op_attr_types.h>
 
-#include "../support/ffi_aliases.h"
+#include "support/ffi_aliases.h"
 #include "target/intrin_rule.h"
 
 namespace tvm {

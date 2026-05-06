@@ -177,7 +177,9 @@ set(HIDE_PRIVATE_SYMBOLS OFF CACHE STRING
 
 # Include directories for TileLang
 set(TILE_LANG_INCLUDES ${TVM_INCLUDES})
-list(APPEND TILE_LANG_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# Add TileLang's own src/ to include path so cross-directory includes
+# can use paths relative to src/ (e.g. "target/utils.h", "op/builtin.h").
+list(INSERT TILE_LANG_INCLUDES 0 "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 # Collect source files
 file(GLOB TILE_LANG_SRCS
@@ -194,17 +196,26 @@ file(GLOB TILE_LANG_SRCS
   # CuTeDSL codegen emits Python source and uses TVM's CUDA fallback module
   # only as a source container. Keep this compile-free builder available in
   # Metal/CPU dev builds so source-level CuTeDSL tests do not require CUDA.
-  src/target/codegen_py.cc
+  # (Task 4 / #2121): these CUDA codegen sources moved to
+  # src/backend/cuda/codegen/; paths updated accordingly. They are listed here
+  # (not only in the CUDA CMakeLists) so Metal/CPU builds with USE_CUDA=OFF
+  # still compile the compile-free CuTeDSL/ptx/codegen_py builders.
+  src/backend/cuda/codegen/codegen_py.cc
   src/target/codegen_utils.cc
-  src/target/codegen_cutedsl.cc
-  src/target/ptx.cc
-  src/target/rt_mod_cutedsl.cc
+  src/backend/cuda/codegen/codegen_cutedsl.cc
+  src/backend/cuda/codegen/ptx.cc
+  src/backend/cuda/codegen/rt_mod_cutedsl.cc
   src/target/utils.cc
   src/target/codegen_c_host.cc
   src/target/codegen_c.cc
   src/target/rt_mod_c.cc
-  # intrin_rule doesn't have system dependency
-  src/target/intrin_rule*.cc
+  # intrin_rule doesn't have system dependency; always compiled regardless of backend
+  src/backend/cuda/codegen/intrin_rule_cuda.cc
+  src/backend/rocm/codegen/intrin_rule_hip.cc
+  # Fork-specific (Task 4 / #2121): our Metal codegen lives in src/target/ and
+  # its intrinsic-rule registrations (tirx.metal.* ops) must always compile.
+  # Upstream's glob dropped Metal here; we restore it explicitly.
+  src/target/intrin_rule_metal.cc
 )
 
 # Always include CPU-safe runtime helpers
@@ -251,6 +262,12 @@ endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/src/backend/cuda/CMakeLists.txt")
 include("${CMAKE_CURRENT_SOURCE_DIR}/src/backend/rocm/CMakeLists.txt")
 include("${CMAKE_CURRENT_SOURCE_DIR}/src/backend/metal/CMakeLists.txt")
+
+# Task 4 / #2121: the compile-free CuTeDSL/ptx/codegen_py sources are listed
+# both in the top-level glob (so Metal/CPU dev builds compile them with
+# USE_CUDA=OFF) and in the CUDA backend CMakeLists (when USE_CUDA=ON). Drop any
+# duplicate entries so a CUDA build does not compile them twice.
+list(REMOVE_DUPLICATES TILE_LANG_SRCS)
 
 set(USE_Z3      ON CACHE STRING "Use Z3 SMT solver for TileLang optimizations")
 set(USE_PYPI_Z3 ON CACHE BOOL   "Use Z3 provided by PyPI z3-solver package")

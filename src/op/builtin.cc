@@ -10,8 +10,8 @@
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/op_attr_types.h>
 
-#include "../target/stubs/cuda.h"
-#include "../target/utils.h"
+#include "backend/cuda/codegen/stubs/cuda.h"
+#include "target/utils.h"
 
 namespace tvm {
 namespace tl {

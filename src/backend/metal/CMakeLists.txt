@@ -25,6 +25,12 @@ if(NOT APPLE)
   return()
 endif()
 
+# NOTE (Task 4 / #2121): Our fork registers ``target.build.tilelang_metal``
+# directly inside ``src/target/codegen_metal.cc`` (a full dedicated Metal
+# codegen), so we deliberately do NOT compile upstream's
+# ``src/backend/metal/codegen/rt_mod_metal.cc`` (which would duplicate the
+# BuildTileLangMetal symbol and the FFI registration). The glob below matches
+# nothing on purpose, preserving our pre-merge Metal wiring.
 file(GLOB TILE_LANG_METAL_SRCS
   src/target/rt_mod_metal.cc
 )

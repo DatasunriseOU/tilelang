@@ -3,8 +3,8 @@
  */
 
 #include "codegen_cutedsl.h"
-#include "codegen_utils.h"
-#include "ptx.h"
+#include "backend/cuda/codegen/ptx.h"
+#include "target/codegen_utils.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ir/transform.h>
@@ -19,9 +19,12 @@
 #include <utility>
 #include <vector>
 
-#include "../op/builtin.h"
-#include "../transform/vendored/tl_runtime_symbols.h"
 #include "arith/pattern_match.h"
+#include "op/builtin.h"
+// Fork-specific (Task 4 / #2121): vendored TileLang runtime symbol table
+// (tvm_global_barrier_kinit, etc.); not present upstream. Path rewritten to
+// be relative to src/ for the new backend/cuda/codegen/ location.
+#include "transform/vendored/tl_runtime_symbols.h"
 
 namespace tvm {
 namespace codegen {

@@ -15,12 +15,15 @@
 #include <utility>
 #include <vector>
 
-#include "../op/builtin.h"
-#include "../transform/common/attr.h"
-#include "../transform/vendored/tl_runtime_symbols.h"
-#include "./ptx.h"
-#include "./utils.h"
 #include "arith/pattern_match.h"
+#include "backend/cuda/codegen/ptx.h"
+#include "op/builtin.h"
+#include "target/utils.h"
+#include "transform/common/attr.h"
+// Fork-specific (Task 4 / #2121): vendored TileLang runtime symbol table used
+// by our CUDA codegen path; not present upstream. Path rewritten to be
+// relative to src/ for the new backend/cuda/codegen/ location.
+#include "transform/vendored/tl_runtime_symbols.h"
 
 namespace tvm {
 namespace codegen {

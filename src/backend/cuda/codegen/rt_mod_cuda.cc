@@ -1,4 +1,3 @@
-#include "../transform/common/attr.h"
 #include "codegen_cuda.h"
 // apache/tvm-latest stripped the public `runtime/cuda/cuda_module.h`; the
 // codegen-facing factory now lives in `target/cuda/cuda_fallback_module.h`
@@ -10,6 +9,7 @@
 // apache/tvm-latest renamed `runtime/meta_data.h` → `runtime/metadata.h`.
 #include "runtime/metadata.h"
 #include "runtime/pack_args.h"
+#include "transform/common/attr.h"
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/transform.h>
 
