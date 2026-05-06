@@ -880,8 +880,43 @@ void Z3Prover::SetTimeoutMs(unsigned timeout_ms) {
   impl_->SetTimeoutMs(timeout_ms);
 }
 void Z3Prover::SetRLimit(unsigned rlimit) { impl_->SetRLimit(rlimit); }
+// CPPMEGA fix-A1: infallible facade. `SetBitVectorMode` may invoke
+// `CreateSolver` / Z3 reset, which can theoretically throw (e.g., OOM,
+// invalid config). Because this method is invoked by `~ScopedBVMode()`
+// (a noexcept destructor), any propagated exception would call
+// std::terminate. Catch any internal failure here, log once, and fall
+// back to bv_width=0 (Int sort) — that mode is the most permissive and
+// preserves correctness at the cost of losing BV-mode wrap semantics.
 void Z3Prover::SetBitVectorMode(int width) {
-  impl_->SetBitVectorMode(width);
+  try {
+    impl_->SetBitVectorMode(width);
+  } catch (const ::z3::exception& e) {
+    LOG(WARNING) << "Z3Prover::SetBitVectorMode(" << width
+                 << ") failed (" << e.msg() << "); falling back to "
+                 << "Int sort (bv_width=0).";
+    try {
+      impl_->SetBitVectorMode(0);
+    } catch (...) {
+      // Even fallback failed; swallow — the prover is in an undefined
+      // state, but we cannot throw from this entry point.
+    }
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "Z3Prover::SetBitVectorMode(" << width
+                 << ") failed (" << e.what() << "); falling back to "
+                 << "Int sort (bv_width=0).";
+    try {
+      impl_->SetBitVectorMode(0);
+    } catch (...) {
+    }
+  } catch (...) {
+    LOG(WARNING) << "Z3Prover::SetBitVectorMode(" << width
+                 << ") failed with unknown exception; falling back to "
+                 << "Int sort (bv_width=0).";
+    try {
+      impl_->SetBitVectorMode(0);
+    } catch (...) {
+    }
+  }
 }
 int Z3Prover::GetBitVectorWidth() const {
   return impl_->GetBitVectorWidth();

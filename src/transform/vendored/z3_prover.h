@@ -115,7 +115,13 @@ class ScopedBVMode {
       : prover_(prover), prev_width_(prover.GetBitVectorWidth()) {
     prover_.SetBitVectorMode(width);
   }
-  ~ScopedBVMode() { prover_.SetBitVectorMode(prev_width_); }
+  // CPPMEGA fix-A1: dtor is `noexcept` because RAII destructors must not
+  // throw — terminate() if SetBitVectorMode ever propagated an exception
+  // would be the only safe outcome. The infallible variant of
+  // SetBitVectorMode (catches any internal exception, logs, defaults to
+  // bv_width=0) means we don't actually rely on this in practice, but the
+  // marker makes the contract explicit at the type-system level.
+  ~ScopedBVMode() noexcept { prover_.SetBitVectorMode(prev_width_); }
 
   ScopedBVMode(const ScopedBVMode&) = delete;
   ScopedBVMode& operator=(const ScopedBVMode&) = delete;
