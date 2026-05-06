@@ -624,7 +624,27 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     return VisitArith(floordiv, op, op->a, op->b);
   }
   ::z3::expr VisitExpr_(const FloorModNode* op) override {
-    return VisitArith(floormod, op, op->a, op->b);
+    // BV-aware FloorMod dispatch.
+    //
+    // In Int mode (bv_width_ == 0) Z3's `operator%` lowers to `Z3_mk_mod`,
+    // which implements SMT-LIB Int mod (Euclidean / non-negative remainder).
+    // That does NOT match TIR FloorMod semantics (sign-of-divisor) when
+    // `b < 0`, so the `floormod` helper is required to reconstruct
+    // sign-of-divisor floor-mod from the Int-mod primitive.
+    //
+    // In BV mode (bv_width_ > 0) Z3's `operator%` lowers to `Z3_mk_bvsmod`,
+    // which is the SMT-LIB signed BV mod and ALREADY implements
+    // sign-of-divisor semantics — exactly TIR FloorMod. Applying the
+    // `ite(b > 0, a % b, -((-a) % b))` helper on top of `bvsmod` is a
+    // double-correction (it would re-flip the sign for negative divisors,
+    // producing the wrong result for FloorMod(5, -3) etc.).
+    if (IsValidDType(op->a->dtype) && IsValidDType(op->b->dtype)) {
+      auto a = VisitInt(op->a);
+      auto b = VisitInt(op->b);
+      if (bv_width_ > 0) return a % b;  // bvsmod, already TIR FloorMod.
+      return floormod(a, b);
+    }
+    return Create(op);
   }
   ::z3::expr VisitExpr_(const EQNode* op) override {
     return VisitArith(::z3::operator==, op, op->a, op->b);

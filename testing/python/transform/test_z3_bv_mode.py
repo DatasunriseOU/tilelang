@@ -90,3 +90,40 @@ def test_overflow_at_int32_max_disagrees():
     # Range = single-point [INT32_MAX, INT32_MAX+1).
     assert _can_prove(i, INT32_MAX, INT32_MAX + 1, expr, 0) is True
     assert _can_prove(i, INT32_MAX, INT32_MAX + 1, expr, 32) is False
+
+
+def test_floormod_negative_dividend_agrees_int_and_bv():
+    """FloorMod(-5, 3) -> 1 in BOTH Int and BV32 mode.
+
+    TIR FloorMod is sign-of-divisor: ``floor(-5 / 3) = -2`` and
+    ``-5 - 3 * (-2) = 1``. Regression guard for the BV-mode
+    double-correction bug: in BV32 the `floormod` helper had been applied
+    on top of ``bvsmod``, which already implements sign-of-divisor mod
+    natively; the double-correction would have turned 1 into -2 (i.e. the
+    Int-mod / Euclidean answer flipped through the helper).
+
+    We pin ``x`` to a single-point range ``[-5, -4)`` and ask whether
+    ``floormod(x, 3) == 1``. It MUST be provable under both sorts.
+    """
+    x = tir.Var("x", "int32")
+    expr = tir.FloorMod(x, tir.const(3, "int32")) == tir.const(1, "int32")
+    # Range = single-point [-5, -4).
+    assert _can_prove(x, -5, -4, expr, 0) is True
+    assert _can_prove(x, -5, -4, expr, 32) is True
+
+
+def test_floormod_negative_divisor_agrees_int_and_bv():
+    """FloorMod(5, -3) -> -1 in BOTH Int and BV32 mode.
+
+    TIR FloorMod is sign-of-divisor: ``floor(5 / -3) = -2`` and
+    ``5 - (-3) * (-2) = -1``. The same double-correction bug as the
+    negative-dividend case but on the divisor side: with ``bvsmod`` the
+    answer is already -1; the helper would have turned it into +1.
+
+    We pin ``x`` to ``[5, 6)`` and ask whether
+    ``floormod(x, -3) == -1``. MUST be provable under both sorts.
+    """
+    x = tir.Var("x", "int32")
+    expr = tir.FloorMod(x, tir.const(-3, "int32")) == tir.const(-1, "int32")
+    assert _can_prove(x, 5, 6, expr, 0) is True
+    assert _can_prove(x, 5, 6, expr, 32) is True
