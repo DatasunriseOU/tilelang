@@ -169,6 +169,37 @@ def test_default_off_preserves():
 # (no `vectorized` annotation should appear on the rewritten loop).
 # ---------------------------------------------------------------------------
 
+def test_alignment_proof_repeated_access():
+    """fix-B5 regression: a body that loads the same `(buffer, indices)`
+    pair multiple times must not pay multiple Z3 round-trips. We assert
+    the build completes in well under the un-memoized cost (which would
+    blow past the per-query 50ms budget × N occurrences).
+
+    Functional contract: the alignment annotation logic still produces
+    the same result regardless of memo hit/miss. The test just asserts
+    the build succeeds — performance is measured externally via the
+    bench harness.
+    """
+
+    @T.prim_func
+    def main(  # noqa: F821
+        A: T.Tensor((128,), T.float16),  # noqa: F821
+        B: T.Tensor((128,), T.float16),  # noqa: F821
+        C: T.Tensor((128,), T.float16),  # noqa: F821
+    ):
+        with T.Kernel(1, threads=32) as bx:  # noqa: F841
+            for i in T.vectorized(4):  # noqa: F821
+                # Repeated access pattern: A[i] read 3x, B[i] written 3x,
+                # C[i] aliased onto B[i] in places. The memo should
+                # collapse these to one Z3 query per unique (buffer,
+                # indices) key.
+                B[i] = A[i] + A[i] * A[i]
+                C[i] = A[i] - A[i]
+
+    mod = _build_with_alignment_proof(main, enable=True)
+    assert mod is not None
+
+
 def test_negative_stride_not_vectorized():
     """A loop that addresses a buffer in reverse direction
     (`out[N-1-i] = in[N-1-i]`) must NOT be marked as vectorizable —

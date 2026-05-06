@@ -39,8 +39,10 @@
 #include <iostream>
 #include <optional>
 #include <tvm/arith/iter_affine_map.h>
+#include <tvm/ffi/extra/structural_hash.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/stmt_functor.h>
+#include <unordered_map>
 #include <vector>
 
 namespace tvm {
@@ -996,11 +998,46 @@ static bool Z3CanProveAlignedAccess(const Buffer &buffer,
 // Walk the loop body and attempt to prove alignment for every
 // global/shared BufferLoad and BufferStore. Returns true iff there is at
 // least one such access AND every one is provably aligned.
+//
+// CPPMEGA fix-B5 (idea712): memoize Z3 alignment queries per
+// `(buffer.get(), indices structural-hash)` pair. The same access can
+// appear multiple times in a loop body (a vector op that decomposes
+// into per-lane loads, a load fed into multiple consumers, etc.) —
+// without a cache, every occurrence pays a fresh Z3 round-trip.
+//
+// Cache lifetime: scoped to a single `Z3CanProveLoopAligned` call.
+// A new cache is created per call, so cross-loop or cross-Plan pollution
+// is impossible. Within a Plan, the same loop body's repeated accesses
+// dedupe trivially.
 static bool Z3CanProveLoopAligned(const Stmt &body, const Var &loop_var,
                                   int vector_size,
                                   arith::Analyzer *analyzer) {
   bool saw_memory = false;
   bool all_aligned = true;
+
+  // Memo keyed by a 64-bit hash of (buffer-ptr, vector_size, indices).
+  // We use the StructuralHash for indices so structurally-identical
+  // expressions (including those that simplify to the same shape after
+  // analyzer rewrites) share the same key.
+  std::unordered_map<size_t, bool> memo;
+  ::tvm::ffi::StructuralHash hasher;
+
+  auto probe = [&](const Buffer &buf, const Array<PrimExpr> &indices) -> bool {
+    size_t key = std::hash<const void *>{}(buf.get());
+    key ^= static_cast<size_t>(vector_size) + 0x9e3779b97f4a7c15ULL +
+           (key << 6) + (key >> 2);
+    for (const PrimExpr &idx : indices) {
+      size_t h = static_cast<size_t>(hasher(idx));
+      key ^= h + 0x9e3779b97f4a7c15ULL + (key << 6) + (key >> 2);
+    }
+    auto it = memo.find(key);
+    if (it != memo.end()) return it->second;
+    bool ok = Z3CanProveAlignedAccess(buf, indices, loop_var, vector_size,
+                                      analyzer);
+    memo.emplace(key, ok);
+    return ok;
+  };
+
   PostOrderVisit(body, [&](const ObjectRef &obj) {
     if (!all_aligned) return;
     if (const auto *ld = obj.as<BufferLoadNode>()) {
@@ -1009,8 +1046,7 @@ static bool Z3CanProveLoopAligned(const Stmt &body, const Var &loop_var,
         return; // local/fragment access — alignment irrelevant.
       }
       saw_memory = true;
-      if (!Z3CanProveAlignedAccess(ld->buffer, ld->indices, loop_var,
-                                   vector_size, analyzer)) {
+      if (!probe(ld->buffer, ld->indices)) {
         all_aligned = false;
       }
     } else if (const auto *st = obj.as<BufferStoreNode>()) {
@@ -1019,8 +1055,7 @@ static bool Z3CanProveLoopAligned(const Stmt &body, const Var &loop_var,
         return;
       }
       saw_memory = true;
-      if (!Z3CanProveAlignedAccess(st->buffer, st->indices, loop_var,
-                                   vector_size, analyzer)) {
+      if (!probe(st->buffer, st->indices)) {
         all_aligned = false;
       }
     }
