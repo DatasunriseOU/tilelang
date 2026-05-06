@@ -462,8 +462,19 @@ def _z3_prove_dot4_legal(
             return False, f"static: stride != 1 ({sa}, {sb})"
         if aa % 4 != 0 or ab % 4 != 0:
             return False, f"static: addr not 4-aligned ({aa}, {ab})"
+        # CPPMEGA Z3 idea #5: the alignment proof above is necessary but not
+        # sufficient -- the Metal dot4 lane accumulates in int24, so we
+        # additionally need ``K * 127 * 127 < 2^23``. Without this gate the
+        # fast path silently overflows for K beyond 520. See
+        # ``tilelang.analysis.int24_overflow_proof`` for the full obligation;
+        # the int8/e4m3 max-abs of 127 is the worst case for the LUT-decoded
+        # path on Apple Silicon.
+        from tilelang.analysis.int24_overflow_proof import prove_dot4_int24_safe
+        if not prove_dot4_int24_safe(ka):
+            return False, f"static: int24 overflow at K={ka} (K*127*127 >= 2^23)"
         return True, (
-            f"static fast path: K={ka}, strides=(1,1), addrs=({aa}%4=0,{ab}%4=0)"
+            f"static fast path: K={ka}, strides=(1,1), addrs=({aa}%4=0,{ab}%4=0), "
+            "int24 safe"
         )
 
     # ----- Symbolic / Z3 fallback -------------------------------------------
@@ -545,9 +556,22 @@ def _z3_prove_dot4_legal(
         res = s.check()
         s.pop()
         if res == _z3.unsat:
+            # CPPMEGA Z3 idea #5: pair the alignment proof with the int24
+            # non-overflow proof. If K is symbolic-and-unbounded the int24
+            # prover returns False (see its docstring), keeping us on the
+            # legacy scalar path. If K is constant or pinned the int24
+            # prover discharges the overflow obligation in plain Python.
+            from tilelang.analysis.int24_overflow_proof import prove_dot4_int24_safe
+            int24_ok = prove_dot4_int24_safe(K_a)
+            if not int24_ok:
+                return False, (
+                    "z3 proved dot4 alignment but int24 overflow proof failed; "
+                    "falling back to scalar accumulator"
+                )
             return True, (
                 "z3 proved dot4 legal under symbolic constraints "
-                f"(timeout={_Z3_DOT4_TIMEOUT_MS}ms, addr_bits={_Z3_DOT4_ADDR_BITS})"
+                f"(timeout={_Z3_DOT4_TIMEOUT_MS}ms, addr_bits={_Z3_DOT4_ADDR_BITS}, "
+                "int24 safe)"
             )
         if res == _z3.unknown:
             return False, "z3 returned UNKNOWN (timeout / incomplete); falling back"
