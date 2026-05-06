@@ -29,6 +29,24 @@ The broader compatibility shims should stay small and removable. `tl_attr.h` and
 
 Pipeline order is part of the contract. `LowerTileLangLetStmt` must run before `LowerTileLangAllocate`, and both must execute before Apache TIR passes in lower/legalize, target optimization, and host/device codegen. If a new drift exposes `tilelang.Allocate` or `tilelang.LetStmt` inside an Apache pass, fix the lowering boundary or add a local guarded traversal; do not broaden the vendored nodes into a second permanent TVM dialect.
 
+### 2026-05-06 — Pulled improvements from cppmega-mlx-tilelang-stack-c and tl_pr_c
+
+Five changes brought into this branch from the `/private/tmp/cppmega-mlx-tilelang-stack-c` and `/tmp/tl_pr_c` reference trees, plus one defensive fix:
+
+1. **Blockscaled e8m0 layout** (`tilelang/language/blockscaled_layout.py` + `testing/python/cpu/test_blockscaled_e8m0_layout.py`). New `BlockScaledLayout.e8m0_k32()` and `e8m0_to_float()` for the Sparse-MLA Path C blockscaled FP8 reducer. 14 CPU unit cases pass at HEAD.
+
+2. **Hybrid `tilelang/language/fp8_op.py`** (431 → 938 LOC). Combines tl_pr_c's macro structure (separate `_fp8_scaled_matmul_m1_vecmat_metal_direct_macro` for direct global store and a fallback `_macro_legacy` using only `tirx.metal.simd_sum`) with stack-c's row-pointer indexing (`B_fp8[col, 0]` + `word_i` instead of flat `B_fp8[0, 0]` + computed `b_word_i`). Adds `metal_fp8_e4m3_dot4`, `_target_thread_warp_size`, `_resolve_target`, `_normalize_block_scale_layout`, `_block_scale_value`, and the trans-B direct metal macro.
+
+3. **Conditional FP8/FP4 helper prelude** (`src/target/codegen_metal.{cc,h}`). Hybrid of tl_pr_c granular per-dtype emit methods (`EmitFp8E3M4Helper`, `EmitFp8E4M3Helper`, `EmitFp8E4M3FnAliasHelper`, `EmitFp8E4M3FnuzHelper`, `EmitFp8E4M3B11FnuzHelper`, `EmitFp8E5M2Helper`, `EmitFp8E5M2FnuzHelper`, `EmitFp8E8M0FnuHelper`, `EmitFp8Dot4Helpers`) and stack-c switch-style dispatch in `EmitFPHelperPrelude`. Reduces vecadd float32 MSL from 9.2 KB to 586–724 bytes (-92 %). Helpers are emitted only for dtypes/intrinsics actually referenced by the kernel (collected by a `StmtExprVisitor` walking BufferLoad / BufferStore / Cast / Call / Allocate / Broadcast / Ramp / Var / Let / params / buffer_map).
+
+4. **`src/transform/lower_access_ptr.cc` correctness fix.** Pulled stack-c's `ExtractAccessPtrBaseLoad` helper which tolerates `if_then_else(cond, BufferLoad(...), fallback)` produced by `LegalizeSafeMemoryAccess`. Replaces the prior hard `Downcast<BufferLoad>` that crashed on wrapped loads.
+
+5. **Z3Prover hooks on Apache `Analyzer`.** The submodule pin bumps `3rdparty/tvm` to a checkout that adds three callback hooks on `tvm::arith::Analyzer` (`BindExprHook`, `BindRangeHook`, `EnterConstraintHook`) so external sub-analyzers can be auto-driven from the `Analyzer::Bind` and `ConstraintContext::EnterWithScope` paths without a circular library dependency. `src/transform/vendored/z3_prover.cc` registers the three hooks at static init via a `Z3HookRegistrar`, so every TileLang `analyzer.Bind(iv->var, range)` and every `with ConstraintContext(analyzer, expr):` automatically forwards to the per-Analyzer Z3Prover instance. This restores the partial-sync optimisation path that the upstream Apache `Analyzer` would otherwise leave starved of constraints.
+
+Defensive fix in `tilelang/jit/adapter/torch/metal.py`: extract trailing `'x'`/`'y'`/`'z'` axis only and skip silently for thread tags that do not end in a recognised axis letter (e.g. `threadIdx.__wmma_x` keeps working; `threadIdx.something_else` no longer raises `ValueError`).
+
+Test summary at HEAD: 36 CPU + 61 Metal + 3 skipped (opt-in benchmarks) = 100 / 103 pass, 0 fail. Cold compile time 0.015 s (≈39× faster than the tl_pr_c baseline). Bench parity vs `/tmp/tl_pr_c`: swap mean 0.984× of tl_pr_c on the metal benchmarks (within MPS variance).
+
 <img src=./images/MatmulExample.png />
 
 ## Latest News
