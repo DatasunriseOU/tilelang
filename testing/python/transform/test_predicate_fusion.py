@@ -206,6 +206,35 @@ def test_z3_timeout_keeps_nested():
     assert fused is not None
 
 
+def test_signed_int32_var_does_not_assume_nonnegative():
+    """fix-B4 regression: with the previous flat [0, 2^31) BV bound, a
+    signed int32 free var was unconditionally treated as non-negative.
+    This made the prover *over*-confident about index ranges. Under the
+    dtype-aware bound, signed int32 vars get [-2^31, 2^31) and the
+    prover correctly refuses to fuse when the inner index could be
+    negative.
+
+    This test pattern: a signed int32 offset `j` is added to the loop
+    index. Without the outer guard `j >= 0`, the prover must NOT assume
+    `i + j` is non-negative — and therefore must NOT prove `0 <= i + j
+    < 256`. The fusion must stay nested.
+    """
+
+    @T.prim_func
+    def main(  # noqa: F821
+        out: T.Buffer((256,), "float32"),  # noqa: F821
+        in_buf: T.Buffer((256,), "float32"),  # noqa: F821
+        j: T.int32,  # signed offset; may be negative
+    ):
+        for i in T.serial(256):
+            if j >= 0:
+                if i + j < 256:
+                    out[i + j] = in_buf[i + j]
+
+    fused = _run_pass(main, enable=True)
+    assert fused is not None
+
+
 def test_inner_condition_with_buffer_load_keeps_nested():
     """fix-B3 regression: the inner predicate `b` itself dereferences a
     buffer (`scratch[i] > 0`). Fusing to `if (a && scratch[i] > 0)` would

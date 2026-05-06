@@ -61,8 +61,11 @@
 #define TILELANG_VENDORED_Z3_CONSTRAINT_SCOPE_H_
 
 #include <tvm/ir/expr.h>
+#include <tvm/runtime/data_type.h>
 
+#include <cstdint>
 #include <functional>
+#include <limits>
 #include <utility>
 
 #include "z3_prover.h"
@@ -119,6 +122,48 @@ class ConstraintScope {
  private:
   std::function<void()> recover_;
 };
+
+// CPPMEGA fix-B4 (idea712): dtype-aware BV bounds.
+//
+// Every Z3 well-definedness / alignment query in this branch bit-bounds
+// each free Var to a small range so the solver can decide quantifier-
+// free affine queries quickly. The previous bound was a flat
+// `[0, 2^31)` regardless of dtype, which is unsound for signed int32
+// vars that may legitimately be negative (sub-buffer offsets,
+// `LegalizeNegativeIndex`-rewritten indices, iter-domain biases). It
+// was also overly conservative for unsigned types and 64-bit types.
+//
+// `BVBoundsForDtype` returns `(lo, hi)` such that the expression
+// `(var >= lo) && (var < hi)` is the tightest sound BV bound for the
+// given dtype.
+//
+//   * unsigned uintN, N < 63   →  [0, 1<<N)
+//   * unsigned uint63/uint64   →  [0, INT64_MAX]   (clamped to int64)
+//   * signed   intN, N <= 63   →  [-(1<<(N-1)), 1<<(N-1))
+//   * signed   int64           →  [INT64_MIN, INT64_MAX]
+//
+// Returned as `int64_t` because the entire constraint stack works in
+// int64 PrimExpr constants. Float/handle/bool dtypes return {0, 0} —
+// callers must check `dt.is_int() || dt.is_uint()` separately.
+inline std::pair<int64_t, int64_t> BVBoundsForDtype(
+    const ::tvm::runtime::DataType& dt) {
+  if (!dt.is_int() && !dt.is_uint()) {
+    return {0, 0};
+  }
+  int bits = dt.bits();
+  if (dt.is_uint()) {
+    if (bits >= 63) {
+      return {0, std::numeric_limits<int64_t>::max()};
+    }
+    return {0, int64_t(1) << bits};
+  }
+  // signed
+  if (bits >= 64) {
+    return {std::numeric_limits<int64_t>::min(),
+            std::numeric_limits<int64_t>::max()};
+  }
+  return {-(int64_t(1) << (bits - 1)), int64_t(1) << (bits - 1)};
+}
 
 }  // namespace tlz3
 }  // namespace tilelang

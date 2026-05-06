@@ -953,15 +953,22 @@ static bool Z3CanProveAlignedAccess(const Buffer &buffer,
         // Non-int free var — cannot bit-bound. Bail. RAII unwinds scopes.
         return false;
       }
-      PrimExpr lo = make_const(dt, 0);
-      PrimExpr hi = make_const(dt, int64_t(1) << 31);
+      // CPPMEGA fix-B4 (idea712): dtype-aware BV bounds. The flat
+      // [0, 2^31) bound was unsound for any signed-int var that may
+      // hold a negative offset (e.g. sub-buffer biases or
+      // `LegalizeNegativeIndex`-rewritten loads). Use the dtype's
+      // proper signed/unsigned range instead.
+      auto [lo64, hi64] = ::tilelang::tlz3::BVBoundsForDtype(dt);
+      PrimExpr lo = make_const(dt, lo64);
+      PrimExpr hi = make_const(dt, hi64);
       PrimExpr bound = (var >= lo) && (var < hi);
-      // For the loop var: also assume it's a multiple of vector_size, which
-      // is the VectorizeRewriter's invariant for the outer-loop iteration
+      // For the loop var: pin lo to 0 (loop vars are non-negative by
+      // construction) and assume it's a multiple of vector_size — the
+      // VectorizeRewriter's invariant for the outer-loop iteration
       // boundary at the START of each vector chunk. Goal: prove the
       // address at lane 0 of every vector chunk is aligned.
       if (v == loop_var.get()) {
-        bound = bound &&
+        bound = (var >= make_const(dt, 0)) && (var < hi) &&
                 (FloorMod(var, make_const(dt, vector_size)) ==
                  make_const(dt, 0));
       }

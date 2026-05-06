@@ -142,10 +142,11 @@ class ExprBufferLoadCollector : public ExprVisitor {
 
 // Probe a single (buf, dim, idx) tuple: prove `0 <= idx < buf.shape[dim]`
 // UNCONDITIONALLY (no outer-guard assumptions pushed). Bit-bounds free
-// vars to [0, 2^31). Returns false on bailout / timeout / >8 free vars.
+// vars to a dtype-aware range (see `BVBoundsForDtype`). Returns false
+// on bailout / timeout / >8 free vars.
 //
 // Hoisted from the previous lambda inside `Z3ProvesInnerWellDefined` so
-// the b-condition probe (fix-B3 below) can reuse it.
+// the b-condition probe (fix-B3) can reuse it.
 static bool Z3ProvesIndexInRange(const Buffer &buf, size_t dim,
                                  const PrimExpr &idx,
                                  ::tilelang::tlz3::Z3Prover &z3) {
@@ -165,8 +166,13 @@ static bool Z3ProvesIndexInRange(const Buffer &buf, size_t dim,
       too_many_vars = true; // unsupported dtype — bail
       break;
     }
-    PrimExpr lo = make_const(dt, 0);
-    PrimExpr hi = make_const(dt, int64_t(1) << 31);
+    // CPPMEGA fix-B4 (idea712): dtype-aware BV bounds. Signed int32
+    // takes [-2^31, 2^31); unsigned [0, 1<<bits); 64-bit clamped to
+    // INT64 range. The previous flat [0, 2^31) was unsound for signed
+    // vars that could legitimately be negative.
+    auto [lo64, hi64] = ::tilelang::tlz3::BVBoundsForDtype(dt);
+    PrimExpr lo = make_const(dt, lo64);
+    PrimExpr hi = make_const(dt, hi64);
     PrimExpr bound = (var >= lo) && (var < hi);
     scopes.emplace_back(z3, bound);
     if (scopes.size() > 8) {
