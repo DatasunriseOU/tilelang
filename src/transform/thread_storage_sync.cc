@@ -709,8 +709,10 @@ private:
 
 struct TileLangThreadSyncPlanner : public ConstrVisitor {
   explicit TileLangThreadSyncPlanner(StorageScope sync_scope,
-                                     int warp_size = 32)
-      : sync_scope_(std::move(sync_scope)), warp_size_(warp_size) {
+                                     int warp_size = 32,
+                                     bool is_metal = false)
+      : sync_scope_(std::move(sync_scope)), warp_size_(warp_size),
+        is_metal_(is_metal) {
     scope_.push_back(std::vector<StmtEntry>());
   }
 
@@ -1556,6 +1558,23 @@ private:
   StorageScope sync_scope_;
   // warp size from target
   int warp_size_;
+  // CPPMEGA: Z3 Apple intra-warp barrier elision
+  // When the active target is Metal, Apple's MSL spec guarantees an
+  // implicit simdgroup barrier inside each 32-lane simdgroup (threads in a
+  // simdgroup execute in lockstep). If Z3 can prove that every shared-memory
+  // RAW/WAR conflict between writer thread `tx1` and reader thread `tx2`
+  // satisfies `tx1 / 32 == tx2 / 32`, the threadgroup_barrier emitted by
+  // ThreadStorageSync is redundant and can be elided. We *only* drop the
+  // barrier when Z3 conclusively proves intra-warp; on timeout/unknown we
+  // keep the barrier (safety mode).
+  bool is_metal_{false};
+
+public:
+  // Diagnostic counter — incremented every time we elide a barrier via the
+  // Apple intra-warp Z3 path. Exposed for tests / logging.
+  mutable int apple_intra_warp_elisions_{0};
+
+private:
 
   void insert_syncs(const Object *obj) {
     if (syncs_inserted_.count(obj))
@@ -1608,6 +1627,106 @@ private:
     }
     return false;
   }
+
+  // CPPMEGA: Z3 Apple intra-warp barrier elision
+  //
+  // Returns true iff Z3 conclusively proves that, given the access-level
+  // constraints captured in `prev` and `curr`, every (writer, reader) thread
+  // pair that could collide on shared memory satisfies
+  //
+  //   (tx_w / 32) == (tx_r / 32)   AND
+  //   (ty_w == ty_r) AND (tz_w == tz_r)
+  //
+  // — i.e., both threads belong to the same Metal simdgroup. Apple's MSL
+  // spec guarantees implicit simdgroup-level lockstep execution, so a
+  // threadgroup_barrier between such accesses is redundant.
+  //
+  // Safety: returns false on any kind of solver uncertainty (timeout,
+  // unknown, missing thread vars, mismatched dtypes). This means: when in
+  // doubt, *keep* the barrier. We only elide on a positive Z3 proof.
+  bool ProveIntraWarpRAW(const AccessEntry &prev, const AccessEntry &curr) {
+    if (!is_metal_) {
+      return false;
+    }
+    // Only meaningful for cross-thread (RAW/WAR) on shared scope.
+    bool same_access_type = (prev.type == kWrite && curr.type == kWrite) ||
+                            (prev.type == kRead && curr.type == kRead);
+    if (same_access_type) {
+      return false;
+    }
+    if (prev.threads.size() < 1 || curr.threads.size() < 1) {
+      return false;
+    }
+    if (prev.scope.rank != StorageRank::kShared ||
+        curr.scope.rank != StorageRank::kShared) {
+      return false;
+    }
+
+    arith::Analyzer analyzer;
+    ConstrSet prev_cset{prev.cset};
+    ConstrSet curr_cset{curr.cset};
+
+    // Build fresh thread vars in lock-step with FindConflict's RAW/WAR path.
+    const char *thread_names[] = {"tx", "ty", "tz"};
+    ffi::Map<Var, PrimExpr> prev_sub, curr_sub;
+    Var tx_w, tx_r, ty_w, ty_r, tz_w, tz_r;
+    Var *w_vars[3] = {&tx_w, &ty_w, &tz_w};
+    Var *r_vars[3] = {&tx_r, &ty_r, &tz_r};
+    int n_dims = static_cast<int>(std::min(prev.threads.size(),
+                                           curr.threads.size()));
+    if (n_dims > 3)
+      n_dims = 3;
+    for (int idx = 0; idx < 3; ++idx) {
+      if (idx >= 3 - n_dims) {
+        size_t pos_p = prev.threads.size() + idx - 3;
+        size_t pos_c = curr.threads.size() + idx - 3;
+        Var old_p = prev.threads[pos_p]->var;
+        Var old_c = curr.threads[pos_c]->var;
+        Var fresh_w(std::string(thread_names[idx]) + "_w", old_p.dtype());
+        Var fresh_r(std::string(thread_names[idx]) + "_r", old_c.dtype());
+        *w_vars[idx] = fresh_w;
+        *r_vars[idx] = fresh_r;
+        prev_sub.Set(old_p, fresh_w);
+        curr_sub.Set(old_c, fresh_r);
+      }
+    }
+
+    if (!tx_w.defined() || !tx_r.defined()) {
+      // No threadIdx.x in scope — cannot reason about simdgroup membership.
+      return false;
+    }
+
+    prev_cset.Substitute(prev_sub).Populate(analyzer);
+    curr_cset.Substitute(curr_sub).Populate(analyzer);
+
+    // Build the goal: (tx_w / warp_size == tx_r / warp_size) ∧
+    //                 (ty_w == ty_r) ∧ (tz_w == tz_r)
+    auto warp_const = make_const(tx_w.dtype(), warp_size_);
+    PrimExpr goal = tirx::EQ(tirx::FloorDiv(tx_w, warp_const),
+                             tirx::FloorDiv(tx_r, warp_const));
+    if (ty_w.defined() && ty_r.defined()) {
+      goal = tirx::And(goal, tirx::EQ(ty_w, ty_r));
+    }
+    if (tz_w.defined() && tz_r.defined()) {
+      goal = tirx::And(goal, tirx::EQ(tz_w, tz_r));
+    }
+
+    // Use Z3 with a tight timeout to avoid pathological slowdowns. On
+    // timeout/unknown, CanProve returns false → we keep the barrier.
+    // CPPMEGA: Z3 simdgroup load opt — apache/tvm `arith::Z3Prover` is a free
+    // function returning a reference to a per-Analyzer cached prover (see
+    // vendored/z3_prover.h), not a constructor.
+    auto &prover = arith::Z3Prover(analyzer);
+    prover.SetTimeoutMs(500);
+    bool proven = false;
+    try {
+      proven = prover.CanProve(goal);
+    } catch (const std::exception &) {
+      proven = false;
+    }
+    return proven;
+  }
+
   void print_access_tentry(const AccessEntry &access,
                            bool print_constr = false) {
     std::ostringstream output;
@@ -1972,6 +2091,17 @@ private:
       }
     }
 
+    // CPPMEGA: Z3 Apple intra-warp barrier elision
+    // If we still believe the accesses overlap on Metal, ask Z3 whether
+    // every potentially-conflicting (writer, reader) pair belongs to the
+    // same simdgroup. If so, the threadgroup_barrier between them is a
+    // no-op (intra-simdgroup execution is implicitly lockstep on Apple GPUs)
+    // and we can drop the conflict report.
+    if (range_is_overlap && is_metal_ && ProveIntraWarpRAW(prev, curr)) {
+      ++apple_intra_warp_elisions_;
+      return false;
+    }
+
     return range_is_overlap;
   }
 
@@ -1995,13 +2125,18 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
   }
   // Get warp size from target, defaulting to 32 if not available
   int warp_size = 32;
+  // CPPMEGA: Z3 Apple intra-warp barrier elision — only enabled when target
+  // is Metal. We extract the kind name in the same scope as warp_size for
+  // forwarding into the planner.
+  bool is_metal = false;
   if (auto target = func->GetAttr<Target>(tvm::attr::kTarget)) {
     warp_size = target.value()
                     ->GetAttr<Integer>("thread_warp_size", 32)
                     .value()
                     .IntValue();
+    is_metal = target.value()->kind->name == "metal";
   }
-  TileLangThreadSyncPlanner planner(sync_scope, warp_size);
+  TileLangThreadSyncPlanner planner(sync_scope, warp_size, is_metal);
   for (const auto &[_, buffer] : func->buffer_map) {
     planner.SetBufferDataToBuffer(buffer->data, buffer);
   }
