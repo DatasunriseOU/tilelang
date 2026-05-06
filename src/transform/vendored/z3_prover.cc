@@ -1013,6 +1013,38 @@ int Z3Prover::GetBitVectorWidth() const {
 // CPPMEGA z3-stack fix-A6: forwarder for the per-pass reset.
 void Z3Prover::Reset() { impl_->Reset(); }
 
+// CPPMEGA fix-B7 (idea712): atomic reset of (memo + solver + scope_stack).
+// See the header doc for the audit rationale. The function is exposed for
+// the future `SetBitVectorMode(width)` port; today it is also a useful
+// "hard reset" hook for tests that want to ensure prior queries on the
+// same Analyzer cannot pollute a new probe.
+void Z3Prover::Reset() {
+  // Lifecycle check: refuse to reset while there are outstanding
+  // EnterConstraint scopes. The prover impl manages a `scope_stack_` of
+  // `std::vector<Scope>`; at construction it pushes a single root frame,
+  // and every EnterConstraint/Bind appends. The invariant for a clean
+  // reset: only the root frame is present and it is empty. Anything else
+  // means a caller forgot to recover() or destructed a ConstraintScope
+  // out of order.
+  ICHECK(impl_) << "Z3Prover::Reset called on null impl";
+  ICHECK_EQ(impl_->scope_stack_.size(), 1u)
+      << "Z3Prover::Reset called with " << impl_->scope_stack_.size()
+      << " scope frames; recover all EnterConstraint scopes first.";
+  ICHECK(impl_->scope_stack_.front().empty())
+      << "Z3Prover::Reset called with non-empty root scope frame; "
+      << "Bind/Constraint records still pending.";
+  // Atomic teardown: solver gets a fresh instance (drops all assertions),
+  // memo_ is cleared. Same-thread context affinity is preserved (Z3's
+  // context is per-thread and reused). `side_effect_exprs_` is private to
+  // the impl and is only ever populated during Convert{Bool,Int} calls;
+  // at idle (root scope, no in-flight conversion) it is already empty.
+  impl_->solver = Z3ProverImpl::CreateSolver(*impl_->ctx);
+  impl_->memo_.clear();
+  // scope_stack_ retains the (now-empty) root frame, matching the
+  // post-construction state. is_assume gets reset for safety.
+  impl_->is_assume = false;
+}
+
 // ---------------------------------------------------------------------------
 // Per-Analyzer cache. `thread_local` because the Z3 context inside
 // Z3ProverImpl is also thread_local; mixing analyzers across threads would

@@ -103,6 +103,22 @@ class Z3Prover {
   // mode-equality fast-path and therefore does NOT clear state).
   // Currently has no in-tree caller; provided for future pass drivers
   // that want a clean proof context without flipping mode.
+  //
+  // CPPMEGA fix-B7 (idea712): atomic reset of (var memo + solver assertions
+  // + scope stack). This is the audit hook for any future
+  // `SetBitVectorMode(width)` port from the parallel `z3-stack` branch:
+  // when the prover swaps int sort for BV<width>, every memoized
+  // `PrimExpr -> z3::expr` mapping becomes invalid (it's still pointing at
+  // the old sort), AND the solver's accumulated assertions reference those
+  // stale exprs, AND the scope stack remembers their push/pop pairings.
+  //
+  // The right invariant is "state is one indivisible unit". Tearing it
+  // apart — clearing memo_ but not the solver, or vice versa — produces
+  // exactly the silent correctness bugs the cross-checked review flagged.
+  //
+  // `Reset()` enforces the invariant: must be called when the constraint
+  // scope stack is at its root (no outstanding `EnterConstraint`
+  // recoverers); fails-fast otherwise to surface the lifecycle violation.
   void Reset();
 
  private:
