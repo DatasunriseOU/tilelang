@@ -85,6 +85,14 @@ class Z3Prover {
   // `SetBitVectorMode(32)` leaks BV semantics into the next caller that
   // expects Int mode. `ScopedBVMode` records the prior width and restores it
   // on scope exit.
+  //
+  // CPPMEGA fix-A2 audit (z3-stack, 2026-05-07): the only call sites of
+  // `SetBitVectorMode` outside this header/impl are the test-FFI helpers
+  // `BvCanProve` and `BvScopedRoundTrip` (see z3_prover.cc, both of which
+  // create a fresh `Analyzer` and exit immediately after the call, so
+  // mode leak is impossible). There are zero production call sites today.
+  // Future production callers MUST use `ScopedBVMode` and not the raw
+  // method — adding a new direct call requires reviewer sign-off.
   void SetBitVectorMode(int width);
   int GetBitVectorWidth() const;
 
