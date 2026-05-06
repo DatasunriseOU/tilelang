@@ -967,6 +967,54 @@ bool IsExprInvariantInVectorBoundary(const PrimExpr &expr, Var var,
   return false;
 }
 
+// CPPMEGA: Z3 idea #1 — affine-pattern guard.
+//
+// Audit fix (HIGH): the unit-stride proof works by substituting `var -> var+1`
+// and asking Z3 whether `(expr_next - expr) == 1`. For non-affine accesses
+// like `A[B[i]]` (where `B[i]` is a separate BufferLoad), the substitution
+// only rewrites the outer `i`, leaving the inner BufferLoad unchanged — so
+// the difference simplifies to `B[i+1] - B[i]`, which Z3 cannot disprove
+// being 1 in general (especially with no constraints on `B`). Worse, a
+// stub-shaped Z3 expression for an opaque BufferLoad can sometimes be
+// proven equal in trivial models, leading to a false positive.
+//
+// Conservative fix: walk `expr` first; if it contains *any* BufferLoad or
+// any non-{Add,Sub,Mul,IntImm,Var} arithmetic node, return false and skip
+// the Z3 fallback entirely. This shrinks the Z3 call domain to syntactic
+// affine functions of `var` (plus arbitrary loop-invariants captured by
+// other Vars), where the substitution-and-subtract trick is sound.
+//
+// We allow Vars other than `var` to appear: those are loop-invariant and
+// will cancel in the subtraction. We disallow FloorDiv/FloorMod/etc. for
+// safety — accesses like `var * stride / N` have stride only when `stride
+// == N` and the simplifier should have already canonicalised that.
+static bool IsAffineInVar(const PrimExpr &expr, const Var &var) {
+  (void)var;  // currently unused; reserved for stricter checks (e.g. var-only).
+  bool ok = true;
+  PostOrderVisit(expr, [&](const ObjectRef &obj) {
+    if (!ok) {
+      return;
+    }
+    if (obj.as<BufferLoadNode>()) {
+      ok = false;  // any indirect index → reject
+      return;
+    }
+    // Only inspect PrimExpr nodes; ignore Stmt / Buffer / etc.
+    if (!obj->IsInstance<PrimExprNode>()) {
+      return;
+    }
+    // Whitelist: Add, Sub, Mul, IntImm, Var (any var; loop-invariants OK).
+    // Everything else (Div, FloorDiv, FloorMod, Cast, Call, Select, …) is
+    // rejected to keep the substitution trick sound.
+    if (obj.as<AddNode>() || obj.as<SubNode>() || obj.as<MulNode>() ||
+        obj.as<IntImmNode>() || obj.as<VarNode>()) {
+      return;
+    }
+    ok = false;
+  });
+  return ok;
+}
+
 // CPPMEGA: Z3 idea #1 — vectorize_loop contiguity proof.
 //
 // When the heuristic ramp-extraction path can't conclude stride==1 (typically
@@ -982,15 +1030,27 @@ bool IsExprInvariantInVectorBoundary(const PrimExpr &expr, Var var,
 // timeout / unknown / exception → conservative false. Heuristic-first: this
 // only runs after all simplifier-based paths have failed.
 //
+// Audit fix (HIGH): we now require `expr` to be *syntactically affine* in
+// `var` before invoking Z3 (see IsAffineInVar above). Indirect indexing
+// `A[B[i]] = C[i]` is conservatively rejected.
+//
 // TIR-vs-Z3 semantic divergences kept in mind:
 //   * FloorDiv/FloorMod (TIR) round toward -inf; Z3 BV bvsdiv/bvsmod round
 //     toward 0. We constrain `var >= 0` so they agree on the bounded domain.
-//     A future variant for negative-stride loops would need explicit handling.
-//   * Signed overflow on `var + 1`: the bit-bound `var < 2^31` keeps the
-//     successor in range; an iter_var_size > 2^31 would be rejected here.
+//   * Signed overflow on `var + 1`: the unsigned-32-bit bit-bound (see the
+//     `bv_hi` literal below, widened in commit 3) keeps the successor in
+//     range; an iter_var_size > 2^32 would be rejected here.
+//   * Loop-carried offsets `expr = base + var*stride + offset` are handled
+//     correctly: `Substitute(var->var+1)` rewrites only the `var` term, and
+//     `(base + (var+1)*stride + offset) - (base + var*stride + offset)`
+//     simplifies to `stride`, so unit-stride iff `stride == 1`.
 static bool Z3CanProveUnitStride(const PrimExpr &expr, const Var &var,
                                  const PrimExpr &iter_var_size,
                                  arith::Analyzer *analyzer) {
+  // Audit fix (HIGH): affine guard. Indirect/non-affine accesses bypass Z3.
+  if (!IsAffineInVar(expr, var)) {
+    return false;
+  }
   try {
     auto &z3 = arith::Z3Prover(analyzer);
     z3.SetTimeoutMs(50);
