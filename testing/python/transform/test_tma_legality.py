@@ -1,6 +1,7 @@
 """Z3 idea #6: tma_legality (CUDA).
 
-Exercises the Z3 fallback in `CopyNode::CheckGlobalStrides` (src/op/copy.cc).
+Exercises the Z3 fallback in `cuda::CheckGlobalStrides`
+(src/backend/cuda/op/copy_analysis.cc).
 
 The fallback is opt-in via the `tl.tma_legality_z3` PassContext config. When
 enabled, TMA is emitted only if BOTH the global base address and every
@@ -201,7 +202,7 @@ def test_tma_legality_z3_query_shape():
     16-byte alignment threshold or the 2^48 virtual-address envelope is
     caught here.
     """
-    # The Z3 query in src/op/copy.cc::Z3ProveStrideAligned16:
+    # The Z3 query in src/backend/cuda/op/copy_analysis.cc::Z3ProveStrideAligned16:
     #
     #   constraints:
     #     addr_bytes   >= 0

@@ -177,6 +177,7 @@ set(HIDE_PRIVATE_SYMBOLS OFF CACHE STRING
 
 # Include directories for TileLang
 set(TILE_LANG_INCLUDES ${TVM_INCLUDES})
+list(APPEND TILE_LANG_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 # Collect source files
 file(GLOB TILE_LANG_SRCS
@@ -186,6 +187,10 @@ file(GLOB TILE_LANG_SRCS
   src/transform/common/*.cc
   src/transform/vendored/*.cc
   src/op/*.cc
+  src/backend/cpu/op/*.cc
+  src/backend/cuda/op/copy_analysis.cc
+  src/backend/metal/op/*.cc
+  src/backend/webgpu/op/*.cc
   src/target/utils.cc
   src/target/codegen_c_host.cc
   src/target/codegen_c.cc
