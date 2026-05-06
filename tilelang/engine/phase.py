@@ -264,6 +264,11 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # InjectSoftwarePipeline, so no late MVB barrier fixup is needed.
     # Buffer allocation placement is handled uniformly for both paths.
     mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
+    # AutoDoubleBuffer: opt-in (PassConfig `tl.auto_double_buffer`, default
+    # OFF). Detects canonical shared-memory tile-load patterns and (when Z3
+    # can prove soundness) inserts ping-pong buffers. Currently a safe stub
+    # — see src/transform/auto_double_buffer.cc.
+    mod = tilelang.transform.AutoDoubleBuffer()(mod)
     mod = tilelang.transform.LowerSharedBarrier()(mod)
     if has_tma:
         mod = tilelang.transform.FuseMBarrierArriveExpectTx()(mod)

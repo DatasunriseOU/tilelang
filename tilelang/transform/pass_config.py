@@ -177,6 +177,26 @@ class PassConfigKey(str, Enum):
     prove the condition. Conservative — any prover error/timeout/UNKNOWN
     keeps the guard. Default: False (OFF for safety)."""
 
+    TL_AUTO_DOUBLE_BUFFER = "tl.auto_double_buffer"
+    """Enable auto-detection of canonical shared-memory tile-load patterns
+    and Z3-gated ping-pong (double-buffer) insertion. Default: False (OFF).
+
+    This is an experimental optimization, not a correctness fix. When
+    enabled, the AutoDoubleBuffer pass walks each ``For`` loop searching
+    for the canonical pattern::
+
+        for k in range(N):
+            shared_buf[i] = global_buf[k * stride + i]
+            use(shared_buf[i])
+
+    For each candidate it builds a Z3 soundness obligation and only
+    transforms the IR when the obligation is provable. When the
+    obligation is unknown/disproved, it falls back to single-buffer
+    (no transformation). The current implementation is a safe stub: it
+    detects candidates and logs the Z3 verdict but does not yet emit the
+    ping-pong rewrite — flipping this flag is a no-op for IR shape.
+    """
+
     TL_LOOP_UNSWITCHING_ALLOW_NON_TRIVIAL_ELSE = "tl.loop_unswitching_allow_non_trivial_else"
     """Allow loop unswitching even when the else-version of the loop body has side effects.
 

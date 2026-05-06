@@ -199,6 +199,27 @@ def DropProvableBoundChecks():
     return _ffi_api.DropProvableBoundChecks()  # type: ignore
 
 
+def AutoDoubleBuffer():
+    """AutoDoubleBuffer: Auto-detect canonical shared-memory tile-load
+    patterns and (when Z3 can prove soundness) ping-pong them.
+
+    Default OFF. Enable by setting the PassConfig
+    ``tl.auto_double_buffer = True``.
+
+    Currently a SAFE STUB: when enabled and a candidate is detected, the
+    pass logs the detection and the Z3 verdict, but leaves the IR
+    unchanged. This lets the wiring (PassConfig, phase slot, FFI binding)
+    ship without committing to a specific transformation; a future
+    iteration can replace the stub with the real ping-pong rewrite.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.AutoDoubleBuffer()  # type: ignore
+
+
 def ProducerConsumerWarpSpecialized():
     """Producer-consumer warp specialization at the tile-op level.
 
