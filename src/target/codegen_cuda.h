@@ -57,7 +57,15 @@ public:
   void VisitExpr_(const MinNode *op, std::ostream &os) final;
   void VisitExpr_(const MaxNode *op, std::ostream &os) final;
   void VisitStmt_(const EvaluateNode *op) final;
-  void VisitStmt_(const AllocateNode *op) final;
+  // CPPMEGA: AllocateNode here is the TileLang-vendored
+  // `tilelang::tl_tir::AllocateNode` (see vendored/allocate.h and the alias
+  // installed in vendored/tl_compat.h). Apache's `StmtFunctor` dispatch table
+  // does not list this vendored type, so the method cannot be marked `final`
+  // or `override`. The vendored `Allocate` is lowered to apache
+  // `tirx::AllocBuffer` before codegen (see vendored/lower_allocate.cc); this
+  // method is kept for source compatibility with sites that dispatch to it
+  // explicitly via `as<AllocateNode>()`.
+  void VisitStmt_(const AllocateNode *op);
   void VisitStmt_(const AttrStmtNode *op) final;
   void VisitExpr_(const BufferLoadNode *op, std::ostream &os) final;
   void VisitStmt_(const BufferStoreNode *op) final;
