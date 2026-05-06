@@ -17,6 +17,7 @@
 
 #include "../op/builtin.h"
 #include "../transform/common/attr.h"
+#include "../transform/vendored/tl_runtime_symbols.h"
 #include "./ptx.h"
 #include "./utils.h"
 #include "arith/pattern_match.h"

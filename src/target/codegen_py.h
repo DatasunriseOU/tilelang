@@ -166,7 +166,14 @@ protected:
   // statment
   void VisitStmt_(const BufferStoreNode *op) override;
   void VisitStmt_(const DeclBufferNode *op) override;
-  void VisitStmt_(const LetStmtNode *op) override;
+  // CPPMEGA: LetStmtNode here is the TileLang-vendored
+  // `tilelang::tl_tir::LetStmtNode`, not apache's `tirx::BindNode`. Apache's
+  // `StmtFunctor` dispatch table doesn't know this type, so the method
+  // cannot mark `override`. The vendored LetStmt is lowered to
+  // SeqStmt({Bind(var, value), body}) before codegen (see lower_let_stmt.cc),
+  // so this method is dead code in the apache pipeline. Kept for source
+  // compatibility with sites that explicitly call it.
+  void VisitStmt_(const LetStmtNode *op);
   void VisitStmt_(const AllocateNode *op) override;
   void VisitStmt_(const AttrStmtNode *op) override;
   void VisitStmt_(const ForNode *op) override;
