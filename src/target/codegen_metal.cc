@@ -116,6 +116,36 @@ void CodeGenTileLangMetal::InitFuncState(const PrimFunc &f) {
 CodeGenTileLangMetal::CodeGenTileLangMetal(Target target) : target_(target) {
   decl_stream << "#include <metal_stdlib>\n";
   decl_stream << "using namespace metal;\n\n";
+  // CPPMEGA: hybrid tl_pr_c granularity + stack-c switch dispatch.
+  // FP8/FP4 helper prelude is emitted lazily by `EmitFPHelperPrelude` after
+  // `CollectReferencedLowPrecisionDtypes` has scanned the kernel body. This
+  // avoids unconditionally injecting ~9KB of dead helper code into every
+  // Metal kernel (e.g. pure-float32 vecadd).
+  decl_stream << "union __TVMArgUnion {\n"
+              << " int v_int[2];\n"
+              << "};\n\n";
+}
+
+// CPPMEGA: hybrid tl_pr_c granularity + stack-c switch dispatch.
+// Per-dtype FP8 helper emitters. Each writes its decl into decl_stream so
+// that Finish() will prepend it ahead of the kernel body. The bodies are
+// raw text — no logic, only structure — so they are easy to extend.
+void CodeGenTileLangMetal::EmitFp8E3M4Helper() {
+  decl_stream << "static inline half __tvm_fp8_e3m4_to_half(uchar x) {\n"
+              << "  uint raw = uint(x);\n"
+              << "  uint abs = raw & 0x7fu;\n"
+              << "  if (abs == 0u) return half(0.0f);\n"
+              << "  uint exp = (raw >> 4) & 0x07u;\n"
+              << "  uint mant = raw & 0x0fu;\n"
+              << "  if (exp == 0x07u && mant == 0x0fu) return half(as_type<float>(0x7fc00000u));\n"
+              << "  float mag = (exp == 0u)\n"
+              << "      ? (float(mant) * 0.0625f * exp2(-2.0f))\n"
+              << "      : ((1.0f + float(mant) * 0.0625f) * exp2(float(int(exp) - 3)));\n"
+              << "  return half((raw & 0x80u) != 0u ? -mag : mag);\n"
+              << "}\n\n";
+}
+
+void CodeGenTileLangMetal::EmitFp8E4M3Helper() {
   decl_stream << "static inline half __tvm_fp8_e4m3_to_half(uchar x) {\n"
               << "  uint raw = uint(x);\n"
               << "  uint abs = raw & 0x7fu;\n"
@@ -128,6 +158,45 @@ CodeGenTileLangMetal::CodeGenTileLangMetal(Target target) : target_(target) {
               << "      : ((1.0f + float(mant) * 0.125f) * exp2(float(int(exp) - 7)));\n"
               << "  return half((raw & 0x80u) != 0u ? -mag : mag);\n"
               << "}\n\n";
+}
+
+void CodeGenTileLangMetal::EmitFp8E4M3FnAliasHelper() {
+  // Depends on EmitFp8E4M3Helper having been emitted already.
+  decl_stream << "static inline half __tvm_fp8_e4m3fn_to_half(uchar x) {\n"
+              << "  return __tvm_fp8_e4m3_to_half(x);\n"
+              << "}\n\n";
+}
+
+void CodeGenTileLangMetal::EmitFp8E4M3FnuzHelper() {
+  decl_stream << "static inline half __tvm_fp8_e4m3fnuz_to_half(uchar x) {\n"
+              << "  uint raw = uint(x) & 0x7fu;\n"
+              << "  uint exp = (raw >> 3) & 0x0fu;\n"
+              << "  uint mant = raw & 0x07u;\n"
+              << "  if (raw == 0u) return half(0.0f);\n"
+              << "  if (exp == 0x0fu && mant == 0x07u) return half(as_type<float>(0x7fc00000u));\n"
+              << "  float mag = (exp == 0u)\n"
+              << "      ? (float(mant) * 0.125f * exp2(-6.0f))\n"
+              << "      : ((1.0f + float(mant) * 0.125f) * exp2(float(int(exp) - 7)));\n"
+              << "  return half(mag);\n"
+              << "}\n\n";
+}
+
+void CodeGenTileLangMetal::EmitFp8E4M3B11FnuzHelper() {
+  decl_stream << "static inline half __tvm_fp8_e4m3b11fnuz_to_half(uchar x) {\n"
+              << "  uint original = uint(x);\n"
+              << "  uint raw = original & 0x7fu;\n"
+              << "  uint exp = (raw >> 3) & 0x0fu;\n"
+              << "  uint mant = raw & 0x07u;\n"
+              << "  if (original == 0x80u) return half(as_type<float>(0x7fc00000u));\n"
+              << "  if (raw == 0u) return half(0.0f);\n"
+              << "  float mag = (exp == 0u)\n"
+              << "      ? (float(mant) * 0.125f * exp2(-10.0f))\n"
+              << "      : ((1.0f + float(mant) * 0.125f) * exp2(float(int(exp) - 11)));\n"
+              << "  return half(mag);\n"
+              << "}\n\n";
+}
+
+void CodeGenTileLangMetal::EmitFp8E5M2Helper() {
   decl_stream << "static inline half __tvm_fp8_e5m2_to_half(uchar x) {\n"
               << "  uint raw = uint(x);\n"
               << "  uint abs = raw & 0x7fu;\n"
@@ -144,9 +213,256 @@ CodeGenTileLangMetal::CodeGenTileLangMetal(Target target) : target_(target) {
               << "      : ((1.0f + float(mant) * 0.25f) * exp2(float(int(exp) - 15)));\n"
               << "  return half((raw & 0x80u) != 0u ? -mag : mag);\n"
               << "}\n\n";
-  decl_stream << "union __TVMArgUnion {\n"
-              << " int v_int[2];\n"
+}
+
+void CodeGenTileLangMetal::EmitFp8E5M2FnuzHelper() {
+  decl_stream << "static inline half __tvm_fp8_e5m2fnuz_to_half(uchar x) {\n"
+              << "  uint raw = uint(x) & 0x7fu;\n"
+              << "  uint exp = (raw >> 2) & 0x1fu;\n"
+              << "  uint mant = raw & 0x03u;\n"
+              << "  if (raw == 0u) return half(0.0f);\n"
+              << "  if (exp == 0x1fu) return half(as_type<float>(0x7fc00000u));\n"
+              << "  float mag = (exp == 0u)\n"
+              << "      ? (float(mant) * 0.25f * exp2(-14.0f))\n"
+              << "      : ((1.0f + float(mant) * 0.25f) * exp2(float(int(exp) - 15)));\n"
+              << "  return half(mag);\n"
+              << "}\n\n";
+}
+
+void CodeGenTileLangMetal::EmitFp8E8M0FnuHelper() {
+  decl_stream << "static inline float __tvm_fp8_e8m0fnu_to_float(uchar x) {\n"
+              << "  uint raw = uint(x);\n"
+              << "  if (raw == 0xffu) return as_type<float>(0x7fc00000u);\n"
+              << "  return exp2(float(int(raw) - 127));\n"
+              << "}\n\n";
+}
+
+void CodeGenTileLangMetal::EmitFp8Dot4Helpers() {
+  decl_stream << "constant float __tvm_fp8_e4m3fn_lut[256] = {\n"
+              << "  0.0f, 0.001953125f, 0.00390625f, 0.005859375f, 0.0078125f, 0.009765625f, 0.01171875f, 0.013671875f,\n"
+              << "  0.015625f, 0.017578125f, 0.01953125f, 0.021484375f, 0.0234375f, 0.025390625f, 0.02734375f, 0.029296875f,\n"
+              << "  0.03125f, 0.03515625f, 0.0390625f, 0.04296875f, 0.046875f, 0.05078125f, 0.0546875f, 0.05859375f,\n"
+              << "  0.0625f, 0.0703125f, 0.078125f, 0.0859375f, 0.09375f, 0.1015625f, 0.109375f, 0.1171875f,\n"
+              << "  0.125f, 0.140625f, 0.15625f, 0.171875f, 0.1875f, 0.203125f, 0.21875f, 0.234375f,\n"
+              << "  0.25f, 0.28125f, 0.3125f, 0.34375f, 0.375f, 0.40625f, 0.4375f, 0.46875f,\n"
+              << "  0.5f, 0.5625f, 0.625f, 0.6875f, 0.75f, 0.8125f, 0.875f, 0.9375f,\n"
+              << "  1.0f, 1.125f, 1.25f, 1.375f, 1.5f, 1.625f, 1.75f, 1.875f,\n"
+              << "  2.0f, 2.25f, 2.5f, 2.75f, 3.0f, 3.25f, 3.5f, 3.75f,\n"
+              << "  4.0f, 4.5f, 5.0f, 5.5f, 6.0f, 6.5f, 7.0f, 7.5f,\n"
+              << "  8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f,\n"
+              << "  16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f,\n"
+              << "  32.0f, 36.0f, 40.0f, 44.0f, 48.0f, 52.0f, 56.0f, 60.0f,\n"
+              << "  64.0f, 72.0f, 80.0f, 88.0f, 96.0f, 104.0f, 112.0f, 120.0f,\n"
+              << "  128.0f, 144.0f, 160.0f, 176.0f, 192.0f, 208.0f, 224.0f, 240.0f,\n"
+              << "  256.0f, 288.0f, 320.0f, 352.0f, 384.0f, 416.0f, 448.0f, 0.0f,\n"
+              << "  0.0f, -0.001953125f, -0.00390625f, -0.005859375f, -0.0078125f, -0.009765625f, -0.01171875f, -0.013671875f,\n"
+              << "  -0.015625f, -0.017578125f, -0.01953125f, -0.021484375f, -0.0234375f, -0.025390625f, -0.02734375f, -0.029296875f,\n"
+              << "  -0.03125f, -0.03515625f, -0.0390625f, -0.04296875f, -0.046875f, -0.05078125f, -0.0546875f, -0.05859375f,\n"
+              << "  -0.0625f, -0.0703125f, -0.078125f, -0.0859375f, -0.09375f, -0.1015625f, -0.109375f, -0.1171875f,\n"
+              << "  -0.125f, -0.140625f, -0.15625f, -0.171875f, -0.1875f, -0.203125f, -0.21875f, -0.234375f,\n"
+              << "  -0.25f, -0.28125f, -0.3125f, -0.34375f, -0.375f, -0.40625f, -0.4375f, -0.46875f,\n"
+              << "  -0.5f, -0.5625f, -0.625f, -0.6875f, -0.75f, -0.8125f, -0.875f, -0.9375f,\n"
+              << "  -1.0f, -1.125f, -1.25f, -1.375f, -1.5f, -1.625f, -1.75f, -1.875f,\n"
+              << "  -2.0f, -2.25f, -2.5f, -2.75f, -3.0f, -3.25f, -3.5f, -3.75f,\n"
+              << "  -4.0f, -4.5f, -5.0f, -5.5f, -6.0f, -6.5f, -7.0f, -7.5f,\n"
+              << "  -8.0f, -9.0f, -10.0f, -11.0f, -12.0f, -13.0f, -14.0f, -15.0f,\n"
+              << "  -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -28.0f, -30.0f,\n"
+              << "  -32.0f, -36.0f, -40.0f, -44.0f, -48.0f, -52.0f, -56.0f, -60.0f,\n"
+              << "  -64.0f, -72.0f, -80.0f, -88.0f, -96.0f, -104.0f, -112.0f, -120.0f,\n"
+              << "  -128.0f, -144.0f, -160.0f, -176.0f, -192.0f, -208.0f, -224.0f, -240.0f,\n"
+              << "  -256.0f, -288.0f, -320.0f, -352.0f, -384.0f, -416.0f, -448.0f, NAN,\n"
               << "};\n\n";
+  decl_stream << "static inline float __tvm_fp8_e4m3_dot4_words(uint pa, uint pb) {\n"
+              << "  return __tvm_fp8_e4m3fn_lut[pa & 0xFFu] * __tvm_fp8_e4m3fn_lut[pb & 0xFFu]\n"
+              << "       + __tvm_fp8_e4m3fn_lut[(pa >> 8) & 0xFFu] * __tvm_fp8_e4m3fn_lut[(pb >> 8) & 0xFFu]\n"
+              << "       + __tvm_fp8_e4m3fn_lut[(pa >> 16) & 0xFFu] * __tvm_fp8_e4m3fn_lut[(pb >> 16) & 0xFFu]\n"
+              << "       + __tvm_fp8_e4m3fn_lut[(pa >> 24) & 0xFFu] * __tvm_fp8_e4m3fn_lut[(pb >> 24) & 0xFFu];\n"
+              << "}\n\n";
+  decl_stream << "static inline uint __tvm_fp8_load_u32(device const uchar* p, uint word_idx) {\n"
+              << "  return reinterpret_cast<device const uint*>(p)[word_idx];\n"
+              << "}\n"
+              << "static inline uint __tvm_fp8_load_u32(threadgroup const uchar* p, uint word_idx) {\n"
+              << "  return reinterpret_cast<threadgroup const uint*>(p)[word_idx];\n"
+              << "}\n"
+              << "static inline uint __tvm_fp8_load_u32(constant const uchar* p, uint word_idx) {\n"
+              << "  return reinterpret_cast<constant const uint*>(p)[word_idx];\n"
+              << "}\n\n";
+  decl_stream << "static inline float __tvm_fp8_e4m3_dot4_packed(device const uchar* a, device const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
+              << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+              << "}\n"
+              << "static inline float __tvm_fp8_e4m3_dot4_packed(device const uchar* a, threadgroup const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
+              << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+              << "}\n"
+              << "static inline float __tvm_fp8_e4m3_dot4_packed(device const uchar* a, constant const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
+              << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+              << "}\n"
+              << "static inline float __tvm_fp8_e4m3_dot4_packed(threadgroup const uchar* a, device const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
+              << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+              << "}\n"
+              << "static inline float __tvm_fp8_e4m3_dot4_packed(threadgroup const uchar* a, threadgroup const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
+              << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+              << "}\n"
+              << "static inline float __tvm_fp8_e4m3_dot4_packed(threadgroup const uchar* a, constant const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
+              << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+              << "}\n"
+              << "static inline float __tvm_fp8_e4m3_dot4_packed(constant const uchar* a, device const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
+              << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+              << "}\n"
+              << "static inline float __tvm_fp8_e4m3_dot4_packed(constant const uchar* a, threadgroup const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
+              << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+              << "}\n"
+              << "static inline float __tvm_fp8_e4m3_dot4_packed(constant const uchar* a, constant const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
+              << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+              << "}\n\n";
+}
+
+// CPPMEGA: hybrid tl_pr_c granularity + stack-c switch dispatch.
+// Pre-walker that scans a PrimFunc for any FP8 (and forward-compat FP4) dtype
+// use. The walker visits BufferLoad/BufferStore/Cast/Call/Allocate/Broadcast/
+// Var/Let/Ramp expressions and stores the unique TypeCodes in
+// `referenced_fp8_codes_`, which `EmitFPHelperPrelude` consumes via switch
+// dispatch into the per-dtype emitters above.
+namespace {
+
+class MetalFp8DTypeCollector final : public StmtExprVisitor {
+public:
+  std::set<int> referenced_codes;
+  bool uses_dot4{false};
+
+  void Note(const DataType &t) {
+    if (t.is_float8() || t.is_float4()) {
+      referenced_codes.insert(static_cast<int>(t.code()));
+    }
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    Note(op->dtype);
+    if (op->buffer.defined()) Note(op->buffer->dtype);
+    StmtExprVisitor::VisitExpr_(op);
+  }
+  void VisitStmt_(const BufferStoreNode *op) final {
+    Note(op->value.dtype());
+    if (op->buffer.defined()) Note(op->buffer->dtype);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+  void VisitExpr_(const CastNode *op) final {
+    Note(op->dtype);
+    Note(op->value.dtype());
+    StmtExprVisitor::VisitExpr_(op);
+  }
+  void VisitExpr_(const CallNode *op) final {
+    Note(op->dtype);
+    for (const auto &arg : op->args) {
+      Note(arg.dtype());
+    }
+    if (auto *opn = op->op.as<OpNode>()) {
+      if (opn->name == "tir.metal.fp8_e4m3_dot4") {
+        uses_dot4 = true;
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+  // CPPMEGA: in the swap branch `AllocateNode` resolves to the vendored
+  // `tilelang::tl_tir::AllocateNode`, which is not part of StmtExprVisitor's
+  // virtual hierarchy — overloading it here would hide base virtuals. Buffer
+  // allocations carry their dtype through the buffer_map walk in
+  // CollectReferencedLowPrecisionDtypes; nothing is missed by skipping it.
+  void VisitExpr_(const BroadcastNode *op) final {
+    Note(op->dtype);
+    StmtExprVisitor::VisitExpr_(op);
+  }
+  void VisitExpr_(const RampNode *op) final {
+    Note(op->dtype);
+    StmtExprVisitor::VisitExpr_(op);
+  }
+  void VisitExpr_(const VarNode *op) final {
+    Note(op->dtype);
+    StmtExprVisitor::VisitExpr_(op);
+  }
+  void VisitExpr_(const LetNode *op) final {
+    Note(op->dtype);
+    StmtExprVisitor::VisitExpr_(op);
+  }
+};
+
+} // namespace
+
+void CodeGenTileLangMetal::CollectReferencedLowPrecisionDtypes(
+    const PrimFunc &f) {
+  referenced_fp8_codes_.clear();
+  uses_fp8_dot4_ = false;
+  MetalFp8DTypeCollector collector;
+  // Inspect parameter dtypes (handle pointers carry their pointee dtype via
+  // the buffer_map; non-handle parameters carry it directly).
+  for (const Var &v : f->params) {
+    if (v.dtype().is_float8() || v.dtype().is_float4()) {
+      referenced_fp8_codes_.insert(static_cast<int>(v.dtype().code()));
+    }
+    if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
+      if (auto *prim = ptr->element_type.as<PrimTypeNode>()) {
+        if (prim->dtype.is_float8() || prim->dtype.is_float4()) {
+          referenced_fp8_codes_.insert(static_cast<int>(prim->dtype.code()));
+        }
+      }
+    }
+  }
+  for (const auto &kv : f->buffer_map) {
+    DataType bt = kv.second->dtype;
+    if (bt.is_float8() || bt.is_float4()) {
+      referenced_fp8_codes_.insert(static_cast<int>(bt.code()));
+    }
+  }
+  collector(f->body);
+  referenced_fp8_codes_.insert(collector.referenced_codes.begin(),
+                               collector.referenced_codes.end());
+  if (collector.uses_dot4) uses_fp8_dot4_ = true;
+}
+
+void CodeGenTileLangMetal::EmitFPHelperPrelude() {
+  // CPPMEGA: hybrid tl_pr_c granularity + stack-c switch dispatch.
+  // Track if e4m3 base helper already emitted (e4m3fn alias depends on it).
+  bool e4m3_emitted = false;
+  for (int code : referenced_fp8_codes_) {
+    switch (static_cast<DataType::TypeCode>(code)) {
+    case DataType::kFloat8_e3m4:
+      EmitFp8E3M4Helper();
+      break;
+    case DataType::kFloat8_e4m3:
+      if (!e4m3_emitted) {
+        EmitFp8E4M3Helper();
+        e4m3_emitted = true;
+      }
+      break;
+    case DataType::kFloat8_e4m3fn:
+      if (!e4m3_emitted) {
+        EmitFp8E4M3Helper();
+        e4m3_emitted = true;
+      }
+      EmitFp8E4M3FnAliasHelper();
+      break;
+    case DataType::kFloat8_e4m3fnuz:
+      EmitFp8E4M3FnuzHelper();
+      break;
+    case DataType::kFloat8_e4m3b11fnuz:
+      EmitFp8E4M3B11FnuzHelper();
+      break;
+    case DataType::kFloat8_e5m2:
+      EmitFp8E5M2Helper();
+      break;
+    case DataType::kFloat8_e5m2fnuz:
+      EmitFp8E5M2FnuzHelper();
+      break;
+    case DataType::kFloat8_e8m0fnu:
+      EmitFp8E8M0FnuHelper();
+      break;
+    default:
+      // Other FP4/FP8 codes are fail-closed in PrintType/CastFromTo today.
+      break;
+    }
+  }
+  // The dot4-packed path stores its inputs as e4m3fn but uses the LUT path,
+  // so it does not require __tvm_fp8_e4m3_to_half — emit only the LUT helpers.
+  if (uses_fp8_dot4_) EmitFp8Dot4Helpers();
 }
 
 void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
@@ -169,6 +485,16 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
   this->InitFuncState(func);
   // skip the first underscore, so SSA variable starts from _1
   name_supply_->FreshName("v_");
+
+  // CPPMEGA: hybrid tl_pr_c granularity + stack-c switch dispatch.
+  // Scan the PrimFunc body for FP8/FP4 dtype use, then emit only the
+  // matching `__tvm_fp8_*_to_half` helpers (and dot4 LUT/dot4_packed
+  // overloads, when used) into decl_stream. This must run before
+  // PrintStmt(func->body) so the helper symbols are visible to the kernel
+  // body generated later in this method. Pure-fp32 kernels emit zero
+  // helpers.
+  this->CollectReferencedLowPrecisionDtypes(func);
+  this->EmitFPHelperPrelude();
 
   // add to alloc buffer type.
   auto global_symbol = func->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol);

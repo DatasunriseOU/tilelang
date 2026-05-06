@@ -115,6 +115,9 @@ from .builtin import stg256 as stg256  # noqa: F401
 from .builtin import any_sync as any_sync  # noqa: F401
 from .builtin import all_sync as all_sync  # noqa: F401
 from .fp8_op import fp8_scaled_matmul as fp8_scaled_matmul  # noqa: F401
+# CPPMEGA pull from stack-c — blockscaled E8M0 + Metal dot4 DSL surface
+from .blockscaled_layout import BlockScaledLayout, e8m0_to_float  # noqa: F401
+from .fp8_op import metal_fp8_e4m3_dot4 as metal_fp8_e4m3_dot4  # noqa: F401
 from .builtin import ballot_sync as ballot_sync  # noqa: F401
 from .builtin import ballot as ballot  # noqa: F401
 from .builtin import activemask as activemask  # noqa: F401

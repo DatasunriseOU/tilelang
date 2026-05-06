@@ -26,6 +26,7 @@
 
 #include <tvm/target/codegen.h>
 
+#include <set>
 #include <string>
 #include <unordered_map>
 
@@ -77,6 +78,31 @@ public:
   using CodeGenC::PrintType;
 
 private:
+  // CPPMEGA: hybrid tl_pr_c granularity + stack-c switch dispatch.
+  // Emit FP8/FP4 prelude helpers only for dtypes actually referenced by the
+  // kernel body (not unconditionally for all FP8 variants). Without this,
+  // every Metal kernel pays ~1KB+ of dead helper code even when it is pure
+  // float32. The helper-emission set is populated by a pre-walker that scans
+  // the PrimFunc body in `AddFunction` before the body is printed, and
+  // consumed by `EmitFPHelperPrelude` which switch-dispatches into the
+  // per-dtype emitters below. New FP8 dtypes plug in by adding a switch case
+  // and a matching per-dtype `EmitFp8XXXHelper()` body. See
+  // docs/mlx_port_master_plan.md (Metal codegen FP8 conditional prelude).
+  void CollectReferencedLowPrecisionDtypes(const PrimFunc &f);
+  void EmitFPHelperPrelude();          // public dispatch entry
+  void EmitFp8E3M4Helper();
+  void EmitFp8E4M3Helper();
+  void EmitFp8E4M3FnAliasHelper();     // delegates to E4M3
+  void EmitFp8E4M3FnuzHelper();
+  void EmitFp8E4M3B11FnuzHelper();
+  void EmitFp8E5M2Helper();
+  void EmitFp8E5M2FnuzHelper();
+  void EmitFp8E8M0FnuHelper();
+  void EmitFp8Dot4Helpers();           // LUT + dot4_words + dot4_packed overloads
+
+  std::set<int> referenced_fp8_codes_;
+  bool uses_fp8_dot4_{false};
+
   std::unordered_map<const VarNode *, std::string> simdgroup_dtype_;
   std::unordered_map<const VarNode *, IntImm> unroll_factor_;
   int thread_index_bits_{32};

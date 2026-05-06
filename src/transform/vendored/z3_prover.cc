@@ -725,5 +725,34 @@ Z3Prover& GetOrCreate(::tvm::arith::Analyzer* analyzer) {
   return *slot;
 }
 
+// CPPMEGA: Auto-driver hooks. Registered at static init so apache
+// `Analyzer::Bind` / `ConstraintContext::EnterWithScope` forward to the
+// per-Analyzer Z3Prover, matching stack-c/tl_pr_c behavior. Without this,
+// the prover is starved of constraints and partial-sync queries collapse
+// to range-only proofs.
+namespace {
+void Z3BindExprHook(::tvm::arith::Analyzer* self, const ::tvm::tirx::Var& var,
+                    const ::tvm::PrimExpr& expr, bool allow_override) {
+  GetOrCreate(self).Bind(var, expr, allow_override);
+}
+void Z3BindRangeHook(::tvm::arith::Analyzer* self, const ::tvm::tirx::Var& var,
+                     const ::tvm::Range& range, bool allow_override) {
+  GetOrCreate(self).Bind(var, range, allow_override);
+}
+std::function<void()> Z3EnterConstraintHook(::tvm::arith::Analyzer* self,
+                                            const ::tvm::PrimExpr& constraint) {
+  return GetOrCreate(self).EnterConstraint(constraint);
+}
+
+struct Z3HookRegistrar {
+  Z3HookRegistrar() {
+    ::tvm::arith::Analyzer::RegisterBindExprHook(&Z3BindExprHook);
+    ::tvm::arith::Analyzer::RegisterBindRangeHook(&Z3BindRangeHook);
+    ::tvm::arith::Analyzer::RegisterEnterConstraintHook(&Z3EnterConstraintHook);
+  }
+};
+static Z3HookRegistrar _z3_hook_registrar;
+}  // namespace
+
 }  // namespace tlz3
 }  // namespace tilelang

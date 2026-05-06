@@ -112,10 +112,17 @@ class MetalKernelAdapter(BaseKernelAdapter):
                 continue
             thread_extent = func.attrs["thread_extent"]
             for tag, extent in thread_extent.items():
+                # CPPMEGA: defensive parse — extract trailing 'x'/'y'/'z' axis only,
+                # tolerate custom suffixed tags (e.g. threadIdx.__wmma_x). If the tag
+                # doesn't end with a recognised axis letter, skip silently.
+                axis_char = tag[-1] if tag else ""
+                if axis_char not in ("x", "y", "z"):
+                    continue
+                axis = "xyz".index(axis_char)
                 if "threadIdx" in tag:
-                    block_info["xyz".index(tag[-1])] = cls._as_int_extent(extent)
+                    block_info[axis] = cls._as_int_extent(extent)
                 elif "blockIdx" in tag:
-                    grid_info["xyz".index(tag[-1])] = cls._as_int_extent(extent)
+                    grid_info[axis] = cls._as_int_extent(extent)
             return block_info, grid_info
 
         raise AssertionError(f"no kernel with name {kernel_name}")

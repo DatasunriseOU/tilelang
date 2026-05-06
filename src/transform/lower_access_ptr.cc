@@ -50,6 +50,28 @@ PrimExpr BaseIndexForOffset(const PrimExpr &index) {
   return index;
 }
 
+// CPPMEGA: pull from stack-c — handle if_then_else-wrapped BufferLoad
+// produced by LegalizeSafeMemoryAccess. Returns the underlying load if
+// the expression is `if_then_else(cond, BufferLoad, fallback)` or
+// directly a `BufferLoad`; FATAL otherwise.
+BufferLoad ExtractAccessPtrBaseLoad(const PrimExpr &expr) {
+  if (const auto *base_load = expr.as<BufferLoadNode>()) {
+    return ffi::GetRef<BufferLoad>(base_load);
+  }
+
+  if (const auto *call = expr.as<CallNode>();
+      call != nullptr && call->op.same_as(builtin::if_then_else()) &&
+      call->args.size() == 3U) {
+    // LegalizeSafeMemoryAccess wraps predicated loads as
+    // if_then_else(cond, BufferLoad(...), safe_zero).  For tl.access_ptr the
+    // value is irrelevant; keep the guarded load's address expression.
+    return ExtractAccessPtrBaseLoad(call->args[1]);
+  }
+
+  LOG(FATAL) << "tl.access_ptr arg0 must be BufferLoad, but got " << expr;
+  return BufferLoad();
+}
+
 PrimExpr LinearOffsetFromLoad(const BufferLoad &load) {
   Buffer buffer = load->buffer;
   ICHECK(buffer.defined());
@@ -85,7 +107,8 @@ public:
     ICHECK_EQ(call->args.size(), 3U)
         << "tl.access_ptr expects 3 args: (BufferLoad, extent, rw_mask)";
 
-    BufferLoad base_load = Downcast<BufferLoad>(call->args[0]);
+    // CPPMEGA: pull from stack-c — tolerate if_then_else-wrapped BufferLoad.
+    BufferLoad base_load = ExtractAccessPtrBaseLoad(call->args[0]);
     Buffer buffer = base_load->buffer;
     ICHECK(buffer.defined());
 
