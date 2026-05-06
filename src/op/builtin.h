@@ -118,6 +118,12 @@ static constexpr const char *kDisableLoopUnswitching =
 // non-trivial (has side effects). Default: false (conservative).
 static constexpr const char *kLoopUnswitchingAllowNonTrivialElse =
     "tl.loop_unswitching_allow_non_trivial_else";
+// CPPMEGA: Z3 idea #7 — predicate fusion. When enabled, fuse adjacent
+// `if(a) { if(b) { body } }` patterns into `if(a && b) { body }` ONLY when
+// Z3 proves that evaluating `b` outside the `a` guard is safe (no
+// out-of-bounds buffer access, no side effects). Default: false (off — the
+// pass is a pure throughput optimization and must remain conservative).
+static constexpr const char *kPredicateFusion = "tl.predicate_fusion";
 
 // CPPMEGA: Z3 idea #4 — drop provable buffer-bound checks.
 // When enabled, IfThenElse nodes whose condition is a buffer-bound predicate

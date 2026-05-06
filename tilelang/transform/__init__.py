@@ -220,6 +220,24 @@ def AutoDoubleBuffer():
     return _ffi_api.AutoDoubleBuffer()  # type: ignore
 
 
+def PredicateFusion():
+    """PredicateFusion (Z3 idea #7): fuse adjacent guarded ``if`` statements.
+
+    Rewrites ``if(a) { if(b) { body } }`` to ``if(a && b) { body }`` when
+    Z3 proves the inner predicate is well-defined unconditionally (i.e.
+    every BufferLoad/BufferStore index is in-range without assuming the
+    outer guard ``a``). Conservative on UNKNOWN/timeout — keeps nesting.
+
+    Controlled by pass config ``tl.predicate_fusion`` (default OFF).
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass.
+    """
+    return _ffi_api.PredicateFusion()  # type: ignore
+
+
 def ProducerConsumerWarpSpecialized():
     """Producer-consumer warp specialization at the tile-op level.
 

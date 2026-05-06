@@ -203,6 +203,10 @@ class PassConfigKey(str, Enum):
     This is more aggressive and may increase code size. Default: False.
     """
 
+    TL_PREDICATE_FUSION = "tl.predicate_fusion"
+    """Z3 idea #7: fuse adjacent guarded ``if`` statements when Z3 proves the
+    inner predicate is well-defined unconditionally. Default: False (off)."""
+
     TL_DISABLE_THREAD_STORAGE_SYNC = "tl.disable_thread_storage_sync"
     """Disable thread storage synchronization pass. When enabled, disables the
     automatic insertion of thread synchronization barriers (e.g., __syncthreads())

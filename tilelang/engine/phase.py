@@ -243,6 +243,11 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.LegalizeVectorizedLoop()(mod)
     # Add safety checks for memory accesses
     mod = tilelang.transform.LegalizeSafeMemoryAccess()(mod)
+    # CPPMEGA: Z3 idea #7 — predicate fusion. Runs immediately after the
+    # safe-memory-access pass (which materializes the `if(a){if(b){...}}`
+    # nesting we target) and before vectorization / async-copy lowering.
+    # Default OFF; opt-in via PassConfig `tl.predicate_fusion`.
+    mod = tilelang.transform.PredicateFusion()(mod)
     # Lower frontend pointer metadata op to standard tvm_access_ptr
     mod = tilelang.transform.LowerAccessPtr()(mod)
     # Simplify again to clean up any duplicated conditions
