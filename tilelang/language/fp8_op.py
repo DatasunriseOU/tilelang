@@ -350,6 +350,16 @@ _Z3_DOT4_TIMEOUT_MS = 50
 # 32 matches the eventual ``Z3Prover::SetBitVectorMode(32)`` semantics.
 _Z3_DOT4_ADDR_BITS = 32
 
+# CPPMEGA Z3 idea #10 audit-fix: bound the symbolic stride search space. Without
+# an upper bound the solver is free to consider absurd strides (the Int sort is
+# unbounded), which inflates the search and hits UNKNOWN/timeout when combined
+# with the addr % 4 modular obligation. Real kernels never use innermost
+# strides above this knob (one stride-1024 row is already 4 KiB / 8 KiB which
+# exceeds typical Metal threadgroup-buffer slabs); legality outside [1, 1024)
+# is conservative-False by construction. Configurable for future kernels with
+# wider K, but the constant is a deliberate "tightening" rather than a hint.
+_DOT4_MAX_STRIDE = 1024
+
 
 def _is_int_imm_or_int(value) -> bool:
     """Return True if ``value`` is a Python int or ``tir.IntImm``."""
@@ -404,10 +414,34 @@ def _z3_prove_dot4_legal(
             && stride_a == 1 && stride_b == 1
             && addr_a % 4 == 0 && addr_b % 4 == 0
 
+    Conservative-on-stride!=1 (audit finding 2026-05-06):
+        We intentionally reject any ``stride != 1`` even when the buffer
+        layout is contiguous in some other algebraic sense (e.g. row-major
+        linearised). The packed-dot4 intrinsic loads a u32 word at
+        ``ptr[word_idx]``; if the FP8 byte stream is anything other than
+        4-byte contiguous along K, the four bytes packed into one u32 word
+        would no longer correspond to four consecutive K elements. So
+        ``stride==1`` is the safe, target-independent invariant the proof
+        pins. This matches the audit recommendation that "conservative
+        rejection on non-unit stride" is the correct posture for the
+        Metal dot4 fast path and any future CUDA / ROCm port.
+
+    Symbolic-negative-address invariant (audit finding 2026-05-06):
+        When ``addr_a`` / ``addr_b`` are symbolic and the caller has NOT
+        added a ``addr >= 0`` constraint, the prover returns False. The
+        BV32 emulation (``0 <= addr < (1<<32)``) inside this function only
+        clamps the *named* free variables; if the caller substitutes a
+        ``tir.Var`` that the prover sees as opaque, the conservative
+        outcome is False. Once the C++-side ``Z3Prover::SetBitVectorMode(32)``
+        FFI bridge lands, signed wrap-around will be encoded properly via
+        BV sort and this invariant becomes part of the BV semantics.
+
     Returns:
         ``(proved, reason)``. ``proved=True`` means every conjunct is
         established; the caller can route to ``metal_fp8_e4m3_dot4``.
         ``proved=False`` always means the caller MUST keep the legacy path.
+        UNKNOWN / timeout / solver exceptions all map to
+        ``proved=False`` -- conservative by construction.
     """
     # ----- Static fast path -------------------------------------------------
     # Common case: M=1 vecmat with concrete shapes baked in. Skip Z3 entirely.
@@ -480,7 +514,20 @@ def _z3_prove_dot4_legal(
         bound = 1 << _Z3_DOT4_ADDR_BITS
         s.add(aa_v >= 0, aa_v < bound)
         s.add(ab_v >= 0, ab_v < bound)
-        s.add(ka_v > 0, kb_v > 0, sa_v > 0, sb_v > 0)
+        # CPPMEGA Z3 idea #10 audit-fix: bound strides on both sides. Without
+        # ``sa < _DOT4_MAX_STRIDE`` the solver explores arbitrary positive
+        # values (Int sort), which is sound but inflates the search and
+        # frequently times out (UNKNOWN -> conservative-False) when paired
+        # with the modular addr obligations. Pinning a high but finite max
+        # gives Z3 a closed search space; legality outside that range
+        # remains conservative-False at the dispatcher (see
+        # ``_buffer_innermost_stride`` callers).
+        s.add(
+            ka_v > 0,
+            kb_v > 0,
+            sa_v > 0, sa_v < _DOT4_MAX_STRIDE,
+            sb_v > 0, sb_v < _DOT4_MAX_STRIDE,
+        )
 
         legality = _z3.And(
             ka_v == kb_v,
