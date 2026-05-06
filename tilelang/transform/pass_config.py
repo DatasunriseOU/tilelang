@@ -158,6 +158,12 @@ class PassConfigKey(str, Enum):
     TL_DISABLE_LOOP_UNSWITCHING = "tl.disable_loop_unswitching"
     """Disable loop unswitching optimization. Default: False"""
 
+    TL_DROP_PROVABLE_BOUND_CHECKS = "tl.drop_provable_bound_checks"
+    """Z3 roadmap idea #4: drop runtime buffer-bound `if (i < N) ...` guards
+    when the default analyzer or the vendored Z3 prover can conclusively
+    prove the condition. Conservative — any prover error/timeout/UNKNOWN
+    keeps the guard. Default: False (OFF for safety)."""
+
     TL_LOOP_UNSWITCHING_ALLOW_NON_TRIVIAL_ELSE = "tl.loop_unswitching_allow_non_trivial_else"
     """Allow loop unswitching even when the else-version of the loop body has side effects.
 

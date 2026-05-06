@@ -181,6 +181,24 @@ def LoopUnswitching():
     return _ffi_api.LoopUnswitching()  # type: ignore
 
 
+def DropProvableBoundChecks():
+    """Drop runtime ``if (i < N) buf[i] = ...`` bound-check guards when the
+    default analyzer or the vendored Z3 prover can conclusively prove the
+    condition (idea #4 of the Z3 roadmap).
+
+    Conservative-by-default: any prover error / timeout / UNKNOWN keeps the
+    guard intact. Pass is gated by the ``tl.drop_provable_bound_checks``
+    PassConfig (default ``False``); calling this pass without the config
+    enabled is a no-op.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.DropProvableBoundChecks()  # type: ignore
+
+
 def ProducerConsumerWarpSpecialized():
     """Producer-consumer warp specialization at the tile-op level.
 

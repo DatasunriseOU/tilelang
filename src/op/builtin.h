@@ -119,6 +119,13 @@ static constexpr const char *kDisableLoopUnswitching =
 static constexpr const char *kLoopUnswitchingAllowNonTrivialElse =
     "tl.loop_unswitching_allow_non_trivial_else";
 
+// CPPMEGA: Z3 idea #4 — drop provable buffer-bound checks.
+// When enabled, IfThenElse nodes whose condition is a buffer-bound predicate
+// (e.g. `i < N`) are stripped when the default analyzer or the vendored Z3
+// prover can conclusively prove the condition. Default: OFF.
+static constexpr const char *kDropProvableBoundChecks =
+    "tl.drop_provable_bound_checks";
+
 /*!
  * \brief Enable lowering non-predicated global load/store to ldg/stg intrinsics
  *

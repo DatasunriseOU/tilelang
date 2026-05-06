@@ -270,6 +270,10 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # as it will flatten index computing
     mod = tilelang.transform.ConfigIndexBitwidth()(mod)
     mod = tir.transform.Simplify()(mod)
+    # CPPMEGA: Z3 roadmap idea #4 — drop provable buffer-bound guards before
+    # vectorization. Gated by `tl.drop_provable_bound_checks` PassConfig
+    # (default OFF). See src/transform/drop_provable_bound_checks.cc.
+    mod = tilelang.transform.DropProvableBoundChecks()(mod)
     mod = tilelang.transform.VectorizeLoop(enable_vectorize=allow_vectorize(pass_ctx=pass_ctx))(mod)
     mod = tilelang.transform.StorageRewrite()(mod)
     mod = tilelang.transform.LoopUnswitching()(mod)
