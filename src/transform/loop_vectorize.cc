@@ -1415,15 +1415,29 @@ bool IndicesCanVectorize(const PrimExpr &expr, Var var,
     }
     return false;
   } else {
+    // CPPMEGA fix-B1 (idea712): only accept positive unit stride.
+    //
+    // Background: the parallel `z3-stack` branch adds a Z3-backed
+    // negative-stride probe. The `VectorizeRewriter` codegen, however,
+    // emits a `Ramp(min=0, stride=+1, lanes=N)` and assumes positive
+    // direction. If a negative-stride probe is ever ported here without
+    // the matching codegen change (a `negative_ramp` annotation +
+    // `Ramp(stride=-1)` emission in `VectorizeRewriter`), kernels like
+    // `for i in range(N-1, -1, -1): out[i] = in[i]` would be marked
+    // vectorizable but lowered with the wrong-order ramp.
+    //
+    // Decision: REJECT negative stride at the planner (option (a) in the
+    // cross-checked review). This is the safe-by-default position. If a
+    // future change wires the codegen, replace this with the proper
+    // negative_ramp flag plumbing (option (b)) and re-enable here.
+    //
+    // CPPMEGA Z3 idea #1 retained: still allow Z3 to prove stride==+1 for
+    // expressions that don't simplify to a literal 1 (e.g. `(k%4)+1` where
+    // k is provably a multiple of 4), and use the positive-only contiguity
+    // fallback. This drops the prior `stride == -1` branch.
     if (is_one(ramp_node->stride)) {
       return true;
     }
-    // CPPMEGA: Z3 idea #1 — ramp shape found but stride did not simplify to
-    // literal 1 (e.g. `1 + 0*x`, or stride `(k % 4) + 1` where k is provably
-    // a multiple of 4). Z3 fallback restricted to this narrow path.
-    //
-    // Audit fix (HIGH): also accept stride == -1 here, mirroring the
-    // bidirectional probe in Z3CanProveUnitStride.
     {
       auto &z3 = arith::Z3Prover(analyzer);
       z3.SetTimeoutMs(50);
@@ -1431,14 +1445,7 @@ bool IndicesCanVectorize(const PrimExpr &expr, Var var,
                       make_const(ramp_node->stride.dtype(), 1))) {
         return true;
       }
-      if (z3.CanProve(ramp_node->stride ==
-                      make_const(ramp_node->stride.dtype(), -1))) {
-        return true;
-      }
     }
-    // CPPMEGA: Z3 idea #1 — final contiguity fallback on the original
-    // `expr`. Triggers when ramp-stride proof failed (timeout/unknown) but
-    // the access *is* in fact unit-stride symbolically.
     return Z3CanProveUnitStride(expr, var, iter_var_size, analyzer);
   }
 }

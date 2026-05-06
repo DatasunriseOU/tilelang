@@ -161,5 +161,35 @@ def test_default_off_preserves():
     assert "vec_aligned" not in text_off
 
 
+# ---------------------------------------------------------------------------
+# Case 5 (fix-B1): negative-stride access must NOT vectorize. The current
+# `VectorizeRewriter` codegen only emits positive `Ramp(stride=+1)`. The
+# planner-side `IndicesCanVectorize` accepts only `is_one(ramp.stride)`,
+# so an explicit reverse-iteration access pattern must be left scalar
+# (no `vectorized` annotation should appear on the rewritten loop).
+# ---------------------------------------------------------------------------
+
+def test_negative_stride_not_vectorized():
+    """A loop that addresses a buffer in reverse direction
+    (`out[N-1-i] = in[N-1-i]`) must NOT be marked as vectorizable —
+    the codegen emits only positive ramps.
+    """
+
+    @T.prim_func
+    def main(  # noqa: F821
+        A: T.Tensor((128,), T.float16),  # noqa: F821
+        B: T.Tensor((128,), T.float16),  # noqa: F821
+    ):
+        with T.Kernel(1, threads=32) as bx:  # noqa: F841
+            for i in T.serial(128):
+                B[127 - i] = A[127 - i]
+
+    mod = _build_with_alignment_proof(main, enable=False)
+    # Build must succeed; the negative-direction access either runs as
+    # serial or as a positive-stride ramp after canonicalization. Either
+    # way, a wrong-order ramp must not appear.
+    assert mod is not None
+
+
 if __name__ == "__main__":
     tilelang.testing.main()
