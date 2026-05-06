@@ -15,6 +15,7 @@
 #include "../transform/loop_partition.h"
 #include "../transform/loop_vectorize.h"
 #include "../transform/ptx_async_copy_injector.h"
+#include "../transform/vendored/z3_prover.h"
 #include "utils.h"
 
 #include "builtin.h"
@@ -531,6 +532,54 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
   auto layout_map = par_op_->InferLayout(T, level);
   return layout_map;
 }
+// Z3 idea #6: tma_legality (CUDA).
+//
+// For TMA descriptor legality, the cheap analyzer can decide alignment for
+// constant strides but is unsound for symbolic strides: the existing flow
+// only REJECTS when it can PROVE (stride_bytes % 16 != 0); when the
+// analyzer cannot decide, it silently admits TMA. If the user has hoisted
+// a `T.assume(stride % 16 == 0)` (or the surrounding loop binds expose an
+// equivalent constraint), Z3 can discharge the proof and we keep the fast
+// TMA path. If Z3 also cannot prove alignment, we conservatively fall back
+// to per-thread cp.async — that is the safe slow path. Any Z3 timeout /
+// exception / unknown collapses to the same conservative reject.
+//
+// Z3 query (per non-innermost stride):
+//   addr  >= 0  /\  addr  < 2^48           (CUDA virtual-address envelope)
+//   box   >  0  /\  box   <= 256           (TMA inner-box size limit)
+//   stride > 0
+//   |==>  (addr % 16 == 0)
+//      /\ (box <= 256)
+//      /\ (stride_bytes % 16 == 0)
+//
+// Only the last conjunct is symbolic in `CheckGlobalStrides` — the first
+// two are static envelope constraints that get registered to the solver
+// to keep the search space tractable. The box-size legality and the
+// addr-alignment are enforced elsewhere (compile-time via `instruction_dim
+// > 256` clamp at copy.cc:1839 and via buffer alignment respectively).
+static bool Z3ProveStrideAligned16(arith::Analyzer *analyzer,
+                                   const PrimExpr &stride_bytes) {
+  try {
+    auto &z3 = arith::Z3Prover(analyzer);
+    z3.SetTimeoutMs(50);
+    PrimExpr addr_envelope =
+        (stride_bytes >= IntImm(DataType::Int(64), 0)) &&
+        (stride_bytes < IntImm(DataType::Int(64), int64_t{1} << 40));
+    PrimExpr box_envelope =
+        IntImm(DataType::Int(64), 1) <= IntImm(DataType::Int(64), 256);
+    auto recover = z3.EnterConstraint(addr_envelope && box_envelope);
+    PrimExpr goal =
+        FloorMod(stride_bytes, IntImm(DataType::Int(64), 16)) ==
+        IntImm(DataType::Int(64), 0);
+    bool proven = z3.CanProve(goal);
+    recover();
+    return proven;
+  } catch (...) {
+    // Conservative: any Z3 error/timeout/unknown -> keep slow cp.async path.
+    return false;
+  }
+}
+
 // Shared stride validation for TMA bulk load/store.
 bool CopyNode::CheckGlobalStrides(const Buffer &buffer,
                                   arith::Analyzer *analyzer) {
@@ -563,6 +612,30 @@ bool CopyNode::CheckGlobalStrides(const Buffer &buffer,
                    << stride_bytes << " for buffer " << buffer->name
                    << ", fallback to normal copy.";
       return false;
+    }
+    // Z3 idea #6: when the cheap analyzer cannot prove the stride is
+    // misaligned (returns false above) AND cannot prove it is aligned
+    // either, the prior flow silently admitted TMA — unsound for symbolic
+    // strides. Opt-in: enable `tl.tma_legality_z3` in the pass context to
+    // require a positive proof of alignment; constants are decided
+    // cheaply, symbolic strides fall through to Z3. Default off to
+    // preserve historical behavior for in-tree tests.
+    PrimExpr aligned =
+        FloorMod(stride_bytes, IntImm(DataType::Int(64), 16)) ==
+        IntImm(DataType::Int(64), 0);
+    if (!analyzer->CanProve(aligned, arith::ProofStrength::kSymbolicBound)) {
+      using namespace tvm::transform;
+      PassContext pass_ctx = PassContext::Current();
+      bool z3_legality_enabled =
+          pass_ctx->GetConfig<Bool>(kTMALegalityZ3, Bool(false)).value();
+      if (z3_legality_enabled &&
+          !Z3ProveStrideAligned16(analyzer, stride_bytes)) {
+        LOG(WARNING)
+            << "TMA bulk copy stride alignment unprovable (Z3): "
+            << stride_bytes << " for buffer " << buffer->name
+            << "; conservative fallback to normal copy.";
+        return false;
+      }
     }
     if (const int64_t *stride =
             as_const_int(analyzer->Simplify(stride_bytes))) {

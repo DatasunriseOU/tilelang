@@ -90,6 +90,14 @@ static constexpr const char *kConfigIndexBitwidth = "tl.config_index_bitwidth";
 // Deprecated pass config, temporarily re-enabled. Prevents plain T.copy()
 // from auto-lowering to TMA store. Will be removed in v0.1.10.
 static constexpr const char *kDisableTMALower = "tl.disable_tma_lower";
+// Z3 idea #6: when enabled, CheckGlobalStrides requires a positive proof
+// of stride alignment (16-byte) before admitting TMA. Symbolic strides
+// without an explicit `T.assume(stride % 16 == 0)` (or equivalent
+// shape-derived constraint visible to the analyzer) cause TMA to be
+// rejected, with a conservative fallback to per-thread cp.async. Default
+// off; enabling tightens correctness for symbolic shapes at the cost of
+// possibly rejecting TMA for cases that were silently admitted before.
+static constexpr const char *kTMALegalityZ3 = "tl.tma_legality_z3";
 static constexpr const char *kEnableAggressiveSharedMemoryMerge =
     "tl.enable_aggressive_shared_memory_merge";
 static constexpr const char *kDisableFastMath = "tl.disable_fast_math";
