@@ -1,6 +1,25 @@
-"""Rewrite local.fragment → metal.simdgroup for GEMM accumulators on Metal."""
+"""Rewrite local.fragment → metal.simdgroup for GEMM accumulators on Metal.
+
+Idea #8 (Z3 roadmap): in addition to the static shape/dtype checks used to
+decide simdgroup eligibility, we run a *detection-only* Z3 fallback for
+symbolic shapes. The Z3 query asserts:
+
+    shape[0] % 8 == 0
+    /\\  shape[1] % 8 == 0
+    /\\  dtype ∈ {fp16, packed fp8}
+    /\\  addr % 16 == 0
+
+If the static check fails for symbolic inputs, the Z3 helper attempts to
+prove the shape constraint and logs the candidate. The IR rewrite remains
+gated behind the legacy static path until we wire Z3-driven lowering. This
+keeps the pass conservative-by-default: if Z3 returns False/UNKNOWN, we keep
+the legacy non-simdgroup path.
+"""
 
 from __future__ import annotations
+
+import logging
+import os
 
 from tvm import tir, IRModule
 from tvm.ir import Op, PointerType
@@ -8,7 +27,150 @@ from tvm.target import Target
 from tvm.tirx.stmt import AllocBuffer
 from tvm.tir.transform import prim_func_pass
 
+logger = logging.getLogger("tilelang.metal_simdgroup")
+
 _GEMM_OPS = None
+
+# ---------------------------------------------------------------------------
+# Z3 detection helpers (Idea #8)
+# ---------------------------------------------------------------------------
+
+#: Dtypes that fit a Metal `simdgroup_matrix` slot.
+_SIMDGROUP_DTYPES = {"float16", "fp16", "bfloat16", "uint8", "int8", "fp8"}
+
+#: Required tile granularity for `simdgroup_matrix_load_*`.
+_SIMDGROUP_TILE = 8
+
+#: Required base address alignment for simdgroup matrix loads (bytes).
+_SIMDGROUP_ALIGN = 16
+
+
+def _is_simdgroup_dtype(dtype: str) -> bool:
+    s = str(dtype).lower()
+    if s.startswith("e4m3") or s.startswith("e5m2"):
+        return True
+    return any(s.startswith(d) for d in _SIMDGROUP_DTYPES)
+
+
+def _static_simdgroup_eligible(shape, dtype) -> bool:
+    """Pure-static check: all shape entries are constant multiples of 8."""
+    if not _is_simdgroup_dtype(dtype):
+        return False
+    if len(shape) < 2:
+        return False
+    for dim in shape[-2:]:
+        if not isinstance(dim, (tir.IntImm,)) and not isinstance(dim, int):
+            return False
+        ival = int(dim) if isinstance(dim, int) else int(dim.value)
+        if ival % _SIMDGROUP_TILE != 0 or ival <= 0:
+            return False
+    return True
+
+
+def _z3_simdgroup_eligible(shape, dtype,
+                           addr_align_bytes: int = _SIMDGROUP_ALIGN,
+                           addr_value: int | None = None
+                           ) -> tuple[bool, str]:
+    """Z3 fallback for symbolic shapes (detection-only).
+
+    Returns a (proved, query) pair. ``proved`` is True only if Z3 can
+    *prove* that for any concrete instantiation consistent with the symbolic
+    expressions, ``shape[0] % 8 == 0 /\\ shape[1] % 8 == 0 /\\ addr % 16 == 0``
+    holds. On UNKNOWN/UNSAT-of-implication/timeout we conservatively return
+    False.
+
+    ``addr_value`` is an optional concrete base-address. When None, the
+    address constraint is *omitted* from the query (we can't prove anything
+    about an unbounded symbolic addr). When set, we plug in the value and
+    insist on alignment.
+    """
+    query_lines = []
+    if not _is_simdgroup_dtype(dtype):
+        return False, f"dtype {dtype!s} not in simdgroup set; reject"
+    if len(shape) < 2:
+        return False, "rank<2; reject"
+
+    try:
+        import z3  # type: ignore
+    except Exception as exc:  # pragma: no cover - z3 missing
+        return False, f"z3 unavailable: {exc!r}"
+
+    s0, s1 = shape[-2], shape[-1]
+    solver = z3.Solver()
+    solver.set("timeout", 500)  # 500 ms cap
+
+    z_s0 = z3.Int("shape0")
+    z_s1 = z3.Int("shape1")
+
+    solver.add(z_s0 > 0, z_s1 > 0)
+
+    if isinstance(s0, (int, tir.IntImm)):
+        solver.add(z_s0 == int(s0 if isinstance(s0, int) else s0.value))
+    if isinstance(s1, (int, tir.IntImm)):
+        solver.add(z_s1 == int(s1 if isinstance(s1, int) else s1.value))
+
+    conjuncts = [
+        z_s0 % _SIMDGROUP_TILE == 0,
+        z_s1 % _SIMDGROUP_TILE == 0,
+    ]
+    if addr_value is not None:
+        # Concrete address — directly check alignment.
+        z_addr = z3.IntVal(int(addr_value))
+        conjuncts.append(z_addr % addr_align_bytes == 0)
+        addr_clause = f" /\\ addr({addr_value})%{addr_align_bytes}==0"
+    else:
+        addr_clause = " /\\ addr-skipped"
+    query = z3.And(*conjuncts)
+
+    # Conservative: we want to PROVE the conjunction holds. That is, the
+    # negation must be UNSAT.
+    solver.push()
+    solver.add(z3.Not(query))
+    res = solver.check()
+    solver.pop()
+    query_str = (
+        f"assert shape[0]%{_SIMDGROUP_TILE}==0 /\\ shape[1]%{_SIMDGROUP_TILE}==0"
+        f"{addr_clause}; check_sat(neg)={res}"
+    )
+    query_lines.append(query_str)
+    proved = (res == z3.unsat)
+    return proved, "; ".join(query_lines)
+
+
+def _log_simdgroup_decision(buf, decided_static: bool, decided_z3: bool, query: str):
+    """Verbose decision logging gated on TL_LOG_SIMDGROUP=1."""
+    if os.environ.get("TL_LOG_SIMDGROUP"):
+        logger.warning(
+            "simdgroup-detect: buf=%s shape=%s dtype=%s static=%s z3=%s query=%s",
+            getattr(buf, "name", "?"),
+            tuple(str(d) for d in getattr(buf, "shape", ())),
+            getattr(buf, "dtype", "?"),
+            decided_static,
+            decided_z3,
+            query,
+        )
+
+
+def is_simdgroup_eligible(buffer_like, *, use_z3: bool = True
+                          ) -> tuple[bool, str]:
+    """Public detection helper — returns (eligible, reason).
+
+    ``buffer_like`` may be a ``tir.Buffer`` or any object exposing
+    ``shape`` and ``dtype`` attributes. ``eligible`` is True only when the
+    static check passes; the Z3 fallback only logs and returns its proven
+    bit in ``reason`` for downstream tooling. We do NOT yet flip the IR
+    rewrite based on Z3 output (conservative-by-default).
+    """
+    shape = list(getattr(buffer_like, "shape", []))
+    dtype = getattr(buffer_like, "dtype", "")
+    if _static_simdgroup_eligible(shape, dtype):
+        _log_simdgroup_decision(buffer_like, True, True, "static-pass")
+        return True, "static"
+    if not use_z3:
+        return False, "static-fail; z3-disabled"
+    proved, query = _z3_simdgroup_eligible(shape, dtype)
+    _log_simdgroup_decision(buffer_like, False, proved, query)
+    return False, f"static-fail; z3-proved={proved}; {query}"
 
 
 def _get_gemm_ops():
@@ -46,6 +208,15 @@ def _collect_fragment_gemm_accum_vars(body: tir.Stmt) -> set:
                     ta = var.type_annotation
                     if ta is not None and hasattr(ta, "storage_scope") and ta.storage_scope == "local.fragment":
                         accum_vars.add(var)
+                        # Idea #8: log Z3 detection result for downstream tooling.
+                        # Try to reconstruct the BufferLoad to expose shape/dtype.
+                        if os.environ.get("TL_LOG_SIMDGROUP"):
+                            buf_load = call.args[2].args[0] if (
+                                len(call.args[2].args) > 0
+                                and isinstance(call.args[2].args[0], tir.BufferLoad)
+                            ) else None
+                            if buf_load is not None:
+                                is_simdgroup_eligible(buf_load.buffer)
 
     tir.stmt_functor.post_order_visit(body, _visitor)
     return accum_vars
