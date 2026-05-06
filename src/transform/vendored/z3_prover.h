@@ -79,11 +79,52 @@ class Z3Prover {
   // another `SetBitVectorMode(width)`. Switching mode invalidates any
   // previously declared variables: callers must re-`Bind` after a mode
   // change. Default behavior (width=0) is bit-identical to the prior API.
+  //
+  // PREFER `ScopedBVMode` (defined below) over raw `SetBitVectorMode` calls.
+  // Because the prover instance is cached per-Analyzer, a bare
+  // `SetBitVectorMode(32)` leaks BV semantics into the next caller that
+  // expects Int mode. `ScopedBVMode` records the prior width and restores it
+  // on scope exit.
   void SetBitVectorMode(int width);
   int GetBitVectorWidth() const;
 
  private:
   std::unique_ptr<Z3ProverImpl> impl_;
+};
+
+// RAII guard that switches a `Z3Prover` to a target BV width on
+// construction and restores the previous width on destruction. Strongly
+// preferred over raw `SetBitVectorMode(width)` calls because the prover
+// instance is per-Analyzer-cached and the mode persists across calls; a
+// bare `SetBitVectorMode(32)` therefore leaks BV state into the next
+// caller (which may want Int-mode proofs). Use `ScopedBVMode` whenever a
+// caller needs BV semantics for a bounded scope:
+//
+//   {
+//     ScopedBVMode g(prover, 32);
+//     prover.Bind(...);
+//     prover.CanProve(...);
+//   }  // <-- prover is back in its prior mode here.
+//
+// Switching mode invalidates previously declared variables (see
+// `SetBitVectorMode` docs); on enter and on exit the solver state is
+// reset, so do not nest scopes that share variable bindings.
+class ScopedBVMode {
+ public:
+  ScopedBVMode(Z3Prover& prover, int width)
+      : prover_(prover), prev_width_(prover.GetBitVectorWidth()) {
+    prover_.SetBitVectorMode(width);
+  }
+  ~ScopedBVMode() { prover_.SetBitVectorMode(prev_width_); }
+
+  ScopedBVMode(const ScopedBVMode&) = delete;
+  ScopedBVMode& operator=(const ScopedBVMode&) = delete;
+  ScopedBVMode(ScopedBVMode&&) = delete;
+  ScopedBVMode& operator=(ScopedBVMode&&) = delete;
+
+ private:
+  Z3Prover& prover_;
+  int prev_width_;
 };
 
 // Per-Analyzer cache — owns the real `Z3Prover` instances. Keyed by

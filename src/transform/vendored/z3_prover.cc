@@ -145,6 +145,10 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
   // 0 == unbounded Int sort (default, bit-identical to prior behavior).
   // 32 / 64 == signed BitVector sort of that width. See SetBitVectorMode().
   int bv_width_{0};
+  // First-occurrence flags for once-per-Analyzer warnings about silent
+  // BV truncation (MakeIntVal) and out-of-range range binds (Bind/Range).
+  bool bv_truncation_warned_{false};
+  bool bv_range_warned_{false};
 
   // Helpers that hide the Int-vs-BV sort dispatch. In default mode
   // (bv_width_ == 0) these behave exactly like the old direct calls into
@@ -164,7 +168,26 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     if (bv_width_ > 0) {
       // Z3 bv_val sign-extends/truncates to the requested width; for an
       // int64 IntImm that "doesn't fit" in BV32 the high bits are
-      // dropped, matching standard two's-complement wrapping.
+      // dropped, matching standard two's-complement wrapping. Warn once
+      // per Analyzer when this happens — the result is well-defined but
+      // usually indicates an upstream bug (e.g. BV32 mode against an
+      // INT64-typed constant). Don't fail; the caller may still want the
+      // wrapped value (e.g. to test wrap-aware proofs).
+      if (!bv_truncation_warned_ && bv_width_ < 64) {
+        int64_t lo = (bv_width_ == 32) ? static_cast<int64_t>(INT32_MIN)
+                                       : -(int64_t{1} << (bv_width_ - 1));
+        int64_t hi = (bv_width_ == 32) ? static_cast<int64_t>(INT32_MAX)
+                                       : ((int64_t{1} << (bv_width_ - 1)) - 1);
+        if (value < lo || value > hi) {
+          LOG(WARNING) << "Z3Prover BV" << bv_width_
+                       << ": MakeIntVal(" << value
+                       << ") wraps (signed range [" << lo << ", " << hi
+                       << "]); proof results may reflect two's-complement "
+                          "wrap, not unbounded Int semantics. "
+                          "(further occurrences suppressed)";
+          bv_truncation_warned_ = true;
+        }
+      }
       return ctx->bv_val(static_cast<long long>(value),
                          static_cast<unsigned>(bv_width_));
     }
@@ -316,13 +339,23 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
       if (min_value < max_value) {
         // In BV mode, skip binds with bounds outside the BV width's
         // signed range rather than synthesize wrap-around BV constants
-        // that would silently misrepresent intent.
-        if (bv_width_ == 32) {
-          if (min_value < static_cast<int64_t>(INT32_MIN) ||
-              max_value > static_cast<int64_t>(INT32_MAX)) {
-            LOG(WARNING) << "Z3Prover BV32: skipping out-of-range bind "
-                         << var << " in [" << min_value << ", " << max_value
-                         << ")";
+        // that would silently misrepresent intent. Warn at most once per
+        // Analyzer to avoid log spam in a long compile.
+        if (bv_width_ > 0 && bv_width_ < 64) {
+          int64_t lo = (bv_width_ == 32) ? static_cast<int64_t>(INT32_MIN)
+                                         : -(int64_t{1} << (bv_width_ - 1));
+          int64_t hi = (bv_width_ == 32) ? static_cast<int64_t>(INT32_MAX)
+                                         : ((int64_t{1} << (bv_width_ - 1)) - 1);
+          if (min_value < lo || max_value > hi) {
+            if (!bv_range_warned_) {
+              LOG(WARNING) << "Z3Prover BV" << bv_width_
+                           << ": skipping out-of-range bind " << var
+                           << " in [" << min_value << ", " << max_value
+                           << ") — bounds exceed signed BV range [" << lo
+                           << ", " << hi
+                           << "]. (further occurrences suppressed)";
+              bv_range_warned_ = true;
+            }
             return;
           }
         }
@@ -352,6 +385,11 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
         << "got " << width;
     if (width == bv_width_) return;
     bv_width_ = width;
+    // Re-arm one-shot warnings: switching mode is effectively a new
+    // proving context, and a wrap that was suppressed under BV32 may be
+    // worth surfacing again under BV64 (or vice-versa).
+    bv_truncation_warned_ = false;
+    bv_range_warned_ = false;
     // Invalidate any pre-existing variable / sub-expression encodings —
     // they were declared at the old sort. Reset the solver and scope
     // stack so the caller starts from a clean slate.
@@ -589,14 +627,38 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     return Create(op);
   }
   ::z3::expr VisitExpr_(const ReduceNode* op) override { return Create(op); }
+  // In BV mode every Z3 operand of an arithmetic / relational op must be a
+  // BV of the current width; in Int mode operands must be Int. The Z3 C++
+  // overloads will raise an error if you mix sorts (e.g. an Int operand
+  // accidentally surfacing inside a BV computation), but the resulting
+  // diagnostic is opaque. Assert sorts up front so misroutes blow up with a
+  // useful message at the source-level node that produced the mismatch.
+  void AssertOperandSort(const ::z3::expr& e, const char* where) const {
+    if (bv_width_ > 0) {
+      ICHECK(e.is_bv())
+          << "Z3Prover " << where << ": expected BV operand at width "
+          << bv_width_ << ", got non-BV sort";
+      ICHECK_EQ(e.get_sort().bv_size(), static_cast<unsigned>(bv_width_))
+          << "Z3Prover " << where << ": BV operand width mismatch (have "
+          << e.get_sort().bv_size() << ", want " << bv_width_ << ")";
+    } else {
+      ICHECK(e.is_int())
+          << "Z3Prover " << where
+          << ": expected Int operand in default (non-BV) mode";
+    }
+  }
   ::z3::expr VisitExpr_(const MinNode* op) override {
     auto a = VisitInt(op->a);
     auto b = VisitInt(op->b);
+    AssertOperandSort(a, "MinNode.a");
+    AssertOperandSort(b, "MinNode.b");
     return ::z3::ite(a < b, a, b);
   }
   ::z3::expr VisitExpr_(const MaxNode* op) override {
     auto a = VisitInt(op->a);
     auto b = VisitInt(op->b);
+    AssertOperandSort(a, "MaxNode.a");
+    AssertOperandSort(b, "MaxNode.b");
     return ::z3::ite(a > b, a, b);
   }
   static ::z3::expr floordiv(const ::z3::expr& a, const ::z3::expr& b) {
@@ -674,8 +736,11 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     return !VisitBool(op->a);
   }
   ::z3::expr VisitExpr_(const SelectNode* op) override {
-    return ::z3::ite(VisitBool(op->condition), VisitInt(op->true_value),
-                     VisitInt(op->false_value));
+    auto t = VisitInt(op->true_value);
+    auto f = VisitInt(op->false_value);
+    AssertOperandSort(t, "SelectNode.true_value");
+    AssertOperandSort(f, "SelectNode.false_value");
+    return ::z3::ite(VisitBool(op->condition), t, f);
   }
   ::z3::expr VisitExpr_(const IntImmNode* op) override {
     return MakeIntVal(op->value);
@@ -885,9 +950,36 @@ bool BvCanProve(const ::tvm::tirx::Var& var, int64_t lo, int64_t hi,
   return prover.CanProve(expr);
 }
 
+// CPPMEGA: ScopedBVMode round-trip exerciser. Creates a fresh Analyzer's
+// prover at `outer_width`, opens a `ScopedBVMode(inner_width)` block,
+// optionally runs a trivial CanProve inside it, then on scope exit
+// confirms the prover is back at `outer_width`. Returns the *observed*
+// width after the inner scope closes; the test asserts it equals
+// `outer_width`. This is the only public way (without a full Z3Prover
+// Python binding) to confirm RAII restoration in-process.
+int BvScopedRoundTrip(int outer_width, int inner_width) {
+  ::tvm::arith::Analyzer ana;
+  Z3Prover& prover = GetOrCreate(&ana);
+  prover.SetBitVectorMode(outer_width);
+  {
+    ScopedBVMode guard(prover, inner_width);
+    ICHECK_EQ(prover.GetBitVectorWidth(), inner_width)
+        << "ScopedBVMode failed to enter target width";
+    // Trivial proof inside the inner scope to make sure the solver works
+    // at the inner sort.
+    ::tvm::tirx::Var x("x", ::tvm::DataType::Int(32));
+    ::tvm::Range r = ::tvm::Range::FromMinExtent(
+        ::tvm::IntImm(x->dtype, 0), ::tvm::IntImm(x->dtype, 1));
+    prover.Bind(x, r);
+    (void)prover.CanProve(x == ::tvm::IntImm(x->dtype, 0));
+  }
+  return prover.GetBitVectorWidth();
+}
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = ::tvm::ffi::reflection;
   refl::GlobalDef().def("tl.z3.bv_can_prove", BvCanProve);
+  refl::GlobalDef().def("tl.z3.bv_scoped_round_trip", BvScopedRoundTrip);
 }
 
 }  // namespace tlz3

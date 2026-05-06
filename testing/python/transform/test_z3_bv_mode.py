@@ -22,10 +22,15 @@ from tvm import tir
 
 
 _BV_CAN_PROVE = tvm.ffi.get_global_func("tl.z3.bv_can_prove")
+_BV_SCOPED_ROUND_TRIP = tvm.ffi.get_global_func("tl.z3.bv_scoped_round_trip")
 
 
 def _can_prove(var, lo, hi, expr, bv_width):
     return bool(_BV_CAN_PROVE(var, lo, hi, expr, bv_width))
+
+
+def _scoped_round_trip(outer_width, inner_width):
+    return int(_BV_SCOPED_ROUND_TRIP(outer_width, inner_width))
 
 
 def test_alignment_int_mode_overproves():
@@ -110,6 +115,50 @@ def test_floormod_negative_dividend_agrees_int_and_bv():
     # Range = single-point [-5, -4).
     assert _can_prove(x, -5, -4, expr, 0) is True
     assert _can_prove(x, -5, -4, expr, 32) is True
+
+
+def test_scoped_bv_mode_round_trip():
+    """ScopedBVMode RAII restores the prior width on scope exit.
+
+    Drive `tl.z3.bv_scoped_round_trip(outer, inner)` which:
+      1. sets the prover to `outer`,
+      2. opens a `ScopedBVMode(inner)` block,
+      3. confirms `GetBitVectorWidth() == inner` inside,
+      4. exits the scope,
+      5. returns the post-exit width.
+
+    Cover all interesting transitions: Int->BV32->Int, BV32->Int->BV32,
+    BV32->BV64->BV32, and the no-op same-width case.
+    """
+    assert _scoped_round_trip(0, 32) == 0
+    assert _scoped_round_trip(32, 0) == 32
+    assert _scoped_round_trip(32, 64) == 32
+    assert _scoped_round_trip(0, 0) == 0
+    assert _scoped_round_trip(64, 32) == 64
+
+
+def test_min_max_bv_mode_sort_assertion():
+    """Min/Max under BV mode keep BV sort throughout (no Int leak).
+
+    The C++ visitor adds `AssertOperandSort(...)` to MinNode and MaxNode
+    that ICHECKs operand sort matches the current mode. If a sort leak
+    were re-introduced (e.g. an Int constant snuck into a BV
+    computation), this proof would crash with an ICHECK failure rather
+    than silently produce a wrong answer.
+
+    We pick a property that's true under BV32 for the bound range:
+    ``Min(i, 100) <= 100`` for ``i in [0, 256)``. Both Int and BV32
+    should prove it; the test's value is mainly that the ICHECK does
+    not fire on this well-formed BV path.
+    """
+    i = tir.Var("i", "int32")
+    expr = tir.Min(i, tir.const(100, "int32")) <= tir.const(100, "int32")
+    assert _can_prove(i, 0, 256, expr, 0) is True
+    assert _can_prove(i, 0, 256, expr, 32) is True
+
+    expr2 = tir.Max(i, tir.const(0, "int32")) >= tir.const(0, "int32")
+    assert _can_prove(i, 0, 256, expr2, 0) is True
+    assert _can_prove(i, 0, 256, expr2, 32) is True
 
 
 def test_floormod_negative_divisor_agrees_int_and_bv():
