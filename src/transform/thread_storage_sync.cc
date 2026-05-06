@@ -1702,7 +1702,16 @@ private:
     auto tz_c_iv = find_axis(curr.threads, "threadIdx.z");
 
     ffi::Map<Var, PrimExpr> prev_sub, curr_sub;
-    Var tx_w, tx_r, ty_w, ty_r, tz_w, tz_r;
+    // CRITICAL: default `Var()` creates a *fresh, named* variable
+    // ("v", "v_1", ...) — it's not a null handle. Initialize explicitly
+    // to NullValue<Var>() so `.defined()` returns false until bind_axis
+    // populates the slot.
+    Var tx_w = NullValue<Var>();
+    Var tx_r = NullValue<Var>();
+    Var ty_w = NullValue<Var>();
+    Var ty_r = NullValue<Var>();
+    Var tz_w = NullValue<Var>();
+    Var tz_r = NullValue<Var>();
 
     auto bind_axis = [&](const Optional<IterVar> &p_iv,
                          const Optional<IterVar> &c_iv, const char *name,
