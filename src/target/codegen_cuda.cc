@@ -3937,11 +3937,11 @@ void CodeGenTileLangCUDA::VisitStmt_(const AttrStmtNode *op) {
     PrintIndent();
     stream << "}\n";
     return;
-  } else if (op->attr_key == tirx::attr::fragment_shape) {
+  } else if (op->attr_key == s_tir::attr::fragment_shape) {
     const VarNode *buffer = op->node.as<VarNode>();
     const StringImmNode *shape_str = op->value.as<StringImmNode>();
     fragment_shapes[buffer] = shape_str->value;
-  } else if (op->attr_key == tirx::attr::fragment_layout) {
+  } else if (op->attr_key == s_tir::attr::fragment_layout) {
     const VarNode *buffer = op->node.as<VarNode>();
     const StringImmNode *layout_str = op->value.as<StringImmNode>();
     fragment_layouts[buffer] = layout_str->value;
