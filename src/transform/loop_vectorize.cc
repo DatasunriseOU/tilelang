@@ -1038,8 +1038,10 @@ static bool IsAffineInVar(const PrimExpr &expr, const Var &var) {
 //   * FloorDiv/FloorMod (TIR) round toward -inf; Z3 BV bvsdiv/bvsmod round
 //     toward 0. We constrain `var >= 0` so they agree on the bounded domain.
 //   * Signed overflow on `var + 1`: the unsigned-32-bit bit-bound (see the
-//     `bv_hi` literal below, widened in commit 3) keeps the successor in
-//     range; an iter_var_size > 2^32 would be rejected here.
+//     `bv_hi` literal below) keeps the successor in range; an
+//     iter_var_size > 2^32 would be rejected here. We model unsigned 32-bit
+//     pointer arithmetic semantics — the typical case for index registers
+//     held in a 64-bit GPR.
 //   * Loop-carried offsets `expr = base + var*stride + offset` are handled
 //     correctly: `Substitute(var->var+1)` rewrites only the `var` term, and
 //     `(base + (var+1)*stride + offset) - (base + var*stride + offset)`
@@ -1056,18 +1058,39 @@ static bool Z3CanProveUnitStride(const PrimExpr &expr, const Var &var,
     z3.SetTimeoutMs(50);
     DataType vt = var.dtype();
     PrimExpr lo = make_const(vt, 0);
-    // Bit-bound: emulate BV32 via [0, 2^31) so `var+1` cannot approach
-    // signed overflow even when iter_var_size is symbolic-but-large.
-    PrimExpr bv_hi = make_const(vt, int64_t(1) << 31);
+    // Audit fix (MEDIUM): widen the bit-bound from signed 2^31 to unsigned
+    // 2^32. Pointer arithmetic on the typical 64-bit host represents indices
+    // as 32-bit *unsigned* values inside a 64-bit register, so the practical
+    // upper bound on a contiguous index is 2^32, not 2^31.
+    //
+    // Implementation note: when `vt` is int32, we cannot literally write a
+    // constant of value 2^32 (it does not fit in int32). In that case the
+    // signed-int32 representation already caps `var` at 2^31 - 1, which is
+    // strictly tighter than the unsigned-32 bound, so the constraint is
+    // already satisfied implicitly and we simply omit the redundant `var <
+    // bv_hi` clause. When `vt` is int64 (or wider), we use the full 2^32
+    // bound. This preserves the documented assumption (unsigned 32-bit
+    // emulation) without violating dtype constraints.
+    bool vt_is_int32 = vt.is_int() && vt.bits() <= 32;
     // Loop-validity bound: var must allow `var+1` to remain a legal index,
     // i.e. var < iter_var_size - 1. This also leaves room for the negative
     // direction probe: var >= 1 is enforced inside that block. This rules
     // out the wrap-around case where iter_var_size could be 0 or 1 (no
     // contiguity to prove).
     PrimExpr iter_hi = analyzer->Simplify(iter_var_size - 1);
-    PrimExpr range_constraint = (var >= lo) && (var < iter_hi) &&
-                                (var < bv_hi) && (iter_var_size > 0) &&
-                                (iter_var_size <= bv_hi);
+    PrimExpr range_constraint =
+        (var >= lo) && (var < iter_hi) && (iter_var_size > 0);
+    if (!vt_is_int32) {
+      // Wider dtype: enforce explicit unsigned-32-bit emulation.
+      PrimExpr bv_hi = make_const(vt, int64_t(1) << 32);
+      range_constraint =
+          range_constraint && (var < bv_hi) && (iter_var_size <= bv_hi);
+    } else {
+      // int32: signed range already caps at 2^31 - 1 < 2^32, but we still
+      // bound iter_var_size by the int32 max.
+      PrimExpr bv_hi = make_const(vt, int64_t(0x7fffffff));
+      range_constraint = range_constraint && (iter_var_size <= bv_hi);
+    }
     auto recover = z3.EnterConstraint(range_constraint);
 
     // Audit fix (HIGH): negative strides. The TileLang For loop is
@@ -1106,10 +1129,30 @@ static bool Z3CanProveUnitStride(const PrimExpr &expr, const Var &var,
     }
 
     recover();
+    if (!proved) {
+      // Audit fix (LOW): log silent UNKNOWN/timeout/false paths so missed
+      // vectorizations can be diagnosed later. We can't distinguish
+      // "proved false" from "UNKNOWN" / "timeout" through the bool return
+      // alone — DLOG(INFO) covers all three in one place. Behavior is
+      // unchanged: the caller still sees `false` and falls back to scalar.
+      DLOG(INFO) << "Z3CanProveUnitStride: could not prove unit stride for "
+                 << "expr=" << expr << " var=" << var
+                 << " iter_var_size=" << iter_var_size
+                 << " (timeout/unknown/false — falling back to scalar)";
+    }
     return proved;
-  } catch (...) {
+  } catch (const std::exception &e) {
     // Conservative: any Z3 error / timeout / UNKNOWN / exception leaves
-    // the For un-vectorized.
+    // the For un-vectorized. Surface the exception in DLOG so a debug
+    // build can pinpoint which queries blow up.
+    DLOG(INFO) << "Z3CanProveUnitStride: exception (" << e.what()
+               << ") — conservatively returning false. expr=" << expr
+               << " var=" << var;
+    return false;
+  } catch (...) {
+    DLOG(INFO) << "Z3CanProveUnitStride: unknown exception — conservatively "
+                  "returning false. expr="
+               << expr << " var=" << var;
     return false;
   }
 }
