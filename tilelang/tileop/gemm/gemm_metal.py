@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from .gemm_base import GemmBase
-from .inst import GemmInst
 from tilelang.utils.language import is_shared, is_full_region, is_metal_simdgroup, is_fragment
 from tilelang import tvm as tvm
 from tvm.target import Target
@@ -9,6 +8,9 @@ from tvm.ir import Range
 from tvm import tir
 from tilelang import language as T
 from tilelang.transform.simplify import _Simplify
+
+
+GEMM_INST_METAL_SIMDGROUP = "metal.simdgroup"
 
 
 class GemmMetal(GemmBase):
@@ -25,7 +27,9 @@ class GemmMetal(GemmBase):
         for name, value in (("M", self.M), ("N", self.N), ("K", self.chunk)):
             if value % 8 != 0:
                 raise ValueError(f"Metal GEMM requires {name} to be a multiple of 8, got {value}")
-        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GemmInst.METAL_SIMDGROUP)
+        m_warp, n_warp = self.policy.compute_warp_partition(
+            self.M, self.N, thread_nums, target, GEMM_INST_METAL_SIMDGROUP
+        )
         if self.M % m_warp != 0 or self.N % n_warp != 0:
             raise ValueError(f"Metal GEMM cannot evenly partition {self.M}x{self.N} across {m_warp}x{n_warp} warps")
         warp_row_tiles = int(self.M // m_warp)
