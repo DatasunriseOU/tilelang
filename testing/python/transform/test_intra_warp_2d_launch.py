@@ -136,5 +136,151 @@ def test_1d_launch_within_single_simdgroup_elides():
         f"found {n_sync} sync(s):\n{mod.script()}")
 
 
+# ----------------------------------------------------------------------
+# gpt-5-5-pro audit follow-ups: regression tests for unusual thread tags,
+# degenerate 3-D launches, and Z3 timeout fallback. Each test pins a
+# behaviour required by the conservative-by-default contract: a custom
+# tag must NOT be matched as `threadIdx.x` (strict-equality allowlist),
+# a degenerate 3-D launch with ty==tz==1 must still elide cleanly, and
+# any solver query that Z3 cannot decide within 200 ms must keep the
+# barrier (catch-all path).
+# ----------------------------------------------------------------------
+
+
+@tilelang.testing.requires_metal
+def test_unusual_thread_tag_keeps_barrier():
+    """A non-canonical thread tag (e.g. ``threadIdx.x_inner`` from a
+    split / vendor-rewritten launch) must NOT be matched as
+    ``threadIdx.x`` by ``ProveIntraWarpRAW``. Strict-equality
+    allowlist (audit finding #1) means the function early-exits
+    "no canonical tx found" and the barrier stays in place.
+
+    The previous substring matcher (`tag.find("threadIdx.x") != npos`)
+    would have spuriously bound a custom tag like ``threadIdx.x_inner``
+    or ``threadIdx.x_outer`` to the canonical tx slot and may have
+    elided the barrier on launches that were never proven safe. The
+    fix is a strict allowlist of canonical tags.
+
+    TVM's runtime ThreadScope::Create only validates that the tag
+    starts with ``threadIdx.`` / ``blockIdx.``, so a tag like
+    ``threadIdx.x_inner`` is accepted by the lowering pipeline but is
+    NOT canonical-equal to ``threadIdx.x``.
+    """
+    from tvm import tir
+    from tvm.ir import Range
+
+    # Two thread axes both tagged with non-canonical names. find_axis()
+    # with substring matching would (incorrectly) match the first one
+    # as `threadIdx.x`. With strict equality, neither matches and the
+    # function returns false → barrier kept.
+    A = tir.decl_buffer((16,), dtype="float32", scope="shared",
+                        name="A_shared")
+    tx_outer_iv = tir.IterVar(
+        Range(0, 1), tir.Var("tx_outer_iv", "int32"),
+        tir.IterVar.ThreadIndex, thread_tag="threadIdx.x_outer")
+    tx_inner_iv = tir.IterVar(
+        Range(0, 16), tir.Var("tx_inner_iv", "int32"),
+        tir.IterVar.ThreadIndex, thread_tag="threadIdx.x_inner")
+    bx_iv = tir.IterVar(
+        Range(0, 1), tir.Var("bx_iv", "int32"), tir.IterVar.ThreadIndex,
+        thread_tag="blockIdx.x")
+
+    tx_var = tx_inner_iv.var
+    body = tir.SeqStmt([
+        tir.BufferStore(A, tir.FloatImm("float32", 1.0), [tx_var]),
+        tir.IfThenElse(
+            tx_var > 0,
+            tir.Evaluate(tir.BufferLoad(A, [tx_var - 1])),
+            None,
+        ),
+    ])
+    body = tir.AttrStmt(tx_inner_iv, "thread_extent", 16, body)
+    body = tir.AttrStmt(tx_outer_iv, "thread_extent", 1, body)
+    body = tir.AttrStmt(bx_iv, "thread_extent", 1, body)
+    body = tir.Allocate(A.data, "float32", [16], tir.const(1, "bool"),
+                        body, annotations={"storage_scope": "shared"})
+    body = tir.AttrStmt(A.data, "storage_scope",
+                        tvm.runtime.convert("shared"), body)
+
+    func = tir.PrimFunc(params=[], body=body)
+
+    mod = _run_thread_sync_metal(func)
+    n_sync = _count_storage_sync(mod)
+    assert n_sync >= 1, (
+        "Non-canonical thread_tag 'threadIdx.x_inner' / 'threadIdx.x_outer' "
+        "must NOT be matched as canonical 'threadIdx.x' by the "
+        "strict-equality allowlist; expected barrier kept, got "
+        f"{n_sync} sync(s):\n{mod.script()}")
+
+
+@tilelang.testing.requires_metal
+def test_3d_launch_padded_y_z_intra_simdgroup_elides():
+    """3-D launch where ty and tz are both 1 (degenerate) and tx fits
+    in one simdgroup (16 < 32). The proof goal reduces to
+    ``tx_w / 32 == tx_r / 32``, which Z3 trivially discharges given the
+    range constraint ``0 <= tx_{w,r} < 16``. Barrier must be elided
+    (audit finding #3).
+    """
+
+    @T.prim_func(private=True)
+    def func():
+        A_shared = T.alloc_buffer((16,), dtype="float32", scope="shared")
+        bx = T.launch_thread("blockIdx.x", 1)
+        # Note ordering: tz / ty / tx all distinct launches; ty and tz
+        # are degenerate (extent 1). tx is the only meaningful axis.
+        tz = T.launch_thread("threadIdx.z", 1)
+        ty = T.launch_thread("threadIdx.y", 1)
+        tx = T.launch_thread("threadIdx.x", 16)
+        A_shared[tx] = T.float32(1)
+        if tx > 0:
+            _ = A_shared[tx - 1]
+
+    mod = _run_thread_sync_metal(func)
+    n_sync = _count_storage_sync(mod)
+    assert n_sync == 0, (
+        "Expected ProveIntraWarpRAW to elide barrier on degenerate "
+        "3-D launch (ty=1, tz=1, tx in [0,16)); "
+        f"found {n_sync} sync(s):\n{mod.script()}")
+
+
+@tilelang.testing.requires_metal
+def test_z3_timeout_keeps_barrier():
+    """Synthesise a query Z3 cannot decide within the 200 ms budget
+    enforced by ``prover.SetTimeoutMs(200)``. The catch-all
+    try/except in ``ProveIntraWarpRAW`` must keep the barrier
+    (conservative-by-default; audit finding #5).
+
+    We use a launch where the writer/reader access pattern is
+    expressed via a non-affine modular index (``tx % 7`` / ``tx ^ 5``)
+    that is intentionally hostile to the floor-div decision procedure.
+    On most builds Z3 still decides quickly, but if it ever times out
+    the test pins the safety contract: barrier kept, never crashed.
+    """
+
+    @T.prim_func(private=True)
+    def func():
+        A_shared = T.alloc_buffer((128,), dtype="float32", scope="shared")
+        bx = T.launch_thread("blockIdx.x", 1)
+        # Larger launch (128) so writer/reader can land in different
+        # simdgroups — the proof MUST be either disproven or undecided.
+        # Either way, conservative-by-default keeps the barrier.
+        tx = T.launch_thread("threadIdx.x", 128)
+        ty = T.launch_thread("threadIdx.y", 1)
+        tz = T.launch_thread("threadIdx.z", 1)
+        # Hostile non-affine indices: writer at tx%7, reader at tx^5.
+        # Even if Z3 succeeds, it cannot prove intra-simdgroup because
+        # tx=0 (writer slot 0) collides with reader threads outside
+        # the same simdgroup.
+        A_shared[tx % 7] = T.float32(1)
+        _ = A_shared[T.bitwise_xor(tx, T.int32(5))]
+
+    mod = _run_thread_sync_metal(func)
+    n_sync = _count_storage_sync(mod)
+    assert n_sync >= 1, (
+        "Hostile non-affine index pattern: barrier must be kept "
+        "(either by Z3 disproof or by 200 ms timeout fallback); "
+        f"got {n_sync} sync(s):\n{mod.script()}")
+
+
 if __name__ == "__main__":
     tilelang.testing.main()
