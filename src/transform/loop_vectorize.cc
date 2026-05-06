@@ -1060,18 +1060,51 @@ static bool Z3CanProveUnitStride(const PrimExpr &expr, const Var &var,
     // signed overflow even when iter_var_size is symbolic-but-large.
     PrimExpr bv_hi = make_const(vt, int64_t(1) << 31);
     // Loop-validity bound: var must allow `var+1` to remain a legal index,
-    // i.e. var < iter_var_size - 1. This rules out the wrap-around case
-    // where iter_var_size could be 0 or 1 (no contiguity to prove).
+    // i.e. var < iter_var_size - 1. This also leaves room for the negative
+    // direction probe: var >= 1 is enforced inside that block. This rules
+    // out the wrap-around case where iter_var_size could be 0 or 1 (no
+    // contiguity to prove).
     PrimExpr iter_hi = analyzer->Simplify(iter_var_size - 1);
     PrimExpr range_constraint = (var >= lo) && (var < iter_hi) &&
                                 (var < bv_hi) && (iter_var_size > 0) &&
                                 (iter_var_size <= bv_hi);
     auto recover = z3.EnterConstraint(range_constraint);
+
+    // Audit fix (HIGH): negative strides. The TileLang For loop is
+    // normalised (min == 0, extent > 0, increment +1), so the loop
+    // *variable* always advances positively. But the *access expression*
+    // can still decrease in `var` — e.g. `out[N-1-i] = in[N-1-i]` produces
+    // an address that decreases by 1 each iteration. That is just as
+    // vectorizable (in absolute-value sense) as a positive stride: the
+    // hardware load/store is `vload`/`vstore` either way, with reversed
+    // element order.
+    //
+    // We probe both directions:
+    //   delta_pos = expr(var+1) - expr(var)   (positive stride: == +1)
+    //   delta_neg = expr(var) - expr(var-1)   (negative stride: == -1
+    //                                          ⇔  expr(var-1) == expr(var)+1)
+    // Either result of magnitude 1 means "addresses are contiguous"; we
+    // accept both.
     PrimExpr var_plus_1 = var + make_const(vt, 1);
     PrimExpr expr_next = Substitute(expr, {{var, var_plus_1}});
-    PrimExpr stride_goal =
+    PrimExpr stride_goal_pos =
         (expr_next - expr) == make_const(expr.dtype(), 1);
-    bool proved = z3.CanProve(stride_goal);
+    bool proved = z3.CanProve(stride_goal_pos);
+
+    if (!proved) {
+      // Negative-direction probe. Requires var >= 1 so var-1 is in-range;
+      // we push that as a temporary constraint, prove, then pop.
+      PrimExpr neg_constraint = (var >= make_const(vt, 1));
+      auto recover_neg = z3.EnterConstraint(neg_constraint);
+      PrimExpr var_minus_1 = var - make_const(vt, 1);
+      PrimExpr expr_prev = Substitute(expr, {{var, var_minus_1}});
+      // expr(var) - expr(var-1) == -1   ⇔  expr(var-1) - expr(var) == +1
+      PrimExpr stride_goal_neg =
+          (expr - expr_prev) == make_const(expr.dtype(), -1);
+      proved = z3.CanProve(stride_goal_neg);
+      recover_neg();
+    }
+
     recover();
     return proved;
   } catch (...) {
@@ -1146,11 +1179,18 @@ bool IndicesCanVectorize(const PrimExpr &expr, Var var,
     // CPPMEGA: Z3 idea #1 — ramp shape found but stride did not simplify to
     // literal 1 (e.g. `1 + 0*x`, or stride `(k % 4) + 1` where k is provably
     // a multiple of 4). Z3 fallback restricted to this narrow path.
+    //
+    // Audit fix (HIGH): also accept stride == -1 here, mirroring the
+    // bidirectional probe in Z3CanProveUnitStride.
     {
       auto &z3 = arith::Z3Prover(analyzer);
       z3.SetTimeoutMs(50);
       if (z3.CanProve(ramp_node->stride ==
                       make_const(ramp_node->stride.dtype(), 1))) {
+        return true;
+      }
+      if (z3.CanProve(ramp_node->stride ==
+                      make_const(ramp_node->stride.dtype(), -1))) {
         return true;
       }
     }
