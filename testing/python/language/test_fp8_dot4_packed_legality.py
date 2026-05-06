@@ -210,7 +210,28 @@ class SymbolicZ3PathTests(unittest.TestCase):
             f"hard symbolic query unexpectedly returned True; reason={reason!r}",
         )
         # No assertion on exact reason wording -- could be UNKNOWN, sat,
-        # or a counter-example string, all of which are conservative-False.
+        # or "int24 overflow proof failed", all of which are
+        # conservative-False.
+
+    def test_static_large_k_fails_int24_overflow(self):
+        """CPPMEGA Z3 idea #5 wiring: int24 overflow proof gates the static path.
+
+        K=2000 with full int8 max-abs ranges yields ``2000 * 127 * 127 =
+        32,258,000`` which overflows int24 (limit 8,388,607). Even though
+        the alignment predicate holds (K%4==0, strides==1, addrs==0), the
+        int24 gate must reject this case, keeping the caller on the legacy
+        scalar simd_sum path.
+        """
+        proved, reason = _z3_prove_dot4_legal(
+            K_a=_intimm(2000),
+            K_b=_intimm(2000),
+            stride_a=1,
+            stride_b=1,
+            addr_a=0,
+            addr_b=0,
+        )
+        self.assertFalse(proved, f"K=2000 unexpectedly proved legal: {reason!r}")
+        self.assertIn("int24", reason)
 
 
 if __name__ == "__main__":
