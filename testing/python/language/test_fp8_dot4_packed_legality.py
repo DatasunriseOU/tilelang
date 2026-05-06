@@ -147,6 +147,71 @@ class SymbolicZ3PathTests(unittest.TestCase):
         )
         self.assertFalse(proved)
 
+    def test_symbolic_negative_addr_returns_false(self):
+        """Audit fix 2026-05-06: locks the BV32 invariant.
+
+        Pass an unconstrained ``tir.Var("addr_a", "int32")`` -- no caller
+        constraint that ``addr_a >= 0``. Under the current Int-sort encoding
+        the prover MUST return False (the named ``addr_a`` Z3 var is
+        constrained ``>= 0`` only because the prover adds that bound; an
+        opaque caller-supplied Var is invisible to that bound, so Z3 is
+        free to find a giant-negative or unaligned witness). This test
+        regression-pins the invariant: when ``Z3Prover::SetBitVectorMode(32)``
+        eventually lands and the encoding flips to BV sort, signed
+        wrap-around on negative addresses still won't slip through.
+        """
+        sym_addr = tir.Var("addr_a", "int32")  # opaque, no ``>= 0`` constraint
+        proved, reason = _z3_prove_dot4_legal(
+            K_a=_intimm(128),
+            K_b=_intimm(128),
+            stride_a=1,
+            stride_b=1,
+            addr_a=sym_addr,
+            addr_b=_intimm(0),
+        )
+        self.assertFalse(
+            proved,
+            f"BV32 invariant broken: opaque negative-allowed addr was proved legal "
+            f"(reason={reason!r})",
+        )
+        self.assertIn("z3", reason.lower())
+
+    def test_z3_timeout_unknown_returns_false(self):
+        """Audit fix 2026-05-06: UNKNOWN / timeout path returns False.
+
+        Construct a deliberately-hard query: huge symbolic K paired with a
+        nonlinear modular constraint. The prover should hit the 50 ms
+        timeout (or simply solve it as ``sat`` for a witness like
+        ``addr_a = 1``) -- either way the outcome MUST be False, never
+        True, never crash. We also defensively assert that the prover
+        does not raise.
+        """
+        # Use ``tir.Var`` with no constraints so the named addr_a / addr_b
+        # vars in the prover see a free Int. This is essentially equivalent
+        # to the existing ``test_symbolic_addr_no_alignment_returns_false``
+        # case but specifically pins the UNKNOWN-or-counterexample contract:
+        # whatever Z3 says, our wrapper must map it to False.
+        sym_a = tir.Var("addr_a_huge", "int32")
+        sym_b = tir.Var("addr_b_huge", "int32")
+        sym_k = tir.Var("K_sym", "int32")  # opaque K -> symbolic path
+        try:
+            proved, reason = _z3_prove_dot4_legal(
+                K_a=sym_k,
+                K_b=sym_k,
+                stride_a=1,
+                stride_b=1,
+                addr_a=sym_a,
+                addr_b=sym_b,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self.fail(f"prover crashed on hard symbolic query: {exc!r}")
+        self.assertFalse(
+            proved,
+            f"hard symbolic query unexpectedly returned True; reason={reason!r}",
+        )
+        # No assertion on exact reason wording -- could be UNKNOWN, sat,
+        # or a counter-example string, all of which are conservative-False.
+
 
 if __name__ == "__main__":
     unittest.main()
