@@ -206,6 +206,46 @@ def test_z3_timeout_keeps_nested():
     assert fused is not None
 
 
+def test_inner_condition_with_buffer_load_keeps_nested():
+    """fix-B3 regression: the inner predicate `b` itself dereferences a
+    buffer (`scratch[i] > 0`). Fusing to `if (a && scratch[i] > 0)` would
+    evaluate the load even when `!a`, which OOBs if `i >= 256`. The pass
+    must prove the load's index is in-range UNCONDITIONALLY before
+    fusing — and since the loop bounds here only guarantee `i < 256`
+    when the outer guard `i < N` (with symbolic N) is true, the proof
+    fails and the nesting stays intact.
+    """
+
+    @T.prim_func
+    def main(  # noqa: F821
+        out: T.Buffer((256,), "float32"),  # noqa: F821
+        in_buf: T.Buffer((256,), "float32"),  # noqa: F821
+        scratch: T.Buffer((256,), "int32"),  # noqa: F821
+        N: T.int32,  # noqa: F821
+    ):
+        for i in T.serial(512):  # extent > scratch.shape[0] on purpose
+            if i < N:
+                # `scratch[i]` is only safe under `i < N`; if the pass
+                # forgets to prove the load in `b` is unconditionally
+                # in-range, fusing to `if (i < N && scratch[i] > 0)`
+                # would OOB when N < i < 512.
+                if scratch[i] > 0:
+                    out[i] = in_buf[i]
+
+    fused = _run_pass(main, enable=True)
+    assert fused is not None
+    # Defensive: the post-pass IR must NOT carry an `&&` ifnode that
+    # combines the outer guard with the load-bearing inner predicate.
+    # If a future regression fuses these, the resulting `tir.And`
+    # appears at the top level and this assertion fires.
+    text = str(fused)
+    if "i < N" in text and "scratch" in text:
+        # Best-effort: if the textual form shows both clauses on one
+        # `tir.And`, the conservative path was bypassed.
+        assert "i < N and scratch" not in text
+        assert "i < N && scratch" not in text
+
+
 def test_repeated_pass_no_solver_leak():
     """fix-B2 regression: run the pass repeatedly. The previous manual
     `EnterConstraint` recovery vector could leak solver scope frames if

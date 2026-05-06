@@ -126,6 +126,98 @@ public:
   }
 };
 
+// Collect every BufferLoad reachable from a (sub)expression. Used by
+// the b-condition probe to enumerate any direct loads inside the inner
+// `if`'s condition — those loads are evaluated even when `!a` after
+// the fusion to `if(a && b)` — though C++/MSL short-circuit at runtime,
+// the lowered TIR may evaluate both sides depending on the codegen.
+class ExprBufferLoadCollector : public ExprVisitor {
+ public:
+  std::vector<const BufferLoadNode *> loads;
+  void VisitExpr_(const BufferLoadNode *op) final {
+    loads.push_back(op);
+    ExprVisitor::VisitExpr_(op);
+  }
+};
+
+// Probe a single (buf, dim, idx) tuple: prove `0 <= idx < buf.shape[dim]`
+// UNCONDITIONALLY (no outer-guard assumptions pushed). Bit-bounds free
+// vars to [0, 2^31). Returns false on bailout / timeout / >8 free vars.
+//
+// Hoisted from the previous lambda inside `Z3ProvesInnerWellDefined` so
+// the b-condition probe (fix-B3 below) can reuse it.
+static bool Z3ProvesIndexInRange(const Buffer &buf, size_t dim,
+                                 const PrimExpr &idx,
+                                 ::tilelang::tlz3::Z3Prover &z3) {
+  if (dim >= buf->shape.size()) {
+    return false; // dimension mismatch — refuse to fuse
+  }
+  PrimExpr extent = buf->shape[dim];
+  FreeVarCollector vc;
+  vc(idx);
+  vc(extent);
+  std::vector<::tilelang::tlz3::ConstraintScope> scopes;
+  bool too_many_vars = false;
+  for (const VarNode *v : vc.vars) {
+    Var var = ffi::GetRef<Var>(v);
+    DataType dt = var.dtype();
+    if (!dt.is_int() && !dt.is_uint()) {
+      too_many_vars = true; // unsupported dtype — bail
+      break;
+    }
+    PrimExpr lo = make_const(dt, 0);
+    PrimExpr hi = make_const(dt, int64_t(1) << 31);
+    PrimExpr bound = (var >= lo) && (var < hi);
+    scopes.emplace_back(z3, bound);
+    if (scopes.size() > 8) {
+      too_many_vars = true; // don't blow up the solver
+      break;
+    }
+  }
+  if (too_many_vars) return false;
+  PrimExpr goal = (idx >= make_const(idx.dtype(), 0)) && (idx < extent);
+  try {
+    return z3.CanProve(goal);
+  } catch (...) {
+    return false;
+  }
+}
+
+// CPPMEGA fix-B3 (idea712): prove every BufferLoad inside the inner
+// `if` *condition* itself is in-range UNCONDITIONALLY. Without this
+// check, a body like
+//
+//     if (a) { if (buf[i] > 0) { ... } }
+//
+// would fuse to `if (a && buf[i] > 0) { ... }`. While C++/MSL `&&`
+// short-circuits at runtime, the lowered TIR fold may evaluate both
+// sides — and if `buf[i]` is only safe under `!a`, that load OOBs.
+//
+// Returns true iff every BufferLoad in `cond` is provably in-range
+// regardless of `a`'s value.
+bool Z3ProvesConditionLoadsWellDefined(const PrimExpr &cond,
+                                       arith::Analyzer *analyzer) {
+  ExprBufferLoadCollector cl;
+  cl(cond);
+  if (cl.loads.empty()) {
+    return true; // no buffer loads in `b` → trivially safe
+  }
+  try {
+    auto &z3 = arith::Z3Prover(analyzer);
+    z3.SetTimeoutMs(50);
+    for (const BufferLoadNode *ld : cl.loads) {
+      for (size_t d = 0; d < ld->indices.size(); ++d) {
+        if (!Z3ProvesIndexInRange(ld->buffer, d, ld->indices[d], z3)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
 // Returns true iff Z3 proves that for every BufferLoad in `inner_body`
 // the index is in-range, *unconditionally* (i.e. WITHOUT assuming the
 // outer guard `a`). The free-vars in those indices are bit-bounded to
@@ -163,67 +255,16 @@ bool Z3ProvesInnerWellDefined(const Stmt &inner_body, arith::Analyzer *analyzer)
     auto &z3 = arith::Z3Prover(analyzer);
     z3.SetTimeoutMs(50);
 
-    auto check_one_index =
-        [&](const Buffer &buf, size_t dim, const PrimExpr &idx) -> bool {
-      if (dim >= buf->shape.size()) {
-        return false; // dimension mismatch — refuse to fuse
-      }
-      PrimExpr extent = buf->shape[dim];
-      // Bit-bound free vars to [0, 2^31) — emulates BV32 signed-positive
-      // domain. If we see a free Var we have no information about, this
-      // is the only sound bound we can impose without polluting the
-      // result.
-      FreeVarCollector vc;
-      vc(idx);
-      vc(extent);
-      // Push bound constraints for each free var.
-      // CPPMEGA fix-B2 (idea712): RAII via ConstraintScope. The previous
-      // manual recoverers vector leaked solver scope frames if any
-      // EnterConstraint / CanProve below threw mid-loop.
-      std::vector<::tilelang::tlz3::ConstraintScope> scopes;
-      bool too_many_vars = false;
-      for (const VarNode *v : vc.vars) {
-        Var var = ffi::GetRef<Var>(v);
-        DataType dt = var.dtype();
-        if (!dt.is_int() && !dt.is_uint()) {
-          too_many_vars = true; // unsupported dtype — bail
-          break;
-        }
-        PrimExpr lo = make_const(dt, 0);
-        PrimExpr hi = make_const(dt, int64_t(1) << 31);
-        PrimExpr bound = (var >= lo) && (var < hi);
-        scopes.emplace_back(z3, bound);
-        if (scopes.size() > 8) {
-          // Don't blow up the solver — give up on highly-symbolic bodies.
-          too_many_vars = true;
-          break;
-        }
-      }
-      bool ok = false;
-      if (!too_many_vars) {
-        // Goal: 0 <= idx AND idx < extent — UNCONDITIONALLY (no `a`
-        // assumption pushed).
-        PrimExpr goal = (idx >= make_const(idx.dtype(), 0)) && (idx < extent);
-        try {
-          ok = z3.CanProve(goal);
-        } catch (...) {
-          ok = false;
-        }
-      }
-      // ConstraintScope destructors run in reverse at scope exit.
-      return ok;
-    };
-
     for (const BufferLoadNode *ld : collector.loads) {
       for (size_t d = 0; d < ld->indices.size(); ++d) {
-        if (!check_one_index(ld->buffer, d, ld->indices[d])) {
+        if (!Z3ProvesIndexInRange(ld->buffer, d, ld->indices[d], z3)) {
           return false;
         }
       }
     }
     for (const auto &kv : stores.stores) {
       for (size_t d = 0; d < kv.second.size(); ++d) {
-        if (!check_one_index(kv.first, d, kv.second[d])) {
+        if (!Z3ProvesIndexInRange(kv.first, d, kv.second[d], z3)) {
           return false;
         }
       }
@@ -274,6 +315,18 @@ private:
     // BufferLoads/Stores are in-range without assuming `a`?
     if (!Z3ProvesInnerWellDefined(new_inner_body, analyzer_)) {
       // Conservative: keep the original nesting (with the recursed body).
+      Stmt rebuilt_inner =
+          IfThenElse(inner->condition, new_inner_body, Stmt(), inner->span);
+      return IfThenElse(op->condition, rebuilt_inner, Stmt(), op->span);
+    }
+
+    // CPPMEGA fix-B3 (idea712): the inner CONDITION `b` itself may
+    // contain BufferLoads (e.g. `b == buf[i] > 0`). After fusion to
+    // `if (a && b)`, the lowered TIR may evaluate both sides regardless
+    // of short-circuit semantics in the surface language. If any load
+    // in `b` is only safe under `!a`, the fusion would OOB. Require Z3
+    // to prove every load index in `b` is in-range UNCONDITIONALLY too.
+    if (!Z3ProvesConditionLoadsWellDefined(inner->condition, analyzer_)) {
       Stmt rebuilt_inner =
           IfThenElse(inner->condition, new_inner_body, Stmt(), inner->span);
       return IfThenElse(op->condition, rebuilt_inner, Stmt(), op->span);
