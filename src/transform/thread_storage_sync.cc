@@ -1731,6 +1731,15 @@ private:
 
     // Build the goal: (tx_w / warp_size == tx_r / warp_size) ∧
     //                 (ty_w == ty_r) ∧ (tz_w == tz_r)
+    //
+    // FloorDiv semantics — TIR's FloorDiv rounds toward negative infinity
+    // (Python-style). For the simdgroup partition we only ever feed
+    // non-negative thread indices in [0, threadgroup_extent_x), so
+    // FloorDiv coincides with Euclidean division and matches Apple's
+    // 32-lane partition exactly: lane = tx mod 32, simd = tx / 32. The
+    // bit-bound EnterConstraint pushed below pins tx into that
+    // non-negative range explicitly so the solver cannot cherry-pick a
+    // negative witness that would otherwise violate the goal.
     auto warp_const = make_const(tx_w.dtype(), warp_size_);
     PrimExpr goal = tirx::EQ(tirx::FloorDiv(tx_w, warp_const),
                              tirx::FloorDiv(tx_r, warp_const));
@@ -1741,19 +1750,73 @@ private:
       goal = tirx::And(goal, tirx::EQ(tz_w, tz_r));
     }
 
+    // CPPMEGA: Z3 idea #11 hardening — bit-bound emulation via
+    // EnterConstraint. Until the parallel `z3-bv-mode` branch lands
+    // `SetBitVectorMode(width)`, we encode the implicit signed-32 thread-
+    // index range (`0 <= tx < threadgroup_extent`) as additional Z3
+    // assertions. This:
+    //   1) Prevents the solver from picking pathological negative-tx
+    //      witnesses for the floor-div-by-32 partition (FloorDiv is
+    //      negative-infinity rounding in TIR; without bounding tx >= 0,
+    //      a negative witness like tx_w == -33, tx_r == -1 falsifies
+    //      `tx_w / 32 == tx_r / 32` even though no real launch can
+    //      reach that state).
+    //   2) Lets Z3 actually solve floor-div on small finite domains
+    //      instead of timing out on the unbounded Int sort.
+    auto extract_extent = [](const Optional<IterVar> &iv) -> Optional<PrimExpr> {
+      if (!iv.has_value() || !iv.value()->dom.defined()) return std::nullopt;
+      return iv.value()->dom->extent;
+    };
+    auto add_axis_bounds = [&](const Var &w_var, const Var &r_var,
+                               const Optional<IterVar> &p_iv,
+                               const Optional<IterVar> &c_iv,
+                               PrimExpr &constraint) {
+      if (!w_var.defined() || !r_var.defined()) return;
+      PrimExpr zero = make_const(w_var.dtype(), 0);
+      constraint = tirx::And(
+          constraint, tirx::And(tirx::GE(w_var, zero), tirx::GE(r_var, zero)));
+      auto ext_p = extract_extent(p_iv);
+      if (ext_p.has_value()) {
+        constraint = tirx::And(
+            constraint, tirx::LT(w_var, Cast(w_var.dtype(), ext_p.value())));
+      }
+      auto ext_c = extract_extent(c_iv);
+      if (ext_c.has_value()) {
+        constraint = tirx::And(
+            constraint, tirx::LT(r_var, Cast(r_var.dtype(), ext_c.value())));
+      }
+    };
+    PrimExpr range_constraint = make_const(DataType::Bool(), true);
+    add_axis_bounds(tx_w, tx_r, tx_p_iv, tx_c_iv, range_constraint);
+    add_axis_bounds(ty_w, ty_r, ty_p_iv, ty_c_iv, range_constraint);
+    add_axis_bounds(tz_w, tz_r, tz_p_iv, tz_c_iv, range_constraint);
+
     // Use Z3 with a tight timeout to avoid pathological slowdowns. On
-    // timeout/unknown, CanProve returns false → we keep the barrier.
-    // CPPMEGA: Z3 simdgroup load opt — apache/tvm `arith::Z3Prover` is a free
-    // function returning a reference to a per-Analyzer cached prover (see
-    // vendored/z3_prover.h), not a constructor.
+    // timeout/unknown/exception, `proven` stays false → we keep the
+    // barrier (conservative-by-default).
+    //
+    // CPPMEGA: Z3 simdgroup load opt — apache/tvm `arith::Z3Prover` is a
+    // free function returning a reference to a per-Analyzer cached prover
+    // (see vendored/z3_prover.h), not a constructor.
+    //
+    // Timeout tuning: 500 ms in the initial draft; the floor-div-by-32
+    // query closes in single-digit ms once range constraints are present,
+    // so 200 ms is plenty (per second-pass review feedback).
     auto &prover = arith::Z3Prover(analyzer);
-    prover.SetTimeoutMs(500);
+    prover.SetTimeoutMs(200);
     bool proven = false;
+    // Push range constraints via EnterConstraint so the recovery handle
+    // restores the prover state on every exit path (success, exception,
+    // early return). Both reviewers (gpt-5-5-pro, grok) flagged that an
+    // unhandled Z3 exception here would crash the entire ThreadSync pass;
+    // `catch (...)` ensures we degrade to "barrier kept" no matter what.
+    auto recover = prover.EnterConstraint(range_constraint);
     try {
       proven = prover.CanProve(goal);
-    } catch (const std::exception &) {
+    } catch (...) {
       proven = false;
     }
+    recover();
     return proven;
   }
 
