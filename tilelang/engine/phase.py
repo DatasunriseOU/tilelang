@@ -213,6 +213,12 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     from tilelang.transform.metal_fragment_to_simdgroup import MetalFragmentToSimdgroup
 
     mod = MetalFragmentToSimdgroup(mod)
+    # Idea #9 (Z3 roadmap): detect reductions that fit a single simdgroup
+    # and could be lifted off threadgroup memory. Default OFF — gated by
+    # PassConfig key ``tl.simd_lift_reductions``. Detection-only for now.
+    from tilelang.transform.metal_simd_lift import MetalSimdLiftReductions
+
+    mod = MetalSimdLiftReductions(mod)
     # Infer memory layouts for fragments and shared memory
     mod = tilelang.transform.LayoutInference()(mod)
     # Visualize the layout

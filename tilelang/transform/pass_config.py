@@ -155,6 +155,19 @@ class PassConfigKey(str, Enum):
     TL_DISABLE_SHUFFLE_ELECT = "tl.disable_shuffle_elect"
     """Disable shuffle election optimization. Default: False"""
 
+    TL_SIMD_LIFT_REDUCTIONS = "tl.simd_lift_reductions"
+    """Idea #9 (Z3 roadmap): on Metal, lift reductions whose tile extent fits
+    within a single simdgroup (<= 32 lanes) into ``simd_shuffle_xor``-based
+    reductions, bypassing threadgroup memory.
+
+    Currently implemented in *detection-only* mode: the pass walks reduction
+    loops, runs a Z3 query asserting ``tile_extent <= 32 /\\ reduce_op ∈
+    {add, max, min, or, and, xor}``, and logs the candidate sites. The IR
+    is left unchanged.
+
+    Default: False.
+    """
+
     TL_DISABLE_LOOP_UNSWITCHING = "tl.disable_loop_unswitching"
     """Disable loop unswitching optimization. Default: False"""
 
