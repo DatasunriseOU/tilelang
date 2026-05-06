@@ -862,6 +862,173 @@ private:
   LayoutMap layout_map_;
 };
 
+// CPPMEGA: Z3 idea #12 — alignment proof companion to #1 (contiguity).
+//
+// After vectorization decides to mark a For as kVectorized with a given
+// `vector_size`, optionally try to prove that the buffer base address
+// (in BYTES) of every memory access in the loop body is aligned to
+// `vector_size * dtype_bytes`. If proven for at least one global/shared
+// access, attach a `tl.vec_aligned` annotation on the inner For so
+// downstream codegen (MSL `vec.load_aligned`/CUDA `ld.global.v4.b32`)
+// can elide the unaligned-load fallback.
+//
+// Conservative on UNKNOWN/timeout: no annotation. The annotation is
+// purely additive — no semantic change unless the codegen explicitly
+// reads the attr. PassConfig: `tl.vectorize_alignment_proof` (default OFF).
+//
+// The proof query, in BV/integer form:
+//
+//     forall free_vars in BV32:
+//       FloorMod(elem_offset_bytes, vector_size * dtype_bytes) == 0
+//
+// where `elem_offset_bytes = (buffer.elem_offset + index_offset) * dtype_bytes`.
+// `index_offset` is the same `elem_offset` expression that the contiguity
+// path computes (sum of `indices[i] * strides[i]`), but evaluated at the
+// loop variable's *base value* (so that `var % vector_size == 0` is implicit).
+//
+// Bit-bound free vars to BV32 emulation via EnterConstraint.
+static bool Z3CanProveAlignedAccess(const Buffer &buffer,
+                                    const Array<PrimExpr> &indices,
+                                    const Var &loop_var, int vector_size,
+                                    arith::Analyzer *analyzer) {
+  if (!buffer.defined() || indices.empty()) {
+    return false;
+  }
+  int dtype_bytes = buffer->dtype.bytes();
+  if (dtype_bytes <= 0) {
+    return false;
+  }
+  int64_t alignment = static_cast<int64_t>(vector_size) * dtype_bytes;
+  if (alignment <= 0) {
+    return false;
+  }
+
+  // Compute element offset (in elements). Use the buffer's strides if
+  // present, otherwise derive a row-major stride layout.
+  Array<PrimExpr> strides = GetBufferStrides(buffer);
+  if (strides.size() != indices.size()) {
+    return false;
+  }
+  PrimExpr elem_offset = make_const(DataType::Int(32), 0);
+  for (size_t i = 0; i < indices.size(); ++i) {
+    elem_offset = elem_offset + indices[i] * strides[i];
+  }
+  // Add the buffer's own elem_offset (in elements) — this captures the
+  // base offset for sub-buffers / views.
+  if (buffer->elem_offset.defined()) {
+    elem_offset = elem_offset + cast(elem_offset.dtype(), buffer->elem_offset);
+  }
+  // Convert to bytes.
+  PrimExpr base_addr_bytes =
+      elem_offset * make_const(elem_offset.dtype(), dtype_bytes);
+
+  try {
+    auto &z3 = arith::Z3Prover(analyzer);
+    z3.SetTimeoutMs(50);
+
+    // Bit-bound: every free Var (including the loop var itself) is
+    // assumed to be in [0, 2^31). For the loop var specifically, also
+    // assume it's a multiple of `vector_size` — because the
+    // VectorizeRewriter has already split the loop so the inner var
+    // ranges over [0, vector_size) and the *outer* var ranges over
+    // [0, extent/vector_size) — but the per-iteration alignment goal is
+    // about the START of each vector lane, i.e. when var == 0 modulo
+    // vector_size. We collect free vars from the elem_offset.
+    std::unordered_set<const VarNode *> free_vars;
+    PostOrderVisit(elem_offset, [&](const ObjectRef &obj) {
+      if (const auto *v = obj.as<VarNode>()) {
+        free_vars.insert(v);
+      }
+    });
+    std::vector<std::function<void()>> recoverers;
+    for (const VarNode *v : free_vars) {
+      Var var = ffi::GetRef<Var>(v);
+      DataType dt = var.dtype();
+      if (!dt.is_int() && !dt.is_uint()) {
+        // Non-int free var — cannot bit-bound. Bail.
+        for (auto it = recoverers.rbegin(); it != recoverers.rend(); ++it) {
+          (*it)();
+        }
+        return false;
+      }
+      PrimExpr lo = make_const(dt, 0);
+      PrimExpr hi = make_const(dt, int64_t(1) << 31);
+      PrimExpr bound = (var >= lo) && (var < hi);
+      // For the loop var: also assume it's a multiple of vector_size, which
+      // is the VectorizeRewriter's invariant for the outer-loop iteration
+      // boundary at the START of each vector chunk. Goal: prove the
+      // address at lane 0 of every vector chunk is aligned.
+      if (v == loop_var.get()) {
+        bound = bound &&
+                (FloorMod(var, make_const(dt, vector_size)) ==
+                 make_const(dt, 0));
+      }
+      recoverers.push_back(z3.EnterConstraint(bound));
+    }
+
+    PrimExpr goal =
+        FloorMod(base_addr_bytes,
+                 make_const(base_addr_bytes.dtype(), alignment)) ==
+        make_const(base_addr_bytes.dtype(), 0);
+
+    bool proved = false;
+    try {
+      proved = z3.CanProve(goal);
+    } catch (...) {
+      proved = false;
+    }
+    for (auto it = recoverers.rbegin(); it != recoverers.rend(); ++it) {
+      (*it)();
+    }
+    return proved;
+  } catch (...) {
+    return false;
+  }
+}
+
+// Walk the loop body and attempt to prove alignment for every
+// global/shared BufferLoad and BufferStore. Returns true iff there is at
+// least one such access AND every one is provably aligned.
+static bool Z3CanProveLoopAligned(const Stmt &body, const Var &loop_var,
+                                  int vector_size,
+                                  arith::Analyzer *analyzer) {
+  bool saw_memory = false;
+  bool all_aligned = true;
+  PostOrderVisit(body, [&](const ObjectRef &obj) {
+    if (!all_aligned) return;
+    if (const auto *ld = obj.as<BufferLoadNode>()) {
+      if (IsLocalBuffer(ld->buffer, /*allow_var=*/true) ||
+          IsFragmentBuffer(ld->buffer)) {
+        return; // local/fragment access — alignment irrelevant.
+      }
+      saw_memory = true;
+      if (!Z3CanProveAlignedAccess(ld->buffer, ld->indices, loop_var,
+                                   vector_size, analyzer)) {
+        all_aligned = false;
+      }
+    } else if (const auto *st = obj.as<BufferStoreNode>()) {
+      if (IsLocalBuffer(st->buffer, /*allow_var=*/true) ||
+          IsFragmentBuffer(st->buffer)) {
+        return;
+      }
+      saw_memory = true;
+      if (!Z3CanProveAlignedAccess(st->buffer, st->indices, loop_var,
+                                   vector_size, analyzer)) {
+        all_aligned = false;
+      }
+    }
+  });
+  return saw_memory && all_aligned;
+}
+
+// Build a new annotation map with `tl.vec_aligned -> True` added.
+static Map<String, ffi::Any> MakeAlignedAnnotations(
+    const Map<String, ffi::Any> &existing) {
+  Map<String, ffi::Any> out = existing;
+  out.Set("tl.vec_aligned", Bool(true));
+  return out;
+}
+
 class VectorizeRewriter : public StmtExprMutator {
 public:
   VectorizeRewriter(int vector_size) : vector_size_(vector_size) {}
@@ -880,8 +1047,34 @@ private:
           << "extent: " << extent << " vector_size_: " << vector_size_
           << " for loop: " << fnode;
       ICHECK(is_zero(fnode->min));
+
+      // CPPMEGA: Z3 idea #12 — best-effort alignment proof. Default OFF.
+      bool alignment_proof_enabled = false;
+      try {
+        alignment_proof_enabled =
+            tvm::transform::PassContext::Current()
+                ->GetConfig<Bool>(kVectorizeAlignmentProof, Bool(false))
+                .value();
+      } catch (...) {
+        alignment_proof_enabled = false;
+      }
+      bool aligned = false;
+      if (alignment_proof_enabled) {
+        arith::Analyzer analyzer;
+        try {
+          aligned = Z3CanProveLoopAligned(fnode->body, fnode->loop_var,
+                                          vector_size_, &analyzer);
+        } catch (...) {
+          aligned = false;
+        }
+      }
+
       if (extent == vector_size_) {
         fnode.CopyOnWrite()->kind = ForKind::kVectorized;
+        if (aligned) {
+          fnode.CopyOnWrite()->annotations =
+              MakeAlignedAnnotations(fnode->annotations);
+        }
         return fnode;
       } else {
         Var inner_var = Var("vec");
@@ -889,7 +1082,13 @@ private:
         Map<Var, PrimExpr> vmap;
         vmap.Set(fnode->loop_var, outer_var * vector_size_ + inner_var);
         Stmt body = Substitute(fnode->body, vmap);
-        body = For(inner_var, 0, vector_size_, ForKind::kVectorized, body);
+        Map<String, ffi::Any> inner_annotations;
+        if (aligned) {
+          inner_annotations =
+              MakeAlignedAnnotations(Map<String, ffi::Any>());
+        }
+        body = For(inner_var, 0, vector_size_, ForKind::kVectorized, body,
+                   /*thread_binding=*/std::nullopt, inner_annotations);
         // TileLang uses ForKind::kParallel in frontend SIMT loops. After
         // vectorization, keep semantics equivalent but downgrade to serial so
         // subsequent passes (e.g. pragma-unroll) can run.

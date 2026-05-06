@@ -47,6 +47,8 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kLoopUnswitchingAllowNonTrivialElse, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDropProvableBoundChecks, Bool);
 // CPPMEGA: Z3 idea #7 — predicate fusion (default off).
 TVM_REGISTER_PASS_CONFIG_OPTION(kPredicateFusion, Bool);
+// CPPMEGA: Z3 idea #12 — vectorize alignment proof companion (default off).
+TVM_REGISTER_PASS_CONFIG_OPTION(kVectorizeAlignmentProof, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableOutOfBoundWarning, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kEnableDumpIR, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDumpIRDir, ffi::String);

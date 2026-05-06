@@ -207,6 +207,12 @@ class PassConfigKey(str, Enum):
     """Z3 idea #7: fuse adjacent guarded ``if`` statements when Z3 proves the
     inner predicate is well-defined unconditionally. Default: False (off)."""
 
+    TL_VECTORIZE_ALIGNMENT_PROOF = "tl.vectorize_alignment_proof"
+    """Z3 idea #12: companion to #1's contiguity proof. Annotate the
+    inner vectorized For with ``tl.vec_aligned`` when Z3 proves the
+    buffer base address is aligned to ``vec_width * dtype_bytes``.
+    Default: False (additive optimization)."""
+
     TL_DISABLE_THREAD_STORAGE_SYNC = "tl.disable_thread_storage_sync"
     """Disable thread storage synchronization pass. When enabled, disables the
     automatic insertion of thread synchronization barriers (e.g., __syncthreads())

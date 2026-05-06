@@ -124,6 +124,15 @@ static constexpr const char *kLoopUnswitchingAllowNonTrivialElse =
 // out-of-bounds buffer access, no side effects). Default: false (off — the
 // pass is a pure throughput optimization and must remain conservative).
 static constexpr const char *kPredicateFusion = "tl.predicate_fusion";
+// CPPMEGA: Z3 idea #12 — vectorize alignment proof companion. When enabled,
+// after `loop_vectorize` rewrites a loop body to a `kVectorized` For, try
+// to prove the buffer base address is aligned to `vec_width * dtype_bytes`
+// using Z3. On success, an `tl.vec_aligned` annotation is attached to the
+// inner For so MSL/CUDA codegen can emit `vec.load_aligned`/`vec.store_aligned`
+// instead of the unaligned default. Default: false (additive optimization
+// on top of #1's contiguity proof).
+static constexpr const char *kVectorizeAlignmentProof =
+    "tl.vectorize_alignment_proof";
 
 // CPPMEGA: Z3 idea #4 — drop provable buffer-bound checks.
 // When enabled, IfThenElse nodes whose condition is a buffer-bound predicate
