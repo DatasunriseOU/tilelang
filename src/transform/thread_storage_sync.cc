@@ -1679,21 +1679,56 @@ private:
     // topk_selector on Apple).
     //
     // The fix: scan `threads` by `thread_tag` and bind by axis identity,
-    // not by position.
-    auto find_axis = [](const Array<IterVar> &v,
-                        const char *tag) -> Optional<IterVar> {
+    // not by position. Audit-tightened to a strict-equality allowlist
+    // (no substring match): a custom vendor tag like `__wmma_x` or a
+    // split tag like `threadIdx.x_outer` does NOT count as the canonical
+    // `threadIdx.x` axis, and we keep the barrier in that case
+    // (conservative-by-default).
+    auto is_canonical_thread_tag = [](const std::string &tag) -> bool {
+      return tag == "threadIdx.x" || tag == "threadIdx.y" ||
+             tag == "threadIdx.z" || tag == "blockIdx.x" ||
+             tag == "blockIdx.y" || tag == "blockIdx.z";
+    };
+    auto find_axis = [&](const Array<IterVar> &v,
+                         const char *tag) -> Optional<IterVar> {
+      // Strict equality match: avoids matching custom tags such as
+      // `__wmma_x`, `threadIdx.x_outer`, or `threadIdx.x_inner` as if
+      // they were the canonical `threadIdx.x` axis. If multiple axes
+      // share the canonical tag (shouldn't happen, but guard anyway),
+      // the first one wins by IterVar binding order.
       for (const IterVar &iv : v) {
-        if (std::string(iv->thread_tag).find(tag) != std::string::npos) {
+        if (std::string(iv->thread_tag) == tag) {
           return iv;
         }
       }
       return std::nullopt;
     };
+    // Audit logging: if either side carries any non-canonical thread_tag
+    // (e.g. `__wmma_x`, `threadIdx.x_outer`), surface it via LOG(WARNING)
+    // so flaky CI runs are diagnosable. We do NOT bail just because a
+    // non-canonical tag exists — the canonical axes still drive the
+    // proof; we only refuse to elide if `threadIdx.x` itself is missing.
+    auto log_unknown_tags = [&](const Array<IterVar> &v, const char *side) {
+      for (const IterVar &iv : v) {
+        std::string tag(iv->thread_tag);
+        if (!tag.empty() && !is_canonical_thread_tag(tag)) {
+          LOG(WARNING) << "ProveIntraWarpRAW: non-canonical thread_tag '"
+                       << tag << "' on " << side
+                       << " — ignored by strict-equality matcher.";
+        }
+      }
+    };
+    log_unknown_tags(prev.threads, "prev");
+    log_unknown_tags(curr.threads, "curr");
+
     auto tx_p_iv = find_axis(prev.threads, "threadIdx.x");
     auto tx_c_iv = find_axis(curr.threads, "threadIdx.x");
     if (!tx_p_iv.has_value() || !tx_c_iv.has_value()) {
-      // No threadIdx.x in scope on either side — cannot reason about
-      // simdgroup membership at all. Keep the barrier.
+      // No canonical threadIdx.x in scope on either side — cannot reason
+      // about simdgroup membership at all. Keep the barrier
+      // (conservative-by-default early exit).
+      LOG(WARNING) << "ProveIntraWarpRAW: no canonical threadIdx.x found "
+                      "(prev or curr); keeping barrier.";
       return false;
     }
     auto ty_p_iv = find_axis(prev.threads, "threadIdx.y");
@@ -1750,8 +1785,22 @@ private:
     // non-negative range explicitly so the solver cannot cherry-pick a
     // negative witness that would otherwise violate the goal.
     auto warp_const = make_const(tx_w.dtype(), warp_size_);
+    // Audit (gpt-5-5-pro #4): null-safety — tx_w / tx_r are guaranteed
+    // `.defined()` here by the early-exit above (`!tx_w.defined()` →
+    // return false at line ~1735). Optional<IterVar> for tx_p_iv /
+    // tx_c_iv was checked via `has_value()` immediately after find_axis.
+    //
+    // FloorDiv safety: Sound only because the EnterConstraint above pins
+    // tx_w, tx_r >= 0. If a transformation introduces negative thread
+    // indices, this query becomes unsound (TIR FloorDiv rounds toward
+    // -infinity, so e.g. FloorDiv(-1, 32) = -1 ≠ FloorDiv(-33, 32) = -2
+    // even though both fall in the "same simdgroup" colloquially).
     PrimExpr goal = tirx::EQ(tirx::FloorDiv(tx_w, warp_const),
                              tirx::FloorDiv(tx_r, warp_const));
+    // Audit (gpt-5-5-pro #2): null-safety — `.defined()` checks below
+    // gate the EQ build on bind_axis having actually populated the
+    // ty/tz slots. Optional<IterVar> sources are themselves null-safe
+    // via has_value() inside bind_axis.
     if (ty_w.defined() && ty_r.defined()) {
       goal = tirx::And(goal, tirx::EQ(ty_w, ty_r));
     }
@@ -1822,7 +1871,18 @@ private:
     auto recover = prover.EnterConstraint(range_constraint);
     try {
       proven = prover.CanProve(goal);
+    } catch (const std::exception &e) {
+      // Audit (gpt-5-5-pro #5): surface UNKNOWN/exception path so flaky
+      // CI timeouts are visible. Conservative-by-default: barrier kept.
+      LOG(WARNING)
+          << "ProveIntraWarpRAW: Z3 prover threw '" << e.what()
+          << "' on goal `" << goal
+          << "` (timeout=200ms); keeping barrier (conservative).";
+      proven = false;
     } catch (...) {
+      LOG(WARNING) << "ProveIntraWarpRAW: Z3 prover threw unknown exception "
+                      "on goal `"
+                   << goal << "`; keeping barrier (conservative).";
       proven = false;
     }
     recover();
