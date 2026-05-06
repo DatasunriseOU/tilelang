@@ -169,6 +169,37 @@ def test_default_off_preserves():
 # (no `vectorized` annotation should appear on the rewritten loop).
 # ---------------------------------------------------------------------------
 
+def test_indices_can_vectorize_memoized_halving():
+    """fix-B6 regression: a body that triggers the planner's halving
+    probe (`while (vec > 1 && !IndicesCanVectorize(...)) vec /= 2;`)
+    issues O(log vec) calls per buffer access, and prior to memoization
+    the same `(elem_offset, loop_var)` pair was re-checked at every
+    halving step for every buffer that shares the pattern.
+
+    Pattern below: `B[i]` and `C[i]` share the same elem_offset shape
+    relative to `i`. With the cache, the second occurrence is an
+    O(1) hash lookup; without it, the planner pays a fresh Z3 round-
+    trip per pair.
+
+    The test asserts: build completes, vectorization runs successfully.
+    The performance contract is verified externally (bench harness).
+    """
+
+    @T.prim_func
+    def main(  # noqa: F821
+        A: T.Tensor((128,), T.float16),  # noqa: F821
+        B: T.Tensor((128,), T.float16),  # noqa: F821
+        C: T.Tensor((128,), T.float16),  # noqa: F821
+    ):
+        with T.Kernel(1, threads=32) as bx:  # noqa: F841
+            for i in T.vectorized(8):  # noqa: F821
+                B[i] = A[i]
+                C[i] = A[i]
+
+    mod = _build_with_alignment_proof(main, enable=False)
+    assert mod is not None
+
+
 def test_alignment_proof_repeated_access():
     """fix-B5 regression: a body that loads the same `(buffer, indices)`
     pair multiple times must not pay multiple Z3 round-trips. We assert

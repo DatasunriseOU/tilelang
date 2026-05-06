@@ -329,9 +329,9 @@ public:
           for (size_t i = 0; i < info.indices.size(); ++i) {
             elem_offset += info.indices[i] * strides[i];
           }
-          if (!IndicesCanVectorize(elem_offset, inner_for_->loop_var,
-                                   inner_for_->extent, vector_size_,
-                                   analyzer_)) {
+          // CPPMEGA fix-B6 (idea712): memoized.
+          if (!MemoizedIndicesCanVectorize(elem_offset, inner_for_->loop_var,
+                                           inner_for_->extent, vector_size_)) {
             // Not invariant at this vector_size, need to take GCD
             int old_vector_size = vector_size_;
             vector_size_ = arith::ZeroAwareGCD(vector_size_, info.vector_size);
@@ -686,10 +686,10 @@ private:
     // immediately scalarized (and to keep semantics sane for side-effectful
     // calls), require the offset to be invariant within the vector boundary.
     PrimExpr offset_s = analyzer_->Simplify(offset);
+    // CPPMEGA fix-B6 (idea712): memoized halving probe.
     while (access_vec_size > 1 &&
-           !IndicesCanVectorize(offset_s, inner_for_->loop_var,
-                                inner_for_->extent, access_vec_size,
-                                analyzer_)) {
+           !MemoizedIndicesCanVectorize(offset_s, inner_for_->loop_var,
+                                        inner_for_->extent, access_vec_size)) {
       access_vec_size /= 2;
     }
     // Record as a memory-like constraint if we can resolve the buffer.
@@ -807,10 +807,10 @@ private:
       return buffer_vec_size; // only limited constraint from this buffer
     }
     // 4. Try to find max vectorize size for this buffer
+    // CPPMEGA fix-B6 (idea712): memoized halving probe.
     while (buffer_vec_size > 1 &&
-           !IndicesCanVectorize(elem_offset, inner_for_->loop_var,
-                                inner_for_->extent, buffer_vec_size,
-                                analyzer_)) {
+           !MemoizedIndicesCanVectorize(elem_offset, inner_for_->loop_var,
+                                        inner_for_->extent, buffer_vec_size)) {
       buffer_vec_size /= 2;
     }
     return buffer_vec_size;
@@ -854,6 +854,46 @@ private:
     return arith::IRMutatorWithAnalyzer::VisitStmt(stmt);
   }
 
+  // CPPMEGA fix-B6 (idea712): memoize IndicesCanVectorize results per
+  // `(elem_offset structural-hash, loop_var pointer, vector_size)`.
+  // Prior to this cache, the planner would call IndicesCanVectorize
+  // multiple times for the same `(buffer, loop_var)` pair when:
+  //   * a buffer appears as both a load source and a store dest
+  //     (lines around 329 / 687 / 808 in this file each reach the
+  //     same elem_offset shape), and
+  //   * the planner's halving loop retries with smaller vector sizes
+  //     (`while (vec > 1 && !IndicesCanVectorize(...)) vec /= 2;`).
+  // The Z3-driven Simplify chain inside IndicesCanVectorize is the
+  // single most expensive call per Plan; deduping is a clear win.
+  //
+  // Cache lifetime: per-planner-instance. A new planner is created per
+  // `Plan(For)` entry, so the cache is naturally scoped.
+  bool MemoizedIndicesCanVectorize(const PrimExpr &expr, Var var,
+                                   const PrimExpr &iter_var_size,
+                                   int target_vectorized_size) {
+    if (target_vectorized_size <= 1) {
+      // IndicesCanVectorize itself returns true at size 1; mirror that
+      // without touching the analyzer.
+      return true;
+    }
+    ::tvm::ffi::StructuralHash hasher;
+    size_t key = static_cast<size_t>(hasher(expr));
+    auto mix = [&](size_t h) {
+      key ^= h + 0x9e3779b97f4a7c15ULL + (key << 6) + (key >> 2);
+    };
+    mix(std::hash<const void *>{}(var.get()));
+    mix(static_cast<size_t>(hasher(iter_var_size)));
+    mix(static_cast<size_t>(target_vectorized_size));
+    auto it = indices_can_vectorize_memo_.find(key);
+    if (it != indices_can_vectorize_memo_.end()) {
+      return it->second;
+    }
+    bool ok = IndicesCanVectorize(expr, var, iter_var_size,
+                                  target_vectorized_size, analyzer_);
+    indices_can_vectorize_memo_.emplace(key, ok);
+    return ok;
+  }
+
   int vector_load_bits_max_;
   int initial_vector_size_ = 128;
   int loop_extent_vector_size_ = 128;
@@ -863,6 +903,7 @@ private:
   int vector_size_ = 128;
   std::vector<BufferVectorInfo> buffer_vector_infos_;
   LayoutMap layout_map_;
+  std::unordered_map<size_t, bool> indices_can_vectorize_memo_;
 };
 
 // CPPMEGA: Z3 idea #12 — alignment proof companion to #1 (contiguity).
