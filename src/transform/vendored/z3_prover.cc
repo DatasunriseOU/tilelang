@@ -52,6 +52,7 @@
 
 #include "tvm/ffi/cast.h"
 #include "tvm/ffi/object.h"
+#include "tvm/ffi/reflection/registry.h"
 #include "tvm/ffi/string.h"
 
 namespace tilelang {
@@ -141,6 +142,41 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
   Namespace ns;
   unsigned timeout_ms{UINT_MAX};
   unsigned rlimit{UINT_MAX};
+  // 0 == unbounded Int sort (default, bit-identical to prior behavior).
+  // 32 / 64 == signed BitVector sort of that width. See SetBitVectorMode().
+  int bv_width_{0};
+
+  // Helpers that hide the Int-vs-BV sort dispatch. In default mode
+  // (bv_width_ == 0) these behave exactly like the old direct calls into
+  // ctx->int_*; in BV mode they produce sized bv_const / bv_val with the
+  // current width, and bv_sort for the sort.
+  ::z3::sort MakeIntSort() {
+    if (bv_width_ > 0) return ctx->bv_sort(static_cast<unsigned>(bv_width_));
+    return ctx->int_sort();
+  }
+  ::z3::expr MakeIntConst(const std::string& name) {
+    if (bv_width_ > 0) {
+      return ctx->bv_const(name.c_str(), static_cast<unsigned>(bv_width_));
+    }
+    return ctx->int_const(name.c_str());
+  }
+  ::z3::expr MakeIntVal(int64_t value) {
+    if (bv_width_ > 0) {
+      // Z3 bv_val sign-extends/truncates to the requested width; for an
+      // int64 IntImm that "doesn't fit" in BV32 the high bits are
+      // dropped, matching standard two's-complement wrapping.
+      return ctx->bv_val(static_cast<long long>(value),
+                         static_cast<unsigned>(bv_width_));
+    }
+    return ctx->int_val(value);
+  }
+  ::z3::expr MakeUIntVal(uint64_t value) {
+    if (bv_width_ > 0) {
+      return ctx->bv_val(static_cast<unsigned long long>(value),
+                         static_cast<unsigned>(bv_width_));
+    }
+    return ctx->int_val(value);
+  }
 
   static ::z3::solver CreateSolver(::z3::context& ctx) {
     ::z3::solver solver(ctx);
@@ -162,8 +198,12 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     if (dtype.is_bool()) {
       return ctx->bool_const(name.c_str());
     } else {
-      ::z3::expr e = ctx->int_const(name.c_str());
-      if (dtype.is_uint() && dtype.bits() == 64) {
+      ::z3::expr e = MakeIntConst(name);
+      if (bv_width_ > 0) {
+        // In BV mode the variable is already bounded by its sort width.
+        // Adding range constraints in terms of int_val would mix sorts;
+        // skip them.
+      } else if (dtype.is_uint() && dtype.bits() == 64) {
         solver.add(ctx->int_val(0) <= e &&
                    e <= ctx->int_val((uint64_t)UINT64_MAX));
       } else {
@@ -274,8 +314,20 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
       int64_t min_value = *tirx_op::as_const_int(range->min);
       int64_t max_value = *tirx_op::as_const_int(range->min + range->extent);
       if (min_value < max_value) {
-        solver.add(ctx->int_val(min_value) <= var_expr);
-        solver.add(var_expr < ctx->int_val(max_value));
+        // In BV mode, skip binds with bounds outside the BV width's
+        // signed range rather than synthesize wrap-around BV constants
+        // that would silently misrepresent intent.
+        if (bv_width_ == 32) {
+          if (min_value < static_cast<int64_t>(INT32_MIN) ||
+              max_value > static_cast<int64_t>(INT32_MAX)) {
+            LOG(WARNING) << "Z3Prover BV32: skipping out-of-range bind "
+                         << var << " in [" << min_value << ", " << max_value
+                         << ")";
+            return;
+          }
+        }
+        solver.add(MakeIntVal(min_value) <= var_expr);
+        solver.add(var_expr < MakeIntVal(max_value));
       }
     } else {
       solver.add(ConvertBool(range->extent <= 0 ||
@@ -293,6 +345,27 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     this->rlimit = rlimit_in;
     solver.set("rlimit", rlimit_in);
   }
+
+  void SetBitVectorMode(int width) {
+    ICHECK(width == 0 || width == 32 || width == 64)
+        << "Z3Prover::SetBitVectorMode only supports width in {0, 32, 64}, "
+        << "got " << width;
+    if (width == bv_width_) return;
+    bv_width_ = width;
+    // Invalidate any pre-existing variable / sub-expression encodings —
+    // they were declared at the old sort. Reset the solver and scope
+    // stack so the caller starts from a clean slate.
+    memo_.clear();
+    side_effect_exprs_.clear();
+    solver = CreateSolver(*ctx);
+    solver.set("timeout", timeout_ms);
+    solver.set("rlimit", rlimit);
+    scope_stack_.clear();
+    scope_stack_.push_back({});
+    ns = Namespace{};
+  }
+
+  int GetBitVectorWidth() const { return bv_width_; }
 
   std::string GetSMTLIB2() {
     std::stringstream ss;
@@ -391,7 +464,7 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
       }
       found_values.push_back(val);
       count++;
-      solver.add(z3_var != ctx->int_val(val));
+      solver.add(z3_var != MakeIntVal(val));
     }
 
     solver.pop();
@@ -476,7 +549,7 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
   ::z3::expr VisitInt(const PrimExpr& expr) {
     auto e = VisitExpr(expr);
     if (e.is_bool()) {
-      return ::z3::ite(e, ctx->int_val(1), ctx->int_val(0));
+      return ::z3::ite(e, MakeIntVal(1), MakeIntVal(0));
     } else {
       return e;
     }
@@ -485,7 +558,7 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
   ::z3::expr VisitBool(const PrimExpr& e) {
     auto expr = VisitExpr(e);
     if (expr.is_bool()) return expr;
-    return expr != ctx->int_val(0);
+    return expr != MakeIntVal(0);
   }
 
   ::z3::expr VisitArith(Z3BinOp signed_op, const PrimExprNode* op,
@@ -585,7 +658,7 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
                      VisitInt(op->false_value));
   }
   ::z3::expr VisitExpr_(const IntImmNode* op) override {
-    return ctx->int_val(op->value);
+    return MakeIntVal(op->value);
   }
 
   ::z3::expr VisitExpr_(const CallNode* op) override {
@@ -615,6 +688,10 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     unsigned bit_width =
         std::max(op->args[0].dtype().bits(), op->args[1].dtype().bits());
     if (IsValidDType(a->dtype) && IsValidDType(b->dtype)) {
+      if (bv_width_ > 0) {
+        // Already BV; bitwise op directly on the BV values.
+        return op_func(VisitInt(a), VisitInt(b));
+      }
       return ::z3::bv2int(
           op_func(::z3::int2bv(bit_width, VisitInt(a)),
                   ::z3::int2bv(bit_width, VisitInt(b))),
@@ -628,6 +705,9 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     ICHECK_EQ(op->args.size(), 1u);
     const PrimExpr& a = op->args[0];
     if (IsValidDType(a->dtype)) {
+      if (bv_width_ > 0) {
+        return ~VisitInt(a);
+      }
       unsigned bit_width = a.dtype().bits();
       ::z3::expr a_int = VisitInt(a);
       ::z3::expr a_bv = ::z3::int2bv(bit_width, a_int);
@@ -644,6 +724,13 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     const PrimExpr& a = op->args[0];
     const PrimExpr& b = op->args[1];
     if (IsValidDType(a->dtype) && IsValidDType(b->dtype)) {
+      if (bv_width_ > 0) {
+        ::z3::expr a_bv = VisitInt(a);
+        ::z3::expr b_bv = VisitInt(b);
+        solver.add(b_bv >= MakeIntVal(0));
+        solver.add(b_bv < MakeIntVal(bv_width_));
+        return op_func(a_bv, b_bv);
+      }
       ::z3::expr a_expr = VisitInt(a);
       ::z3::expr b_expr = VisitInt(b);
       solver.add(b_expr >= 0);
@@ -708,6 +795,12 @@ void Z3Prover::SetTimeoutMs(unsigned timeout_ms) {
   impl_->SetTimeoutMs(timeout_ms);
 }
 void Z3Prover::SetRLimit(unsigned rlimit) { impl_->SetRLimit(rlimit); }
+void Z3Prover::SetBitVectorMode(int width) {
+  impl_->SetBitVectorMode(width);
+}
+int Z3Prover::GetBitVectorWidth() const {
+  return impl_->GetBitVectorWidth();
+}
 
 // ---------------------------------------------------------------------------
 // Per-Analyzer cache. `thread_local` because the Z3 context inside
@@ -753,6 +846,29 @@ struct Z3HookRegistrar {
 };
 static Z3HookRegistrar _z3_hook_registrar;
 }  // namespace
+
+// CPPMEGA: Test-only FFI helpers. Exposes Z3Prover with the bv-mode
+// switch so Python tests can drive the prover directly without needing
+// a full Python binding for the C++ class. The signature is
+//    bv_can_prove(var, lo, hi, expr, bv_width) -> bool
+// where `var` is bound to the half-open range [lo, hi) before the
+// proof attempt; `bv_width` is 0 / 32 / 64 (see SetBitVectorMode).
+bool BvCanProve(const ::tvm::tirx::Var& var, int64_t lo, int64_t hi,
+                const ::tvm::PrimExpr& expr, int bv_width) {
+  ::tvm::arith::Analyzer ana;
+  Z3Prover& prover = GetOrCreate(&ana);
+  prover.SetBitVectorMode(bv_width);
+  ::tvm::Range range = ::tvm::Range::FromMinExtent(
+      ::tvm::IntImm(var->dtype, lo),
+      ::tvm::IntImm(var->dtype, hi - lo));
+  prover.Bind(var, range);
+  return prover.CanProve(expr);
+}
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = ::tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.z3.bv_can_prove", BvCanProve);
+}
 
 }  // namespace tlz3
 }  // namespace tilelang

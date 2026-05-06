@@ -70,6 +70,18 @@ class Z3Prover {
   void SetTimeoutMs(unsigned timeout_ms);
   void SetRLimit(unsigned rlimit);
 
+  // Switch the prover between unbounded Int sort (default, width=0) and a
+  // signed BitVector sort of the given width (32 or 64). In BV mode, all
+  // arithmetic uses bvadd/bvsub/bvmul/bvsdiv/bvsmod and comparisons use the
+  // signed bv predicates (bvslt/bvsle/bvsgt/bvsge); equality stays as
+  // operator==/operator!=, which work for either sort. The mode is
+  // per-Analyzer-cached-instance and persists across calls until reset by
+  // another `SetBitVectorMode(width)`. Switching mode invalidates any
+  // previously declared variables: callers must re-`Bind` after a mode
+  // change. Default behavior (width=0) is bit-identical to the prior API.
+  void SetBitVectorMode(int width);
+  int GetBitVectorWidth() const;
+
  private:
   std::unique_ptr<Z3ProverImpl> impl_;
 };
