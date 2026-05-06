@@ -34,6 +34,7 @@
 #include "tvm/tirx/var.h"
 #include "vendored/allocate_visit_passthrough.h"
 #include "vendored/let_stmt.h"
+#include "vendored/z3_prover.h"
 #include <iostream>
 #include <optional>
 #include <tvm/arith/iter_affine_map.h>
@@ -966,6 +967,60 @@ bool IsExprInvariantInVectorBoundary(const PrimExpr &expr, Var var,
   return false;
 }
 
+// CPPMEGA: Z3 idea #1 — vectorize_loop contiguity proof.
+//
+// When the heuristic ramp-extraction path can't conclude stride==1 (typically
+// because `iter_var_size` is symbolic and the simplifier won't fold the access
+// expression into a Ramp node), prove unit-stride directly:
+//
+//   forall var in [0, iter_var_size - 1):  expr(var + 1) - expr(var) == 1
+//
+// `expr` is an element-offset (already converted from indices via strides), so
+// the goal is literally `delta == 1` (no element_bytes multiplier). Until the
+// parallel `z3-bv-mode` branch lands `SetBitVectorMode(width)`, we bit-bound
+// `var` by pushing range constraints via `EnterConstraint`. Any
+// timeout / unknown / exception → conservative false. Heuristic-first: this
+// only runs after all simplifier-based paths have failed.
+//
+// TIR-vs-Z3 semantic divergences kept in mind:
+//   * FloorDiv/FloorMod (TIR) round toward -inf; Z3 BV bvsdiv/bvsmod round
+//     toward 0. We constrain `var >= 0` so they agree on the bounded domain.
+//     A future variant for negative-stride loops would need explicit handling.
+//   * Signed overflow on `var + 1`: the bit-bound `var < 2^31` keeps the
+//     successor in range; an iter_var_size > 2^31 would be rejected here.
+static bool Z3CanProveUnitStride(const PrimExpr &expr, const Var &var,
+                                 const PrimExpr &iter_var_size,
+                                 arith::Analyzer *analyzer) {
+  try {
+    auto &z3 = arith::Z3Prover(analyzer);
+    z3.SetTimeoutMs(50);
+    DataType vt = var.dtype();
+    PrimExpr lo = make_const(vt, 0);
+    // Bit-bound: emulate BV32 via [0, 2^31) so `var+1` cannot approach
+    // signed overflow even when iter_var_size is symbolic-but-large.
+    PrimExpr bv_hi = make_const(vt, int64_t(1) << 31);
+    // Loop-validity bound: var must allow `var+1` to remain a legal index,
+    // i.e. var < iter_var_size - 1. This rules out the wrap-around case
+    // where iter_var_size could be 0 or 1 (no contiguity to prove).
+    PrimExpr iter_hi = analyzer->Simplify(iter_var_size - 1);
+    PrimExpr range_constraint = (var >= lo) && (var < iter_hi) &&
+                                (var < bv_hi) && (iter_var_size > 0) &&
+                                (iter_var_size <= bv_hi);
+    auto recover = z3.EnterConstraint(range_constraint);
+    PrimExpr var_plus_1 = var + make_const(vt, 1);
+    PrimExpr expr_next = Substitute(expr, {{var, var_plus_1}});
+    PrimExpr stride_goal =
+        (expr_next - expr) == make_const(expr.dtype(), 1);
+    bool proved = z3.CanProve(stride_goal);
+    recover();
+    return proved;
+  } catch (...) {
+    // Conservative: any Z3 error / timeout / UNKNOWN / exception leaves
+    // the For un-vectorized.
+    return false;
+  }
+}
+
 bool IndicesCanVectorize(const PrimExpr &expr, Var var,
                          const PrimExpr &iter_var_size,
                          int target_vectorized_size,
@@ -1017,10 +1072,32 @@ bool IndicesCanVectorize(const PrimExpr &expr, Var var,
     // Broadcast value
     if (expr_vectorized.dtype().lanes() == 1)
       return true;
-    else
-      return false;
+    // CPPMEGA: Z3 idea #1 — broadcast/non-ramp shape was reached but lanes
+    // count > 1 means the access actually does depend on `var`. Try the
+    // direct Z3 unit-stride proof as a last resort before giving up.
+    if (Z3CanProveUnitStride(expr, var, iter_var_size, analyzer)) {
+      return true;
+    }
+    return false;
   } else {
-    return is_one(ramp_node->stride);
+    if (is_one(ramp_node->stride)) {
+      return true;
+    }
+    // CPPMEGA: Z3 idea #1 — ramp shape found but stride did not simplify to
+    // literal 1 (e.g. `1 + 0*x`, or stride `(k % 4) + 1` where k is provably
+    // a multiple of 4). Z3 fallback restricted to this narrow path.
+    {
+      auto &z3 = arith::Z3Prover(analyzer);
+      z3.SetTimeoutMs(50);
+      if (z3.CanProve(ramp_node->stride ==
+                      make_const(ramp_node->stride.dtype(), 1))) {
+        return true;
+      }
+    }
+    // CPPMEGA: Z3 idea #1 — final contiguity fallback on the original
+    // `expr`. Triggers when ramp-stride proof failed (timeout/unknown) but
+    // the access *is* in fact unit-stride symbolically.
+    return Z3CanProveUnitStride(expr, var, iter_var_size, analyzer);
   }
 }
 
