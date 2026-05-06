@@ -330,8 +330,15 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     if (!IsValidDType(var->dtype)) return;
     scope_stack_.back().push_back(
         Scope{Scope::BindRange, var, PrimExpr(), range->min, range->extent});
+    // CPPMEGA fix-A3: defer memoization until after the BV-range check.
+    // Previously we wrote `memo_.emplace(var, var_expr)` here unconditionally,
+    // which meant an out-of-range bind in BV mode left the var memoized at
+    // the current sort but with no range constraint asserted in the solver.
+    // A subsequent CanProve over the same var would then see a free symbol
+    // and silently skip the intended bound. Compute `var_expr` but only
+    // commit it to memo_ once we know we're going to assert the constraints.
     auto var_expr = Create(var.as<PrimExprNode>());
-    memo_.emplace(var, var_expr);
+    bool commit_memo = true;
     if (tirx_op::is_const_int(range->min) &&
         tirx_op::is_const_int(range->min + range->extent)) {
       int64_t min_value = *tirx_op::as_const_int(range->min);
@@ -356,17 +363,31 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
                            << "]. (further occurrences suppressed)";
               bv_range_warned_ = true;
             }
+            // CPPMEGA fix-A3: skip memo write entirely on out-of-range.
+            // The var stays unbound from the prover's POV; a later
+            // ConvertInt(var) will go through normal Create() codepath.
             return;
           }
         }
+        memo_.emplace(var, var_expr);
         solver.add(MakeIntVal(min_value) <= var_expr);
         solver.add(var_expr < MakeIntVal(max_value));
+        commit_memo = false;  // already committed
+      } else {
+        // Empty range — drop the memo write to avoid leaking a free var
+        // with no range. (Pre-fix-A3 we'd memoize anyway.)
+        commit_memo = false;
+        return;
       }
     } else {
+      memo_.emplace(var, var_expr);
       solver.add(ConvertBool(range->extent <= 0 ||
                              (range->min <= var &&
                               var < range->min + range->extent)));
+      commit_memo = false;
     }
+    (void)commit_memo;  // explicit: every code path that exits this
+                        // function has either committed memo or returned.
   }
 
   void SetTimeoutMs(unsigned timeout_ms_in) {
