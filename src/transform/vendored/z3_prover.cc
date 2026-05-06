@@ -1020,6 +1020,11 @@ static Z3HookRegistrar _z3_hook_registrar;
 //    bv_can_prove(var, lo, hi, expr, bv_width) -> bool
 // where `var` is bound to the half-open range [lo, hi) before the
 // proof attempt; `bv_width` is 0 / 32 / 64 (see SetBitVectorMode).
+//
+// CPPMEGA z3-stack fix-A5: gated by `TILELANG_BUILD_TESTS` (default ON).
+// Release wheels can pass `-DTILELANG_BUILD_TESTS=OFF` to drop these
+// helpers from the FFI surface.
+#ifdef TILELANG_BUILD_TESTS
 bool BvCanProve(const ::tvm::tirx::Var& var, int64_t lo, int64_t hi,
                 const ::tvm::PrimExpr& expr, int bv_width) {
   ::tvm::arith::Analyzer ana;
@@ -1063,6 +1068,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::GlobalDef().def("tl.z3.bv_can_prove", BvCanProve);
   refl::GlobalDef().def("tl.z3.bv_scoped_round_trip", BvScopedRoundTrip);
 }
+#endif  // TILELANG_BUILD_TESTS
 
 }  // namespace tlz3
 }  // namespace tilelang

@@ -261,6 +261,13 @@ else()
 endif()
 option(TILELANG_RELEASE_BUILD "Strip source paths from log messages (for wheel releases)" ${TILELANG_RELEASE_BUILD_DEFAULT})
 
+# CPPMEGA z3-stack fix-A5: gate test-only FFI surface behind a build flag
+# so we don't ship `tl.z3.bv_can_prove` / `tl.z3.bv_scoped_round_trip`
+# in release wheels (these are diagnostic helpers only used by tests).
+# Default ON to avoid breaking existing test infra; release wheels can
+# pass `-DTILELANG_BUILD_TESTS=OFF` to drop the symbols.
+option(TILELANG_BUILD_TESTS "Build test-only FFI helpers (e.g. Z3 bv probes)" ON)
+
 # Include tvm after configs have been populated
 add_subdirectory(${TVM_SOURCE} tvm EXCLUDE_FROM_ALL)
 
@@ -290,6 +297,13 @@ target_compile_options(tilelang_objs PRIVATE "-include" "${CMAKE_CURRENT_SOURCE_
 # target_compile_definitions(tilelang_objs PRIVATE TVM_LOG_CUSTOMIZE=1)
 if(TILELANG_RELEASE_BUILD)
   target_compile_definitions(tilelang_objs PRIVATE TILELANG_RELEASE_BUILD=1)
+endif()
+# CPPMEGA z3-stack fix-A5: surface TILELANG_BUILD_TESTS as a compile def
+# so source files (currently `src/transform/vendored/z3_prover.cc`) can
+# `#ifdef`-gate test-only FFI registrations. Default ON keeps existing
+# tests working unchanged.
+if(TILELANG_BUILD_TESTS)
+  target_compile_definitions(tilelang_objs PRIVATE TILELANG_BUILD_TESTS=1)
 endif()
 
 add_library(tilelang SHARED $<TARGET_OBJECTS:tilelang_objs>)
