@@ -67,7 +67,9 @@ __all__ = [
     "map_arith_extsi",
     "map_arith_extui",
     "map_arith_trunci",
+    "map_arith_constant",
     "map_tt_advance",
+    "map_tt_func",
     "map_scf_for",
     "map_scf_if",
     "map_scf_yield",
@@ -465,6 +467,384 @@ def map_tt_advance(op: Any, ctx: _om.WalkerCtx) -> Any:
     if _om._results(op):
         ctx.bind(_om._results(op)[0], new_state)
     return new_state
+
+
+# ---------------------------------------------------------------------------
+# tt.func  (block-arg seeding)  /  arith.constant  (scalar literal seeding)
+# ---------------------------------------------------------------------------
+#
+# The walker in ``triton_frontend.__init__:_walk_mlir_module`` dispatches by
+# OP_TABLE name and recurses into regions afterwards. ``tt.func`` historically
+# lived in ``_TTIR_STRUCTURAL_OPS`` (no-op skip) which meant block arguments
+# were never bound into ``ctx.value_map`` -- downstream emitters that look up
+# ``%arg0`` (e.g. ``tt.load %arg0, ...``) then KeyError'd on the operand.
+# Similarly, ``arith.constant`` was unmapped, so any kernel using ``%c0 =
+# arith.constant 0 : i32`` blew up at the first use of ``%c0``.
+#
+# We register both ops here in CONTROL_EMITTERS. The emitters do NOT recurse
+# into regions themselves -- the parent walker still owns recursion -- they
+# only seed the value_map (and ctx.buffers, for pointer-typed block args)
+# so subsequent ops can resolve their operands.
+#
+# Hard constraint per spec: arith.constant with an unsupported attr type
+# (e.g. ``dense<...>`` array splat) raises EmitError instead of guessing.
+
+
+def _ssa_name(value: Any) -> Optional[str]:
+    """Return the printed SSA name for a value (``%arg0`` / ``%c0`` / ...).
+
+    Tries, in order:
+      1. ``value.get_name()`` (real MLIR Value / BlockArgument)
+      2. ``value["name"]`` (dict-shaped fake)
+      3. ``str(value).split()[0]`` (last-ditch printable form)
+
+    Returns ``None`` when no usable name can be produced.
+    """
+    getter = getattr(value, "get_name", None)
+    if callable(getter):
+        try:
+            name = getter()
+            if name:
+                return str(name)
+        except Exception:
+            pass
+    if isinstance(value, dict):
+        nm = value.get("name")
+        if nm:
+            return str(nm)
+    try:
+        s = str(value).strip()
+        if s:
+            head = s.split(None, 1)[0]
+            return head if head else None
+    except Exception:
+        pass
+    return None
+
+
+def _type_string(value: Any) -> str:
+    """Best-effort printable type for a TTIR Value or dict-fake.
+
+    For dict-fakes we synthesize ``!tt.ptr<dtype>`` if the entry sets
+    ``"is_ptr": True`` so the same emitter logic applies in tests.
+    """
+    if isinstance(value, dict):
+        if value.get("is_ptr"):
+            elt = str(value.get("dtype", "float32"))
+            return f"!tt.ptr<{elt}>"
+        # Plain scalar / tensor: synthesize from shape + dtype.
+        shape = tuple(value.get("shape", ()))
+        dt = str(value.get("dtype", "float32"))
+        if shape:
+            return f"tensor<{'x'.join(str(s) for s in shape)}x{dt}>"
+        return dt
+    typ = getattr(value, "type", None)
+    if typ is None:
+        return ""
+    try:
+        return str(typ)
+    except Exception:
+        return ""
+
+
+def _is_ptr_type(type_str: str) -> bool:
+    s = type_str.strip()
+    return s.startswith("!tt.ptr<") or s.startswith("tt.ptr<")
+
+
+def _ptr_element_dtype(type_str: str) -> str:
+    """Extract ``f32`` from ``!tt.ptr<f32>`` (or fall back to float32)."""
+    s = type_str.strip()
+    if "<" in s and s.endswith(">"):
+        return s[s.index("<") + 1:-1].strip() or "float32"
+    return "float32"
+
+
+def _func_block_args(op: Any) -> List[Any]:
+    """Return the entry-block arguments of a ``tt.func`` op.
+
+    Real MLIR: ``op.regions[0].blocks[0].arguments``. Dict-fake: the op
+    may surface them via ``op["block_args"]`` directly.
+    """
+    if isinstance(op, dict):
+        ba = op.get("block_args")
+        if ba is not None:
+            return list(ba)
+        regions = op.get("regions") or []
+        if regions:
+            r0 = regions[0]
+            if isinstance(r0, dict):
+                return list(r0.get("block_args") or [])
+        return []
+    regions = getattr(op, "regions", ()) or ()
+    for region in regions:
+        blocks = getattr(region, "blocks", ()) or ()
+        for block in blocks:
+            return list(getattr(block, "arguments", ()) or ())
+    return []
+
+
+def map_tt_func(op: Any, ctx: _om.WalkerCtx) -> Any:
+    """Seed ``tt.func`` block arguments into ``ctx.value_map`` / ``ctx.buffers``.
+
+    Mapping summary
+    ---------------
+    * Pointer block args (``!tt.ptr<T>``): allocated as ``tir.decl_buffer``
+      shape=(?,), dtype=T, name=<ssa stripped of '%'>; bound under both
+      the SSA Value (so MLIR-walker operand lookups resolve) AND the
+      printed SSA name string (so test fixtures can introspect by name).
+    * Scalar block args (``i32`` etc.): bound as a fresh ``tir.Var`` of the
+      MLIR dtype, again under both the Value and the SSA-name string.
+
+    We deliberately do NOT recurse into the body region: the parent walker
+    (``_walk_mlir_module`` in ``triton_frontend.__init__``) handles
+    recursion already. Doing so here would double-walk the body.
+
+    Returning ``None`` keeps the walker's auto-bind logic (which only fires
+    on single-result ops with non-None return) inert -- ``tt.func`` has no
+    result SSA to bind anyway.
+    """
+    block_args = _func_block_args(op)
+    if not block_args:
+        # Nothing to seed. This is unusual but legal (e.g. zero-arg kernel)
+        # and we honour it silently rather than raising -- the walker will
+        # still recurse into the body and downstream ops with no operand
+        # references will succeed.
+        return None
+
+    tir_mod = None
+    try:
+        tir_mod = ctx.tir()
+    except Exception:
+        # TVM unavailable: we still want to seed string-keyed entries so
+        # text-walker-style fakes can introspect the value_map. We use a
+        # sentinel dict in that case.
+        tir_mod = None
+
+    for idx, arg in enumerate(block_args):
+        ssa = _ssa_name(arg) or f"%arg{idx}"
+        clean = ssa.lstrip("%") or f"arg{idx}"
+        type_str = _type_string(arg)
+
+        if _is_ptr_type(type_str):
+            elt = _normalize_dtype(_ptr_element_dtype(type_str))
+            if tir_mod is not None:
+                # Pointer block arg: allocate a placeholder buffer. Shape
+                # is symbolic (no kernel-level info available here); we
+                # use 1 -- the actual extents come from later tt.load /
+                # tt.store ops that re-decl with the right shape via the
+                # PtrAnalysis path. This matches what
+                # mlir_walker.TTIRWalker._materialize_func_args does.
+                if clean not in ctx.buffers:
+                    ctx.buffers[clean] = tir_mod.decl_buffer(
+                        shape=[1], dtype=elt, name=clean,
+                    )
+                bound = ctx.buffers[clean]
+            else:
+                bound = {"_placeholder": True, "name": clean, "dtype": elt}
+                ctx.buffers[clean] = bound
+        else:
+            # Scalar (or tensor) block arg: emit a tir.Var of the right dtype.
+            # We don't materialise tensor-shaped block args specially because
+            # Triton TTIR doesn't actually pass tensor SSAs across function
+            # boundaries -- only scalars and pointers. Normalise short MLIR
+            # spellings (``i32`` -> ``int32``) to TVM's canonical names so
+            # ``tir.Var`` doesn't reject ``i32`` as unknown.
+            dt = _normalize_dtype(type_str) if type_str else "int32"
+            if tir_mod is not None:
+                bound = tir_mod.Var(clean, dt)
+            else:
+                bound = {"_var_placeholder": True, "name": clean, "dtype": dt}
+
+        # Bind under BOTH keys so:
+        #   - downstream ops looking up the Value object (real MLIR walker
+        #     case) resolve;
+        #   - tests / introspection looking up by printed SSA name string
+        #     resolve too.
+        try:
+            ctx.bind(arg, bound)
+        except Exception:
+            # Some Value objects aren't hashable across binding shapes;
+            # the string key below still gives downstream code a way in.
+            pass
+        ctx.value_map[ssa] = bound
+
+    return None
+
+
+def _parse_value_attr(value_attr: Any) -> Tuple[str, Any]:
+    """Return ``(dtype_str, scalar_value)`` for an ``arith.constant`` value attr.
+
+    Accepted shapes
+    ---------------
+    * Real MLIR ``IntegerAttr`` / ``FloatAttr``: probed via ``.value`` and
+      ``.type``. ``dtype_str`` is taken from ``str(.type)``.
+    * Dict-shaped fake: ``{"value": <int|float>, "type": "i32"}`` or just
+      ``{"value": ..., "dtype": ...}``.
+    * Generic-form string ``"42 : i32"`` (the printed form used by the
+      MLIR generic syntax) -- split on the colon.
+
+    Raises :class:`EmitError` for anything else (e.g. ``DenseElementsAttr``,
+    ``ArrayAttr``) because silently lowering an array constant to a single
+    IntImm/FloatImm would change semantics.
+    """
+    # Real MLIR Integer/Float attr.
+    if hasattr(value_attr, "value") and hasattr(value_attr, "type"):
+        # Probe for array-attr shapes first: DenseElementsAttr exposes
+        # ``.value`` as a numpy array-ish, not a scalar. We err on the side
+        # of explicitness: any non-scalar ``.value`` raises EmitError.
+        v = value_attr.value
+        # numpy arrays / list / tuple are not supported.
+        if isinstance(v, (list, tuple)):
+            raise EmitError(
+                f"arith.constant with array attr unsupported; got: "
+                f"{value_attr!r}"
+            )
+        # numpy scalars OK; arrays not.
+        try:
+            import numpy as _np  # noqa: WPS433
+            if isinstance(v, _np.ndarray):
+                raise EmitError(
+                    f"arith.constant with array attr unsupported; got: "
+                    f"{value_attr!r}"
+                )
+        except ImportError:
+            pass
+        dtype_str = str(value_attr.type)
+        return dtype_str, v
+
+    # Dict-fake.
+    if isinstance(value_attr, dict):
+        if "value" not in value_attr:
+            raise EmitError(
+                f"arith.constant: dict attr missing 'value' field: {value_attr!r}"
+            )
+        v = value_attr["value"]
+        if isinstance(v, (list, tuple)):
+            raise EmitError(
+                f"arith.constant with array attr unsupported; got: {value_attr!r}"
+            )
+        dtype_str = str(value_attr.get("type") or value_attr.get("dtype") or "int32")
+        return dtype_str, v
+
+    # Generic-form string: ``"42 : i32"`` or ``"3.14 : f32"``.
+    if isinstance(value_attr, str):
+        s = value_attr.strip()
+        if "dense" in s.lower() or "array" in s.lower() or s.startswith("["):
+            raise EmitError(
+                f"arith.constant with array attr unsupported; got: {value_attr!r}"
+            )
+        if ":" not in s:
+            raise EmitError(
+                f"arith.constant: cannot parse value attr {value_attr!r} "
+                f"(expected '<value> : <type>')"
+            )
+        val_part, dt_part = s.rsplit(":", 1)
+        val_part = val_part.strip()
+        dtype_str = dt_part.strip()
+        # Try int first, then float.
+        try:
+            return dtype_str, int(val_part)
+        except ValueError:
+            try:
+                return dtype_str, float(val_part)
+            except ValueError as exc:
+                raise EmitError(
+                    f"arith.constant: cannot parse scalar value {val_part!r} "
+                    f"in {value_attr!r}"
+                ) from exc
+
+    raise EmitError(
+        f"arith.constant with unsupported attr type {type(value_attr).__name__}; "
+        f"got: {value_attr!r}"
+    )
+
+
+def _normalize_dtype(dtype_str: str) -> str:
+    """Canonicalise short MLIR dtype names to TVM's spelling.
+
+    ``i32`` -> ``int32``; ``f32`` -> ``float32``; ``bf16`` -> ``bfloat16``;
+    ``f16`` -> ``float16``; ``i1`` -> ``bool``. Anything else passes through
+    unchanged so already-TVM-spelled dtypes (``float32``, ``int64``) work.
+    """
+    s = dtype_str.strip()
+    aliases = {
+        "i1": "bool",
+        "bf16": "bfloat16",
+    }
+    if s in aliases:
+        return aliases[s]
+    if len(s) >= 2 and s[0] in {"i", "u"} and s[1:].isdigit():
+        prefix = "int" if s[0] == "i" else "uint"
+        return f"{prefix}{s[1:]}"
+    if len(s) >= 2 and s[0] == "f" and s[1:].isdigit():
+        return f"float{s[1:]}"
+    return s
+
+
+def map_arith_constant(op: Any, ctx: _om.WalkerCtx) -> Any:
+    """Lower ``arith.constant`` to a ``tir.IntImm`` / ``tir.FloatImm``.
+
+    Mapping summary
+    ---------------
+    * Pull the ``value`` attribute (generic form: ``<{value = N : <ty>}>``).
+    * Build ``tir.IntImm`` for integer / bool dtypes, ``tir.FloatImm`` for
+      float dtypes (after normalising short MLIR spellings to TVM's names
+      via :func:`_normalize_dtype`).
+    * Bind the result SSA into ``ctx.value_map`` under both the result
+      Value object and its printed name string.
+
+    The hard-constraint branch lives in :func:`_parse_value_attr`: an
+    ``arith.constant`` carrying an array (``dense<...>`` / ``ArrayAttr``)
+    raises :class:`EmitError` rather than silently lowering to a scalar.
+    """
+    attrs = _om._attrs(op)
+    value_attr: Any = attrs.get("value")
+    if value_attr is None:
+        # Some MLIR Python bindings (e.g. jaxlib's) hide ``arith.constant``'s
+        # ``value`` under the operation properties rather than the
+        # discardable-attributes dict that ``_attrs`` iterates. Probe the
+        # op directly for an attribute named ``value`` before giving up.
+        if not isinstance(op, dict):
+            value_attr = getattr(op, "value", None)
+            # Some bindings additionally expose the typed attribute via
+            # ``op.attributes["value"]`` even when iterating yields empty.
+            if value_attr is None:
+                op_attrs = getattr(op, "attributes", None)
+                if op_attrs is not None:
+                    try:
+                        if "value" in op_attrs:
+                            value_attr = op_attrs["value"]
+                    except Exception:
+                        pass
+    if value_attr is None:
+        raise EmitError(
+            "arith.constant: missing 'value' attribute"
+        )
+    dtype_str, scalar_val = _parse_value_attr(value_attr)
+    dtype = _normalize_dtype(dtype_str)
+
+    tir = ctx.tir()
+    if dtype == "bool" or dtype.startswith("int") or dtype.startswith("uint"):
+        const = tir.IntImm(dtype, int(scalar_val))
+    elif dtype.startswith("float") or dtype.startswith("bfloat"):
+        const = tir.FloatImm(dtype, float(scalar_val))
+    else:
+        raise EmitError(
+            f"arith.constant: unsupported dtype {dtype!r} (from {dtype_str!r})"
+        )
+
+    results = _om._results(op)
+    if results:
+        result = results[0]
+        try:
+            ctx.bind(result, const)
+        except Exception:
+            pass
+        nm = _ssa_name(result)
+        if nm:
+            ctx.value_map[nm] = const
+    return const
 
 
 # ---------------------------------------------------------------------------
@@ -1276,8 +1656,16 @@ CONTROL_EMITTERS: Dict[str, Callable[..., Any]] = {
     "arith.extsi": map_arith_extsi,
     "arith.extui": map_arith_extui,
     "arith.trunci": map_arith_trunci,
+    # arith.constant -- scalar literal (i32 / f32 / ...). Seeds value_map
+    # so downstream uses of ``%c0`` resolve via ctx.get(); raises EmitError
+    # on array (``dense<...>``) attrs rather than silently splatting.
+    "arith.constant": map_arith_constant,
     # tt.advance (block-pointer)
     "tt.advance": map_tt_advance,
+    # tt.func -- structural; seeds block-arg buffers / vars into the ctx so
+    # downstream emitters can look up ``%arg0`` via ctx.get(). The walker
+    # owns recursion into the body region itself.
+    "tt.func": map_tt_func,
     # scf
     "scf.for": map_scf_for,
     "scf.if": map_scf_if,

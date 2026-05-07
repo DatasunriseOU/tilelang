@@ -60,6 +60,50 @@ def test_kernel_numeric_pass(kernel_module: str, deps_dict) -> None:
     )
 
 
+def test_vector_add_numeric_pass_in_venv(deps_dict) -> None:
+    """Targeted assertion: vector_add must reach NUMERIC_PASS when run in
+    the Triton 3.6 / TileLang Metal / MLX venv at
+    ``/private/tmp/tl_apache_tvm_swap/.venv313`` (workstream A1/A2 venv).
+
+    Outside that venv (CI runners without the full stack) every
+    pipeline component is skipped via :data:`Verdict.SKIP`; we honour
+    that. When the deps probe reports the venv-grade stack is fully
+    importable and the kernel still falls short of NUMERIC_PASS, this
+    test fails with the precise stage so the toolchain regression is
+    obvious in CI logs.
+    """
+    if any(deps_dict[c] for c in ("triton", "tvm", "tilelang", "mlx")):
+        # At least one component is missing -- this is the legitimate
+        # SKIP case (e.g. a CI runner without Metal). The
+        # ``test_kernel_numeric_pass[vector_add]`` parametrize covers
+        # the SKIP path; nothing further to verify here.
+        pytest.skip(
+            "venv-grade stack not fully importable: "
+            + ", ".join(f"{k}={v}" for k, v in deps_dict.items() if v)
+        )
+
+    result = numeric_smoke.run_one("vector_add", deps_dict)
+
+    if result.verdict == Verdict.NUMERIC_PASS:
+        # Cross-check: numeric tolerances must satisfy the kernel's atol.
+        from poc.triton_frontend._test_harness.numeric_kernels import (
+            vector_add as va,
+        )
+
+        assert result.max_abs_err is not None
+        assert result.max_abs_err <= va.ATOL, (
+            f"vector_add NUMERIC_PASS but max_abs_err={result.max_abs_err} "
+            f"exceeds kernel ATOL={va.ATOL}"
+        )
+        return
+
+    pytest.fail(
+        f"vector_add expected NUMERIC_PASS in venv313; got "
+        f"verdict={result.verdict} detail={result.detail!r} "
+        f"max_abs={result.max_abs_err}"
+    )
+
+
 def test_run_all_writes_report(tmp_path) -> None:
     """``run_all`` writes a markdown report at the requested path.
 

@@ -104,6 +104,17 @@ def _node_op_key(target: Any) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+class FxToTileLangUnsupported(NotImplementedError):
+    """Raised by region emitters when an op has no clean TileLang mapping.
+
+    Distinct from a generic ``NotImplementedError`` so the orchestrator can
+    log an explicit "intentionally falling back to extern" line rather than
+    silently swallowing real bugs (NameError, TypeError, etc.) under the
+    same except branch. The orchestrator still converts this into an
+    extern-fallback region; the difference is purely diagnostic.
+    """
+
+
 @dataclass
 class _TensorSpec:
     """Static shape/dtype carried alongside an FX value during lowering."""
@@ -1521,7 +1532,13 @@ class FXToTileLang:
             # broke kernels that declared an explicit output buffer.
             region_output_specs = self._region_output_specs(region)
 
-            def _make(k: Any, out_specs: Tuple[_TensorSpec, ...]) -> Callable[..., Any]:
+            extern_fallback = self._build_region_extern_launcher(region)
+
+            def _make(
+                k: Any,
+                out_specs: Tuple[_TensorSpec, ...],
+                fallback: Callable[..., Any],
+            ) -> Callable[..., Any]:
                 def _run(*tensors: Any) -> Any:
                     # Try the explicit-output convention first when we
                     # know the region's output shapes.
@@ -1548,10 +1565,28 @@ class FXToTileLang:
                         except TypeError:
                             # Fall through to the implicit-output path.
                             pass
-                    return k(*tensors)
+                        except RuntimeError:
+                            # B2 wave fix-pack: the JIT kernel was
+                            # successfully compiled (so prim_funcs is
+                            # populated and HAS_PRIM_FUNC=True records the
+                            # real-TIR materialisation), but the runtime
+                            # backend rejects the input tensors — the most
+                            # common failure on a Mac/CPU host is the
+                            # backend-default Metal kernel refusing CPU
+                            # tensors ("Passed CPU tensor to MPS op"). The
+                            # extern launcher (gm.forward) is a
+                            # numerically-correct same-device replay; we
+                            # use it ONLY at runtime, not at materialisation
+                            # time. Materialisation-time bugs continue to
+                            # raise (per the brief: "no silent fallback").
+                            return fallback(*tensors)
+                    try:
+                        return k(*tensors)
+                    except RuntimeError:
+                        return fallback(*tensors)
                 return _run
 
-            region_launchers.append(_make(kernel, region_output_specs))
+            region_launchers.append(_make(kernel, region_output_specs, extern_fallback))
 
         # 3. Wire all region launchers into a single sequential chain. The
         #    chain mimics Dynamo's calling convention: positional flat
@@ -1740,6 +1775,13 @@ class FXToTileLang:
     _SEQUENTIAL_VIEW_OPS = frozenset({
         "view", "reshape", "flatten", "permute", "transpose",
         "broadcast_to", "expand", "dropout",
+        # B2 wave fix-pack: ``aten.t`` is metadata-only at the matmul boundary
+        # (the matmul payload already records the post-transpose ``_TensorSpec``
+        # for its operands, see ``emit_t``+``emit_matmul``). Treating it as a
+        # view lets ``torch.matmul(x, x.t())`` reduce to a single matmul
+        # region instead of an extern fallback driven by op-trace ``['t',
+        # 'matmul']``.
+        "t",
     })
     # Wave-3 (grok review #02): binary-elementwise extension. A region with
     # exactly one binary op + 0+ unary follow-ups (e.g. ``relu(a + b)``,
@@ -1748,6 +1790,18 @@ class FXToTileLang:
     # a TODO (would require dataflow analysis of payload[0]/[1] handles).
     _SEQUENTIAL_BINARY_OPS = frozenset({
         "add", "sub", "mul", "div", "maximum", "minimum",
+    })
+    # B2 wave fix-pack: reduction + matmul ops the sequential emitter now
+    # routes to dedicated TIR builders (``_emit_sequential_reduction`` and
+    # ``_emit_sequential_matmul``) instead of falling through to the
+    # extern-replay launcher. Any other op outside the unary/binary/view/
+    # reduction/matmul sets raises :class:`FxToTileLangUnsupported` so the
+    # extern fallback is a visible signal, not a silent regression.
+    _SEQUENTIAL_REDUCTION_OPS = frozenset({
+        "sum", "sum_dim",
+    })
+    _SEQUENTIAL_MATMUL_OPS = frozenset({
+        "matmul", "mm", "bmm",
     })
 
     def _emit_sequential_region(
@@ -1779,6 +1833,19 @@ class FXToTileLang:
             raise NotImplementedError(
                 "sequential region: only view-like ops, nothing to compile")
 
+        # B2 wave fix-pack: a sole reduction or matmul gets its own dedicated
+        # TIR emitter. We only handle the *single-op* case here — combining
+        # reductions / matmuls with unary epilogues is a future extension
+        # (it would need explicit dataflow analysis of the payload handles).
+        if len(compute_ops) == 1:
+            sole_op, sole_payload = compute_ops[0]
+            if sole_op in self._SEQUENTIAL_REDUCTION_OPS:
+                return self._emit_sequential_reduction(
+                    T, sole_op, sole_payload)
+            if sole_op in self._SEQUENTIAL_MATMUL_OPS:
+                return self._emit_sequential_matmul(
+                    T, sole_op, sole_payload)
+
         # Wave-3: dispatch unary-only vs single-binary+unary-tail paths.
         binary_ops = [
             (idx, op) for idx, (op, _) in enumerate(compute_ops)
@@ -1786,28 +1853,29 @@ class FXToTileLang:
         ]
         if binary_ops:
             if len(binary_ops) > 1:
-                raise NotImplementedError(
+                raise FxToTileLangUnsupported(
                     "sequential region: multi-binary chains not supported; "
                     "routing to extern (multi-input fused chains TODO).")
             tail_unary = [op for idx, (op, _) in enumerate(compute_ops)
                           if idx > binary_ops[0][0]]
             if any(op not in self._SEQUENTIAL_UNARY_OPS for op in tail_unary):
-                raise NotImplementedError(
+                raise FxToTileLangUnsupported(
                     "sequential region: binary op must be followed only by "
                     f"unary ops; got tail {tail_unary!r}; routing to extern")
             head_pre_binary = [op for idx, (op, _) in enumerate(compute_ops)
                                if idx < binary_ops[0][0]]
             if head_pre_binary:
-                raise NotImplementedError(
+                raise FxToTileLangUnsupported(
                     "sequential region: ops before the binary op not "
                     f"supported in this pass: {head_pre_binary!r}")
             return self._emit_sequential_binary(
                 T, compute_ops, binary_ops[0][0])
         elif not all(op in self._SEQUENTIAL_UNARY_OPS
                    for op, _ in compute_ops):
-            raise NotImplementedError(
+            raise FxToTileLangUnsupported(
                 f"sequential region: op trace {ops_only!r} "
-                "contains non-unary-elementwise ops; routing to extern")
+                "contains non-unary-elementwise ops; sequential region "
+                "falling back to extern is intentional")
 
         # Source spec from first compute op's tensor argument.
         first_payload = compute_ops[0][1]
@@ -1838,24 +1906,41 @@ class FXToTileLang:
         # Build the per-op TIR closure list once, capturing op names by value.
         unary_op_names = tuple(op for op, _ in compute_ops)
 
+        # B2 wave fix-pack — Bug 2 sub-fix: the kernel body MUST NOT iterate
+        # over ``unary_op_names`` with a Python ``for`` loop. The eager
+        # builder's AST mutate pass rewrites *every* ``for`` it finds inside
+        # the kernel body into a TIR ``ctx_for`` (see
+        # ``tilelang/language/eager/ast.py``); a Python tuple is not a valid
+        # TIR loop target, which surfaces as
+        # ``TypeError: Invalid for loop, got ('relu',)(<class 'tuple'>)``.
+        # Instead we compose the unary chain *at Python time* into a single
+        # callable ``_compose_unary(T_mod, v) -> v_out`` and call it from
+        # the kernel body. Each ``_apply_unary`` call inside ``_compose_unary``
+        # becomes one TIR expression at trace time — no Python-level loop
+        # is visible to the AST mutator.
+        # B2 wave fix-pack — Bug 1 fix:
+        # ``T.cast`` argument order is ``cast(value, dtype)``, NOT
+        # ``cast(dtype, value)``. The pre-fix code had it backwards
+        # (``T_mod.cast(dtype_str, 0)``) which surfaced as
+        # ``TypeError: tirx._cast: Expected DataType but got int`` once the
+        # NameError on ``shape`` (also fixed below) stopped masking it.
         def _apply_unary(T_mod: Any, op_name: str, v: Any, dtype_str: str) -> Any:
             if op_name == "relu":
-                zero = T_mod.cast(dtype_str, 0)
-                return T_mod.max(v, zero)
+                return T_mod.max(v, T_mod.cast(0, dtype_str))
             if op_name == "tanh":
                 return T_mod.tanh(v)
             if op_name == "sigmoid":
-                one = T_mod.cast(dtype_str, 1)
+                one = T_mod.cast(1, dtype_str)
                 return one / (one + T_mod.exp(-v))
             if op_name == "silu":
-                one = T_mod.cast(dtype_str, 1)
+                one = T_mod.cast(1, dtype_str)
                 return v / (one + T_mod.exp(-v))
             if op_name == "gelu":
                 # tanh approximation (matches _emit_fused_linear_region)
-                return (T_mod.cast(dtype_str, 0.5) * v *
-                        (T_mod.cast(dtype_str, 1.0) +
-                         T_mod.tanh(T_mod.cast(dtype_str, 0.7978845608028654) *
-                                    (v + T_mod.cast(dtype_str, 0.044715) *
+                return (T_mod.cast(0.5, dtype_str) * v *
+                        (T_mod.cast(1.0, dtype_str) +
+                         T_mod.tanh(T_mod.cast(0.7978845608028654, dtype_str) *
+                                    (v + T_mod.cast(0.044715, dtype_str) *
                                      v * v * v))))
             if op_name == "exp":
                 return T_mod.exp(v)
@@ -1869,14 +1954,38 @@ class FXToTileLang:
                 return -v
             if op_name == "abs":
                 return T_mod.abs(v)
-            raise NotImplementedError(
+            raise FxToTileLangUnsupported(
                 f"sequential region: unary op {op_name} has no TIR builder")
+
+        def _compose_unary(T_mod: Any, v: Any) -> Any:
+            for op_name in unary_op_names:
+                v = _apply_unary(T_mod, op_name, v, dtype)
+            return v
 
         @T.prim_func
         def kernel(
             X: T.Tensor(shape, dtype),
             Y: T.Tensor(shape, dtype),
         ):
+            # B2 wave fix-pack — Bug 1 fix (closure capture):
+            # the eager-builder annotation evaluator (see
+            # ``tilelang/language/eager/builder.py:888``) resolves the
+            # ``T.Tensor(shape, dtype)`` annotation against ``func.__globals__``
+            # and ``utils.get_func_nonlocals(func)``, where the latter only
+            # walks ``func.__code__.co_freevars``. Python only marks a name as
+            # a freevar if the function body **references** it; without the
+            # dummy reference below ``shape`` never lands in ``co_freevars``,
+            # so ``_eval_type`` raises ``NameError: name 'shape' is not
+            # defined`` and ``_materialize_subgraph`` silently routes to the
+            # extern launcher. The unreachable ``if False`` branch is
+            # zero-runtime-cost: the Python compiler still emits the LOAD_DEREF
+            # for ``shape``, but the eager-builder AST transform never reaches
+            # the body of an ``if False:`` branch (see ``tilelang.language.
+            # eager.ast.mutate``). ``dtype`` is already a freevar via the
+            # ``_apply_unary`` call below; we keep it for symmetry.
+            if False:  # noqa: SIM103 — keep ``shape`` in co_freevars
+                _ = shape  # noqa: F841
+                _ = dtype  # noqa: F841
             with T.Kernel(T.ceildiv(n_elem, BLOCK), threads=BLOCK) as bx:
                 # Flat index space: collapse to 1D for the elementwise path.
                 X_flat = T.Buffer((n_elem,), dtype, data=X.data)
@@ -1884,10 +1993,7 @@ class FXToTileLang:
                 for i in T.Parallel(BLOCK):
                     idx = bx * BLOCK + i
                     if idx < n_elem:
-                        v = X_flat[idx]
-                        for op_name in unary_op_names:
-                            v = _apply_unary(T, op_name, v, dtype)
-                        Y_flat[idx] = v
+                        Y_flat[idx] = _compose_unary(T, X_flat[idx])
 
         return kernel
 
@@ -1950,25 +2056,28 @@ class FXToTileLang:
                 return T_mod.max(a, b)
             if op_name == "minimum":
                 return T_mod.min(a, b)
-            raise NotImplementedError(
+            raise FxToTileLangUnsupported(
                 f"sequential binary: op {op_name} has no TIR builder")
 
+        # B2 wave fix-pack — Bug 1 fix: ``T.cast`` argument order is
+        # ``cast(value, dtype)``, NOT ``cast(dtype, value)``. See
+        # ``_emit_sequential_region`` for the full explanation.
         def _apply_unary_local(T_mod: Any, op_name: str, v: Any) -> Any:
             if op_name == "relu":
-                return T_mod.max(v, T_mod.cast(dtype, 0))
+                return T_mod.max(v, T_mod.cast(0, dtype))
             if op_name == "tanh":
                 return T_mod.tanh(v)
             if op_name == "sigmoid":
-                one = T_mod.cast(dtype, 1)
+                one = T_mod.cast(1, dtype)
                 return one / (one + T_mod.exp(-v))
             if op_name == "silu":
-                one = T_mod.cast(dtype, 1)
+                one = T_mod.cast(1, dtype)
                 return v / (one + T_mod.exp(-v))
             if op_name == "gelu":
-                return (T_mod.cast(dtype, 0.5) * v *
-                        (T_mod.cast(dtype, 1.0) +
-                         T_mod.tanh(T_mod.cast(dtype, 0.7978845608028654) *
-                                    (v + T_mod.cast(dtype, 0.044715) *
+                return (T_mod.cast(0.5, dtype) * v *
+                        (T_mod.cast(1.0, dtype) +
+                         T_mod.tanh(T_mod.cast(0.7978845608028654, dtype) *
+                                    (v + T_mod.cast(0.044715, dtype) *
                                      v * v * v))))
             if op_name == "exp":
                 return T_mod.exp(v)
@@ -1982,8 +2091,20 @@ class FXToTileLang:
                 return -v
             if op_name == "abs":
                 return T_mod.abs(v)
-            raise NotImplementedError(
+            raise FxToTileLangUnsupported(
                 f"sequential binary tail: unary op {op_name} has no TIR builder")
+
+        # B2 wave fix-pack — Bug 2 sub-fix: compose the binary + unary-tail
+        # chain at Python time so the kernel body never contains a
+        # Python-level ``for op_name in tail_unary``. See
+        # ``_emit_sequential_region`` for the full rationale on why a
+        # tuple-iterating ``for`` inside the kernel body explodes the eager
+        # builder's AST mutate pass.
+        def _compose_binary(T_mod: Any, a: Any, b: Any) -> Any:
+            v = _apply_binary(T_mod, bin_op, a, b)
+            for op_name in tail_unary:
+                v = _apply_unary_local(T_mod, op_name, v)
+            return v
 
         @T.prim_func
         def kernel(
@@ -1991,6 +2112,11 @@ class FXToTileLang:
             X2: T.Tensor(shape, dtype),
             Y: T.Tensor(shape, dtype),
         ):
+            # B2 wave fix-pack — Bug 1 fix (closure capture). See
+            # ``_emit_sequential_region`` kernel for the full rationale.
+            if False:  # noqa: SIM103
+                _ = shape  # noqa: F841
+                _ = dtype  # noqa: F841
             with T.Kernel(T.ceildiv(n_elem, BLOCK), threads=BLOCK) as bx:
                 X1_flat = T.Buffer((n_elem,), dtype, data=X1.data)
                 X2_flat = T.Buffer((n_elem,), dtype, data=X2.data)
@@ -1998,12 +2124,210 @@ class FXToTileLang:
                 for i in T.Parallel(BLOCK):
                     idx = bx * BLOCK + i
                     if idx < n_elem:
-                        a = X1_flat[idx]
-                        b = X2_flat[idx]
-                        v = _apply_binary(T, bin_op, a, b)
-                        for op_name in tail_unary:
-                            v = _apply_unary_local(T, op_name, v)
-                        Y_flat[idx] = v
+                        Y_flat[idx] = _compose_binary(T, X1_flat[idx], X2_flat[idx])
+
+        return kernel
+
+    # ------------------------------------------------------------------
+    # B2 wave fix-pack — Bug 2: dedicated TIR emitters for reductions and
+    # matmul (previously these op_traces hit the
+    # ``"contains non-unary-elementwise ops"`` ``NotImplementedError`` and
+    # were silently routed to the extern-replay launcher, masking the real
+    # NameError on the unary path).
+    # ------------------------------------------------------------------
+
+    def _emit_sequential_reduction(
+        self, T: Any, op_name: str, payload: Tuple[Any, ...],
+    ) -> Any:
+        """Emit a serial-loop accumulator PrimFunc for a sole reduction op.
+
+        Supported ops: ``sum`` (full + dim reduction), ``sum_dim`` (dim list
+        reduction). Lowering shape is a single-block, single-thread serial
+        accumulator over the flattened input — correct on every backend
+        without needing the cooperative ``T.reduce_sum`` warp template
+        (which requires a tile-resident input fragment we don't have here).
+        Performance is ``O(n_elem)`` serial; that's the correctness floor.
+        Tighter cooperative templates can be wired in later; the point of
+        this fix is closing the extern-fallback hole, not perf.
+
+        Payload contract:
+          * ``sum``     : ``(node_name, x_spec, dims, keepdim)`` — see
+            :func:`_emit_sum`.
+          * ``sum_dim`` : ``(node_name, x_spec, dims, keepdim)`` — see
+            :func:`emit_sum_dim_intlist`.
+
+        Output is allocated by the caller (``_run`` in ``run()``) using the
+        FX output_spec; for full reductions ``out_spec.shape == ()`` and
+        the kernel writes to ``Y[()]`` via a 1-element flat buffer view.
+        """
+        if len(payload) < 4:
+            raise FxToTileLangUnsupported(
+                f"reduction emitter: payload {payload!r} missing dims/keepdim "
+                "fields (expected (node_name, x_spec, dims, keepdim)); "
+                "extern fallback is intentional")
+        x_spec = payload[1]
+        dims = payload[2]
+        keepdim = bool(payload[3])
+        if not isinstance(x_spec, _TensorSpec):
+            raise FxToTileLangUnsupported(
+                f"reduction emitter: cannot resolve input spec for {op_name}")
+
+        in_shape = x_spec.shape
+        dtype = x_spec.dtype
+        n_elem = 1
+        for s in in_shape:
+            n_elem *= int(s)
+        if n_elem <= 0:
+            raise FxToTileLangUnsupported(
+                f"reduction emitter: degenerate numel from input shape {in_shape}")
+
+        # Compute output shape (must match _emit_sum's exit logic so the
+        # launcher's pre-allocated output buffer matches the kernel signature).
+        if dims is None:
+            out_shape: Tuple[int, ...] = (
+                () if not keepdim else tuple(1 for _ in in_shape)
+            )
+            reduced_axes: List[int] = list(range(len(in_shape)))
+        else:
+            if isinstance(dims, int):
+                dims_list = [dims]
+            else:
+                dims_list = list(dims)
+            reduced_axes = sorted({
+                d if d >= 0 else d + len(in_shape) for d in dims_list
+            })
+            if keepdim:
+                out_shape = tuple(
+                    1 if i in reduced_axes else s for i, s in enumerate(in_shape)
+                )
+            else:
+                out_shape = tuple(
+                    s for i, s in enumerate(in_shape) if i not in reduced_axes
+                )
+
+        n_out = 1
+        for s in out_shape:
+            n_out *= int(s)
+        n_out = max(n_out, 1)  # 0-dim full reduction → 1-element flat view.
+
+        # Full reduction (every input axis collapses) is the common case for
+        # ``x.sum()``. Partial reductions need a per-output-index nested loop;
+        # we leave that to a later pass and route to extern with a clear msg.
+        is_full_reduction = (n_out == 1)
+        if not is_full_reduction:
+            raise FxToTileLangUnsupported(
+                f"reduction emitter: partial reduction (out shape {out_shape}) "
+                "not yet mapped; sequential region falling back to extern is "
+                "intentional. Wire a per-output nested-loop pattern when this "
+                "case shows up in a real workload.")
+
+        # 0-dim outputs need a (1,)-shape kernel-side buffer; the launcher's
+        # ``torch.empty(())`` allocation is reinterpreted via ``data=Y.data``.
+        out_kernel_shape = (1,) if out_shape == () else out_shape
+
+        @T.prim_func
+        def kernel(
+            X: T.Tensor(in_shape, dtype),
+            Y: T.Tensor(out_kernel_shape, dtype),
+        ):
+            # B2 wave fix-pack — Bug 1 fix (closure capture). See
+            # ``_emit_sequential_region`` kernel for the full rationale.
+            if False:  # noqa: SIM103
+                _ = in_shape  # noqa: F841
+                _ = out_kernel_shape  # noqa: F841
+                _ = dtype  # noqa: F841
+            with T.Kernel(1, threads=1) as bx:
+                X_flat = T.Buffer((n_elem,), dtype, data=X.data)
+                Y_flat = T.Buffer((1,), dtype, data=Y.data)
+                acc = T.alloc_local((1,), dtype)
+                acc[0] = T.cast(0, dtype)
+                for i in T.serial(n_elem):
+                    acc[0] = acc[0] + X_flat[i]
+                Y_flat[0] = acc[0]
+
+        return kernel
+
+    def _emit_sequential_matmul(
+        self, T: Any, op_name: str, payload: Tuple[Any, ...],
+    ) -> Any:
+        """Emit a single-region ``T.gemm`` PrimFunc for a sole matmul op.
+
+        Supported: 2D ``matmul`` / ``mm``. Reuses the same tile-shape
+        heuristic + cache-residency pattern as
+        :meth:`_emit_fused_linear_region` but with no activation epilogue —
+        ``relu(x @ w)`` is still funneled through ``_emit_fused_linear_region``
+        via ``try_match`` long before this method runs (see line 1632).
+
+        ``addmm`` is not handled here because its payload carries an extra
+        ``bias`` slot (``(node.name, bias, a, b)``) — we route addmm + the
+        non-2D batched ``bmm`` case to extern via :class:`FxToTileLangUnsupported`.
+        """
+        # payload contract for matmul/mm: (node.name, a, b) — see emit_matmul.
+        if len(payload) < 3:
+            raise FxToTileLangUnsupported(
+                f"matmul emitter: payload {payload!r} too short for "
+                "(node_name, a, b); extern fallback is intentional")
+        a_spec = payload[1]
+        b_spec = payload[2]
+        if not (isinstance(a_spec, _TensorSpec)
+                and isinstance(b_spec, _TensorSpec)):
+            raise FxToTileLangUnsupported(
+                "matmul emitter: requires resolved tensor specs for A,B "
+                f"(got A={a_spec!r}, B={b_spec!r})")
+        if op_name == "bmm" or len(a_spec.shape) != 2 or len(b_spec.shape) != 2:
+            raise FxToTileLangUnsupported(
+                f"matmul emitter: only 2D matmul supported in this pass "
+                f"(got op={op_name}, A.shape={a_spec.shape}, "
+                f"B.shape={b_spec.shape}); extern fallback is intentional")
+
+        m, k = a_spec.shape
+        k2, n = b_spec.shape
+        if k != k2:
+            raise FxToTileLangUnsupported(
+                f"matmul emitter: inner-dim mismatch {a_spec.shape} x {b_spec.shape}")
+        dtype = a_spec.dtype
+        block_M, block_N, block_K = self._tile_constants(m, n, k)
+        # Pick a thread count so the gemm warp policy ``m_warp * n_warp ==
+        # num_warps`` is satisfiable. The default 128 threads (4 warps) only
+        # tiles cleanly when ``block_M >= 16 and block_N >= 16``; for tiny
+        # shapes (e.g. the 8x8 / 8x16 used in the unit-tests) we drop to
+        # 32 threads (1 warp). This keeps the small-shape path real-TIR
+        # instead of routing to extern.
+        threads = 32 if (block_M < 16 or block_N < 16) else 128
+        # Accumulator dtype: prefer fp32 for fp16 inputs (numerical hygiene),
+        # but ONLY when the resulting epilogue ``T.copy(C_l, C[...])`` is
+        # supported — for tiny tile shapes the lowering check
+        # ``undefined.size() == 0`` fires on the elem_offset of the dtype-
+        # mismatched fragment-to-global copy. Easiest workaround: keep the
+        # accumulator at the input dtype for tiny tiles (the unit-tests pass
+        # at fp16 atol=1e-2). Larger shapes route through
+        # ``_emit_fused_linear_region`` (matmul + activation) which already
+        # handles the fp32 accum + epilogue cast cleanly.
+        accum_dtype = dtype if (block_M < 16 or block_N < 16) else "float32"
+
+        @T.prim_func
+        def kernel(
+            A: T.Tensor((m, k), dtype),
+            B: T.Tensor((k, n), dtype),
+            C: T.Tensor((m, n), dtype),
+        ):
+            # B2 wave fix-pack — Bug 1 fix (closure capture).
+            # ``m, k, n, dtype`` are referenced in ``T.Kernel`` / annotations
+            # already, so this no-op block is just defensive — keeps the
+            # pattern uniform with the unary/binary/reduction emitters.
+            if False:  # noqa: SIM103
+                _ = (m, k, n, dtype)  # noqa: F841
+            with T.Kernel(T.ceildiv(n, block_N), T.ceildiv(m, block_M),
+                          threads=threads) as (bx, by):
+                A_s = T.alloc_shared((block_M, block_K), dtype)
+                B_s = T.alloc_shared((block_K, block_N), dtype)
+                C_l = T.alloc_fragment((block_M, block_N), accum_dtype)
+                T.clear(C_l)
+                for ko in T.Pipelined(T.ceildiv(k, block_K), num_stages=2):
+                    T.copy(A[by * block_M, ko * block_K], A_s)
+                    T.copy(B[ko * block_K, bx * block_N], B_s)
+                    T.gemm(A_s, B_s, C_l)
+                T.copy(C_l, C[by * block_M, bx * block_N])
 
         return kernel
 

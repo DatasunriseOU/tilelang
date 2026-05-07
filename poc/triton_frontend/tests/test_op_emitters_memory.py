@@ -19,7 +19,7 @@ Coverage:
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 import pytest
 
@@ -44,6 +44,38 @@ from poc.triton_frontend.op_mapping import WalkerCtx  # noqa: E402
 
 def _fake_value(name: str, *, shape: List[int] = (), dtype: str = "float32") -> Dict[str, Any]:
     return {"name": name, "shape": tuple(shape), "dtype": dtype}
+
+
+class _HashableSSA(dict):
+    """Hashable dict-shaped SSA fixture.
+
+    The legacy ``_fake_value`` returns a plain ``dict`` which the old
+    ``WalkerCtx.bind`` happily accepted (TVM's value_map used to allow
+    unhashable keys via a list-of-pairs lookup). ``WalkerCtx.bind`` now
+    indexes ``self.value_map[ssa_value]`` directly, so a plain dict keys
+    raise ``TypeError: unhashable type: 'dict'`` -- exactly the symptom
+    that took the existing test suite offline.
+
+    The fix that's compatible with every emitter helper (``_shape_of``
+    / ``_dtype_of`` / ``_ssa_name`` -- all of them check ``isinstance(v,
+    dict)``) is a tiny ``dict`` subclass that overrides ``__hash__`` to
+    use ``id()``. It is still a real dict so the helpers see the
+    ``shape`` / ``dtype`` / ``name`` keys; ``bind`` is happy because
+    ``hash(_HashableSSA(...))`` returns an int.
+    """
+
+    __slots__ = ()
+
+    def __hash__(self) -> int:  # type: ignore[override]
+        return id(self)
+
+    def __eq__(self, other: object) -> bool:  # type: ignore[override]
+        return self is other
+
+
+def _ssa(name: str, *, shape: Sequence[int] = (), dtype: str = "float32") -> _HashableSSA:
+    """Hashable counterpart to ``_fake_value`` for tests that need ``ctx.bind``."""
+    return _HashableSSA(name=name, shape=tuple(shape), dtype=dtype)
 
 
 def _stringify(node: Any) -> str:
@@ -285,3 +317,187 @@ def test_memory_emitters_table_keys() -> None:
 def test_has_cxx_shim_returns_bool() -> None:
     """``has_cxx_shim()`` returns a real bool (not None / dict)."""
     assert isinstance(has_cxx_shim(), bool)
+
+
+# ---------------------------------------------------------------------------
+# Regression: generic-form Triton 3.6 attribute parsing for ``tt.make_range``.
+# ---------------------------------------------------------------------------
+#
+# When the harness rounds the captured TTIR through the C++ shim's
+# ``to_generic()`` and re-parses it with jaxlib's ``mlir.ir`` (which only
+# supports ``allow_unregistered_dialects``), the ``<{end = 256, start = 0}>``
+# block stays as Properties storage. jaxlib does NOT surface property
+# values via ``op.attributes`` for unregistered dialects, so the legacy
+# helper :func:`poc.triton_frontend.op_mapping._attrs` returns ``{}`` and
+# the emitter computed a degenerate ``[0, 0)`` range -> ``ValueError``.
+#
+# The fix in ``op_emitters/memory.py`` introduces ``_attrs_with_properties``,
+# which falls back to parsing the printed ``<{...}>`` block out of
+# ``str(op)`` when the dict-shaped accessor comes back empty.
+
+
+def test_make_range_parses_generic_form_attrs() -> None:
+    """Generic-form attrs (``<{start = 0, end = 256}>``) lower to a 256-lane Ramp.
+
+    We cover the dict-shape form here (the synthetic op the bug report
+    handed us); the textual ``<{...}>`` parser is exercised separately
+    via ``test_make_range_parses_real_mlir_properties`` below.
+    """
+    ctx = WalkerCtx()
+    out = _ssa("range_out", shape=[256], dtype="int32")
+    op = {
+        "name": "tt.make_range",
+        "operands": [],
+        "results": [out],
+        # Mirrors the dict produced by the walker after extracting the
+        # ``<{end = 256 : i32, start = 0 : i32}>`` properties block.
+        "attrs": {"start": 0, "end": 256},
+    }
+    out_node = emit_tt_make_range(op, ctx)
+    # The bug surfaced as ``Ramp(0, 1, 0)`` -- a degenerate range that
+    # raised ``ValueError: end < start`` from inside the emitter. After
+    # the fix, 256 lanes exceeds the vector-width cap (128) so the
+    # emitter spills to a serial ``tir.For`` over a 256-element buffer.
+    # The structural invariant the regression proves out is "lanes is
+    # 256, not 0" -- we check that on whichever shape the emitter chose
+    # (Ramp for narrow, Buffer for spilled).
+    if isinstance(out_node, tvm.tir.Ramp):
+        assert int(out_node.lanes) == 256
+        assert int(out_node.base) == 0
+        assert int(out_node.stride) == 1
+    elif isinstance(out_node, tvm.tir.Buffer):
+        assert int(out_node.shape[0]) == 256, (
+            f"spilled buffer must have 256 elements; got shape={out_node.shape}"
+        )
+        # And the For loop driving the spill must have been emitted.
+        text = _stringify(ctx.stmts)
+        assert "for " in text.lower(), (
+            f"expected serial For driving the spill; got {text!r}"
+        )
+    else:
+        raise AssertionError(
+            f"expected tir.Ramp or tir.Buffer; got {type(out_node).__name__}"
+        )
+
+
+def test_make_range_parses_real_mlir_properties() -> None:
+    """Parse a real generic-form MLIR op whose properties ARE textual-only.
+
+    Uses jaxlib's ``mlir.ir`` to construct an op with the exact
+    ``<{end = 256, start = 0}>`` printed shape Triton 3.6 emits. The
+    jaxlib bindings expose properties through ``str(op)`` but NOT through
+    ``op.attributes`` (the latter is empty for unregistered dialects);
+    the emitter's ``_attrs_with_properties`` helper recovers the values
+    by parsing the printed assembly.
+    """
+    ir = pytest.importorskip("jaxlib.mlir.ir")
+
+    text = (
+        "module {\n"
+        '  "tt.make_range"() <{end = 256 : i32, start = 0 : i32}>'
+        " : () -> tensor<256xi32>\n"
+        "}"
+    )
+    mctx = ir.Context()
+    mctx.allow_unregistered_dialects = True
+    with mctx, ir.Location.unknown(mctx):
+        mod = ir.Module.parse(text, mctx)
+
+    target_op = None
+    for region in mod.operation.regions:
+        for block in region.blocks:
+            for child in block.operations:
+                if getattr(child, "name", None) == "tt.make_range":
+                    target_op = child
+                    break
+
+    assert target_op is not None, "did not find tt.make_range in parsed module"
+    # Sanity: confirm the legacy attrs accessor is empty -- this is the
+    # exact regression precondition the helper now compensates for.
+    assert len(list(target_op.attributes)) == 0, (
+        "test precondition violated: jaxlib now surfaces properties via "
+        ".attributes (would mean the regression cannot reproduce here)"
+    )
+
+    ctx = WalkerCtx()
+    out_node = emit_tt_make_range(target_op, ctx)
+    # 256 lanes spills past the default vector cap (128) -> Buffer
+    # backed by a serial For. The regression-preventing invariant is
+    # "we got 256 elements out, not 0".
+    if isinstance(out_node, tvm.tir.Ramp):
+        assert int(out_node.lanes) == 256
+        assert int(out_node.base) == 0
+    else:
+        assert isinstance(out_node, tvm.tir.Buffer)
+        assert int(out_node.shape[0]) == 256
+
+
+def test_load_handles_f32_dtype_string() -> None:
+    """``tt.load`` over a ``tensor<256xf32>`` operand must NOT raise ``unknown dtype 'f32'``.
+
+    The MLIR generic-form prints scalar element types using the short
+    spelling (``f32``), which TVM's ``tir.decl_buffer`` rejects with
+    ``ValueError: unknown dtype 'f32'``. The fix to ``_dtype_of`` in
+    ``op_mapping.py`` normalises the alias map (``f32 -> float32``,
+    ``i32 -> int32``, ...) so emitters that thread the dtype through
+    ``tir.decl_buffer`` keep working with both shapes.
+    """
+    ctx = WalkerCtx()
+    # The ``dtype`` here is the SHORT MLIR spelling -- exactly what
+    # ``_dtype_of`` returned before the fix when the result type was
+    # printed in generic form.
+    ptr_ssa = _ssa("ptr_in", shape=[], dtype="f32")
+    out_ssa = _ssa("loaded", shape=[256], dtype="f32")
+
+    # Bind the pointer to a real buffer with the SHORT dtype too -- mimics
+    # the state that ``map_tt_func`` would leave us in when it received
+    # generic-form ``!tt.ptr<f32>`` block-arg types from the walker.
+    buf = tvm.tir.decl_buffer([256], "float32", name="A")
+    ctx.bind(ptr_ssa, buf)
+    op = {
+        "name": "tt.load",
+        "operands": [ptr_ssa],
+        "results": [out_ssa],
+        "attrs": {},
+    }
+    # The regression: this used to raise ``ValueError: unknown dtype 'f32'``
+    # from tir.decl_buffer when the tile-load fallback path tried to
+    # allocate a fresh buffer with the unnormalised dtype.
+    emit_tt_load(op, ctx)
+
+
+def test_dtype_helper_normalises_short_mlir_spellings() -> None:
+    """Guard the dtype alias map against accidental coverage gaps.
+
+    Hard constraint from the maintainer: every short MLIR dtype Triton
+    can produce must canonicalise to a TVM dtype string. A genuinely
+    unknown dtype must raise ``ValueError`` so we never silently fall
+    back to ``float32``.
+    """
+    from poc.triton_frontend.op_mapping import _normalize_mlir_dtype
+
+    cases = {
+        "f16": "float16",
+        "f32": "float32",
+        "f64": "float64",
+        "bf16": "bfloat16",
+        "i1": "bool",
+        "i8": "int8",
+        "i16": "int16",
+        "i32": "int32",
+        "i64": "int64",
+        "index": "int64",
+    }
+    for short, canonical in cases.items():
+        assert _normalize_mlir_dtype(short) == canonical, (
+            f"expected {short} -> {canonical}, got {_normalize_mlir_dtype(short)}"
+        )
+
+    # Already-canonical TVM spellings round-trip unchanged.
+    for tvm_name in ("float32", "int64", "bool", "bfloat16"):
+        assert _normalize_mlir_dtype(tvm_name) == tvm_name
+
+    # Unknown dtypes must NOT silently default to float32 (the no-silent-
+    # fallback rule).
+    with pytest.raises(ValueError, match="unsupported MLIR dtype"):
+        _normalize_mlir_dtype("complex_who_knows")

@@ -55,6 +55,7 @@ Hard constraints (from the maintainer)
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 # Reuse the public surface of op_mapping (WalkerCtx, helpers) so this file
@@ -71,6 +72,95 @@ from ..op_mapping import (
     _results,
     _shape_of,
 )
+
+
+# ---------------------------------------------------------------------------
+# Generic-form properties parser
+# ---------------------------------------------------------------------------
+#
+# Triton 3.6 (and any MLIR op that uses Properties storage) prints its
+# inherent attributes inside ``<{...}>`` rather than the legacy ``{...}``
+# braces. jaxlib's ``mlir.ir`` Python bindings expose properties only
+# when the dialect is registered; with ``allow_unregistered_dialects=True``
+# (the only mode we have on a host that lacks ``brew llvm`` + Triton's
+# tt-dialect MLIR build) ``op.attributes`` returns an EMPTY map for
+# property-only ops. The result was that ``_attrs(tt.make_range)`` came
+# back as ``{}`` and the emitter computed ``[0, 0)`` -> ValueError.
+#
+# We recover by lifting the ``<{...}>`` slice out of ``str(op)`` (the
+# printed assembly *does* include properties even when the dict-shaped
+# accessor is empty) and parsing the small ``key = literal`` grammar
+# Triton emits. This keeps the fix local to op_emitters/memory.py per
+# the maintainer's territory rules.
+
+# Match ``<{...}>`` at any nesting level inside the printed op. We only
+# need the OUTERMOST one -- properties don't nest.
+_PROPERTIES_RE = re.compile(r"<\{(?P<body>[^}]*)\}>")
+# A key=value pair with an optional ``: <type>`` annotation.  Matches
+# ``start = 0 : i32`` and ``end = 256 : i32`` from the Triton 3.6 form.
+_PROP_PAIR_RE = re.compile(
+    r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+    r"(?P<val>-?\d+|true|false|\"[^\"]*\")"
+    r"(?:\s*:\s*[A-Za-z_][A-Za-z0-9_]*)?"
+)
+
+
+def _parse_generic_properties(op: Any) -> Dict[str, Any]:
+    """Extract the ``<{key = literal : <type>, ...}>`` block from ``str(op)``.
+
+    Returns an empty dict when the op has no printable ``<{...}>`` block
+    (e.g. real dict-shaped fakes or attributes-only ops). On parse the
+    values are coerced to Python ``int`` / ``bool`` / ``str`` -- the
+    coverage we need for ``tt.make_range`` and friends.
+    """
+    if isinstance(op, dict):
+        return {}
+    try:
+        text = str(op)
+    except Exception:
+        return {}
+    m = _PROPERTIES_RE.search(text)
+    if not m:
+        return {}
+    out: Dict[str, Any] = {}
+    for pair in _PROP_PAIR_RE.finditer(m.group("body")):
+        key = pair.group("key")
+        raw = pair.group("val")
+        if raw == "true":
+            out[key] = True
+        elif raw == "false":
+            out[key] = False
+        elif raw.startswith("\"") and raw.endswith("\""):
+            out[key] = raw[1:-1]
+        else:
+            try:
+                out[key] = int(raw)
+            except ValueError:
+                out[key] = raw
+    return out
+
+
+def _attrs_with_properties(op: Any) -> Dict[str, Any]:
+    """``_attrs`` plus a fallback to the ``<{...}>`` properties block.
+
+    Existing dict-shaped fakes and ops with classic attribute storage
+    take the fast path through the legacy ``_attrs`` helper. When that
+    returns an empty dict and we're looking at a real MLIR op whose
+    inherent attributes live in Properties storage, we fall back to a
+    small textual parser. The parser is intentionally narrow: we only
+    accept the ``key = scalar : type`` shape that ``tt.make_range`` uses.
+    """
+    base: Dict[str, Any] = {}
+    try:
+        base = dict(_attrs(op))
+    except Exception:
+        # ``_attrs`` itself can throw on op shapes whose ``op.attributes``
+        # iterator yields strings instead of NamedAttribute records (some
+        # jaxlib builds do this for unregistered ops). Treat as empty.
+        base = {}
+    if base:
+        return base
+    return _parse_generic_properties(op)
 
 __all__ = ["MEMORY_EMITTERS", "has_cxx_shim"]
 
@@ -501,10 +591,14 @@ def emit_tt_load(op: Any, ctx: WalkerCtx) -> Any:
     if out_dtype in {"", "handle", "float32"} and result_value is not None:
         # Honour an explicit ``.dtype`` when ``_dtype_of`` defaulted us back
         # to float32 with no MLIR type info. (Cheap; doesn't affect the dict
-        # path because dicts are caught by ``_dtype_of`` directly.)
+        # path because dicts are caught by ``_dtype_of`` directly.) Pipe
+        # through the alias map so a raw MLIR ``f32`` doesn't reach
+        # ``tir.decl_buffer`` with the short spelling -- TVM rejects it
+        # outright with ``ValueError: unknown dtype 'f32'``.
         attr_dtype = getattr(result_value, "dtype", None)
         if isinstance(attr_dtype, str) and attr_dtype:
-            out_dtype = attr_dtype
+            from ..op_mapping import _normalize_mlir_dtype  # local import
+            out_dtype = _normalize_mlir_dtype(attr_dtype)
 
     # Pre-pass-seeded PtrState lookup (run_ptr_analysis_pre_pass populated
     # ``ctx.ptr_states`` keyed by SSA name). When found, we synthesize the
@@ -717,7 +811,12 @@ def emit_tt_make_range(op: Any, ctx: WalkerCtx) -> Any:
     LayoutInference can re-vectorise once the actual target reports more.
     """
     tir = ctx.tir()
-    attrs = _attrs(op)
+    # Use the property-aware helper so generic-form Triton 3.6 ops
+    # (``<{end = 256 : i32, start = 0 : i32}>``) parse correctly. The
+    # legacy ``_attrs`` returns ``{}`` for those because jaxlib's
+    # ``op.attributes`` does NOT surface inherent attributes stored in
+    # Properties when the dialect is unregistered.
+    attrs = _attrs_with_properties(op)
     start = int(attrs.get("start", 0))
     end = int(attrs.get("end", 0))
     lanes = end - start

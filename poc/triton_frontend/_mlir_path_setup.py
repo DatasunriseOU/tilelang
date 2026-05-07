@@ -50,7 +50,12 @@ import os
 import sys
 from typing import List, Optional
 
-__all__ = ["probe_and_wire_mlir", "SELECTED_PATH", "SELECTED_SOURCE"]
+__all__ = [
+    "probe_and_wire_mlir",
+    "bootstrap_jaxlib_alias",
+    "SELECTED_PATH",
+    "SELECTED_SOURCE",
+]
 
 
 # Set after a successful probe so README / debug tools can show which
@@ -132,6 +137,62 @@ def _set_env_prefix(path: str) -> None:
         os.environ["MLIR_PYTHON_PACKAGE_PREFIX"] = path
 
 
+def bootstrap_jaxlib_alias() -> bool:
+    """Alias ``jaxlib.mlir`` into ``sys.modules['mlir']`` so ``import mlir.ir`` works.
+
+    This is the CHEAPEST way to get mlir Python bindings on a Mac without
+    building LLVM Python packages from source (jaxlib bundles them).
+    Falls back gracefully if jaxlib isn't installed; returns ``True`` iff
+    the alias was created (or was already in place).
+
+    Idempotency: if ``mlir`` / ``mlir.ir`` are already on ``sys.modules``
+    (whether placed there by an earlier call to this function, by an IREE
+    alias from :func:`probe_and_wire_mlir`, or by a real ``mlir_core``
+    import), we return ``True`` without re-aliasing.
+
+    NB: we deliberately do NOT prepend ``<jaxlib_path>`` to ``sys.path``.
+    jaxlib's wheel ships a ``triton`` sub-package which would shadow the
+    real Triton install (causing a circular-import failure as
+    ``triton.backends`` is partially initialised). Aliasing via
+    ``sys.modules`` sidesteps that shadowing.
+    """
+    # Already aliased / installed? No-op.
+    if "mlir.ir" in sys.modules:
+        return True
+    try:
+        # Cheap probe: does ``mlir.ir`` import via the normal mechanism
+        # (real mlir_core install, IREE alias, etc.)?
+        import importlib
+
+        importlib.import_module("mlir.ir")
+        return True
+    except Exception:
+        pass
+
+    try:
+        import importlib
+
+        jaxlib_mlir = importlib.import_module("jaxlib.mlir")
+        jaxlib_mlir_ir = importlib.import_module("jaxlib.mlir.ir")
+    except Exception:
+        return False
+
+    sys.modules.setdefault("mlir", jaxlib_mlir)
+    sys.modules.setdefault("mlir.ir", jaxlib_mlir_ir)
+
+    # Forward optional sub-modules if jaxlib exposes them (best-effort).
+    for sub in ("passmanager", "dialects"):
+        try:
+            import importlib
+
+            mod = importlib.import_module(f"jaxlib.mlir.{sub}")
+            sys.modules.setdefault(f"mlir.{sub}", mod)
+        except Exception:
+            pass
+
+    return True
+
+
 def probe_and_wire_mlir() -> Optional[str]:
     """Run the probe order and update ``sys.path`` / ``sys.modules``.
 
@@ -179,6 +240,20 @@ def probe_and_wire_mlir() -> Optional[str]:
         SELECTED_PATH = iree_path
         SELECTED_SOURCE = "iree"
         return iree_path
+
+    # Probe 4: jaxlib's bundled mlir bindings (jaxlib.mlir.*). On the
+    # venv313 host this is the only path that lights up; aliased into
+    # ``sys.modules['mlir']`` without touching sys.path so the bundled
+    # ``jaxlib/triton/`` subpackage does not shadow the real Triton.
+    if bootstrap_jaxlib_alias():
+        try:
+            import jaxlib.mlir  # type: ignore  # noqa: WPS433
+            jaxlib_path = os.path.dirname(jaxlib.mlir.__file__)
+        except Exception:
+            jaxlib_path = "<jaxlib alias>"
+        SELECTED_PATH = jaxlib_path
+        SELECTED_SOURCE = "jaxlib"
+        return jaxlib_path
 
     return None
 

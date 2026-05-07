@@ -51,6 +51,7 @@ __all__ = [
     "parse_ttir",
     "try_import_mlir",
     "walk_module",
+    "wrap_module_for_walker",
 ]
 
 
@@ -207,10 +208,15 @@ def walk_module(module: Any, visitor: OpVisitor) -> None:
     op recursively. Block arguments are *not* delivered as ops (they
     are not operations); the walker driver in :class:`TTIRWalker`
     materializes them into ``ctx.buffers`` before recursion starts.
+
+    Auto-wraps jaxlib-shaped modules (where ``module.body`` is a
+    ``Block`` lacking ``regions``) via :func:`wrap_module_for_walker`
+    so the recursion descends into the operation tree correctly.
     """
     if module is None:
         return
 
+    module = wrap_module_for_walker(module)
     body = getattr(module, "body", None)
     top = body if body is not None else getattr(module, "operation", module)
 
@@ -338,12 +344,102 @@ class TTIRWalker:
 
 
 # ---------------------------------------------------------------------------
+# jaxlib Module adapter
+#
+# jaxlib's ``mlir.ir.Module`` exposes ``module.body`` as a ``Block`` (not
+# an ``Operation``) -- different from upstream MLIR-bundled Python
+# bindings. Our walker expects to recurse via
+# ``module.operation.regions[0].blocks[0].operations``. The adapter below
+# hides ``module.body`` so :func:`walk_module` falls through to the
+# ``module.operation`` branch (which DOES carry ``regions``).
+#
+# This wrapper is the public counterpart to the ad-hoc adapter the e2e
+# harness invented in B1; lifting it here means any caller that parses
+# TTIR via the jaxlib alias gets the right traversal shape without
+# re-implementing the wrap.
+# ---------------------------------------------------------------------------
+
+
+class _JaxlibModuleAdapter:
+    """Wrap ``mlir.ir.Module`` so the walker uses the ``operation`` branch.
+
+    jaxlib's ``Module.body`` is a ``Block`` (no ``regions`` attr),
+    causing :func:`walk_module`'s recursion to silently bottom out and
+    produce an empty PrimFunc. By exposing ``operation`` (which DOES
+    have ``regions``) and deliberately *not* exposing ``body``, we force
+    the walker's ``getattr(module, 'body', None)`` to return ``None`` so
+    it falls back to ``getattr(module, 'operation', module)`` which is
+    the correct traversal entry on jaxlib.
+
+    PtrAnalysis and other consumers that only need ``str(module)`` get a
+    transparent ``__str__`` / ``__repr__`` delegation.
+    """
+
+    __slots__ = ("_inner", "operation")
+
+    def __init__(self, mlir_module: Any) -> None:
+        self._inner = mlir_module
+        self.operation = mlir_module.operation
+
+    def __str__(self) -> str:
+        return str(self._inner)
+
+    def __repr__(self) -> str:
+        return repr(self._inner)
+
+
+def wrap_module_for_walker(module: Any) -> Any:
+    """Return ``module`` (or an adapter) tuned for the walker's traversal.
+
+    When the active ``mlir.ir`` provider is jaxlib's (bundled) bindings,
+    ``module.body`` is a ``Block`` rather than an ``Operation``, which
+    confuses the walker's recursion. We detect that case heuristically
+    (the module class lives under ``jaxlib.``) and return a
+    :class:`_JaxlibModuleAdapter`. Otherwise the module is returned
+    unchanged.
+    """
+    if module is None:
+        return module
+    cls = type(module)
+    mod_name = getattr(cls, "__module__", "") or ""
+    if mod_name.startswith("jaxlib"):
+        return _JaxlibModuleAdapter(module)
+    # Fallback heuristic: if ``module.body`` lacks ``regions`` but
+    # ``module.operation`` has ``regions``, the upstream-Operation
+    # branch is the correct one. This catches non-jaxlib bindings that
+    # share jaxlib's body-as-Block shape.
+    body = getattr(module, "body", None)
+    if body is not None and not hasattr(body, "regions"):
+        op = getattr(module, "operation", None)
+        if op is not None and hasattr(op, "regions"):
+            return _JaxlibModuleAdapter(module)
+    return module
+
+
+# ---------------------------------------------------------------------------
 # Module-load probe
 # ---------------------------------------------------------------------------
+
+
+def _bootstrap_and_probe() -> bool:
+    """Run :func:`bootstrap_jaxlib_alias` then probe ``mlir.ir``.
+
+    Imported lazily to avoid a circular import: ``_mlir_path_setup`` is
+    a sibling module, and the package ``__init__`` already imports it
+    before us, so by now its attributes are reachable.
+    """
+    try:
+        from ._mlir_path_setup import bootstrap_jaxlib_alias  # noqa: WPS433
+        bootstrap_jaxlib_alias()
+    except Exception:
+        # Don't let the bootstrap failure mask the underlying probe;
+        # ``try_import_mlir`` will surface the degraded-mode warning.
+        pass
+    return try_import_mlir() is not None
 
 
 # Probed once at import. Re-import in tests will re-run try_import_mlir
 # but the warning is suppressed after the first miss thanks to
 # _WARNED_ONCE; tests that need to see the warning use catch_warnings
 # with a fresh module reload.
-MLIR_WALKER_AVAILABLE: bool = try_import_mlir() is not None
+MLIR_WALKER_AVAILABLE: bool = _bootstrap_and_probe()

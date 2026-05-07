@@ -196,16 +196,94 @@ def _shape_of(value: Any) -> Tuple[int, ...]:
 
 
 def _dtype_of(value: Any) -> str:
-    """Best-effort element dtype for a TTIR SSA value (defaults to float32)."""
+    """Best-effort element dtype for a TTIR SSA value (defaults to float32).
+
+    Normalises short MLIR dtype spellings (``f32``, ``i32``, ``bf16``,
+    ``i1``) to TVM's canonical names (``float32``, ``int32``,
+    ``bfloat16``, ``bool``). The MLIR generic form prints element types
+    using the short spelling (a bare ``f32`` rather than ``float32``);
+    TVM's ``tir.decl_buffer`` rejects those short forms with
+    ``ValueError: unknown dtype 'f32'``. Returning the canonical TVM
+    spelling here is the pinch point that keeps every emitter that
+    threads dtype through ``_dtype_of`` working with both shapes.
+    """
     if isinstance(value, dict):
-        return str(value.get("dtype", "float32"))
+        return _normalize_mlir_dtype(str(value.get("dtype", "float32")))
     typ = getattr(value, "type", None)
     if typ is None:
         return "float32"
     elt = getattr(typ, "element_type", None)
     if elt is None:
-        return "float32"
-    return str(elt)
+        # ``typ`` may itself be a scalar element type (i32 / f32) when the
+        # SSA value is non-tensor. Stringify and normalise.
+        return _normalize_mlir_dtype(str(typ))
+    return _normalize_mlir_dtype(str(elt))
+
+
+# Canonical short-form -> TVM dtype map. Covers every spelling we expect
+# from Triton 3.6 generic-form TTIR (and a handful of legacy aliases for
+# robustness). Anything outside this set raises in :func:`_normalize_mlir_dtype`
+# so silent dtype defaulting cannot mask a regression -- the maintainer's
+# "no silent fallback" hard constraint.
+_MLIR_DTYPE_ALIASES: Dict[str, str] = {
+    # Floating point
+    "f16": "float16",
+    "f32": "float32",
+    "f64": "float64",
+    "bf16": "bfloat16",
+    "float16": "float16",
+    "float32": "float32",
+    "float64": "float64",
+    "bfloat16": "bfloat16",
+    # Integer
+    "i1": "bool",
+    "i8": "int8",
+    "i16": "int16",
+    "i32": "int32",
+    "i64": "int64",
+    "int8": "int8",
+    "int16": "int16",
+    "int32": "int32",
+    "int64": "int64",
+    "bool": "bool",
+    # Unsigned (Triton occasionally surfaces these via ptr<u8> etc.)
+    "ui8": "uint8",
+    "ui16": "uint16",
+    "ui32": "uint32",
+    "ui64": "uint64",
+    "uint8": "uint8",
+    "uint16": "uint16",
+    "uint32": "uint32",
+    "uint64": "uint64",
+    # Index -- treat as 64-bit signed for kernel-args (matches TVM convention).
+    "index": "int64",
+    # Opaque handle -- pointer-typed block args fall back here when the
+    # element type can't be resolved; we keep TVM's spelling intact.
+    "handle": "handle",
+}
+
+
+def _normalize_mlir_dtype(dtype: str) -> str:
+    """Canonicalise an MLIR-printed dtype string to TVM's spelling.
+
+    Raises ``ValueError`` when the input is genuinely unknown so that a
+    coverage gap surfaces immediately rather than silently lowering as
+    ``float32`` (the regression that motivated this helper).
+    """
+    s = (dtype or "").strip()
+    if not s:
+        # Empty string falls back to handle so pointer block args without
+        # a resolvable element dtype keep working; downstream emitters
+        # that need a real dtype will already have replaced it.
+        return "handle"
+    if s in _MLIR_DTYPE_ALIASES:
+        return _MLIR_DTYPE_ALIASES[s]
+    # Already-canonical TVM spellings pass through (the alias map already
+    # covers them, but keep this branch defensive against future TVM
+    # additions like ``float8_e4m3``).
+    if s.startswith(("float", "int", "uint")) or s == "bool":
+        return s
+    raise ValueError(f"unsupported MLIR dtype: {dtype!r}")
 
 
 # ---------------------------------------------------------------------------

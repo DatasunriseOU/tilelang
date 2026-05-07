@@ -44,7 +44,19 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from . import numeric_kernels
+
+# Bootstrap jaxlib's mlir bindings as ``mlir`` BEFORE we import the
+# reducer (which probes ``mlir.ir`` at module load and caches the
+# result). The lifted helper :func:`bootstrap_jaxlib_alias` lives in
+# :mod:`poc.triton_frontend._mlir_path_setup` so other entry points
+# (e.g. the user-facing ``triton_to_tilelang_prim`` API) can call it
+# without depending on the e2e harness.
+from poc.triton_frontend._mlir_path_setup import bootstrap_jaxlib_alias  # noqa: E402
+
+bootstrap_jaxlib_alias()
+
+
+from . import numeric_kernels  # noqa: E402  -- after bootstrap_jaxlib_alias
 
 
 __all__ = [
@@ -141,9 +153,8 @@ def _capture_ttir(kernel_mod: Any) -> Tuple[Optional[str], Optional[str]]:
     ``error`` is the diagnostic.
     """
     try:
-        import triton  # type: ignore
+        import triton  # type: ignore  # noqa: F401  -- import probe
         from triton.compiler.compiler import ASTSource  # type: ignore
-        from triton.compiler import compile as triton_compile  # type: ignore
     except Exception as exc:  # noqa: BLE001
         return None, f"triton import failed: {type(exc).__name__}: {exc}"
 
@@ -151,26 +162,78 @@ def _capture_ttir(kernel_mod: Any) -> Tuple[Optional[str], Optional[str]]:
     if fn is None:
         return None, "TRITON_KERNEL is None (triton failed to import in kernel module)"
 
-    # The signature/constants split changed across Triton minor versions.
-    # We try the modern form first (signature dict + constants dict);
-    # callers that hit older Triton hosts can fall through to the wider
-    # try/except.
+    # Triton 3.6 dropped the ``compile(src, options={"stage":"ttir"})`` knob.
+    # The replacement is ``ASTSource.make_ir(target, options, codegen_fns,
+    # module_map, ctx)`` which returns an MLIR module whose ``str()`` is
+    # the TTIR text. Older 3.x compile-with-stage flow is kept as a
+    # fallback so this helper still works on 3.0/3.1 hosts.
     try:
-        # Build a minimal signature: every non-constexpr parameter is a
-        # raw pointer (``*fp32``) or scalar int. We don't actually run
-        # Triton's autotune -- we only need TTIR -- so the signature
-        # types only need to type-check at the TTIR layer.
-        # NOTE: this is intentionally hand-rolled; if a kernel takes an
-        # exotic dtype, override by patching its module to provide
-        # ``TTIR_SIGNATURE``.
         signature = getattr(kernel_mod, "TTIR_SIGNATURE", None)
         if signature is None:
             signature = _default_signature(fn, kernel_mod.META_ARGS)
-        src = ASTSource(
-            fn=fn,
-            signature=signature,
-            constants=kernel_mod.META_ARGS,
+            # In Triton 3.6 every signature key (including constexprs) must
+            # be present; constexprs use the literal string "constexpr".
+            for k in kernel_mod.META_ARGS:
+                signature.setdefault(k, "constexpr")
+
+        # Try 3.6 form (constexprs= kwarg); fall back to 3.x form.
+        import inspect as _inspect
+
+        ast_init_params = set(
+            _inspect.signature(ASTSource.__init__).parameters
         )
+        if "constexprs" in ast_init_params:
+            src = ASTSource(
+                fn=fn, signature=signature, constexprs=kernel_mod.META_ARGS
+            )
+        else:
+            src = ASTSource(
+                fn=fn, signature=signature, constants=kernel_mod.META_ARGS
+            )
+
+        if hasattr(src, "make_ir"):
+            from triton._C.libtriton import ir as _ir  # type: ignore
+            from triton.backends.compiler import GPUTarget  # type: ignore
+            from triton.backends import backends as _backends  # type: ignore
+
+            gpu_target = None
+            try:
+                runtime = importlib.import_module("triton.runtime")
+                gpu_target = runtime.driver.active.get_current_target()
+            except Exception:
+                gpu_target = None
+            if gpu_target is None:
+                gpu_target = GPUTarget(
+                    backend="mps", arch="apple_m", warp_size=32
+                )
+
+            backend_entry = _backends.get(gpu_target.backend)
+            if backend_entry is None:
+                for _name, _entry in _backends.items():
+                    try:
+                        if _entry.compiler.supports_target(gpu_target):
+                            backend_entry = _entry
+                            break
+                    except Exception:
+                        continue
+            if backend_entry is None:
+                return None, (
+                    f"no triton backend registered for {gpu_target.backend!r} "
+                    f"(registry keys: {list(_backends.keys())})"
+                )
+            be = backend_entry.compiler(gpu_target)
+            options = be.parse_options({})
+            ctx = _ir.context()
+            _ir.load_dialects(ctx)
+            be.load_dialects(ctx)
+            codegen = be.get_codegen_implementation(options)
+            module_map = be.get_module_map()
+            module = src.make_ir(gpu_target, options, codegen, module_map, ctx)
+            return str(module), None
+
+        # 3.0/3.1 fallback path.
+        from triton.compiler import compile as triton_compile  # type: ignore
+
         compiled = triton_compile(src, options={"stage": "ttir"})
         asm = getattr(compiled, "asm", None)
         if asm is None:
@@ -180,7 +243,7 @@ def _capture_ttir(kernel_mod: Any) -> Tuple[Optional[str], Optional[str]]:
             return None, f"triton compile produced no 'ttir' key in asm: keys={list(asm)}"
         return str(ttir), None
     except Exception as exc:  # noqa: BLE001
-        tb = traceback.format_exc(limit=4)
+        tb = traceback.format_exc(limit=6)
         return None, f"triton.compile raised: {type(exc).__name__}: {exc}\n{tb}"
 
 
@@ -216,28 +279,102 @@ def _default_signature(fn: Any, constants: Dict[str, Any]) -> Dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def _ensure_cxx_shim_on_syspath() -> None:
+    """Best-effort: locate the prebuilt ``_triton_frontend_cxx`` extension.
+
+    The shim is conventionally built under ``poc/triton_frontend/_cxx/
+    build/`` but the orchestrator's CI also puts py3.13 builds under
+    ``build-port-313/``. ``ensure_built`` only looks at the canonical
+    ``build/``; mirror its behaviour for the sibling dirs so the harness
+    finds the shim regardless of where it was placed.
+    """
+    import sys
+    from pathlib import Path
+
+    try:
+        importlib.import_module("_triton_frontend_cxx")
+        return
+    except Exception:
+        pass
+
+    # Run the canonical locator first (handles the "build/" case).
+    try:
+        from poc.triton_frontend.build_cxx import ensure_built  # type: ignore
+
+        if ensure_built(build=False, verbose=False):
+            return
+    except Exception:
+        pass
+
+    # Sibling-dir scan: anything under ``_cxx/`` that contains a
+    # CPython-suffixed shim. Prefer the suffix matching this interpreter.
+    here = Path(__file__).resolve().parent.parent / "_cxx"
+    if not here.exists():
+        return
+    py_suffix = f"cpython-{sys.version_info.major}{sys.version_info.minor}"
+    candidates = sorted(here.glob(f"build*/{ '_triton_frontend_cxx' }*.so"))
+    # Prefer Python-version-matched builds.
+    candidates.sort(key=lambda p: (py_suffix not in p.name, str(p)))
+    for cand in candidates:
+        path_str = str(cand.parent)
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
+        try:
+            importlib.invalidate_caches()
+            importlib.import_module("_triton_frontend_cxx")
+            return
+        except Exception:
+            continue
+
+
 def _lower_ttir(ttir_text: str, kernel_name: str) -> Tuple[Any, Optional[str]]:
     """Run ``poc.triton_frontend.from_ttir`` on the captured TTIR.
 
-    The frontend prefers an ``mlir.ir.Module`` but accepts the textual
-    coverage path via ``_allow_text_ttir=True``. We try MLIR first; if
-    the bindings are missing we fall back to the text path -- the
-    harness explicitly notes this in the verdict detail since it limits
-    what the lowering can produce.
+    Uses the lifted helpers:
+
+    * :func:`poc.triton_frontend.pipeline.is_custom_form_ttir` +
+      :func:`poc.triton_frontend.pipeline.round_trip_through_cxx_shim`
+      to convert Triton's custom-form TTIR into generic op form
+      (parseable by jaxlib's stripped ``mlir.ir`` bindings).
+    * :func:`poc.triton_frontend.mlir_walker.wrap_module_for_walker`
+      to wrap jaxlib's body-as-Block ``Module`` so the walker uses
+      the ``operation`` branch which carries ``regions``.
+
+    On hosts without jaxlib *and* without ``mlir.ir`` we fall back to
+    the text walker; the verdict detail flags it.
     """
     try:
         from poc.triton_frontend import from_ttir  # type: ignore
+        from poc.triton_frontend.mlir_walker import wrap_module_for_walker  # type: ignore
+        from poc.triton_frontend.pipeline import (  # type: ignore
+            is_custom_form_ttir,
+            round_trip_through_cxx_shim,
+        )
     except Exception as exc:  # noqa: BLE001
         return None, f"poc.triton_frontend import failed: {type(exc).__name__}: {exc}"
 
-    # Try the real MLIR path first.
+    # Locate the C++ shim before we try the real MLIR walker. The mlir.ir
+    # alias was already wired up at module load via bootstrap_jaxlib_alias().
+    _ensure_cxx_shim_on_syspath()
+
+    # Try the real MLIR path first. Convert via the C++ shim's
+    # ``to_generic()`` when input is custom-form so a vanilla ``mlir.ir``
+    # (without ``tt`` dialect) can still parse the result.
     try:
         from mlir import ir as _mlir_ir  # type: ignore
 
         ctx = _mlir_ir.Context()
         ctx.allow_unregistered_dialects = True
-        module = _mlir_ir.Module.parse(ttir_text, ctx)
-        prim = from_ttir(module, name=kernel_name)
+
+        parse_text = ttir_text
+        if is_custom_form_ttir(ttir_text):
+            parse_text = round_trip_through_cxx_shim(ttir_text)
+
+        with ctx, _mlir_ir.Location.unknown(ctx):
+            module = _mlir_ir.Module.parse(parse_text, ctx)
+
+        adapter = wrap_module_for_walker(module)
+        prim = from_ttir(adapter, name=kernel_name)
         return prim, None
     except ImportError:
         # Fall through to text path.

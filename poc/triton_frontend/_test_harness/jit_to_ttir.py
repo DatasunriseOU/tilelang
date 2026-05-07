@@ -106,6 +106,9 @@ def _signature_from_constexprs(
     for name, _param in sig.parameters.items():
         if name in constexprs:
             constants[name] = constexprs[name]
+            # Triton 3.6 expects the literal ``"constexpr"`` string in the
+            # signature dict alongside the constexpr value in
+            # ``constexprs={...}``.
             signature[name] = "constexpr"
             continue
         # Default heuristic: arguments whose name ends with ``_ptr`` /
@@ -145,32 +148,113 @@ def triton_jit_to_ttir(
             "harness with canned TTIR fixtures instead."
         )
 
-    triton = importlib.import_module("triton")
+    triton = importlib.import_module("triton")  # noqa: F841 -- import probe
     compiler = importlib.import_module("triton.compiler")
-    target_fn = getattr(fn, "fn", fn)
-    signature, constants = _signature_from_constexprs(target_fn, constexprs)
+    # Triton 3.6 ``ASTSource`` expects the JITFunction (not the unwrapped
+    # python function); only fall back to ``fn.fn`` when introspecting the
+    # plain signature for ``_signature_from_constexprs``.
+    raw_fn = getattr(fn, "fn", fn)
+    jit_fn = fn  # may already be a JITFunction
+    signature, constants = _signature_from_constexprs(raw_fn, constexprs)
 
-    # --- Attempt 1: modern ASTSource path (Triton 3.x). ---
+    primary_exc: Optional[BaseException] = None
+
+    # --- Attempt 1: Triton 3.6 make_ir() path (no compile() stage knob). ---
+    #
+    # Triton 3.6 dropped ``triton.compiler.compile(src, options={"stage":"ttir"})``.
+    # The replacement is ``ASTSource.make_ir(target, options, codegen_fns,
+    # module_map, ctx)`` which returns an ``ir.module`` whose ``str()`` is
+    # the TTIR text. We have to construct the per-target backend ourselves
+    # to source ``options``, ``codegen_fns``, and ``module_map``.
     try:
         ast_mod = importlib.import_module("triton.compiler.compiler")
         ASTSource = getattr(ast_mod, "ASTSource", None)
-        if ASTSource is not None:
-            src = ASTSource(fn=target_fn, signature=signature, constants=constants)
-            compiled = compiler.compile(src, target=target, options={"stage": "ttir"})
-            if hasattr(compiled, "asm"):
-                ttir = compiled.asm.get("ttir")
-                if isinstance(ttir, str) and ttir:
-                    return ttir
-            if isinstance(compiled, str):
-                return compiled
+        if ASTSource is None:
+            raise RuntimeError("ASTSource not present on triton.compiler.compiler")
+
+        # Probe whether ASTSource is the 3.6 form (constexprs kwarg) or the
+        # 3.0/3.1 form (constants kwarg).
+        import inspect as _inspect
+
+        ast_init_params = set(
+            _inspect.signature(ASTSource.__init__).parameters
+        )
+        if "constexprs" in ast_init_params:
+            src = ASTSource(
+                fn=jit_fn, signature=signature, constexprs=constants
+            )
+        else:
+            # Older 3.x form -- accepts ``constants=`` directly.
+            src = ASTSource(fn=jit_fn, signature=signature, constants=constants)
+
+        # Has ``make_ir``? -> 3.6+ path. Construct backend + ctx.
+        if hasattr(src, "make_ir"):
+            from triton._C.libtriton import ir as _ir  # type: ignore
+            from triton.backends.compiler import GPUTarget  # type: ignore
+            from triton.backends import backends as _backends  # type: ignore
+
+            # Map our string ``target`` to a real GPUTarget. Prefer driver
+            # autodetect; fall back to a hand-built one for headless hosts.
+            gpu_target = None
+            try:
+                runtime = importlib.import_module("triton.runtime")
+                gpu_target = runtime.driver.active.get_current_target()
+            except Exception:
+                gpu_target = None
+            if gpu_target is None:
+                # Heuristic mapping; the harness only needs TTIR which is
+                # mostly target-independent.
+                if target == "metal" or target == "mps":
+                    gpu_target = GPUTarget(
+                        backend="mps", arch="apple_m", warp_size=32
+                    )
+                else:
+                    gpu_target = GPUTarget(
+                        backend="cuda", arch="sm_80", warp_size=32
+                    )
+
+            # The registry key is the *package* name (``apple``) but the
+            # GPUTarget.backend identifier is the device class (``mps``).
+            # Search by ``supports_target`` to be robust across versions.
+            backend_entry = _backends.get(gpu_target.backend)
+            if backend_entry is None:
+                for _name, _entry in _backends.items():
+                    try:
+                        if _entry.compiler.supports_target(gpu_target):
+                            backend_entry = _entry
+                            break
+                    except Exception:
+                        continue
+            if backend_entry is None:
+                raise RuntimeError(
+                    f"no triton backend registered for "
+                    f"{gpu_target.backend!r} (registry keys: "
+                    f"{list(_backends.keys())})"
+                )
+            be = backend_entry.compiler(gpu_target)
+            options = be.parse_options({})
+            ctx = _ir.context()
+            _ir.load_dialects(ctx)
+            be.load_dialects(ctx)
+            codegen = be.get_codegen_implementation(options)
+            module_map = be.get_module_map()
+            module = src.make_ir(gpu_target, options, codegen, module_map, ctx)
+            return str(module)
+
+        # Otherwise: 3.0/3.1 fallback via compile() with options dict.
+        compiled = compiler.compile(src, target=target, options={"stage": "ttir"})
+        if hasattr(compiled, "asm"):
+            ttir = compiled.asm.get("ttir")
+            if isinstance(ttir, str) and ttir:
+                return ttir
+        if isinstance(compiled, str):
+            return compiled
     except Exception as exc:  # noqa: BLE001 -- fall through to legacy path
-        primary_exc: Optional[BaseException] = exc
-    else:
-        primary_exc = None
+        primary_exc = exc
 
     # --- Attempt 2: legacy positional API (Triton 2.x). ---
     try:
-        legacy = compiler.compile(target_fn, signature=constants, output="ttir")
+        legacy = compiler.compile(raw_fn, signature=constants, output="ttir")
         if isinstance(legacy, str):
             return legacy
         if hasattr(legacy, "asm"):

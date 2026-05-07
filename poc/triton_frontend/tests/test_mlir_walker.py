@@ -147,3 +147,77 @@ def test_value_map_populated():
     assert len(walker.ctx.value_map) >= 3, (
         f"expected >=3 value_map entries, got {len(walker.ctx.value_map)}"
     )
+
+
+def test_bootstrap_jaxlib_alias_idempotent():
+    """``bootstrap_jaxlib_alias`` must be safe to call repeatedly.
+
+    The function is called at package import time (via
+    ``_mlir_path_setup.probe_and_wire_mlir``) and again at module load
+    inside ``mlir_walker._bootstrap_and_probe``. Both call sites assume
+    the second invocation is a no-op when the alias is already in
+    place. We assert that explicitly here.
+    """
+    from poc.triton_frontend._mlir_path_setup import (  # noqa: WPS433
+        bootstrap_jaxlib_alias,
+    )
+
+    # First call: may or may not produce the alias depending on host;
+    # we just assert it returns a bool and does not raise.
+    first = bootstrap_jaxlib_alias()
+    assert isinstance(first, bool)
+
+    # Second call: must not raise and must return the same bool.
+    second = bootstrap_jaxlib_alias()
+    assert second == first
+
+    # Third call (paranoid): still no raise.
+    third = bootstrap_jaxlib_alias()
+    assert third == first
+
+
+def test_wrap_module_for_walker_passthrough_for_non_jaxlib():
+    """``wrap_module_for_walker`` returns the module unchanged when its
+    class doesn't live under ``jaxlib.`` and ``module.body`` already
+    carries ``regions`` (the upstream MLIR shape).
+    """
+    from poc.triton_frontend.mlir_walker import wrap_module_for_walker  # noqa: WPS433
+
+    class _FakeBlock:
+        regions = ()
+
+    class _FakeModule:
+        body = _FakeBlock()
+        operation = None
+
+    fm = _FakeModule()
+    assert wrap_module_for_walker(fm) is fm
+
+
+def test_wrap_module_for_walker_adapts_jaxlib_shape():
+    """When ``module.body`` is a Block (no ``regions``), the wrapper
+    produces an adapter that forwards ``operation`` and hides ``body``.
+    """
+    from poc.triton_frontend.mlir_walker import (  # noqa: WPS433
+        _JaxlibModuleAdapter,
+        wrap_module_for_walker,
+    )
+
+    class _FakeBlock:
+        # No ``regions`` attribute -- jaxlib's Module.body shape.
+        pass
+
+    class _FakeOperation:
+        regions = ()
+
+    class _FakeModule:
+        body = _FakeBlock()
+        operation = _FakeOperation()
+
+    fm = _FakeModule()
+    wrapped = wrap_module_for_walker(fm)
+    assert isinstance(wrapped, _JaxlibModuleAdapter)
+    # The adapter must NOT expose ``body`` (otherwise the walker would
+    # take the body branch and silently bottom out).
+    assert getattr(wrapped, "body", None) is None
+    assert wrapped.operation is fm.operation

@@ -20,6 +20,7 @@ from poc.triton_frontend.op_emitters.control import (  # noqa: E402
     PTX_TO_TIR,
     SCF_WHILE_MAX_ITERATIONS,
     map_arith_bitcast,
+    map_arith_constant,
     map_arith_extf,
     map_arith_select,
     map_arith_extsi,
@@ -30,6 +31,7 @@ from poc.triton_frontend.op_emitters.control import (  # noqa: E402
     map_scf_while,
     map_scf_yield,
     map_tt_advance,
+    map_tt_func,
 )
 
 
@@ -551,3 +553,172 @@ def test_scf_while_max_iterations_default() -> None:
     """The bound default is documented and positive."""
     assert SCF_WHILE_MAX_ITERATIONS > 0
     assert SCF_WHILE_MAX_ITERATIONS == 1024 or SCF_WHILE_MAX_ITERATIONS > 0
+
+
+# ---------------------------------------------------------------------------
+# tt.func  -> seed block args into ctx.value_map / ctx.buffers
+# ---------------------------------------------------------------------------
+
+
+def test_tt_func_seeds_block_args_into_value_map() -> None:
+    """A ``tt.func`` with three block args of differing dtypes seeds them all.
+
+    Pointer args land in ``ctx.buffers`` (under the stripped SSA name) and
+    are bound in ``ctx.value_map`` under both the Value object and the
+    printed SSA name string. Scalar args become ``tir.Var`` and are bound
+    the same way (no ``ctx.buffers`` entry).
+    """
+    ctx = WalkerCtx()
+
+    # Three block args:
+    #   %arg0 : !tt.ptr<f32>   (pointer; allocates a buffer)
+    #   %arg1 : i32            (scalar 32-bit signless)
+    #   %arg2 : !tt.ptr<f16>   (pointer to half)
+    arg0 = _FakeSSA({"name": "%arg0", "dtype": "float32", "is_ptr": True})
+    arg1 = _FakeSSA({"name": "%arg1", "dtype": "i32", "shape": ()})
+    arg2 = _FakeSSA({"name": "%arg2", "dtype": "float16", "is_ptr": True})
+
+    op = {
+        "name": "tt.func",
+        "operands": [],
+        "results": [],
+        "attrs": {"sym_name": "kernel"},
+        # Dict-fake convention used elsewhere in this file: block_args is the
+        # entry block's argument list, surfaced at op level for convenience.
+        "block_args": [arg0, arg1, arg2],
+        "regions": [{"ops": []}],
+    }
+
+    map_tt_func(op, ctx)
+
+    # All three SSA names landed in value_map keyed by their printed string.
+    assert "%arg0" in ctx.value_map, \
+        f"value_map missing %arg0; keys={sorted(repr(k) for k in ctx.value_map)}"
+    assert "%arg1" in ctx.value_map, \
+        f"value_map missing %arg1; keys={sorted(repr(k) for k in ctx.value_map)}"
+    assert "%arg2" in ctx.value_map, \
+        f"value_map missing %arg2; keys={sorted(repr(k) for k in ctx.value_map)}"
+
+    # Pointer args allocate buffers under the stripped name; scalar arg does not.
+    assert "arg0" in ctx.buffers, "pointer block arg %arg0 should allocate a buffer"
+    assert "arg2" in ctx.buffers, "pointer block arg %arg2 should allocate a buffer"
+    assert "arg1" not in ctx.buffers, \
+        "scalar block arg %arg1 must NOT be in ctx.buffers (no decl_buffer)"
+
+    # The buffer dtype matches the pointer element type.
+    assert str(ctx.buffers["arg0"].dtype) == "float32"
+    assert str(ctx.buffers["arg2"].dtype) == "float16"
+
+    # Pointer SSA in value_map points at the same buffer object.
+    assert ctx.value_map["%arg0"] is ctx.buffers["arg0"]
+    assert ctx.value_map["%arg2"] is ctx.buffers["arg2"]
+
+    # Scalar arg becomes a tir.Var with the canonical TVM dtype spelling
+    # (``i32`` -> ``int32``).
+    var = ctx.value_map["%arg1"]
+    assert isinstance(var, tvm.tir.Var), \
+        f"expected tir.Var for scalar block arg, got {type(var).__name__}"
+    assert str(var.dtype) == "int32", f"expected int32 dtype, got {var.dtype!r}"
+
+    # Both keying conventions resolve to the same object (Value-keyed and
+    # name-keyed entries point to the same TIR node).
+    assert ctx.value_map[arg0] is ctx.value_map["%arg0"]
+    assert ctx.value_map[arg1] is ctx.value_map["%arg1"]
+    assert ctx.value_map[arg2] is ctx.value_map["%arg2"]
+
+
+def test_tt_func_zero_args_is_noop() -> None:
+    """A zero-argument ``tt.func`` doesn't blow up and produces no bindings."""
+    ctx = WalkerCtx()
+    op = {
+        "name": "tt.func",
+        "operands": [],
+        "results": [],
+        "attrs": {},
+        "block_args": [],
+        "regions": [{"ops": []}],
+    }
+    map_tt_func(op, ctx)
+    assert ctx.value_map == {}
+    assert ctx.buffers == {}
+
+
+# ---------------------------------------------------------------------------
+# arith.constant  -> seed value_map with IntImm / FloatImm
+# ---------------------------------------------------------------------------
+
+
+def test_arith_constant_seeds_value_map() -> None:
+    """``%c0 = arith.constant 0 : i32`` lowers to ``tir.IntImm("int32", 0)``.
+
+    The result SSA name is bound into ``ctx.value_map`` so a downstream
+    use (e.g. ``%idx = arith.addi %c0, %tid``) can resolve the operand.
+    """
+    ctx = WalkerCtx()
+    result = _FakeSSA({"name": "%c0", "dtype": "i32", "shape": ()})
+    op = {
+        "name": "arith.constant",
+        "operands": [],
+        "results": [result],
+        # Dict-shaped attr: the parser also accepts MLIR generic-form
+        # strings ("0 : i32") and real IntegerAttr objects.
+        "attrs": {"value": {"value": 0, "type": "i32"}},
+    }
+    const = map_arith_constant(op, ctx)
+
+    # The expected node: tir.IntImm("int32", 0).
+    expected = tvm.tir.IntImm("int32", 0)
+    assert isinstance(const, tvm.tir.IntImm), \
+        f"expected tir.IntImm, got {type(const).__name__}"
+    assert str(const.dtype) == "int32"
+    assert int(const.value) == 0
+
+    # Bound under the printed name string per the spec.
+    assert "%c0" in ctx.value_map
+    assert isinstance(ctx.value_map["%c0"], tvm.tir.IntImm)
+    assert str(ctx.value_map["%c0"].dtype) == "int32"
+    assert int(ctx.value_map["%c0"].value) == 0
+    # And under the Value object too, pointing at the same node so MLIR-walker
+    # operand lookups resolve.
+    assert ctx.value_map[result] is ctx.value_map["%c0"]
+    # Sanity: structurally equal to the freshly-built expected node.
+    assert str(ctx.value_map["%c0"]) == str(expected)
+
+
+def test_arith_constant_float_seeds_floatimm() -> None:
+    """``%cf = arith.constant 3.5 : f32`` lowers to ``tir.FloatImm``."""
+    ctx = WalkerCtx()
+    result = _FakeSSA({"name": "%cf", "dtype": "f32", "shape": ()})
+    op = {
+        "name": "arith.constant",
+        "operands": [],
+        "results": [result],
+        "attrs": {"value": "3.5 : f32"},
+    }
+    const = map_arith_constant(op, ctx)
+    assert isinstance(const, tvm.tir.FloatImm)
+    assert str(const.dtype) == "float32"
+    assert float(const.value) == pytest.approx(3.5)
+    assert ctx.value_map["%cf"] is const
+
+
+def test_arith_constant_array_attr_raises() -> None:
+    """Array (``dense<...>``) attrs raise EmitError -- no silent splat."""
+    ctx = WalkerCtx()
+    result = _FakeSSA({"name": "%cv", "dtype": "i32", "shape": (4,)})
+    op = {
+        "name": "arith.constant",
+        "operands": [],
+        "results": [result],
+        # List form -- our parser flags any list/tuple/ndarray as unsupported.
+        "attrs": {"value": {"value": [0, 1, 2, 3], "type": "tensor<4xi32>"}},
+    }
+    with pytest.raises(EmitError) as excinfo:
+        map_arith_constant(op, ctx)
+    assert "array attr" in str(excinfo.value).lower()
+
+
+def test_arith_constant_registered_in_dispatch_table() -> None:
+    """Both new emitters appear in CONTROL_EMITTERS for the walker to find."""
+    assert CONTROL_EMITTERS.get("arith.constant") is map_arith_constant
+    assert CONTROL_EMITTERS.get("tt.func") is map_tt_func

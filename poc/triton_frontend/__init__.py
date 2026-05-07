@@ -230,6 +230,11 @@ def _walk_mlir_module(
                 for child in getattr(block, "operations", ()) or ():
                     _recurse(child)
 
+    # Auto-wrap jaxlib-shaped modules so ``module.operation`` (which
+    # carries ``regions``) is the recursion entry point. See
+    # :func:`mlir_walker.wrap_module_for_walker` for the rationale.
+    from .mlir_walker import wrap_module_for_walker as _wrap  # noqa: WPS433
+    module = _wrap(module)
     body = getattr(module, "body", None) or getattr(module, "operation", module)
     _recurse(body)
     return visited

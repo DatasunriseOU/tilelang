@@ -21,6 +21,7 @@ pass to one of the Tier-1 stages from the RFC:
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -34,6 +35,8 @@ __all__ = [
     "run",
     "run_ptr_analysis_pre_pass",
     "seed_ptr_states",
+    "is_custom_form_ttir",
+    "round_trip_through_cxx_shim",
 ]
 
 
@@ -401,3 +404,82 @@ def seed_ptr_states(ctx: Any, state_map: dict) -> int:
         }
         seeded += 1
     return seeded
+
+
+# ---------------------------------------------------------------------------
+# Custom-form -> generic-form round-trip via the C++ shim
+#
+# Triton's printer emits TTIR in *custom* form -- e.g. ``tt.func @kernel``,
+# ``arith.constant 0 : i32``. jaxlib's bundled mlir.ir bindings can only
+# parse the *generic* op form (``"dialect.op"(...) : (...) -> (...)``)
+# unless the relevant dialect TableGen has been registered, which
+# jaxlib does not do for ``tt.*``. The C++ shim links against Triton's
+# real dialect registration and offers ``Module.to_generic()`` to
+# round-trip the text. This module hosts the helper so non-harness
+# entry points (e.g. the future ``triton_to_tilelang_prim`` API) get
+# the same fix without re-implementing it.
+# ---------------------------------------------------------------------------
+
+
+# Heuristic: any of these tokens appearing in TTIR text means the printer
+# used custom form. We deliberately use plain string membership rather
+# than a regex over the full body -- false positives are harmless because
+# the C++ shim's ``to_generic()`` is idempotent on already-generic IR.
+# NB: every hint must be a substring that does NOT appear in
+# *generic* form. Generic always quotes op names (``"tt.foo"(...)``)
+# so a hint like ``tt.func @`` (with the ``@`` symbol marker) is
+# unambiguous; bare ``tt.return`` would match ``"tt.return"`` and
+# misclassify generic form as custom. We use ``\n`` boundaries +
+# ``@`` / ``=`` markers to keep the heuristic specific.
+_CUSTOM_FORM_HINTS: Tuple[str, ...] = (
+    "tt.func @",          # custom-form func declaration
+    "tt.func public @",   # variant with visibility keyword
+    "= tt.load ",         # custom-form load result-binding form
+    "= tt.make_range ",   # custom-form make_range
+    "= tt.splat ",        # custom-form splat
+    "= arith.constant ",  # custom-form constant
+)
+
+
+def is_custom_form_ttir(ttir_text: str) -> bool:
+    """Heuristic: does ``ttir_text`` look like custom-form MLIR?
+
+    A *generic* MLIR module quotes every op name (``"tt.func"(...)``);
+    *custom* form lets the dialect printer emit a more readable surface
+    (``tt.func @kernel(...)``). jaxlib's mlir.ir parser accepts the
+    former (with ``allow_unregistered_dialects=True``) but not the
+    latter unless the ``tt`` dialect is registered, which we cannot
+    expect on a host with only jaxlib bindings.
+
+    We check for a small list of hint substrings. The hints are chosen
+    to be unambiguous custom-form markers -- ``tt.func @`` would never
+    appear in generic form because the op name would be quoted.
+    """
+    if not isinstance(ttir_text, str):
+        return False
+    return any(hint in ttir_text for hint in _CUSTOM_FORM_HINTS)
+
+
+def round_trip_through_cxx_shim(ttir_text: str) -> str:
+    """Re-print custom-form TTIR as generic form via the C++ shim.
+
+    Calls ``_triton_frontend_cxx.Module(ctx, ttir_text).to_generic()``
+    and returns the generic-form text. If the shim is unavailable or
+    the round-trip raises, returns the input unchanged so the caller
+    can attempt a direct parse (works on hosts with the full ``tt``
+    dialect registered, e.g. brew llvm + Triton).
+
+    Use the heuristic :func:`is_custom_form_ttir` to decide whether to
+    invoke this helper.
+    """
+    try:
+        import _triton_frontend_cxx as _cxx  # type: ignore  # noqa: WPS433
+    except Exception:
+        return ttir_text
+
+    try:
+        cxx_ctx = _cxx.Context()
+        cxx_mod = _cxx.Module(cxx_ctx, ttir_text)
+        return cxx_mod.to_generic()
+    except Exception:
+        return ttir_text
