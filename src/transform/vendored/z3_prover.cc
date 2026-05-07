@@ -398,36 +398,23 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
           if (min_value < lo || max_value > hi) {
             if (!bv_range_warned_) {
               LOG(WARNING) << "Z3Prover BV" << bv_width_
-                           << ": clamping out-of-range bind " << var
+                           << ": dropping out-of-range bind " << var
                            << " in [" << min_value << ", " << max_value
-                           << ") to signed BV range [" << lo << ", " << hi
-                           << "]. (further occurrences suppressed)";
+                           << ") (signed BV range [" << lo << ", " << hi
+                           << "]). Subsequent CanProve over this var will"
+                           << " fail closed. (further occurrences suppressed)";
               bv_range_warned_ = true;
             }
-            // CPPMEGA fix-A7: NEW-1 (round-3): the previous fix-A3 bailed
-            // here without writing memo_, which left a hole — a later
-            // Visit(var) would mint a *fresh* free Z3 symbol, so the
-            // caller's range request was silently dropped while the
-            // prover happily reasoned about an unconstrained variable.
-            // Conservative fallback: memoize `var_expr` and assert the
-            // BV-clamped range [lo, hi+1) so subsequent uses see the
-            // tightest sound approximation we can express in this sort.
-            // This is over-approximation (the BV interval is wider than
-            // the caller's intent), so any CanProve we return remains
-            // sound; we only lose precision, never correctness.
-            int64_t clamped_min = std::max<int64_t>(min_value, lo);
-            int64_t clamped_max =
-                std::min<int64_t>(max_value, hi + int64_t{1});
-            if (clamped_min >= clamped_max) {
-              // Caller's range is entirely outside BV bounds — there's
-              // no representable interval. Fall back to the full BV
-              // range to keep the var bound at the right sort.
-              clamped_min = lo;
-              clamped_max = hi + int64_t{1};
-            }
-            memo_.emplace(var, var_expr);
-            solver.add(MakeIntVal(clamped_min) <= var_expr);
-            solver.add(var_expr < MakeIntVal(clamped_max));
+            // CPPMEGA fix-C2 (round-7): the round-3 fix wrote a clamped memo
+            // here, which over-approximated the caller's intent. Wave-5
+            // audit flagged this as unsound under composition: a downstream
+            // CanProve on `var` would see the *clamped* range and could
+            // prove tautologies that the caller never asserted. Round-7
+            // tightens to NOT emplace memo on OOR. A subsequent Visit(var)
+            // will still mint a fresh symbol, but with no range constraint
+            // asserted, CanProve will fail closed (return false) for any
+            // non-trivial query — preserving soundness. Callers that need
+            // the bind must keep variables within the BV width.
             commit_memo = false;
             return;
           }
