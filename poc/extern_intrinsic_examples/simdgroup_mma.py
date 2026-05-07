@@ -30,7 +30,12 @@ codegen materialises the MSL body keyed by ``"metal"`` from the registry.
 
 from __future__ import annotations
 
-from tilelang.language.extern import Frag, extern_intrinsic
+from tilelang.language.extern import (
+    extern_intrinsic,
+    simdgroup_a,
+    simdgroup_b,
+    simdgroup_c,
+)
 
 # Apple MSL body. Note:
 #   - No threadgroup_barrier — barriers are inserted by thread_storage_sync.cc.
@@ -52,41 +57,15 @@ inline void simdgroup_mma_8x8(
 }
 """
 
-# Register the intrinsic. Frag layouts ``simdgroup_a/b/c`` tell
-# layout_inference.cc which SIMDgroup fragment layout each operand uses.
+# Register the intrinsic. The ``simdgroup_a/b/c`` factories pin the canonical
+# scope/dtype/alignment for each operand role; we only override the
+# ``pipeline_stage`` hint since stages are use-site policy, not layout policy.
 simdgroup_mma_8x8 = extern_intrinsic(
     name="simdgroup_mma_8x8",
     signature=lambda: (
-        Frag(
-            name="a",
-            shape=(8, 8),
-            scope="simdgroup",
-            dtype="float16",
-            layout="simdgroup_a",
-            alignment=16,
-            pipeline_stage=0,
-            is_output=False,
-        ),
-        Frag(
-            name="b",
-            shape=(8, 8),
-            scope="simdgroup",
-            dtype="float16",
-            layout="simdgroup_b",
-            alignment=16,
-            pipeline_stage=0,
-            is_output=False,
-        ),
-        Frag(
-            name="c",
-            shape=(8, 8),
-            scope="simdgroup",
-            dtype="float32",
-            layout="simdgroup_c",
-            alignment=16,
-            pipeline_stage=1,
-            is_output=True,
-        ),
+        simdgroup_a("a", pipeline_stage=0),
+        simdgroup_b("b", pipeline_stage=0),
+        simdgroup_c("c", pipeline_stage=1),
     ),
     bodies={"metal": SIMDGROUP_MMA_8x8_MSL},
 )

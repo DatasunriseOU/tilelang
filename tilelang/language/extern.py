@@ -64,6 +64,7 @@ Citations:
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Literal, Mapping, Sequence, Tuple
 
@@ -189,12 +190,39 @@ def _split_args(arglist: str) -> list[str]:
     return out
 
 
+# Strip out comments + string literals before the parameter-name scan so a
+# stray ``// uses A_frag`` / ``"a"`` doesn't satisfy the contract check.
+_C_COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
+_C_STRING_RE = re.compile(r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'")
+
+
+def _scrub_body_for_name_scan(body: str) -> str:
+    """Drop comments + string literals so the name scan doesn't match them."""
+    body = _C_COMMENT_RE.sub(" ", body)
+    body = _C_STRING_RE.sub(" ", body)
+    return body
+
+
 def _validate_body(target: str, intrinsic_name: str, body: str, frags: Sequence[Frag]) -> None:
     """Lightly validate the body string against the declared contract.
 
-    We only check arity (parameter count) — full type-matching is impractical
-    across CUDA / HIP / Metal. The named function must appear; if it does, its
-    arg count must equal ``len(frags)``.
+    Two checks:
+
+    1. **Arity** — if the named function definition appears, its parameter
+       count must equal ``len(frags)``. Full C type matching is impractical
+       across CUDA / HIP / Metal, so we only count.
+    2. **Parameter-name matching** (best-effort) — every declared
+       :class:`Frag` ``name`` must appear at least once as a word-boundary
+       token in the body source (after stripping comments and string
+       literals). A missing Frag name is the most common typo failure mode
+       and is reported via :class:`UserWarning`; we don't escalate to an
+       error because some users hand-roll the body in an unusual style
+       (e.g. typedef'd structs, macro-expanded names) where a literal name
+       match would false-fire.
+
+    We don't do the reverse "names that look like a fragment but aren't
+    declared" check because it would false-fire on every helper local
+    variable in the body.
     """
     pat = _METAL_FN_RE if target == "metal" else _DEVICE_FN_RE
     matches = list(pat.finditer(body))
@@ -215,6 +243,21 @@ def _validate_body(target: str, intrinsic_name: str, body: str, frags: Sequence[
             f"{len(args)} body parameter(s), but the signature declares "
             f"{len(frags)} Frag(s). Body args: {args!r}; "
             f"Frags: {[f.name for f in frags]!r}."
+        )
+
+    scrubbed = _scrub_body_for_name_scan(body)
+    missing: list[str] = []
+    for f in frags:
+        if not re.search(rf"\b{re.escape(f.name)}\b", scrubbed):
+            missing.append(f.name)
+    if missing:
+        warnings.warn(
+            f"extern_intrinsic[{target}] '{intrinsic_name}': declared Frag name(s) "
+            f"{missing!r} do not appear in the body source. This is usually a typo "
+            f"between the signature and the body; the kernel will still register "
+            f"but the body cannot reference frags whose names it doesn't know.",
+            UserWarning,
+            stacklevel=3,
         )
 
 
@@ -511,6 +554,108 @@ def _emit_tir_call(
     return tir.call_extern("handle", symbol, *access_ptrs)
 
 
+# ---------------------------------------------------------------------------
+# Canonical Frag factories for hardware-specific MMA fragment shapes.
+#
+# The grok security review (#08, "other bugs" #3) flagged that hand-rolling
+# every Frag at the call site is error-prone — the same Apple SIMDgroup MMA
+# tile shows up in every Metal MMA op and reviewers were drifting on default
+# scope/dtype/alignment. The factories below pin the canonical defaults so
+# users only override what they actually mean to change.
+#
+# Layout strings stay as the canonical ``simdgroup_a/b/c`` enum entries
+# resolved by ``layout_inference.cc`` -> ``src/layout/gemm_layouts.cc``;
+# concrete register-tile layouts are owned by the C++ side. The factories
+# here only make the *contract* unambiguous.
+#
+# TODO(simdgroup): once the Metal codegen lands explicit register-tile
+# layouts (per Apple MSL §6.7), factor the per-axis stride/thread mapping
+# into these factories so the example in poc/extern_intrinsic_examples/
+# doesn't have to know magic numbers.
+# ---------------------------------------------------------------------------
+
+
+def _simdgroup_factory(
+    layout: str,
+    default_dtype: str,
+    default_is_output: bool,
+) -> Callable[..., Frag]:
+    def _make(
+        name: str,
+        shape: Tuple[int, int] = (8, 8),
+        dtype: str = default_dtype,
+        *,
+        scope: str = "simdgroup",
+        alignment: int = 16,
+        pipeline_stage: int = -1,
+        is_output: bool = default_is_output,
+    ) -> Frag:
+        if len(shape) != 2:
+            raise ValueError(
+                f"simdgroup_{layout[-1]} expects a 2-D tile shape; got {shape!r}"
+            )
+        return Frag(
+            name=name,
+            shape=tuple(shape),
+            scope=scope,
+            dtype=dtype,
+            layout=layout,
+            alignment=alignment,
+            pipeline_stage=pipeline_stage,
+            is_output=is_output,
+        )
+    _make.__name__ = f"simdgroup_{layout[-1]}"
+    _make.__qualname__ = _make.__name__
+    return _make
+
+
+simdgroup_a = _simdgroup_factory("simdgroup_a", default_dtype="float16", default_is_output=False)
+"""Apple Metal SIMDgroup matrix-A operand factory.
+
+>>> a = simdgroup_a("a")
+>>> a.layout, a.shape, a.dtype, a.scope, a.is_output
+('simdgroup_a', (8, 8), 'float16', 'simdgroup', False)
+"""
+
+simdgroup_b = _simdgroup_factory("simdgroup_b", default_dtype="float16", default_is_output=False)
+"""Apple Metal SIMDgroup matrix-B operand factory.
+
+>>> b = simdgroup_b("b")
+>>> b.layout, b.shape, b.dtype, b.scope, b.is_output
+('simdgroup_b', (8, 8), 'float16', 'simdgroup', False)
+"""
+
+simdgroup_c = _simdgroup_factory("simdgroup_c", default_dtype="float32", default_is_output=True)
+"""Apple Metal SIMDgroup C-accumulator operand factory.
+
+Defaults to ``is_output=True`` since SIMDgroup MMA always writes the C tile.
+
+>>> c = simdgroup_c("c")
+>>> c.layout, c.shape, c.dtype, c.scope, c.is_output
+('simdgroup_c', (8, 8), 'float32', 'simdgroup', True)
+"""
+
+
+def _simdgroup_doctest() -> None:
+    """End-to-end doctest for the 8-field Frag contract via the simdgroup_*
+    factories. No execution; just exercises the metadata path that
+    layout_inference.cc / inject_pipeline.cc consume.
+
+    >>> a = simdgroup_a("a", pipeline_stage=0)
+    >>> b = simdgroup_b("b", pipeline_stage=0)
+    >>> c = simdgroup_c("c", pipeline_stage=1)
+    >>> meta = build_meta((a, b, c), pipeline_stage=1)
+    >>> meta["layouts"]
+    ['simdgroup_a', 'simdgroup_b', 'simdgroup_c']
+    >>> meta["tile_size"]
+    [8, 8]
+    >>> meta["is_output"]
+    [0, 0, 1]
+    >>> meta["pipeline_stage"]
+    1
+    """
+
+
 __all__ = [
     "Frag",
     "LayoutKind",
@@ -519,4 +664,7 @@ __all__ = [
     "build_meta",
     "EXTERN_CALL_PREFIX",
     "EXTERN_BLOCK_ATTR",
+    "simdgroup_a",
+    "simdgroup_b",
+    "simdgroup_c",
 ]

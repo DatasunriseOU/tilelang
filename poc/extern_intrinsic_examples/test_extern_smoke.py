@@ -10,7 +10,14 @@ import importlib.util
 import pytest
 
 from tilelang.language import extern_registry
-from tilelang.language.extern import Frag, EXTERN_CALL_PREFIX, extern_intrinsic
+from tilelang.language.extern import (
+    EXTERN_CALL_PREFIX,
+    Frag,
+    extern_intrinsic,
+    simdgroup_a,
+    simdgroup_b,
+    simdgroup_c,
+)
 
 _HAS_TVM = importlib.util.find_spec("tvm") is not None
 _HAS_CUDA = False
@@ -170,3 +177,101 @@ def test_unregister_public_api():
 def test_cuda_device_present_for_real_compile():
     """Placeholder for a future end-to-end compile-and-run test."""
     assert _HAS_CUDA
+
+
+def test_simdgroup_factories_produce_canonical_frags():
+    """Factories must pin scope/dtype/layout/alignment to canonical values.
+
+    Regression for grok security review #08 "other bugs" #3.
+    """
+    a = simdgroup_a("a")
+    b = simdgroup_b("b")
+    c = simdgroup_c("c")
+    assert (a.scope, a.dtype, a.layout, a.alignment, a.is_output) == (
+        "simdgroup", "float16", "simdgroup_a", 16, False,
+    )
+    assert (b.scope, b.dtype, b.layout, b.alignment, b.is_output) == (
+        "simdgroup", "float16", "simdgroup_b", 16, False,
+    )
+    assert (c.scope, c.dtype, c.layout, c.alignment, c.is_output) == (
+        "simdgroup", "float32", "simdgroup_c", 16, True,
+    )
+    # Defaults to (8, 8); override is honoured.
+    assert simdgroup_a("a").shape == (8, 8)
+    assert simdgroup_a("a", shape=(16, 16)).shape == (16, 16)
+    # Non-2D rejected.
+    with pytest.raises(ValueError, match="2-D tile shape"):
+        simdgroup_a("a", shape=(8, 8, 8))
+
+
+def test_validate_body_warns_on_missing_frag_name(recwarn):
+    """The body-name scan must warn (but not error) when a declared Frag.name
+    is not referenced anywhere in the body. Regression for grok review item
+    "_validate_body parameter-name matching" deferred from Wave-1.
+    """
+    # Body refers to ``a`` and ``b`` but never to ``out`` — the ``out`` Frag
+    # name is unreferenced, which usually indicates a typo.
+    body = r"""
+__device__ void typo_intrinsic(const float *a, const float *b, float *not_out) {
+    not_out[0] = a[0] + b[0];
+}
+"""
+    extern_intrinsic(
+        name="fused_relu_add_16",
+        signature=lambda: (
+            Frag("a", (16,), "shared", "float32"),
+            Frag("b", (16,), "shared", "float32"),
+            Frag("out", (16,), "shared", "float32", is_output=True),
+        ),
+        bodies={"cuda": body},
+    )
+    msgs = [str(w.message) for w in recwarn.list if issubclass(w.category, UserWarning)]
+    assert any("'out'" in m or "[\'out\']" in m for m in msgs), (
+        f"expected warning about unreferenced 'out' Frag; saw {msgs!r}"
+    )
+
+
+def test_validate_body_no_warning_when_names_match(recwarn):
+    """No warning when every Frag.name appears in the body."""
+    body = r"""
+__device__ void clean_intrinsic(const float *a, const float *b, float *out) {
+    out[0] = a[0] + b[0];
+}
+"""
+    extern_intrinsic(
+        name="fused_relu_add_16",
+        signature=lambda: (
+            Frag("a", (16,), "shared", "float32"),
+            Frag("b", (16,), "shared", "float32"),
+            Frag("out", (16,), "shared", "float32", is_output=True),
+        ),
+        bodies={"cuda": body},
+    )
+    body_warns = [
+        w for w in recwarn.list
+        if issubclass(w.category, UserWarning) and "do not appear in the body" in str(w.message)
+    ]
+    assert not body_warns, f"unexpected body-name warning(s): {body_warns!r}"
+
+
+def test_validate_body_ignores_names_inside_comments(recwarn):
+    """A Frag.name appearing only in a comment must not satisfy the check."""
+    body = r"""
+__device__ void typo_intrinsic(const float *a, const float *b, float *not_out) {
+    // out[0] = a[0] + b[0];   <-- commented-out reference to 'out' must not count
+    not_out[0] = a[0] + b[0];
+}
+"""
+    extern_intrinsic(
+        name="fused_relu_add_16",
+        signature=lambda: (
+            Frag("a", (16,), "shared", "float32"),
+            Frag("b", (16,), "shared", "float32"),
+            Frag("out", (16,), "shared", "float32", is_output=True),
+        ),
+        bodies={"cuda": body},
+    )
+    msgs = [str(w.message) for w in recwarn.list if issubclass(w.category, UserWarning)]
+    assert any("'out'" in m for m in msgs), (
+        f"expected warning when 'out' only appears in a comment; saw {msgs!r}"
+    )
