@@ -181,9 +181,14 @@ class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
         if (!v.dtype().is_int()) {
           continue;
         }
-        recover_stack.push_back(z3.EnterConstraint(v >= IntImm(v.dtype(), 0)));
-        recover_stack.push_back(
-            z3.EnterConstraint(v < IntImm(v.dtype(), kBitBound)));
+        // fix-round-6 C2: IntImm(int32, 1<<31) overflows int32. Build the
+        // upper-bound constant in Int64 to avoid the silent wrap. Z3's
+        // sort-coercion will then promote `v` (int32) on the LT to a
+        // common int sort.
+        recover_stack.push_back(z3.EnterConstraint(
+            v >= IntImm(tvm::DataType::Int(64), 0)));
+        recover_stack.push_back(z3.EnterConstraint(
+            v < IntImm(tvm::DataType::Int(64), kBitBound)));
       }
 
       proved = z3.CanProve(cond);
