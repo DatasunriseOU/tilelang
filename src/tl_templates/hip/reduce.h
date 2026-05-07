@@ -11,6 +11,15 @@ struct SumOp {
 };
 
 // Wave-8 #5: product reduction warp template (HIP).
+//
+// Wave-10 #3 (meta rev_c2fc451321 HIGH): same identity-padding contract as
+// the CUDA template — XOR-butterfly across a wave reads neighbour lanes
+// unconditionally, so callers MUST initialise inactive lanes to T(1) (the
+// multiplicative identity) before invoking AllReduce<MulOp, ...> /
+// warp_reduce<MulOp>(). HIP wave width is 32 on RDNA / 64 on CDNA — both
+// require the same caller-side identity pad. Sum/Max/Min identity (0 / -inf
+// / +inf) is more often default-initialised; MulOp is not. See the CUDA
+// template comment in `src/tl_templates/cuda/reduce.h` for the full rationale.
 struct MulOp {
   template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
     return x * y;
@@ -101,6 +110,14 @@ struct AllReduce {
                 threads == 128 || threads == 64 || threads == 32 ||
                 threads == 16 || threads == 8 || threads == 4 || threads == 2);
   static_assert(threads % scale == 0);
+  // Wave-11 #1: the explicit power-of-two enumeration above already
+  // covers the AllReduce XOR-butterfly invariant; this static_assert
+  // restates the contract so the HIP and CUDA templates stay in lock
+  // step (CUDA does not have the explicit enum). See cuda/reduce.h
+  // and src/op/reduce.cc Lower() for the matching lowering-time
+  // ICHECK that rejects non-power-of-2 reducing_threads.
+  static_assert((threads & (threads - 1)) == 0,
+                "tl::AllReduce<> (HIP): `threads` must be a power of two.");
 
   // Scalar interface (backward-compatible).
   template <typename T> static __device__ T run(T x, T *red_buf = nullptr) {

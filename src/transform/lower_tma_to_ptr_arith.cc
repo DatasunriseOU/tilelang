@@ -290,6 +290,15 @@ Stmt BuildPointerArithCopy(const DecodedDesc &desc,
   // and tile sizes can exceed 2^31 on large dense tensors (e.g. 64K-wide
   // fp32 rows × 32 ranks). 32-bit accumulation would silently wrap before
   // `handle_add_byte_offset` and read the wrong element on non-NV targets.
+  //
+  // INVARIANT (do not weaken): every coord, stride, ivar, and accumulator
+  // below is built on `kIdx`. Locked in by `test_int64_stride_no_overflow`
+  // (testing/python/transform/test_lower_tma_to_ptr_arith.py). A wave-9
+  // triple-LLM review (meta `rev_c2fc451321`) flagged this site as a
+  // CRITICAL int32-overflow OOB; that finding was a false positive — the
+  // i64 cast is already in place on every operand. If you ever change
+  // `kIdx` to `Int(32)` you re-open the OOB; the regression test will
+  // fail loudly.
   const DataType kIdx = DataType::Int(64);
 
   // Loop variables iterate over the smem_box (the tile shape), one var

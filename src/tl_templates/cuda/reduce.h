@@ -35,6 +35,19 @@ struct SumOp {
 // Wave-8 #5: product reduction warp template. Mirrors SumOp; the AllReduce
 // driver in `src/op/reduce.cc:MakeCodegenReducer()` emits "tl::MulOp" for
 // `T.reduce_prod(...)` / `tt.reduce(mul)`.
+//
+// Wave-10 #3 (meta rev_c2fc451321 HIGH): the AllReduce / warp_reduce templates
+// below issue an XOR-butterfly with full-warp mask 0xffffffff. That pulls the
+// partner lane's value regardless of whether the partner held a real input or
+// uninitialized garbage. SumOp is forgiving because uninit is often zeroed
+// (and 0 is the additive identity); MulOp is NOT — the multiplicative identity
+// is 1.0, not 0. Callers MUST identity-pad inactive warp lanes to 1 before
+// invoking AllReduce<MulOp, ...> / warp_reduce<MulOp>(), e.g. by initialising
+// the per-thread fragment to T(1) before the per-element load and using
+// `T x_lane = (lane_id < N_active) ? frag[lane_id] : T(1);`. The reduce
+// macro in `tilelang/language/reduce_op.py` documents this contract; failing
+// to honour it produces silent wrong products on shapes whose dim length is
+// not a multiple of the warp width (32 on CUDA, 32/64 on HIP).
 struct MulOp {
   template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
     return x * y;
@@ -161,6 +174,17 @@ template <class Reducer, int threads, int scale, int thread_offset = 0,
           int workspace_stride = 0>
 struct AllReduce {
   static_assert(threads % scale == 0);
+  // Wave-11 #1 (closes grok+meta HIGH on warp-lane-mask exploit). The
+  // recursion below halves `threads` at every step and shuffles with
+  // offset = threads/2; correctness requires `threads` to be a power of
+  // two. The matching ICHECK in src/op/reduce.cc Lower() guarantees this
+  // at lowering time, but we re-state it here so any direct C++ caller
+  // (e.g. hand-written kernels under src/tl_templates/) gets a clean
+  // compile-time error instead of silent wrong-results from the XOR
+  // butterfly visiting non-existent lanes.
+  static_assert((threads & (threads - 1)) == 0,
+                "tl::AllReduce<>: `threads` must be a power of two "
+                "(structural invariant of the XOR-butterfly recursion).");
 
   // Scalar interface (backward-compatible).
   template <typename T> static TL_DEVICE T run(T x, T *red_buf = nullptr) {
