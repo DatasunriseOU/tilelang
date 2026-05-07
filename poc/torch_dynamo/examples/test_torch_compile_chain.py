@@ -368,3 +368,169 @@ def test_unsupported_op_falls_back_to_extern() -> None:
     # ("extern slot") OR (when no fusable region exists) the chain still
     # produced a launcher.
     assert artifact.launcher is not None
+
+
+# ---------------------------------------------------------------------------
+# Wave-2 fix-pack regressions — grok #02 design §1 / correctness §1
+# (top-8 ATEN gaps + sequential emitter + multi-region launcher)
+# ---------------------------------------------------------------------------
+
+
+def test_wave2_aten_dispatch_covers_top_ops() -> None:
+    """ATEN_DISPATCH must include the top-8 ops grok #02 review called out."""
+    from poc.torch_dynamo.fx_to_tilelang import ATEN_DISPATCH
+
+    must_have = (
+        "view", "reshape", "permute", "transpose", "flatten",
+        "broadcast_to", "expand",
+        "exp", "log", "sqrt", "rsqrt", "sigmoid", "pow",
+        "cat", "stack",
+        "clamp", "clip",
+        "dropout",
+    )
+    missing = [op for op in must_have if op not in ATEN_DISPATCH]
+    assert not missing, f"ATEN_DISPATCH still missing: {missing!r}"
+
+
+def test_wave2_unary_chain_uses_sequential_emitter() -> None:
+    """Pure unary elementwise chain must hit ``_emit_sequential_region``
+    (not ``NotImplementedError`` -> extern fallback).
+    """
+    if _no_tilelang_jit():
+        pytest.xfail("tilelang.compile unavailable; sequential emitter unverifiable")
+
+    import torch
+    from torch import nn
+    import torch.fx
+    from torch.fx.passes.shape_prop import ShapeProp
+
+    from poc.torch_dynamo.fx_to_tilelang import FXToTileLang
+
+    class UnaryChain(nn.Module):
+        def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+            return torch.relu(torch.tanh(torch.exp(x)))
+
+    model = UnaryChain().eval()
+    x = torch.randn(4, 8, dtype=torch.float32)
+    gm = torch.fx.symbolic_trace(model)
+    ShapeProp(gm).propagate(x)
+
+    artifact = FXToTileLang(gm, [x]).run()
+    # The sequential emitter must have produced at least one PrimFunc OR
+    # the source line must say "tilelang.compile ok" — anything other than
+    # "extern slot" for every region indicates the new path engaged.
+    src = artifact.source
+    assert artifact.launcher is not None
+    assert "extern slot" not in src or "tilelang.compile ok" in src, (
+        "Unary chain must hit the new sequential emitter, "
+        f"got source: {src!r}"
+    )
+
+
+def test_wave2_multi_region_launcher_does_not_use_gm_forward() -> None:
+    """When >1 compiled region exists, the chain launcher must NOT mark
+    itself as ``multi_fallback_to_gm_forward``.
+    """
+    if _no_tilelang_jit():
+        pytest.xfail("tilelang.compile unavailable; chain launcher path inert")
+
+    import torch
+    from torch import nn
+    import torch.fx
+    from torch.fx.passes.shape_prop import ShapeProp
+
+    from poc.torch_dynamo.fx_to_tilelang import FXToTileLang
+
+    class TwoRegions(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lin = nn.Linear(16, 16, bias=False)
+
+        def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+            y = torch.relu(self.lin(x))
+            return torch.tanh(torch.exp(y))
+
+    model = TwoRegions().eval()
+    x = torch.randn(4, 16, dtype=torch.float32)
+    gm = torch.fx.symbolic_trace(model)
+    ShapeProp(gm).propagate(x)
+
+    artifact = FXToTileLang(gm, [x]).run()
+    chain_mode = getattr(artifact.launcher, "_tilelang_chain_mode", None)
+    assert chain_mode != "multi_fallback_to_gm_forward", (
+        f"Multi-region chain still falls back to gm.forward; "
+        f"chain_mode={chain_mode!r}, source={artifact.source!r}"
+    )
+
+
+def test_wave2_contiguity_guard_warns_and_materialises() -> None:
+    """Non-contiguous input through ``_impl`` must trigger one warning and
+    a ``.contiguous()`` materialisation.
+    """
+    import warnings as _w
+    import torch
+
+    from poc.torch_dynamo.custom_op_wrapper import _ensure_contiguous_inputs
+
+    x = torch.randn(4, 8, dtype=torch.float32)
+    xt = x.t()  # non-contiguous view
+    assert not xt.is_contiguous()
+
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        out = _ensure_contiguous_inputs("tilelang::test_op_a", (xt,))
+    assert out[0].is_contiguous()
+    assert any(issubclass(w.category, RuntimeWarning) for w in caught), (
+        f"expected RuntimeWarning, got {[w.category for w in caught]!r}"
+    )
+
+    # Second call with the same op+slot pattern must NOT warn again.
+    with _w.catch_warnings(record=True) as caught2:
+        _w.simplefilter("always")
+        _ensure_contiguous_inputs("tilelang::test_op_a", (xt,))
+    assert not any(issubclass(w.category, RuntimeWarning)
+                   for w in caught2), (
+        f"warn-once cache leaked; second call warned again: "
+        f"{[w.category for w in caught2]!r}"
+    )
+
+
+def test_wave2_dropout_eval_is_identity_spec() -> None:
+    """``aten.dropout`` in eval mode must emit a same-shape spec with no error."""
+    import torch
+    import torch.fx
+    from torch.fx.passes.shape_prop import ShapeProp
+    from torch import nn
+
+    from poc.torch_dynamo.fx_to_tilelang import FXToTileLang
+
+    class DropoutEval(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.drop = nn.Dropout(p=0.5)
+
+        def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+            return self.drop(x)
+
+    model = DropoutEval().eval()
+    x = torch.randn(4, 8, dtype=torch.float32)
+    gm = torch.fx.symbolic_trace(model)
+    ShapeProp(gm).propagate(x)
+    artifact = FXToTileLang(gm, [x]).run()
+    assert artifact.launcher is not None
+
+
+def test_wave2_view_reshape_specs_resolve() -> None:
+    """``view`` / ``reshape`` emitters must resolve -1 dims correctly."""
+    from poc.torch_dynamo.fx_to_tilelang import (
+        ATEN_DISPATCH, _TensorSpec, LoweringContext,
+    )
+
+    class _StubNode:
+        name = "view_node"
+
+    ctx = LoweringContext(gm=None, example_inputs=[])  # type: ignore[arg-type]
+    src = _TensorSpec(shape=(4, 8), dtype="float32")
+    spec = ATEN_DISPATCH["view"](_StubNode(), (src, (2, -1)), ctx)
+    assert spec.shape == (2, 16)
+    assert spec.dtype == "float32"

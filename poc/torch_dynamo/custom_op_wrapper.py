@@ -27,8 +27,9 @@ indicates a missed aot_autograd capture.
 from __future__ import annotations
 
 import threading
+import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Sequence, Tuple, TYPE_CHECKING  # noqa: F401
+from typing import Any, Callable, Dict, FrozenSet, Sequence, Tuple, TYPE_CHECKING  # noqa: F401
 
 if TYPE_CHECKING:  # pragma: no cover
     import torch
@@ -37,6 +38,65 @@ if TYPE_CHECKING:  # pragma: no cover
 # Process-wide cache so re-registering the same fused op is idempotent.
 _REGISTRY: Dict[str, Callable[..., Any]] = {}
 _REGISTRY_LOCK = threading.Lock()
+
+# Wave-2 fix-pack (grok #02 security note 2 + killer scenarios):
+# warn-once cache for non-contiguous / aliased tensors at the custom_op
+# boundary. Keyed by (op_qualname, position-in-args, contiguity-flag) so
+# the warning fires once per op×slot×stride-pattern.
+_CONTIGUITY_WARN_SEEN: FrozenSet = frozenset()
+_CONTIGUITY_LOCK = threading.Lock()
+
+
+def _ensure_contiguous_inputs(
+    op_qualname: str,
+    tensors: Sequence[Any],
+) -> Tuple[Any, ...]:
+    """Return ``tensors`` with each non-contiguous input replaced by
+    ``.contiguous()``, warning once per ``(op, slot)`` pair.
+
+    The current TileLang launcher convention assumes row-major contiguous
+    input strides; passing a non-contiguous view (transpose/expand result)
+    causes silent address-arithmetic corruption inside the kernel. We
+    proactively materialise a contiguous copy and warn so callers can
+    upstream a ``.contiguous()`` if the copy shows up in profiling.
+    """
+    global _CONTIGUITY_WARN_SEEN
+    fixed: list = []
+    new_seen = set(_CONTIGUITY_WARN_SEEN)
+    changed = False
+    for i, t in enumerate(tensors):
+        try:
+            is_tensor = hasattr(t, "is_contiguous")
+        except Exception:  # pragma: no cover
+            is_tensor = False
+        if not is_tensor:
+            fixed.append(t)
+            continue
+        try:
+            ok = t.is_contiguous()
+        except Exception:  # pragma: no cover
+            ok = True
+        if not ok:
+            key = (op_qualname, i)
+            if key not in new_seen:
+                new_seen.add(key)
+                changed = True
+                warnings.warn(
+                    f"tilelang custom_op {op_qualname!r}: input #{i} "
+                    f"(shape={tuple(getattr(t, 'shape', ()))}) is "
+                    f"non-contiguous; auto-materialising .contiguous(). "
+                    f"For best perf insert an explicit .contiguous() "
+                    f"upstream of this op.",
+                    RuntimeWarning,
+                    stacklevel=4,
+                )
+            fixed.append(t.contiguous())
+        else:
+            fixed.append(t)
+    if changed:
+        with _CONTIGUITY_LOCK:
+            _CONTIGUITY_WARN_SEEN = frozenset(new_seen)
+    return tuple(fixed)
 
 
 @dataclass
@@ -179,6 +239,8 @@ def wrap_as_custom_op(
         @custom_op(op_qualname, mutates_args=())
         def _impl(args: Sequence[torch.Tensor]) -> Any:  # type: ignore[name-defined]
             _check_no_grad(args, allow_grad=allow_grad)
+            # Wave-2 fix-pack: contiguity guard at the custom_op boundary.
+            args = _ensure_contiguous_inputs(op_qualname, args)
             if _has_params:
                 return _bound_launcher(*args, *param_tensors)
             return _bound_launcher(*args)

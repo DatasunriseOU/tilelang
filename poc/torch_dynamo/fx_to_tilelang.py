@@ -599,7 +599,190 @@ def _emit_sdpa(node, args, ctx: LoweringContext) -> _TensorSpec:
 
 # ---------------------------------------------------------------------------
 # Inductor-coverage set called out in RFC §7 Phase 2.2.
+# Wave-2 fix-pack: top-8 ATEN gaps from grok #02 review (correctness §1 +
+# design §1).
 # ---------------------------------------------------------------------------
+
+
+def _emit_view_like(name: str) -> Callable[..., _TensorSpec]:
+    """Factory for shape-only operators (view / reshape / flatten).
+
+    These operators do not change underlying memory — only the spec's shape
+    interpretation. The materialiser (``_emit_kernel_body``) reuses the
+    source buffer and rewrites the spec, no kernel is emitted.
+    """
+
+    def _emit(node, args, ctx: LoweringContext) -> _TensorSpec:
+        x = args[0]
+        if not isinstance(x, _TensorSpec):
+            raise TypeError(f"aten.{name} requires a tensor input")
+        target = args[1] if len(args) > 1 else None
+        # Resolve -1 entries against the source numel.
+        if target is None:
+            new_shape: Tuple[int, ...] = x.shape
+        elif isinstance(target, (list, tuple)):
+            target_t = tuple(target)
+            n_neg = sum(1 for s in target_t if s == -1)
+            if n_neg > 1:
+                raise NotImplementedError(
+                    f"aten.{name}: multiple -1 dims not supported")
+            if n_neg == 0:
+                new_shape = target_t
+            else:
+                src_numel = 1
+                for s in x.shape:
+                    src_numel *= s
+                fixed = 1
+                for s in target_t:
+                    if s != -1:
+                        fixed *= s
+                if fixed == 0 or src_numel % fixed != 0:
+                    raise NotImplementedError(
+                        f"aten.{name}: cannot infer -1 dim "
+                        f"from src numel {src_numel} / fixed {fixed}")
+                inferred = src_numel // fixed
+                new_shape = tuple(inferred if s == -1 else s for s in target_t)
+        else:
+            new_shape = (int(target),)
+        ctx.op_trace.append((name, (node.name, x, new_shape)))
+        return _TensorSpec(shape=new_shape, dtype=x.dtype)
+
+    _emit.__name__ = f"emit_{name}"
+    return _emit
+
+
+def _emit_permute(node, args, ctx: LoweringContext) -> _TensorSpec:
+    """``aten.permute`` — track the spec under axis permutation.
+
+    Materialiser emits a ``T.copy`` with the swapped iteration order
+    (analogous to ``emit_t``).
+    """
+    x = args[0]
+    perm = args[1] if len(args) > 1 else tuple(range(len(x.shape)))
+    if not isinstance(x, _TensorSpec):
+        raise TypeError("aten.permute requires a tensor input")
+    perm_t = tuple(int(p) for p in perm)
+    if sorted(perm_t) != list(range(len(x.shape))):
+        raise NotImplementedError(
+            f"aten.permute: invalid permutation {perm_t} "
+            f"for shape {x.shape}")
+    new_shape = tuple(x.shape[p] for p in perm_t)
+    ctx.op_trace.append(("permute", (node.name, x, perm_t)))
+    return _TensorSpec(shape=new_shape, dtype=x.dtype)
+
+
+def _emit_transpose(node, args, ctx: LoweringContext) -> _TensorSpec:
+    """``aten.transpose`` — swap two axes."""
+    x = args[0]
+    if not isinstance(x, _TensorSpec):
+        raise TypeError("aten.transpose requires a tensor input")
+    rank = len(x.shape)
+    dim0 = int(args[1]) if len(args) > 1 else 0
+    dim1 = int(args[2]) if len(args) > 2 else 1
+    if dim0 < 0:
+        dim0 += rank
+    if dim1 < 0:
+        dim1 += rank
+    if not (0 <= dim0 < rank and 0 <= dim1 < rank):
+        raise NotImplementedError(
+            f"aten.transpose: out-of-range dims ({dim0},{dim1}) for rank {rank}")
+    swapped = list(x.shape)
+    swapped[dim0], swapped[dim1] = swapped[dim1], swapped[dim0]
+    ctx.op_trace.append(("transpose", (node.name, x, dim0, dim1)))
+    return _TensorSpec(shape=tuple(swapped), dtype=x.dtype)
+
+
+def _emit_broadcast_to(node, args, ctx: LoweringContext) -> _TensorSpec:
+    """``aten.broadcast_to`` — same shape resolution as ``expand``."""
+    x = args[0]
+    target = tuple(args[1]) if len(args) > 1 else x.shape
+    if not isinstance(x, _TensorSpec):
+        raise TypeError("aten.broadcast_to requires a tensor input")
+    out_shape = tuple(
+        s if s != -1 else x.shape[i] for i, s in enumerate(target)
+    )
+    ctx.op_trace.append(("broadcast_to", (node.name, x, target)))
+    return _TensorSpec(shape=out_shape, dtype=x.dtype)
+
+
+def _emit_dropout(node, args, ctx: LoweringContext) -> _TensorSpec:
+    """``aten.dropout`` — eval-only (training=False) is identity for the POC.
+
+    Real materialisation honours ``training`` + a Philox RNG path; we
+    record both as a TODO and let the eager fallback fire when training=True.
+    """
+    x = args[0]
+    if not isinstance(x, _TensorSpec):
+        raise TypeError("aten.dropout requires a tensor input")
+    p = args[1] if len(args) > 1 else 0.0
+    training = bool(args[2]) if len(args) > 2 else False
+    if training and p != 0.0:
+        # TODO(wave-3): emit a Philox RNG path for training-mode dropout.
+        raise NotImplementedError(
+            "aten.dropout(training=True, p>0) requires a Philox RNG kernel "
+            "(deferred to wave-3)")
+    ctx.op_trace.append(("dropout", (node.name, x, p, training)))
+    return _TensorSpec(shape=x.shape, dtype=x.dtype)
+
+
+def _emit_pow(node, args, ctx: LoweringContext) -> _TensorSpec:
+    """``aten.pow`` — elementwise (tensor, scalar-or-tensor)."""
+    base = args[0]
+    exp_ = args[1] if len(args) > 1 else None
+    if not isinstance(base, _TensorSpec):
+        raise TypeError("aten.pow requires a tensor base")
+    if isinstance(exp_, _TensorSpec):
+        out_shape = _broadcast_shape(base.shape, exp_.shape)
+    else:
+        out_shape = base.shape
+    ctx.op_trace.append(("pow", (node.name, base, exp_)))
+    return _TensorSpec(shape=out_shape, dtype=base.dtype)
+
+
+def _emit_cat(node, args, ctx: LoweringContext) -> _TensorSpec:
+    """``aten.cat`` — concat along ``dim``."""
+    tensors = args[0]
+    dim = int(args[1]) if len(args) > 1 else 0
+    if not isinstance(tensors, (list, tuple)) or not tensors:
+        raise TypeError("aten.cat requires a non-empty list of tensors")
+    if not all(isinstance(t, _TensorSpec) for t in tensors):
+        raise NotImplementedError("aten.cat: non-tensor element")
+    rank = len(tensors[0].shape)
+    if dim < 0:
+        dim += rank
+    if any(len(t.shape) != rank for t in tensors):
+        raise NotImplementedError("aten.cat: rank mismatch across operands")
+    out = list(tensors[0].shape)
+    out[dim] = sum(t.shape[dim] for t in tensors)
+    ctx.op_trace.append(("cat", (node.name, tuple(tensors), dim)))
+    return _TensorSpec(shape=tuple(out), dtype=tensors[0].dtype)
+
+
+def _emit_stack(node, args, ctx: LoweringContext) -> _TensorSpec:
+    """``aten.stack`` — concat along a new axis."""
+    tensors = args[0]
+    dim = int(args[1]) if len(args) > 1 else 0
+    if not isinstance(tensors, (list, tuple)) or not tensors:
+        raise TypeError("aten.stack requires a non-empty list of tensors")
+    if not all(isinstance(t, _TensorSpec) for t in tensors):
+        raise NotImplementedError("aten.stack: non-tensor element")
+    base = list(tensors[0].shape)
+    if dim < 0:
+        dim += len(base) + 1
+    out = base[:dim] + [len(tensors)] + base[dim:]
+    ctx.op_trace.append(("stack", (node.name, tuple(tensors), dim)))
+    return _TensorSpec(shape=tuple(out), dtype=tensors[0].dtype)
+
+
+def _emit_clamp(node, args, ctx: LoweringContext) -> _TensorSpec:
+    """``aten.clamp`` / ``aten.clip`` — elementwise min/max bounds."""
+    x = args[0]
+    if not isinstance(x, _TensorSpec):
+        raise TypeError("aten.clamp requires a tensor input")
+    lo = args[1] if len(args) > 1 else None
+    hi = args[2] if len(args) > 2 else None
+    ctx.op_trace.append(("clamp", (node.name, x, lo, hi)))
+    return _TensorSpec(shape=x.shape, dtype=x.dtype)
 
 
 ATEN_DISPATCH: Dict[str, Callable[..., _TensorSpec]] = {
@@ -634,6 +817,32 @@ ATEN_DISPATCH: Dict[str, Callable[..., _TensorSpec]] = {
     # --- masking -----------------------------------------------------------
     "where": _emit_where,
     "masked_fill": _emit_masked_fill,
+    # --- shape / view family (wave-2) -------------------------------------
+    "view": _emit_view_like("view"),
+    "reshape": _emit_view_like("reshape"),
+    "_unsafe_view": _emit_view_like("view"),
+    "flatten": _emit_view_like("flatten"),
+    "permute": _emit_permute,
+    "transpose": _emit_transpose,
+    "broadcast_to": _emit_broadcast_to,
+    # --- elementwise math (wave-2) ----------------------------------------
+    "exp": _unary_elementwise("exp"),
+    "log": _unary_elementwise("log"),
+    "sqrt": _unary_elementwise("sqrt"),
+    "rsqrt": _unary_elementwise("rsqrt"),
+    "sigmoid": _unary_elementwise("sigmoid"),
+    "neg": _unary_elementwise("neg"),
+    "abs": _unary_elementwise("abs"),
+    "pow": _emit_pow,
+    # --- shape ops --------------------------------------------------------
+    "cat": _emit_cat,
+    "stack": _emit_stack,
+    # --- ranges / clamping -----------------------------------------------
+    "clamp": _emit_clamp,
+    "clip": _emit_clamp,
+    # --- training (no-op when training=False) -----------------------------
+    "dropout": _emit_dropout,
+    "_native_dropout": _emit_dropout,
 }
 
 
@@ -1475,26 +1684,136 @@ class FXToTileLang:
 
         return kernel
 
+    # ------------------------------------------------------------------
+    # Sequential elementwise materialiser (wave-2 fix-pack — grok #02
+    # design §1 + correctness §1: "make _emit_sequential_region actually
+    # emit a chain of per-op TIR snippets").
+    # ------------------------------------------------------------------
+    _SEQUENTIAL_UNARY_OPS = frozenset({
+        "relu", "gelu", "silu", "tanh", "sigmoid",
+        "exp", "log", "sqrt", "rsqrt", "neg", "abs",
+    })
+    _SEQUENTIAL_VIEW_OPS = frozenset({
+        "view", "reshape", "flatten", "permute", "transpose",
+        "broadcast_to", "expand", "dropout",
+    })
+
     def _emit_sequential_region(
         self, T: Any,
         region: List[Tuple[str, Tuple[Any, ...]]],
     ) -> Any:
         """Best-effort sequential PrimFunc for a region of ops.
 
-        For the POC this raises ``NotImplementedError`` for any op trace
-        we don't have a tight pattern for — the orchestrator catches the
-        exception and routes the region to the extern-fallback launcher.
-        Future contributors fill in this method by walking ``region`` and
-        chaining per-op TIR snippets via shared/fragment-resident
-        intermediates (see ``_alloc_intermediate_kind`` for the
-        register/shared/local heuristic).
+        Wave-2 status: handles a *pure unary elementwise chain* with a
+        single tensor input, single tensor output, identical
+        ``(shape, dtype)`` across the chain. View-like ops (``view``,
+        ``reshape``, ``permute``, ``transpose``, ``flatten``,
+        ``broadcast_to``, ``expand``) are absorbed as no-ops at the
+        kernel boundary — the spec just changes, no code is emitted.
+
+        Any other shape (binary elementwise, reductions, attention) still
+        raises ``NotImplementedError`` so the orchestrator routes to the
+        extern-fallback launcher. Wave-3 follow-ups should extend this to
+        binary elementwise and to multi-input fused chains.
         """
-        ops = [op for op, _ in region]
-        raise NotImplementedError(
-            f"sequential region materialisation for op trace {ops!r} "
-            "not implemented in POC; orchestrator will route to "
-            "tir.call_extern fallback (RFC §7 Phase 2)."
-        )
+        ops_only = [op for op, _ in region]
+
+        # Strip leading/trailing view-like ops; they are spec-only.
+        compute_ops: List[Tuple[str, Tuple[Any, ...]]] = [
+            (op, payload) for (op, payload) in region
+            if op not in self._SEQUENTIAL_VIEW_OPS
+        ]
+        if not compute_ops:
+            raise NotImplementedError(
+                "sequential region: only view-like ops, nothing to compile")
+
+        if not all(op in self._SEQUENTIAL_UNARY_OPS
+                   for op, _ in compute_ops):
+            raise NotImplementedError(
+                f"sequential region: op trace {ops_only!r} "
+                "contains non-unary-elementwise ops; routing to extern")
+
+        # Source spec from first compute op's tensor argument.
+        first_payload = compute_ops[0][1]
+        src_spec = first_payload[1] if len(first_payload) > 1 else None
+        if not isinstance(src_spec, _TensorSpec):
+            raise NotImplementedError(
+                "sequential region: cannot resolve source tensor spec")
+        for op_name, payload in compute_ops:
+            t = payload[1] if len(payload) > 1 else None
+            if not isinstance(t, _TensorSpec):
+                raise NotImplementedError(
+                    f"sequential region: op {op_name} missing tensor input")
+            if t.shape != src_spec.shape or t.dtype != src_spec.dtype:
+                raise NotImplementedError(
+                    "sequential region: shape/dtype mismatch across chain")
+
+        shape = src_spec.shape
+        dtype = src_spec.dtype
+        n_elem = 1
+        for s in shape:
+            n_elem *= int(s)
+        if n_elem <= 0:
+            raise NotImplementedError(
+                f"sequential region: degenerate numel from shape {shape}")
+        # Block size — same heuristic as _alloc_intermediate_kind.
+        BLOCK = 128 if n_elem >= 128 else (64 if n_elem >= 64 else max(n_elem, 1))
+
+        # Build the per-op TIR closure list once, capturing op names by value.
+        unary_op_names = tuple(op for op, _ in compute_ops)
+
+        def _apply_unary(T_mod: Any, op_name: str, v: Any, dtype_str: str) -> Any:
+            if op_name == "relu":
+                zero = T_mod.cast(dtype_str, 0)
+                return T_mod.max(v, zero)
+            if op_name == "tanh":
+                return T_mod.tanh(v)
+            if op_name == "sigmoid":
+                one = T_mod.cast(dtype_str, 1)
+                return one / (one + T_mod.exp(-v))
+            if op_name == "silu":
+                one = T_mod.cast(dtype_str, 1)
+                return v / (one + T_mod.exp(-v))
+            if op_name == "gelu":
+                # tanh approximation (matches _emit_fused_linear_region)
+                return (T_mod.cast(dtype_str, 0.5) * v *
+                        (T_mod.cast(dtype_str, 1.0) +
+                         T_mod.tanh(T_mod.cast(dtype_str, 0.7978845608028654) *
+                                    (v + T_mod.cast(dtype_str, 0.044715) *
+                                     v * v * v))))
+            if op_name == "exp":
+                return T_mod.exp(v)
+            if op_name == "log":
+                return T_mod.log(v)
+            if op_name == "sqrt":
+                return T_mod.sqrt(v)
+            if op_name == "rsqrt":
+                return T_mod.rsqrt(v)
+            if op_name == "neg":
+                return -v
+            if op_name == "abs":
+                return T_mod.abs(v)
+            raise NotImplementedError(
+                f"sequential region: unary op {op_name} has no TIR builder")
+
+        @T.prim_func
+        def kernel(
+            X: T.Tensor(shape, dtype),
+            Y: T.Tensor(shape, dtype),
+        ):
+            with T.Kernel(T.ceildiv(n_elem, BLOCK), threads=BLOCK) as bx:
+                # Flat index space: collapse to 1D for the elementwise path.
+                X_flat = T.Buffer((n_elem,), dtype, data=X.data)
+                Y_flat = T.Buffer((n_elem,), dtype, data=Y.data)
+                for i in T.Parallel(BLOCK):
+                    idx = bx * BLOCK + i
+                    if idx < n_elem:
+                        v = X_flat[idx]
+                        for op_name in unary_op_names:
+                            v = _apply_unary(T, op_name, v, dtype)
+                        Y_flat[idx] = v
+
+        return kernel
 
     def _region_output_specs(
         self,
@@ -1599,6 +1918,81 @@ class FXToTileLang:
         _launcher._tilelang_extern_fallback = True  # type: ignore[attr-defined]
         return _launcher
 
+    def _derive_region_io(
+        self,
+        regions: List[List[Tuple[str, Tuple[Any, ...]]]],
+    ) -> Optional[List[Tuple[List[str], List[str]]]]:
+        """Derive ``(input_node_names, output_node_names)`` per region.
+
+        Walks the FX graph to identify which placeholder / get_attr / prior
+        region outputs each region consumes, and which of its produced
+        nodes are consumed externally (by a later region or the FX
+        ``output``). Returns ``None`` if the trace doesn't carry enough
+        info (e.g., a region's payload[0] isn't a node-name string), so
+        the caller can fall back to ``gm.forward``.
+        """
+        try:
+            gm_nodes = list(self.gm.graph.nodes)
+            name_to_node = {n.name: n for n in gm_nodes}
+        except Exception:  # pragma: no cover
+            return None
+
+        produced_per_region: List[List[str]] = []
+        for region in regions:
+            produced: List[str] = []
+            for _, payload in region:
+                if not payload or not isinstance(payload[0], str):
+                    return None
+                produced.append(payload[0])
+            produced_per_region.append(produced)
+
+        # Reverse map: node-name -> region index (last writer wins).
+        node_to_region: Dict[str, int] = {}
+        for r_idx, names in enumerate(produced_per_region):
+            for n in names:
+                node_to_region[n] = r_idx
+
+        result: List[Tuple[List[str], List[str]]] = []
+        for r_idx, region in enumerate(regions):
+            produced = produced_per_region[r_idx]
+            produced_set = set(produced)
+
+            # Inputs: external nodes referenced by any FX node in this region.
+            input_names: List[str] = []
+            input_seen: set = set()
+            for n_name in produced:
+                fx_node = name_to_node.get(n_name)
+                if fx_node is None:
+                    return None
+                for arg in fx_node.all_input_nodes:
+                    if (arg.name not in produced_set
+                            and arg.name not in input_seen):
+                        input_seen.add(arg.name)
+                        input_names.append(arg.name)
+
+            # Outputs: produced nodes consumed by some node OUTSIDE this region
+            # (later region or graph output).
+            output_names: List[str] = []
+            for n_name in produced:
+                fx_node = name_to_node.get(n_name)
+                if fx_node is None:
+                    return None
+                consumed_externally = False
+                for user in fx_node.users:
+                    if user.op == "output" or user.name not in produced_set:
+                        consumed_externally = True
+                        break
+                if consumed_externally:
+                    output_names.append(n_name)
+            if not output_names and produced:
+                # Treat the last produced node as the region output if the FX
+                # graph never references any of them externally (rare; usually
+                # means the region was eliminated by DCE).
+                output_names = [produced[-1]]
+            result.append((input_names, output_names))
+
+        return result
+
     def _build_chain_launcher(
         self,
         region_launchers: List[Callable[..., Any]],
@@ -1606,18 +2000,15 @@ class FXToTileLang:
     ) -> Callable[..., Any]:
         """Wire region launchers into a single Dynamo-shaped callable.
 
-        The chain launcher is invoked with the runtime inputs Dynamo
-        passes the backend (placeholders + bound params, in FX order).
-        It forwards them through each region launcher in sequence,
-        threading the previous region's outputs as the next region's
-        inputs. The final region's outputs are returned.
+        Wave-2 fix-pack (grok #02 perf §1 / design): for genuinely
+        multi-region compiled traces we now derive per-region
+        ``(input_names, output_names)`` from the FX graph and thread
+        tensors through an ``env`` dict instead of falling back to
+        ``gm.forward``. The fallback only fires when:
 
-        POC simplification: when every region is using the extern
-        fallback (i.e. nothing compiled to real TileLang), we delegate to
-        a single ``gm.forward`` call so we don't pay N x eager-replay
-        cost. When regions mix compiled + extern, we still need a
-        real region-level argument router — that's deferred until
-        ``_materialize_subgraph`` covers the full op set.
+        * every region is the extern stub (nothing compiled), OR
+        * the trace lacks enough info to derive region I/O (a region's
+          op-trace payload doesn't carry node-name strings).
         """
         gm = self.gm
         all_extern = all(
@@ -1627,28 +2018,76 @@ class FXToTileLang:
         if all_extern:
             def _launcher(*runtime_inputs: Any) -> Any:
                 return gm(*runtime_inputs)
+            _launcher._tilelang_chain_mode = "extern_all"  # type: ignore[attr-defined]
             return _launcher
 
-        # Mixed / fully compiled: today this only fires for the
-        # ``fused_linear`` smoke pattern (exactly one region, the matmul +
-        # activation kernel). The kernel signature matches the FX graph's
-        # placeholder + param order, so a single launcher call suffices.
-        # Multi-region wiring lands together with the sequential
-        # materialiser.
         if len(region_launchers) == 1:
             single = region_launchers[0]
             def _launcher_one(*runtime_inputs: Any) -> Any:
                 return single(*runtime_inputs)
+            _launcher_one._tilelang_chain_mode = "single_region"  # type: ignore[attr-defined]
             return _launcher_one
 
-        # True multi-region chain: sequentially run regions, but until
-        # _materialize_subgraph covers more patterns we can't statically
-        # know which inputs each region consumes — so we conservatively
-        # fall back to gm.forward and let the per-op compile cache pick
-        # up the kernels for next time. (This is the only place we still
-        # touch gm.forward in the orchestrator.)
-        def _launcher_multi(*runtime_inputs: Any) -> Any:  # pragma: no cover
-            return gm(*runtime_inputs)
+        # True multi-region chain — derive per-region I/O from the FX graph.
+        region_io = self._derive_region_io(regions)
+        try:
+            placeholder_names = [
+                n.name for n in self.gm.graph.nodes if n.op == "placeholder"
+            ]
+            attr_names = [
+                n.name for n in self.gm.graph.nodes if n.op == "get_attr"
+            ]
+        except Exception:  # pragma: no cover
+            placeholder_names = []
+            attr_names = []
+        runtime_input_names = placeholder_names + attr_names
+
+        if region_io is None or not runtime_input_names:
+            # Degenerate case — give up cleanly rather than producing wrong
+            # results. This is the ONLY remaining gm.forward fall-through.
+            def _launcher_multi_fallback(*runtime_inputs: Any) -> Any:
+                return gm(*runtime_inputs)
+            _launcher_multi_fallback._tilelang_chain_mode = (  # type: ignore[attr-defined]
+                "multi_fallback_to_gm_forward"
+            )
+            return _launcher_multi_fallback
+
+        def _launcher_multi(*runtime_inputs: Any) -> Any:
+            if len(runtime_inputs) < len(runtime_input_names):
+                # Calling convention drift: fall back to gm.forward rather
+                # than IndexError. (Shouldn't happen in practice.)
+                return gm(*runtime_inputs)
+            env: Dict[str, Any] = dict(zip(runtime_input_names, runtime_inputs))
+            for rl, (in_names, out_names) in zip(region_launchers, region_io):
+                try:
+                    in_tensors = tuple(env[n] for n in in_names)
+                except KeyError:
+                    # A region needs a tensor we don't have in the env yet.
+                    # Fall back to gm.forward this call.
+                    return gm(*runtime_inputs)
+                out = rl(*in_tensors)
+                if not isinstance(out, tuple):
+                    out_tup: Tuple[Any, ...] = (out,)
+                else:
+                    out_tup = out
+                # Match output count; pad with ``out`` if launcher returned
+                # a single tensor for a multi-output region (best-effort).
+                if len(out_tup) < len(out_names):
+                    out_tup = out_tup + (out_tup[-1],) * (len(out_names) - len(out_tup))
+                for nm, t in zip(out_names, out_tup):
+                    env[nm] = t
+
+            # Final outputs = the last region's output names.
+            final_names = region_io[-1][1] if region_io else []
+            if not final_names:
+                # Should not happen given _derive_region_io's fallback,
+                # but stay safe.
+                return gm(*runtime_inputs)
+            if len(final_names) == 1:
+                return env[final_names[0]]
+            return tuple(env[n] for n in final_names)
+
+        _launcher_multi._tilelang_chain_mode = "multi_real_chain"  # type: ignore[attr-defined]
         return _launcher_multi
 
     # ------------------------------------------------------------------
