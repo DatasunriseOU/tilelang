@@ -339,11 +339,19 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
   bool CanProve(const PrimExpr& expr) {
     if (CheckTrivilBadCases(expr)) return false;
     if (!IsValidDType(expr->dtype)) return false;
-    ::z3::expr_vector constr(*ctx);
-    constr.push_back(!ConvertBool(expr));
-    auto result = solver.check(constr);
-    constr.pop_back();
-    return result == ::z3::unsat;
+    try {
+      ::z3::expr_vector constr(*ctx);
+      constr.push_back(!ConvertBool(expr));
+      auto result = solver.check(constr);
+      constr.pop_back();
+      return result == ::z3::unsat;
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "Z3 query exception: " << e.what();
+      return false;
+    } catch (...) {
+      LOG(WARNING) << "Z3 query unknown exception";
+      return false;
+    }
   }
 
   void Bind(const Var& var, const PrimExpr& value, bool /*allow_override*/) {
