@@ -32,6 +32,7 @@ Adding a new mapping
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 # When True, force the log/exp synthesis for tt.reduce(mul) instead of the
@@ -177,6 +178,103 @@ def _attrs(op: Any) -> Dict[str, Any]:
         return dict(op.get("attrs", {}))
     # Real MLIR: attributes attribute. Keep stringified for portability.
     return {a.name: a.attr for a in op.attributes} if hasattr(op, "attributes") else {}
+
+
+# ---------------------------------------------------------------------------
+# Generic-form properties parser (shared by memory.py and arith.py emitters)
+# ---------------------------------------------------------------------------
+#
+# Triton 3.6 (and any MLIR op that uses Properties storage) prints its
+# inherent attributes inside ``<{...}>`` rather than the legacy ``{...}``
+# braces. jaxlib's ``mlir.ir`` Python bindings expose properties only when
+# the dialect is registered; with ``allow_unregistered_dialects=True`` --
+# the only mode we have on hosts that lack a Triton-aware MLIR build --
+# ``op.attributes`` returns an EMPTY map for property-only ops. The same
+# bug affected ``tt.make_range`` (fixed in op_emitters/memory.py during
+# Wave C2) and now bites ``arith.cmpi`` / ``arith.cmpf`` whose ``predicate``
+# attribute is stored as a Property in Triton 3.6.
+#
+# We recover by lifting the ``<{...}>`` slice out of ``str(op)`` (the
+# printed assembly *does* include properties even when the dict-shaped
+# accessor is empty) and parsing the small ``key = literal`` grammar
+# Triton emits. The helpers live here so every op-emitter module can use
+# them without duplicating the regex.
+
+# Match ``<{...}>`` at any nesting level inside the printed op. We only
+# need the OUTERMOST one -- properties don't nest.
+_PROPERTIES_RE = re.compile(r"<\{(?P<body>[^}]*)\}>")
+# A key=value pair with an optional ``: <type>`` annotation. Matches
+# ``predicate = 4 : i64``, ``start = 0 : i32``, and ``end = 256 : i32``.
+_PROP_PAIR_RE = re.compile(
+    r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+    r"(?P<val>-?\d+|true|false|\"[^\"]*\")"
+    r"(?:\s*:\s*[A-Za-z_][A-Za-z0-9_]*)?"
+)
+
+
+def _parse_generic_properties_shared(op: Any) -> Dict[str, Any]:
+    """Extract Triton 3.6 MLIR Properties from ``str(op)``.
+
+    jaxlib's ``mlir.ir`` Python bindings under
+    ``allow_unregistered_dialects=True`` don't expose dialect-registered
+    Properties via ``op.attributes`` -- only inherent attrs of *registered*
+    dialects come through. This helper pulls the ``<{...}>`` block out of
+    the printed op string and parses the ``key = literal : <type>`` grammar
+    Triton/arith emit.
+
+    Returns an empty dict when the op has no printable ``<{...}>`` block
+    (real dict-shaped fakes or attributes-only ops). Values are coerced
+    to Python ``int`` / ``bool`` / ``str`` -- the coverage we need for
+    ``tt.make_range`` and ``arith.cmpi``/``arith.cmpf`` predicates.
+    """
+    if isinstance(op, dict):
+        return {}
+    try:
+        text = str(op)
+    except Exception:
+        return {}
+    m = _PROPERTIES_RE.search(text)
+    if not m:
+        return {}
+    out: Dict[str, Any] = {}
+    for pair in _PROP_PAIR_RE.finditer(m.group("body")):
+        key = pair.group("key")
+        raw = pair.group("val")
+        if raw == "true":
+            out[key] = True
+        elif raw == "false":
+            out[key] = False
+        elif raw.startswith("\"") and raw.endswith("\""):
+            out[key] = raw[1:-1]
+        else:
+            try:
+                out[key] = int(raw)
+            except ValueError:
+                out[key] = raw
+    return out
+
+
+def _attrs_with_properties_shared(op: Any) -> Dict[str, Any]:
+    """``_attrs`` plus a fallback to the ``<{...}>`` properties block.
+
+    Existing dict-shaped fakes and ops with classic attribute storage
+    take the fast path through the legacy ``_attrs`` helper. When that
+    returns an empty dict and we're looking at a real MLIR op whose
+    inherent attributes live in Properties storage, we fall back to a
+    small textual parser. The parser is intentionally narrow: we only
+    accept the ``key = scalar : type`` shape Triton/arith emit.
+    """
+    base: Dict[str, Any] = {}
+    try:
+        base = dict(_attrs(op))
+    except Exception:
+        # ``_attrs`` itself can throw on op shapes whose ``op.attributes``
+        # iterator yields strings instead of NamedAttribute records (some
+        # jaxlib builds do this for unregistered ops). Treat as empty.
+        base = {}
+    if base:
+        return base
+    return _parse_generic_properties_shared(op)
 
 
 def _shape_of(value: Any) -> Tuple[int, ...]:

@@ -55,7 +55,6 @@ Hard constraints (from the maintainer)
 """
 from __future__ import annotations
 
-import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 # Reuse the public surface of op_mapping (WalkerCtx, helpers) so this file
@@ -63,8 +62,10 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from ..op_mapping import (
     WalkerCtx,
     _attrs,
+    _attrs_with_properties_shared,
     _dtype_of,
     _operands,
+    _parse_generic_properties_shared,
     _ptrstate_buffer,
     _ptrstate_is_tile,
     _ptrstate_offsets_or_zero,
@@ -78,89 +79,15 @@ from ..op_mapping import (
 # Generic-form properties parser
 # ---------------------------------------------------------------------------
 #
-# Triton 3.6 (and any MLIR op that uses Properties storage) prints its
-# inherent attributes inside ``<{...}>`` rather than the legacy ``{...}``
-# braces. jaxlib's ``mlir.ir`` Python bindings expose properties only
-# when the dialect is registered; with ``allow_unregistered_dialects=True``
-# (the only mode we have on a host that lacks ``brew llvm`` + Triton's
-# tt-dialect MLIR build) ``op.attributes`` returns an EMPTY map for
-# property-only ops. The result was that ``_attrs(tt.make_range)`` came
-# back as ``{}`` and the emitter computed ``[0, 0)`` -> ValueError.
-#
-# We recover by lifting the ``<{...}>`` slice out of ``str(op)`` (the
-# printed assembly *does* include properties even when the dict-shaped
-# accessor is empty) and parsing the small ``key = literal`` grammar
-# Triton emits. This keeps the fix local to op_emitters/memory.py per
-# the maintainer's territory rules.
+# The real implementation now lives in :mod:`poc.triton_frontend.op_mapping`
+# as ``_parse_generic_properties_shared`` / ``_attrs_with_properties_shared``
+# so other emitter modules (``op_emitters/arith.py`` for cmpi/cmpf) can
+# reuse the same Triton 3.6 ``<{...}>`` parser without duplicating the
+# regex. We keep these module-private aliases for backwards compatibility
+# with code that imports the unprefixed names directly.
 
-# Match ``<{...}>`` at any nesting level inside the printed op. We only
-# need the OUTERMOST one -- properties don't nest.
-_PROPERTIES_RE = re.compile(r"<\{(?P<body>[^}]*)\}>")
-# A key=value pair with an optional ``: <type>`` annotation.  Matches
-# ``start = 0 : i32`` and ``end = 256 : i32`` from the Triton 3.6 form.
-_PROP_PAIR_RE = re.compile(
-    r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
-    r"(?P<val>-?\d+|true|false|\"[^\"]*\")"
-    r"(?:\s*:\s*[A-Za-z_][A-Za-z0-9_]*)?"
-)
-
-
-def _parse_generic_properties(op: Any) -> Dict[str, Any]:
-    """Extract the ``<{key = literal : <type>, ...}>`` block from ``str(op)``.
-
-    Returns an empty dict when the op has no printable ``<{...}>`` block
-    (e.g. real dict-shaped fakes or attributes-only ops). On parse the
-    values are coerced to Python ``int`` / ``bool`` / ``str`` -- the
-    coverage we need for ``tt.make_range`` and friends.
-    """
-    if isinstance(op, dict):
-        return {}
-    try:
-        text = str(op)
-    except Exception:
-        return {}
-    m = _PROPERTIES_RE.search(text)
-    if not m:
-        return {}
-    out: Dict[str, Any] = {}
-    for pair in _PROP_PAIR_RE.finditer(m.group("body")):
-        key = pair.group("key")
-        raw = pair.group("val")
-        if raw == "true":
-            out[key] = True
-        elif raw == "false":
-            out[key] = False
-        elif raw.startswith("\"") and raw.endswith("\""):
-            out[key] = raw[1:-1]
-        else:
-            try:
-                out[key] = int(raw)
-            except ValueError:
-                out[key] = raw
-    return out
-
-
-def _attrs_with_properties(op: Any) -> Dict[str, Any]:
-    """``_attrs`` plus a fallback to the ``<{...}>`` properties block.
-
-    Existing dict-shaped fakes and ops with classic attribute storage
-    take the fast path through the legacy ``_attrs`` helper. When that
-    returns an empty dict and we're looking at a real MLIR op whose
-    inherent attributes live in Properties storage, we fall back to a
-    small textual parser. The parser is intentionally narrow: we only
-    accept the ``key = scalar : type`` shape that ``tt.make_range`` uses.
-    """
-    base: Dict[str, Any] = {}
-    try:
-        base = dict(_attrs(op))
-    except Exception:
-        # ``_attrs`` itself can throw on op shapes whose ``op.attributes``
-        # iterator yields strings instead of NamedAttribute records (some
-        # jaxlib builds do this for unregistered ops). Treat as empty.
-        base = {}
-    if base:
-        return base
-    return _parse_generic_properties(op)
+_parse_generic_properties = _parse_generic_properties_shared
+_attrs_with_properties = _attrs_with_properties_shared
 
 __all__ = ["MEMORY_EMITTERS", "has_cxx_shim"]
 
@@ -986,7 +913,16 @@ def emit_tt_broadcast(op: Any, ctx: WalkerCtx) -> Any:
 
 
 def emit_tt_splat(op: Any, ctx: WalkerCtx) -> Any:
-    """Lower ``tt.splat`` (scalar -> tile) to ``tir.Broadcast(scalar, lanes)``."""
+    """Lower ``tt.splat`` (scalar -> tile) to ``tir.Broadcast(scalar, lanes)``.
+
+    Pointer-typed splats (``tt.splat %ptr : !tt.ptr<f32> -> tensor<Nx!tt.ptr<f32>>``)
+    cannot go through ``tir.Broadcast`` -- TVM's Broadcast node rejects
+    non-PrimExpr operands and pointer-tile expansion is handled lazily by
+    the downstream ``tt.addptr`` / ``tt.load`` pair (which materialises the
+    per-lane address from the base buffer + the per-lane offset). For those
+    we propagate the source buffer through unchanged so ``tt.addptr`` sees
+    the underlying base and can wire it into a ``(buffer, indices)`` tuple.
+    """
     tir = ctx.tir()
     operands = _operands(op)
     if not operands:
@@ -1001,7 +937,13 @@ def emit_tt_splat(op: Any, ctx: WalkerCtx) -> Any:
         except (TypeError, ValueError):
             lanes = 0
             break
-    if lanes > 1 and hasattr(tir, "Broadcast"):
+    # Pointer-typed splat: pass the underlying buffer through. ``tt.addptr``
+    # downstream picks up the buffer via ``_resolved_or_none`` and pairs it
+    # with the per-lane offset tile.
+    tvm_mod = ctx.tvm()
+    if isinstance(src, tvm_mod.tir.Buffer):
+        out = src
+    elif lanes > 1 and hasattr(tir, "Broadcast"):
         out = tir.Broadcast(src, lanes)
     else:
         out = src
@@ -1053,7 +995,25 @@ def emit_tt_reshape(op: Any, ctx: WalkerCtx) -> Any:
 
 
 def emit_tt_addptr(op: Any, ctx: WalkerCtx) -> Any:
-    """Lower ``tt.addptr(ptr, offset)`` to a (buffer, indices) tuple update.
+    """Lower ``tt.addptr(ptr, offset)`` to a pointer descriptor.
+
+    Return-type contract
+    --------------------
+    The result is **never** a bare ``tir.PrimExpr`` -- pointer arithmetic
+    is a memory-side concept. Possible result shapes:
+
+    * Tagged ``dict`` ``{"_ptrstate": PtrState, "offsets", "sizes",
+      "strides", "source"}`` when PtrAnalysis (the C++ shim) folded the
+      op into a structured pointer. Consumed by ``tt.load`` / ``tt.store``.
+    * Plain ``(buffer_or_None, indices_list)`` 2-tuple in the degraded
+      path. ``buffer`` is a ``tir.Buffer`` (or ``None`` when the base
+      pointer wasn't bound yet) and ``indices_list`` is a list of
+      ``tir.PrimExpr`` index expressions.
+
+    Downstream consumers must extract the buffer + index pair (``tt.load`` /
+    ``tt.store`` already do this). Pure ``arith.*`` ops MUST NOT consume an
+    addptr result -- if they do, ``_emit_tile_binop`` in
+    ``op_emitters/arith.py`` raises an ``EmitError`` with the offending op.
 
     With the C++ shim available we delegate to PtrAnalysis (it does the
     full strided-layout fold). Without the shim we degrade to a scalar

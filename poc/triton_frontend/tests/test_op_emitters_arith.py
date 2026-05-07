@@ -423,3 +423,104 @@ def test_registry_covers_required_ops():
     }
     missing = required - set(ARITH_EMITTERS.keys())
     assert not missing, f"emitters missing for: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# Regression: jaxlib mlir.ir Properties fallback (Wave D2)
+# ---------------------------------------------------------------------------
+
+
+class _FakeMlirOp:
+    """Minimal stand-in for a jaxlib ``mlir.ir.Operation`` whose inherent
+    attrs live in MLIR Properties storage.
+
+    Under ``allow_unregistered_dialects=True`` jaxlib hides the dialect's
+    Properties from ``op.attributes`` (it stays empty), but the printed
+    op text still includes the ``<{predicate = N : i64}>`` block.  This
+    fake mirrors that exact shape so the emitter is forced through the
+    ``_attrs_with_properties_shared`` fallback in op_mapping.py.
+    """
+
+    def __init__(self, name: str, operands, results, printed: str) -> None:
+        self.name = name
+        self.operands = list(operands)
+        self.results = list(results)
+        self.attributes = []  # empty -- jaxlib Properties path
+        self._printed = printed
+
+    def __str__(self) -> str:  # what _parse_generic_properties_shared reads
+        return self._printed
+
+
+class _HashableSSA:
+    """Hashable SSA stand-in carrying a dtype.
+
+    The existing dict-shaped ``_ssa`` helper in this file isn't hashable
+    so it can't be used as a key in ``WalkerCtx.value_map``. The arith
+    emitter only reads ``.dtype`` off operands, so a tiny class with that
+    one attribute is enough to drive the regression test end-to-end.
+    """
+
+    __slots__ = ("name", "dtype")
+
+    def __init__(self, name: str, dtype: str) -> None:
+        self.name = name
+        self.dtype = dtype
+
+
+def test_cmpi_predicate_from_properties_block():
+    """jaxlib-shape arith.cmpi with ``<{predicate = 2 : i64}>`` -> tir.LT.
+
+    Regression for Wave D2: prior to lifting ``_attrs_with_properties``
+    into op_mapping, the arith emitter called the bare ``_attrs`` helper
+    which returned ``{}`` for property-only ops, producing
+    ``EmitError: arith.cmpi: missing 'predicate' attribute`` on every
+    softmax / layer_norm kernel. Predicate enum 2 is ``slt`` -> tir.LT.
+    """
+    ctx = WalkerCtx()
+    a_ssa = _HashableSSA("a", "int32")
+    b_ssa = _HashableSSA("b", "int32")
+    a_var = tvm.tir.Var("a", "int32")
+    b_var = tvm.tir.Var("b", "int32")
+    ctx.bind(a_ssa, a_var)
+    ctx.bind(b_ssa, b_var)
+    out = _HashableSSA("o", "uint1")
+    printed = (
+        '%2 = "arith.cmpi"(%0, %1) <{predicate = 2 : i64}>'
+        ' : (i32, i32) -> i1'
+    )
+    op = _FakeMlirOp(
+        name="arith.cmpi",
+        operands=[a_ssa, b_ssa],
+        results=[out],
+        printed=printed,
+    )
+    expr = ARITH_EMITTERS["arith.cmpi"](op, ctx)
+    assert tvm.ir.structural_equal(expr, tvm.tir.LT(a_var, b_var))
+
+
+def test_cmpf_predicate_from_properties_block():
+    """jaxlib-shape arith.cmpf with ``<{predicate = 4 : i64}>`` -> tir.LT.
+
+    Predicate enum 4 in MLIR ``CmpFPredicate`` is ``olt`` -> tir.LT.
+    """
+    ctx = WalkerCtx()
+    a_ssa = _HashableSSA("a", "float32")
+    b_ssa = _HashableSSA("b", "float32")
+    a_var = tvm.tir.Var("a", "float32")
+    b_var = tvm.tir.Var("b", "float32")
+    ctx.bind(a_ssa, a_var)
+    ctx.bind(b_ssa, b_var)
+    out = _HashableSSA("o", "uint1")
+    printed = (
+        '%2 = "arith.cmpf"(%0, %1) <{predicate = 4 : i64}>'
+        ' : (f32, f32) -> i1'
+    )
+    op = _FakeMlirOp(
+        name="arith.cmpf",
+        operands=[a_ssa, b_ssa],
+        results=[out],
+        printed=printed,
+    )
+    expr = ARITH_EMITTERS["arith.cmpf"](op, ctx)
+    assert tvm.ir.structural_equal(expr, tvm.tir.LT(a_var, b_var))

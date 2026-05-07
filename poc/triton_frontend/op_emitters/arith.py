@@ -32,10 +32,37 @@ Design notes
   ``(a*b) + c`` fallback when the intrinsic name isn't registered (this
   also keeps ``structural_equal`` happy in unit tests where we feed scalar
   PrimExprs directly).
+
+Tile-shape contract (vector_add e2e fix)
+----------------------------------------
+Triton TTIR for ``vector_add``-class kernels combines tile-shaped operands
+that surface in the walker as **mixed shapes**:
+
+* ``tt.make_range``/``tt.load`` -> ``tir.Buffer`` (when the lane count
+  exceeds the vector-width cap or the tile fell back to the per-element
+  ``# DEGRADED:`` path).
+* ``tt.splat`` -> ``tir.Broadcast`` (a vector ``PrimExpr`` whose ``.value``
+  is the scalar source).
+* ``tt.broadcast`` (vec->tile) -> ``tir.Buffer``.
+
+Before this fix, ``arith.addi(splat, make_range)`` raised
+``TypeError: tirx.Add expected ir.PrimExpr but got tirx.Buffer`` because
+``ctx.tir().Add`` is scalar-only. The :func:`_emit_tile_binop` helper
+below detects tile operands (Buffer / Broadcast / Ramp) and lowers the op
+to a per-lane ``tir.For`` that writes into a fresh result Buffer. The
+emitter returns the Buffer so downstream tile-aware ops (``tt.store``,
+follow-on ``arith.*``) keep composing without per-emitter shape probes.
 """
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, Tuple
+
+# Shared helper for Triton 3.6 ``<{predicate = N : i64}>`` Properties.
+# jaxlib's mlir.ir under ``allow_unregistered_dialects=True`` exposes
+# property-only attrs as an empty ``op.attributes`` dict, so we have to
+# fall back to parsing the printed op text. The same helper is used by
+# ``op_emitters/memory.py`` for ``tt.make_range`` (Wave C2 fix).
+from ..op_mapping import _attrs_with_properties_shared
 
 # We import op_mapping lazily inside emitters when we need to reach into
 # WalkerCtx machinery; the type alias below is just for static readers.
@@ -143,39 +170,232 @@ def _resolve_one(op: Any, ctx: EmitContext) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Tile-shape helpers (vector_add e2e fix)
+# ---------------------------------------------------------------------------
+#
+# Triton's TTIR commonly hands us tile-shaped operands at the arith layer:
+# ``arith.addi(splat<256xi32>, range<256xi32>)``. The splat is a
+# ``tir.Broadcast`` (a vector PrimExpr), the range may be a ``tir.Buffer``
+# (when it spilled past the vector-width cap in ``tt.make_range``) or a
+# ``tir.Ramp`` (small range). Mixed shapes (Buffer + Broadcast) cannot
+# feed ``ctx.tir().Add`` directly -- TVM's scalar binop nodes reject Buffer
+# operands. The helpers here detect tile operands and emit a per-lane
+# ``tir.For`` over a fresh result Buffer.
+
+
+def _is_tile_operand(ctx: EmitContext, value: Any) -> bool:
+    """True iff ``value`` is a tile (Buffer, Broadcast, or Ramp)."""
+    tvm_mod = ctx.tvm()
+    tir = tvm_mod.tir
+    if isinstance(value, tvm_mod.tir.Buffer):
+        return True
+    for cls_name in ("Broadcast", "Ramp"):
+        cls = getattr(tir, cls_name, None)
+        if cls is not None and isinstance(value, cls):
+            return True
+    # Vector-typed PrimExpr (dtype like ``int32x256``): treat as tile too.
+    dt = getattr(value, "dtype", None)
+    if dt is not None and "x" in str(dt):
+        try:
+            lanes = int(str(dt).rsplit("x", 1)[-1])
+        except ValueError:
+            lanes = 1
+        if lanes > 1:
+            return True
+    return False
+
+
+def _tile_lanes(ctx: EmitContext, value: Any) -> int:
+    """Return the number of lanes for a tile operand, or 1 for a scalar."""
+    tvm_mod = ctx.tvm()
+    if isinstance(value, tvm_mod.tir.Buffer):
+        # Single-axis tile (vector_add); higher-rank handled by _tile_shape.
+        try:
+            return int(value.shape[0]) if len(value.shape) >= 1 else 1
+        except Exception:
+            return 1
+    lanes = getattr(value, "lanes", None)
+    if lanes is not None:
+        try:
+            return int(lanes)
+        except Exception:
+            pass
+    dt = getattr(value, "dtype", None)
+    if dt is not None and "x" in str(dt):
+        try:
+            return int(str(dt).rsplit("x", 1)[-1])
+        except ValueError:
+            return 1
+    return 1
+
+
+def _tile_shape(ctx: EmitContext, value: Any) -> Tuple[int, ...]:
+    """Return the multi-dim shape for a tile operand (rank>=1)."""
+    tvm_mod = ctx.tvm()
+    if isinstance(value, tvm_mod.tir.Buffer):
+        try:
+            return tuple(int(s) for s in value.shape)
+        except Exception:
+            return (_tile_lanes(ctx, value),)
+    return (_tile_lanes(ctx, value),)
+
+
+def _tile_dtype(ctx: EmitContext, value: Any) -> str:
+    """Return the per-lane dtype for a tile/scalar operand."""
+    tvm_mod = ctx.tvm()
+    if isinstance(value, tvm_mod.tir.Buffer):
+        return str(value.dtype)
+    dt = getattr(value, "dtype", None)
+    if dt is None:
+        return "float32"
+    s = str(dt)
+    if "x" in s:
+        s = s.rsplit("x", 1)[0]
+    return s
+
+
+def _read_lane(ctx: EmitContext, value: Any, indices: Tuple[Any, ...]) -> Any:
+    """Per-lane read from a tile operand at multi-dim ``indices``.
+
+    * ``Buffer`` -> ``BufferLoad``.
+    * ``Broadcast`` -> the splat value (constant per lane).
+    * ``Ramp`` -> ``base + stride * idx`` (rank-1 only).
+    * scalar PrimExpr -> the value itself (broadcast semantics).
+    """
+    tvm_mod = ctx.tvm()
+    tir = tvm_mod.tir
+    if isinstance(value, tvm_mod.tir.Buffer):
+        # Truncate / pad indices to the buffer rank.
+        rank = len(value.shape)
+        idx = list(indices[-rank:]) if rank else [tir.const(0, "int32")]
+        if not idx:
+            idx = [tir.const(0, "int32")]
+        return tir.BufferLoad(value, idx)
+    bcast_cls = getattr(tir, "Broadcast", None)
+    if bcast_cls is not None and isinstance(value, bcast_cls):
+        return value.value
+    ramp_cls = getattr(tir, "Ramp", None)
+    if ramp_cls is not None and isinstance(value, ramp_cls):
+        # rank-1 Ramp; use the last (innermost) loop var.
+        last = indices[-1] if indices else tir.const(0, "int32")
+        return value.base + value.stride * last
+    # Scalar PrimExpr: broadcast semantics.
+    return value
+
+
+def _emit_tile_binop(
+    op: Any,
+    ctx: EmitContext,
+    a: Any,
+    b: Any,
+    scalar_combine: Callable[[Any, Any], Any],
+    op_label: str,
+    out_dtype: str,
+) -> Any:
+    """Emit a per-lane ``tir.For`` for a binop whose operands include tiles.
+
+    Returns the freshly allocated result ``tir.Buffer``. ``scalar_combine``
+    receives per-lane PrimExprs and returns the per-lane result PrimExpr.
+    """
+    tir = ctx.tir()
+    # Pick the larger shape between the two operands; tile-vs-scalar broadcasts.
+    shape_a = _tile_shape(ctx, a) if _is_tile_operand(ctx, a) else ()
+    shape_b = _tile_shape(ctx, b) if _is_tile_operand(ctx, b) else ()
+    out_shape = shape_a if len(shape_a) >= len(shape_b) else shape_b
+    if not out_shape:
+        # Defensive: caller should not reach here without a tile operand.
+        raise EmitError(
+            f"{op_label}: _emit_tile_binop called without tile operand"
+        )
+    out_buf = tir.decl_buffer(list(out_shape), out_dtype, name=ctx.fresh("tile"))
+    ctx.buffers[out_buf.name] = out_buf
+
+    loop_vars = [tir.Var(ctx.fresh(f"j{axis}"), "int32") for axis in range(len(out_shape))]
+    lhs = _read_lane(ctx, a, tuple(loop_vars))
+    rhs = _read_lane(ctx, b, tuple(loop_vars))
+    body: Any = tir.BufferStore(out_buf, scalar_combine(lhs, rhs), list(loop_vars))
+    for axis in range(len(loop_vars) - 1, -1, -1):
+        body = tir.For(
+            loop_vars[axis],
+            tir.const(0, "int32"),
+            tir.const(int(out_shape[axis]), "int32"),
+            tir.ForKind.SERIAL,
+            body,
+        )
+    ctx.emit(body)
+    return _bind_result(op, ctx, out_buf)
+
+
+def _maybe_tile_binop(
+    op: Any,
+    ctx: EmitContext,
+    a: Any,
+    b: Any,
+    scalar_combine: Callable[[Any, Any], Any],
+    op_label: str,
+    out_dtype: str,
+) -> Any:
+    """Dispatch: tile path when either operand is a tile, scalar otherwise.
+
+    Returns ``None`` when the scalar fast-path applies (caller emits the
+    PrimExpr directly); returns the bound result Buffer when the tile
+    path was taken.
+    """
+    if _is_tile_operand(ctx, a) or _is_tile_operand(ctx, b):
+        return _emit_tile_binop(op, ctx, a, b, scalar_combine, op_label, out_dtype)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Float arithmetic (arith.*f)
 # ---------------------------------------------------------------------------
 
 
 def _emit_addf(op: Any, ctx: EmitContext) -> Any:
     a, b = _resolve_two(op, ctx)
-    dt = _dtype_of(a)
+    dt = _tile_dtype(ctx, a)
     if not _is_float_dtype(dt):
         raise EmitError(f"arith.addf on non-float type {dt!r}; use arith.addi")
+    tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: ctx.tir().Add(x, y),
+                             "arith.addf", dt)
+    if tile is not None:
+        return tile
     return _bind_result(op, ctx, ctx.tir().Add(a, b))
 
 
 def _emit_subf(op: Any, ctx: EmitContext) -> Any:
     a, b = _resolve_two(op, ctx)
-    dt = _dtype_of(a)
+    dt = _tile_dtype(ctx, a)
     if not _is_float_dtype(dt):
         raise EmitError(f"arith.subf on non-float type {dt!r}; use arith.subi")
+    tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: ctx.tir().Sub(x, y),
+                             "arith.subf", dt)
+    if tile is not None:
+        return tile
     return _bind_result(op, ctx, ctx.tir().Sub(a, b))
 
 
 def _emit_mulf(op: Any, ctx: EmitContext) -> Any:
     a, b = _resolve_two(op, ctx)
-    dt = _dtype_of(a)
+    dt = _tile_dtype(ctx, a)
     if not _is_float_dtype(dt):
         raise EmitError(f"arith.mulf on non-float type {dt!r}; use arith.muli")
+    tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: ctx.tir().Mul(x, y),
+                             "arith.mulf", dt)
+    if tile is not None:
+        return tile
     return _bind_result(op, ctx, ctx.tir().Mul(a, b))
 
 
 def _emit_divf(op: Any, ctx: EmitContext) -> Any:
     a, b = _resolve_two(op, ctx)
-    dt = _dtype_of(a)
+    dt = _tile_dtype(ctx, a)
     if not _is_float_dtype(dt):
         raise EmitError(f"arith.divf on non-float type {dt!r}; use arith.divsi/divui")
+    tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: ctx.tir().Div(x, y),
+                             "arith.divf", dt)
+    if tile is not None:
+        return tile
     return _bind_result(op, ctx, ctx.tir().Div(a, b))
 
 
@@ -196,35 +416,51 @@ def _emit_negf(op: Any, ctx: EmitContext) -> Any:
 
 def _emit_addi(op: Any, ctx: EmitContext) -> Any:
     a, b = _resolve_two(op, ctx)
-    dt = _dtype_of(a)
+    dt = _tile_dtype(ctx, a)
     if _is_float_dtype(dt):
         raise EmitError(f"arith.addi on float type {dt!r}; use arith.addf")
+    tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: ctx.tir().Add(x, y),
+                             "arith.addi", dt)
+    if tile is not None:
+        return tile
     return _bind_result(op, ctx, ctx.tir().Add(a, b))
 
 
 def _emit_subi(op: Any, ctx: EmitContext) -> Any:
     a, b = _resolve_two(op, ctx)
-    dt = _dtype_of(a)
+    dt = _tile_dtype(ctx, a)
     if _is_float_dtype(dt):
         raise EmitError(f"arith.subi on float type {dt!r}; use arith.subf")
+    tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: ctx.tir().Sub(x, y),
+                             "arith.subi", dt)
+    if tile is not None:
+        return tile
     return _bind_result(op, ctx, ctx.tir().Sub(a, b))
 
 
 def _emit_muli(op: Any, ctx: EmitContext) -> Any:
     a, b = _resolve_two(op, ctx)
-    dt = _dtype_of(a)
+    dt = _tile_dtype(ctx, a)
     if _is_float_dtype(dt):
         raise EmitError(f"arith.muli on float type {dt!r}; use arith.mulf")
+    tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: ctx.tir().Mul(x, y),
+                             "arith.muli", dt)
+    if tile is not None:
+        return tile
     return _bind_result(op, ctx, ctx.tir().Mul(a, b))
 
 
 def _emit_divsi(op: Any, ctx: EmitContext) -> Any:
     """Signed integer division -- TIR ``truncdiv`` matches MLIR ``arith.divsi``."""
     a, b = _resolve_two(op, ctx)
-    dt = _dtype_of(a)
+    dt = _tile_dtype(ctx, a)
     if _is_float_dtype(dt):
         raise EmitError(f"arith.divsi on float type {dt!r}; use arith.divf")
     tir = ctx.tir()
+    tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: tir.truncdiv(x, y),
+                             "arith.divsi", dt)
+    if tile is not None:
+        return tile
     return _bind_result(op, ctx, tir.truncdiv(a, b))
 
 
@@ -236,25 +472,37 @@ def _emit_divui(op: Any, ctx: EmitContext) -> Any:
     the same hardware divide on every backend we target.
     """
     a, b = _resolve_two(op, ctx)
-    dt = _dtype_of(a)
+    dt = _tile_dtype(ctx, a)
     if _is_float_dtype(dt):
         raise EmitError(f"arith.divui on float type {dt!r}; use arith.divf")
+    tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: ctx.tir().floordiv(x, y),
+                             "arith.divui", dt)
+    if tile is not None:
+        return tile
     return _bind_result(op, ctx, ctx.tir().floordiv(a, b))
 
 
 def _emit_remsi(op: Any, ctx: EmitContext) -> Any:
     a, b = _resolve_two(op, ctx)
-    dt = _dtype_of(a)
+    dt = _tile_dtype(ctx, a)
     if _is_float_dtype(dt):
         raise EmitError(f"arith.remsi on float type {dt!r}")
+    tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: ctx.tir().truncmod(x, y),
+                             "arith.remsi", dt)
+    if tile is not None:
+        return tile
     return _bind_result(op, ctx, ctx.tir().truncmod(a, b))
 
 
 def _emit_remui(op: Any, ctx: EmitContext) -> Any:
     a, b = _resolve_two(op, ctx)
-    dt = _dtype_of(a)
+    dt = _tile_dtype(ctx, a)
     if _is_float_dtype(dt):
         raise EmitError(f"arith.remui on float type {dt!r}")
+    tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: ctx.tir().floormod(x, y),
+                             "arith.remui", dt)
+    if tile is not None:
+        return tile
     return _bind_result(op, ctx, ctx.tir().floormod(a, b))
 
 
@@ -265,33 +513,49 @@ def _emit_remui(op: Any, ctx: EmitContext) -> Any:
 
 def _emit_minimumf(op: Any, ctx: EmitContext) -> Any:
     a, b = _resolve_two(op, ctx)
-    dt = _dtype_of(a)
+    dt = _tile_dtype(ctx, a)
     if not _is_float_dtype(dt):
         raise EmitError(f"arith.minimumf on non-float type {dt!r}; use arith.minsi")
+    tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: ctx.tir().Min(x, y),
+                             "arith.minimumf", dt)
+    if tile is not None:
+        return tile
     return _bind_result(op, ctx, ctx.tir().Min(a, b))
 
 
 def _emit_maximumf(op: Any, ctx: EmitContext) -> Any:
     a, b = _resolve_two(op, ctx)
-    dt = _dtype_of(a)
+    dt = _tile_dtype(ctx, a)
     if not _is_float_dtype(dt):
         raise EmitError(f"arith.maximumf on non-float type {dt!r}; use arith.maxsi")
+    tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: ctx.tir().Max(x, y),
+                             "arith.maximumf", dt)
+    if tile is not None:
+        return tile
     return _bind_result(op, ctx, ctx.tir().Max(a, b))
 
 
 def _emit_minsi(op: Any, ctx: EmitContext) -> Any:
     a, b = _resolve_two(op, ctx)
-    dt = _dtype_of(a)
+    dt = _tile_dtype(ctx, a)
     if _is_float_dtype(dt):
         raise EmitError(f"arith.minsi on float type {dt!r}; use arith.minimumf")
+    tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: ctx.tir().Min(x, y),
+                             "arith.minsi", dt)
+    if tile is not None:
+        return tile
     return _bind_result(op, ctx, ctx.tir().Min(a, b))
 
 
 def _emit_maxsi(op: Any, ctx: EmitContext) -> Any:
     a, b = _resolve_two(op, ctx)
-    dt = _dtype_of(a)
+    dt = _tile_dtype(ctx, a)
     if _is_float_dtype(dt):
         raise EmitError(f"arith.maxsi on float type {dt!r}; use arith.maximumf")
+    tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: ctx.tir().Max(x, y),
+                             "arith.maxsi", dt)
+    if tile is not None:
+        return tile
     return _bind_result(op, ctx, ctx.tir().Max(a, b))
 
 
@@ -421,10 +685,13 @@ def _normalize_predicate(raw: Any, table: Dict[str, Any], numeric: list) -> str:
 
 def _emit_cmpf(op: Any, ctx: EmitContext) -> Any:
     a, b = _resolve_two(op, ctx)
-    dt = _dtype_of(a)
+    dt = _tile_dtype(ctx, a)
     if not _is_float_dtype(dt):
         raise EmitError(f"arith.cmpf on non-float type {dt!r}; use arith.cmpi")
-    attrs = _attrs(op)
+    # Real Triton 3.6 ops store ``predicate`` as a Property which jaxlib's
+    # bindings hide from ``op.attributes`` -- route through the shared
+    # parser so we transparently pick it up from the ``<{...}>`` block.
+    attrs = _attrs_with_properties_shared(op)
     raw = attrs.get("predicate", attrs.get("kind"))
     if raw is None:
         raise EmitError("arith.cmpf: missing 'predicate' attribute")
@@ -437,15 +704,22 @@ def _emit_cmpf(op: Any, ctx: EmitContext) -> Any:
         )
     tir = ctx.tir()
     cls = getattr(tir, cls_name)
+    tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: cls(x, y),
+                             "arith.cmpf", "bool")
+    if tile is not None:
+        return tile
     return _bind_result(op, ctx, cls(a, b))
 
 
 def _emit_cmpi(op: Any, ctx: EmitContext) -> Any:
     a, b = _resolve_two(op, ctx)
-    dt = _dtype_of(a)
+    dt = _tile_dtype(ctx, a)
     if _is_float_dtype(dt):
         raise EmitError(f"arith.cmpi on float type {dt!r}; use arith.cmpf")
-    attrs = _attrs(op)
+    # Real Triton 3.6 ops store ``predicate`` as a Property which jaxlib's
+    # bindings hide from ``op.attributes`` -- route through the shared
+    # parser so we transparently pick it up from the ``<{...}>`` block.
+    attrs = _attrs_with_properties_shared(op)
     raw = attrs.get("predicate", attrs.get("kind"))
     if raw is None:
         raise EmitError("arith.cmpi: missing 'predicate' attribute")
@@ -453,6 +727,10 @@ def _emit_cmpi(op: Any, ctx: EmitContext) -> Any:
     cls_name = _CMPI_PREDICATES[pred]
     tir = ctx.tir()
     cls = getattr(tir, cls_name)
+    tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: cls(x, y),
+                             "arith.cmpi", "bool")
+    if tile is not None:
+        return tile
     return _bind_result(op, ctx, cls(a, b))
 
 

@@ -291,6 +291,121 @@ def test_addptr_without_shim_emits_degraded_marker(monkeypatch: pytest.MonkeyPat
 
 
 # ---------------------------------------------------------------------------
+# tt.addptr -> arith.addf pipeline-shape regression (vector_add e2e blocker)
+# ---------------------------------------------------------------------------
+#
+# Triton TTIR for vector_add combines tile-shaped operands at the arith
+# layer (``arith.addi(splat<256xi32>, range<256xi32>)`` -- the splat is a
+# ``tir.Broadcast`` PrimExpr, the range a ``tir.Buffer`` once it spilled
+# past the vector-width cap). Before the C2-D1 fix, mixed shapes blew up
+# the scalar-only ``tirx.Add`` with
+# ``TypeError: Expected ir.PrimExpr but got tirx.Buffer``. The fix routes
+# Buffer / Broadcast / Ramp operands through ``_emit_tile_binop`` in
+# ``op_emitters/arith.py``; the regression below pins down the contract:
+# (1) ``tt.addptr`` returns a 2-tuple ``(buffer, indices)`` consumed by
+#     ``tt.load`` / ``tt.store``, never by an ``arith.*`` op;
+# (2) tile-shaped ``arith.*`` consumers compose by emitting per-lane
+#     ``tir.For`` loops that produce a fresh result Buffer.
+
+
+def test_addptr_returns_buffer_indices_tuple_for_load_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``tt.addptr`` result is a ``(Buffer, [PrimExpr])`` tuple."""
+    _force_no_shim(monkeypatch)
+    ctx = WalkerCtx()
+    ptr_ssa = _ssa("ptr", shape=[], dtype="float32")
+    off_ssa = _ssa("off", shape=[], dtype="int32")
+    out_ssa = _ssa("ptr_added", shape=[], dtype="float32")
+    buf = tvm.tir.decl_buffer([1024], "float32", name="A")
+    ctx.bind(ptr_ssa, (buf, [tvm.tir.const(0, "int32")]))
+    ctx.bind(off_ssa, tvm.tir.const(7, "int32"))
+    op = {
+        "name": "tt.addptr",
+        "operands": [ptr_ssa, off_ssa],
+        "results": [out_ssa],
+        "attrs": {},
+    }
+    result = emit_tt_addptr(op, ctx)
+    assert isinstance(result, tuple), (
+        f"tt.addptr must return a (buffer, indices) tuple; got {type(result).__name__}"
+    )
+    assert len(result) == 2, f"tt.addptr tuple must have 2 elements; got {len(result)}"
+    addptr_buf, addptr_indices = result
+    assert isinstance(addptr_buf, tvm.tir.Buffer), (
+        f"tt.addptr[0] must be a tir.Buffer; got {type(addptr_buf).__name__}"
+    )
+    assert isinstance(addptr_indices, list), (
+        f"tt.addptr[1] must be a list of PrimExpr; got {type(addptr_indices).__name__}"
+    )
+
+
+def test_arith_addi_handles_buffer_and_broadcast_tile_operands() -> None:
+    """``arith.addi(broadcast, buffer)`` emits a per-lane For into a fresh Buffer.
+
+    This is the regression that took ``vector_add`` offline: ``tt.make_range``
+    spills to a Buffer at lane > 128 and ``tt.splat`` produces a Broadcast,
+    so ``arith.addi(splat, make_range)`` had two different tile shapes
+    feeding ``ctx.tir().Add`` -- which is scalar-only.
+    """
+    from poc.triton_frontend.op_emitters.arith import _emit_addi  # noqa: WPS433
+
+    ctx = WalkerCtx()
+    splat_ssa = _ssa("splat", shape=[256], dtype="int32")
+    range_ssa = _ssa("range", shape=[256], dtype="int32")
+    out_ssa = _ssa("offsets", shape=[256], dtype="int32")
+
+    splat_val = tvm.tir.Broadcast(tvm.tir.const(7, "int32"), 256)
+    range_buf = tvm.tir.decl_buffer([256], "int32", name="R")
+    ctx.bind(splat_ssa, splat_val)
+    ctx.bind(range_ssa, range_buf)
+
+    op = {
+        "name": "arith.addi",
+        "operands": [splat_ssa, range_ssa],
+        "results": [out_ssa],
+        "attrs": {},
+    }
+    result = _emit_addi(op, ctx)
+    assert isinstance(result, tvm.tir.Buffer), (
+        f"tile-shaped arith.addi must produce a tir.Buffer; got "
+        f"{type(result).__name__}"
+    )
+    assert int(result.shape[0]) == 256
+    text = _stringify(ctx.stmts)
+    assert "for" in text.lower(), (
+        f"expected per-lane For loop in emitted stmts; got:\n{text}"
+    )
+
+
+def test_arith_addf_handles_two_buffer_tile_operands() -> None:
+    """``arith.addf(buffer, buffer)`` emits a per-lane For (the load+load+addf path)."""
+    from poc.triton_frontend.op_emitters.arith import _emit_addf  # noqa: WPS433
+
+    ctx = WalkerCtx()
+    x_ssa = _ssa("x", shape=[256], dtype="float32")
+    y_ssa = _ssa("y", shape=[256], dtype="float32")
+    out_ssa = _ssa("z", shape=[256], dtype="float32")
+
+    x_buf = tvm.tir.decl_buffer([256], "float32", name="X")
+    y_buf = tvm.tir.decl_buffer([256], "float32", name="Y")
+    ctx.bind(x_ssa, x_buf)
+    ctx.bind(y_ssa, y_buf)
+
+    op = {
+        "name": "arith.addf",
+        "operands": [x_ssa, y_ssa],
+        "results": [out_ssa],
+        "attrs": {},
+    }
+    result = _emit_addf(op, ctx)
+    assert isinstance(result, tvm.tir.Buffer), (
+        f"tile-shaped arith.addf must produce a tir.Buffer; got "
+        f"{type(result).__name__}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Dispatch table sanity
 # ---------------------------------------------------------------------------
 
