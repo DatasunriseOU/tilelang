@@ -176,3 +176,30 @@ def test_floormod_negative_divisor_agrees_int_and_bv():
     expr = tir.FloorMod(x, tir.const(-3, "int32")) == tir.const(-1, "int32")
     assert _can_prove(x, 5, 6, expr, 0) is True
     assert _can_prove(x, 5, 6, expr, 32) is True
+
+
+# CPPMEGA z3-stack fix-A7 (NEW-1): out-of-range Bind in BV mode now
+# emplaces a memoization clamped to the BV signed range, with a single
+# warning logged per Analyzer. Previously the code returned without
+# memoizing, so a subsequent CanProve over the same var would hit the
+# `Create()` codepath and mint a free unconstrained Z3 symbol — i.e.,
+# the caller's range request was silently dropped.
+def test_z3_bv_out_of_range_bind_uses_clamped_memoization():
+    """Bind addr to a range that exceeds INT32 under BV32. The caller's
+    range cannot be represented losslessly in 32-bit signed BV; the
+    prover clamps to [INT32_MIN, INT32_MAX+1) and asserts that
+    constraint instead.
+
+    Verification angle: ``addr >= INT32_MIN`` MUST be provable in BV32
+    after the clamped bind, because the clamp asserts exactly that
+    lower bound. Pre-fix-A7 this was NOT provable — the var was free,
+    with NO range, so the answer collapsed to "cannot prove".
+    """
+    addr = tir.Var("addr", "int32")
+    INT32_MIN = -(1 << 31)
+    # Range = [-2^40, 2^40), well outside INT32 representable range.
+    lo = -(1 << 40)
+    hi = 1 << 40
+    expr = addr >= tir.const(INT32_MIN, "int32")
+    # Post-fix-A7: clamped memoization makes this provable in BV32.
+    assert _can_prove(addr, lo, hi, expr, 32) is True
