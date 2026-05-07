@@ -1,0 +1,787 @@
+"""Reduction / scan / dot / atomic emitters for the Triton TTIR walker.
+
+This module is the *Path C* counterpart to the high-level emitters in
+:mod:`poc.triton_frontend.op_mapping`: instead of routing every reducer
+through a single TileLang primitive (``T.reduce_sum`` / ``T.reduce_max``)
+the emitters here lower ``tt.reduce`` and ``tt.scan`` to an explicit
+``tir.For`` loop with an accumulator variable, which is the surface the
+**TileLang Path C kernels** consume after the frontend has run. This
+gives downstream passes (``LowerThreadAllreduce`` /
+``InjectSoftwarePipeline``) more room to fuse than the macro form.
+
+Ops implemented
+---------------
+* ``tt.reduce``        -> ``tir.For`` + accumulator (identity from combiner).
+* ``tt.scan``          -> ``tir.For`` writing a running accumulator into a
+                          fresh fragment buffer at each step (prefix scan).
+* ``tt.dot``           -> ``T.gemm(A, B, C)`` when ``tilelang.language.gemm``
+                          is importable; for fp8 / fp16 / bf16 inputs this
+                          path is mandatory (Path C kernel quality matters).
+                          Otherwise a 3-loop ``tir.For`` nest with a
+                          BufferStore on the inner body.
+* ``tt.atomic_add``    -> ``T.atomic_add`` / ``tir.call_intrin("tir.atomic_add", ...)``.
+* ``tt.atomic_max``    -> ``T.atomic_max`` / ``tir.call_intrin("tir.atomic_max", ...)``.
+* ``tt.atomic_min``    -> ``T.atomic_min`` / ``tir.call_intrin("tir.atomic_min", ...)``.
+* ``tt.atomic_xchg``   -> ``T.atomic_xchg`` / ``tir.call_intrin("tir.atomic_xchg", ...)``.
+* ``tt.atomic_cas``    -> ``tir.call_intrin("tir.atomic_cas", ...)`` (TileLang
+                          does not currently expose a CAS primitive on its
+                          language surface — see ``tilelang/language/atomic.py``).
+
+Combiner-region detection
+-------------------------
+``tt.reduce`` (and ``tt.scan``) carry an MLIR region whose terminator
+(``tt.reduce.return``) tells us how to combine two operands. Mapping
+combiner -> identity / TIR op:
+
+    addf / addi  -> identity 0,    op = ``tir.Add``
+    mulf / muli  -> identity 1,    op = ``tir.Mul``
+    maximumf / maxsi / maxnumf -> identity ``min_value(dtype)``, op = ``tir.Max``
+    minimumf / minsi / minnumf -> identity ``max_value(dtype)``, op = ``tir.Min``
+
+Detection mechanism: we try MLIR Python bindings first (``mlir.ir``) by
+walking the region/block/operations chain and inspecting the inner op
+name. When ``mlir.ir`` is unavailable (the dict-shaped fake-op test path,
+which is what the in-tree unit tests use) we fall back to:
+
+  1. A top-level ``"combiner"`` field on the dict op, or
+  2. A regex over the textual region (``op["region"]`` or stringified op),
+     looking for the keywords ``addf`` / ``maximumf`` / ``minimumf`` /
+     ``mulf`` and integer variants. The keyword scan is intentionally
+     coarse: if a region mixes combiners (Triton allows but doesn't
+     emit such patterns from Python source) we raise ``EmitError``.
+
+Why a separate file
+-------------------
+Per the project convention (and to avoid merge conflicts with parallel
+agents working on the same dispatch table) every op family lives in its
+own ``op_emitters/<family>.py`` module that exports a ``*_EMITTERS`` dict.
+The ``op_mapping.py`` table merges this dict at import time -- callers
+that already import ``op_mapping`` get the new ops transparently.
+"""
+from __future__ import annotations
+
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+# WalkerCtx alias only -- imported lazily so this module stays cheap to load.
+EmitContext = Any  # poc.triton_frontend.op_mapping.WalkerCtx
+
+
+__all__ = [
+    "REDUCTION_EMITTERS",
+    "EmitError",
+    "detect_combiner_kind",
+]
+
+
+class EmitError(RuntimeError):
+    """Raised when an emitter cannot lower an op (precise, never silent)."""
+
+
+# ---------------------------------------------------------------------------
+# Op-shape helpers (mirror op_mapping internal helpers; we don't reach into
+# the op_mapping module to keep the import graph one-way).
+# ---------------------------------------------------------------------------
+
+
+def _operands(op: Any) -> Tuple[Any, ...]:
+    if isinstance(op, dict):
+        return tuple(op.get("operands", ()))
+    return tuple(op.operands)
+
+
+def _results(op: Any) -> Tuple[Any, ...]:
+    if isinstance(op, dict):
+        return tuple(op.get("results", ()))
+    return tuple(op.results)
+
+
+def _attrs(op: Any) -> Dict[str, Any]:
+    if isinstance(op, dict):
+        return dict(op.get("attrs", {}))
+    return {a.name: a.attr for a in op.attributes} if hasattr(op, "attributes") else {}
+
+
+def _shape_of(value: Any) -> Tuple[int, ...]:
+    if isinstance(value, dict):
+        return tuple(value.get("shape", ()))
+    typ = getattr(value, "type", None)
+    if typ is None:
+        return ()
+    shape = getattr(typ, "shape", None)
+    return tuple(shape) if shape is not None else ()
+
+
+def _dtype_of(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("dtype", "float32"))
+    if hasattr(value, "dtype"):
+        return str(value.dtype)
+    typ = getattr(value, "type", None)
+    if typ is None:
+        return "float32"
+    elt = getattr(typ, "element_type", None)
+    if elt is None:
+        return "float32"
+    return str(elt)
+
+
+# ---------------------------------------------------------------------------
+# Combiner-region detection (mlir.ir preferred; regex fallback otherwise).
+# ---------------------------------------------------------------------------
+
+
+# Canonical kind -> (TIR-binop attr name, identity callable)
+#
+# The identity callable is invoked as ``identity(tir, dtype)`` so it can pick
+# +/- infinity for floating-point min/max even when the dtype is not yet
+# known at module-load time.
+_COMBINER_TABLE: Dict[str, Tuple[str, Callable[[Any, str], Any]]] = {
+    "add": ("Add", lambda tir, dt: tir.const(0, dt)),
+    "mul": ("Mul", lambda tir, dt: tir.const(1, dt)),
+    "max": ("Max", lambda tir, dt: tir.min_value(dt)),  # -inf for fp; INT_MIN for int
+    "min": ("Min", lambda tir, dt: tir.max_value(dt)),  # +inf for fp; INT_MAX for int
+}
+
+
+# Keyword -> canonical kind. Order matters: longer prefixes first so that
+# ``maximumf`` doesn't match ``addf`` etc.
+_KEYWORD_TO_KIND: Tuple[Tuple[str, str], ...] = (
+    ("maximumf", "max"),
+    ("minimumf", "min"),
+    ("maxnumf", "max"),
+    ("minnumf", "min"),
+    ("maxsi", "max"),
+    ("minsi", "min"),
+    ("maxui", "max"),
+    ("minui", "min"),
+    ("addf", "add"),
+    ("addi", "add"),
+    ("mulf", "mul"),
+    ("muli", "mul"),
+    ("max", "max"),
+    ("min", "min"),
+    ("mul", "mul"),
+    ("add", "add"),
+)
+
+
+def _detect_via_mlir(op: Any) -> Optional[str]:
+    """Walk an MLIR region tree and return the combiner kind, or None.
+
+    Uses ``mlir.ir`` Python bindings when available. We only consider the
+    *first* non-terminator op in the first block of the first region --
+    Triton's Python frontend emits a single arithmetic op followed by
+    ``tt.reduce.return``, so this is enough for every pattern produced
+    upstream. Mixed-combiner regions (theoretically allowed by the
+    dialect) raise via the caller.
+    """
+    try:
+        import mlir.ir  # type: ignore  # noqa: F401
+    except ImportError:
+        return None
+    regions = getattr(op, "regions", None) or ()
+    for region in regions:
+        for block in getattr(region, "blocks", ()) or ():
+            for inner in getattr(block, "operations", ()) or ():
+                name = str(getattr(inner, "name", "")).lower()
+                if not name or "return" in name:
+                    continue
+                for keyword, kind in _KEYWORD_TO_KIND:
+                    if keyword in name:
+                        return kind
+                # Unknown op inside the combiner -- bail out so the caller
+                # can raise a precise EmitError.
+                return f"__unsupported__:{name}"
+    return None
+
+
+def _detect_via_dict(op: Any) -> Optional[str]:
+    """Detect the combiner kind from a dict-shaped fake op.
+
+    Two routes:
+      * ``op["combiner"]`` set explicitly -> trusted.
+      * ``op["region"]`` carrying a textual snippet -> keyword scan.
+    """
+    if not isinstance(op, dict):
+        return None
+    explicit = op.get("combiner")
+    if explicit is not None:
+        s = str(explicit).lower().strip()
+        for keyword, kind in _KEYWORD_TO_KIND:
+            if s == keyword or s == kind or s in {"sum", "prod"}:
+                if s == "sum":
+                    return "add"
+                if s == "prod":
+                    return "mul"
+                return kind
+        return f"__unsupported__:{s}"
+    region = op.get("region") or op.get("body") or ""
+    if region:
+        text = str(region).lower()
+        # Make sure we match in deterministic priority order: longer keys
+        # win. ``_KEYWORD_TO_KIND`` is already ordered for that.
+        for keyword, kind in _KEYWORD_TO_KIND:
+            if keyword in text:
+                return kind
+        return "__unsupported__:<unknown-region>"
+    return None
+
+
+def detect_combiner_kind(op: Any) -> str:
+    """Public entry: return one of ``'add' / 'mul' / 'max' / 'min'``.
+
+    Raises :class:`EmitError` when the combiner cannot be determined or
+    contains an unsupported op (for example ``arith.divf`` -- division
+    isn't a meaningful associative reducer for tensor reductions).
+    """
+    candidate = _detect_via_mlir(op)
+    if candidate is None:
+        candidate = _detect_via_dict(op)
+    if candidate is None:
+        raise EmitError(
+            "tt.reduce/tt.scan: cannot determine combiner kind from op "
+            "(no mlir.ir bindings, no 'combiner' field, no 'region' text). "
+            "Set op['combiner'] to one of: addf, maximumf, minimumf, mulf."
+        )
+    if candidate.startswith("__unsupported__:"):
+        bad = candidate.split(":", 1)[1]
+        raise EmitError(
+            f"tt.reduce combiner contains unsupported op {bad!r}; "
+            f"supported: addf, addi, maximumf, maxnumf, maxsi, "
+            f"minimumf, minnumf, minsi, mulf, muli."
+        )
+    if candidate not in _COMBINER_TABLE:  # pragma: no cover - guarded above
+        raise EmitError(f"tt.reduce: unrecognised combiner kind {candidate!r}")
+    return candidate
+
+
+# ---------------------------------------------------------------------------
+# tt.reduce  -- explicit tir.For + accumulator
+# ---------------------------------------------------------------------------
+
+
+def _accum_buffer(ctx: EmitContext, dtype: str, name: str) -> Any:
+    """Allocate a length-1 fragment-style buffer to host the accumulator.
+
+    We use a buffer (not a Var) so the accumulator survives across the
+    For-loop boundary as a side-effected write target -- a TIR
+    ``Var`` is SSA and cannot be re-bound inside ``tir.For``.
+    """
+    tir = ctx.tir()
+    buf_name = ctx.fresh(name)
+    return tir.decl_buffer([1], dtype, name=buf_name)
+
+
+def map_tt_reduce(op: Any, ctx: EmitContext) -> Any:
+    """Lower ``tt.reduce`` to a ``tir.For`` + accumulator buffer.
+
+    The emitter:
+      1. Determines the combiner kind from the op's region (mlir.ir
+         preferred, regex/dict fallback).
+      2. Allocates a length-1 accumulator buffer at the result dtype and
+         initialises it to the combiner identity (0/-inf/+inf/1).
+      3. Emits ``for i in range(N): accum[0] = combine(accum[0], src[i])``.
+      4. Binds the result SSA to ``accum[0]`` (a ``tir.BufferLoad``) so
+         downstream consumers can pick up the scalar.
+
+    Multi-axis reductions: the spec only requires a 1D reduction; for an
+    N-D source we reduce along the requested ``axis`` attribute and emit
+    one For per non-reduction axis on the outside (a tight nest). The
+    body still hosts a single accumulator-update statement.
+    """
+    tir = ctx.tir()
+    operands = _operands(op)
+    if not operands:
+        raise EmitError("tt.reduce: missing source operand")
+
+    src_ssa = operands[0]
+    src = ctx.get(src_ssa)
+
+    attrs = _attrs(op)
+    axis = int(attrs.get("axis", -1))
+
+    src_shape = list(_shape_of(src_ssa)) or list(getattr(src, "shape", []) or [])
+    if not src_shape:
+        raise EmitError(
+            "tt.reduce: source operand has unknown shape; "
+            "ensure the SSA value's `shape` attribute is populated."
+        )
+    # Normalise negative axis.
+    rank = len(src_shape)
+    ax = axis if axis >= 0 else rank + axis
+    if not 0 <= ax < rank:
+        raise EmitError(
+            f"tt.reduce: axis {axis} out of range for shape {src_shape}"
+        )
+
+    result_value = _results(op)[0] if _results(op) else None
+    out_dtype = _dtype_of(result_value) if result_value is not None else _dtype_of(src_ssa)
+
+    kind = detect_combiner_kind(op)
+    binop_name, identity_fn = _COMBINER_TABLE[kind]
+    BinOp = getattr(tir, binop_name)
+    identity = identity_fn(tir, out_dtype)
+
+    # Accumulator buffer (per-output-element). For rank > 1 we store one
+    # accumulator per non-reduced position; we model this as a single
+    # buffer indexed by the outer iteration variables.
+    accum_shape = src_shape[:ax] + src_shape[ax + 1:] or [1]
+    accum = tir.decl_buffer(accum_shape, out_dtype, name=ctx.fresh("reduce_accum"))
+
+    # Build the outer iteration variables for the non-reduced axes.
+    outer_vars: List[Any] = []
+    outer_extents: List[int] = []
+    for i, ext in enumerate(src_shape):
+        if i == ax:
+            continue
+        v = tir.Var(ctx.fresh(f"i{i}"), "int32")
+        outer_vars.append(v)
+        outer_extents.append(int(ext))
+
+    # Inner accumulator update.
+    red_var = tir.Var(ctx.fresh("r"), "int32")
+    red_extent = int(src_shape[ax])
+
+    # Index expression into the source: outer_vars interleaved with red_var.
+    src_indices: List[Any] = []
+    outer_iter = iter(outer_vars)
+    for i in range(rank):
+        if i == ax:
+            src_indices.append(red_var)
+        else:
+            src_indices.append(next(outer_iter))
+
+    # ``src`` may be a Buffer (the common case after ``tt.load`` -> T.copy)
+    # or a PrimExpr (lane-wise load); we BufferLoad in the buffer case.
+    if hasattr(src, "shape") and hasattr(src, "dtype"):
+        src_elem = tir.BufferLoad(src, list(src_indices))
+    else:
+        src_elem = src  # PrimExpr operand; degenerate 1D fragment use case.
+
+    accum_indices = list(outer_vars) if outer_vars else [tir.const(0, "int32")]
+    accum_load = tir.BufferLoad(accum, list(accum_indices))
+    update = tir.BufferStore(accum, BinOp(accum_load, src_elem), list(accum_indices))
+
+    # Reduction For-loop.
+    inner_for = tir.For(
+        red_var,
+        tir.const(0, "int32"),
+        tir.const(red_extent, "int32"),
+        tir.ForKind.SERIAL,
+        update,
+    )
+
+    # Identity-init: a tight nest writing ``identity`` to every accum slot.
+    init_store = tir.BufferStore(accum, identity, list(accum_indices))
+
+    # Wrap the init + reduction in the outer (non-reduction) For nest.
+    body = tir.SeqStmt([init_store, inner_for])
+    for v, ext in zip(reversed(outer_vars), reversed(outer_extents)):
+        body = tir.For(
+            v,
+            tir.const(0, "int32"),
+            tir.const(ext, "int32"),
+            tir.ForKind.SERIAL,
+            body,
+        )
+
+    ctx.emit(body)
+
+    # Bind the result SSA to a BufferLoad over the accumulator. Callers
+    # that consume an N-D reduction result will use the same outer-var
+    # indices we just emitted; for a rank-1 reduction the result is a
+    # scalar (length-1 buffer indexed at 0).
+    if result_value is not None:
+        if outer_vars:
+            # For multi-axis: bind the buffer itself (callers that need
+            # element access will index it the same way).
+            ctx.bind(result_value, accum)
+        else:
+            ctx.bind(result_value, tir.BufferLoad(accum, [tir.const(0, "int32")]))
+    return body
+
+
+# ---------------------------------------------------------------------------
+# tt.scan -- prefix scan via tir.For + running accumulator
+# ---------------------------------------------------------------------------
+
+
+def map_tt_scan(op: Any, ctx: EmitContext) -> Any:
+    """Lower ``tt.scan`` to a ``tir.For`` writing a running accumulator.
+
+    Recipe::
+
+        accum[0] = identity
+        for i in range(N):
+            accum[0] = combine(accum[0], src[i])
+            dst[i]   = accum[0]
+
+    The emitter only supports a 1-D scan along the requested axis (that
+    is what Triton's Python frontend emits today; multi-axis scans would
+    need an outer For nest mirroring ``map_tt_reduce``). For unsupported
+    combiners we raise the same ``EmitError`` as ``tt.reduce``.
+    """
+    tir = ctx.tir()
+    operands = _operands(op)
+    if not operands:
+        raise EmitError("tt.scan: missing source operand")
+    src_ssa = operands[0]
+    src = ctx.get(src_ssa)
+
+    attrs = _attrs(op)
+    axis = int(attrs.get("axis", -1))
+
+    src_shape = list(_shape_of(src_ssa)) or list(getattr(src, "shape", []) or [])
+    if not src_shape:
+        raise EmitError("tt.scan: source operand has unknown shape")
+    rank = len(src_shape)
+    ax = axis if axis >= 0 else rank + axis
+    if not 0 <= ax < rank:
+        raise EmitError(f"tt.scan: axis {axis} out of range for shape {src_shape}")
+    if rank != 1:
+        # The dispatcher accepts the op but the emitter restricts to 1D
+        # scans; multi-D would be a straight outer-loop wrap (left as a
+        # follow-up so we don't ship code we haven't tested).
+        raise EmitError(
+            f"tt.scan: only rank-1 scans are supported in this emitter "
+            f"(got shape {src_shape}); raise an issue if you need rank>1."
+        )
+
+    result_value = _results(op)[0] if _results(op) else None
+    out_dtype = _dtype_of(result_value) if result_value is not None else _dtype_of(src_ssa)
+    kind = detect_combiner_kind(op)
+    binop_name, identity_fn = _COMBINER_TABLE[kind]
+    BinOp = getattr(tir, binop_name)
+    identity = identity_fn(tir, out_dtype)
+
+    # Output buffer: same shape/dtype as the source.
+    dst = tir.decl_buffer(src_shape, out_dtype, name=ctx.fresh("scan_dst"))
+    accum = tir.decl_buffer([1], out_dtype, name=ctx.fresh("scan_accum"))
+
+    init = tir.BufferStore(accum, identity, [tir.const(0, "int32")])
+
+    i_var = tir.Var(ctx.fresh("i"), "int32")
+    if hasattr(src, "shape") and hasattr(src, "dtype"):
+        src_elem = tir.BufferLoad(src, [i_var])
+    else:
+        src_elem = src
+
+    accum_load = tir.BufferLoad(accum, [tir.const(0, "int32")])
+    new_val = BinOp(accum_load, src_elem)
+    update = tir.BufferStore(accum, new_val, [tir.const(0, "int32")])
+    write_dst = tir.BufferStore(
+        dst, tir.BufferLoad(accum, [tir.const(0, "int32")]), [i_var]
+    )
+
+    body = tir.SeqStmt([update, write_dst])
+    loop = tir.For(
+        i_var,
+        tir.const(0, "int32"),
+        tir.const(int(src_shape[0]), "int32"),
+        tir.ForKind.SERIAL,
+        body,
+    )
+    full = tir.SeqStmt([init, loop])
+    ctx.emit(full)
+    if result_value is not None:
+        ctx.bind(result_value, dst)
+    return full
+
+
+# ---------------------------------------------------------------------------
+# tt.dot -- T.gemm preferred; manual 3-loop nest fallback for fp32 only.
+# ---------------------------------------------------------------------------
+
+
+_FP_LOW_PRECISION_DTYPES = {
+    "float16", "f16", "half",
+    "bfloat16", "bf16",
+    "float8_e4m3", "float8_e5m2",
+    "fp8", "fp8_e4m3", "fp8_e5m2",
+    "e4m3", "e5m2",
+}
+
+
+def _import_tilelang_gemm() -> Optional[Callable[..., Any]]:
+    """Return ``tilelang.language.gemm`` if importable, else None."""
+    try:
+        import tilelang.language as T  # type: ignore
+    except ImportError:
+        return None
+    return getattr(T, "gemm", None)
+
+
+def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
+    """Lower ``tt.dot(a, b, c)`` to ``T.gemm`` (preferred) or a 3-loop nest.
+
+    Routing rules:
+      * If ``tilelang.language.gemm`` is importable, always use it -- this
+        is the Path C kernel surface: layout inference picks WMMA / WGMMA
+        / MFMA / SIMDgroup per target.
+      * Otherwise, for **fp8 / fp16 / bf16** inputs we still raise
+        :class:`EmitError`: a manual loop nest will produce a numerically
+        correct but wildly slow kernel on those dtypes, which is worse
+        than failing the lowering and asking the user to install TileLang.
+      * For fp32 inputs, fall back to a 3-loop nest with a
+        ``tir.BufferStore(C, ...)`` carrying ``C[m, n] + A[m, k] * B[k, n]``.
+    """
+    operands = _operands(op)
+    if len(operands) < 2:
+        raise EmitError(f"tt.dot: expected (A, B[, C]); got {len(operands)} operands")
+    a_ssa, b_ssa = operands[0], operands[1]
+    c_ssa = operands[2] if len(operands) >= 3 else None
+
+    a = ctx.get(a_ssa)
+    b = ctx.get(b_ssa)
+
+    a_dtype = _dtype_of(a_ssa)
+    b_dtype = _dtype_of(b_ssa)
+    a_shape = list(_shape_of(a_ssa))
+    b_shape = list(_shape_of(b_ssa))
+    if len(a_shape) != 2 or len(b_shape) != 2:
+        raise EmitError(
+            f"tt.dot: both operands must be rank-2; got A={a_shape}, B={b_shape}"
+        )
+    M, Ka = a_shape
+    Kb, N = b_shape
+    if Ka != Kb:
+        raise EmitError(f"tt.dot: K-dim mismatch: A.K={Ka} vs B.K={Kb}")
+
+    result_value = _results(op)[0] if _results(op) else None
+    out_dtype = (
+        _dtype_of(result_value) if result_value is not None else "float32"
+    )
+
+    gemm = _import_tilelang_gemm()
+    attrs = _attrs(op)
+    transpose_A = bool(attrs.get("transpose_A", False) or attrs.get("trans_a", False))
+    transpose_B = bool(attrs.get("transpose_B", False) or attrs.get("trans_b", False))
+
+    if gemm is not None:
+        # Resolve / allocate accumulator C.
+        try:
+            import tilelang.language as T  # type: ignore
+        except ImportError:  # pragma: no cover - we just imported this above
+            T = None  # type: ignore
+        if c_ssa is not None:
+            try:
+                c = ctx.get(c_ssa)
+            except KeyError:
+                c = None
+        else:
+            c = None
+        if c is None:
+            # Triton accumulates fp16/bf16 inputs into fp32 by convention.
+            acc_dtype = (
+                "float32" if a_dtype in {"float16", "f16", "bfloat16", "bf16"} else out_dtype
+            )
+            c = T.alloc_fragment([M, N], acc_dtype)  # type: ignore[union-attr]
+
+        handle = gemm(a, b, c, transpose_A=transpose_A, transpose_B=transpose_B)
+        ctx.emit(handle)
+        if result_value is not None:
+            ctx.bind(result_value, c)
+        return handle
+
+    # No TileLang -> low-precision dtypes are off-limits.
+    if a_dtype in _FP_LOW_PRECISION_DTYPES or b_dtype in _FP_LOW_PRECISION_DTYPES:
+        raise EmitError(
+            f"tt.dot: refusing to emit a manual 3-loop nest for low-precision "
+            f"dtypes (A={a_dtype}, B={b_dtype}); install tilelang so we can "
+            f"route through tilelang.language.gemm (Path C kernel quality)."
+        )
+
+    # ``tir.For`` 3-loop nest. We allocate a fresh C buffer when the user
+    # didn't supply one; otherwise we accumulate in-place into the supplied
+    # accumulator buffer.
+    tir = ctx.tir()
+    if c_ssa is not None:
+        try:
+            c = ctx.get(c_ssa)
+        except KeyError:
+            c = None
+    else:
+        c = None
+    if c is None:
+        c = tir.decl_buffer([M, N], out_dtype, name=ctx.fresh("dot_c"))
+
+    m_var = tir.Var(ctx.fresh("m"), "int32")
+    n_var = tir.Var(ctx.fresh("n"), "int32")
+    k_var = tir.Var(ctx.fresh("k"), "int32")
+
+    # Honor transpose flags by swapping the index order on A / B reads.
+    a_idx = [k_var, m_var] if transpose_A else [m_var, k_var]
+    b_idx = [n_var, k_var] if transpose_B else [k_var, n_var]
+
+    a_load = tir.BufferLoad(a, a_idx) if hasattr(a, "shape") else a
+    b_load = tir.BufferLoad(b, b_idx) if hasattr(b, "shape") else b
+    c_load = tir.BufferLoad(c, [m_var, n_var])
+    mac = tir.Add(c_load, tir.Mul(a_load, b_load))
+    inner = tir.BufferStore(c, mac, [m_var, n_var])
+
+    body = tir.For(k_var, tir.const(0, "int32"), tir.const(int(Ka), "int32"),
+                   tir.ForKind.SERIAL, inner)
+    body = tir.For(n_var, tir.const(0, "int32"), tir.const(int(N), "int32"),
+                   tir.ForKind.SERIAL, body)
+    body = tir.For(m_var, tir.const(0, "int32"), tir.const(int(M), "int32"),
+                   tir.ForKind.SERIAL, body)
+
+    ctx.emit(body)
+    if result_value is not None:
+        ctx.bind(result_value, c)
+    return body
+
+
+# ---------------------------------------------------------------------------
+# Atomics: tt.atomic_add / _max / _min / _xchg / _cas
+# ---------------------------------------------------------------------------
+
+
+def _import_tilelang_atomic(name: str) -> Optional[Callable[..., Any]]:
+    """Return ``tilelang.language.atomic_<name>`` if available, else None."""
+    try:
+        import tilelang.language as T  # type: ignore
+    except ImportError:
+        return None
+    return getattr(T, f"atomic_{name}", None)
+
+
+def _resolve_atomic_target(ctx: EmitContext, ptr_ssa: Any) -> Tuple[Any, List[Any]]:
+    """Resolve an atomic op's destination pointer to ``(buffer, indices)``.
+
+    Mirrors the convention used by ``map_tt_atomic_rmw`` in
+    :mod:`op_mapping`: ptr_analysis populates ``value_map[ptr_ssa]`` with
+    a ``(buffer, indices)`` tuple in the resolved case, or with a bare
+    buffer / scalar PrimExpr in the MVP / unit-test path.
+    """
+    resolved = ctx.get(ptr_ssa)
+    if isinstance(resolved, tuple) and len(resolved) == 2:
+        buf, indices = resolved
+        return buf, list(indices)
+    return resolved, [0]
+
+
+def _emit_atomic(
+    op: Any,
+    ctx: EmitContext,
+    *,
+    kind: str,
+    expects_two_values: bool = False,
+) -> Any:
+    """Shared dispatcher for atomic_{add,max,min,xchg,cas}.
+
+    ``expects_two_values`` is True for ``tt.atomic_cas`` (compare, swap).
+    """
+    operands = _operands(op)
+    min_operands = 3 if expects_two_values else 2
+    if len(operands) < min_operands:
+        raise EmitError(
+            f"tt.atomic_{kind}: expected at least "
+            f"{min_operands} operands (ptr, "
+            f"{'expected, desired' if expects_two_values else 'val'}); "
+            f"got {len(operands)}"
+        )
+    ptr_ssa = operands[0]
+    val_ssas = operands[1:min_operands]
+    mask_ssa = operands[min_operands] if len(operands) > min_operands else None
+
+    buf, indices = _resolve_atomic_target(ctx, ptr_ssa)
+    val_exprs = [ctx.get(v) for v in val_ssas]
+
+    tir = ctx.tir()
+    return_prev = bool(_results(op))
+
+    intrinsic_call: Any
+    fn = _import_tilelang_atomic(kind) if not expects_two_values else None
+    if fn is not None and not expects_two_values:
+        # TileLang surface call: e.g. T.atomic_add(buf, val, return_prev=...).
+        # Indices are encoded into the buffer-region path inside TileLang;
+        # for the MVP scalar path the buffer is treated as a 1-element
+        # atomic target.
+        intrinsic_call = fn(buf, val_exprs[0], return_prev=return_prev)
+    else:
+        # Generic call_intrin path -- this is also the only path for
+        # atomic_cas (TileLang has no atomic_cas surface today).
+        ret_dtype = (
+            _dtype_of(_results(op)[0]) if return_prev and _results(op) else "handle"
+        )
+        # Build an address-of(buf[indices]) handle so backends that need
+        # a scalar pointer get one. Falls back to passing the buffer if
+        # ``tir.address_of`` is unavailable.
+        try:
+            addr = tir.call_intrin(
+                "handle",
+                tir.op.Op.get("tir.address_of"),
+                tir.BufferLoad(buf, list(indices)),
+            )
+        except Exception:  # pragma: no cover - older TVMs
+            addr = buf
+        intrinsic_call = tir.call_intrin(
+            ret_dtype, f"tir.atomic_{kind}", addr, *val_exprs
+        )
+
+    if mask_ssa is not None:
+        mask_expr = ctx.get(mask_ssa)
+        if return_prev:
+            zero = tir.const(0, _dtype_of(_results(op)[0]))
+            intrinsic_call = tir.if_then_else(mask_expr, intrinsic_call, zero)
+        else:
+            intrinsic_call = tir.IfThenElse(
+                mask_expr, tir.Evaluate(intrinsic_call), None
+            )
+
+    if return_prev:
+        ctx.bind(_results(op)[0], intrinsic_call)
+    else:
+        ctx.emit(intrinsic_call)
+    return intrinsic_call
+
+
+def map_tt_atomic_add(op: Any, ctx: EmitContext) -> Any:
+    return _emit_atomic(op, ctx, kind="add")
+
+
+def map_tt_atomic_max(op: Any, ctx: EmitContext) -> Any:
+    return _emit_atomic(op, ctx, kind="max")
+
+
+def map_tt_atomic_min(op: Any, ctx: EmitContext) -> Any:
+    return _emit_atomic(op, ctx, kind="min")
+
+
+def map_tt_atomic_xchg(op: Any, ctx: EmitContext) -> Any:
+    return _emit_atomic(op, ctx, kind="xchg")
+
+
+def map_tt_atomic_cas(op: Any, ctx: EmitContext) -> Any:
+    """Compare-and-swap: routes through ``tir.call_intrin('tir.atomic_cas', ...)``.
+
+    TileLang doesn't expose a CAS primitive on its language surface today
+    (see ``tilelang/language/atomic.py`` -- only add/max/min/xchg/and/or/xor
+    are exported), so we always go through the generic ``tir.atomic_cas``
+    intrinsic. Backends that don't lower ``tir.atomic_cas`` will fail
+    loudly at codegen time, which is the right behaviour for a primitive
+    we cannot synthesise from cheaper ops.
+    """
+    return _emit_atomic(op, ctx, kind="cas", expects_two_values=True)
+
+
+# ---------------------------------------------------------------------------
+# Dispatch table -- merged into op_mapping.OP_TABLE.
+# ---------------------------------------------------------------------------
+
+
+REDUCTION_EMITTERS: Dict[str, Callable[[Any, EmitContext], Any]] = {
+    # Reductions / scans
+    "tt.reduce": map_tt_reduce,
+    "tt.scan": map_tt_scan,
+    # Matmul
+    "tt.dot": map_tt_dot,
+    # Atomics (Triton names: tt.atomic_<op>; the legacy tt.atomic_rmw with
+    # an `rmw_op` attr is still handled by op_mapping.map_tt_atomic_rmw).
+    "tt.atomic_add": map_tt_atomic_add,
+    "tt.atomic_max": map_tt_atomic_max,
+    "tt.atomic_min": map_tt_atomic_min,
+    "tt.atomic_xchg": map_tt_atomic_xchg,
+    "tt.atomic_cas": map_tt_atomic_cas,
+}

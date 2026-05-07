@@ -47,9 +47,49 @@ SHIM_MODULE_NAME = "_triton_frontend_cxx"
 """Name of the pybind11 extension built from ``poc/triton_frontend/_cxx/``."""
 
 
+# Module-level latch so the "shim unavailable" warning fires at most once per
+# process, no matter how many call sites poke shim_available(). The build_cxx
+# helper is consulted lazily so importing this module never triggers cmake.
+_SHIM_WARNED = False
+
+
+def _shim_unavailable_warn_once() -> None:
+    global _SHIM_WARNED
+    if _SHIM_WARNED:
+        return
+    _SHIM_WARNED = True
+    warnings.warn(
+        "C++ PtrAnalysis shim unavailable; falling back to MVP scalar path. "
+        "Run `python -m poc.triton_frontend.build_cxx --build` to enable "
+        "multi-element tile loads.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 def shim_available() -> bool:
-    """Return True if the C++ shim is importable from ``sys.path``."""
-    return importlib.util.find_spec(SHIM_MODULE_NAME) is not None
+    """Return True if the C++ shim is importable from ``sys.path``.
+
+    If a pre-built extension exists under ``_cxx/build/`` but isn't yet on
+    ``sys.path``, this prepends the build dir so the next ``import`` succeeds.
+    The cmake/ninja build itself is NEVER triggered from here -- callers must
+    invoke ``python -m poc.triton_frontend.build_cxx --build`` explicitly.
+
+    Emits a one-shot :class:`RuntimeWarning` when the shim is missing so the
+    fallback to the MVP scalar path is observable in test logs without
+    drowning them in repeated messages.
+    """
+    if importlib.util.find_spec(SHIM_MODULE_NAME) is not None:
+        return True
+    # Try the cmake build dir without shelling out to cmake itself.
+    try:
+        from . import build_cxx as _build_cxx
+    except ImportError:  # pragma: no cover - build_cxx ships alongside us
+        _build_cxx = None  # type: ignore[assignment]
+    if _build_cxx is not None and _build_cxx.ensure_built(build=False, verbose=False):
+        return True
+    _shim_unavailable_warn_once()
+    return False
 
 
 def dialects_available() -> bool:

@@ -37,6 +37,14 @@ import re
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from .mlir_walker import (
+    DEGRADED_WARNING_MESSAGE as _DEGRADED_WARNING_MESSAGE,
+    MLIR_WALKER_AVAILABLE,
+    TTIRWalker,
+    parse_ttir,
+    try_import_mlir,
+    walk_module,
+)
 from .op_mapping import OP_TABLE, WalkerCtx
 from .ptr_analysis import PtrAnalysis, shim_available
 
@@ -44,7 +52,12 @@ __all__ = [
     "from_triton_kernel",
     "from_ttir",
     "TileLangPrimFunc",
+    "MLIR_WALKER_AVAILABLE",
 ]
+
+
+# One-shot guard so we don't spam the fallback warning per-call.
+_FALLBACK_WARNED: bool = False
 
 
 # Sentinel type alias. The real return type is ``tvm.tir.PrimFunc``;
@@ -356,14 +369,28 @@ def from_ttir(
     TileLangPrimFunc
         A TileLang ``PrimFunc`` ready for :mod:`pipeline` lowering.
     """
+    global _FALLBACK_WARNED
     ctx = WalkerCtx()
     if isinstance(ttir_module, str):
+        # Preferred path: re-parse via mlir.ir and use the MLIR walker
+        # (populates ctx.value_map / ctx.buffers properly). If
+        # mlir.ir bindings aren't available we degrade to the regex
+        # walker, but only with explicit opt-in (_allow_text_ttir) and
+        # a one-shot UserWarning.
+        parsed = parse_ttir(ttir_module) if MLIR_WALKER_AVAILABLE else None
+        if parsed is not None:
+            walker = TTIRWalker(ctx)
+            walk_module(parsed, walker)
+            return _make_prim_func(ctx, name=name)
         if not _allow_text_ttir:
             raise TypeError(
                 "from_ttir: textual TTIR is no longer the default path; "
                 "pass an mlir.ir.Module (recommended) or set "
                 "_allow_text_ttir=True for the coverage-only text walker."
             )
+        if not _FALLBACK_WARNED:
+            _FALLBACK_WARNED = True
+            warnings.warn(_DEGRADED_WARNING_MESSAGE, UserWarning, stacklevel=2)
         _walk_text_ttir(ttir_module, ctx)
     else:
         # Pre-pass: run microsoft/triton-shared PtrAnalysis to rewrite

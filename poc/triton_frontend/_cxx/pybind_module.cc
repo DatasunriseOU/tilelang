@@ -56,6 +56,17 @@ class Module {
   TLPtrAnalysisModule* get() const { return raw_; }
   Context* ctx() const { return ctx_; }
 
+  // Centralised wrapper around tl_pa_run_rewrite so both the pybind class
+  // method and the top-level convenience helpers share one implementation
+  // (and the same error-translation path).
+  void run_rewrite(bool enable_gs, bool unsafe_mask) {
+    auto st = tl_pa_run_rewrite(get(), enable_gs ? 1 : 0, unsafe_mask ? 1 : 0);
+    if (st != TL_PA_OK) {
+      throw std::runtime_error(std::string("tl_pa_run_rewrite failed: ") +
+                               tl_pa_take_last_error(ctx_->get()));
+    }
+  }
+
  private:
   Context* ctx_;
   TLPtrAnalysisModule* raw_ = nullptr;
@@ -99,17 +110,7 @@ PYBIND11_MODULE(_triton_frontend_cxx, m) {
            py::keep_alive<1, 2>(),
            py::arg("ctx"), py::arg("mlir_text"))
       .def("to_string", &moduleToString)
-      .def("run_rewrite",
-           [](Module& self, bool enable_gs, bool unsafe_mask) {
-             auto st = tl_pa_run_rewrite(self.get(),
-                                         enable_gs ? 1 : 0,
-                                         unsafe_mask ? 1 : 0);
-             if (st != TL_PA_OK) {
-               throw std::runtime_error(
-                   std::string("tl_pa_run_rewrite failed: ") +
-                   tl_pa_take_last_error(self.ctx()->get()));
-             }
-           },
+      .def("run_rewrite", &Module::run_rewrite,
            py::arg("enable_make_gather_scatter_tensor_ptr") = false,
            py::arg("use_unsafe_mask") = false)
       .def("extract_states_json",

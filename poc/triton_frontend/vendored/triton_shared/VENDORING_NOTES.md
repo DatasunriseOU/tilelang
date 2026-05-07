@@ -321,6 +321,89 @@ confirms (a) the dialect registry is wired up, (b) the parser accepts
 the upstream-printer form for both `tts.*` ops, and (c) the walker can
 traverse them. The test auto-skips when the shim is not built.
 
+## Canonical build commands
+
+The pybind shim that drives `mlir::tts::PtrAnalysis::rewriteOp` is built
+out-of-tree under `poc/triton_frontend/_cxx/`. Two reference environments
+are supported:
+
+### macOS (Apple Silicon, brew LLVM/MLIR) — stub mode
+
+When `TRITON_INSTALL_DIR` is unset, the build automatically falls into
+`TRITON_FRONTEND_STUB_BUILD=ON`: the vendored
+`AnalysisStructured/PtrAnalysis.cpp` is skipped (it transitively requires
+upstream Triton's `triton/Dialect/Triton/IR/Dialect.h`) and the resulting
+extension is *loadable* but `tl_pa_run_rewrite` returns `TL_PA_ERR_INTERNAL`.
+This is enough to demonstrate the import path and is what most Mac
+developer boxes actually want.
+
+```bash
+brew install llvm ninja pybind11
+export MLIR_DIR=$(brew --prefix llvm)/lib/cmake/mlir
+export LLVM_DIR=$(brew --prefix llvm)/lib/cmake/llvm
+
+cd poc/triton_frontend/_cxx
+cmake -B build -GNinja -DMLIR_DIR=$MLIR_DIR -DLLVM_DIR=$LLVM_DIR
+ninja -C build
+# -> build/_triton_frontend_cxx.cpython-3xx-darwin.so
+```
+
+Or, equivalently, from any cwd:
+
+```bash
+python -m poc.triton_frontend.build_cxx --build
+```
+
+The Python helper auto-detects `MLIR_DIR`/`LLVM_DIR` via `brew --prefix llvm`
+and adds the build directory to `sys.path` so `import _triton_frontend_cxx`
+just works.
+
+### GB10 (Linux, sm_121, system LLVM/MLIR) — full build
+
+The GB10 reference image ships system LLVM 18 under `/usr/lib/llvm-18/`,
+plus an OpenAI Triton checkout that is built with `pip install -e .` (the
+resulting MLIR install lives under
+`<triton-src>/python/build/cmake.linux-aarch64-cpython-3.<minor>/install`).
+With both available the full PtrAnalysis is compiled and
+`tl_pa_run_rewrite` runs the structured rewrite end-to-end.
+
+```bash
+# Adjust to whichever Triton checkout/install you have on the box.
+export MLIR_DIR=/usr/lib/llvm-18/lib/cmake/mlir
+export LLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+export TRITON_INSTALL_DIR=$HOME/triton/python/build/cmake.linux-aarch64-cpython-3.10/install
+
+cd poc/triton_frontend/_cxx
+cmake -B build -GNinja \
+    -DMLIR_DIR=$MLIR_DIR -DLLVM_DIR=$LLVM_DIR \
+    -DTRITON_INSTALL_DIR=$TRITON_INSTALL_DIR
+ninja -C build
+```
+
+Or:
+
+```bash
+TRITON_INSTALL_DIR=... python -m poc.triton_frontend.build_cxx --build
+```
+
+The Python helper falls back to scanning `/usr/lib/llvm-{20..14}` when
+`MLIR_DIR`/`LLVM_DIR` are unset; on GB10 LLVM 18 is the canonical pick.
+
+### Forcing stub mode on Linux
+
+Useful if you want a fast local smoke test on Linux without standing up a
+full Triton build:
+
+```bash
+TRITON_FRONTEND_STUB_BUILD=ON python -m poc.triton_frontend.build_cxx --build
+```
+
+The resulting extension imports cleanly; `dialects_available` is `False`
+and the Python facade in `poc/triton_frontend/ptr_analysis.py` falls back
+to its MVP scalar lowering path with the documented
+`RuntimeWarning("C++ PtrAnalysis shim unavailable; …")` fired exactly
+once per process.
+
 ## CMake integration with `add_mlir_library`
 
 The four library declarations (`TritonStructuredDialect`,

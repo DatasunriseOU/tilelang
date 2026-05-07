@@ -19,11 +19,23 @@
 # =====================================================================
 
 cmake_minimum_required(VERSION 3.20)
-project(triton_frontend_cxx LANGUAGES CXX)
+# C is enabled in addition to CXX because LLVM's HandleLLVMOptions.cmake (loaded
+# below from ${LLVM_CMAKE_DIR}) calls `check_c_compiler_flag(...)` while
+# probing host-compiler features. Without `C` in LANGUAGES, configure aborts
+# with "check_compiler_flag: C: needs to be enabled before use" on cmake >=3.27.
+project(triton_frontend_cxx LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Stub build: compile only the C ABI + pybind shim so the resulting Python
+# extension is *loadable*, but `tl_pa_run_rewrite` returns TL_PA_ERR_INTERNAL.
+# Auto-enabled whenever the Triton dialect headers are not findable (i.e.
+# TRITON_INSTALL_DIR is unset). Useful on Mac developer boxes where building
+# upstream Triton is heavy and we just want the import path to work.
+option(TRITON_FRONTEND_STUB_BUILD
+       "Skip vendored PtrAnalysis sources; build C ABI + pybind shim only" OFF)
 
 # Optional: swap the hand-rolled RFC-8259 JSON escaper in
 # tl_pa_extract_states_json for nlohmann::json. The two encoders MUST emit
@@ -96,6 +108,9 @@ else()
   message(WARNING
     "TRITON_INSTALL_DIR not set: building C-ABI surface only; "
     "tl_pa_run_rewrite will return TL_PA_ERR_INTERNAL until integration #5.")
+  # Auto-promote to a stub build so we don't try to compile vendored
+  # PtrAnalysis.cpp against missing `triton/Dialect/Triton/IR/Dialect.h`.
+  set(TRITON_FRONTEND_STUB_BUILD ON)
 endif()
 
 # ---- Vendored triton-shared sources ----------------------------------
@@ -103,9 +118,18 @@ endif()
 set(VENDORED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../vendored/triton_shared")
 include_directories(${VENDORED_DIR}/include)
 
-set(VENDORED_SOURCES
-  ${VENDORED_DIR}/lib/AnalysisStructured/PtrAnalysis.cpp
-)
+# Stub builds skip the vendored PtrAnalysis.cpp because it transitively
+# requires `triton/Dialect/Triton/IR/Dialect.h` from the upstream Triton MLIR
+# install. The C ABI itself compiles regardless thanks to the `__has_include`
+# gates in ptr_analysis_shim.cc.
+if(TRITON_FRONTEND_STUB_BUILD)
+  message(STATUS "TRITON_FRONTEND_STUB_BUILD=ON: skipping vendored PtrAnalysis.cpp")
+  set(VENDORED_SOURCES "")
+else()
+  set(VENDORED_SOURCES
+    ${VENDORED_DIR}/lib/AnalysisStructured/PtrAnalysis.cpp
+  )
+endif()
 
 # ---- Library + Python module ----------------------------------------
 

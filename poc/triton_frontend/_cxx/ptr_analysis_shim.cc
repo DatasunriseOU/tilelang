@@ -59,8 +59,16 @@
 // Vendored triton-shared headers. The TritonStructured dialect (sibling
 // integration #5) is not yet vendored; the include is gated so this TU can
 // compile against both layouts. When integration #5 lands, drop the gate.
-#include "triton-shared/AnalysisStructured/PtrAnalysis.h"
-#if __has_include("triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h")
+//
+// Note on stub builds: `triton-shared/AnalysisStructured/PtrAnalysis.h`
+// transitively references `mlir::triton::AddPtrOp`, `MakeRangeOp`, etc., so
+// it cannot be parsed unless the upstream Triton dialect headers are on the
+// include path. We therefore gate it on the same condition we use for the
+// dialect symbols; when the gate is false the C ABI still compiles but
+// `tl_pa_run_rewrite` returns TL_PA_ERR_INTERNAL.
+#if __has_include("triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h") \
+    && __has_include("triton/Dialect/Triton/IR/Dialect.h")
+#  include "triton-shared/AnalysisStructured/PtrAnalysis.h"
 #  include "triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h"
 #  define TL_PA_HAVE_TRITON_STRUCTURED 1
 #else
@@ -108,11 +116,11 @@ extern "C" {
 
 TLPtrAnalysisContext* tl_pa_context_create(void) {
   auto* impl = new ContextImpl();
-  // getDialectRegistry() returns the context's internal registry by reference;
-  // mutating it directly is sufficient. Do NOT appendDialectRegistry(reg) on
-  // the same registry -- that's a self-append and can cause subtle MLIR state
-  // issues in future versions.
-  auto& reg = impl->ctx.getDialectRegistry();
+  // Build a DialectRegistry, append it to the context, and load. We construct
+  // a separate registry rather than mutating `getDialectRegistry()` because
+  // upstream MLIR (>= 18) returns it by *const* reference; the supported
+  // append point is `appendDialectRegistry`.
+  mlir::DialectRegistry reg;
   reg.insert<mlir::arith::ArithDialect,
              mlir::math::MathDialect,
              mlir::affine::AffineDialect,
@@ -125,6 +133,7 @@ TLPtrAnalysisContext* tl_pa_context_create(void) {
 #if TL_PA_HAVE_TRITON_STRUCTURED
   reg.insert<mlir::tts::TritonStructuredDialect>();
 #endif
+  impl->ctx.appendDialectRegistry(reg);
   impl->ctx.loadAllAvailableDialects();
   return reinterpret_cast<TLPtrAnalysisContext*>(impl);
 }

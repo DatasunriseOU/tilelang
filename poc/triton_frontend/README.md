@@ -82,6 +82,59 @@ extern intrinsic mechanism).
 4. Cite the RFC subsection (sections 5.1, 5.2, 5.4 are the typical ones)
    in the docstring.
 
+## Building the C++ PtrAnalysis shim
+
+The Python facade in `ptr_analysis.py` drives the vendored
+`mlir::tts::PtrAnalysis` via a small pybind11 extension (`_triton_frontend_cxx`)
+under `_cxx/`. It is **not** built as part of the regular Python install; the
+walker silently falls back to the MVP scalar path (per-element BufferLoad /
+BufferStore) when the shim is missing, with a one-shot
+`RuntimeWarning("C++ PtrAnalysis shim unavailable; ...")`.
+
+### macOS (Apple Silicon, brew LLVM/MLIR) — stub mode
+
+```bash
+brew install llvm ninja pybind11
+python -m poc.triton_frontend.build_cxx --build
+```
+
+`build_cxx.py` auto-detects `MLIR_DIR=$(brew --prefix llvm)/lib/cmake/mlir`
+and `LLVM_DIR=$(brew --prefix llvm)/lib/cmake/llvm`, runs cmake + ninja in
+`poc/triton_frontend/_cxx/build/`, and prepends that directory to
+`sys.path` so the next `import _triton_frontend_cxx` succeeds.
+
+Without `TRITON_INSTALL_DIR` the build defaults to
+`TRITON_FRONTEND_STUB_BUILD=ON`: the vendored `PtrAnalysis.cpp` is skipped
+(it transitively needs upstream Triton MLIR headers), the C ABI compiles,
+the extension loads, but `tl_pa_run_rewrite` returns `TL_PA_ERR_INTERNAL`
+so the Python facade still falls back to MVP scalar.
+
+### GB10 (Linux, sm_121, system LLVM/MLIR) — full build
+
+```bash
+export TRITON_INSTALL_DIR=$HOME/triton/python/build/cmake.linux-aarch64-cpython-3.10/install
+python -m poc.triton_frontend.build_cxx --build
+```
+
+`build_cxx.py` scans `/usr/lib/llvm-{20..14}` for system MLIR (GB10 dev
+images ship 18) and passes `-DTRITON_INSTALL_DIR=...` through to cmake.
+With both Triton dialect headers and `libTritonIR` available the full
+PtrAnalysis is compiled and the multi-element tile load fast path lights
+up automatically (no Python-side switch -- `dialects_available` flips to
+`True`).
+
+### Verification
+
+```bash
+python -m poc.triton_frontend.build_cxx --check    # exit 0 if importable
+python -c "from poc.triton_frontend.ptr_analysis import shim_available, dialects_available; \
+           print('shim:', shim_available(), 'dialects:', dialects_available())"
+```
+
+See `vendored/triton_shared/VENDORING_NOTES.md` for the full set of CMake
+options (`TRITON_FRONTEND_USE_NLOHMANN_JSON`, `TRITON_FRONTEND_STUB_BUILD`)
+and the file-level rationale for stub mode.
+
 ## How to run conformance
 
 Once stubs are filled in, the suite runs under pytest::

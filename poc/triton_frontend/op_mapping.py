@@ -392,6 +392,15 @@ def _emit_store_copy(op: Any, ctx: "WalkerCtx", resolved: Dict[str, Any],
 # ---------------------------------------------------------------------------
 
 
+# TODO(memory-emitters): the legacy stubs map_tt_load / map_tt_store and
+# their shape-op siblings (map_tt_make_range / map_tt_broadcast /
+# map_tt_splat / map_tt_expand_dims / map_tt_reshape) have a richer
+# replacement in ``poc.triton_frontend.op_emitters.memory.MEMORY_EMITTERS``
+# that honors the "never silent-fallback" rule: when PtrAnalysis is
+# unavailable for a multi-element tile they emit a ``# DEGRADED:``
+# pragma_comment AttrStmt that survives PrimFunc pretty-print. Per the
+# ``feedback_no_silent_delete`` policy we keep these stubs live until the
+# walker is rewired through the new overlay.
 def map_tt_load(op: Any, ctx: WalkerCtx) -> Any:
     """Lower ``tt.load(ptr, mask, other)`` to a guarded ``BufferLoad``.
 
@@ -1403,3 +1412,54 @@ OP_TABLE: Dict[str, EmitFn] = {
     # misc
     "tt.print": map_tt_print,
 }
+
+
+# ---------------------------------------------------------------------------
+# arith.* / math.* / tt.fma -- sourced from op_emitters.arith to avoid the
+# 1400-line table in this file growing further (and to keep merge-conflict
+# surface small for parallel work on individual op families).
+# ---------------------------------------------------------------------------
+from .op_emitters.arith import ARITH_EMITTERS  # noqa: E402
+
+OP_TABLE.update(ARITH_EMITTERS)
+
+
+# ---------------------------------------------------------------------------
+# Reductions / scan / dot / atomics -- sourced from op_emitters.reduction.
+# Path C kernel surface: ``tt.reduce`` and ``tt.scan`` lower to explicit
+# ``tir.For`` + accumulator (rather than the high-level ``T.reduce_*``
+# macros invoked by the legacy ``map_tt_reduce`` above). The legacy
+# ``map_tt_reduce`` / ``map_tt_dot`` / ``map_tt_atomic_rmw`` stubs in this
+# file are deliberately left in place per ``feedback_no_silent_delete``;
+# the ``OP_TABLE.update`` call below overrides them with the explicit
+# emitters for the modern ``tt.atomic_<op>`` names. ``tt.atomic_rmw``
+# (the legacy single-op spelling carrying an ``rmw_op`` attribute) is
+# still handled by ``map_tt_atomic_rmw`` here.
+# TODO: once Path C is the only path, fold the explicit emitters back
+# into this file and delete the high-level stubs above.
+# ---------------------------------------------------------------------------
+from .op_emitters.reduction import REDUCTION_EMITTERS  # noqa: E402
+
+OP_TABLE.update(REDUCTION_EMITTERS)
+
+
+# ---------------------------------------------------------------------------
+# Memory / shape -- sourced from op_emitters.memory. ``tt.load`` / ``tt.store``
+# / ``tt.make_range`` / ``tt.broadcast`` / ``tt.splat`` / ``tt.expand_dims`` /
+# ``tt.view`` / ``tt.reshape`` / ``tt.addptr`` / ``tts.make_tptr``. The legacy
+# ``map_tt_*`` stubs above are kept per ``feedback_no_silent_delete``; the
+# ``OP_TABLE.update`` below overrides them with the real TIR emitters.
+# ---------------------------------------------------------------------------
+from .op_emitters.memory import MEMORY_EMITTERS  # noqa: E402
+
+OP_TABLE.update(MEMORY_EMITTERS)
+
+
+# ---------------------------------------------------------------------------
+# Control flow + casts -- sourced from op_emitters.control. ``arith.select`` /
+# ``arith.{ext,trunc,fpto*,*tofp,bit}cast`` / ``arith.{ext,trunc}{si,ui}`` /
+# ``tt.advance`` / ``scf.{for,if,yield}``.
+# ---------------------------------------------------------------------------
+from .op_emitters.control import CONTROL_EMITTERS  # noqa: E402
+
+OP_TABLE.update(CONTROL_EMITTERS)
