@@ -29,9 +29,19 @@ __all__ = [
     "PassRole",
     "PassEntry",
     "PASS_ORDER",
+    "PipelineError",
     "build_pipeline",
     "run",
+    "run_ptr_analysis_pre_pass",
+    "seed_ptr_states",
 ]
+
+
+class PipelineError(RuntimeError):
+    """Raised when a pre-walker pipeline stage fails in a way that should NOT
+    silently degrade. Carries enough context (op name, SSA, state count) to
+    point a maintainer at the missing PtrState wiring without a debug build.
+    """
 
 
 PassStatus = str  # Literal["reuse", "extend", "skip"] in real impl.
@@ -304,3 +314,90 @@ def run(prim_func: Any, target: Optional[str] = None, **kwargs: Any) -> Any:
     else:
         mod = IRModule({"main": prim_func})
     return seq(mod)
+
+
+# ---------------------------------------------------------------------------
+# Pre-walker PtrAnalysis pre-pass
+#
+# The TileLang ``Sequential`` above operates on ``IRModule`` objects after
+# the TTIR->TIR walker has already produced a PrimFunc. The C++ shim's
+# PtrAnalysis runs *before* that, on raw TTIR text, to rewrite multi-element
+# pointer arithmetic into ``tts.make_tptr`` ops and surface ``PtrState``
+# descriptors. The two helpers below are the integration glue between the
+# shim (see :mod:`poc.triton_frontend.ptr_analysis`) and the walker's
+# :class:`WalkerCtx`.
+# ---------------------------------------------------------------------------
+
+
+def run_ptr_analysis_pre_pass(
+    ttir_text: str,
+) -> Tuple[str, dict]:
+    """Run PtrAnalysis on TTIR text and return ``(rewritten_ttir, state_map)``.
+
+    ``state_map`` is keyed by ``result_ssa`` (e.g. ``"%2"``) for fast lookup
+    inside emitters. When the C++ shim is unavailable this returns
+    ``(ttir_text, {})`` unchanged -- callers are expected to fall back to
+    the MVP scalar path with a visible ``# DEGRADED:`` AttrStmt.
+
+    Hard-constraint: when the shim *is* available but raises while
+    extracting states, surface the exception as a :class:`PipelineError`
+    with diagnostics. We never silently degrade in that case.
+    """
+    from .ptr_analysis import shim_available, run_ptr_analysis_with_states
+
+    if not shim_available():
+        return ttir_text, {}
+
+    try:
+        rewritten, states = run_ptr_analysis_with_states(ttir_text)
+    except BaseException as exc:  # noqa: BLE001
+        raise PipelineError(
+            f"PtrAnalysis pre-pass failed: {type(exc).__name__}: {exc}. "
+            "Build invariant: when the C++ shim is loaded we must not "
+            "silently degrade -- check the TTIR input for a parser error "
+            "or rebuild poc/triton_frontend/_cxx."
+        ) from exc
+
+    state_map: dict = {}
+    for s in states:
+        if s.result_ssa is not None:
+            state_map[s.result_ssa] = s
+        # Also key by source SSA so emitters that look up by the underlying
+        # base pointer (the common ``tt.addptr`` -> source case) still find it.
+        # Don't overwrite an existing result-keyed entry.
+        if s.source is not None and s.source not in state_map:
+            state_map[s.source] = s
+    return rewritten, state_map
+
+
+def seed_ptr_states(ctx: Any, state_map: dict) -> int:
+    """Seed ``ctx.ptr_states`` (and ``ctx.value_map``) with PtrState entries.
+
+    Populates two surfaces so emitters can find state via either path:
+
+    1. ``ctx.ptr_states[ssa_name] = PtrState`` -- the new authoritative
+       lookup table; emitters in ``op_emitters/memory.py`` consult it as
+       ``ctx.ptr_states.get(_op_result_name(op))``.
+    2. ``ctx.value_map[ssa_name] = {"_ptrstate": ..., ...}`` -- the legacy
+       tagged-dict shape that ``_emit_load_copy`` / ``_emit_store_copy``
+       in op_mapping.py already understand. Keying by name (string) means
+       a name-based look-up resolves; the existing code already special-
+       cases this dict shape via ``_ptrstate_is_tile`` etc.
+
+    Returns the number of states seeded.
+    """
+    seeded = 0
+    if not hasattr(ctx, "ptr_states"):
+        ctx.ptr_states = {}
+    for ssa_name, state in state_map.items():
+        ctx.ptr_states[ssa_name] = state
+        ctx.value_map[ssa_name] = {
+            "_ptrstate": state,
+            "source": state.source,
+            "offsets": list(state.offsets),
+            "sizes": list(state.sizes),
+            "strides": list(state.strides),
+            "shape": list(state.shape) if state.shape is not None else None,
+        }
+        seeded += 1
+    return seeded

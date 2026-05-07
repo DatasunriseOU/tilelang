@@ -243,6 +243,77 @@ target_link_libraries(TritonSharedAnalysisStructured PUBLIC
 )
 
 # -----------------------------------------------------------------------------
+# Library: TritonSharedConversionStructuredToMemref
+#
+# Lifted verbatim from facebookincubator/triton-shared
+# `lib/Conversion/StructuredToMemref/StructuredToMemref.cpp` (1153 LoC) —
+# contains the pattern population entry point
+# `mlir::triton::populateStructuredToMemrefConversionPatterns(...)` plus the
+# four OpConversionPatterns (MakeTensorPtrConverter,
+# MakeGatherScatterTensorPtrConverter, LoadConverter, StoreConverter).
+#
+# Note: Meta also ships `StructuredToMemrefPass.cpp` (the pass *driver* that
+# wires those patterns into a runOnOperation hook). The driver depends on two
+# additional dialects (`tptr::TPtrDialect` + `ttx::TritonTilingExtDialect`)
+# that we have NOT vendored. Compiling it would force us to forward-port two
+# more dialects whose only consumer is `getDependentDialects`. Instead, we
+# vendor the patterns and leave it to consumers (e.g. `_cxx/ptr_analysis_shim`)
+# to spin up their own ConversionTarget + applyPartialConversion driver — that
+# is the same control flow as Pass.cpp, just without the dialect-registry call.
+# StructuredToMemrefPass.cpp ships in the source tree for reference but is
+# intentionally excluded from this library's source list. If you re-vendor the
+# missing dialects, append it here.
+# -----------------------------------------------------------------------------
+# TableGen for the StructuredToMemref pass (`-gen-pass-decls`). Even though we
+# don't compile Pass.cpp in this build, the cpp/h headers reference
+# `Passes.h.inc` via GEN_PASS_DECL. The cpp uses GEN_PASS_DEF only via Pass.cpp
+# (not built), but StructuredToMemref.h pulls in the GEN_PASS_DECL block which
+# the patterns library does NOT emit, so we still want the tablegen step in case
+# a future change includes Pass.cpp.
+set(_TS_S2M_TG_OUT_DIR
+    "${_VENDOR_BUILD_INCLUDE}/triton-shared/Conversion/StructuredToMemref")
+file(MAKE_DIRECTORY "${_TS_S2M_TG_OUT_DIR}")
+set(LLVM_TARGET_DEFINITIONS
+    "${_VENDOR_INCLUDE}/triton-shared/Conversion/StructuredToMemref/Passes.td")
+mlir_tablegen("${_TS_S2M_TG_OUT_DIR}/Passes.h.inc"
+              -gen-pass-decls --name StructuredToMemref)
+add_public_tablegen_target(StructuredToMemrefConversionPassIncGen)
+
+_tl_add_vendored_library(TritonSharedConversionStructuredToMemref
+  "${_VENDOR_LIB}/Conversion/StructuredToMemref/StructuredToMemref.cpp"
+)
+add_dependencies(TritonSharedConversionStructuredToMemref
+  TritonStructuredVendoredTableGen
+  StructuredToMemrefConversionPassIncGen
+)
+target_include_directories(TritonSharedConversionStructuredToMemref PUBLIC
+  "${_VENDOR_INCLUDE}"
+  "$<BUILD_INTERFACE:${_VENDOR_BUILD_INCLUDE}>"
+  "${TRITON_INSTALL_DIR}/include"
+  ${MLIR_INCLUDE_DIRS}
+  ${LLVM_INCLUDE_DIRS}
+)
+target_link_libraries(TritonSharedConversionStructuredToMemref PUBLIC
+  TritonStructuredDialect
+  MLIRArithDialect
+  MLIRBufferizationDialect
+  MLIRDialectUtils
+  MLIRFuncDialect
+  MLIRIR
+  MLIRLinalgDialect
+  MLIRMathDialect
+  MLIRMemRefDialect
+  MLIRPass
+  MLIRSCFDialect
+  MLIRSCFTransforms
+  MLIRSupport
+  MLIRTensorDialect
+  MLIRTransforms
+  MLIRTransformUtils
+  TritonIR
+)
+
+# -----------------------------------------------------------------------------
 # Optional: registration helper (RegisterTritonStructured.cc) — small public
 # library so a downstream pybind module can call
 # `mlir::triton_shared_vendored::registerTritonStructured(registry)`.
@@ -280,6 +351,7 @@ install(TARGETS
   TritonStructuredDialect
   TritonSharedUseAnalysis
   TritonSharedAnalysisStructured
+  TritonSharedConversionStructuredToMemref
   TritonSharedRegister
   EXPORT triton_shared_vendoredTargets
   ARCHIVE DESTINATION lib

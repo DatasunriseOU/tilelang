@@ -65,6 +65,12 @@ void                 tl_pa_module_destroy(TLPtrAnalysisModule* mod);
 // Print the (possibly rewritten) module to a freshly allocated, NUL-terminated
 // C string. Caller must free with `tl_pa_string_free`.
 char*                tl_pa_module_to_string(TLPtrAnalysisModule* mod);
+
+// Same as `tl_pa_module_to_string` but emits generic op form
+// (`"dialect.op"(...) : ...`) so external parsers without the Triton dialect
+// loaded (jaxlib's stripped mlir.ir, brew mlir-opt) can round-trip the text.
+char*                tl_pa_module_to_generic(TLPtrAnalysisModule* mod);
+
 void                 tl_pa_string_free(char* s);
 
 // ---- Driver entry points ---------------------------------------------------
@@ -85,6 +91,15 @@ const char*          tl_pa_extract_states_json(TLPtrAnalysisModule* mod);
 // Retrieve and clear the last error message produced by any of the entry
 // points above. Returns an empty string if no error is pending.
 const char*          tl_pa_take_last_error(TLPtrAnalysisContext* ctx);
+
+// Run the StructuredToMemref conversion (lifted from
+// facebookincubator/triton-shared lib/Conversion/StructuredToMemref/) over
+// the top-level ModuleOp owned by `mod`. The conversion target legalizes
+// `tts::LoadOp`, `tts::StoreOp`, `tts::MakeTensorPtrOp` (i.e. they are
+// rewritten away into memref subview/load/store + linalg copies). Returns
+// TL_PA_ERR_REWRITE on failure; the precise error text is available via
+// `tl_pa_take_last_error`.
+TLPtrAnalysisStatus tl_pa_run_structured_to_memref(TLPtrAnalysisModule* mod);
 
 // Returns 1 if the shim was compiled with TL_PA_USE_NLOHMANN_JSON=1, else 0.
 // Lets Python callers introspect which encoder produced the JSON they hold;

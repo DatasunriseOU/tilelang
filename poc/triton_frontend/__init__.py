@@ -37,6 +37,14 @@ import re
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+# Probe ~/.triton/llvm, brew, and IREE for an mlir.ir provider before
+# importing the walker. ``_mlir_path_setup`` adjusts ``sys.path`` and/or
+# registers an ``iree.compiler.ir``-backed alias under
+# ``sys.modules['mlir.ir']`` so the walker's subsequent
+# ``try_import_mlir`` succeeds. If every probe misses the walker emits
+# its existing one-shot UserWarning unchanged.
+from . import _mlir_path_setup  # noqa: F401  (import-time side effect)
+
 from .mlir_walker import (
     DEGRADED_WARNING_MESSAGE as _DEGRADED_WARNING_MESSAGE,
     MLIR_WALKER_AVAILABLE,

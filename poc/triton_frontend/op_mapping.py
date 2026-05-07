@@ -106,6 +106,11 @@ class WalkerCtx:
         # axes flipped; for the common 2D matmul case both values are the
         # last two axes (e.g. (-2, -1)).
         self.transposed_views: Dict[Any, Tuple[int, int]] = {}
+        # SSA name (string, e.g. "%2") -> PtrState seeded by the
+        # ``run_ptr_analysis_pre_pass`` helper in pipeline.py. Emitters in
+        # ``op_emitters/memory.py`` look up here to choose between the real
+        # T.copy path and the per-element ``# DEGRADED:`` fallback.
+        self.ptr_states: Dict[str, Any] = {}
 
     # ---- helpers --------------------------------------------------------
 

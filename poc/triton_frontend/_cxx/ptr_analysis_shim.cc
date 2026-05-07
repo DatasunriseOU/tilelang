@@ -51,10 +51,15 @@
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Transforms/DialectConversion.h"
 
 // Vendored triton-shared headers. The TritonStructured dialect (sibling
 // integration #5) is not yet vendored; the include is gated so this TU can
@@ -69,6 +74,7 @@
 #if __has_include("triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h") \
     && __has_include("triton/Dialect/Triton/IR/Dialect.h")
 #  include "triton-shared/AnalysisStructured/PtrAnalysis.h"
+#  include "triton-shared/Conversion/StructuredToMemref/StructuredToMemref.h"
 #  include "triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h"
 #  define TL_PA_HAVE_TRITON_STRUCTURED 1
 #else
@@ -124,6 +130,10 @@ TLPtrAnalysisContext* tl_pa_context_create(void) {
   reg.insert<mlir::arith::ArithDialect,
              mlir::math::MathDialect,
              mlir::affine::AffineDialect,
+             mlir::bufferization::BufferizationDialect,
+             mlir::cf::ControlFlowDialect,
+             mlir::func::FuncDialect,
+             mlir::linalg::LinalgDialect,
              mlir::scf::SCFDialect,
              mlir::tensor::TensorDialect,
              mlir::memref::MemRefDialect>();
@@ -188,6 +198,28 @@ char* tl_pa_module_to_string(TLPtrAnalysisModule* mod) {
   return buf;
 }
 
+// Print the module in generic op form so external parsers (jaxlib's stripped
+// mlir.ir, brew LLVM's mlir-opt, etc.) can re-parse it without needing the
+// Triton dialect's custom assembly registered. The output is functionally
+// equivalent to the custom-form output above; it just uses the
+// `"dialect.op"(operands) {attrs} : (operand_types) -> result_types` shape
+// instead of dialect-specific shorthand.
+char* tl_pa_module_to_generic(TLPtrAnalysisModule* mod) {
+  if (!mod) return nullptr;
+  auto* m = reinterpret_cast<ModuleImpl*>(mod);
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  mlir::OpPrintingFlags flags;
+  flags.printGenericOpForm();
+  m->module.get().print(os, flags);
+  os.flush();
+  char* buf = static_cast<char*>(std::malloc(out.size() + 1));
+  if (!buf) return nullptr;
+  std::memcpy(buf, out.data(), out.size());
+  buf[out.size()] = '\0';
+  return buf;
+}
+
 void tl_pa_string_free(char* s) { std::free(s); }
 
 TLPtrAnalysisStatus tl_pa_run_rewrite(TLPtrAnalysisModule* mod,
@@ -213,6 +245,68 @@ TLPtrAnalysisStatus tl_pa_run_rewrite(TLPtrAnalysisModule* mod,
   moduleOp.walk([&](mlir::tts::GetStructuredStateOp op) {
     (void)pa.rewriteGetStructuredStateOp(op);
   });
+  return TL_PA_OK;
+#endif
+}
+
+TLPtrAnalysisStatus tl_pa_run_structured_to_memref(TLPtrAnalysisModule* mod) {
+  if (!mod) return TL_PA_ERR_NULL_HANDLE;
+  auto* m = reinterpret_cast<ModuleImpl*>(mod);
+#if !TL_PA_HAVE_TRITON_STRUCTURED || !TL_PA_HAVE_TRITON
+  setError(m->parent,
+           "TritonStructured/Triton dialect not yet vendored: rebuild after "
+           "integration #5 with -DTRITON_INSTALL_DIR set.");
+  return TL_PA_ERR_INTERNAL;
+#else
+  // Mirror facebookincubator/triton-shared
+  // lib/Conversion/StructuredToMemref/StructuredToMemrefPass.cpp::runOnOperation,
+  // minus the dialect-registry entries for `tptr::TPtrDialect` /
+  // `ttx::TritonTilingExtDialect` (those dialects are not vendored). The
+  // TypeConverter and target legalization rules are otherwise identical to
+  // upstream.
+  mlir::ModuleOp moduleOp = m->module.get();
+
+  // ---- TypeConverter: tt.ptr -> unranked memref ---------------------------
+  mlir::TypeConverter typeConverter;
+  typeConverter.addConversion([](mlir::Type type) { return type; });
+  typeConverter.addConversion([](mlir::triton::PointerType ptrType) {
+    return mlir::UnrankedMemRefType::get(ptrType.getPointeeType(), 0);
+  });
+  auto materialize = [](mlir::OpBuilder& builder,
+                        mlir::Type resultType,
+                        mlir::ValueRange inputs,
+                        mlir::Location loc) -> mlir::Value {
+    return mlir::UnrealizedConversionCastOp::create(builder, loc, resultType,
+                                                    inputs)
+        .getResult(0);
+  };
+  typeConverter.addTargetMaterialization(materialize);
+  typeConverter.addSourceMaterialization(materialize);
+
+  // ---- ConversionTarget ---------------------------------------------------
+  mlir::ConversionTarget target(*moduleOp.getContext());
+  target.addLegalDialect<
+      mlir::func::FuncDialect, mlir::arith::ArithDialect,
+      mlir::math::MathDialect, mlir::linalg::LinalgDialect,
+      mlir::affine::AffineDialect, mlir::scf::SCFDialect,
+      mlir::cf::ControlFlowDialect, mlir::tensor::TensorDialect,
+      mlir::bufferization::BufferizationDialect,
+      mlir::memref::MemRefDialect>();
+  target.addIllegalOp<mlir::tts::LoadOp, mlir::tts::StoreOp,
+                      mlir::tts::MakeTensorPtrOp>();
+  target.addLegalOp<mlir::UnrealizedConversionCastOp>();
+
+  // ---- Patterns -----------------------------------------------------------
+  mlir::RewritePatternSet patterns(moduleOp.getContext());
+  mlir::triton::populateStructuredToMemrefConversionPatterns(patterns,
+                                                             typeConverter);
+
+  if (mlir::failed(mlir::applyPartialConversion(moduleOp, target,
+                                                std::move(patterns)))) {
+    setError(m->parent,
+             "applyPartialConversion(StructuredToMemref) returned failure");
+    return TL_PA_ERR_REWRITE;
+  }
   return TL_PA_OK;
 #endif
 }

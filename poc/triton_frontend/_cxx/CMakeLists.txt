@@ -137,6 +137,7 @@ else()
   include_directories("${CMAKE_BINARY_DIR}/vendored_triton_shared/include")
   list(APPEND TL_PA_LINK_LIBS
        TritonSharedAnalysisStructured
+       TritonSharedConversionStructuredToMemref
        TritonStructuredDialect)
   set(VENDORED_SOURCES "")
 endif()
@@ -148,12 +149,17 @@ list(APPEND TL_PA_LINK_LIBS
   MLIRParser
   MLIRSupport
   MLIRArithDialect
+  MLIRBufferizationDialect
+  MLIRControlFlowDialect
+  MLIRFuncDialect
+  MLIRLinalgDialect
   MLIRMathDialect
   MLIRMemRefDialect
   MLIRSCFDialect
   MLIRTensorDialect
   MLIRAffineDialect
   MLIRTransforms
+  MLIRTransformUtils
 )
 
 pybind11_add_module(_triton_frontend_cxx

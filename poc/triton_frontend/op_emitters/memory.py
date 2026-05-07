@@ -119,7 +119,75 @@ def _resolved_or_none(ctx: WalkerCtx, ssa_value: Any) -> Any:
     """
     if ssa_value is None:
         return None
-    return ctx.value_map.get(ssa_value)
+    try:
+        return ctx.value_map.get(ssa_value)
+    except TypeError:
+        # ssa_value is unhashable (e.g. a dict-shaped fake op from tests, or
+        # a raw operand record from the regex walker). value_map keys are
+        # always hashable SSA names; an unhashable key is by definition
+        # not in the map, so return None.
+        return None
+
+
+def _ssa_name(value: Any) -> Optional[str]:
+    """Best-effort printed SSA name for a TTIR value (e.g. ``"%2"``).
+
+    Mirrors the lookup pattern used by ``mlir_walker._block_arg_name``: try
+    the standard ``get_name``/``name`` accessors, then fall back to ``str()``
+    and take the first whitespace-delimited token (which is the SSA name in
+    the printed form ``"%2 = tt.load ..."``).
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return value.get("name") or value.get("ssa") or None
+    for attr in ("get_name", "name"):
+        getter = getattr(value, attr, None)
+        if callable(getter):
+            try:
+                out = str(getter())
+                if out:
+                    return out
+            except Exception:
+                pass
+        elif isinstance(getter, str) and getter:
+            return getter
+    try:
+        s = str(value).strip()
+        if s:
+            head = s.split()[0]
+            return head if head.startswith("%") else None
+    except Exception:
+        pass
+    return None
+
+
+def _lookup_ptr_state(ctx: WalkerCtx, op: Any, ptr_ssa: Any) -> Any:
+    """Find a :class:`PtrState` for the load/store at ``op``.
+
+    Search order:
+
+    1. ``ctx.ptr_states[result_ssa_name]`` -- the most precise match
+       (``tts.load``/``tts.store`` ops post-rewrite carry the result name
+       that PtrAnalysis emitted).
+    2. ``ctx.ptr_states[ptr_ssa_name]`` -- pre-rewrite case where the load
+       still references the original pointer.
+    3. ``None``.
+    """
+    states_map = getattr(ctx, "ptr_states", None) or {}
+    if not states_map:
+        return None
+    results = _results(op)
+    if results:
+        rname = _ssa_name(results[0])
+        if rname and rname in states_map:
+            return states_map[rname]
+    pname = _ssa_name(ptr_ssa)
+    if pname and pname in states_map:
+        return states_map[pname]
+    return None
 
 
 def _wrap_pragma_comment(ctx: WalkerCtx, body: Any, comment: str) -> Any:
@@ -341,6 +409,21 @@ def emit_tt_load(op: Any, ctx: WalkerCtx) -> Any:
     out_shape = list(_shape_of(result_value)) if result_value is not None else []
     out_dtype = _dtype_of(result_value) if result_value is not None else "float32"
 
+    # Pre-pass-seeded PtrState lookup (run_ptr_analysis_pre_pass populated
+    # ``ctx.ptr_states`` keyed by SSA name). When found, we synthesize the
+    # legacy tagged-dict shape that ``_emit_load_copy`` already understands
+    # so the existing T.copy code path runs and we DON'T emit ``# DEGRADED:``.
+    if (resolved is None or not (isinstance(resolved, dict) and "_ptrstate" in resolved)):
+        state = _lookup_ptr_state(ctx, op, ptr_ssa)
+        if state is not None:
+            resolved = {
+                "_ptrstate": state,
+                "source": state.source,
+                "offsets": list(state.offsets),
+                "sizes": list(state.sizes),
+                "strides": list(state.strides),
+            }
+
     # Tile path (PtrState has explicit sizes > 1).
     if isinstance(resolved, dict) and "_ptrstate" in resolved and _ptrstate_is_tile(resolved):
         tile_shape = _ptrstate_sizes_int(resolved) or list(out_shape) or [1]
@@ -426,6 +509,20 @@ def emit_tt_store(op: Any, ctx: WalkerCtx) -> Any:
     resolved = _resolved_or_none(ctx, ptr_ssa)
     val_expr = ctx.get(val_ssa)
     val_shape = list(_shape_of(val_ssa))
+
+    # Pre-pass-seeded PtrState lookup (see emit_tt_load). Promotes the no-shim
+    # ``# DEGRADED:`` path to the real T.copy when run_ptr_analysis_pre_pass
+    # has surfaced a tile descriptor for the destination pointer.
+    if (resolved is None or not (isinstance(resolved, dict) and "_ptrstate" in resolved)):
+        state = _lookup_ptr_state(ctx, op, ptr_ssa)
+        if state is not None:
+            resolved = {
+                "_ptrstate": state,
+                "source": state.source,
+                "offsets": list(state.offsets),
+                "sizes": list(state.sizes),
+                "strides": list(state.strides),
+            }
 
     # Tile path via PtrState.
     if isinstance(resolved, dict) and "_ptrstate" in resolved and _ptrstate_is_tile(resolved):

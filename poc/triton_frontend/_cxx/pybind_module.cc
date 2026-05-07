@@ -80,6 +80,14 @@ std::string moduleToString(Module& m) {
   return out;
 }
 
+std::string moduleToGeneric(Module& m) {
+  char* s = tl_pa_module_to_generic(m.get());
+  if (!s) return {};
+  std::string out(s);
+  tl_pa_string_free(s);
+  return out;
+}
+
 }  // namespace
 
 // Probe whether the Triton + TritonStructured dialect headers were available
@@ -110,6 +118,10 @@ PYBIND11_MODULE(_triton_frontend_cxx, m) {
            py::keep_alive<1, 2>(),
            py::arg("ctx"), py::arg("mlir_text"))
       .def("to_string", &moduleToString)
+      .def("to_generic", &moduleToGeneric,
+           "Print the module in generic op form (\"dialect.op\"(...) : ...) "
+           "so external parsers without Triton dialect registered can "
+           "round-trip the text — e.g. jaxlib's stripped mlir.ir bindings.")
       .def("run_rewrite", &Module::run_rewrite,
            py::arg("enable_make_gather_scatter_tensor_ptr") = false,
            py::arg("use_unsafe_mask") = false)
@@ -118,6 +130,23 @@ PYBIND11_MODULE(_triton_frontend_cxx, m) {
              const char* s = tl_pa_extract_states_json(self.get());
              return s ? std::string(s) : std::string("[]");
            });
+
+  // Run the StructuredToMemref conversion pass on a parsed TTIR text.
+  // Parses, applies StructuredToMemref, prints, returns the rewritten module.
+  // Raises RuntimeError on parse/verify/conversion failure.
+  m.def("run_structured_to_memref",
+        [](const std::string& mlir_text) -> std::string {
+          Context ctx;
+          Module mod(ctx, mlir_text);
+          auto st = tl_pa_run_structured_to_memref(mod.get());
+          if (st != TL_PA_OK) {
+            throw std::runtime_error(
+                std::string("tl_pa_run_structured_to_memref failed: ") +
+                tl_pa_take_last_error(ctx.get()));
+          }
+          return moduleToString(mod);
+        },
+        py::arg("mlir_text"));
 
   // Convenience top-level: parse, rewrite, return printed text in one step.
   m.def("run_ptr_analysis",

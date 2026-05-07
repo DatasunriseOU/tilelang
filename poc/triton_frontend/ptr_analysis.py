@@ -29,9 +29,13 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import os
+import re
+import sys
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 __all__ = [
     "PtrState",
@@ -39,12 +43,55 @@ __all__ = [
     "PtrAnalysis",
     "shim_available",
     "dialects_available",
+    "run_ptr_analysis",
+    "extract_ptr_states",
+    "run_ptr_analysis_with_states",
     "SHIM_MODULE_NAME",
 ]
 
 
 SHIM_MODULE_NAME = "_triton_frontend_cxx"
 """Name of the pybind11 extension built from ``poc/triton_frontend/_cxx/``."""
+
+
+# Build directories the cmake configuration may have produced the shim into.
+# Order matters: the orchestrator's "port" build (out-of-tree, cmake -B build-port)
+# is checked first because that is where freshly-produced .so files land in the
+# current pipeline; ``_cxx/build/`` is the legacy in-tree location used by
+# ``build_cxx.ensure_built``.
+_THIS_DIR = Path(__file__).resolve().parent
+_SHIM_BUILD_DIRS: Tuple[Path, ...] = (
+    _THIS_DIR / "_cxx" / "build-port",
+    _THIS_DIR / "_cxx" / "build",
+)
+
+
+def _shim_dir_has_extension(d: Path) -> bool:
+    if not d.is_dir():
+        return False
+    for entry in d.iterdir():
+        name = entry.name
+        if not name.startswith(SHIM_MODULE_NAME):
+            continue
+        if name.endswith((".so", ".dylib", ".pyd")):
+            return True
+    return False
+
+
+def _ensure_shim_on_syspath() -> bool:
+    """If a built shim exists in any known build dir, prepend it to sys.path.
+
+    Returns True when a directory was added (or was already present) and the
+    shim should now be importable.
+    """
+    for d in _SHIM_BUILD_DIRS:
+        if _shim_dir_has_extension(d):
+            ds = str(d)
+            if ds not in sys.path:
+                sys.path.insert(0, ds)
+            importlib.invalidate_caches()
+            return True
+    return False
 
 
 # Module-level latch so the "shim unavailable" warning fires at most once per
@@ -81,7 +128,10 @@ def shim_available() -> bool:
     """
     if importlib.util.find_spec(SHIM_MODULE_NAME) is not None:
         return True
-    # Try the cmake build dir without shelling out to cmake itself.
+    # First try our local build-dir candidates (build-port, build).
+    if _ensure_shim_on_syspath() and importlib.util.find_spec(SHIM_MODULE_NAME) is not None:
+        return True
+    # Fall back to the cmake build helper without shelling out to cmake itself.
     try:
         from . import build_cxx as _build_cxx
     except ImportError:  # pragma: no cover - build_cxx ships alongside us
@@ -111,6 +161,11 @@ def dialects_available() -> bool:
 
 def _load_shim() -> Any:
     """Lazy-import the C++ shim or raise a NotImplementedError with build hint."""
+    # Make sure local build-port / build dirs are on sys.path before importing.
+    # This mirrors the discovery logic in :func:`shim_available` so callers
+    # that go straight through the load helper don't trip over a stale
+    # negative cache from an early ``find_spec`` miss.
+    _ensure_shim_on_syspath()
     try:
         return importlib.import_module(SHIM_MODULE_NAME)
     except ImportError as exc:  # pragma: no cover - exercised only when unbuilt
@@ -135,13 +190,37 @@ class PtrState:
     AnalysisStructured/PtrAnalysis.h``. Values are kept as opaque strings
     (the printed form of the corresponding ``OpFoldResult``) so this
     dataclass does not require an ``mlir.ir`` import.
+
+    Attributes
+    ----------
+    offsets, sizes, strides:
+        The recovered ``OpFoldResult`` lists (printed form). Strings are
+        either SSA names like ``"%i"`` or integer literals like ``"16"``.
+    source:
+        Printed form of the base pointer SSA value, or ``None`` if absent.
+    modulos:
+        Per-axis modulo information (or ``None`` for axes without one).
+        May be empty when not surfaced by the shim.
+    shape:
+        Original tensor shape for block-pointer loads, or ``None`` for
+        plain pointer loads.
+    op:
+        Printed form of the op the state was extracted from (typically a
+        ``tts.make_tptr``). Useful for diagnostics and for matching the
+        emitted state back to the rewritten module.
+    result_ssa:
+        SSA name of the result the state describes (e.g. ``"%2"``). Used
+        as the key when threading the state map through the walker.
     """
 
     offsets: Tuple[str, ...] = ()
     sizes: Tuple[str, ...] = ()
     strides: Tuple[str, ...] = ()
     source: Optional[str] = None
-    """Printed form of the base pointer SSA value, or ``None`` if absent."""
+    modulos: Tuple[Optional[str], ...] = ()
+    shape: Optional[Tuple[str, ...]] = None
+    op: Optional[str] = None
+    result_ssa: Optional[str] = None
 
 
 # Backwards-compatible alias for the prior scaffold name.
@@ -295,13 +374,62 @@ class PtrAnalysis:
         return self.extract_states()
 
 
+_MISSING_FIELD_WARNED: bool = False
+
+
+def _warn_missing_fields_once(missing: Sequence[str]) -> None:
+    global _MISSING_FIELD_WARNED
+    if _MISSING_FIELD_WARNED:
+        return
+    _MISSING_FIELD_WARNED = True
+    warnings.warn(
+        "PtrAnalysis shim returned PtrState entries missing fields "
+        f"{sorted(set(missing))!r}; falling back to printed-op parsing. "
+        "Rebuild poc/triton_frontend/_cxx for richer state metadata.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+
+# Regex that pulls structured fields out of the printed form of a
+# ``tts.make_tptr`` op. The shim's minimal JSON contains the printed op text
+# in the ``"op"`` key; until the C++ side is updated to emit explicit JSON
+# arrays for offsets/sizes/strides we parse it from here. Example input:
+#   "%2 = tts.make_tptr %arg0 to sizes: [16], strides: [1], "
+#   "offsets: [0], shape: [0], order: [] : <f32> to tensor<16x!tt.ptr<f32>>"
+_TPTR_RE = re.compile(
+    r"""
+    (?P<result>%[A-Za-z0-9_]+)\s*=\s*tts\.make_tptr\s+
+    (?P<source>%[A-Za-z0-9_]+)\s+to\s+
+    sizes:\s*\[(?P<sizes>[^\]]*)\]\s*,\s*
+    strides:\s*\[(?P<strides>[^\]]*)\]\s*,\s*
+    offsets:\s*\[(?P<offsets>[^\]]*)\]\s*,\s*
+    shape:\s*\[(?P<shape>[^\]]*)\]
+    """,
+    re.VERBOSE,
+)
+
+
+def _split_oplist(s: str) -> Tuple[str, ...]:
+    """Split a comma-separated MLIR OpFoldResult list, stripping whitespace.
+
+    Empty input -> empty tuple. Keeps each element as a string (caller decides
+    if it wants ``int(x)`` -- the dataclass deliberately stays string-typed).
+    """
+    s = s.strip()
+    if not s:
+        return ()
+    return tuple(part.strip() for part in s.split(",") if part.strip())
+
+
 def _parse_states_json(raw: str) -> List[PtrState]:
     """Translate the shim's JSON dump into ``PtrState`` instances.
 
-    The shim emits a *minimal* JSON array of ``{"op": "<printed-op>"}``
-    entries today; once integration #5 lands, the schema will gain
-    explicit ``offsets/sizes/strides/source`` arrays. We tolerate both
-    shapes here.
+    The shim emits a *minimal* JSON array today: each element is
+    ``{"op": "<printed tts.make_tptr>"}``. We parse the printed form to
+    recover ``sizes``, ``strides``, ``offsets``, ``shape``, ``source``, and
+    the ``result_ssa`` name. Once integration #5 lands the JSON will gain
+    explicit array fields and the dict-shaped path below kicks in.
     """
     import json
 
@@ -312,15 +440,107 @@ def _parse_states_json(raw: str) -> List[PtrState]:
     except json.JSONDecodeError:
         return []
     out: List[PtrState] = []
+    saw_dict_with_explicit_fields = False
     for entry in data:
         if not isinstance(entry, dict):
             continue
+        op_text = entry.get("op")
+        # ---- Path A: explicit JSON arrays (future-richer schema). ------
+        if any(k in entry for k in ("offsets", "sizes", "strides", "source")):
+            saw_dict_with_explicit_fields = True
+            shape_val = entry.get("shape")
+            shape_t: Optional[Tuple[str, ...]]
+            if shape_val is None:
+                shape_t = None
+            else:
+                shape_t = tuple(str(s) for s in shape_val)
+            modulos_val = entry.get("modulos") or ()
+            modulos_t = tuple(
+                (None if m is None else str(m)) for m in modulos_val
+            )
+            out.append(
+                PtrState(
+                    offsets=tuple(str(o) for o in entry.get("offsets", []) or ()),
+                    sizes=tuple(str(s) for s in entry.get("sizes", []) or ()),
+                    strides=tuple(str(s) for s in entry.get("strides", []) or ()),
+                    source=entry.get("source"),
+                    modulos=modulos_t,
+                    shape=shape_t,
+                    op=op_text,
+                    result_ssa=entry.get("result_ssa"),
+                )
+            )
+            continue
+        # ---- Path B: minimal {"op": "<printed>"} -- parse from text. ---
+        if not isinstance(op_text, str):
+            continue
+        m = _TPTR_RE.search(op_text)
+        if m is None:
+            # Not a make_tptr -- record what we can so the caller still sees
+            # the op. ``source`` falls back to the op text for compat.
+            out.append(PtrState(source=op_text, op=op_text))
+            continue
         out.append(
             PtrState(
-                offsets=tuple(entry.get("offsets", []) or ()),
-                sizes=tuple(entry.get("sizes", []) or ()),
-                strides=tuple(entry.get("strides", []) or ()),
-                source=entry.get("source") or entry.get("op"),
+                offsets=_split_oplist(m.group("offsets")),
+                sizes=_split_oplist(m.group("sizes")),
+                strides=_split_oplist(m.group("strides")),
+                shape=_split_oplist(m.group("shape")) or None,
+                source=m.group("source"),
+                op=op_text,
+                result_ssa=m.group("result"),
             )
         )
+    if not saw_dict_with_explicit_fields and out:
+        # Only a one-shot warning so we don't flood logs.
+        _warn_missing_fields_once(("offsets", "sizes", "strides", "source"))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Module-level convenience wrappers (used by the lowering pipeline).
+# ---------------------------------------------------------------------------
+
+
+def run_ptr_analysis(ttir_text: str) -> str:
+    """Run PtrAnalysis on TTIR text and return the rewritten module text.
+
+    Convenience wrapper around the C++ shim's free function of the same name.
+    Raises ``NotImplementedError`` (with a build hint) if the shim isn't
+    importable.
+    """
+    shim = _load_shim()
+    return shim.run_ptr_analysis(ttir_text)
+
+
+def extract_ptr_states(ttir_text: str) -> List[PtrState]:
+    """Run PtrAnalysis and return the recovered :class:`PtrState` list.
+
+    Wraps the shim's ``extract_ptr_states`` (which returns a JSON string in
+    the current shim build) and parses it through :func:`_parse_states_json`.
+    """
+    shim = _load_shim()
+    raw = shim.extract_ptr_states(ttir_text)
+    if not isinstance(raw, str):
+        # Future-proof: if the shim ever returns a structured list directly
+        # we still hand it to the parser via JSON serialization for one
+        # consistent code path.
+        import json as _json
+        raw = _json.dumps(raw)
+    return _parse_states_json(raw)
+
+
+def run_ptr_analysis_with_states(
+    ttir_text: str,
+) -> Tuple[str, List[PtrState]]:
+    """Combined rewrite + extract; one shim invocation.
+
+    Returns ``(rewritten_ttir_text, states)``. Cheaper than calling the two
+    helpers separately because the shim parses the input only once.
+    """
+    shim = _load_shim()
+    rewritten, raw_states = shim.run_ptr_analysis_with_states(ttir_text)
+    if not isinstance(raw_states, str):
+        import json as _json
+        raw_states = _json.dumps(raw_states)
+    return rewritten, _parse_states_json(raw_states)
