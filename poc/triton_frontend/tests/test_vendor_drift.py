@@ -15,18 +15,17 @@ from poc.triton_frontend.vendored.triton_shared import check_vendor_drift
 import pytest
 
 
-@pytest.mark.xfail(
-    reason="Real vendor drift: vendored triton-shared files in lib/Analysis "
-    "and lib/AnalysisStructured + lib/Dialect/TritonStructured/IR have "
-    "sha256 mismatches against the committed manifest. This is a tracked "
-    "drift surfaced by the consolidation waves; either revert the "
-    "downstream edits or re-vendor and refresh the manifest with "
-    "tools/check_vendor_drift.py --refresh. TODO: separate fix wave to "
-    "audit each modified file and decide revert-vs-refresh.",
-    strict=False,
-    raises=AssertionError,
-)
 def test_no_vendor_drift() -> None:
+    """Assert the vendored triton-shared tree matches the committed manifest.
+
+    Wave 3 forward-port edits are intentionally tracked: the manifest at
+    ``vendored/triton_shared/.vendor-manifest.sha256`` records the
+    forward-ported on-disk state, and per-file rationale lives in
+    ``vendored/triton_shared/VENDOR_DRIFT.md``. Any mismatch surfaced by
+    this test means either an undocumented edit or a stale manifest —
+    both must be resolved (refresh the manifest and update the drift
+    register, or revert the edit) before merging.
+    """
     clean, problems = check_vendor_drift.check_drift()
     assert clean, "vendor drift detected:\n  - " + "\n  - ".join(problems)
 

@@ -423,3 +423,37 @@ Both code paths produce identical link-time semantics.
 `TRITON_SHARED_ALLOW_LEGACY_PTRANALYSIS` macro. It depends on Triton ops
 removed in 2026 — see file headers for full rationale. The supported
 forward-ported variant is `lib/AnalysisStructured/PtrAnalysis.cpp`.
+
+## Wave 3 forward-port: intentional vendor drift (2026-05-08)
+
+The Wave 3 review identified four classes of intentional edits to the
+vendored sources, plus a handful of paired header/utility files that
+travel with them. The committed `.vendor-manifest.sha256` is therefore
+**not a verbatim mirror of the upstream commit** — it tracks the
+forward-ported on-disk state. Per-file rationale and intended-upstream
+revisions live in the dedicated drift register:
+
+- `poc/triton_frontend/vendored/triton_shared/VENDOR_DRIFT.md`
+
+Headline drifts (see `VENDOR_DRIFT.md` for the full table):
+
+- `lib/Analysis/PtrAnalysis.cpp` — forward-port (legacy variant)
+- `lib/AnalysisStructured/PtrAnalysis.cpp` — forward-port (supported variant)
+- `lib/Analysis/UseAnalysis.cpp` — `visitNonControlFlowArguments` override
+- `lib/Dialect/TritonStructured/IR/TritonStructuredOps.cpp` — TableGen drift fix
+
+Plus paired headers and utility cpps (`MaskAnalysis.cpp`,
+`OpFoldResultUtils.cpp`, the matching `*.h` files, and
+`TritonStructuredDialect.td`).
+
+Refresh workflow when adding a new intentional edit:
+
+1. Edit the vendored file deliberately.
+2. Add a row to `VENDOR_DRIFT.md` (file path, drift category, reason,
+   intended-upstream-rev).
+3. `python -m poc.triton_frontend.vendored.triton_shared.check_vendor_drift --refresh`
+4. Commit the manifest, the source edit, and the drift-register update
+   in the same change.
+
+`pytest poc/triton_frontend/tests/test_vendor_drift.py` is CI-gated and
+will fail if the manifest is stale relative to the on-disk tree.

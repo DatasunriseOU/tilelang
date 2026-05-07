@@ -33,17 +33,6 @@ def _vector_add_kernel(x_ptr, y_ptr, out_ptr, n_elements, BLOCK: tl.constexpr):
     tl.store(out_ptr + offsets, x + y, mask=mask)
 
 
-@pytest.mark.xfail(
-    reason="Real bug in poc.triton_frontend.__init__ TTIR-extraction path: "
-    "ASTSource(...) is being constructed with a 'constants=' kwarg that "
-    "the current Triton version does not accept (the param was renamed/"
-    "removed). The fallback legacy path then trips on signature= kwarg "
-    "to triton.compile. TODO: separate fix wave to update the Triton "
-    "API call sites in __init__.py:_extract_ttir to match the installed "
-    "Triton version (currently /Volumes/external/sources/triton-pr9701).",
-    strict=False,
-    raises=RuntimeError,
-)
 def test_vector_add_lowers_to_prim_func() -> None:
     """``from_triton_kernel`` returns a ``tvm.tir.PrimFunc``."""
     func = from_triton_kernel(

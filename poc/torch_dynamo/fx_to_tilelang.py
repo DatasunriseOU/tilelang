@@ -2544,12 +2544,32 @@ class FXToTileLang:
         ``addmm`` is not handled here because its payload carries an extra
         ``bias`` slot (``(node.name, bias, a, b)``) — we route addmm + the
         non-2D batched ``bmm`` case to extern via :class:`FxToTileLangUnsupported`.
+
+        ``b_view_of_a`` detection
+        --------------------------
+        When the FX graph shows ``torch.matmul(x, x.t())`` the ``aten.t``
+        call is absorbed by ``_SEQUENTIAL_VIEW_OPS`` and dropped from
+        ``compute_ops`` — but the matmul's B operand is still a *view* of
+        the same input tensor as A. The ``input_specs`` list (driven by FX
+        placeholders) has exactly **one** entry for that case. If we emit
+        a 3-buffer kernel signature ``(A, B, C)`` the launcher's
+        ``k(*tensors, *outs)`` call passes 1 input + 1 output = 2 tensors
+        and the kernel arity check fails — which is why ``a @ a.t()``
+        previously routed silently to the extern fallback.
+
+        Detect the view-of-self case by inspecting the FX graph: walk the
+        matmul node's args; if its second arg is an ``aten.t`` call whose
+        sole operand is the matmul's first arg, set ``b_view_of_a=True``
+        and emit a 2-buffer ``kernel(A, C)`` that materialises B's tile
+        directly from A inside the kernel. Otherwise fall back to the
+        original 3-buffer signature.
         """
         # payload contract for matmul/mm: (node.name, a, b) — see emit_matmul.
         if len(payload) < 3:
             raise FxToTileLangUnsupported(
                 f"matmul emitter: payload {payload!r} too short for "
                 "(node_name, a, b); extern fallback is intentional")
+        node_name = payload[0]
         a_spec = payload[1]
         b_spec = payload[2]
         if not (isinstance(a_spec, _TensorSpec)
@@ -2562,6 +2582,14 @@ class FXToTileLang:
                 f"matmul emitter: only 2D matmul supported in this pass "
                 f"(got op={op_name}, A.shape={a_spec.shape}, "
                 f"B.shape={b_spec.shape}); extern fallback is intentional")
+
+        # ``b_view_of_a`` — does B's FX node come from ``aten.t`` of A's node?
+        # When True the launcher only carries one input tensor, so the
+        # kernel signature MUST drop the redundant B parameter; otherwise
+        # the runtime arity check fails (one input + one output != three
+        # kernel buffers) and the entire region degrades to the extern
+        # fallback.
+        b_view_of_a = self._matmul_b_is_t_view_of_a(node_name)
 
         m, k = a_spec.shape
         k2, n = b_spec.shape
@@ -2588,6 +2616,43 @@ class FXToTileLang:
         # handles the fp32 accum + epilogue cast cleanly.
         accum_dtype = dtype if (block_M < 16 or block_N < 16) else "float32"
 
+        if b_view_of_a:
+            # B is ``A.t()``: shape ``(n, m)`` originally became ``(k, n)``
+            # after the transpose, where ``a_spec`` is ``(m, k)`` and
+            # ``b_spec`` is ``(k, n)``. For ``a @ a.t()`` we additionally
+            # have ``n == m``. The kernel reads B by indexing A with
+            # swapped row/col, materialised into a shared tile via an
+            # explicit per-element load loop (``T.copy`` on a transposed
+            # access path is rejected by the region-extent inferencer).
+            @T.prim_func
+            def kernel(
+                A: T.Tensor((m, k), dtype),
+                C: T.Tensor((m, n), dtype),
+            ):
+                # Defensive closure-capture marker (see Bug 1 doc above).
+                if False:  # noqa: SIM103
+                    _ = (m, k, n, dtype)  # noqa: F841
+                with T.Kernel(T.ceildiv(n, block_N), T.ceildiv(m, block_M),
+                              threads=threads) as (bx, by):
+                    A_s = T.alloc_shared((block_M, block_K), dtype)
+                    B_s = T.alloc_shared((block_K, block_N), dtype)
+                    C_l = T.alloc_fragment((block_M, block_N), accum_dtype)
+                    T.clear(C_l)
+                    for ko in T.Pipelined(T.ceildiv(k, block_K),
+                                          num_stages=2):
+                        T.copy(A[by * block_M, ko * block_K], A_s)
+                        # Materialise the transposed-A tile into B_s using
+                        # an explicit parallel loop: ``B[i, j] == A[j, i]``
+                        # since ``B = A.t()`` and the matmul reads
+                        # ``B[ko*block_K + ki, bx*block_N + bj]``.
+                        for ki, bj in T.Parallel(block_K, block_N):
+                            B_s[ki, bj] = A[bx * block_N + bj,
+                                            ko * block_K + ki]
+                        T.gemm(A_s, B_s, C_l)
+                    T.copy(C_l, C[by * block_M, bx * block_N])
+
+            return kernel
+
         @T.prim_func
         def kernel(
             A: T.Tensor((m, k), dtype),
@@ -2613,6 +2678,47 @@ class FXToTileLang:
                 T.copy(C_l, C[by * block_M, bx * block_N])
 
         return kernel
+
+    def _matmul_b_is_t_view_of_a(self, matmul_node_name: str) -> bool:
+        """Return True if ``matmul_node_name``'s B operand is ``aten.t(A)``.
+
+        Walks the FX graph (``self.gm.graph``) to detect the
+        ``torch.matmul(x, x.t())`` shape. Returns False when the graph
+        cannot be inspected, when the node isn't found, or when B's FX
+        node is anything other than a ``t`` / ``transpose`` of A. The
+        check is purely structural: we compare FX node identities, not
+        ``_TensorSpec`` shape equality, because the goal is to know
+        whether the launcher's input list collapses two matmul operands
+        into one (which it does iff B is a view of A).
+        """
+        try:
+            graph = self.gm.graph
+        except Exception:
+            return False
+        target_node = None
+        for node in graph.nodes:
+            if getattr(node, "name", None) == matmul_node_name:
+                target_node = node
+                break
+        if target_node is None:
+            return False
+        args = getattr(target_node, "args", ()) or ()
+        if len(args) < 2:
+            return False
+        a_node, b_node = args[0], args[1]
+        # B must itself be an ``aten.t`` call (op == call_method "t" or
+        # call_function torch.t / aten.t). The transpose inputs match A
+        # iff its sole operand is the same FX node we passed for A.
+        if getattr(b_node, "op", None) not in ("call_method", "call_function"):
+            return False
+        target = getattr(b_node, "target", None)
+        target_name = getattr(target, "__name__", None) or str(target)
+        if target_name not in ("t", "transpose") and "aten.t" not in str(target):
+            return False
+        b_args = getattr(b_node, "args", ()) or ()
+        if not b_args:
+            return False
+        return b_args[0] is a_node
 
     def _region_output_specs(
         self,

@@ -286,3 +286,83 @@ def test_metal_bridge_raises_when_no_prim_func() -> None:
     with pytest.raises(FXToTileLangMetalBridgeError) as excinfo:
         lowering.run(expose_metal=True)
     assert "prim_funcs=()" in str(excinfo.value) or "at least one" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# NUMERIC_PASS push regression — matmul + ``.t()`` view absorption.
+#
+# When ``torch.matmul(x, x.t())`` is traced, ``aten.t`` is absorbed by the
+# sequential view-strip step but the launcher's ``input_specs`` still has
+# only one entry (the lone placeholder). The pre-fix kernel signature
+# emitted three buffers ``(A, B, C)``, mismatching the runtime's two
+# ``k(*tensors, *outs) == k(input, output)`` slots — and the matmul
+# silently degraded to the extern fallback. The fix tracks
+# ``b_view_of_a`` from the FX graph and emits a 2-buffer ``(A, C)``
+# kernel that materialises B's tile from A inside the kernel body.
+# ---------------------------------------------------------------------------
+
+
+def test_matmul_with_t_view_emits_correct_buffer_count_in_signature() -> None:
+    """``a @ a.t()`` must emit a 2-buffer kernel signature.
+
+    Pre-fix: 3-buffer ``(A, B, C)`` kernel; launcher passes ``(input, out)``;
+    arity mismatch silently degrades to extern. Post-fix: 2-buffer
+    ``(A, C)`` kernel; launcher arity matches; numerics match torch eager.
+    """
+    import torch
+    import torch.fx as fx
+    from poc.torch_dynamo.fx_to_tilelang import FXToTileLang
+
+    torch.manual_seed(0)
+    x = torch.randn(8, 16, dtype=torch.float16)
+    artifact = FXToTileLang(
+        fx.symbolic_trace(lambda a: torch.matmul(a, a.t())),
+        [x],
+    ).run()
+    assert len(artifact.prim_funcs) >= 1, (
+        f"matmul with .t() view must lower to a real PrimFunc; "
+        f"source={artifact.source!r}")
+    prim = artifact.prim_funcs[0]
+    n_params = len(prim.params)
+    n_inputs = len(artifact.input_specs)
+    n_outputs = len(artifact.output_specs)
+    assert n_params == n_inputs + n_outputs, (
+        f"kernel signature buffer count {n_params} must equal "
+        f"{n_inputs} input(s) + {n_outputs} output(s); 3-buffer signature "
+        f"on a 1-input/1-output launcher silently degrades the matmul to "
+        f"the extern fallback. prim_func params: {prim.params}")
+    # Sanity: with one absorbed view, the expected count is 2.
+    assert n_params == 2, (
+        f"a @ a.t() reduces to a 2-buffer (A, C) kernel — got {n_params} "
+        f"params: {prim.params}")
+    # Numerical pass: launcher returns the correct dot product.
+    out = artifact.launcher(x)
+    y_ref = torch.matmul(x, x.t())
+    assert torch.allclose(out, y_ref, rtol=1e-2, atol=1e-2), (
+        f"matmul launcher numerics drifted from torch eager: "
+        f"max abs diff {(out - y_ref).abs().max().item()}")
+
+
+def test_matmul_with_distinct_inputs_keeps_3_buffer_signature() -> None:
+    """``a @ b`` (independent inputs) must keep the 3-buffer kernel sig.
+
+    Companion regression to the b_view_of_a fix — guards against an
+    overzealous "always emit 2-buffer" rewrite that would corrupt the
+    standard two-input matmul path.
+    """
+    import torch
+    import torch.fx as fx
+    from poc.torch_dynamo.fx_to_tilelang import FXToTileLang
+
+    torch.manual_seed(0)
+    a = torch.randn(8, 16, dtype=torch.float16)
+    b = torch.randn(16, 8, dtype=torch.float16)
+    artifact = FXToTileLang(
+        fx.symbolic_trace(lambda x, y: torch.matmul(x, y)),
+        [a, b],
+    ).run()
+    assert len(artifact.prim_funcs) >= 1
+    prim = artifact.prim_funcs[0]
+    assert len(prim.params) == 3, (
+        f"distinct-input matmul must keep its 3-buffer (A, B, C) signature; "
+        f"got params: {prim.params}")

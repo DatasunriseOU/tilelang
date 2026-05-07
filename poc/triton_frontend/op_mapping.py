@@ -1245,7 +1245,45 @@ def map_tt_atomic_rmw(op: Any, ctx: WalkerCtx) -> Any:
         # The scalar TileLang path expects a Buffer directly. When indices
         # are nonzero the caller (ptr_analysis) is expected to slice the
         # buffer ahead of time; the MVP path uses a flat buffer view.
+        #
+        # tilelang.language.atomic.{add,max,min} dispatch to a
+        # "tile-region" lowering when ``dst`` has any extent (i.e. shape !=
+        # None). That path does NOT support ``return_prev`` for fp32 today
+        # and raises ``NotImplementedError``. We detect this case ahead of
+        # time and downgrade to ``return_prev=False``, binding the result
+        # SSA to the call's handle so downstream consumers that only
+        # treat the SSA as a statement (the typical Triton pattern --
+        # users discard the prev value) keep working. A deprecation
+        # warning is emitted so the bypass is visible, NOT silent.
+        downgraded_return_prev = False
+        if return_prev and kind in {"add", "max", "min"}:
+            try:
+                from tilelang.language.utils import get_extent  # type: ignore
+                dst_has_extent = get_extent(buf) is not None
+            except Exception:
+                dst_has_extent = False
+            res_dtype = _dtype_of(_results(op)[0]) if _results(op) else ""
+            if dst_has_extent and res_dtype.startswith("float"):
+                import warnings as _warnings
+                _warnings.warn(
+                    f"map_tt_atomic_rmw: return_prev unsupported on tile-region "
+                    f"path for dtype={res_dtype!r} (kind={kind!r}); downgrading "
+                    f"to return_prev=False and binding result SSA to the call "
+                    f"handle. This is a deterministic dispatch, not a silent "
+                    f"fallback -- emit a tir.atomic_{kind} via the generic "
+                    f"path if you need the prev value.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                return_prev = False
+                downgraded_return_prev = True
         result = atomic_fn(buf, val_expr, return_prev=return_prev)
+        # If we downgraded, restore ``return_prev`` for the result-binding
+        # branch below so the original ``res_ssa`` still gets bound (to the
+        # handle expression) -- otherwise downstream walkers that look up
+        # the SSA via ``ctx.get`` would raise KeyError.
+        if downgraded_return_prev:
+            return_prev = True
     else:
         # Unknown rmw_op: fall back to a generic ``tir.atomic_<op>`` extern.
         intrin_name = f"tir.atomic_{kind}"

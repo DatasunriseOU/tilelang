@@ -661,40 +661,34 @@ def _compile_to_ttir(
     """Drive ``triton.compiler`` far enough to obtain a TTIR ``mlir.Module``.
 
     Triton compiles in stages: AST -> TTIR -> TTGIR -> LLVM. We stop
-    after the first stage. The exact API has evolved (see Triton 2.x vs
-    3.x) so we try a couple of entry points.
-    """
-    import triton  # noqa: WPS433  (intentional lazy import)
-    from triton.compiler import compile as triton_compile  # noqa: WPS433
+    after the first stage. The exact API has evolved across Triton 2.x,
+    3.0/3.1 and 3.6+; we delegate to the harness implementation in
+    :mod:`poc.triton_frontend._test_harness.jit_to_ttir` which already
+    handles all three forms. Notably:
 
-    # Triton 3.x: ``triton.compiler.compile(src, options={"stage": "ttir"})``.
-    # Triton 2.x: ``triton.compile(fn, ..., output="ttir")``.
-    # Both spellings appear in the wild; we attempt the 3.x form first
-    # and fall back to a kwargs-tolerant call.
+      * Triton 3.6 renamed ``ASTSource(constants=...)`` to
+        ``ASTSource(constexprs=...)`` and dropped the
+        ``compile(..., options={"stage": "ttir"})`` knob in favour of
+        ``ASTSource.make_ir(target, options, codegen, module_map, ctx)``.
+      * Triton 2.x kept the legacy positional
+        ``triton.compile(fn, signature=..., output="ttir")`` API.
+
+    The harness probes which spelling the installed Triton accepts and
+    returns the TTIR text. The reducer below re-parses the text via
+    ``mlir.ir.Module.parse`` so the textual / module paths converge.
+    """
+    from ._test_harness.jit_to_ttir import (  # noqa: WPS433 -- lazy import
+        TTIRCaptureError,
+        TritonUnavailable,
+        triton_jit_to_ttir,
+    )
+
     try:
-        # Newer-style: src is an ASTSource.
-        from triton.compiler.compiler import ASTSource  # noqa: WPS433
-        signature = constexprs or {}
-        src = ASTSource(fn=fn, signature=signature, constants=constexprs or {})
-        compiled = triton_compile(src, target=target, options={"stage": "ttir"})
-        return compiled.asm.get("ttir") if hasattr(compiled, "asm") else compiled
-    except (ImportError, AttributeError, TypeError) as primary_err:
-        # Triton 2.x or a slimmer build that lacks ASTSource. Fall back to
-        # the legacy positional API. We narrow to import / shape-mismatch
-        # errors so genuine compile failures (RuntimeError, ValueError)
-        # propagate immediately rather than being silently swallowed.
-        try:
-            return triton_compile(fn, signature=constexprs, output="ttir")
-        except TypeError as exc:
-            raise RuntimeError(
-                "Could not stop Triton compilation at the TTIR stage; "
-                "this Triton version may need a custom hook."
-            ) from exc
-        except Exception as fallback_err:  # pragma: no cover -- legacy path
-            raise RuntimeError(
-                f"Triton TTIR extraction failed via both modern and legacy paths: "
-                f"primary={primary_err!r}, legacy={fallback_err!r}"
-            ) from fallback_err
+        return triton_jit_to_ttir(fn, constexprs=constexprs, target=target)
+    except (TTIRCaptureError, TritonUnavailable) as exc:
+        raise RuntimeError(
+            f"Could not stop Triton compilation at the TTIR stage: {exc}"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------

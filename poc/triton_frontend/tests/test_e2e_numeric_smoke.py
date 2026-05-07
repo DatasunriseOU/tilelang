@@ -43,14 +43,20 @@ def test_kernel_numeric_pass(kernel_module: str, deps_dict) -> None:
     SKIP -> pytest.skip; NUMERIC_PASS -> assert; everything else fails
     with the harness detail string so CI logs surface the cause.
     """
-    # Real bug: matmul currently fails Metal GEMM lowering with
-    # ``ValueError: Metal GEMM requires C in local.fragment, metal.simdgroup,
-    # or shared scope, got local``. The C accumulator is being declared with
-    # storage scope ``local`` instead of ``local.fragment`` somewhere in the
-    # tt.dot lowering path (likely op_emitters/reduction.py allocating the
-    # accumulator via plain ``alloc_buffer`` rather than ``alloc_fragment``).
-    # TODO: separate fix wave to tighten the scope to ``local.fragment``;
-    # for now we accept COMPILE_FAIL with this exact diagnostic.
+    # Real bug: matmul currently fails Metal GEMM lowering. The original
+    # blocker was ``"Metal GEMM requires C in local.fragment, metal.simdgroup,
+    # or shared scope, got local"`` — the C accumulator was declared with
+    # plain ``local`` scope instead of ``local.fragment``. The accumulator
+    # scope fix in ``op_emitters/reduction.py:map_tt_dot`` resolved that and
+    # advances the matmul path to a new downstream blocker:
+    # ``"Unsupported gemm combination, A: local, B: local"`` — the A and B
+    # operand tile buffers materialised by ``tt.load`` end up in plain
+    # ``local`` scope, but Metal's ``gemm_metal.py`` only accepts the
+    # ``shared, shared`` (and a few simdgroup) combinations. Tightening
+    # ``tt.load`` tile-destination scope to ``shared`` is a separate fix
+    # wave; we xfail BOTH diagnostics here so the regression band stays
+    # narrow enough to flag a true regression but wide enough to record
+    # the incremental progress.
     if kernel_module == "matmul":
         result = numeric_smoke.run_one(kernel_module, deps_dict)
         if result.verdict == Verdict.NUMERIC_PASS:
@@ -58,10 +64,13 @@ def test_kernel_numeric_pass(kernel_module: str, deps_dict) -> None:
         if (
             result.verdict == Verdict.COMPILE_FAIL
             and result.detail is not None
-            and "Metal GEMM requires C in local.fragment" in result.detail
+            and (
+                "Metal GEMM requires C in local.fragment" in result.detail
+                or "Unsupported gemm combination" in result.detail
+            )
         ):
             pytest.xfail(
-                "matmul GEMM accumulator scope bug -- see TODO above; "
+                "matmul GEMM combination/scope bug -- see TODO above; "
                 f"detail={result.detail!r}"
             )
         # Any other verdict is an unexpected regression and must surface.

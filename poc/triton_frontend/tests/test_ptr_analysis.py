@@ -1,8 +1,15 @@
 """Smoke test for the PtrAnalysis facade.
 
-Source MLIR text below is copied verbatim (sans CHECK lines) from
+Source MLIR text below is adapted from
 ``microsoft/triton-shared/test/Conversion/TritonToStructured/
-addptr_scalar_loopback.mlir`` (MIT, Microsoft + Meta).
+addptr_loopback.mlir`` (MIT, Microsoft + Meta) -- the *tensor-of-pointers*
+loopback fixture, which is the one ``PtrAnalysis::rewriteOp`` actually
+emits ``tts.make_tptr`` for. The earlier scalar-loopback fixture
+(``addptr_scalar_loopback.mlir``) was a deliberate no-op: upstream
+preserves scalar ``tt.addptr`` chains as-is (see CHECK lines in
+``addptr_scalar_loopback.mlir`` -- the post-rewrite IR still contains
+``tt.addptr``). Using the scalar fixture caused the test to xfail even
+on a correctly-built shim.
 """
 from __future__ import annotations
 
@@ -17,18 +24,36 @@ from poc.triton_frontend.ptr_analysis import (
     shim_available,
 )
 
+# Tensor-of-pointers loopback: ``tt.make_range`` + ``tt.expand_dims`` +
+# ``tt.broadcast`` + ``tt.splat`` + ``tt.addptr`` is the canonical
+# structured-amenable shape that rewriteOp emits ``tts.make_tptr`` for.
 ADDPTR_MLIR = """\
 module {
   tt.func @kernel(
   %arg0 : !tt.ptr<bf16>,
   %arg1 : !tt.ptr<bf16>,
   %arg2 : i32
-  ) {
-    %0 = tt.addptr %arg0, %arg2 : !tt.ptr<bf16>, i32
-    %1 = tt.addptr %arg1, %arg2 : !tt.ptr<bf16>, i32
-    %10 = tt.load %0 {cache = 1 : i32, evict = 1 : i32, isVolatile = false}: !tt.ptr<bf16>
-    tt.store %1, %10 : !tt.ptr<bf16>
-    tt.return
+  )
+  {
+  %0 = tt.make_range {end = 4 : i32, start = 0 : i32}:tensor<4xi32>
+  %1 = tt.expand_dims %0 {axis = 1 : i32} : tensor<4xi32> -> tensor<4x1xi32>
+  %2 = tt.broadcast %1 : tensor<4x1xi32> -> tensor<4x256xi32>
+  %arg2splat = tt.splat %arg2 : i32 -> tensor<4x256xi32>
+  %offset2 = arith.addi %2, %arg2splat : tensor<4x256xi32>
+  %3 = tt.make_range {end = 256 : i32, start = 0 : i32}:tensor<256xi32>
+  %4 = tt.expand_dims %3 {axis = 0 : i32} : tensor<256xi32> -> tensor<1x256xi32>
+  %5 = tt.broadcast %4 : tensor<1x256xi32> -> tensor<4x256xi32>
+  %c6 = arith.constant 6 : i32
+  %splat6 = tt.splat %c6 : i32 -> tensor<4x256xi32>
+  %scale5 = arith.muli %5, %splat6 : tensor<4x256xi32>
+  %7 = arith.addi %offset2, %scale5: tensor<4x256xi32>
+  %8 = tt.splat %arg0 : !tt.ptr<bf16> -> tensor<4x256x!tt.ptr<bf16>>
+  %9 = tt.addptr %8, %7 : tensor<4x256x!tt.ptr<bf16>>, tensor<4x256xi32>
+  %10 = tt.splat %arg1 : !tt.ptr<bf16> -> tensor<4x256x!tt.ptr<bf16>>
+  %11 = tt.addptr %10, %7 : tensor<4x256x!tt.ptr<bf16>>, tensor<4x256xi32>
+  %12 = tt.load %9 {cache = 1 : i32, evict = 1 : i32, isVolatile = false}: tensor<4x256x!tt.ptr<bf16>>
+  tt.store %11, %12 : tensor<4x256x!tt.ptr<bf16>>
+  tt.return
   }
 }
 """
@@ -40,17 +65,6 @@ module {
         "shim built without TritonStructured/Triton dialects -- rebuild with "
         "-DTRITON_INSTALL_DIR set (see _cxx/README.md)."
     ),
-)
-@pytest.mark.xfail(
-    reason="C++ shim rewrite() returns the input MLIR unchanged for the "
-    "scalar-loopback fixture (no tts.make_tptr emitted) even though "
-    "dialects_available() reports True. Likely cause: the vendored "
-    "TritonToStructured pass is registered but does not match the "
-    "scalar-i32 addptr pattern we feed it. TODO: confirm whether the "
-    "upstream pass requires a tensor<>-typed offset, and update either "
-    "the fixture or the shim's pipeline. For now this test serves as a "
-    "build-state regression marker.",
-    strict=False,
 )
 def test_ptr_analysis_rewrites_addptr() -> None:
     pa = PtrAnalysis(ADDPTR_MLIR)
