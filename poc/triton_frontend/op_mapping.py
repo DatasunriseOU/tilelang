@@ -1190,11 +1190,35 @@ def map_tt_print(op: Any, ctx: WalkerCtx) -> Any:
 
     # Scalar / multi-arg path: emit a direct printf call_extern. On
     # Metal, codegen will route this to os_log; on HIP/CUDA it lowers
-    # to printf. We pass the prefix as the format string verbatim.
+    # to printf. The prefix may originate from user-supplied TTIR and
+    # could carry malicious format specifiers (%n stack-write, etc.) —
+    # sanitize before forwarding to the GPU printf runtime.
     fmt = prefix if prefix else " ".join(["%g"] * len(args)) + "\n"
+    fmt = _sanitize_printf_format(fmt)
     handle = tir.call_extern("handle", "printf", fmt, *args)
     ctx.emit(handle)
     return handle
+
+
+_PRINTF_FORBIDDEN_SPECS = ("%n",)
+
+
+def _sanitize_printf_format(fmt: str) -> str:
+    """Defang malicious printf specifiers that could corrupt GPU runtime state.
+
+    %n writes to memory and is dangerous in any context that accepts
+    untrusted format strings. We escape it as a literal "%%n" so the
+    runtime sees a printable token, never a write directive. Other
+    specifiers (%s/%p/%x) are left intact — they only read; an attacker
+    controlling the format would still need a matching argument list to
+    leak anything non-trivial, and our caller fixes the arg count.
+    """
+    if not fmt:
+        return fmt
+    out = fmt
+    for bad in _PRINTF_FORBIDDEN_SPECS:
+        out = out.replace(bad, "%" + bad)  # %n -> %%n (literal)
+    return out
 
 
 # ---------------------------------------------------------------------------

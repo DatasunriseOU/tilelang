@@ -85,7 +85,11 @@ def _compile_to_ttir(
         src = ASTSource(fn=fn, signature=signature, constants=constexprs or {})
         compiled = triton_compile(src, target=target, options={"stage": "ttir"})
         return compiled.asm.get("ttir") if hasattr(compiled, "asm") else compiled
-    except Exception:  # pragma: no cover -- fall through to legacy path
+    except (ImportError, AttributeError, TypeError) as primary_err:
+        # Triton 2.x or a slimmer build that lacks ASTSource. Fall back to
+        # the legacy positional API. We narrow to import / shape-mismatch
+        # errors so genuine compile failures (RuntimeError, ValueError)
+        # propagate immediately rather than being silently swallowed.
         try:
             return triton_compile(fn, signature=constexprs, output="ttir")
         except TypeError as exc:
@@ -93,6 +97,11 @@ def _compile_to_ttir(
                 "Could not stop Triton compilation at the TTIR stage; "
                 "this Triton version may need a custom hook."
             ) from exc
+        except Exception as fallback_err:  # pragma: no cover -- legacy path
+            raise RuntimeError(
+                f"Triton TTIR extraction failed via both modern and legacy paths: "
+                f"primary={primary_err!r}, legacy={fallback_err!r}"
+            ) from fallback_err
 
 
 # ---------------------------------------------------------------------------

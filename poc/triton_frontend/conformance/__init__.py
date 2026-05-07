@@ -81,19 +81,120 @@ def kernel_vector_add(N: int = 1024, BLOCK: int = 128) -> Optional[Any]:
     return vector_add
 
 
-def kernel_softmax() -> None:
-    """RFC 5.5 #2: row-wise softmax. TODO: port from triton-shared examples."""
-    pass
+def kernel_softmax(M: int = 128, N: int = 256, BLOCK_N: int = 256) -> Optional[Any]:
+    """RFC 5.5 #2: row-wise softmax (one program per row).
+
+    Loads a row, subtracts the row-max for numerical stability, takes
+    exp, divides by the row-sum. Mirrors the Triton tutorial 02 layout
+    but uses TileLang's high-level ``T.reduce_max`` / ``T.reduce_sum``.
+    """
+    T = _try_tilelang()
+    if T is None:
+        return None
+    import tilelang
+
+    @tilelang.jit
+    @T.prim_func
+    def softmax(
+        X: T.Tensor((M, N), "float32"),
+        Y: T.Tensor((M, N), "float32"),
+    ):
+        with T.Kernel(M, threads=BLOCK_N) as bx:
+            row = T.alloc_fragment((BLOCK_N,), "float32")
+            row_max = T.alloc_fragment((1,), "float32")
+            row_sum = T.alloc_fragment((1,), "float32")
+            for j in T.Parallel(BLOCK_N):
+                row[j] = T.if_then_else(j < N, X[bx, j], T.float32(-3.4e38))
+            T.reduce_max(row, row_max, dim=0, clear=True)
+            for j in T.Parallel(BLOCK_N):
+                row[j] = T.exp(row[j] - row_max[0])
+            T.reduce_sum(row, row_sum, dim=0, clear=True)
+            for j in T.Parallel(BLOCK_N):
+                if j < N:
+                    Y[bx, j] = row[j] / row_sum[0]
+
+    return softmax
 
 
-def kernel_matmul() -> None:
-    """RFC 5.5 #3: tiled matmul with multi-stage software pipelining."""
-    pass
+def kernel_matmul(
+    M: int = 128, N: int = 128, K: int = 64,
+    BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K: int = 32,
+) -> Optional[Any]:
+    """RFC 5.5 #3: tiled fp16 matmul -> fp32 accumulator.
+
+    Each program owns a ``(BLOCK_M, BLOCK_N)`` output tile and walks the
+    K dimension in ``BLOCK_K`` chunks via ``T.Pipelined`` for software
+    pipelining. Mirrors the Triton tutorial 03 layout.
+    """
+    T = _try_tilelang()
+    if T is None:
+        return None
+    import tilelang
+
+    @tilelang.jit
+    @T.prim_func
+    def matmul(
+        A: T.Tensor((M, K), "float16"),
+        B: T.Tensor((K, N), "float16"),
+        C: T.Tensor((M, N), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(M, BLOCK_M), T.ceildiv(N, BLOCK_N), threads=128) as (bx, by):
+            A_s = T.alloc_shared((BLOCK_M, BLOCK_K), "float16")
+            B_s = T.alloc_shared((BLOCK_K, BLOCK_N), "float16")
+            C_f = T.alloc_fragment((BLOCK_M, BLOCK_N), "float32")
+            T.clear(C_f)
+            for k in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                T.copy(A[bx * BLOCK_M, k * BLOCK_K], A_s)
+                T.copy(B[k * BLOCK_K, by * BLOCK_N], B_s)
+                T.gemm(A_s, B_s, C_f)
+            T.copy(C_f, C[bx * BLOCK_M, by * BLOCK_N])
+
+    return matmul
 
 
-def kernel_layer_norm() -> None:
-    """RFC 5.5 #4: two-pass Welford layer-norm (Triton tutorial 05)."""
-    pass
+def kernel_layer_norm(
+    M: int = 128, N: int = 256, BLOCK_N: int = 256, eps: float = 1e-5,
+) -> Optional[Any]:
+    """RFC 5.5 #4: layer-norm — two-pass mean/variance (Triton tutorial 05).
+
+    One program per row. Computes mean, then variance, then normalizes
+    and applies optional gamma/beta. We use the simple two-pass form
+    (not Welford) — sufficient for fp32 conformance.
+    """
+    T = _try_tilelang()
+    if T is None:
+        return None
+    import tilelang
+
+    @tilelang.jit
+    @T.prim_func
+    def layer_norm(
+        X: T.Tensor((M, N), "float32"),
+        Gamma: T.Tensor((N,), "float32"),
+        Beta: T.Tensor((N,), "float32"),
+        Y: T.Tensor((M, N), "float32"),
+    ):
+        with T.Kernel(M, threads=BLOCK_N) as bx:
+            row = T.alloc_fragment((BLOCK_N,), "float32")
+            mean = T.alloc_fragment((1,), "float32")
+            var = T.alloc_fragment((1,), "float32")
+            inv_n = T.float32(1.0) / T.float32(N)
+            for j in T.Parallel(BLOCK_N):
+                row[j] = T.if_then_else(j < N, X[bx, j], T.float32(0))
+            T.reduce_sum(row, mean, dim=0, clear=True)
+            mean[0] = mean[0] * inv_n
+            sq = T.alloc_fragment((BLOCK_N,), "float32")
+            for j in T.Parallel(BLOCK_N):
+                d = row[j] - mean[0]
+                sq[j] = T.if_then_else(j < N, d * d, T.float32(0))
+            T.reduce_sum(sq, var, dim=0, clear=True)
+            var[0] = var[0] * inv_n
+            inv_std = T.float32(1.0) / T.sqrt(var[0] + T.float32(eps))
+            for j in T.Parallel(BLOCK_N):
+                if j < N:
+                    Y[bx, j] = (row[j] - mean[0]) * inv_std * Gamma[j] + Beta[j]
+
+    return layer_norm
 
 
 def kernel_fa_v2() -> None:
