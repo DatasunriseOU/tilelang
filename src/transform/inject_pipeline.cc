@@ -3526,9 +3526,9 @@ private:
   void MaybeWrapExternPipelineStage(const SBlockNode *op,
                                     SBlock *block) const {
     auto meta_opt = GetExternBlockMeta(op);
-    if (!meta_opt.defined()) return;
+    if (!meta_opt.has_value()) return;
     auto stage_any = meta_opt.value().Get("pipeline_stage");
-    if (!stage_any.defined()) return;
+    if (!stage_any.has_value()) return;
     const auto *imm = stage_any.value().as<IntImmNode>();
     if (imm == nullptr) return;
     int stage = static_cast<int>(imm->value);

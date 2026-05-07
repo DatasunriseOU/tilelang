@@ -19,7 +19,7 @@
 #define TVM_TL_TRANSFORM_EXTERN_INTRINSIC_META_H_
 
 #include <tvm/ffi/string.h>
-#include <tvm/tir/builtin.h>
+#include <tvm/tirx/builtin.h>
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/stmt.h>
 
@@ -39,16 +39,16 @@ static constexpr const char *kExternBlockAttr = "tl.extern_intrinsic_meta";
  * we recognise it via the call_extern op and the symbol prefix on the first
  * string argument.
  */
-inline bool IsExternIntrinsicCall(const tir::CallNode *call) {
+inline bool IsExternIntrinsicCall(const tirx::CallNode *call) {
   if (call == nullptr) return false;
-  if (!call->op.same_as(tvm::tir::builtin::call_extern())) return false;
+  if (!call->op.same_as(tvm::tirx::builtin::call_extern())) return false;
   if (call->args.empty()) return false;
-  const auto *name_imm = call->args[0].as<tvm::ffi::StringObj>();
+  const auto *name_imm = call->args[0].as<tvm::tirx::StringImmNode>();
   if (name_imm == nullptr) return false;
-  ffi::String s = ffi::GetRef<ffi::String>(name_imm);
+  const std::string &s = name_imm->value;
   const std::string prefix(kExternCallPrefix);
   if (s.length() < prefix.size()) return false;
-  return std::string(s).compare(0, prefix.size(), prefix) == 0;
+  return s.compare(0, prefix.size(), prefix) == 0;
 }
 
 /*!
