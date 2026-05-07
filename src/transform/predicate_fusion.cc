@@ -212,6 +212,14 @@ bool Z3ProvesConditionLoadsWellDefined(const PrimExpr &cond,
     auto &z3 = arith::Z3Prover(analyzer);
     z3.SetTimeoutMs(50);
     for (const BufferLoadNode *ld : cl.loads) {
+      // CPPMEGA idea712 round-final fix-NG: degenerate-load null guard.
+      // A BufferLoad with no indices or an undefined buffer is malformed
+      // for our proof: there's no index to range-check, and the buffer
+      // shape lookup in Z3ProvesIndexInRange would dereference a null.
+      // Conservatively bail (return false → predicate-fusion is skipped).
+      if (ld == nullptr || ld->indices.empty() || !ld->buffer.defined()) {
+        return false;
+      }
       for (size_t d = 0; d < ld->indices.size(); ++d) {
         if (!Z3ProvesIndexInRange(ld->buffer, d, ld->indices[d], z3)) {
           return false;
@@ -262,6 +270,11 @@ bool Z3ProvesInnerWellDefined(const Stmt &inner_body, arith::Analyzer *analyzer)
     z3.SetTimeoutMs(50);
 
     for (const BufferLoadNode *ld : collector.loads) {
+      // CPPMEGA idea712 round-final fix-NG: same null guard as the
+      // condition-load probe. Treat malformed BufferLoads conservatively.
+      if (ld == nullptr || ld->indices.empty() || !ld->buffer.defined()) {
+        return false;
+      }
       for (size_t d = 0; d < ld->indices.size(); ++d) {
         if (!Z3ProvesIndexInRange(ld->buffer, d, ld->indices[d], z3)) {
           return false;
@@ -269,6 +282,9 @@ bool Z3ProvesInnerWellDefined(const Stmt &inner_body, arith::Analyzer *analyzer)
       }
     }
     for (const auto &kv : stores.stores) {
+      if (!kv.first.defined() || kv.second.empty()) {
+        return false;
+      }
       for (size_t d = 0; d < kv.second.size(); ++d) {
         if (!Z3ProvesIndexInRange(kv.first, d, kv.second[d], z3)) {
           return false;
