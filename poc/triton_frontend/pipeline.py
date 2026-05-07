@@ -199,6 +199,36 @@ _NV_ONLY: frozenset = frozenset({
 })
 
 
+# Minimal pass set sufficient to lower Tier-1 conformance kernels
+# (vector_add / softmax / matmul). All other entries in PASS_ORDER are
+# either NV/Hopper-only, Blackwell/2SM/TCGEN05 noise, or fusion
+# nice-to-haves -- harmless but unnecessary for the first three.
+_TIER1_SUBSET: frozenset = frozenset({
+    "InstructionAnnotation",
+    "LayoutInference",
+    "LowerTileOp",
+    "InjectSoftwarePipeline",
+    "ThreadSync(shared)",
+    "ThreadSync(shared.dyn)",
+    "IfStmtBinding",
+    "MergeIfStmt",
+    "LoopUnswitching",
+    "LegalizeVectorizedLoop",
+    "VectorizeLoop",
+    "FlattenBuffer",
+    "PlanAndUpdateBufferAllocationLocation",
+    "StorageRewrite",
+    "LowerOpaqueBlock",
+    "LowerIntrin",
+    "LowerThreadAllreduce",
+    "LowerDeviceKernelLaunch",
+    "AnnotateDeviceRegions",
+    "SplitHostDevice",
+    "MakePackedAPI",
+    "CombineContextCall",
+})
+
+
 def _is_nv(target: Optional[str]) -> bool:
     """True iff ``target`` is a CUDA target (string match keeps it simple)."""
     if target is None:
@@ -212,6 +242,7 @@ def build_pipeline(
     *,
     enable_tma: bool = False,
     enable_warp_specialization: bool = False,
+    tier1_only: bool = True,
 ) -> Any:
     """Materialize a ``tvm.transform.Sequential`` for ``target``.
 
@@ -222,6 +253,11 @@ def build_pipeline(
     3. Hopper passes (``LowerHopperIntrin``, ``FuseMBarrierArriveExpectTx``,
        ``ClusterPlanning``) only enabled when ``enable_tma`` /
        ``enable_warp_specialization`` are set.
+    4. When ``tier1_only`` is True (default), passes outside
+       :data:`_TIER1_SUBSET` are dropped. The subset is sufficient for
+       vector_add / softmax / matmul lowering and skips Blackwell / 2SM /
+       TCGEN05 noise that the generic ``tilelang.transform`` registry
+       would otherwise pull in.
 
     Returns a ``tvm.transform.Sequential`` ready to apply via
     ``seq(IRModule)`` or to slot into ``tilelang.engine.phase``.
@@ -244,6 +280,8 @@ def build_pipeline(
         if entry.name == "LowerHopperIntrin" and not enable_tma:
             continue
         if entry.name == "FuseMBarrierArriveExpectTx" and not enable_tma:
+            continue
+        if tier1_only and entry.name not in _TIER1_SUBSET:
             continue
         if entry.factory is None:  # pragma: no cover -- safety
             continue

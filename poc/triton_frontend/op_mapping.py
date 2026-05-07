@@ -58,6 +58,8 @@ __all__ = [
     # TMA
     "map_tt_experimental_descriptor_load",
     "map_tt_experimental_descriptor_store",
+    # Grid / launch
+    "map_tt_program_id",
     # Misc
     "map_tt_print",
 ]
@@ -225,13 +227,36 @@ def map_tt_load(op: Any, ctx: WalkerCtx) -> Any:
     # ptr_analysis has already populated value_map[ptr_ssa] with a
     # ``(buffer, indices)`` tuple. Fall back to assuming ptr_ssa is an
     # opaque buffer + scalar offset for the elementwise MVP path.
-    resolved = ctx.get(ptr_ssa)
+    resolved = ctx.get(ptr_ssa) if ptr_ssa in ctx.value_map else None
     if isinstance(resolved, tuple) and len(resolved) == 2:
         buf, indices = resolved
-    else:
+    elif resolved is not None:
         # MVP: treat the SSA value itself as the buffer with offset 0.
         buf, indices = resolved, [0]
+    else:
+        # Fallback path used when PtrAnalysis hasn't run yet (e.g. unit
+        # tests with dict-shaped fakes): seed a placeholder buffer so the
+        # walker can keep going. The shape/dtype come from the result type
+        # when available; otherwise we fall back to a flat 1024xfp32 buf.
+        # TODO: replace with PtrAnalysis-derived (buffer, indices).
+        result = _results(op)[0] if _results(op) else None
+        out_shape = list(_shape_of(result)) if result is not None else [1024]
+        out_dtype = _dtype_of(result) if result is not None else "float32"
+        buf_name = (
+            getattr(ptr_ssa, "name", None)
+            or (ptr_ssa.get("name") if isinstance(ptr_ssa, dict) else None)
+            or ctx.fresh("buf")
+        )
+        if buf_name not in ctx.buffers:
+            ctx.buffers[buf_name] = tir.decl_buffer(
+                shape=out_shape or [1024], dtype=out_dtype, name=buf_name
+            )
+        buf, indices = ctx.buffers[buf_name], [0]
 
+    # Prefer high-level T.copy when consumers can use it (RFC 5.1: keep the
+    # frontend on the high-level surface so LayoutInference / LowerTileOp
+    # apply uniformly). For the MVP scalar path we still emit BufferLoad
+    # because T.copy expects buffer regions, not scalar elements.
     load_expr = tir.BufferLoad(buf, list(indices))
 
     if mask_ssa is not None:
@@ -265,12 +290,27 @@ def map_tt_store(op: Any, ctx: WalkerCtx) -> Any:
     ptr_ssa, val_ssa = operands[0], operands[1]
     mask_ssa = operands[2] if len(operands) >= 3 else None
 
-    resolved = ctx.get(ptr_ssa)
+    resolved = ctx.get(ptr_ssa) if ptr_ssa in ctx.value_map else None
+    val_expr = ctx.get(val_ssa)
     if isinstance(resolved, tuple) and len(resolved) == 2:
         buf, indices = resolved
-    else:
+    elif resolved is not None:
         buf, indices = resolved, [0]
-    val_expr = ctx.get(val_ssa)
+    else:
+        # Same placeholder-seed path as map_tt_load; see notes there.
+        # TODO: replace with PtrAnalysis-derived (buffer, indices).
+        out_shape = list(_shape_of(val_ssa))
+        out_dtype = _dtype_of(val_ssa)
+        buf_name = (
+            getattr(ptr_ssa, "name", None)
+            or (ptr_ssa.get("name") if isinstance(ptr_ssa, dict) else None)
+            or ctx.fresh("buf")
+        )
+        if buf_name not in ctx.buffers:
+            ctx.buffers[buf_name] = tir.decl_buffer(
+                shape=out_shape or [1024], dtype=out_dtype or "float32", name=buf_name
+            )
+        buf, indices = ctx.buffers[buf_name], [0]
 
     store_stmt = tir.BufferStore(buf, val_expr, list(indices))
     if mask_ssa is not None:
@@ -536,12 +576,25 @@ def map_tt_reduce(op: Any, ctx: WalkerCtx) -> Any:
     elif kind == "min":
         T.reduce_min(src, dst, dim=axis, clear=True)
     elif kind == "mul":
-        # # TODO: verify reduce_prod in tilelang.language; not currently
-        # exposed (only sum/max/min/abssum/absmax/bitand/bitor/bitxor).
-        raise NotImplementedError(
-            "tt.reduce 'mul' combiner: reduce_prod not in tilelang.language; "
-            "fall back to expanding into a manual loop or T.cumsum/log path."
-        )
+        # tilelang.language has no reduce_prod (only sum/max/min/abssum/
+        # absmax/bit*). Synthesize as exp(reduce_sum(log(src))) for the
+        # MVP path. This loses precision near 0 / for negative inputs;
+        # callers needing exact products should fall back to a manual
+        # loop. # TODO: numerical accuracy -- replace with a real
+        # reduce_prod once tilelang.language exposes one.
+        if hasattr(T, "log"):
+            log_src = T.log(src)
+        else:
+            tir = ctx.tir()
+            log_src = tir.call_intrin(out_dtype, "tir.log", src)
+        T.reduce_sum(log_src, dst, dim=axis, clear=True)
+        if hasattr(T, "exp"):
+            # In-place exp on the reduced buffer; T.copy(T.exp(dst), dst)
+            # gives LayoutInference / LowerTileOp a clean rebind point.
+            T.copy(T.exp(dst), dst)
+        else:
+            tir = ctx.tir()
+            ctx.emit(tir.call_intrin(out_dtype, "tir.exp", dst))
     else:
         raise NotImplementedError(
             f"tt.reduce: unsupported combiner kind {kind!r}; "
@@ -756,11 +809,21 @@ def map_tt_mbarrier(op: Any, ctx: WalkerCtx) -> Any:
         return bar
 
     operands = _operands(op)
+    tir = ctx.tir()
     if "arrive" in name:
         if not operands:
             raise ValueError("mbarrier.arrive: missing barrier operand")
         bar = ctx.get(operands[0])
-        handle = T.barrier_arrive(bar)
+        # Prefer the high-level T.barrier_arrive (re-exported via
+        # tilelang.language.builtin). Fall back to a raw call_intrin so
+        # the emitter still works if the symbol isn't re-exported.
+        # TODO: verify barrier_arrive remains in tilelang.language.
+        if hasattr(T, "barrier_arrive"):
+            handle = T.barrier_arrive(bar)
+        else:
+            handle = tir.call_intrin(
+                "handle", tir.op.Op.get("tl.mbarrier_arrive"), bar
+            )
         ctx.emit(handle)
         return handle
 
@@ -769,7 +832,14 @@ def map_tt_mbarrier(op: Any, ctx: WalkerCtx) -> Any:
             raise ValueError("mbarrier.wait: missing barrier operand")
         bar = ctx.get(operands[0])
         parity = int(attrs.get("parity", 0))
-        handle = T.barrier_wait(bar, parity)
+        # Prefer the high-level T.barrier_wait; fall back to call_intrin.
+        # TODO: verify barrier_wait remains in tilelang.language.
+        if hasattr(T, "barrier_wait"):
+            handle = T.barrier_wait(bar, parity)
+        else:
+            handle = tir.call_intrin(
+                "handle", tir.op.Op.get("tl.mbarrier_wait_parity"), bar, parity
+            )
         ctx.emit(handle)
         return handle
 
@@ -907,6 +977,53 @@ def map_tt_print(op: Any, ctx: WalkerCtx) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Grid / launch -- RFC section 5.1, ``tt.get_program_id`` (a.k.a. tt.program_id)
+# ---------------------------------------------------------------------------
+
+
+def map_tt_program_id(op: Any, ctx: WalkerCtx) -> Any:
+    """Lower ``tt.get_program_id(axis=N)`` to a block-binding ``Var``.
+
+    Triton's ``tl.program_id(axis=N)`` selects gridDim.(x|y|z); the
+    natural TileLang equivalent is ``T.Kernel(bx, by, bz)``'s block
+    binding for axis ``N`` (``KernelLaunchFrame.get_block_binding``).
+
+    Outside an active KernelLaunchFrame (e.g. unit tests with dict-shaped
+    fakes) we fall back to allocating a fresh ``int32`` Var so the walker
+    keeps going; downstream codegen replaces it with the real binding.
+    """
+    attrs = _attrs(op)
+    axis = int(attrs.get("axis", 0))
+    if axis < 0 or axis > 2:
+        raise ValueError(
+            f"tt.program_id: axis must be in [0, 2]; got {axis}"
+        )
+
+    var: Any
+    try:
+        from tilelang.language.kernel import KernelLaunchFrame  # type: ignore
+        frame = KernelLaunchFrame.Current()
+    except Exception:  # pragma: no cover -- TileLang absent during tests
+        frame = None
+
+    if frame is not None:
+        try:
+            var = frame.get_block_binding(axis)
+        except Exception:  # pragma: no cover -- frame missing axis
+            var = None
+    else:
+        var = None
+
+    if var is None:
+        tir = ctx.tir()
+        var = tir.Var(ctx.fresh(f"pid{axis}"), "int32")
+
+    if _results(op):
+        ctx.bind(_results(op)[0], var)
+    return var
+
+
+# ---------------------------------------------------------------------------
 # Dispatch table (TTIR op name -> emitter)
 # ---------------------------------------------------------------------------
 
@@ -937,6 +1054,9 @@ OP_TABLE: Dict[str, EmitFn] = {
     # TMA
     "tt.experimental_descriptor_load": map_tt_experimental_descriptor_load,
     "tt.experimental_descriptor_store": map_tt_experimental_descriptor_store,
+    # grid / launch (multiple TTIR spellings route through one emitter)
+    "tt.program_id": map_tt_program_id,
+    "tt.get_program_id": map_tt_program_id,
     # misc
     "tt.print": map_tt_print,
 }

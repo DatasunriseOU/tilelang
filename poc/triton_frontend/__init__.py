@@ -34,9 +34,11 @@ Layout::
 from __future__ import annotations
 
 import re
+import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .op_mapping import OP_TABLE, WalkerCtx
+from .ptr_analysis import PtrAnalysis, shim_available
 
 __all__ = [
     "from_triton_kernel",
@@ -145,9 +147,21 @@ def _walk_mlir_module(module: Any, ctx: WalkerCtx) -> List[str]:
     # Triton TTIR stores tt.func ops at the module top level.
     # We recurse into all regions and dispatch by op name.
 
+    def _op_name(op: Any) -> str:
+        """Extract the dotted MLIR op name across binding shapes."""
+        # Real mlir.ir.Operation: ``op.name`` is the dotted op name; some
+        # builds expose it via ``op.operation.name``. We try both, then
+        # fall back to ``str(op.operation.opview)`` and dict-shaped fakes.
+        name = getattr(op, "name", None)
+        if not name:
+            inner = getattr(op, "operation", None)
+            name = getattr(inner, "name", None) if inner is not None else None
+        if not name and isinstance(op, dict):
+            name = op.get("name")
+        return str(name) if name else ""
+
     def _recurse(op: Any) -> None:
-        op_name = getattr(op, "name", None) or getattr(op, "operation", None)
-        op_name_str = str(op_name) if op_name is not None else ""
+        op_name_str = _op_name(op)
         if op_name_str in OP_TABLE:
             visited.append(op_name_str)
             OP_TABLE[op_name_str](op, ctx)
@@ -242,6 +256,30 @@ def from_triton_kernel(
     ttir_module = _compile_to_ttir(
         fn, grid=grid, constexprs=constexprs, target=target
     )
+    # ``_compile_to_ttir`` may return either an ``mlir.ir.Module`` or a
+    # textual MLIR string (depending on Triton version). Force the MLIR
+    # object path: re-parse the text through ``mlir.ir`` so the walker
+    # sees real ops. Fall back to the explicit text-walker only when the
+    # MLIR Python bindings are unavailable.
+    if isinstance(ttir_module, str):
+        try:
+            from mlir import ir as _mlir_ir  # type: ignore
+            ctx = _mlir_ir.Context()
+            ctx.allow_unregistered_dialects = True
+            ttir_module = _mlir_ir.Module.parse(ttir_module, ctx)
+        except Exception as exc:  # pragma: no cover -- mlir bindings absent
+            warnings.warn(
+                "triton_frontend: mlir.ir bindings unavailable; using "
+                f"text-TTIR coverage walker. cause={exc!r}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return from_ttir(
+                ttir_module,
+                target=target,
+                name=getattr(fn, "__name__", "main"),
+                _allow_text_ttir=True,
+            )
     return from_ttir(ttir_module, target=target, name=getattr(fn, "__name__", "main"))
 
 
@@ -250,22 +288,30 @@ def from_ttir(
     *,
     target: Optional[str] = None,
     name: str = "main",
+    _allow_text_ttir: bool = False,
     **kwargs: Any,
 ) -> TileLangPrimFunc:
     """Lower a Triton TTIR module to a TileLang ``PrimFunc``.
 
-    Accepts either:
-      * a textual TTIR string (``str``), or
-      * an ``mlir.ir.Module`` object with ``regions``/``blocks``.
+    Expects an ``mlir.ir.Module`` object with ``regions``/``blocks``. The
+    text-TTIR path is **opt-in** (``_allow_text_ttir=True``); it is a
+    coverage-only walker that does not populate ``ctx.value_map`` /
+    ``ctx.buffers`` and therefore cannot produce a real lowered PrimFunc
+    (see ``_walk_text_ttir`` docstring).
 
     Parameters
     ----------
     ttir_module:
-        TTIR text or MLIR module containing one or more ``tt.func`` ops.
+        MLIR module containing one or more ``tt.func`` ops. A textual
+        TTIR string is only accepted when ``_allow_text_ttir=True``.
     target:
         TileLang target string.
     name:
         Symbol name to assign to the resulting PrimFunc.
+    _allow_text_ttir:
+        Internal escape hatch for unit tests that want to exercise the
+        regex-based op-name walker without an MLIR module. Production
+        callers should always pass an ``mlir.ir.Module``.
 
     Returns
     -------
@@ -274,7 +320,41 @@ def from_ttir(
     """
     ctx = WalkerCtx()
     if isinstance(ttir_module, str):
+        if not _allow_text_ttir:
+            raise TypeError(
+                "from_ttir: textual TTIR is no longer the default path; "
+                "pass an mlir.ir.Module (recommended) or set "
+                "_allow_text_ttir=True for the coverage-only text walker."
+            )
         _walk_text_ttir(ttir_module, ctx)
     else:
+        # Pre-pass: run microsoft/triton-shared PtrAnalysis to rewrite
+        # tt.* pointer arithmetic into ``tts.make_tptr`` ops and seed
+        # ctx.value_map with the recovered ``(buffer, indices)`` tuples.
+        # Skipped silently when the C++ shim is unavailable so the walker
+        # falls back to the MVP scalar path (op_mapping seeds placeholder
+        # buffers in that case).
+        if shim_available():
+            try:
+                pa = PtrAnalysis(ttir_module)
+                pa.rewrite()
+                for state in pa.extract_states():
+                    if state.source is None:
+                        continue
+                    # The shim emits printed-form keys; emitters look up
+                    # via ``ctx.value_map[ssa_value]`` which uses the
+                    # MLIR Value as the key. We surface the recovered
+                    # PtrState as a (source, indices) tuple keyed by the
+                    # printed source so emitters can match it lazily.
+                    ctx.value_map[state.source] = (
+                        state.source, list(state.offsets) or [0]
+                    )
+            except Exception as exc:  # pragma: no cover -- shim build issues
+                warnings.warn(
+                    f"triton_frontend: PtrAnalysis pre-pass failed; "
+                    f"falling back to MVP scalar path. cause={exc!r}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
         _walk_mlir_module(ttir_module, ctx)
     return _make_prim_func(ctx, name=name)
