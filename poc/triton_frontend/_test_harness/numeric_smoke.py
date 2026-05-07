@@ -317,52 +317,57 @@ def _run_mlx(
     except Exception as exc:  # noqa: BLE001
         return None, f"mlx import failed: {type(exc).__name__}: {exc}"
 
-    src = getattr(artifact, "kernel_source", None)
-    if src is None:
-        return None, "artifact.kernel_source is None"
-    if not isinstance(src, str) or "kernel void" not in src:
+    # Delegate buffer-name renaming + MLX wrapping to
+    # ``cppmega_mlx.nn._tilelang._mlx_runtime.wrap_tilelang_metal_kernel``,
+    # which parses the TileLang-emitted ``kernel void name(...) { ... }``
+    # signature, renames the positional ``A``, ``B``, ... buffer params
+    # to MLX's required ``inp0``/``out0`` convention in the body, and
+    # builds the ``mx.fast.metal_kernel`` callable. See that module's
+    # docstring for the rename strategy.
+    try:
+        from cppmega_mlx.nn._tilelang._mlx_runtime import (  # type: ignore
+            MLXRuntimeError,
+            wrap_tilelang_metal_kernel,
+        )
+    except Exception as exc:  # noqa: BLE001
         return None, (
-            f"artifact.kernel_source did not contain a 'kernel void' "
-            f"function (len={len(src) if isinstance(src, str) else 'n/a'})"
+            f"cppmega_mlx._mlx_runtime import failed: "
+            f"{type(exc).__name__}: {exc}"
         )
 
-    # The TileLang metal codegen produces a complete ``kernel void
-    # name(...) { ... }`` declaration. ``mx.fast.metal_kernel`` wants
-    # only the BODY of such a function (it builds the signature itself
-    # from the input/output ndarray descriptors). Extracting the body
-    # robustly requires a real Metal parser; we shortcut by finding the
-    # first '{' after 'kernel void' and matching braces to its close.
-    body = _extract_kernel_body(src)
-    if body is None:
-        return None, (
-            "could not extract body from kernel_source; "
-            "TileLang Metal emitter shape changed?"
-        )
-
-    # Build the mlx kernel. We assume the LAST array in ``kernel_args``
-    # is the output (matches the convention used by all kernels in
-    # numeric_kernels/). We pass everything else as inputs.
+    # Convention used by all kernels in numeric_kernels/: the LAST array
+    # in ``kernel_args`` is the output, everything else is an input.
     *inputs_np, output_np = kernel_args
+
+    try:
+        adapter = wrap_tilelang_metal_kernel(
+            artifact,
+            input_count=len(inputs_np),
+            output_count=1,
+            name="triton_e2e_kernel",
+        )
+    except MLXRuntimeError as exc:
+        return None, f"wrap_tilelang_metal_kernel: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        tb = traceback.format_exc(limit=6)
+        return None, (
+            f"wrap_tilelang_metal_kernel raised: "
+            f"{type(exc).__name__}: {exc}\n{tb}"
+        )
+
     try:
         mx_inputs = [mx.array(a) for a in inputs_np]
-        # mlx infers output dtype/shape from output_shapes/output_dtypes.
-        kernel = mx.fast.metal_kernel(
-            name="triton_e2e_kernel",
-            input_names=[f"inp{i}" for i in range(len(mx_inputs))],
-            output_names=["out0"],
-            source=body,
-        )
         grid = tuple(int(g) for g in kernel_mod.LAUNCH_GRID)
         # Pad grid to 3D as mx.fast.metal_kernel requires.
         while len(grid) < 3:
             grid = grid + (1,)
         threadgroup = (1, 1, 1)
-        out_arrays = kernel(
+        out_arrays = adapter(
             inputs=mx_inputs,
-            grid=grid,
-            threadgroup=threadgroup,
             output_shapes=[output_np.shape],
             output_dtypes=[_np_to_mx_dtype(mx, output_np.dtype)],
+            grid=grid,
+            threadgroup=threadgroup,
         )
         mx.eval(out_arrays)
         result_np = np.array(out_arrays[0], copy=False).astype(output_np.dtype)
@@ -370,32 +375,6 @@ def _run_mlx(
     except Exception as exc:  # noqa: BLE001
         tb = traceback.format_exc(limit=6)
         return None, f"mx.fast.metal_kernel raised: {type(exc).__name__}: {exc}\n{tb}"
-
-
-def _extract_kernel_body(src: str) -> Optional[str]:
-    """Pull the body out of the first ``kernel void ...(...) { ... }``.
-
-    We use brace matching (not regex) so nested ``{}`` inside the body
-    don't fool us. Returns ``None`` if no kernel function is found or
-    the braces don't balance.
-    """
-    idx = src.find("kernel void")
-    if idx < 0:
-        return None
-    open_idx = src.find("{", idx)
-    if open_idx < 0:
-        return None
-    depth = 0
-    for i in range(open_idx, len(src)):
-        c = src[i]
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                # Body is between open_idx+1 and i (exclusive of braces).
-                return src[open_idx + 1 : i]
-    return None
 
 
 def _np_to_mx_dtype(mx: Any, np_dtype: np.dtype) -> Any:

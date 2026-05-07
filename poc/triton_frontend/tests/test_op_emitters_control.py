@@ -17,13 +17,17 @@ from poc.triton_frontend.op_mapping import WalkerCtx  # noqa: E402
 from poc.triton_frontend.op_emitters.control import (  # noqa: E402
     CONTROL_EMITTERS,
     EmitError,
+    PTX_TO_TIR,
+    SCF_WHILE_MAX_ITERATIONS,
     map_arith_bitcast,
     map_arith_extf,
     map_arith_select,
     map_arith_extsi,
     map_arith_fptosi,
+    map_llvm_inline_asm,
     map_scf_for,
     map_scf_if,
+    map_scf_while,
     map_scf_yield,
     map_tt_advance,
 )
@@ -34,9 +38,28 @@ from poc.triton_frontend.op_emitters.control import (  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
+class _FakeSSA(dict):
+    """Hashable dict wrapper for fake SSA values.
+
+    The op_mapping helpers (``_dtype_of`` / ``_shape_of`` / ``_attrs``) treat
+    SSA values as opaque dicts when they don't expose MLIR-style attributes;
+    that's fine for inspection but the ``WalkerCtx.value_map`` keys need to
+    be hashable. A plain dict isn't, so we wrap with this thin subclass that
+    hashes on identity (each fake SSA is a distinct value, by construction).
+    """
+
+    __slots__ = ()
+
+    def __hash__(self) -> int:  # type: ignore[override]
+        return id(self)
+
+    def __eq__(self, other: Any) -> bool:  # type: ignore[override]
+        return self is other
+
+
 def _val(name: str, *, shape: List[int] = (), dtype: str = "float32") -> Dict[str, Any]:
-    """Build a dict-shaped fake SSA value."""
-    return {"name": name, "shape": tuple(shape), "dtype": dtype}
+    """Build a dict-shaped fake SSA value (hashable for value_map keys)."""
+    return _FakeSSA({"name": name, "shape": tuple(shape), "dtype": dtype})
 
 
 def _stringify(node: Any) -> str:
@@ -360,7 +383,171 @@ def test_control_emitters_table_has_expected_keys() -> None:
         "arith.bitcast",
         "arith.extsi", "arith.extui", "arith.trunci",
         "tt.advance",
-        "scf.for", "scf.if", "scf.yield",
+        "scf.for", "scf.if", "scf.yield", "scf.while",
+        "llvm.inline_asm", "tt.elementwise_inline_asm",
     }
     missing = expected - set(CONTROL_EMITTERS.keys())
     assert not missing, f"CONTROL_EMITTERS missing keys: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# scf.while  -> bounded tir.For + IfThenElse
+# ---------------------------------------------------------------------------
+
+
+def test_scf_while_with_iter_arg() -> None:
+    """A single-iter_arg scf.while lowers to tir.For with iter_arg LetStmt
+    bindings, and the after-region is guarded by tir.IfThenElse(cond)."""
+    ctx = WalkerCtx()
+    init = _val("init", shape=[], dtype="int32")
+    out = _val("final", shape=[], dtype="int32")
+
+    # Region block-arg SSAs (one carry slot each region).
+    before_carry = _val("bc0", shape=[], dtype="int32")
+    after_carry = _val("ac0", shape=[], dtype="int32")
+    cond_ssa = _val("cond", shape=[], dtype="bool")
+
+    ctx.bind(init, tvm.tir.const(0, "int32"))
+
+    op = {
+        "name": "scf.while",
+        "operands": [init],
+        "results": [out],
+        "attrs": {"upper_bound": 16},
+        "before_block_args": [before_carry],
+        "after_block_args": [after_carry],
+        "regions": [
+            # before-region: just compute a (constant) condition then
+            # forward the carry. The walker will need to resolve `cond_ssa`
+            # so we pre-bind it here via a no-op constant-emitting op of
+            # our own.
+            {
+                "ops": [
+                    {
+                        "name": "scf.condition",
+                        "operands": [cond_ssa, before_carry],
+                        "results": [],
+                        "attrs": {},
+                    },
+                ],
+            },
+            # after-region: yield the carry unchanged.
+            {
+                "ops": [
+                    {
+                        "name": "scf.yield",
+                        "operands": [after_carry],
+                        "results": [],
+                        "attrs": {},
+                    },
+                ],
+            },
+        ],
+    }
+    # Pre-seed the cond binding the same way the parent walker would.
+    ctx.bind(cond_ssa, tvm.tir.const(1, "bool"))
+
+    for_stmt = map_scf_while(op, ctx)
+    assert isinstance(for_stmt, tvm.tir.For), \
+        f"expected tir.For, got {type(for_stmt)}"
+    # Bound is honoured.
+    assert int(for_stmt.extent) == 16
+    # The printed body must show both the carry binding (``wcarry... = 0``)
+    # and an ``if`` guard around the after-region. We assert against the
+    # printed form because TVM's TIR types vary across releases (some
+    # builds wrap LetStmt in a SeqStmt-shim, some preserve it directly).
+    body_text = _stringify(for_stmt.body)
+    assert "wcarry" in body_text, \
+        f"expected carry-var binding in body, got: {body_text!r}"
+    assert " = " in body_text or ":=" in body_text, \
+        f"expected an iter_arg initialisation in body, got: {body_text!r}"
+    assert "if" in body_text.lower(), \
+        f"expected IfThenElse guard, got: {body_text!r}"
+    # Result SSA bound.
+    assert out in ctx.value_map
+
+
+def test_scf_while_unbounded_raises() -> None:
+    """An scf.while explicitly tagged as unbounded must raise EmitError --
+    silently truncating the loop is a correctness hazard."""
+    ctx = WalkerCtx()
+    init = _val("init", shape=[], dtype="int32")
+    ctx.bind(init, tvm.tir.const(0, "int32"))
+    op = {
+        "name": "scf.while",
+        "operands": [init],
+        "results": [_val("o")],
+        "attrs": {"unbounded": True},
+        "before_block_args": [_val("bc")],
+        "after_block_args": [_val("ac")],
+        "regions": [
+            {"ops": [{"name": "scf.condition",
+                      "operands": [_val("c", shape=[], dtype="bool"), _val("bc")],
+                      "results": [], "attrs": {}}]},
+            {"ops": [{"name": "scf.yield", "operands": [_val("ac")],
+                      "results": [], "attrs": {}}]},
+        ],
+    }
+    with pytest.raises(EmitError, match="unbounded"):
+        map_scf_while(op, ctx)
+
+
+# ---------------------------------------------------------------------------
+# llvm.inline_asm  -> portable TIR intrinsics
+# ---------------------------------------------------------------------------
+
+
+def test_inline_asm_tanh_approx_lowered_to_tir_tanh() -> None:
+    """PTX ``tanh.approx.f32 $0, $1;`` must lower to ``tir.tanh(x)``."""
+    ctx = WalkerCtx()
+    src = _val("x", shape=[], dtype="float32")
+    dst = _val("y", shape=[], dtype="float32")
+    ctx.bind(src, tvm.tir.Var("x", "float32"))
+
+    op = {
+        "name": "llvm.inline_asm",
+        "operands": [src],
+        "results": [dst],
+        "attrs": {
+            "asm_string": "tanh.approx.f32 $0, $1;",
+            "constraints": "=f,f",
+            "has_side_effects": False,
+            "asm_dialect": 0,
+        },
+    }
+    expr = map_llvm_inline_asm(op, ctx)
+    text = _stringify(expr).lower()
+    assert "tanh" in text, f"expected tir.tanh node, got: {text!r}"
+    # Result must be bound.
+    assert ctx.value_map[dst] is expr
+    # Sanity: PTX_TO_TIR is populated with at least the well-known set.
+    assert "tanh.approx.f32" in PTX_TO_TIR
+    assert "ex2.approx.f32" in PTX_TO_TIR
+
+
+def test_inline_asm_unknown_raises() -> None:
+    """An unrecognised PTX pattern must raise EmitError that surfaces the
+    asm_string verbatim so triage can copy-paste it."""
+    ctx = WalkerCtx()
+    src = _val("x", shape=[], dtype="float32")
+    ctx.bind(src, tvm.tir.Var("x", "float32"))
+    op = {
+        "name": "llvm.inline_asm",
+        "operands": [src],
+        "results": [_val("y", shape=[], dtype="float32")],
+        "attrs": {
+            "asm_string": "bizzarre.intrin $0, $1;",
+            "constraints": "=f,f",
+        },
+    }
+    with pytest.raises(EmitError) as excinfo:
+        map_llvm_inline_asm(op, ctx)
+    msg = str(excinfo.value)
+    assert "bizzarre.intrin" in msg, \
+        f"expected EmitError message to surface asm_string verbatim, got: {msg!r}"
+
+
+def test_scf_while_max_iterations_default() -> None:
+    """The bound default is documented and positive."""
+    assert SCF_WHILE_MAX_ITERATIONS > 0
+    assert SCF_WHILE_MAX_ITERATIONS == 1024 or SCF_WHILE_MAX_ITERATIONS > 0

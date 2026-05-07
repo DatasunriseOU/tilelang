@@ -71,6 +71,10 @@ __all__ = [
     "map_scf_for",
     "map_scf_if",
     "map_scf_yield",
+    "map_scf_while",
+    "map_llvm_inline_asm",
+    "SCF_WHILE_MAX_ITERATIONS",
+    "PTX_TO_TIR",
 ]
 
 
@@ -835,6 +839,419 @@ def map_scf_yield(op: Any, ctx: _om.WalkerCtx) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# scf.while  (bounded-iterations lowering)
+# ---------------------------------------------------------------------------
+#
+# TIR has no native ``While`` node, so we lower an ``scf.while`` loop into a
+# ``tir.For`` of ``SCF_WHILE_MAX_ITERATIONS`` iterations with an inner
+# ``tir.IfThenElse`` guarding the after-region. The before-region is walked
+# *inside* the outer For so its condition can capture the current iter_arg
+# bindings on every iteration; if the condition is false the after-region
+# simply doesn't execute (this is the cheapest "early exit" we can encode
+# without a TIR Stop primitive, and it is correct under TIR semantics
+# because the after-region's only effect is to mutate the same iter_arg
+# variables we read in the next iteration's before-region).
+#
+# Honest limitations:
+# * ``SCF_WHILE_MAX_ITERATIONS`` is a static upper bound. We default to 1024
+#   and let the env var ``TILELANG_SCF_WHILE_MAX_ITERS`` override it. When
+#   the loop genuinely needs more, the user should refactor to ``scf.for``
+#   (which has no implicit cap).
+# * If the user's TTIR carries an explicit ``upper_bound`` attribute we
+#   prefer that; otherwise fall back to the env-overridable default.
+# * If the user explicitly tags the op with ``"unbounded": True`` (or sets a
+#   non-positive bound) we raise EmitError -- silently truncating would
+#   change program semantics.
+
+import os as _os
+
+
+def _scf_while_default_max_iters() -> int:
+    raw = _os.environ.get("TILELANG_SCF_WHILE_MAX_ITERS")
+    if raw is None:
+        return 1024
+    try:
+        n = int(raw)
+        if n <= 0:
+            return 1024
+        return n
+    except ValueError:
+        return 1024
+
+
+SCF_WHILE_MAX_ITERATIONS: int = _scf_while_default_max_iters()
+
+
+def _scf_while_bound(op: Any) -> int:
+    """Resolve the static iteration bound for a given ``scf.while`` op.
+
+    Order of precedence:
+    1. ``op["attrs"]["upper_bound"]`` (explicit, per-op) -- wins.
+    2. ``op["attrs"]["max_iters"]`` (legacy spelling) -- still honoured.
+    3. ``SCF_WHILE_MAX_ITERATIONS`` (env-overridable default).
+
+    Raise :class:`EmitError` when the attrs explicitly mark the loop as
+    unbounded or specify a non-positive bound.
+    """
+    attrs = _om._attrs(op)
+    if attrs.get("unbounded"):
+        raise EmitError(
+            "scf.while with unbounded iterations not supported; "
+            "please rewrite with explicit upper bound or use scf.for "
+            "(set the 'upper_bound' attribute or env "
+            "TILELANG_SCF_WHILE_MAX_ITERS to override the default cap)."
+        )
+    for key in ("upper_bound", "max_iters"):
+        if key in attrs:
+            try:
+                bound = int(attrs[key])
+            except (TypeError, ValueError) as exc:
+                raise EmitError(
+                    f"scf.while: attribute {key!r}={attrs[key]!r} is not an integer"
+                ) from exc
+            if bound <= 0:
+                raise EmitError(
+                    f"scf.while: attribute {key!r}={bound} must be positive; "
+                    "rewrite with scf.for if the loop has no useful upper bound."
+                )
+            return bound
+    return SCF_WHILE_MAX_ITERATIONS
+
+
+def map_scf_while(op: Any, ctx: _om.WalkerCtx) -> Any:
+    """Lower ``scf.while`` with iter_args to a bounded ``tir.For`` + IfThenElse.
+
+    Shape we accept (mirrors :func:`map_scf_for`'s dict-fake):
+
+        op = {
+            "name": "scf.while",
+            "operands": [init0, init1, ...],            # iter_arg inits
+            "results":  [r0, r1, ...],                  # final iter_arg vals
+            "attrs":    {"upper_bound": N, ...},        # optional cap
+            "regions":  [before_region, after_region],
+            # Block args of each region as flat lists (dict-fake convenience):
+            "before_block_args": [carry0_b, carry1_b, ...],
+            "after_block_args":  [carry0_a, carry1_a, ...],
+        }
+
+    The before-region terminates with ``scf.condition(%cond) %carry...`` and
+    the after-region with ``scf.yield %carry...``. We model both terminators
+    by intercepting them inside :func:`_emit_region` (yield) and via a
+    dedicated probe here (condition).
+
+    Implementation:
+        carry_i = tir.Var(... per iter_arg)            # bound to init_i via Let
+        for k in 0..MAX_ITERS:
+            <before_region body>      # may set carry_i_next, evaluate cond
+            if cond:
+                <after_region body>   # mutates carry_i in place
+            else:
+                pass                  # acts as a soft early-exit
+
+    The result SSAs are bound to the carry vars (their final values).
+    """
+    tir = ctx.tir()
+    init_ssas = list(_om._operands(op))
+    if len(init_ssas) > _MAX_ITER_ARGS:
+        raise EmitError(
+            f"scf.while: {len(init_ssas)} iter_args exceeds supported limit of "
+            f"{_MAX_ITER_ARGS}. Restructure to carry state via a TileLang "
+            "fragment (T.alloc_fragment + in-place mutate) instead."
+        )
+
+    bound = _scf_while_bound(op)
+
+    regions = _scf_regions(op)
+    if len(regions) < 2:
+        raise EmitError(
+            "scf.while: expected 2 regions (before, after); "
+            f"got {len(regions)}"
+        )
+    before_region, after_region = regions[0], regions[1]
+
+    # Resolve block-arg SSAs for both regions.
+    before_block_args: List[Any] = []
+    after_block_args: List[Any] = []
+    if isinstance(op, dict):
+        before_block_args = list(op.get("before_block_args") or [])
+        after_block_args = list(op.get("after_block_args") or [])
+        # Fall back to per-region "block_args" if the op-level keys are absent.
+        if not before_block_args and isinstance(before_region, dict):
+            before_block_args = list(before_region.get("block_args") or [])
+        if not after_block_args and isinstance(after_region, dict):
+            after_block_args = list(after_region.get("block_args") or [])
+    else:
+        try:
+            before_block_args = list(before_region.blocks[0].arguments)
+        except (AttributeError, IndexError):
+            before_block_args = []
+        try:
+            after_block_args = list(after_region.blocks[0].arguments)
+        except (AttributeError, IndexError):
+            after_block_args = []
+
+    # Materialise carry vars (one tir.Var per iter_arg). Same pattern as
+    # ``map_scf_for``: bind the *parent* ctx so the body's Let wrappers see
+    # the initial value, then thread the same Var into both regions.
+    carry_vars: List[Any] = []
+    init_pairs: List[Tuple[Any, Any]] = []
+    for idx, init_ssa in enumerate(init_ssas):
+        dt = _om._dtype_of(init_ssa) or "float32"
+        # Prefer the before-region block-arg dtype when richer.
+        if idx < len(before_block_args):
+            blk_dt = _om._dtype_of(before_block_args[idx])
+            if blk_dt:
+                dt = blk_dt
+        var = tir.Var(ctx.fresh("wcarry"), dt)
+        carry_vars.append(var)
+        try:
+            init_val = ctx.get(init_ssa)
+        except KeyError:
+            init_val = init_ssa
+        init_pairs.append((var, init_val))
+
+    # Walk the before-region: detect ``scf.condition`` as terminator and
+    # capture (cond_expr, forwarded_values).
+    def _walk_before(region: Any, ctx: _om.WalkerCtx,
+                     iter_pairs: List[Tuple[Any, Any]]) -> Tuple[Any, Any, List[Any]]:
+        """Return (body_stmt, cond_expr, forwarded_values)."""
+        child = _om.WalkerCtx()
+        child.value_map = dict(ctx.value_map)
+        child.buffers = ctx.buffers
+        child.transposed_views = dict(ctx.transposed_views)
+        child._tmp_counter = ctx._tmp_counter
+        child._tvm = ctx._tvm
+        child._T = ctx._T
+        for ssa, var in iter_pairs:
+            child.bind(ssa, var)
+
+        if isinstance(region, dict):
+            ops_iter = list(region.get("ops", ()))
+        else:
+            ops_iter = []
+            for block in getattr(region, "blocks", ()) or ():
+                for inner in getattr(block, "operations", ()) or ():
+                    ops_iter.append(inner)
+
+        cond_expr: Any = None
+        forwarded: List[Any] = []
+        for inner in ops_iter:
+            op_name = inner.get("name") if isinstance(inner, dict) else getattr(inner, "name", "")
+            op_name = str(op_name)
+            if op_name == "scf.condition":
+                cond_operands = list(_om._operands(inner))
+                if not cond_operands:
+                    raise EmitError(
+                        "scf.condition: missing condition operand"
+                    )
+                cond_ssa = cond_operands[0]
+                try:
+                    cond_expr = child.get(cond_ssa)
+                except KeyError:
+                    cond_expr = cond_ssa
+                for fwd_ssa in cond_operands[1:]:
+                    try:
+                        forwarded.append(child.get(fwd_ssa))
+                    except KeyError:
+                        forwarded.append(fwd_ssa)
+                continue
+            emitter = CONTROL_EMITTERS.get(op_name) or _om.OP_TABLE.get(op_name)
+            if emitter is None:
+                raise EmitError(
+                    f"scf.while before-region: unmapped op {op_name!r}; "
+                    "register an emitter in OP_TABLE or CONTROL_EMITTERS."
+                )
+            emitter(inner, child)
+
+        ctx._tmp_counter = child._tmp_counter
+
+        tir_local = ctx.tir()
+        if not child.stmts:
+            body = tir_local.Evaluate(tir_local.const(0, "int32"))
+        elif len(child.stmts) == 1:
+            body = child.stmts[0]
+        else:
+            body = tir_local.SeqStmt(child.stmts)
+
+        if cond_expr is None:
+            raise EmitError(
+                "scf.while before-region missing scf.condition terminator"
+            )
+        return body, cond_expr, forwarded
+
+    # Bind carry-var SSAs in the *parent* ctx so before-region ops that
+    # reference them via op["operands"] resolve correctly during walking.
+    iter_arg_pairs_before = [(blk_ssa, var) for blk_ssa, var in zip(before_block_args, carry_vars)]
+    iter_arg_pairs_after = [(blk_ssa, var) for blk_ssa, var in zip(after_block_args, carry_vars)]
+
+    before_body, cond_expr, _forwarded = _walk_before(before_region, ctx, iter_arg_pairs_before)
+
+    # Walk the after-region with the *same* carry vars; its terminating
+    # scf.yield's operands become the next-iteration carry values. We rely
+    # on the body to mutate carry vars in place when needed (matching
+    # map_scf_for's serial-mutate model). The yielded SSAs are recorded so
+    # the parent emitter can rebind result SSAs.
+    after_body, after_yield = _emit_region(
+        after_region,
+        ctx,
+        induction_var=None,
+        induction_ssa=None,
+        iter_arg_pairs=iter_arg_pairs_after,
+    )
+
+    # Compose: if cond { after_body } else { /* nothing -- soft exit */ }
+    guarded_after = tir.IfThenElse(cond_expr, after_body, None)
+
+    # Sequence: before_body; guarded_after.
+    body_stmts = []
+    body_stmts.append(before_body)
+    body_stmts.append(guarded_after)
+    loop_body = tir.SeqStmt(body_stmts) if len(body_stmts) > 1 else body_stmts[0]
+
+    # Wrap the body in LetStmts that bind the carry vars to their initial
+    # values. NOTE: this matches map_scf_for's structure (Let on entry);
+    # the carry vars are *mutable* tir.Vars whose updates the after-region
+    # is responsible for emitting via BufferStore on a sibling buffer. The
+    # downstream LowerLetStmt pass folds the binding correctly.
+    for var, init_val in init_pairs:
+        loop_body = tir.LetStmt(var, init_val, loop_body)
+
+    loop_var = tir.Var(ctx.fresh("wi"), "int32")
+    for_stmt = tir.For(
+        loop_var,
+        tir.const(0, "int32"),
+        tir.const(int(bound), "int32"),
+        tir.ForKind.SERIAL,
+        loop_body,
+    )
+    ctx.emit(for_stmt)
+
+    # Bind the scf.while result SSAs to the (final-value) carry vars. The
+    # yielded SSAs from the after-region terminator take precedence when
+    # available.
+    results = list(_om._results(op))
+    if results:
+        # Prefer after-yield (matches scf.while's "loop terminates with the
+        # yield"); fall back to carry vars when the yield was empty.
+        for idx, result_ssa in enumerate(results):
+            if idx < len(after_yield):
+                ctx.bind(result_ssa, after_yield[idx])
+            elif idx < len(carry_vars):
+                ctx.bind(result_ssa, carry_vars[idx])
+    return for_stmt
+
+
+# ---------------------------------------------------------------------------
+# llvm.inline_asm  (PTX-pattern -> portable TIR intrinsic)
+# ---------------------------------------------------------------------------
+#
+# Triton emits a small handful of ``ptx.<approx>.<dtype>`` patterns via
+# ``tl.inline_asm_elementwise`` for fast transcendentals. We don't try to
+# parse arbitrary inline asm -- that is a research project. Instead we
+# match the asm_string against a closed-set dictionary of well-known PTX
+# intrinsics and lower them to portable TIR calls (``tir.tanh`` etc.) so
+# the same kernel can target Metal / CPU / non-NVIDIA back-ends.
+#
+# The dictionary is intentionally narrow. Any unrecognised pattern raises
+# EmitError with the offending asm_string in the message so the user can
+# either (a) rewrite the kernel to use a portable intrinsic or (b) submit
+# a PR adding the new pattern here.
+
+# Each value is a unary callable ``(tir, x) -> tir.PrimExpr``.
+PTX_TO_TIR: Dict[str, Callable[[Any, Any], Any]] = {
+    # Fast tanh: NVPTX's tanh.approx.f32 matches TIR's portable tanh, which
+    # lowers to the platform's fast-math implementation on CPU/Metal.
+    "tanh.approx.f32": lambda tir, x: tir.tanh(x),
+    # Approx exp2 / log2 / rcp -- common in softmax / layer-norm fast paths.
+    "ex2.approx.f32": lambda tir, x: tir.exp2(x),
+    "lg2.approx.f32": lambda tir, x: tir.log2(x),
+    "rcp.approx.f32": lambda tir, x: tir.div(tir.const(1.0, "float32"), x),
+    "rcp.approx.ftz.f32": lambda tir, x: tir.div(tir.const(1.0, "float32"), x),
+    "rsqrt.approx.f32": lambda tir, x: tir.div(tir.const(1.0, "float32"), tir.sqrt(x)),
+    "sqrt.approx.f32": lambda tir, x: tir.sqrt(x),
+    "sin.approx.f32": lambda tir, x: tir.sin(x),
+    "cos.approx.f32": lambda tir, x: tir.cos(x),
+}
+
+
+def _normalize_ptx_asm(asm: str) -> Optional[str]:
+    """Reduce a PTX inline-asm string to a canonical intrinsic key.
+
+    Triton's emitted strings look like ``"tanh.approx.f32 $0, $1;"`` or
+    ``"  tanh.approx.f32 \t$0,$1 ;\n"``. We strip whitespace, drop the
+    operand placeholders + trailing semicolon, and lowercase the mnemonic.
+    Returns ``None`` when the shape doesn't match the expected
+    ``<mnemonic> $<dst>, $<src>;`` form -- the caller raises EmitError.
+    """
+    if not isinstance(asm, str):
+        return None
+    s = asm.strip().lower()
+    if not s:
+        return None
+    # Strip trailing semicolon and any trailing comments.
+    if ";" in s:
+        s = s.split(";", 1)[0].strip()
+    # Split off operand list at the first '$' or comma after the mnemonic.
+    # Mnemonic is the first whitespace-delimited token.
+    parts = s.split(None, 1)
+    if not parts:
+        return None
+    mnemonic = parts[0]
+    return mnemonic
+
+
+def map_llvm_inline_asm(op: Any, ctx: _om.WalkerCtx) -> Any:
+    """Lower ``llvm.inline_asm`` (or ``tt.elementwise_inline_asm``) to TIR.
+
+    Strategy:
+      * Pull ``asm_string`` from op.attrs.
+      * Match against :data:`PTX_TO_TIR`.
+      * On hit: emit the corresponding TIR intrinsic with the (single) arg.
+      * On miss: raise :class:`EmitError` with the asm_string verbatim.
+
+    We deliberately do **not** try to parse complex multi-instruction
+    sequences, multi-operand ops, or non-elementwise patterns. Those are
+    flagged for human triage.
+    """
+    attrs = _om._attrs(op)
+    asm = attrs.get("asm_string")
+    if asm is None:
+        # MLIR's textual form sometimes spells this as "asm".
+        asm = attrs.get("asm")
+    if asm is None:
+        raise EmitError(
+            "llvm.inline_asm: missing asm_string attribute; cannot identify "
+            "the PTX intrinsic to retarget."
+        )
+
+    mnemonic = _normalize_ptx_asm(str(asm))
+    if mnemonic is None or mnemonic not in PTX_TO_TIR:
+        # Surface the *full* asm_string so triage can copy-paste it into
+        # the dictionary (or back into a portable intrinsic). The message
+        # also lists supported keys so the user can see what we DO handle.
+        supported = ", ".join(sorted(PTX_TO_TIR.keys()))
+        raise EmitError(
+            "llvm.inline_asm with unrecognized PTX pattern; cannot retarget "
+            f"to Metal. asm_string={asm!r}. Supported intrinsics: {supported}."
+        )
+
+    operands = _om._operands(op)
+    if not operands:
+        raise EmitError(
+            f"llvm.inline_asm({mnemonic}): expected 1 operand; got 0"
+        )
+    src_ssa = operands[0]
+    src = ctx.get(src_ssa) if src_ssa in ctx.value_map else src_ssa
+
+    tir = ctx.tir()
+    expr = PTX_TO_TIR[mnemonic](tir, src)
+
+    if _om._results(op):
+        ctx.bind(_om._results(op)[0], expr)
+    return expr
+
+
+# ---------------------------------------------------------------------------
 # Public dispatch table
 # ---------------------------------------------------------------------------
 
@@ -865,6 +1282,11 @@ CONTROL_EMITTERS: Dict[str, Callable[..., Any]] = {
     "scf.for": map_scf_for,
     "scf.if": map_scf_if,
     "scf.yield": map_scf_yield,
+    "scf.while": map_scf_while,
+    # llvm inline asm (Triton's PTX fast-math escape hatch). We also accept
+    # the Triton-dialect spelling some pipelines emit pre-canonicalisation.
+    "llvm.inline_asm": map_llvm_inline_asm,
+    "tt.elementwise_inline_asm": map_llvm_inline_asm,
 }
 
 

@@ -5,6 +5,23 @@
 //
 //===----------------------------------------------------------------------===//
 
+//===----------------------------------------------------------------------===//
+// LEGACY BLOCK-POINTER PtrAnalysis — opt-in gated.
+//
+// This file uses mlir::triton::MakeTensorPtrOp / mlir::triton::AdvanceOp,
+// both of which were removed from upstream Triton in early 2026. The
+// AnalysisStructured/PtrAnalysis variant in the same vendored tree is the
+// supported forward-ported path.
+//
+// This file is excluded from the default CMake build target. To compile it
+// against an older Triton snapshot that still has MakeTensorPtrOp/AdvanceOp,
+// define TRITON_SHARED_ALLOW_LEGACY_PTRANALYSIS at compile time.
+//===----------------------------------------------------------------------===//
+
+#ifndef TRITON_SHARED_ALLOW_LEGACY_PTRANALYSIS
+#error "vendored/triton_shared/lib/Analysis/PtrAnalysis is the legacy block-pointer variant; mlir::triton::{MakeTensorPtrOp,AdvanceOp} are removed in current Triton. Use lib/AnalysisStructured/PtrAnalysis instead, OR define TRITON_SHARED_ALLOW_LEGACY_PTRANALYSIS=1 if you have an older Triton snapshot. See vendored/triton_shared/VENDORING_NOTES.md."
+#endif
+
 #ifndef TRITON_ANALYSIS_PTRANALYSIS_H
 #define TRITON_ANALYSIS_PTRANALYSIS_H
 

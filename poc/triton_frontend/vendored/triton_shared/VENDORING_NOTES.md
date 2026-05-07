@@ -416,3 +416,10 @@ DISABLE_INSTALL`) when it is available — that is, when downstream
 MLIR's CMake helpers (pure LLVM, system-installed MLIR without dev
 files, …) the helper falls back to plain `add_library(... STATIC ...)`.
 Both code paths produce identical link-time semantics.
+
+## Legacy block-pointer PtrAnalysis (gated)
+
+`lib/Analysis/PtrAnalysis.{h,cpp}` is the legacy variant gated behind the
+`TRITON_SHARED_ALLOW_LEGACY_PTRANALYSIS` macro. It depends on Triton ops
+removed in 2026 — see file headers for full rationale. The supported
+forward-ported variant is `lib/AnalysisStructured/PtrAnalysis.cpp`.

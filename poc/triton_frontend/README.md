@@ -82,6 +82,21 @@ extern intrinsic mechanism).
 4. Cite the RFC subsection (sections 5.1, 5.2, 5.4 are the typical ones)
    in the docstring.
 
+## Setup
+
+Install Triton (with the Apple backend) into `.venv313` so this POC can
+capture TTIR from `@triton.jit` kernels:
+
+```bash
+bash scripts/setup_local_triton.sh
+```
+
+Idempotent. Editable-installs Triton from
+`/Volumes/external/sources/triton-pr9701` (or falls back to the PyPI wheel
+where available), pins the resolved version into
+`.venv313/etc/pip/constraints.txt`, and verifies that `tvm_ffi`, `tvm`,
+`tilelang`, and `triton` all import side-by-side.
+
 ## Building the C++ PtrAnalysis shim
 
 The Python facade in `ptr_analysis.py` drives the vendored
