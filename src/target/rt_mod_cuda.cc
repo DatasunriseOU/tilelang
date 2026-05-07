@@ -1,7 +1,14 @@
 #include "../transform/common/attr.h"
 #include "codegen_cuda.h"
-#include "runtime/cuda/cuda_module.h"
-#include "runtime/meta_data.h"
+// apache/tvm-latest stripped the public `runtime/cuda/cuda_module.h`; the
+// codegen-facing factory now lives in `target/cuda/cuda_fallback_module.h`
+// (`target::CUDAModuleCreateWithFallback`).  It returns a real `CUDAModuleNode`
+// when the runtime is registered ("ffi.Module.create.cuda") and a
+// `CUDAFallbackModuleNode` otherwise — equivalent surface to the old
+// `runtime::CUDAModuleCreate`.
+#include "target/cuda/cuda_fallback_module.h"
+// apache/tvm-latest renamed `runtime/meta_data.h` → `runtime/metadata.h`.
+#include "runtime/metadata.h"
 #include "runtime/pack_args.h"
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/transform.h>
@@ -39,42 +46,54 @@ static void ValidateUniqueDeviceGlobalSymbols(const IRModule &mod) {
   }
 }
 
-static std::unordered_map<std::string, runtime::FunctionInfo>
+// apache/tvm-latest converted `runtime::FunctionInfo` from a struct with
+// std::vector members to an ObjectRef around `FunctionInfoObj` whose fields
+// are `ffi::Array<...>`.  Build up the ffi::Array values, then construct the
+// FunctionInfo via its 4-arg ctor (name, arg_types, launch_param_tags,
+// arg_extra_tags).
+static ffi::Map<ffi::String, runtime::FunctionInfo>
 ExtractFuncInfo(const IRModule &mod) {
-  std::unordered_map<std::string, runtime::FunctionInfo> fmap;
+  ffi::Map<ffi::String, runtime::FunctionInfo> fmap;
 
   for (auto kv : mod->functions) {
     ICHECK(kv.second->IsInstance<tirx::PrimFuncNode>())
         << "Can only lower IR Module with PrimFuncs";
     auto f = Downcast<tirx::PrimFunc>(kv.second);
 
-    runtime::FunctionInfo info;
+    ffi::Array<DLDataType> arg_types;
+    ffi::Array<runtime::ArgExtraTags> arg_extra_tags;
+    auto is_tensormap = [](const tirx::Var &var) -> bool {
+      const auto *type = var->type_annotation.as<PointerTypeNode>();
+      if (type == nullptr) return false;
+      return type->element_type.as<TensorMapTypeNode>() != nullptr;
+    };
     for (size_t i = 0; i < f->params.size(); ++i) {
-      if (f->params[i]->dtype.is_handle()) {
-        auto ptr = f->params[i]->type_annotation.as<PointerTypeNode>();
-        if (ptr && ptr->storage_scope == "grid_constant") {
-          info.arg_types.push_back(DataType(runtime::kDLGridConstant, 64, 1));
-          continue;
-        }
-      }
+      // apache/tvm-latest dropped the `kDLGridConstant` synthetic dtype that
+      // was previously emitted for `grid_constant` storage_scope params; the
+      // tensor-map case is now signalled per-arg via
+      // `ArgExtraTags::kTensorMap`.
       DataType dtype = f->params[i].dtype();
       // Device runtime cannot directly take bool arguments, map to int32.
       if (dtype.is_bool())
         dtype = DataType::Int(32);
-      info.arg_types.push_back(dtype);
+      arg_types.push_back(dtype);
+      arg_extra_tags.push_back(is_tensormap(f->params[i])
+                                   ? runtime::ArgExtraTags::kTensorMap
+                                   : runtime::ArgExtraTags::kNone);
     }
+    ffi::Array<ffi::String> launch_param_tags;
     if (f->HasNonzeroAttr(tl::attr::kHasGridSync)) {
-      info.launch_param_tags.push_back(
+      launch_param_tags.push_back(
           runtime::launch_param::kUseProgramaticDependentLaunch);
     }
     if (f->HasNonzeroAttr("use_cooperative_groups")) {
-      info.launch_param_tags.push_back(
+      launch_param_tags.push_back(
           runtime::launch_param::kUseCooperativeLaunch);
     }
     if (f->GetAttr<ffi::Array<Integer>>("cluster_dims").defined()) {
-      info.launch_param_tags.push_back(runtime::launch_param::kClusterDimX);
-      info.launch_param_tags.push_back(runtime::launch_param::kClusterDimY);
-      info.launch_param_tags.push_back(runtime::launch_param::kClusterDimZ);
+      launch_param_tags.push_back(runtime::launch_param::kClusterDimX);
+      launch_param_tags.push_back(runtime::launch_param::kClusterDimY);
+      launch_param_tags.push_back(runtime::launch_param::kClusterDimZ);
     }
     if (auto opt = f->GetAttr<ffi::Array<ffi::String>>(
             tirx::attr::kKernelLaunchParams)) {
@@ -82,11 +101,16 @@ ExtractFuncInfo(const IRModule &mod) {
         if (tag != runtime::launch_param::kClusterDimX &&
             tag != runtime::launch_param::kClusterDimY &&
             tag != runtime::launch_param::kClusterDimZ) {
-          info.launch_param_tags.push_back(tag);
+          launch_param_tags.push_back(tag);
         }
       }
     }
-    fmap[GetDeviceGlobalSymbol(Downcast<GlobalVar>(kv.first), f)] = info;
+    ffi::String global_symbol =
+        GetDeviceGlobalSymbol(Downcast<GlobalVar>(kv.first), f);
+    fmap.Set(global_symbol,
+             runtime::FunctionInfo(global_symbol, std::move(arg_types),
+                                   std::move(launch_param_tags),
+                                   std::move(arg_extra_tags)));
   }
   return fmap;
 }
@@ -130,7 +154,13 @@ ffi::Module BuildTileLangCUDA(IRModule mod, Target target) {
   } else {
     ICHECK(0);
   }
-  return runtime::CUDAModuleCreate(ptx, fmt, ExtractFuncInfo(mod), code);
+  // Hand off compiled bytes to the fallback-aware factory (apache/tvm-latest
+  // dropped the public `runtime::CUDAModuleCreate` wrapper).
+  ffi::Map<ffi::String, ffi::String> source_map;
+  source_map.Set("cuda_source", code);
+  return target::CUDAModuleCreateWithFallback(ffi::Bytes(ptx.data(), ptx.size()),
+                                              ffi::String(fmt), ExtractFuncInfo(mod),
+                                              source_map);
 }
 
 ffi::Module BuildTileLangCUDAWithoutCompile(IRModule mod, Target target) {
@@ -159,7 +189,10 @@ ffi::Module BuildTileLangCUDAWithoutCompile(IRModule mod, Target target) {
           ffi::Function::GetGlobal("tilelang_callback_cuda_postproc")) {
     code = (*f)(code, target).cast<std::string>();
   }
-  return runtime::CUDAModuleCreate("ptx", "ptx", ExtractFuncInfo(mod), code);
+  ffi::Map<ffi::String, ffi::String> source_map;
+  source_map.Set("cuda_source", code);
+  return target::CUDAModuleCreateWithFallback(ffi::Bytes("ptx", 3), ffi::String("ptx"),
+                                              ExtractFuncInfo(mod), source_map);
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
