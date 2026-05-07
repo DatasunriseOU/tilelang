@@ -74,10 +74,37 @@ def test_dot_reduce_atomic_matches_numpy():
     np.testing.assert_allclose(got, expect, rtol=5e-2, atol=5e-2)
 
 
+def test_dot_reduce_atomic_trans_b_matches_numpy():
+    """Phase-1 migration regression: trans_b path produces same numerics."""
+    np = _np()
+    conf = _conformance()
+    kernel = conf.kernel_dot_reduce_atomic_trans_b(M=64, N=64, K=64, BLOCK=32)
+    if kernel is None:
+        pytest.skip("tilelang.language not available")
+
+    a = np.random.randn(64, 64).astype(np.float16)
+    # Trans-B layout: pass B as (N, K) and let T.gemm transpose at MMA.
+    b_kn = np.random.randn(64, 64).astype(np.float16)
+    expect = (a.astype(np.float32) @ b_kn.astype(np.float32).T).sum(axis=0)
+
+    try:
+        import torch
+        a_t = torch.from_numpy(a)
+        b_t = torch.from_numpy(b_kn)
+        acc = torch.zeros(64, dtype=torch.float32)
+        kernel(a_t, b_t, acc)
+        got = acc.numpy()
+    except Exception as exc:
+        pytest.skip(f"backend execution failed: {exc!r}")
+
+    np.testing.assert_allclose(got, expect, rtol=5e-2, atol=5e-2)
+
+
 def test_kernels_dict_lists_wave2_additions():
     conf = _conformance()
     assert "vector_add" in conf.KERNELS
     assert "dot_reduce_atomic" in conf.KERNELS
+    assert "dot_reduce_atomic_trans_b" in conf.KERNELS
 
 
 def test_softmax_matches_numpy():

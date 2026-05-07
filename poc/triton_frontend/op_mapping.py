@@ -56,10 +56,12 @@ __all__ = [
     "map_tt_splat",
     "map_tt_expand_dims",
     "map_tt_reshape",
+    "map_tt_trans",
     "map_tt_make_range",
     # Async / barrier
     "map_tt_async_copy",
     "map_tt_mbarrier",
+    "map_tt_sync_threads_partial",
     # TMA
     "map_tt_experimental_descriptor_load",
     "map_tt_experimental_descriptor_store",
@@ -98,6 +100,12 @@ class WalkerCtx:
         # Lazy-loaded TVM modules.
         self._tvm: Any = None
         self._T: Any = None
+        # SSA value -> source SSA value for transposed views (tt.trans).
+        # Lets map_tt_dot fold an intervening tt.trans into transpose_A/B
+        # without materialising the transpose. The pair (i, j) records the
+        # axes flipped; for the common 2D matmul case both values are the
+        # last two axes (e.g. (-2, -1)).
+        self.transposed_views: Dict[Any, Tuple[int, int]] = {}
 
     # ---- helpers --------------------------------------------------------
 
@@ -689,6 +697,16 @@ def map_tt_dot(op: Any, ctx: WalkerCtx) -> Any:
     transpose_A = bool(attrs.get("transpose_A", False) or attrs.get("trans_a", False))
     transpose_B = bool(attrs.get("transpose_B", False) or attrs.get("trans_b", False))
 
+    # Fold an intervening tt.trans (recorded by map_tt_trans) into the
+    # transpose flags. dsa_splitk and sparse_mla_path_c emit
+    # ``%bt = tt.trans %b ; %c = tt.dot %a, %bt`` rather than a single
+    # tt.dot with a transpose_B attribute; without folding we'd materialise
+    # an unnecessary copy.
+    if a_ssa in ctx.transposed_views:
+        transpose_A = not transpose_A
+    if b_ssa in ctx.transposed_views:
+        transpose_B = not transpose_B
+
     import tilelang.language as T  # type: ignore  # lazy
     if c_ssa is not None:
         try:
@@ -925,6 +943,44 @@ def map_tt_reshape(op: Any, ctx: WalkerCtx) -> Any:
     return src
 
 
+def map_tt_trans(op: Any, ctx: WalkerCtx) -> Any:
+    """Lower ``tt.trans`` (logical transpose) to a sidecar bind.
+
+    Triton's ``tt.trans`` flips two axes of a tile (default: the last
+    two). At the TIR layer we don't materialise the transpose; instead
+    we rebind the result SSA to the *same* TIR value as the source and
+    record the flipped-axis pair in ``ctx.transposed_views`` so that a
+    downstream ``tt.dot`` consumer can fold it into ``transpose_A`` /
+    ``transpose_B`` on the emitted ``T.gemm`` call. This matches the
+    Triton pattern used by ``tl.dot(A, B, trans_b=True)`` which the
+    frontend lowers as ``%bt = tt.trans %b; tt.dot %a, %bt`` when the
+    ``trans_b`` kwarg has been propagated as a separate op.
+    """
+    operands = _operands(op)
+    if not operands:
+        raise ValueError("tt.trans: missing source operand")
+    src_ssa = operands[0]
+    src = ctx.get(src_ssa)
+    attrs = _attrs(op)
+    # Default to flipping the last two axes; honour an explicit ``order``
+    # attribute when it carries a 2-element permutation that swaps two
+    # axes (Triton's general form, but matmul callers always use a swap).
+    order = attrs.get("order")
+    if order is not None and len(tuple(order)) >= 2:
+        a, b = int(tuple(order)[-2]), int(tuple(order)[-1])
+    else:
+        a, b = -2, -1
+    if _results(op):
+        result_ssa = _results(op)[0]
+        ctx.bind(result_ssa, src)
+        # If the source was itself transposed, double-transpose cancels.
+        if src_ssa in ctx.transposed_views:
+            ctx.transposed_views.pop(result_ssa, None)
+        else:
+            ctx.transposed_views[result_ssa] = (a, b)
+    return src
+
+
 def map_tt_make_range(op: Any, ctx: WalkerCtx) -> Any:
     """Lower ``tt.make_range(start, end)`` to a Ramp PrimExpr.
 
@@ -1067,6 +1123,43 @@ def map_tt_mbarrier(op: Any, ctx: WalkerCtx) -> Any:
     # Plain ``__syncthreads`` style barrier.
     tir = ctx.tir()
     handle = tir.call_intrin("handle", tir.op.Op.get("tir.tvm_storage_sync"), "shared")
+    ctx.emit(handle)
+    return handle
+
+
+def map_tt_sync_threads_partial(op: Any, ctx: WalkerCtx) -> Any:
+    """Lower ``tt.sync_threads_partial(mask, n_threads)`` to ``T.sync_threads_partial``.
+
+    Recipe (cppmega.mlx topk_selector → unified pipeline migration, Phase 1):
+    Triton-style radix-select kernels emit a partial-warp barrier so only the
+    lanes set in ``mask`` rendezvous. Forward straight to the new TileLang
+    primitive that lowers to ``__syncwarp(mask)`` on CUDA, a no-op on HIP
+    (wavefront is hardware-convergent), and ``simdgroup_barrier`` on Metal.
+    Also accepts the alias spellings ``triton.language.partial_barrier`` and
+    ``tt.partial_barrier`` so multiple TTIR producers route through one
+    emitter.
+    """
+    operands = _operands(op)
+    if len(operands) < 2:
+        raise ValueError(
+            f"tt.sync_threads_partial: expected (mask, n_threads); got "
+            f"{len(operands)} operands"
+        )
+    mask = ctx.get(operands[0])
+    n_threads = ctx.get(operands[1])
+
+    import tilelang.language as T  # type: ignore  # lazy
+
+    if hasattr(T, "sync_threads_partial"):
+        handle = T.sync_threads_partial(mask, n_threads)
+    else:
+        tir = ctx.tir()
+        handle = tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.sync_threads_partial"),
+            mask,
+            n_threads,
+        )
     ctx.emit(handle)
     return handle
 
@@ -1286,6 +1379,7 @@ OP_TABLE: Dict[str, EmitFn] = {
     "tt.splat": map_tt_splat,
     "tt.expand_dims": map_tt_expand_dims,
     "tt.reshape": map_tt_reshape,
+    "tt.trans": map_tt_trans,
     "tt.make_range": map_tt_make_range,
     # async / barrier (multiple TTIR spellings route through one emitter)
     "async_copy": map_tt_async_copy,
@@ -1296,6 +1390,10 @@ OP_TABLE: Dict[str, EmitFn] = {
     "tt.barrier_init": map_tt_mbarrier,
     "tt.barrier_arrive": map_tt_mbarrier,
     "tt.barrier_wait": map_tt_mbarrier,
+    # partial-warp / subgroup barrier (cppmega.mlx topk_selector migration)
+    "tt.sync_threads_partial": map_tt_sync_threads_partial,
+    "tt.partial_barrier": map_tt_sync_threads_partial,
+    "triton.language.partial_barrier": map_tt_sync_threads_partial,
     # TMA
     "tt.experimental_descriptor_load": map_tt_experimental_descriptor_load,
     "tt.experimental_descriptor_store": map_tt_experimental_descriptor_store,

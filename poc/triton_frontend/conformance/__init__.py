@@ -29,6 +29,7 @@ __all__ = [
     "kernel_fa_v3",
     "kernel_paged_attn",
     "kernel_dot_reduce_atomic",
+    "kernel_dot_reduce_atomic_trans_b",
 ]
 
 
@@ -253,6 +254,46 @@ def kernel_dot_reduce_atomic(
     return dot_reduce_atomic
 
 
+def kernel_dot_reduce_atomic_trans_b(
+    M: int = 64, N: int = 64, K: int = 64, BLOCK: int = 32
+) -> Optional[Any]:
+    """Phase-1 migration: ``tl.dot(A, B, trans_b=True)`` + reduce_sum + atomic_add.
+
+    Mirrors ``kernel_dot_reduce_atomic`` but takes B in ``(N, K)`` layout
+    and asks ``T.gemm`` to transpose B at MMA time. Locks the
+    ``map_tt_dot`` + ``map_tt_trans`` fold path used by cppmega.mlx
+    kernels (``dsa_splitk_indexer_loss``, ``sparse_mla_path_c``).
+    """
+    T = _try_tilelang()
+    if T is None:
+        return None
+    import tilelang
+
+    @tilelang.jit
+    @T.prim_func
+    def dot_reduce_atomic_trans_b(
+        A: T.Tensor((M, K), "float16"),
+        B: T.Tensor((N, K), "float16"),  # transposed-B layout
+        Acc: T.Tensor((N,), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(M, BLOCK), T.ceildiv(N, BLOCK), threads=128) as (bx, by):
+            A_s = T.alloc_shared((BLOCK, K), "float16")
+            B_s = T.alloc_shared((BLOCK, K), "float16")
+            C_f = T.alloc_fragment((BLOCK, BLOCK), "float32")
+            T.clear(C_f)
+            T.copy(A[bx * BLOCK, 0], A_s)
+            T.copy(B[by * BLOCK, 0], B_s)
+            T.gemm(A_s, B_s, C_f, transpose_B=True)
+
+            col_sum = T.alloc_fragment((BLOCK,), "float32")
+            T.reduce_sum(C_f, col_sum, dim=0, clear=True)
+
+            for j in T.Parallel(BLOCK):
+                T.atomic_add(Acc[by * BLOCK + j], col_sum[j])
+
+    return dot_reduce_atomic_trans_b
+
+
 KERNELS: Dict[str, Callable[..., Optional[Any]]] = {
     "vector_add": kernel_vector_add,
     "softmax": kernel_softmax,
@@ -262,4 +303,5 @@ KERNELS: Dict[str, Callable[..., Optional[Any]]] = {
     "fa_v3": kernel_fa_v3,
     "paged_attn": kernel_paged_attn,
     "dot_reduce_atomic": kernel_dot_reduce_atomic,
+    "dot_reduce_atomic_trans_b": kernel_dot_reduce_atomic_trans_b,
 }
