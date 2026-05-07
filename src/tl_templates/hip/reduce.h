@@ -110,6 +110,14 @@ struct AllReduce {
                 threads == 128 || threads == 64 || threads == 32 ||
                 threads == 16 || threads == 8 || threads == 4 || threads == 2);
   static_assert(threads % scale == 0);
+  // Wave-11 #1: the explicit power-of-two enumeration above already
+  // covers the AllReduce XOR-butterfly invariant; this static_assert
+  // restates the contract so the HIP and CUDA templates stay in lock
+  // step (CUDA does not have the explicit enum). See cuda/reduce.h
+  // and src/op/reduce.cc Lower() for the matching lowering-time
+  // ICHECK that rejects non-power-of-2 reducing_threads.
+  static_assert((threads & (threads - 1)) == 0,
+                "tl::AllReduce<> (HIP): `threads` must be a power of two.");
 
   // Scalar interface (backward-compatible).
   template <typename T> static __device__ T run(T x, T *red_buf = nullptr) {

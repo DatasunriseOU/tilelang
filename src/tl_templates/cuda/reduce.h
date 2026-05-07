@@ -174,6 +174,17 @@ template <class Reducer, int threads, int scale, int thread_offset = 0,
           int workspace_stride = 0>
 struct AllReduce {
   static_assert(threads % scale == 0);
+  // Wave-11 #1 (closes grok+meta HIGH on warp-lane-mask exploit). The
+  // recursion below halves `threads` at every step and shuffles with
+  // offset = threads/2; correctness requires `threads` to be a power of
+  // two. The matching ICHECK in src/op/reduce.cc Lower() guarantees this
+  // at lowering time, but we re-state it here so any direct C++ caller
+  // (e.g. hand-written kernels under src/tl_templates/) gets a clean
+  // compile-time error instead of silent wrong-results from the XOR
+  // butterfly visiting non-existent lanes.
+  static_assert((threads & (threads - 1)) == 0,
+                "tl::AllReduce<>: `threads` must be a power of two "
+                "(structural invariant of the XOR-butterfly recursion).");
 
   // Scalar interface (backward-compatible).
   template <typename T> static TL_DEVICE T run(T x, T *red_buf = nullptr) {

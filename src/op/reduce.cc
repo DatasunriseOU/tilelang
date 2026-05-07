@@ -130,6 +130,21 @@ PrimExpr ReduceOpNode::MakeInitValue() const {
     return make_zero(dst->dtype);
   } else if (type->isMul()) {
     // Wave-8 #5: identity element for product reduction is 1.
+    //
+    // Wave-11 #1 (closes grok rev_d1fb5da1bb / meta rev_528f578233 HIGH on
+    // "warp lane mask exploit" — silent wrong product on non-warp-divisible
+    // dim length). The MakeInitValue() result here writes the multiplicative
+    // identity into *every* clear_buffer slot of every participating thread
+    // BEFORE the per-thread reduce loop unrolls. Threads that the fragment
+    // layout maps to zero src elements (because the reduce-dim length is
+    // smaller than reducing_threads, e.g. dim=33 lowered onto 32 threads
+    // means lane 32..reducing_threads-1 see no src element) therefore enter
+    // AllReduce<MulOp,...> holding T(1), not garbage. The subsequent XOR-
+    // butterfly thus combines `acc * 1 == acc` for the inactive lanes — the
+    // identity-pad contract documented in src/tl_templates/{cuda,hip}/reduce.h
+    // is enforced *at lowering time* by this initial store, not by callers.
+    // The static_assert((threads & (threads-1)) == 0, ...) on AllReduce
+    // additionally rejects non-power-of-2 reducing_threads at compile time.
     return make_const(dst->dtype, 1);
   } else {
     LOG(FATAL) << "Unsupported reduce type: " << type->type;
@@ -513,6 +528,16 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
           continue;
 
         int reducing_threads = (*extent) * (*scale);
+        // Wave-11 #1: same power-of-two enforcement as the scalar path
+        // above. The batched AllReduce recursion has identical structural
+        // requirements (offset = threads/2 at every step).
+        ICHECK(reducing_threads > 0 &&
+               (reducing_threads & (reducing_threads - 1)) == 0)
+            << "ReduceOp(batched): reducing_threads must be a power of two "
+            << "for the AllReduce XOR-butterfly to be correct; got "
+            << reducing_threads << " for type=" << this->type->type
+            << ". Adjust the fragment layout / thread split or insert an "
+            << "identity-pad before the reduce.";
         auto thread_offset = T.thread_bounds->min;
         std::stringstream ss;
 
@@ -652,6 +677,26 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
             continue;
 
           int reducing_threads = (*extent) * (*scale);
+          // Wave-11 #1: lowering-time enforcement of the AllReduce contract.
+          // The XOR-butterfly recursion in
+          // src/tl_templates/{cuda,hip}/reduce.h halves `threads` at every
+          // step and shuffles with offset = threads/2; this only converges
+          // correctly when reducing_threads is a power of two. The CUDA
+          // template's `shfl_xor_sync(0xffffffff, ...)` additionally
+          // requires every participating lane's red_buf slot to hold a
+          // valid identity-padded value — which `MakeInitValue()` already
+          // writes before the per-thread reduce loop runs (see the kMul
+          // comment there). This ICHECK therefore closes the meta/grok
+          // wave-10 HIGH on "silent wrong product on non-warp-divisible N"
+          // by refusing to lower to AllReduce when the structural
+          // power-of-two invariant cannot hold.
+          ICHECK(reducing_threads > 0 &&
+                 (reducing_threads & (reducing_threads - 1)) == 0)
+              << "ReduceOp: reducing_threads must be a power of two for the "
+              << "AllReduce XOR-butterfly to be correct; got "
+              << reducing_threads << " for type=" << this->type->type
+              << ". Adjust the fragment layout / thread split or insert an "
+              << "identity-pad before the reduce.";
           std::stringstream ss;
 
           auto thread_offset = T.thread_bounds->min;
