@@ -100,24 +100,12 @@ def _z3_extent_le_32(extent_expr) -> tuple[bool, str]:
         proved = int(extent_expr.value) <= _SIMD_LANES
         return proved, f"static: extent={int(extent_expr.value)} <= {_SIMD_LANES}? {proved}"
 
-    try:
-        import z3  # type: ignore
-    except Exception as exc:  # pragma: no cover - z3 missing
-        return False, f"z3 unavailable: {exc!r}"
-
-    solver = z3.Solver()
-    solver.set("timeout", 500)
-    z_ext = z3.Int("extent")
-    solver.add(z_ext > 0)
-    solver.push()
-    solver.add(z3.Not(z_ext <= _SIMD_LANES))
-    res = solver.check()
-    solver.pop()
-    proved = (res == z3.unsat)
-    query = (
-        f"assert extent <= {_SIMD_LANES}; check_sat(neg)={res}; proved={proved}"
-    )
-    return proved, query
+    # fix-round-4: previous version constructed `z3.Int("extent")` with only
+    # `z_ext > 0` — no link to the actual TIR expression — so the query was
+    # vacuous (always SAT under negation, hence always returning False but
+    # advertising a "z3 proof" in the log). Reject symbolic extents
+    # conservatively without spinning up z3.
+    return False, f"symbolic extent rejected (expr={extent_expr!s})"
 
 
 def _is_butterfly_annotated(node: tir.For) -> bool:
