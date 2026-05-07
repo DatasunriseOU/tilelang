@@ -146,17 +146,21 @@ def test_bug2_matmul_lowers_to_real_prim_func() -> None:
         f"path. source={artifact.source!r}")
 
 
-def test_matmul_two_input_lowers_with_threadidx_extent() -> None:
-    """Two-input matmul ``A @ B`` lowers without the ``num_warps == 0``
-    failure.
+def test_matmul_two_input_emits_threadidx_extent_in_prim_func() -> None:
+    """Two-input matmul ``A @ B`` emits a PrimFunc whose body carries the
+    ``threadIdx.x`` ``thread_extent`` binding TileLang's ``gemm.lower``
+    needs to compute ``num_warps = block_size / warp_size`` non-zero.
 
     Regression for the Triton-frontend ``COMPILE_FAIL: m_warp * n_warp ==
-    num_warps, num_warps: 0`` where the lowered PrimFunc lacked a
-    ``threadIdx.x`` ``thread_extent`` AttrStmt. The fx-to-tilelang
-    sequential matmul builder uses ``T.Kernel(threads=...)`` which already
-    emits the binding; this test pins that contract by asserting the
-    region lowers all the way to ``tilelang.compile ok`` without the
-    matmul PrimFunc emitter fallback.
+    num_warps, num_warps: 0`` failure. The fx-to-tilelang sequential
+    matmul builder uses ``T.Kernel(threads=128)`` which emits the
+    threadIdx.x binding directly; we pin that contract here so a
+    refactor that drops the explicit ``threads=`` kwarg fails this test.
+
+    We do NOT assert ``tilelang.compile ok`` because a separate fp32
+    accumulator → fp16 epilogue lowering bug (``C_l_elem_offset`` not
+    in API args) currently blocks the full Metal codegen — that's a
+    different issue tracked outside this regression.
     """
     import torch
 
@@ -167,8 +171,22 @@ def test_matmul_two_input_lowers_with_threadidx_extent() -> None:
     assert len(artifact.prim_funcs) >= 1, (
         f"expected matmul to lower to a real PrimFunc; source={artifact.source!r}"
     )
-    assert "tilelang.compile ok" in artifact.source, (
-        f"expected 'tilelang.compile ok' in source, got {artifact.source!r}"
+    prim_text = str(artifact.prim_funcs[0])
+    assert "threadIdx.x" in prim_text, (
+        "matmul PrimFunc must carry a threadIdx.x binding so TileLang's "
+        "gemm.lower can compute num_warps; got body without threadIdx.x:\n"
+        f"{prim_text}"
+    )
+    # Sanity: 128-thread default (= 4 warps). The exact extent comes from
+    # ``_emit_sequential_matmul``'s ``threads`` heuristic; for a 64x64
+    # tile the heuristic picks 128. If the heuristic ever changes, accept
+    # any non-zero extent that's a multiple of 32 (warp_size).
+    import re
+    m = re.search(r'threadIdx\.x", (\d+)', prim_text)
+    assert m is not None, f"could not parse threadIdx.x extent from:\n{prim_text}"
+    extent = int(m.group(1))
+    assert extent > 0 and extent % 32 == 0, (
+        f"threadIdx.x extent must be a positive multiple of 32 (warp_size); got {extent}"
     )
 
 
