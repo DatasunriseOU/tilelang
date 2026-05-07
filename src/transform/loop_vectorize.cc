@@ -1018,6 +1018,14 @@ static bool Z3CanProveAlignedAccess(const Buffer &buffer,
   if (!buffer.defined() || indices.empty()) {
     return false;
   }
+  // CPPMEGA idea712 round-final fix-N0: vector_size <= 1 is a degenerate
+  // request — there is nothing to align (every byte address is "aligned"
+  // to width 1). The caller's loop-level affine substitution
+  // `loop_var % vector_size == 0` collapses to `loop_var % 1 == 0` which
+  // is trivially true and yields a meaningless proof. Skip Z3.
+  if (vector_size <= 1) {
+    return false;
+  }
   int dtype_bytes = buffer->dtype.bytes();
   if (dtype_bytes <= 0) {
     return false;
@@ -1418,6 +1426,17 @@ static bool Z3CanProveUnitStride(const PrimExpr &expr, const Var &var,
   if (!IsAffineInVar(expr, var)) {
     return false;
   }
+  // CPPMEGA idea712 round-final fix-N0: degenerate-extent guard. If the
+  // loop trip count is statically 0 or 1, the substitution `var -> var + 1`
+  // steps outside the loop domain and the affine "delta == 1" comparison
+  // is meaningless. Skip Z3 entirely. The runtime BV constraint
+  // `iter_var_size > 0` below still defends the symbolic-extent case;
+  // this short-circuit defends the constant-extent case.
+  if (const auto *iv_imm = iter_var_size.as<IntImmNode>()) {
+    if (iv_imm->value <= 1) {
+      return false;
+    }
+  }
   try {
     auto &z3 = arith::Z3Prover(analyzer);
     z3.SetTimeoutMs(50);
@@ -1529,6 +1548,17 @@ bool IndicesCanVectorize(const PrimExpr &expr, Var var,
   ICHECK(target_vectorized_size >= 1);
   if (target_vectorized_size == 1)
     return true;
+
+  // CPPMEGA idea712 round-final fix-N0: extent 0/1 short-circuit. If the
+  // loop trip count is statically 0 or 1 there is no contiguity to prove
+  // (the affine substitution `var -> var + 1` would step outside the loop
+  // domain and the resulting comparisons are nonsensical). Bail to scalar
+  // before invoking Z3.
+  if (const auto *iv_imm = iter_var_size.as<IntImmNode>()) {
+    if (iv_imm->value <= 1) {
+      return false;
+    }
+  }
 
   // Extent must be divisible
   PrimExpr target_size_for_iter =
