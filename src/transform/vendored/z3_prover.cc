@@ -1010,8 +1010,10 @@ void Z3Prover::SetBitVectorMode(int width) {
 int Z3Prover::GetBitVectorWidth() const {
   return impl_->GetBitVectorWidth();
 }
-// CPPMEGA z3-stack fix-A6: forwarder for the per-pass reset.
-void Z3Prover::Reset() { impl_->Reset(); }
+// CPPMEGA z3-stack fix-A6/A8 + idea712 fix-B7: atomic reset of
+// (memo + solver + scope_stack). The B7 implementation supersedes the
+// earlier A8 forwarder (`impl_->Reset()`); it adds lifecycle checks and
+// directly manages each piece of state for invariant-preserving teardown.
 
 // CPPMEGA fix-B7 (idea712): atomic reset of (memo + solver + scope_stack).
 // See the header doc for the audit rationale. The function is exposed for
