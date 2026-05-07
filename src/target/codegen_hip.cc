@@ -227,6 +227,18 @@ std::string CodeGenTileLangHIP::Finish() {
   decl_stream << "#include <tl_templates/hip/threadblock_swizzle.h>\n";
   decl_stream << "#include <tl_templates/hip/debug.h>\n";
   decl_stream << "\n";
+  // RFC §5.4 / lower_tma_to_ptr_arith.cc:249 — non-NV TMA fallback emits
+  // ``tl::call_extern("__tl_ptr_copy_elem", dst, src, bytes)`` per element
+  // copy. HIP/HCC has a unified address space at the C++ level, so a
+  // single generic-pointer overload suffices; the LDS/global distinction
+  // is recovered by the AMDGPU backend from the use site. Body is a byte
+  // loop — small enough to inline, vectorized by ROCm clang when aligned.
+  decl_stream << "__device__ inline void __tl_ptr_copy_elem("
+                 "void* dst, const void* src, int bytes) {\n"
+              << "  char* d = (char*)dst;\n"
+              << "  const char* s = (const char*)src;\n"
+              << "  for (int i = 0; i < bytes; ++i) { d[i] = s[i]; }\n"
+              << "}\n\n";
   return CodeGenC::Finish();
 }
 
@@ -1423,6 +1435,71 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     // atomic_min_ret_elem_op(dst_ptr, src_value[, memory_order]) -> returns
     // prev value
     os << "AtomicMinRet(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]);
+    if (op->args.size() > 2) {
+      os << ", " << PrintExpr(op->args[2]);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::atomic_xchg_elem_op())) {
+    // atomic_xchg_elem_op(dst_ptr, src_value[, memory_order])
+    std::string dst_ptr = PrintExpr(op->args[0]);
+    std::string src_value = PrintExpr(op->args[1]);
+    this->PrintIndent();
+    this->stream << "AtomicXchg(" << dst_ptr << ", " << src_value;
+    if (op->args.size() > 2) {
+      this->stream << ", " << PrintExpr(op->args[2]);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::atomic_xchg_ret_elem_op())) {
+    os << "AtomicXchgRet(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]);
+    if (op->args.size() > 2) {
+      os << ", " << PrintExpr(op->args[2]);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::atomic_and_elem_op())) {
+    std::string dst_ptr = PrintExpr(op->args[0]);
+    std::string src_value = PrintExpr(op->args[1]);
+    this->PrintIndent();
+    this->stream << "AtomicAnd(" << dst_ptr << ", " << src_value;
+    if (op->args.size() > 2) {
+      this->stream << ", " << PrintExpr(op->args[2]);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::atomic_and_ret_elem_op())) {
+    os << "AtomicAndRet(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]);
+    if (op->args.size() > 2) {
+      os << ", " << PrintExpr(op->args[2]);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::atomic_or_elem_op())) {
+    std::string dst_ptr = PrintExpr(op->args[0]);
+    std::string src_value = PrintExpr(op->args[1]);
+    this->PrintIndent();
+    this->stream << "AtomicOr(" << dst_ptr << ", " << src_value;
+    if (op->args.size() > 2) {
+      this->stream << ", " << PrintExpr(op->args[2]);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::atomic_or_ret_elem_op())) {
+    os << "AtomicOrRet(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]);
+    if (op->args.size() > 2) {
+      os << ", " << PrintExpr(op->args[2]);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::atomic_xor_elem_op())) {
+    std::string dst_ptr = PrintExpr(op->args[0]);
+    std::string src_value = PrintExpr(op->args[1]);
+    this->PrintIndent();
+    this->stream << "AtomicXor(" << dst_ptr << ", " << src_value;
+    if (op->args.size() > 2) {
+      this->stream << ", " << PrintExpr(op->args[2]);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::atomic_xor_ret_elem_op())) {
+    os << "AtomicXorRet(" << PrintExpr(op->args[0]) << ", "
        << PrintExpr(op->args[1]);
     if (op->args.size() > 2) {
       os << ", " << PrintExpr(op->args[2]);

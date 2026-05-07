@@ -1177,7 +1177,15 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
                call_op.same_as(tl::atomic_max_elem_op()) ||
                call_op.same_as(tl::atomic_max_ret_elem_op()) ||
                call_op.same_as(tl::atomic_min_elem_op()) ||
-               call_op.same_as(tl::atomic_min_ret_elem_op());
+               call_op.same_as(tl::atomic_min_ret_elem_op()) ||
+               call_op.same_as(tl::atomic_xchg_elem_op()) ||
+               call_op.same_as(tl::atomic_xchg_ret_elem_op()) ||
+               call_op.same_as(tl::atomic_and_elem_op()) ||
+               call_op.same_as(tl::atomic_and_ret_elem_op()) ||
+               call_op.same_as(tl::atomic_or_elem_op()) ||
+               call_op.same_as(tl::atomic_or_ret_elem_op()) ||
+               call_op.same_as(tl::atomic_xor_elem_op()) ||
+               call_op.same_as(tl::atomic_xor_ret_elem_op());
       }
       return false;
     }();

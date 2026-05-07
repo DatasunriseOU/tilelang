@@ -642,5 +642,46 @@ def test_tile_atomic_max_expr():
     run_tile_atomic_max_expr(128, 128, 32, 32)
 
 
+# ======================= xchg / and / or / xor IR-level tests =======================
+#
+# These tests construct a tiny prim_func that calls each new T.atomic_*
+# wrapper and assert the corresponding ``tl.atomic_<op>_elem_op`` intrinsic
+# name shows up in the printed IR. They exercise the wrappers + the C++
+# Op registration without requiring a CUDA / Metal device.
+
+
+def _atomic_intrin_in_ir(builder_fn, expected_substr: str) -> None:
+    """Build a prim_func with ``builder_fn`` and check the printed IR.
+
+    ``builder_fn`` is a one-arg lambda taking a 1-element ``int32`` buffer
+    and emitting an atomic intrinsic call against it.
+    """
+    @T.prim_func
+    def f(A: T.Tensor((1,), "int32")):
+        with T.Kernel(1, threads=1) as bx:
+            builder_fn(A)
+
+    text = str(f)
+    assert expected_substr in text, (
+        f"expected {expected_substr!r} in lowered IR for atomic intrinsic; got:\n{text}"
+    )
+
+
+def test_atomic_xchg_emits_tl_atomic_xchg_intrin():
+    _atomic_intrin_in_ir(lambda A: T.atomic_xchg(A, 1), "tl.atomic_xchg_elem_op")
+
+
+def test_atomic_and_emits_tl_atomic_and_intrin():
+    _atomic_intrin_in_ir(lambda A: T.atomic_and(A, 0xFF), "tl.atomic_and_elem_op")
+
+
+def test_atomic_or_emits_tl_atomic_or_intrin():
+    _atomic_intrin_in_ir(lambda A: T.atomic_or(A, 0x1), "tl.atomic_or_elem_op")
+
+
+def test_atomic_xor_emits_tl_atomic_xor_intrin():
+    _atomic_intrin_in_ir(lambda A: T.atomic_xor(A, 0xF), "tl.atomic_xor_elem_op")
+
+
 if __name__ == "__main__":
     tilelang.testing.main()

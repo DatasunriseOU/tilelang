@@ -132,6 +132,28 @@ def LowerHopperIntrin():
     return _ffi_api.LowerHopperIntrin() if hasattr(_ffi_api, "LowerHopperIntrin") else lambda f: f  # type: ignore
 
 
+def LowerTMAToPtrArith():
+    """LowerTMAToPtrArith.
+
+    Decomposes Hopper-style TMA descriptor loads/stores
+    (``tl::tma_load`` / ``tl::tma_store`` / ``tl::tma_load_im2col``) into
+    explicit pointer-arith copy loops on non-Hopper targets (Apple Metal
+    SIMDgroup, AMD HIP, pre-Hopper CUDA, CPU). NV Hopper+ paths are
+    passed through unchanged so the existing ``LowerHopperIntrin`` pipeline
+    keeps owning the native lowering.
+
+    See ``src/transform/lower_tma_to_ptr_arith.cc`` for the lowering rules.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass.
+    """
+    if hasattr(_ffi_api, "LowerTMAToPtrArith"):
+        return _ffi_api.LowerTMAToPtrArith()  # type: ignore
+    return lambda f: f
+
+
 def ThreadSync(storage_scope: str):
     """Insert sync between parallel read/write of shared buffers.
 

@@ -710,3 +710,48 @@ TL_DEVICE void AtomicStore(T1 *ref, T2 value, int memory_order) {
   TL_NOT_IMPLEMENTED();
 #endif
 }
+
+// AtomicXchg / AtomicAnd / AtomicOr / AtomicXor — direct mappings to CUDA
+// device builtins ``atomicExch`` / ``atomicAnd`` / ``atomicOr`` / ``atomicXor``.
+// The bitwise ops require integer (signed/unsigned 32/64 bit) types; CUDA does
+// not provide hardware atomics for fp dtypes so callers should pass ints.
+
+template <typename T1, typename T2>
+TL_DEVICE void AtomicXchg(T1 *ref, T2 val, int memory_order = 0) {
+  atomicExch(ref, static_cast<T1>(val));
+}
+
+template <typename T1, typename T2>
+TL_DEVICE T1 AtomicXchgRet(T1 *ref, T2 val, int memory_order = 0) {
+  return atomicExch(ref, static_cast<T1>(val));
+}
+
+template <typename T1, typename T2>
+TL_DEVICE void AtomicAnd(T1 *ref, T2 val, int memory_order = 0) {
+  atomicAnd(ref, static_cast<T1>(val));
+}
+
+template <typename T1, typename T2>
+TL_DEVICE T1 AtomicAndRet(T1 *ref, T2 val, int memory_order = 0) {
+  return atomicAnd(ref, static_cast<T1>(val));
+}
+
+template <typename T1, typename T2>
+TL_DEVICE void AtomicOr(T1 *ref, T2 val, int memory_order = 0) {
+  atomicOr(ref, static_cast<T1>(val));
+}
+
+template <typename T1, typename T2>
+TL_DEVICE T1 AtomicOrRet(T1 *ref, T2 val, int memory_order = 0) {
+  return atomicOr(ref, static_cast<T1>(val));
+}
+
+template <typename T1, typename T2>
+TL_DEVICE void AtomicXor(T1 *ref, T2 val, int memory_order = 0) {
+  atomicXor(ref, static_cast<T1>(val));
+}
+
+template <typename T1, typename T2>
+TL_DEVICE T1 AtomicXorRet(T1 *ref, T2 val, int memory_order = 0) {
+  return atomicXor(ref, static_cast<T1>(val));
+}

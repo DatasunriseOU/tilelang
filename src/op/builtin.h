@@ -1106,6 +1106,53 @@ TVM_DLL const Op &atomic_min_elem_op();
 TVM_DLL const Op &atomic_min_ret_elem_op();
 
 /*!
+ * \brief tilelang intrinsic for element-wise atomic exchange.
+ *
+ *  This op is used to represent an element-wise atomic exchange (xchg)
+ *  operation in tilelang.
+ */
+TVM_DLL const Op &atomic_xchg_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic exchange with return
+ * value.
+ */
+TVM_DLL const Op &atomic_xchg_ret_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic bitwise AND.
+ */
+TVM_DLL const Op &atomic_and_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic bitwise AND with
+ * return value.
+ */
+TVM_DLL const Op &atomic_and_ret_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic bitwise OR.
+ */
+TVM_DLL const Op &atomic_or_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic bitwise OR with
+ * return value.
+ */
+TVM_DLL const Op &atomic_or_ret_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic bitwise XOR.
+ */
+TVM_DLL const Op &atomic_xor_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic bitwise XOR with
+ * return value.
+ */
+TVM_DLL const Op &atomic_xor_ret_elem_op();
+
+/*!
  * \brief tilelang intrinsic for assert on device.
  *
  *  This op is used to represent an assert on device

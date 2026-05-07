@@ -97,6 +97,10 @@ from .customize import (
     view,  # noqa: F401
     atomic_load,  # noqa: F401
     atomic_store,  # noqa: F401
+    atomic_xchg,  # noqa: F401
+    atomic_and,  # noqa: F401
+    atomic_or,  # noqa: F401
+    atomic_xor,  # noqa: F401
     loop_break,  # noqa: F401
 )
 from .logical import any_of, all_of  # noqa: F401
@@ -126,6 +130,9 @@ from .builtin import syncthreads_and as syncthreads_and  # noqa: F401
 from .builtin import syncthreads_or as syncthreads_or  # noqa: F401
 
 from .utils import index_to_coordinates  # noqa: F401
+
+# RFC §6 — cross-source extern intrinsic declaration mechanism.
+from .extern import extern_intrinsic, Frag  # noqa: F401
 
 from .symbolics import dynamic, symbolic  # noqa: F401
 from .annotations import (  # noqa: F401

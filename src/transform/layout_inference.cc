@@ -1,6 +1,13 @@
 /*!
  * \file layout_inference.cc
  * \brief infer the fragment/shared memory layout
+ *
+ * Modified for integration #9 follow-up: extern_intrinsic metadata pickup.
+ * We add a small branch in ``BufferUseDefCollector::VisitExpr_(CallNode*)``
+ * and in ``BufferUseDefCollector::VisitStmt_(SBlockNode*)`` that reads the
+ * ``tl.extern_intrinsic_meta`` block annotation and registers the declared
+ * per-Frag layout strings into ``annotated_layout_map_``. See
+ * :file:`extern_intrinsic_meta.h` for the shared helpers.
  */
 
 #include <tvm/ffi/reflection/registry.h>
@@ -29,6 +36,7 @@
 #include "common/loop_fusion_utils.h"
 #include "common/pipeline_utils.h"
 #include "common/union_find.h"
+#include "extern_intrinsic_meta.h"
 #include "layout_reducer.h"
 #include "parallel_loop_layout_validator.h"
 #include "tirx/transform/ir_utils.h"
@@ -763,6 +771,107 @@ private:
     // First, visit the block body to collect all buffers from
     // BufferLoad/BufferStore
     IRVisitorWithAnalyzer::VisitStmt_(op);
+
+    // Integration #9 follow-up: pick up tl.extern_intrinsic_meta block
+    // annotation. The Python decorator stashes a Map of per-Frag fields
+    // (layout, alignment, pipeline_stage, is_output) on the enclosing
+    // block. For each call_extern with the registered prefix inside this
+    // block body, we register the declared fragment layout for the
+    // corresponding Buffer argument so layout-inference does not have to
+    // guess it.
+    //
+    // For unknown layout strings we just log and skip — existing extern
+    // intrinsics (without metadata) keep working.
+    if (auto meta_opt = GetExternBlockMeta(op)) {
+      const auto &meta = meta_opt.value();
+
+      // Pull tile_size = (M, N[, K]) from the meta if present. The Python
+      // decorator's ``build_meta`` (see ``tilelang/language/extern.py``)
+      // serialises ``Frag.shape`` of the output frag here, exactly so that
+      // we can dispatch onto the tile-parameterised
+      // ``makeGemmFragment{A,B,C}`` factories below. When absent, we fall
+      // back to ``Layout()`` (the original behaviour).
+      auto tile_size_arr = [&]() -> Array<Integer> {
+        auto v = meta.Get("tile_size");
+        if (!v.defined()) return {};
+        return v.value().as<Array<Integer>>().value_or({});
+      }();
+      auto tile_at = [&](size_t i, int fallback) -> int {
+        return i < tile_size_arr.size()
+                   ? static_cast<int>(tile_size_arr[i]->value)
+                   : fallback;
+      };
+      // Per-frag dtype is not in the meta yet; default to 16-bit which
+      // covers the common fp16/bf16 mma path. Sub-byte / fp32 frags will
+      // fall through to the empty Layout() (and the existing INFO log).
+      const int default_element_bits = 16;
+
+      // Layout strings we recognise. Anything else is opaque / passthrough.
+      auto layout_for_string =
+          [&](const ffi::String &s) -> Layout {
+        const std::string str(s);
+        // Linear / opaque kinds: nothing to register; fall through.
+        if (str == "row_major" || str == "col_major" ||
+            str == "swizzled_xor") {
+          return Layout();
+        }
+        // mma_* fragments: tile_size = (M, N, K). Use M as warp_m, N as
+        // warp_n (i.e. single-warp tile) when only the block-level tile is
+        // known here — the GEMM op's full block/warp partition lives in
+        // gemm.cc and is unavailable in this scope.
+        if (str == "mma_A" || str == "mma_B" || str == "mma_C") {
+          if (tile_size_arr.size() < 2) return Layout();
+          int M = tile_at(0, 16);
+          int N = tile_at(1, 16);
+          int K = tile_at(2, 16);
+          if (str == "mma_A") {
+            return makeGemmFragmentA(M, N, K, M, N, default_element_bits,
+                                     /*transposed=*/false);
+          }
+          if (str == "mma_B") {
+            return makeGemmFragmentB(M, N, K, M, N, /*transposed=*/false);
+          }
+          // mma_C
+          return makeGemmFragmentC(M, N, M, N, default_element_bits);
+        }
+        // TODO: add simdgroup Fragment factories in src/op/builtin.cc /
+        // src/layout/gemm_layouts.cc (currently absent — see grep for
+        // "Simdgroup" in src/layout/). Until then, fall through to the
+        // INFO-log + empty-Layout path so existing extern intrinsics keep
+        // working.
+        if (str == "simdgroup_a" || str == "simdgroup_b" ||
+            str == "simdgroup_c") {
+          return Layout();
+        }
+        return Layout();
+      };
+      // The extern call sits inside the block body. Walk it once to pair
+      // each call_extern arg buffer with the i-th Frag entry of the meta.
+      PostOrderVisit(op->body, [&](const ObjectRef &node) {
+        const auto *call = node.as<CallNode>();
+        if (!IsExternIntrinsicCall(call)) return;
+        // Per-frag layout list lives under "layouts" (Array<String>) when
+        // the decorator chose to serialise it; otherwise meta is a flat
+        // map keyed by frag name. We accept both shapes here.
+        if (auto layouts_any = meta.Get("layouts")) {
+          auto layouts =
+              layouts_any.value().as<Array<ffi::String>>().value_or({});
+          for (size_t i = 0;
+               i < layouts.size() && i + 1 < call->args.size(); ++i) {
+            auto buf_opt = getBufferFromAccessPtr(call->args[i + 1]);
+            if (!buf_opt.defined()) continue;
+            Layout l = layout_for_string(layouts[i]);
+            if (l.defined() && IsRegisterBuffer(buf_opt.value())) {
+              annotated_layout_map_.Set(buf_opt.value(), l);
+            } else {
+              LOG(INFO) << "[LayoutInference] tl.extern_intrinsic: layout '"
+                        << layouts[i] << "' is opaque for buffer "
+                        << buf_opt.value() << "; skipped.";
+            }
+          }
+        }
+      });
+    }
 
     // After visiting, apply layouts to all collected buffers
     if (op->annotations.count(attr::kLayoutMap)) {

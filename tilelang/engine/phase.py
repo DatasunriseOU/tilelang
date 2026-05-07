@@ -332,6 +332,15 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tir.transform.InferFragment()(mod)
     mod = tilelang.transform.LowerThreadAllreduce()(mod)
     mod = tilelang.transform.LowerLDGSTG()(mod)
+    # RFC §5.4: decompose Hopper TMA descriptor copies into pointer-arith
+    # `T.copy` loops on non-Hopper targets (Apple Metal SIMDgroup, AMD HIP,
+    # pre-Hopper CUDA, CPU). On NV Hopper+ this is a no-op so the
+    # `LowerHopperIntrin` pass below still owns the native lowering. Slot
+    # is BEFORE `LowerHopperIntrin` (which is gated on CUDA_MAJOR_VERSION
+    # >= 12) and AFTER `LowerTileOp` (which produces the TMA Calls). The
+    # software-pipeliner (`InjectSoftwarePipeline`) runs earlier on tile-op
+    # `T.copy`, so pipelining is unaffected by this pass.
+    mod = tilelang.transform.LowerTMAToPtrArith()(mod)
     mod = tilelang.transform.LowerHopperIntrin()(mod)
     # Global Barrier Synchronization must be applied before
     # SplitHostDevice pass, as the global barrier

@@ -1,0 +1,116 @@
+# =====================================================================
+# poc/triton_frontend/_cxx/CMakeLists.txt
+#
+# Builds the `_triton_frontend_cxx` Python extension that drives
+# `mlir::tts::PtrAnalysis::rewriteOp` on a parsed MLIR module.
+#
+# REQUIRED ENVIRONMENT VARIABLES (pass via `cmake -D...` or `export`):
+#   MLIR_DIR            CMake package dir for an MLIR install
+#                       (e.g. /opt/llvm/lib/cmake/mlir)
+#   LLVM_DIR            CMake package dir for the matching LLVM install
+#                       (e.g. /opt/llvm/lib/cmake/llvm)
+#   TRITON_INSTALL_DIR  Prefix containing the upstream Triton install
+#                       (must expose include/triton/Dialect/Triton/IR/Dialect.h
+#                       and lib/libTritonIR.a -- TODO integration #5).
+#
+# The vendored microsoft/triton-shared sources live alongside this file at
+# ../vendored/triton_shared/ and are compiled in directly (no separate
+# install step).
+# =====================================================================
+
+cmake_minimum_required(VERSION 3.20)
+project(triton_frontend_cxx LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# ---- LLVM / MLIR -----------------------------------------------------
+
+find_package(MLIR REQUIRED CONFIG)
+find_package(LLVM REQUIRED CONFIG)
+
+message(STATUS "Using MLIR_DIR  = ${MLIR_DIR}")
+message(STATUS "Using LLVM_DIR  = ${LLVM_DIR}")
+
+list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
+list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+include(TableGen)
+include(AddLLVM)
+include(AddMLIR)
+include(HandleLLVMOptions)
+
+include_directories(${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+link_directories(${LLVM_BUILD_LIBRARY_DIR})
+add_definitions(${LLVM_DEFINITIONS})
+
+# ---- pybind11 --------------------------------------------------------
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
+find_package(pybind11 CONFIG REQUIRED)
+
+# ---- Triton (upstream) ------------------------------------------------
+# TODO(integration#5): the upstream Triton dialect / IR is required so
+# PtrAnalysis can resolve `triton::AddPtrOp`, `triton::MakeRangeOp`, etc.
+# Until integration #5 vendors that dialect we leave the link line stubbed
+# out so this CMakeLists still configures (and tests can compile against
+# the C ABI surface for unit-style validation).
+#
+# When wiring it in, replace the block below with something like:
+#
+#   set(TRITON_INSTALL_DIR "${TRITON_INSTALL_DIR}" CACHE PATH "Triton install")
+#   include_directories(${TRITON_INSTALL_DIR}/include)
+#   find_library(TRITON_IR_LIB TritonIR PATHS ${TRITON_INSTALL_DIR}/lib REQUIRED)
+#   list(APPEND TL_PA_LINK_LIBS ${TRITON_IR_LIB})
+#
+if(DEFINED ENV{TRITON_INSTALL_DIR} OR DEFINED TRITON_INSTALL_DIR)
+  if(NOT DEFINED TRITON_INSTALL_DIR)
+    set(TRITON_INSTALL_DIR "$ENV{TRITON_INSTALL_DIR}")
+  endif()
+  message(STATUS "Using TRITON_INSTALL_DIR = ${TRITON_INSTALL_DIR}")
+  include_directories(${TRITON_INSTALL_DIR}/include)
+  # find_library(TRITON_IR_LIB TritonIR PATHS ${TRITON_INSTALL_DIR}/lib REQUIRED)
+else()
+  message(WARNING
+    "TRITON_INSTALL_DIR not set: building C-ABI surface only; "
+    "tl_pa_run_rewrite will return TL_PA_ERR_INTERNAL until integration #5.")
+endif()
+
+# ---- Vendored triton-shared sources ----------------------------------
+
+set(VENDORED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../vendored/triton_shared")
+include_directories(${VENDORED_DIR}/include)
+
+set(VENDORED_SOURCES
+  ${VENDORED_DIR}/lib/AnalysisStructured/PtrAnalysis.cpp
+)
+
+# ---- Library + Python module ----------------------------------------
+
+set(TL_PA_LINK_LIBS
+  MLIRIR
+  MLIRParser
+  MLIRSupport
+  MLIRArithDialect
+  MLIRMathDialect
+  MLIRMemRefDialect
+  MLIRSCFDialect
+  MLIRTensorDialect
+  MLIRAffineDialect
+  MLIRTransforms
+)
+
+pybind11_add_module(_triton_frontend_cxx
+  ptr_analysis_shim.cc
+  pybind_module.cc
+  ${VENDORED_SOURCES}
+)
+target_include_directories(_triton_frontend_cxx PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${VENDORED_DIR}/include
+)
+target_link_libraries(_triton_frontend_cxx PRIVATE ${TL_PA_LINK_LIBS})
+
+set_target_properties(_triton_frontend_cxx PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+)
