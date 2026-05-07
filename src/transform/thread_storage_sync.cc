@@ -1822,9 +1822,24 @@ private:
     //   2) Lets Z3 actually solve floor-div on small finite domains
     //      instead of timing out on the unbounded Int sort.
     auto extract_extent = [](const Optional<IterVar> &iv) -> Optional<PrimExpr> {
-      if (!iv.has_value() || !iv.value()->dom.defined()) return std::nullopt;
+      if (!iv.has_value() || !iv.value()->dom.defined() ||
+          !iv.value()->dom->extent.defined()) {
+        return std::nullopt;
+      }
       return iv.value()->dom->extent;
     };
+    // CPPMEGA fix-C2 (round-7): if `threadIdx.x` (the only mandatory axis,
+    // already required upstream) lacks an upper bound on either side, the
+    // Z3 floor-div-by-32 query becomes unbounded and can prove anything —
+    // a false-positive barrier elision was traced to this code path. Bail
+    // closed when the canonical x extent is missing on either side. y/z
+    // can stay optional (their bounds are added best-effort below).
+    if (!extract_extent(tx_p_iv).defined() ||
+        !extract_extent(tx_c_iv).defined()) {
+      LOG(WARNING) << "ProveIntraWarpRAW: threadIdx.x extent missing on "
+                      "prev or curr; keeping barrier (conservative).";
+      return false;
+    }
     auto add_axis_bounds = [&](const Var &w_var, const Var &r_var,
                                const Optional<IterVar> &p_iv,
                                const Optional<IterVar> &c_iv,
