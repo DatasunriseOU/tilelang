@@ -220,3 +220,54 @@ lists `UseAnalysis.cpp`).
 - Conversion pass drivers (`lib/Conversion/TritonToStructured/...`). We
   invoke `tts::PtrAnalysis::rewriteOp` directly from our own shim, so the
   driver pass is not needed.
+
+## Python entry point: `register_dialects(mlir.ir.Context)`
+
+The vendored `RegisterTritonStructured.{h,cc}` declares the C++ symbol
+`mlir::triton_shared_vendored::registerTritonStructured`. The Python-facing
+`register_dialects` wrapper used by `verify_dialect_loads.py` is provided by
+a small pybind11 shim that lives **outside** this directory at:
+
+- `poc/triton_frontend/_cxx/register_triton_structured_pybind.cc` —
+  produces the standalone Python extension
+  `poc.triton_frontend._cxx.register_triton_structured`. It links the
+  `TritonSharedRegister` static library and exposes `register_dialects(ctx)`
+  by extracting the `MLIRContext*` from `ctx._CAPIPtr`.
+
+The smoke-test script attempts to import that module first; if not built it
+falls back to the combined `_triton_frontend_cxx` extension, where the
+existing stub will be wired through the same registration call once the
+project chooses to fold the two pybind modules into one. Either way the
+runtime semantics are identical.
+
+The build wiring step (`pybind11_add_module(...)` + `target_link_libraries(
+register_triton_structured PRIVATE TritonSharedRegister)`) lives in the
+parent `_cxx/CMakeLists.txt` because that directory already owns the
+`pybind_module.cc` build for `_triton_frontend_cxx`. Keeping the two
+modules independent means downstream consumers that only need dialect
+registration (e.g. golden-IR test harnesses) can link the small static
+library without pulling in the PtrAnalysis C shim.
+
+## Review-driven fixes (2026-05-07)
+
+Applied based on grok-4 code review of this directory:
+
+- **CMakeLists.txt** — corrected stale comment (`MLIR_TABLEGEN_FLAGS` →
+  `LLVM_TABLEGEN_FLAGS`); the variable read by `mlir_tablegen()` is the
+  LLVM-named one. No functional change.
+- **verify_dialect_loads.py** — replaced the abbreviated `<f32> to ...`
+  printer form in the smoke-test snippet with the full
+  `!tt.ptr<f32> to tensor<4x!tt.ptr<f32>>` round-trip form expected by
+  `TritonStructuredDialect.td:78`'s custom assembly. Also normalised the
+  triple-quoted indentation by switching to explicit `\n`-joined string
+  literals (the MLIR parser tolerates leading whitespace, but mixing
+  Python indentation with `custom<DynamicIndexList>` is fragile).
+- **verify_dialect_loads.py** — import resolution now tries the new
+  dedicated shim first (`poc.triton_frontend._cxx.register_triton_structured`)
+  and falls back to the existing combined `_triton_frontend_cxx` module so
+  existing build configurations keep working.
+- **`_cxx/register_triton_structured_pybind.cc`** (new) — standalone
+  pybind11 module producing `register_dialects(ctx)` that forwards into
+  `mlir::triton_shared_vendored::registerTritonStructured(*ctx)`, closing
+  the import-name mismatch flagged by the review (correctness bug #1 in
+  `grok__correctness__*.md`).

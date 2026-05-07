@@ -115,7 +115,7 @@ set(LLVM_TARGET_DEFINITIONS
 # up so the outputs land at the correct sub-path.
 set(_TS_TG_OUT_DIR "${_VENDOR_BUILD_INCLUDE}/triton-shared/Dialect/TritonStructured/IR")
 
-# Per-call include-dir override (mlir_tablegen reads MLIR_TABLEGEN_FLAGS):
+# Per-call include-dir override (mlir_tablegen reads LLVM_TABLEGEN_FLAGS):
 list(APPEND LLVM_TABLEGEN_FLAGS
      "-I${TRITON_INSTALL_DIR}/include"
      "-I${MLIR_INCLUDE_DIRS}"
