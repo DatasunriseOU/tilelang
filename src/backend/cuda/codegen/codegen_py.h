@@ -21,7 +21,7 @@
 // from tvm/src/
 #include "target/source/codegen_source_base.h"
 #include "tirx/transform/ir_utils.h"
-#include "../transform/vendored/let_stmt.h"
+#include "transform/vendored/let_stmt.h"
 
 namespace tvm {
 namespace codegen {

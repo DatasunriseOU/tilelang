@@ -23,7 +23,8 @@ public:
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.Fill", FillNode, TileOperatorNode);
 
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
-  LayoutMap InferLayout(const LayoutInferArgs &T, InferLevel level) const override;
+  LayoutMap InferLayout(const LayoutInferArgs &T,
+                        InferLevel level) const override;
   static const Op &Get();
 
   static void RegisterReflection() {
@@ -36,10 +37,21 @@ public:
 
   TileOperator Clone() const override;
 
-private:
   /// Create SIMT-style parallel loop for filling
   For MakeSIMTLoop(arith::Analyzer *analyzer) const;
 };
+
+using FillTargetPredicate = bool (*)(Target target);
+
+struct FillImpl {
+  const char *name;
+  FillTargetPredicate match_target;
+
+  Stmt (*lower)(const FillNode &op, const LowerArgs &T,
+                arith::Analyzer *analyzer);
+};
+
+void RegisterFillImpl(FillImpl impl);
 
 /// Wrapper class for fill operations
 class Fill : public TileOperator {

@@ -232,6 +232,18 @@ public:
   TileOperator Clone() const override;
 };
 
+using CumSumTargetPredicate = bool (*)(Target target);
+
+struct CumSumImpl {
+  const char *name;
+  CumSumTargetPredicate match_target;
+
+  Stmt (*lower)(const CumSumOpNode &op, const LowerArgs &T,
+                arith::Analyzer *analyzer);
+};
+
+void RegisterCumSumImpl(CumSumImpl impl);
+
 /// Wrapper class for cumulative sum operations
 class CumSumOp : public TileOperator {
 public:
