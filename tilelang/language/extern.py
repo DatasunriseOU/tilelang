@@ -89,6 +89,8 @@ LayoutKind = Literal[
     "simdgroup_a",
     "simdgroup_b",
     "simdgroup_c",
+    "simdgroup_a_fp8",
+    "simdgroup_b_fp8",
 ]
 
 ScopeKind = Literal["global", "shared", "shared.dyn", "local", "wmma", "simdgroup"]
@@ -681,6 +683,71 @@ def _simdgroup_doctest() -> None:
     """
 
 
+# ---------------------------------------------------------------------------
+# FP8 SIMDgroup MMA fragment factories — FORWARD-COMPATIBLE PLACEHOLDERS
+# ---------------------------------------------------------------------------
+# Apple has not (as of 2026-05) shipped ``simdgroup_matrix<float8_e4m3>`` /
+# ``simdgroup_matrix<float8_e5m2>`` types in the MSL specification. Current
+# Apple silicon (M3/M4) exposes simdgroup MMA only for fp16/bf16/fp32. The
+# factories below pin the *call-site contract* — shape (8, 8), scope
+# ``"simdgroup"``, default dtype ``"float8_e4m3"`` — so kernels in
+# ``cppmega.mlx/_tilelang/{fp8_msl_kernels,sparse_mla_fp8,fp8_vecmat_path_c}.py``
+# can drop in cleanly the moment Apple ships. Until then:
+#
+#  - the layout string ``simdgroup_a_fp8`` / ``simdgroup_b_fp8`` is unknown
+#    to ``layout_inference.cc`` and falls through to the same empty
+#    ``Layout()`` path that the existing fp16 factories already use — see
+#    the comment block above ``_simdgroup_factory`` for why opacity is the
+#    correct answer for SIMDgroup MMA in general (Apple's per-thread element
+#    decomposition is implementation-defined per MSL §6.7.2).
+#  - codegen will *not* synthesise an fp8 MMA call from a TileLang
+#    intrinsic; FP8 paths still go through extern_intrinsic with an opaque
+#    MSL body that includes whatever fp8 emulation Apple ships
+#    (``mx_get_fp8_dot4`` / ``simd_sum`` software emulation today). The
+#    factory just labels the operand role for the metadata pipeline.
+#
+# When Apple ships native FP8 simdgroup MMA the precise edits required:
+#   1. Confirm dtype tokens in MSL spec (likely ``float8_e4m3`` / ``float8_e5m2``
+#      to match Metal's official type names) — adjust ``default_dtype`` here.
+#   2. Add register-tile decomposition to ``src/layout/gemm_layouts.cc`` and
+#      have ``layout_inference.cc`` map ``simdgroup_{a,b}_fp8`` to it.
+#   3. Add ``builtin::simdgroup_mma_fp8`` to ``src/op/builtin.cc`` and a
+#      Metal codegen path in ``src/target/codegen_metal.cc``.
+#   4. Flip the ``xfail`` marker on
+#      ``test_simdgroup_fp8_factories_produce_canonical_frags_fp8_runtime``
+#      in ``poc/extern_intrinsic_examples/test_extern_smoke.py``.
+# ---------------------------------------------------------------------------
+
+simdgroup_a_fp8 = _simdgroup_factory(
+    "simdgroup_a_fp8", default_dtype="float8_e4m3", default_is_output=False,
+)
+"""Apple Metal SIMDgroup matrix-A operand factory — FP8 forward-compat.
+
+Forward-compatible placeholder pending Apple FP8 silicon (see module
+docstring). Layout is opaque (empty ``Layout()``), matching the canonical
+fp16 ``simdgroup_a`` factory. ``dtype`` defaults to ``"float8_e4m3"``;
+override to ``"float8_e5m2"`` for the unsigned-zero variant.
+
+>>> a = simdgroup_a_fp8("a")
+>>> a.layout, a.shape, a.dtype, a.scope, a.is_output
+('simdgroup_a_fp8', (8, 8), 'float8_e4m3', 'simdgroup', False)
+"""
+
+simdgroup_b_fp8 = _simdgroup_factory(
+    "simdgroup_b_fp8", default_dtype="float8_e4m3", default_is_output=False,
+)
+"""Apple Metal SIMDgroup matrix-B operand factory — FP8 forward-compat.
+
+Forward-compatible placeholder pending Apple FP8 silicon (see module
+docstring). Pair with ``simdgroup_c`` (fp32 accumulator) for the typical
+FP8 → FP32 GEMM contract.
+
+>>> b = simdgroup_b_fp8("b")
+>>> b.layout, b.shape, b.dtype, b.scope, b.is_output
+('simdgroup_b_fp8', (8, 8), 'float8_e4m3', 'simdgroup', False)
+"""
+
+
 __all__ = [
     "Frag",
     "LayoutKind",
@@ -692,4 +759,6 @@ __all__ = [
     "simdgroup_a",
     "simdgroup_b",
     "simdgroup_c",
+    "simdgroup_a_fp8",
+    "simdgroup_b_fp8",
 ]
