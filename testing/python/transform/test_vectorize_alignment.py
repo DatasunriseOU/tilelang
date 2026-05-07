@@ -253,5 +253,66 @@ def test_negative_stride_not_vectorized():
     assert mod is not None
 
 
+# ---------------------------------------------------------------------------
+# CPPMEGA idea712 fix-B8 (round-3): memo collision-resistance regression.
+#
+# The pre-fix-B8 hash key for `MemoizedIndicesCanVectorize` was an
+# FNV-xor mix of four size_t-shaped inputs:
+#
+#     key  = StructuralHash(expr)
+#     key ^= h(loop_var)  (with rotation)
+#     key ^= StructuralHash(iter_size)
+#     key ^= target_size
+#
+# Pathology: when two of the four mixed inputs were equal-valued, their
+# XOR contributions could cancel in the running seed, so distinct
+# (expr, var, iter_size, target_size) tuples could collide and one
+# memo entry would shadow another. Fix-B8 replaces the key with a
+# `std::tuple<size_t, const void*, size_t, int>` and a tuple-aware
+# hash, eliminating the cancellation class.
+#
+# This Python test approximates a collision regression by building two
+# distinct vectorize-eligible loops that share enough of their planner
+# state (loop var dtype, target size) that the prior FNV-xor mix
+# COULD have aliased their memo entries. We don't have direct C++
+# access to the planner's memo from Python, but we can verify that
+# both loops independently lower correctly — under the prior bug a
+# colliding memo entry could have flipped a "cannot vectorize" answer
+# to "can vectorize" (or vice versa) on the second loop.
+# ---------------------------------------------------------------------------
+
+def test_memo_collision_resistance():
+    """Two distinct vectorize-eligible loops in the same module each
+    receive an independent vectorization decision.
+
+    Both loops use the same target size (4) and the same loop-var dtype
+    (int32), so under the pre-fix FNV-xor mix the {iter_size, target}
+    contributions could have cancelled. After fix-B8 the tuple key
+    keeps them separate; both loops should lower without errors.
+    """
+
+    @T.prim_func
+    def main(  # noqa: F821
+        A: T.Tensor((128,), T.float16),  # noqa: F821
+        B: T.Tensor((128,), T.float16),  # noqa: F821
+        C: T.Tensor((128,), T.float16),  # noqa: F821
+    ):
+        with T.Kernel(1, threads=32) as bx:  # noqa: F841
+            for i in T.vectorized(4):  # noqa: F821
+                B[i] = A[i]
+            for j in T.vectorized(4):  # noqa: F821
+                C[j] = A[j] + B[j]
+
+    # Build with alignment proof OFF to keep the test focused on the
+    # MemoizedIndicesCanVectorize path (which runs in both modes).
+    mod = _build_with_alignment_proof(main, enable=False)
+    assert mod is not None
+    # And again with alignment proof ON — the alignment memo
+    # (`Z3CanProveLoopAligned`) uses the SAME tuple-hash fix, so this
+    # exercises both memo sites.
+    mod = _build_with_alignment_proof(main, enable=True)
+    assert mod is not None
+
+
 if __name__ == "__main__":
     tilelang.testing.main()

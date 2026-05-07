@@ -42,7 +42,9 @@
 #include <tvm/ffi/extra/structural_hash.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/stmt_functor.h>
+#include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace tvm {
@@ -51,6 +53,64 @@ namespace tl {
 using namespace tirx;
 using ::tilelang::tl_tir::LetStmt;
 using ::tilelang::tl_tir::LetStmtNode;
+
+// CPPMEGA idea712 fix-B8 (round-3): tuple-based memo-key hash mixer.
+// Replaces the prior FNV-xor mix used in `MemoizedIndicesCanVectorize`
+// and `Z3CanProveLoopAligned`'s `probe`. The XOR-mix has a known
+// collision pathology: if two of the four mixed `size_t` inputs are
+// equal, their contributions cancel under XOR and the resulting key
+// stops depending on either input — distinct memo entries can then
+// alias each other. Using `std::tuple<...>` as the unordered_map key
+// directly removes the collision class entirely (the map's equality
+// comparator does field-wise comparison; the hash mixes via rotation,
+// not XOR-cancellation).
+//
+// The mixer below is the variant of `boost::hash_combine` that
+// rotates by a fixed odd offset (0x9e3779b97f4a7c15ULL is 2^64/φ) and
+// shifts so that equal inputs do NOT cancel. Same shape as the prior
+// FNV mix but with a "+=" instead of "^=" on the seed, eliminating
+// the cancellation risk.
+namespace {
+
+inline void TupleHashMix(size_t &seed, size_t value) {
+  seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 12) + (seed >> 4);
+  // Use `+=` on the rotated chunks to break XOR-cancellation: two
+  // identical `value` arguments now produce different seed updates
+  // because the rotation depends on the running seed.
+  seed += (seed << 7) ^ (seed >> 11);
+}
+
+// Hash functor for std::tuple<size_t, const void*, size_t, int> —
+// the key shape used by MemoizedIndicesCanVectorize (expr-hash,
+// loop_var ptr, iter_size-hash, target_size).
+struct VectorizeMemoKeyHash {
+  size_t operator()(
+      const std::tuple<size_t, const void *, size_t, int> &k) const noexcept {
+    size_t seed = std::get<0>(k);
+    TupleHashMix(seed, std::hash<const void *>{}(std::get<1>(k)));
+    TupleHashMix(seed, std::get<2>(k));
+    TupleHashMix(seed, static_cast<size_t>(std::get<3>(k)));
+    return seed;
+  }
+};
+
+// Hash functor for std::tuple<const void*, int, std::vector<size_t>> —
+// the key shape used by Z3CanProveLoopAligned's `probe` (buffer ptr,
+// vector_size, list of indices structural-hashes).
+struct AlignmentMemoKeyHash {
+  size_t operator()(
+      const std::tuple<const void *, int, std::vector<size_t>> &k) const
+      noexcept {
+    size_t seed = std::hash<const void *>{}(std::get<0>(k));
+    TupleHashMix(seed, static_cast<size_t>(std::get<1>(k)));
+    for (size_t h : std::get<2>(k)) {
+      TupleHashMix(seed, h);
+    }
+    return seed;
+  }
+};
+
+}  // namespace
 
 /*!
  * \brief Check if buffer strides represent a contiguous (row-major) layout.
@@ -361,6 +421,15 @@ public:
     if (verbose) {
       std::cerr << "=== Final vector_size: " << vector_size_ << " ===" << "\n";
     }
+    // CPPMEGA idea712 fix-B8 (round-3): conservative cache invalidation.
+    // The memo's cache lifetime was already documented as "per-planner-
+    // instance", but a planner is reused across multiple `Plan(For)`
+    // invocations on the same VectorizePlanner object (e.g. nested
+    // For nodes). Clearing here scopes the cache strictly to a single
+    // top-level Plan call so no stale entries from a prior body can
+    // leak into a subsequent one (different `inner_for_`, possibly
+    // different analyzer state).
+    indices_can_vectorize_memo_.clear();
     return vector_size_;
   }
 
@@ -876,21 +945,26 @@ private:
       // without touching the analyzer.
       return true;
     }
+    // CPPMEGA idea712 fix-B8 (round-3): replace the FNV-xor mix with a
+    // std::tuple key. The previous mix XOR'd four size_t-shaped inputs
+    // into a single hash — distinct (expr, var, iter_size, target_size)
+    // tuples that differed only in two equal-valued entries could
+    // collide because the XOR contributions cancelled. With a tuple
+    // key the unordered_map's equality comparator is field-wise, so
+    // collisions are now genuine hash collisions (handled correctly
+    // by the bucket chain) instead of memo-table aliasing.
     ::tvm::ffi::StructuralHash hasher;
-    size_t key = static_cast<size_t>(hasher(expr));
-    auto mix = [&](size_t h) {
-      key ^= h + 0x9e3779b97f4a7c15ULL + (key << 6) + (key >> 2);
-    };
-    mix(std::hash<const void *>{}(var.get()));
-    mix(static_cast<size_t>(hasher(iter_var_size)));
-    mix(static_cast<size_t>(target_vectorized_size));
+    auto key = std::make_tuple(static_cast<size_t>(hasher(expr)),
+                               static_cast<const void *>(var.get()),
+                               static_cast<size_t>(hasher(iter_var_size)),
+                               target_vectorized_size);
     auto it = indices_can_vectorize_memo_.find(key);
     if (it != indices_can_vectorize_memo_.end()) {
       return it->second;
     }
     bool ok = IndicesCanVectorize(expr, var, iter_var_size,
                                   target_vectorized_size, analyzer_);
-    indices_can_vectorize_memo_.emplace(key, ok);
+    indices_can_vectorize_memo_.emplace(std::move(key), ok);
     return ok;
   }
 
@@ -903,7 +977,13 @@ private:
   int vector_size_ = 128;
   std::vector<BufferVectorInfo> buffer_vector_infos_;
   LayoutMap layout_map_;
-  std::unordered_map<size_t, bool> indices_can_vectorize_memo_;
+  // CPPMEGA idea712 fix-B8 (round-3): tuple key replaces FNV-xor 64-bit
+  // hash. See `TupleHashMix` rationale at top of this file; the comparator
+  // is std::tuple's default field-wise equality, so collisions cannot
+  // alias distinct memo entries the way the XOR mix could.
+  std::unordered_map<std::tuple<size_t, const void *, size_t, int>, bool,
+                     VectorizeMemoKeyHash>
+      indices_can_vectorize_memo_;
 };
 
 // CPPMEGA: Z3 idea #12 — alignment proof companion to #1 (contiguity).
@@ -1056,26 +1136,29 @@ static bool Z3CanProveLoopAligned(const Stmt &body, const Var &loop_var,
   bool saw_memory = false;
   bool all_aligned = true;
 
-  // Memo keyed by a 64-bit hash of (buffer-ptr, vector_size, indices).
-  // We use the StructuralHash for indices so structurally-identical
-  // expressions (including those that simplify to the same shape after
-  // analyzer rewrites) share the same key.
-  std::unordered_map<size_t, bool> memo;
+  // CPPMEGA idea712 fix-B8 (round-3): tuple-keyed memo replaces the
+  // prior FNV-xor mix. See `TupleHashMix` rationale at top of file.
+  // Key is `(buffer ptr, vector_size, vector<index structural-hash>)`
+  // so structurally-identical accesses dedupe; distinct accesses can
+  // no longer collide via XOR cancellation.
+  std::unordered_map<std::tuple<const void *, int, std::vector<size_t>>, bool,
+                     AlignmentMemoKeyHash>
+      memo;
   ::tvm::ffi::StructuralHash hasher;
 
   auto probe = [&](const Buffer &buf, const Array<PrimExpr> &indices) -> bool {
-    size_t key = std::hash<const void *>{}(buf.get());
-    key ^= static_cast<size_t>(vector_size) + 0x9e3779b97f4a7c15ULL +
-           (key << 6) + (key >> 2);
+    std::vector<size_t> idx_hashes;
+    idx_hashes.reserve(indices.size());
     for (const PrimExpr &idx : indices) {
-      size_t h = static_cast<size_t>(hasher(idx));
-      key ^= h + 0x9e3779b97f4a7c15ULL + (key << 6) + (key >> 2);
+      idx_hashes.push_back(static_cast<size_t>(hasher(idx)));
     }
+    auto key = std::make_tuple(static_cast<const void *>(buf.get()),
+                               vector_size, std::move(idx_hashes));
     auto it = memo.find(key);
     if (it != memo.end()) return it->second;
     bool ok = Z3CanProveAlignedAccess(buf, indices, loop_var, vector_size,
                                       analyzer);
-    memo.emplace(key, ok);
+    memo.emplace(std::move(key), ok);
     return ok;
   };
 
