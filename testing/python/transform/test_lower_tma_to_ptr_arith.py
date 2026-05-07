@@ -388,3 +388,55 @@ def test_unknown_dtype_code_is_refused():
     mod = _lower(func, "metal")
     assert _has_tma_call(mod), \
         "Unknown dtype must NOT be silently lowered (would corrupt mem)."
+
+
+def test_vendored_allocate_is_passed_through():
+    """Wave-7 #3 regression: a Path-C TileLang DSL kernel that mixes
+    ``T.alloc_shared(...)`` (lowered to the vendored ``tilelang.Allocate``
+    node) with a TMA copy must NOT trip the StmtFunctor dispatch table.
+
+    Before the fix, ``LowerTMAToPtrArith`` rejected the vendored Allocate
+    with ``Check failed: (can_dispatch(n)) is false``, breaking every
+    engine-path lowering of ``sparse_mla_blockscaled``,
+    ``fp8_vecmat_path_c``, etc. The ``TryVisitAllocateMutator`` pass-
+    through helper (mirroring ``frontend_legalize.cc`` /
+    ``lower_tile_op.cc`` / ``simplify.cc``) preserves the Allocate so
+    the downstream ``LowerTileLangAllocate`` pass can convert it to
+    apache-native ``AllocBuffer + SeqStmt``.
+    """
+
+    create_tma = tvm.tir.op.Op.get("tl.create_tma_descriptor")
+    tma_load = tvm.tir.op.Op.get("tl.tma_load")
+
+    @T.prim_func
+    def kernel(A_handle: T.handle):
+        # Wrap the TMA emission with a T.alloc_shared so the vendored
+        # tilelang.Allocate ends up on the LowerTMAToPtrArith dispatch
+        # path. The exact buffer shape is irrelevant for this regression.
+        smem = T.alloc_buffer((16, 16), "float16", scope="shared")
+        desc = T.call_intrin(
+            "handle", create_tma,
+            T.int32(_CU_TENSOR_MAP_DATA_TYPE_FLOAT16),
+            T.int32(2), A_handle,
+            T.int32(64), T.int32(64),
+            T.int32(2), T.int32(128),
+            T.int32(16), T.int32(16),
+            T.int32(1), T.int32(1),
+            T.int32(0), T.int32(0),
+            T.int32(0), T.int32(0),
+        )
+        T.evaluate(
+            T.call_intrin(
+                "handle", tma_load,
+                desc, T.int32(0), smem.access_ptr("w"),
+                T.int32(0), T.int32(0),
+                T.int32(0),
+            ))
+
+    # The bug manifests at IR construction inside the pass — any
+    # successful return (Hopper no-op or Metal rewrite) confirms the
+    # dispatcher accepted the vendored Allocate node.
+    mod_metal = _lower(kernel, "metal")
+    assert mod_metal is not None
+    mod_hopper = _lower(kernel, "cuda -arch=sm_90")
+    assert mod_hopper is not None
