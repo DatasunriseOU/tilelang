@@ -1498,19 +1498,24 @@ static bool Z3CanProveUnitStride(const PrimExpr &expr, const Var &var,
         (expr_next - expr) == make_const(expr.dtype(), 1);
     bool proved = z3.CanProve(stride_goal_pos);
 
-    if (!proved) {
-      // Negative-direction probe. Requires var >= 1 so var-1 is in-range;
-      // we push that as a temporary constraint, prove, then pop.
-      PrimExpr neg_constraint = (var >= make_const(vt, 1));
-      auto recover_neg = z3.EnterConstraint(neg_constraint);
-      PrimExpr var_minus_1 = var - make_const(vt, 1);
-      PrimExpr expr_prev = Substitute(expr, {{var, var_minus_1}});
-      // expr(var) - expr(var-1) == -1   ⇔  expr(var-1) - expr(var) == +1
-      PrimExpr stride_goal_neg =
-          (expr - expr_prev) == make_const(expr.dtype(), -1);
-      proved = z3.CanProve(stride_goal_neg);
-      recover_neg();
-    }
+    // fix-round-6 C1: Negative-stride probe disabled. Z3 may accept
+    // stride=-1 but VectorizeRewriter only emits Ramp(stride=+1), so a
+    // proved-negative case would lower to wrong-order ramp and produce
+    // incorrect results for kernels like `out[N-1-i] = in[N-1-i]`.
+    // TODO: enable when negative_ramp codegen support lands.
+    // if (!proved) {
+    //   // Negative-direction probe. Requires var >= 1 so var-1 is in-range;
+    //   // we push that as a temporary constraint, prove, then pop.
+    //   PrimExpr neg_constraint = (var >= make_const(vt, 1));
+    //   auto recover_neg = z3.EnterConstraint(neg_constraint);
+    //   PrimExpr var_minus_1 = var - make_const(vt, 1);
+    //   PrimExpr expr_prev = Substitute(expr, {{var, var_minus_1}});
+    //   // expr(var) - expr(var-1) == -1   ⇔  expr(var-1) - expr(var) == +1
+    //   PrimExpr stride_goal_neg =
+    //       (expr - expr_prev) == make_const(expr.dtype(), -1);
+    //   proved = z3.CanProve(stride_goal_neg);
+    //   recover_neg();
+    // }
 
     recover();
     if (!proved) {
