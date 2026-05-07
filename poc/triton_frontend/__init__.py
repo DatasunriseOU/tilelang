@@ -128,20 +128,43 @@ _OP_LINE = re.compile(
 )
 
 
-def _walk_text_ttir(ttir_text: str, ctx: WalkerCtx) -> List[str]:
+# Structural / scaffolding TTIR ops that wrap the body of a kernel but do
+# not themselves emit TIR. The MLIR walker silently skips these via the
+# OP_TABLE-membership check; the text walker mirrors that behaviour with
+# an explicit allow-list so we can keep raising NotImplementedError on
+# truly-unknown ops (helps catch coverage regressions).
+# TODO: implement a real ``map_tt_func`` that builds the PrimFunc shell
+# from the TTIR function signature instead of relying on the implicit
+# ``_make_prim_func(ctx)`` epilogue.
+_TTIR_STRUCTURAL_OPS = frozenset({"tt.func", "tt.return"})
+
+
+def _walk_text_ttir(
+    ttir_text: str, ctx: Optional[WalkerCtx] = None
+) -> List[str]:
     """Naive line-by-line walk over textual TTIR; returns op names visited.
 
     This intentionally does *not* parse operands or types -- it is the
     minimum surface needed to (a) confirm dispatch coverage in tests and
     (b) serve as a stand-in until MLIR Python bindings are wired up.
     Real lowering uses :func:`from_ttir` with a full ``mlir.ir.Module``.
+
+    ``ctx`` is reserved for future use (the text walker is coverage-only
+    today and does not populate ctx); when ``None`` a fresh ``WalkerCtx``
+    is created so callers / tests don't have to thread one explicitly.
     """
+    if ctx is None:
+        ctx = WalkerCtx()
     visited: List[str] = []
     for line in ttir_text.splitlines():
         m = _OP_LINE.match(line)
         if not m:
             continue
         op_name = m.group("op")
+        if op_name in _TTIR_STRUCTURAL_OPS:
+            # Structural scaffolding -- recorded for coverage but no emit.
+            visited.append(op_name)
+            continue
         visited.append(op_name)
         if op_name not in OP_TABLE:
             raise NotImplementedError(
@@ -150,7 +173,9 @@ def _walk_text_ttir(ttir_text: str, ctx: WalkerCtx) -> List[str]:
     return visited
 
 
-def _walk_mlir_module(module: Any, ctx: WalkerCtx) -> List[str]:
+def _walk_mlir_module(
+    module: Any, ctx: Optional[WalkerCtx] = None
+) -> List[str]:
     """Walk a real ``mlir.ir.Module`` and dispatch each op via OP_TABLE."""
     visited: List[str] = []
     # Triton TTIR stores tt.func ops at the module top level.
@@ -174,6 +199,10 @@ def _walk_mlir_module(module: Any, ctx: WalkerCtx) -> List[str]:
         if op_name_str in OP_TABLE:
             visited.append(op_name_str)
             OP_TABLE[op_name_str](op, ctx)
+        elif op_name_str in _TTIR_STRUCTURAL_OPS:
+            # Same scaffolding skip as the text walker (tt.func / tt.return
+            # are wrappers; recurse into them but emit nothing).
+            visited.append(op_name_str)
         # Recurse into regions/blocks.
         for region in getattr(op, "regions", ()) or ():
             for block in getattr(region, "blocks", ()) or ():
