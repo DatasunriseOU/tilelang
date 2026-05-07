@@ -17,10 +17,20 @@ import tilelang as tl  # noqa: E402
 from tvm.script import tir as T  # noqa: E402
 
 
-def _build_tma_kernel():
+_CU_TENSOR_MAP_DATA_TYPE_FLOAT16 = 6
+_CU_TENSOR_MAP_DATA_TYPE_FLOAT32 = 7
+
+
+def _build_tma_kernel(data_type_code: int = _CU_TENSOR_MAP_DATA_TYPE_FLOAT16):
     """Build a tiny PrimFunc that contains a `tl::tma_load` Call wrapped in
     its `create_tma_descriptor` plumbing — i.e. exactly the IR shape that
-    `LowerTileOp` emits on the Hopper TMA path."""
+    `LowerTileOp` emits on the Hopper TMA path.
+
+    The ``data_type_code`` is the inverse-mapped ``CUtensorMapDataType``
+    value (see ``src/op/utils.cc::to_CUtensorMapDataType``). Selecting a
+    non-fp16 code exercises the dtype-recovery path the fallback uses to
+    compute per-element byte strides.
+    """
 
     create_tma = tvm.tir.op.Op.get("tl.create_tma_descriptor")
     tma_load = tvm.tir.op.Op.get("tl.tma_load")
@@ -34,7 +44,7 @@ def _build_tma_kernel():
         desc = T.call_intrin(
             "handle",
             create_tma,
-            T.int32(2),  # data_type code (placeholder)
+            T.int32(data_type_code),  # CUtensorMapDataType code
             T.int32(2),  # rank
             A_handle,    # global_addr
             T.int32(64), T.int32(64),       # shape
@@ -97,3 +107,42 @@ def test_hip_decomposes():
     print("[hip lowered IR]\n", mod)
     assert not _has_tma_call(mod), \
         "LowerTMAToPtrArith on HIP must rewrite TMA calls"
+
+
+def test_metal_fp32_uses_4_byte_stride():
+    """Regression: the fallback used to default to fp16 (2 bytes/elem)
+    regardless of the descriptor's data_type code, silently corrupting
+    every non-fp16 TMA copy on non-NV targets. Verify that an fp32
+    descriptor emits a 4-byte stride in the rewritten IR (the
+    ``__tl_ptr_copy_elem`` byte-count argument)."""
+    func = _build_tma_kernel(data_type_code=_CU_TENSOR_MAP_DATA_TYPE_FLOAT32)
+    mod = _lower(func, "metal")
+    s = str(mod.script() if hasattr(mod, "script") else mod)
+    assert "__tl_ptr_copy_elem" in s, \
+        "expected pointer-arith copy helper in lowered IR"
+    # The third arg to __tl_ptr_copy_elem is the element byte count; for
+    # fp32 it must be 4 (not the legacy 2-byte fp16 default).
+    assert ", 4)" in s or ", 4i64)" in s or ", T.int64(4)" in s, \
+        f"expected 4-byte element stride in fp32 fallback, got:\n{s}"
+
+
+def test_metal_fp16_uses_2_byte_stride():
+    """Companion to the fp32 test: the legacy default should now only
+    appear when the descriptor actually says fp16."""
+    func = _build_tma_kernel(data_type_code=_CU_TENSOR_MAP_DATA_TYPE_FLOAT16)
+    mod = _lower(func, "metal")
+    s = str(mod.script() if hasattr(mod, "script") else mod)
+    assert "__tl_ptr_copy_elem" in s
+    assert ", 2)" in s or ", 2i64)" in s or ", T.int64(2)" in s, \
+        f"expected 2-byte element stride in fp16 fallback, got:\n{s}"
+
+
+def test_unknown_dtype_code_is_refused():
+    """An unrecognized CUtensorMapDataType code must NOT silently lower
+    to a wrong byte stride — the pass logs a warning and leaves the TMA
+    call in place so codegen surfaces the bug instead of corrupting
+    memory."""
+    func = _build_tma_kernel(data_type_code=999)  # outside enum range
+    mod = _lower(func, "metal")
+    assert _has_tma_call(mod), \
+        "Unknown dtype must NOT be silently lowered (would corrupt mem)."

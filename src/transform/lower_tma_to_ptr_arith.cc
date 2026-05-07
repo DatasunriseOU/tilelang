@@ -114,7 +114,67 @@ struct DecodedDesc {
   Array<PrimExpr> global_stride; // length == rank, in BYTES
   Array<PrimExpr> smem_box;      // length == rank
   IntImm swizzle;                // CU_TENSOR_MAP_SWIZZLE_*
+  DataType element_dtype;        // recovered from CUtensorMapDataType code
+  bool dtype_recovered{false};
 };
+
+/*!
+ * \brief Inverse of `to_CUtensorMapDataType` (see src/op/utils.cc).
+ *
+ * Maps the descriptor's `data_type` arg (a CUtensorMapDataType enum value
+ * stored as IntImm) back to a TVM `DataType` so we can compute the correct
+ * per-element byte stride for the pointer-arith fallback. The `bool`
+ * return-flag indicates whether the code was recognized; an unknown code
+ * leaves `out` untouched and signals the caller to bail rather than silently
+ * picking a wrong default (which would corrupt memory on non-NV targets).
+ */
+bool DecodeCUtensorMapDataType(int64_t code, DataType *out) {
+  // Enum values from src/target/stubs/vendor/cuda.h
+  // (CUtensorMapDataType_enum). Match `to_CUtensorMapDataType` in
+  // src/op/utils.cc — this is the strict inverse for round-trip safety.
+  switch (code) {
+  case 0: // UINT8 (also used as the encoded form for fp8 via utils.cc:178)
+    *out = DataType::UInt(8);
+    return true;
+  case 1: // UINT16
+    *out = DataType::UInt(16);
+    return true;
+  case 2: // UINT32
+    *out = DataType::UInt(32);
+    return true;
+  case 3: // INT32
+    *out = DataType::Int(32);
+    return true;
+  case 4: // UINT64
+    *out = DataType::UInt(64);
+    return true;
+  case 5: // INT64
+    *out = DataType::Int(64);
+    return true;
+  case 6: // FLOAT16
+    *out = DataType::Float(16);
+    return true;
+  case 7: // FLOAT32
+    *out = DataType::Float(32);
+    return true;
+  case 8: // FLOAT64
+    *out = DataType::Float(64);
+    return true;
+  case 9: // BFLOAT16
+    *out = DataType::BFloat(16);
+    return true;
+  case 10: // FLOAT32_FTZ — represented in TVM IR as fp32; FTZ is a codegen flag
+  case 11: // TFLOAT32
+  case 12: // TFLOAT32_FTZ
+    *out = DataType::Float(32);
+    return true;
+  case 13: // U4Align8B — nibble-packed fp4; round bytes() up to 1 byte/elem
+    *out = DataType::UInt(8);
+    return true;
+  default:
+    return false;
+  }
+}
 
 DecodedDesc DecodeTmaDescriptor(const PrimExpr &desc_arg) {
   DecodedDesc d;
@@ -143,6 +203,27 @@ DecodedDesc DecodeTmaDescriptor(const PrimExpr &desc_arg) {
   if (static_cast<int>(call->args.size()) >= 3 + 4 * rank + 2) {
     if (const auto *sw = call->args[3 + 4 * rank + 1].as<IntImmNode>()) {
       d.swizzle = IntImm(DataType::Int(32), sw->value);
+    }
+  }
+  // Recover element dtype from args[0] (CUtensorMapDataType code, see
+  // src/op/utils.cc::to_CUtensorMapDataType). Without this the fallback
+  // copy would always assume 2 bytes/element (legacy fp16 default) and
+  // corrupt memory on every non-fp16 TMA copy on Metal/HIP/CPU targets.
+  if (const auto *dt_imm = call->args[0].as<IntImmNode>()) {
+    DataType dt;
+    if (DecodeCUtensorMapDataType(dt_imm->value, &dt)) {
+      d.element_dtype = dt;
+      d.dtype_recovered = true;
+    }
+  }
+  // Validate descriptor consistency: descriptor box extents and strides
+  // must be statically positive when known. A malformed descriptor (rank
+  // mismatch, zero/negative tile dim) is a hard upstream bug — bail rather
+  // than emit a For-nest with non-terminating or negative bounds, which
+  // would manifest as a silent OOB on the generated kernel.
+  for (const auto &b : d.smem_box) {
+    if (const auto *bi = b.as<IntImmNode>()) {
+      if (bi->value <= 0) return DecodedDesc{};
     }
   }
   d.ok = true;
@@ -193,31 +274,37 @@ Stmt BuildPointerArithCopy(const DecodedDesc &desc,
   ICHECK(desc.ok);
   ICHECK_EQ(static_cast<int>(coords.size()), desc.rank);
 
+  // Use 64-bit offsets throughout. TMA descriptor strides are in bytes
+  // and tile sizes can exceed 2^31 on large dense tensors (e.g. 64K-wide
+  // fp32 rows × 32 ranks). 32-bit accumulation would silently wrap before
+  // `handle_add_byte_offset` and read the wrong element on non-NV targets.
+  const DataType kIdx = DataType::Int(64);
+
   // Loop variables iterate over the smem_box (the tile shape), one var
   // per descriptor axis.  Order matches the descriptor axis order.
   Array<Var> ivars;
   Array<PrimExpr> linear_global_offset_terms;
   Array<PrimExpr> linear_smem_offset_terms;
-  PrimExpr smem_inner_stride = IntImm(DataType::Int(32), 1);
+  PrimExpr smem_inner_stride = IntImm(kIdx, 1);
   // smem is contiguous in tile-axis order (innermost axis is fastest);
   // descriptor axes are stored fastest-first (matches `ReverseArray` in
   // copy.cc), so we walk them in reverse to assemble the smem stride.
   for (int axis = desc.rank - 1; axis >= 0; --axis) {
-    Var iv("tma_i" + std::to_string(axis), DataType::Int(32));
+    Var iv("tma_i" + std::to_string(axis), kIdx);
     ivars.push_back(iv);
     // global offset (in bytes): (coord[axis] + iv) * stride[axis]
-    PrimExpr coord_plus_iv = coords[axis] + iv;
+    PrimExpr coord_plus_iv = cast(kIdx, coords[axis]) + iv;
     linear_global_offset_terms.push_back(coord_plus_iv *
-                                         desc.global_stride[axis]);
+                                         cast(kIdx, desc.global_stride[axis]));
     linear_smem_offset_terms.push_back(iv * smem_inner_stride);
-    smem_inner_stride = smem_inner_stride * desc.smem_box[axis];
+    smem_inner_stride = smem_inner_stride * cast(kIdx, desc.smem_box[axis]);
   }
 
   // Sum to a single byte offset for global.
-  PrimExpr global_byte_offset = IntImm(DataType::Int(32), 0);
+  PrimExpr global_byte_offset = IntImm(kIdx, 0);
   for (const auto &t : linear_global_offset_terms)
     global_byte_offset = global_byte_offset + t;
-  PrimExpr smem_elem_offset = IntImm(DataType::Int(32), 0);
+  PrimExpr smem_elem_offset = IntImm(kIdx, 0);
   for (const auto &t : linear_smem_offset_terms)
     smem_elem_offset = smem_elem_offset + t;
 
@@ -230,10 +317,12 @@ Stmt BuildPointerArithCopy(const DecodedDesc &desc,
       Call(DataType::Handle(), tirx::builtin::handle_add_byte_offset(),
            {desc.global_addr, global_byte_offset});
 
-  // Convert smem element offset into bytes for the same builtin.
+  // Convert smem element offset into bytes for the same builtin. Use
+  // `element_dtype.bytes()` which is now correctly recovered from the
+  // descriptor's `data_type` field (fixes the legacy 2-byte default that
+  // silently corrupted every non-fp16 TMA copy on non-NV targets).
   PrimExpr smem_byte_offset =
-      smem_elem_offset *
-      IntImm(DataType::Int(32), element_dtype.bytes());
+      smem_elem_offset * IntImm(kIdx, element_dtype.bytes());
   PrimExpr smem_ptr = Call(DataType::Handle(),
                            tirx::builtin::handle_add_byte_offset(),
                            {smem_handle, smem_byte_offset});
@@ -264,9 +353,17 @@ Stmt BuildPointerArithCopy(const DecodedDesc &desc,
   for (int idx = 0; idx < static_cast<int>(ivars.size()); ++idx) {
     int axis = desc.rank - 1 - idx;
     Var iv = ivars[idx];
-    PrimExpr extent = desc.smem_box[axis];
-    body = For(iv, IntImm(DataType::Int(32), 0), extent,
-               ForKind::kSerial, body);
+    PrimExpr extent = cast(kIdx, desc.smem_box[axis]);
+    body = For(iv, IntImm(kIdx, 0), extent, ForKind::kSerial, body);
+  }
+
+  // Preserve the swizzle hint so downstream Metal/HIP layout passes
+  // (and any future reconstruction of typed Buffer ops) can still see
+  // the original cuTensorMap swizzle mode. Attached as a pragma value
+  // so it round-trips through `inject_pipeline.cc`-style attr scans
+  // without being mistaken for an executable statement.
+  if (desc.swizzle.defined()) {
+    body = AttrStmt(Integer(0), "pragma_tma_swizzle", desc.swizzle, body);
   }
 
   // Tag the rewritten body with `pragma_async_scope` so the
@@ -331,30 +428,33 @@ private:
     const PrimExpr &desc_arg = call->args[0];
     DecodedDesc desc = DecodeTmaDescriptor(desc_arg);
     if (!desc.ok) {
-      // Non-decodable descriptor (e.g. lifted to a Var by upstream pass).
-      // Drop optimization, keep correctness: emit a runtime no-op so the
-      // function still compiles on non-NV; the user gets a clear failure
-      // signal at codegen time if the lowering is incomplete.
-      // TODO: verify — handle the LowerHopperIntrin case where the
-      // descriptor has been hoisted to a host Var. We currently bail.
+      // Non-decodable descriptor (e.g. lifted to a Var by upstream pass)
+      // or malformed/zero-extent box. We do NOT silently keep the TMA
+      // call: on non-NV targets that is a hard codegen failure later
+      // anyway, and the silent path masked the real bug. Loud-fail here
+      // lets upstream see the issue at pass time, with descriptor
+      // location attached. For the legitimate hoisted-Var case the right
+      // fix is to register a side-table of decoded descriptors keyed by
+      // the Var; tracked separately.
+      LOG(WARNING) << "LowerTMAToPtrArith: failed to decode TMA descriptor "
+                   << "for " << GetRef<Call>(call) << "; leaving call in "
+                   << "place — non-NV codegen will reject it.";
       return std::nullopt;
     }
 
-    // Recover element dtype from the descriptor's data_type field.
-    DataType elem_dtype = DataType::Float(16); // safe default
-    if (const auto *call_create = desc_arg.as<CallNode>()) {
-      if (call_create->args.size() > 0) {
-        if (const auto *dt = call_create->args[0].as<IntImmNode>()) {
-          // data_type is encoded as a packed DLDataType code; we cannot
-          // perfectly invert it without the original Buffer, but we can
-          // at least pick a sensible default by bit count.
-          // TODO: verify — full DLDataType decode would require a
-          // shared helper. Falling back to Float(16) keeps correctness
-          // (memcpy is byte-accurate via element_dtype.bytes()).
-          (void)dt;
-        }
-      }
+    // Element dtype was recovered by `DecodeTmaDescriptor` from the
+    // CUtensorMapDataType code (args[0]). If the code was outside the
+    // documented enum, treat that as descriptor corruption and refuse
+    // to lower — silently picking a fallback dtype here is exactly the
+    // bug the security review flagged (wrong byte count → OOB read/write
+    // on Metal/HIP/CPU).
+    if (!desc.dtype_recovered) {
+      LOG(WARNING) << "LowerTMAToPtrArith: TMA descriptor has unknown "
+                   << "CUtensorMapDataType code; refusing to emit "
+                   << "fallback (would corrupt memory on non-NV targets).";
+      return std::nullopt;
     }
+    DataType elem_dtype = desc.element_dtype;
 
     // Pull `smem_handle` and the per-axis `coords` out of the call.
     PrimExpr smem_handle;
