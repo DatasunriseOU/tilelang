@@ -213,10 +213,19 @@ def reduce_sum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
 def reduce_prod(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, batch: int = 1) -> None:
     """Perform reduce product on input buffer, store the result to output buffer.
 
-    Backend lowering uses the ``"mul"`` reduction kind. Some backends do not
-    yet implement multiplicative all-reduce; callers compiling on those
-    targets will see a codegen error and should fall back to the
-    log/exp synthesis (see :mod:`poc.triton_frontend.op_mapping`).
+    Backend lowering uses the ``"mul"`` reduction kind. Known limitation
+    (wave-7 #5, runtime-test-matrix commit e2bd513e): the C++ TIR pass
+    that lowers ``"mul"`` AllReduce currently emits a buffer access with a
+    vector lane in a non-last dimension, which then trips the invariant
+    in ``src/transform/vectorize_loop.cc:67`` and
+    ``src/transform/storage_rewrite.cc:70`` (``"Only the last index of a
+    buffer access may be a vector type."``). The Python wrapper here is
+    correct (mirrors ``reduce_sum`` / ``reduce_max`` exactly); the bug
+    is in the C++ lowering and tracked for wave-8.
+
+    Until the C++ pass is fixed, callers should prefer the log/exp
+    synthesis fallback (see :data:`poc.triton_frontend.op_mapping._USE_LOGEXP_PROD`).
+    A ``RuntimeWarning`` is emitted on first call as a tracking signal.
 
     Args:
         buffer (tir.Buffer): The input buffer
@@ -225,8 +234,26 @@ def reduce_prod(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool 
         clear (bool): If True, output buffer is initialised to 1 before the reduction.
         batch (int): Number of output elements per batched AllReduce call (default 1).
     """
+    global _REDUCE_PROD_WARNED
+    if not _REDUCE_PROD_WARNED:
+        import warnings
+        warnings.warn(
+            "tilelang.language.reduce_prod: the 'mul' AllReduce lowering "
+            "currently violates the last-index-vector-only invariant in "
+            "vectorize_loop.cc / storage_rewrite.cc. Constructing this "
+            "prim_func body will compile, but lowering will fail. Prefer "
+            "the log/exp synthesis fallback "
+            "(poc.triton_frontend.op_mapping._USE_LOGEXP_PROD = True) "
+            "until wave-8 fixes the C++ pass.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        _REDUCE_PROD_WARNED = True
     dim = _legalize_dim(buffer, dim)
     reduce(buffer, out, "mul", dim, clear, batch=batch)
+
+
+_REDUCE_PROD_WARNED = False
 
 
 def reduce_abssum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, batch: int = 1) -> None:
