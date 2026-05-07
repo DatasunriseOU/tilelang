@@ -217,6 +217,52 @@ def _walk_mlir_module(
 
     # Lazy import to avoid a top-of-file cycle with mlir_walker.
     from .mlir_walker import OPS_THAT_HANDLE_OWN_REGIONS  # noqa: WPS433
+    # Lazy import of the tt.func sym_name extractor + tt.call callee parser
+    # (live in the control emitters module). Used by the pre-pass below to
+    # seed ``ctx.callees`` so ``emit_tt_call`` can look up callees without
+    # re-walking the module, and to flag which tt.func ops are referenced
+    # by tt.call so we don't double-emit their bodies at module level.
+    from .op_emitters.control import (  # noqa: WPS433
+        _func_sym_name,
+        _parse_callee_attr,
+    )
+
+    # Auto-wrap jaxlib-shaped modules so ``module.operation`` (which
+    # carries ``regions``) is the recursion entry point. See
+    # :func:`mlir_walker.wrap_module_for_walker` for the rationale.
+    from .mlir_walker import wrap_module_for_walker as _wrap  # noqa: WPS433
+    module = _wrap(module)
+    body = getattr(module, "body", None) or getattr(module, "operation", module)
+
+    # ------------------------------------------------------------------
+    # tt.call pre-pass
+    # ------------------------------------------------------------------
+    #
+    # Before dispatching anything we enumerate every ``tt.func`` and
+    # ``tt.call`` reachable from the module root. Each tt.func is
+    # registered in ``ctx.callees`` keyed by ``sym_name`` so
+    # ``emit_tt_call`` can look up its target callee without doing its
+    # own module walk. Each tt.call's referenced symbol is collected in
+    # ``ctx.callee_used`` so the dispatch loop below knows which tt.func
+    # ops to *skip* recursion into (their bodies are inlined at call
+    # sites; re-walking them at module level would double-emit and
+    # KeyError on unbound block-args).
+    if ctx is not None:
+        def _prepass(op: Any) -> None:
+            name = _op_name(op)
+            if name == "tt.func":
+                sym = _func_sym_name(op)
+                if sym:
+                    ctx.callees[sym] = op
+            elif name == "tt.call":
+                callee_sym = _parse_callee_attr(op)
+                if callee_sym:
+                    ctx.callee_used.add(callee_sym)
+            for region in getattr(op, "regions", ()) or ():
+                for block in getattr(region, "blocks", ()) or ():
+                    for child in getattr(block, "operations", ()) or ():
+                        _prepass(child)
+        _prepass(body)
 
     def _recurse(op: Any) -> None:
         op_name_str = _op_name(op)
@@ -236,18 +282,26 @@ def _walk_mlir_module(
         # yet mapped`` on the next downstream op.
         if op_name_str in OPS_THAT_HANDLE_OWN_REGIONS:
             return
+        # tt.call: emit_tt_call inline-walks the callee's body itself, so
+        # we must not re-recurse into the (empty) tt.call op regions here.
+        # tt.call has no regions in practice but we defensively short-circuit
+        # for parity with the OPS_THAT_HANDLE_OWN_REGIONS branch above.
+        if op_name_str == "tt.call":
+            return
+        # Helper tt.func: a tt.func whose sym_name is referenced by some
+        # tt.call is inlined at the call site. We must NOT re-walk its
+        # body here -- doing so would double-emit and (worse) the helper's
+        # block-args are not bound at module-level so dispatch would fail.
+        if op_name_str == "tt.func" and ctx is not None:
+            sym = _func_sym_name(op)
+            if sym and sym in ctx.callee_used:
+                return
         # Recurse into regions/blocks.
         for region in getattr(op, "regions", ()) or ():
             for block in getattr(region, "blocks", ()) or ():
                 for child in getattr(block, "operations", ()) or ():
                     _recurse(child)
 
-    # Auto-wrap jaxlib-shaped modules so ``module.operation`` (which
-    # carries ``regions``) is the recursion entry point. See
-    # :func:`mlir_walker.wrap_module_for_walker` for the rationale.
-    from .mlir_walker import wrap_module_for_walker as _wrap  # noqa: WPS433
-    module = _wrap(module)
-    body = getattr(module, "body", None) or getattr(module, "operation", module)
     _recurse(body)
     return visited
 
@@ -263,6 +317,17 @@ def _make_prim_func(ctx: WalkerCtx, name: str = "main") -> Any:
     Buffers come from ``ctx.buffers`` (one per kernel argument); body is
     ``SeqStmt(ctx.stmts)``. The PrimFunc is annotated with ``"tir.noalias"``
     and ``"global_symbol"`` to match what TileLang's pipeline expects.
+
+    Tile-scoped buffers stashed in ``ctx.local_buffers`` (e.g. the spill
+    buffer for a wide ``tt.make_range``, the destination of a
+    ``tt.broadcast`` / ``tt.expand_dims`` / ``tt.splat`` materialisation,
+    or the output of a per-element ``tt.load`` fallback) are NOT promoted
+    to PrimFunc parameters. Instead we wrap the body with one
+    ``tir.AllocBuffer`` per local buffer so the data Var is properly scoped
+    inside the function body. This keeps ``tirx::analysis::VerifyMemory``
+    happy: its "directly accessed by host memory" check only fires when a
+    BufferLoad/Store hits a Var that is in ``buffer_map`` (a function arg);
+    locally-allocated buffers fall into the "skip conservatively" branch.
     """
     import tvm  # noqa: WPS433
     from tvm import tir  # noqa: WPS433
@@ -280,6 +345,23 @@ def _make_prim_func(ctx: WalkerCtx, name: str = "main") -> Any:
         body = ctx.stmts[0]
     else:
         body = tir.SeqStmt(ctx.stmts)
+
+    # Wrap the body with AllocBuffer stmts for tile-scoped buffers.
+    # AllocBuffer is a Stmt that introduces a buffer's data Var into scope,
+    # so we prepend one stmt per local buffer ahead of the existing body
+    # via SeqStmt. The order doesn't matter: each AllocBuffer is independent.
+    local_buffers = list(getattr(ctx, "local_buffers", []) or [])
+    if local_buffers:
+        AllocBuffer = getattr(tir, "AllocBuffer", None)
+        if AllocBuffer is None:
+            # Legacy TVM that exposes Allocate but not AllocBuffer -- fall
+            # back to a no-op wrapper. The body still type-checks; the
+            # legacy verifier doesn't perform the same buffer_map scrutiny.
+            wrapped = body
+        else:
+            alloc_stmts = [AllocBuffer(buf) for buf in local_buffers]
+            wrapped = tir.SeqStmt(alloc_stmts + [body])
+        body = wrapped
 
     func = tir.PrimFunc(params=params, body=body, buffer_map=buffer_map)
     func = func.with_attr("tir.noalias", True)

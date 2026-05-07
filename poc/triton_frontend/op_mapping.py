@@ -42,6 +42,7 @@ _USE_LOGEXP_PROD = False
 
 __all__ = [
     "OP_TABLE",
+    "TritonFrontendError",
     "EmitError",
     "EmitFn",
     "WalkerCtx",
@@ -74,7 +75,24 @@ __all__ = [
 ]
 
 
-class EmitError(RuntimeError):
+class TritonFrontendError(RuntimeError):
+    """Common base for all frontend-raised exceptions.
+
+    Wave G4 introduced this base so :class:`EmitError` (raised by op
+    emitters) and :class:`poc.triton_frontend.pipeline.PipelineError`
+    (raised by pre-walker stages) form a coherent hierarchy. A pipeline
+    driver that wants to catch *any* deliberate frontend failure -- as
+    opposed to a generic ``RuntimeError`` from TVM/TileLang internals --
+    can write ``except TritonFrontendError`` exactly once.
+
+    Per the Wave G4 hard constraint, this base must NOT be caught with a
+    bare ``except TritonFrontendError: pass``. Catch the specific subclass
+    and re-raise / annotate; catching the base is reserved for top-level
+    drivers that translate the failure into a structured status code.
+    """
+
+
+class EmitError(TritonFrontendError):
     """Raised when an emitter cannot lower an op for a precise, named reason.
 
     We use a dedicated subclass (rather than ``ValueError`` /
@@ -86,6 +104,9 @@ class EmitError(RuntimeError):
     re-export this class via ``from ..op_mapping import EmitError`` so all
     emitter modules raise the same exception type and ``except EmitError``
     in the pipeline catches every emitter-side failure.
+
+    Wave G4: ``EmitError`` is now a subclass of :class:`TritonFrontendError`
+    so it shares a common ancestor with :class:`PipelineError`.
     """
 
 
@@ -128,6 +149,36 @@ class WalkerCtx:
         # ``op_emitters/memory.py`` look up here to choose between the real
         # T.copy path and the per-element ``# DEGRADED:`` fallback.
         self.ptr_states: Dict[str, Any] = {}
+        # Symbol name (e.g. "@triton.language.standard.max__...") -> tt.func
+        # op. Populated by the module-level pre-pass in
+        # ``triton_frontend._walk_mlir_module`` so the ``tt.call`` emitter can
+        # inline-expand the callee's body without re-walking the whole module.
+        # The leading ``@`` is stripped during lookup.
+        self.callees: Dict[str, Any] = {}
+        # Set of sym_names referenced by at least one ``tt.call``. The
+        # walker uses this to avoid recursing into helper ``tt.func`` ops
+        # at module-level (their bodies are emitted only via inline expansion
+        # at the tt.call site).
+        self.callee_used: set = set()
+        # Stack of substitution overlays pushed by ``push_substitution``.
+        # Each frame is a ``Dict[Any, Any]`` mapping callee block-arg SSA
+        # values (or their printed names) to the caller's TIR-resolved
+        # operand. ``ctx.get`` consults this stack before falling back to
+        # ``value_map``.
+        self._subst_stack: List[Dict[Any, Any]] = []
+        # Tile-scoped buffers allocated *inside* the kernel body (e.g. the
+        # results of ``tt.make_range`` spills, ``tt.broadcast`` /
+        # ``tt.expand_dims`` / ``tt.splat`` materialisations, and per-element
+        # ``tt.load`` fallbacks). These are NEVER promoted to PrimFunc
+        # parameters; ``_make_prim_func`` emits one ``tir.AllocBuffer`` stmt
+        # per entry at the head of the body so the buffer's ``data`` Var is
+        # properly scoped. Putting them in ``buffer_map`` would make
+        # ``tirx::analysis::VerifyMemory`` flag every BufferLoad/BufferStore
+        # as "directly accessed by host memory" because the verifier requires
+        # that any buffer-arg's data var be accessed only inside a thread
+        # environment (see 3rdparty/tvm/src/tirx/analysis/verify_memory.cc
+        # ``HandleLoadStoreToVariable``).
+        self.local_buffers: List[Any] = []
 
     # ---- helpers --------------------------------------------------------
 
@@ -148,7 +199,31 @@ class WalkerCtx:
         return self.tvm().tir
 
     def get(self, ssa_value: Any) -> Any:
-        """Resolve an MLIR SSA value to its TIR equivalent."""
+        """Resolve an MLIR SSA value to its TIR equivalent.
+
+        Consults the substitution stack first (top-of-stack wins), so a
+        ``push_substitution`` overlay can mask a stale ``value_map`` entry
+        for an SSA name that the inlined callee reuses internally.
+        """
+        # Substitution overlays (pushed by ``push_substitution``) take
+        # precedence -- this is how ``tt.call`` rebinds the callee's
+        # block-arg SSAs to the caller's resolved operands without
+        # mutating ``value_map`` for the duration of the inline walk.
+        for frame in reversed(self._subst_stack):
+            if ssa_value in frame:
+                return frame[ssa_value]
+            # SSA values may be unhashable Value objects but their printed
+            # name (``%arg0``) is a usable key. Try that fallback.
+            try:
+                # Best-effort name extraction without importing the helper
+                # from op_emitters.control (avoids a circular import).
+                getter = getattr(ssa_value, "get_name", None)
+                if callable(getter):
+                    name = getter()
+                    if name and name in frame:
+                        return frame[name]
+            except Exception:
+                pass
         if ssa_value in self.value_map:
             return self.value_map[ssa_value]
         # Best-effort context: identify the producing op and (if the SSA
@@ -187,6 +262,51 @@ class WalkerCtx:
     def emit(self, stmt: Any) -> None:
         """Append a TIR statement to the current function body."""
         self.stmts.append(stmt)
+
+    # ---- tt.call inline-expansion plumbing ------------------------------
+
+    def lookup_callee(self, name: str) -> Optional[Any]:
+        """Return the ``tt.func`` op registered for ``name``, or None.
+
+        ``name`` may be supplied with or without a leading ``@``; both are
+        normalised before the lookup. Used by ``op_emitters.control.emit_tt_call``
+        to find the callee body to inline-expand.
+        """
+        if not name:
+            return None
+        key = name.lstrip("@")
+        return self.callees.get(key) or self.callees.get(name)
+
+    class _SubstScope:
+        """Context manager popping a substitution frame on exit."""
+
+        __slots__ = ("ctx", "frame")
+
+        def __init__(self, ctx: "WalkerCtx", frame: Dict[Any, Any]) -> None:
+            self.ctx = ctx
+            self.frame = frame
+
+        def __enter__(self) -> Dict[Any, Any]:
+            self.ctx._subst_stack.append(self.frame)
+            return self.frame
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            popped = self.ctx._subst_stack.pop()
+            assert popped is self.frame, (
+                "WalkerCtx._subst_stack desync: pop returned a different frame "
+                "than the one push_substitution installed; something nested "
+                "out-of-order."
+            )
+
+    def push_substitution(self, mapping: Dict[Any, Any]) -> "_SubstScope":
+        """Push an SSA-substitution overlay for the duration of a ``with`` block.
+
+        Used by ``emit_tt_call`` to bind a callee's block-argument SSAs to
+        the caller's already-resolved TIR operands. The overlay is consulted
+        by :meth:`get` BEFORE ``value_map``, so it correctly shadows any
+        outer binding of the same SSA name.
+        """
+        return WalkerCtx._SubstScope(self, dict(mapping))
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +637,61 @@ def _ptrstate_buffer(ctx: "WalkerCtx", resolved: Dict[str, Any], dtype: str) -> 
     return ctx.buffers[name]
 
 
+def _alloc_tile_buffer(
+    ctx: "WalkerCtx",
+    shape: Sequence[Any],
+    dtype: str,
+    name: str,
+    scope: str = "local",
+) -> Any:
+    """Allocate a tile-scoped buffer that is visible only inside the kernel body.
+
+    Use this in op-emitters whenever you need a fresh buffer to hold an
+    intermediate tile (``tt.make_range`` spill, ``tt.broadcast`` /
+    ``tt.expand_dims`` / ``tt.splat`` materialisation, per-element
+    ``tt.load`` fallback, ``arith.constant`` dense tile, etc.).
+
+    Why not ``tir.decl_buffer + ctx.buffers[name] = buf``?
+    -----------------------------------------------------
+    Promoting a tile buffer to ``ctx.buffers`` makes it a PrimFunc parameter
+    (it ends up in ``buffer_map``).  TileLang's ``tirx::analysis::VerifyMemory``
+    pass walks every ``BufferLoad`` / ``BufferStore`` and, if the data ``Var``
+    is in ``buffer_map`` (i.e. comes from a function argument) **and** the
+    access is not inside a thread environment, it raises
+    ``"Variable 'X' is directly accessed by host memory"``.  Since our
+    intermediate tile buffers are written/read at host scope (the
+    surrounding ``T.Kernel`` is added later in the pipeline), keeping them
+    out of ``buffer_map`` lets the verifier's "skip locally-allocated
+    buffers conservatively" branch handle them correctly.
+
+    Why ``T.alloc_fragment``-style scope?
+    -------------------------------------
+    The buffer carries ``scope="local"`` (or ``scope="local.fragment"`` /
+    ``"shared"`` etc., when callers explicitly request one) so downstream
+    LowerOpaqueBlock / FlattenBuffer passes treat it as thread-local
+    storage rather than global memory.
+
+    The buffer is registered in ``ctx.local_buffers``; ``_make_prim_func``
+    emits a ``tir.AllocBuffer`` stmt at the head of the body so the
+    buffer's ``data`` Var is in scope before the first reference.
+
+    Falls back to ``tir.decl_buffer`` + no scope tracking when TVM's
+    ``tirx`` namespace lacks ``AllocBuffer`` (legacy / unit-test sandbox
+    paths); the helper still returns a usable Buffer in that case.
+    """
+    tir = ctx.tir()
+    shape_list = list(shape) if shape else [1]
+    try:
+        buf = tir.decl_buffer(shape_list, dtype, name=name, scope=scope)
+    except TypeError:
+        # Older decl_buffer signatures don't accept ``scope`` kw -- fall
+        # back to the unscoped form. The buffer still bypasses buffer_map
+        # via ``ctx.local_buffers`` so VerifyMemory will skip it.
+        buf = tir.decl_buffer(shape_list, dtype, name=name)
+    ctx.local_buffers.append(buf)
+    return buf
+
+
 def _emit_load_copy(op: Any, ctx: "WalkerCtx", resolved: Dict[str, Any],
                     mask_ssa: Any, other_ssa: Any) -> Any:
     """Emit ``T.copy(global[region], frag)`` and bind the result SSA to frag.
@@ -721,6 +896,11 @@ def map_tt_load(op: Any, ctx: WalkerCtx) -> Any:
         # tests with dict-shaped fakes): seed a placeholder buffer so the
         # walker can keep going. The shape/dtype come from the result type
         # when available; otherwise we fall back to a flat 1024xfp32 buf.
+        # The placeholder is NOT a real PrimFunc parameter -- it's a
+        # local-scope tile buffer (see ``_alloc_tile_buffer``) so the
+        # downstream ``BufferLoad`` survives ``VerifyMemory``.  When
+        # PtrAnalysis seeds a real PtrState the earlier branches handle
+        # it; this fallback is the no-shim / unit-test path.
         # TODO: replace with PtrAnalysis-derived (buffer, indices).
         result = _results(op)[0] if _results(op) else None
         out_shape = list(_shape_of(result)) if result is not None else [1024]
@@ -731,10 +911,12 @@ def map_tt_load(op: Any, ctx: WalkerCtx) -> Any:
             or ctx.fresh("buf")
         )
         if buf_name not in ctx.buffers:
-            ctx.buffers[buf_name] = tir.decl_buffer(
-                shape=out_shape or [1024], dtype=out_dtype, name=buf_name
+            buf = _alloc_tile_buffer(
+                ctx, out_shape or [1024], out_dtype, buf_name
             )
-        buf, indices = ctx.buffers[buf_name], [0]
+        else:
+            buf = ctx.buffers[buf_name]
+        indices = [0]
 
     # Prefer high-level T.copy when consumers can use it (RFC 5.1: keep the
     # frontend on the high-level surface so LayoutInference / LowerTileOp
@@ -794,6 +976,8 @@ def map_tt_store(op: Any, ctx: WalkerCtx) -> Any:
         buf, indices = resolved, [0]
     else:
         # Same placeholder-seed path as map_tt_load; see notes there.
+        # The placeholder is a tile-local buffer rather than a PrimFunc
+        # parameter so VerifyMemory's host-memory check skips it.
         # TODO: replace with PtrAnalysis-derived (buffer, indices).
         out_shape = list(_shape_of(val_ssa))
         out_dtype = _dtype_of(val_ssa)
@@ -803,10 +987,12 @@ def map_tt_store(op: Any, ctx: WalkerCtx) -> Any:
             or ctx.fresh("buf")
         )
         if buf_name not in ctx.buffers:
-            ctx.buffers[buf_name] = tir.decl_buffer(
-                shape=out_shape or [1024], dtype=out_dtype or "float32", name=buf_name
+            buf = _alloc_tile_buffer(
+                ctx, out_shape or [1024], out_dtype or "float32", buf_name
             )
-        buf, indices = ctx.buffers[buf_name], [0]
+        else:
+            buf = ctx.buffers[buf_name]
+        indices = [0]
 
     store_stmt = tir.BufferStore(buf, val_expr, list(indices))
     if mask_ssa is not None:

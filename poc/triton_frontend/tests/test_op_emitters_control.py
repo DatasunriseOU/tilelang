@@ -792,8 +792,13 @@ def test_arith_constant_dense_splat_zero() -> None:
     # Buffer is bound under both the SSA Value object and printed name.
     assert ctx.value_map[result] is out
     assert ctx.value_map["%c0"] is out
-    # Buffer registered in ctx.buffers under the constructed name.
-    assert any(b is out for b in ctx.buffers.values())
+    # Buffer registered in ctx.local_buffers (tile-scoped, NOT a PrimFunc
+    # parameter -- making it a parameter would trip ``VerifyMemory``
+    # because the surrounding For nest writes to it at host scope).
+    assert any(b is out for b in ctx.local_buffers)
+    assert not any(b is out for b in ctx.buffers.values()), (
+        "dense arith.constant must NOT be promoted to ctx.buffers"
+    )
     # A serial For nest writing the splat value was emitted.
     assert len(ctx.stmts) == 1
     stmt = ctx.stmts[0]
@@ -861,3 +866,129 @@ def test_arith_constant_dense_int_splat() -> None:
     assert isinstance(inner.value, tvm.tir.IntImm)
     assert int(inner.value.value) == 7
     assert str(inner.value.dtype) == "int32"
+
+
+# ---------------------------------------------------------------------------
+# tt.call -- inline expansion of a tt.func callee
+# ---------------------------------------------------------------------------
+#
+# These tests exercise the dict-fake path (no MLIR bindings) so they run
+# wherever ``tvm`` is importable. They cover:
+#   * happy path: a synthetic callee ``%c = %a + %b`` is inlined at the
+#     call site and the call's result SSA is bound to the Add expr.
+#   * error path: a tt.call whose ``@callee`` is not in ctx.callees
+#     surfaces an EmitError instead of silently producing junk.
+
+from poc.triton_frontend.op_emitters.control import emit_tt_call  # noqa: E402
+
+
+def test_tt_call_inlines_simple_callee() -> None:
+    """Synthetic ``tt.call`` over an inlined ``%a + %b`` callee.
+
+    Dict-fake module shape:
+      tt.func @callee(%a: f32, %b: f32) -> f32 {
+          %c = arith.addf %a, %b : f32
+          tt.return %c : f32
+      }
+      // caller site:
+      %r = tt.call @callee(%x, %y) : (f32, f32) -> f32
+
+    After dispatch, ``ctx.value_map[%r]`` should be the TIR Add of x+y, and
+    the callee's body should NOT have polluted ``value_map`` under the
+    callee's own block-arg names ``%a`` / ``%b`` (those live only in the
+    substitution scope while emit_tt_call walks the body).
+    """
+    ctx = WalkerCtx()
+
+    # Caller-side SSA values, already bound to TIR Vars.
+    x = _val("%x", shape=[], dtype="float32")
+    y = _val("%y", shape=[], dtype="float32")
+    ctx.bind(x, tvm.tir.Var("x", "float32"))
+    ctx.bind(y, tvm.tir.Var("y", "float32"))
+
+    # Callee block-arg SSAs and the body's intermediate %c.
+    a = _val("%a", shape=[], dtype="float32")
+    b = _val("%b", shape=[], dtype="float32")
+    c = _val("%c", shape=[], dtype="float32")
+
+    # The arith.addf op inside the callee: %c = %a + %b.
+    addf_op = {
+        "name": "arith.addf",
+        "operands": [a, b],
+        "results": [c],
+        "attrs": {},
+    }
+    return_op = {
+        "name": "tt.return",
+        "operands": [c],
+        "results": [],
+        "attrs": {},
+    }
+
+    callee_func = {
+        "name": "tt.func",
+        "operands": [],
+        "results": [],
+        "attrs": {"sym_name": "my_add", "sym_visibility": "private"},
+        "block_args": [a, b],
+        "regions": [{
+            "blocks": [
+                {
+                    "block_args": [a, b],
+                    "ops": [addf_op, return_op],
+                },
+            ],
+        }],
+    }
+
+    # Register the callee in ctx.callees the way the module pre-pass would.
+    ctx.callees["my_add"] = callee_func
+
+    # Caller's tt.call op.
+    r = _val("%r", shape=[], dtype="float32")
+    call_op = {
+        "name": "tt.call",
+        "operands": [x, y],
+        "results": [r],
+        "attrs": {"callee": "@my_add"},
+    }
+
+    out = emit_tt_call(call_op, ctx)
+    assert out is not None, "emit_tt_call should return the inlined return value"
+
+    # The call's result SSA must be bound to the Add expression.
+    assert r in ctx.value_map
+    bound = ctx.value_map[r]
+    text = str(bound)
+    # tvm.tir.Add prints as "x + y" (or "Add(x, y)"); accept either form.
+    assert ("+" in text) or ("Add" in text), \
+        f"expected an Add expression, got: {text!r}"
+    # Callee was marked as referenced.
+    assert "my_add" in ctx.callee_used
+    # The substitution stack was popped cleanly after the inline walk.
+    assert ctx._subst_stack == []
+
+
+def test_tt_call_unknown_callee_raises() -> None:
+    """A ``tt.call`` whose @callee is not in ctx.callees raises EmitError.
+
+    No silent fallback: a missing callee in the registry almost certainly
+    means the module-level pre-pass missed a tt.func, and emitting nothing
+    would leave the call's result SSA unbound -- the next consumer would
+    KeyError with a far-less-helpful message. Surface the failure here.
+    """
+    ctx = WalkerCtx()
+    x = _val("%x", shape=[], dtype="float32")
+    ctx.bind(x, tvm.tir.Var("x", "float32"))
+    r = _val("%r", shape=[], dtype="float32")
+    call_op = {
+        "name": "tt.call",
+        "operands": [x],
+        "results": [r],
+        "attrs": {"callee": "@missing"},
+    }
+    with pytest.raises(EmitError) as excinfo:
+        emit_tt_call(call_op, ctx)
+    msg = str(excinfo.value)
+    assert "missing" in msg, f"error should name the missing callee: {msg!r}"
+    assert "tt.call" in msg or "callee" in msg, msg

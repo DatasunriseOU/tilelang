@@ -61,6 +61,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 # stays a thin overlay rather than a parallel implementation.
 from ..op_mapping import (
     WalkerCtx,
+    _alloc_tile_buffer,
     _attrs,
     _attrs_with_properties_shared,
     _dtype_of,
@@ -321,8 +322,10 @@ def _emit_degraded_tile_load(
     tir = ctx.tir()
     result_value = _results(op)[0] if _results(op) else None
     out_buf_name = ctx.fresh("tile_load")
-    tile_buf = tir.decl_buffer(list(out_shape) or [1], out_dtype, name=out_buf_name)
-    ctx.buffers[out_buf_name] = tile_buf
+    # Tile-scoped allocation -- see ``_alloc_tile_buffer`` for why this
+    # bypasses ``ctx.buffers`` (otherwise ``VerifyMemory`` flags the
+    # per-lane BufferStore as host-memory access).
+    tile_buf = _alloc_tile_buffer(ctx, list(out_shape) or [1], out_dtype, out_buf_name)
 
     # Build a nested ``For`` over the tile shape. We collapse to a single
     # 1-D loop when the tile is rank-1 to keep the output legible; higher
@@ -491,8 +494,8 @@ def _emit_tile_copy_tir(
     tir = ctx.tir()
     result_value = _results(op)[0] if _results(op) else None
     out_buf_name = ctx.fresh("tile_load")
-    tile_buf = tir.decl_buffer(list(out_shape) or [1], out_dtype, name=out_buf_name)
-    ctx.buffers[out_buf_name] = tile_buf
+    # Tile-scoped allocation; see ``_alloc_tile_buffer`` docstring.
+    tile_buf = _alloc_tile_buffer(ctx, list(out_shape) or [1], out_dtype, out_buf_name)
 
     loop_vars: List[Any] = []
     body_indices: List[Any] = list(base_indices) if base_indices else []
@@ -539,6 +542,86 @@ def _emit_tile_copy_tir(
     if result_value is not None:
         ctx.bind(result_value, tile_buf)
     return tile_buf
+
+
+def _emit_tile_store_tir(
+    op: Any,
+    ctx: WalkerCtx,
+    dst_buf: Any,
+    base_indices: Sequence[Any],
+    val_expr: Any,
+    val_shape: Sequence[int],
+    mask_ssa: Any,
+) -> Any:
+    """Non-DEGRADED tile store fallback: rolled ``tir.For`` over ``BufferStore``.
+
+    Symmetric to :func:`_emit_tile_copy_tir`. Used when the destination is a
+    multi-rank tile buffer but no PtrAnalysis tile descriptor or
+    ``T``-builder scope is available, so we must emit a rank-N ``tir.For``
+    nest by hand. Without this helper, an emitter that synthesises a
+    rank-N ``decl_buffer`` based on the result/value shape would index it
+    with a single ``[0]`` index and trip the TVM ``Buffer is N-dimensional,
+    cannot be indexed with the 1-dimensional indices`` check.
+    """
+    tir = ctx.tir()
+    # Handle the scalar / empty-shape case the same way ``BufferStore`` does
+    # for rank-1 (or rank-0) buffers: the caller is responsible for passing
+    # a sensible scalar value.
+    if not val_shape:
+        idx = list(base_indices) or [tir.const(0, "int32")]
+        store: Any = tir.BufferStore(dst_buf, val_expr, idx)
+        if mask_ssa is not None:
+            try:
+                mask_expr = ctx.get(mask_ssa)
+                mask_lane = _resolve_lane_operand(ctx, mask_expr, [], role="mask")
+                store = tir.IfThenElse(mask_lane, store, None)
+            except KeyError:
+                pass
+        ctx.emit(store)
+        return store
+
+    loop_vars = [tir.Var(ctx.fresh(f"i{axis}"), "int32") for axis in range(len(val_shape))]
+
+    dst_indices: List[Any] = []
+    for axis, lv in enumerate(loop_vars):
+        base = (
+            base_indices[axis]
+            if axis < len(base_indices)
+            else tir.const(0, "int32")
+        )
+        dst_indices.append(base + lv)
+
+    # The value being stored may be a buffer (per-lane BufferLoad) or a
+    # PrimExpr that we broadcast to every lane.
+    if hasattr(val_expr, "shape"):
+        rhs = tir.BufferLoad(val_expr, list(loop_vars))
+    else:
+        rhs = val_expr  # scalar PrimExpr broadcast
+
+    store = tir.BufferStore(dst_buf, rhs, dst_indices)
+    if mask_ssa is not None:
+        try:
+            mask_expr = ctx.get(mask_ssa)
+            mask_lane = _resolve_lane_operand(ctx, mask_expr, loop_vars, role="mask")
+            store = tir.IfThenElse(mask_lane, store, None)
+        except KeyError:
+            pass
+
+    body: Any = store
+    for axis in range(len(loop_vars) - 1, -1, -1):
+        extent = val_shape[axis]
+        body = tir.For(
+            loop_vars[axis],
+            tir.const(0, "int32"),
+            tir.const(int(extent), "int32"),
+            tir.ForKind.SERIAL,
+            body,
+        )
+
+    # No ``# DEGRADED:`` AttrStmt: the buffer rank is honoured rank-N, this
+    # is just a non-T.copy fallback (e.g., shim present but no PtrState).
+    ctx.emit(body)
+    return body
 
 
 def _is_tile_shape(shape: Sequence[int]) -> bool:
@@ -676,16 +759,30 @@ def emit_tt_load(op: Any, ctx: WalkerCtx) -> Any:
             or (ptr_ssa.get("name") if isinstance(ptr_ssa, dict) else None)
             or ctx.fresh("buf")
         )
+        # Tile-scoped placeholder for the no-PtrState path; see
+        # ``op_mapping._alloc_tile_buffer`` for why this bypasses
+        # ``ctx.buffers`` (Memory verification would otherwise flag
+        # every per-lane BufferLoad below).
         if buf_name not in ctx.buffers:
-            ctx.buffers[buf_name] = tir.decl_buffer(out_shape, out_dtype, name=buf_name)
-        src_buf = ctx.buffers[buf_name]
+            src_buf = _alloc_tile_buffer(ctx, list(out_shape), out_dtype, buf_name)
+        else:
+            src_buf = ctx.buffers[buf_name]
+        # Rank-N safety: ``src_buf`` was declared with the result tile
+        # shape, so indexing it with a single ``[0]`` would trip TVM's
+        # "Buffer is N-dimensional, cannot be indexed with the
+        # 1-dimensional indices" assertion (matmul's 2D pointer-arithmetic
+        # tiles hit this). Always emit a rank-N ``tir.For`` nest -- even
+        # with the shim available -- so the BufferLoad index count
+        # matches ``src_buf.shape``. PtrAnalysis-driven shim acceleration
+        # only fires earlier in this function (the ``_ptrstate_is_tile``
+        # branch); here we have no PtrState, so the rolled-loop path is
+        # the contractually-correct lowering.
         if has_cxx_shim():
-            # We don't have PtrState -- best we can do is a single
-            # BufferLoad on the flat buffer. Future: thread PtrAnalysis here.
-            load_expr = tir.BufferLoad(src_buf, [tir.const(0, "int32")])
-            if result_value is not None:
-                ctx.bind(result_value, load_expr)
-            return load_expr
+            base_indices = [tir.const(0, "int32") for _ in out_shape]
+            return _emit_tile_copy_tir(
+                op, ctx, src_buf, base_indices, out_shape, out_dtype,
+                mask_ssa, other_ssa,
+            )
         return _emit_degraded_tile_load(
             op, ctx, src_buf, [0], out_shape, out_dtype, mask_ssa, other_ssa,
         )
@@ -697,14 +794,19 @@ def emit_tt_load(op: Any, ctx: WalkerCtx) -> Any:
         buf, indices = resolved, [0]
     else:
         # Seed a placeholder buffer to match the legacy fallback shape.
+        # Tile-scoped (see ``_alloc_tile_buffer``) so VerifyMemory skips it.
         buf_name = (
             getattr(ptr_ssa, "name", None)
             or (ptr_ssa.get("name") if isinstance(ptr_ssa, dict) else None)
             or ctx.fresh("buf")
         )
         if buf_name not in ctx.buffers:
-            ctx.buffers[buf_name] = tir.decl_buffer(out_shape or [1024], out_dtype, name=buf_name)
-        buf, indices = ctx.buffers[buf_name], [0]
+            buf = _alloc_tile_buffer(
+                ctx, out_shape or [1024], out_dtype, buf_name
+            )
+        else:
+            buf = ctx.buffers[buf_name]
+        indices = [0]
 
     load_expr: Any = tir.BufferLoad(buf, list(indices))
     if mask_ssa is not None:
@@ -773,9 +875,13 @@ def emit_tt_store(op: Any, ctx: WalkerCtx) -> Any:
             or (ptr_ssa.get("name") if isinstance(ptr_ssa, dict) else None)
             or ctx.fresh("buf")
         )
+        # Tile-scoped placeholder; see ``op_mapping._alloc_tile_buffer``.
+        # Production with a shim hits ``_emit_store_copy`` above; this is
+        # the no-shim / unit-test fallback.
         if buf_name not in ctx.buffers:
-            ctx.buffers[buf_name] = tir.decl_buffer(val_shape, dtype, name=buf_name)
-        dst_buf = ctx.buffers[buf_name]
+            dst_buf = _alloc_tile_buffer(ctx, list(val_shape), dtype, buf_name)
+        else:
+            dst_buf = ctx.buffers[buf_name]
         if has_cxx_shim():
             # Detect Buffer-shaped mask early: the single-statement path
             # below has no enclosing loop to index a per-lane mask, so we
@@ -798,18 +904,17 @@ def emit_tt_store(op: Any, ctx: WalkerCtx) -> Any:
                 return _emit_degraded_tile_store(
                     op, ctx, dst_buf, [0], val_expr, val_shape, mask_ssa,
                 )
-            store_stmt = tir.BufferStore(dst_buf, val_expr, [tir.const(0, "int32")])
-            if mask_ssa is not None:
-                try:
-                    mask_expr = ctx.get(mask_ssa)
-                    mask_lane = _resolve_lane_operand(
-                        ctx, mask_expr, [], role="mask"
-                    )
-                    store_stmt = tir.IfThenElse(mask_lane, store_stmt, None)
-                except KeyError:
-                    pass
-            ctx.emit(store_stmt)
-            return store_stmt
+            # Rank-N safety: ``dst_buf`` was declared with the value's tile
+            # shape (matmul writes a 2D output tile), so a single ``[0]``
+            # index against a 2D buffer would trip TVM's
+            # ``buffer->shape.size() == indices.size()`` check. Always
+            # emit a rank-N ``tir.For`` nest. Without PtrState the shim
+            # cannot fold this into ``T.copy`` anyway, so the rolled
+            # loop is the contractually-correct lowering.
+            base_indices = [tir.const(0, "int32") for _ in val_shape]
+            return _emit_tile_store_tir(
+                op, ctx, dst_buf, base_indices, val_expr, val_shape, mask_ssa,
+            )
         return _emit_degraded_tile_store(
             op, ctx, dst_buf, [0], val_expr, val_shape, mask_ssa,
         )
@@ -826,9 +931,12 @@ def emit_tt_store(op: Any, ctx: WalkerCtx) -> Any:
             or (ptr_ssa.get("name") if isinstance(ptr_ssa, dict) else None)
             or ctx.fresh("buf")
         )
+        # Tile-scoped placeholder; see ``op_mapping._alloc_tile_buffer``.
         if buf_name not in ctx.buffers:
-            ctx.buffers[buf_name] = tir.decl_buffer(val_shape or [1024], dtype, name=buf_name)
-        buf, indices = ctx.buffers[buf_name], [0]
+            buf = _alloc_tile_buffer(ctx, val_shape or [1024], dtype, buf_name)
+        else:
+            buf = ctx.buffers[buf_name]
+        indices = [0]
 
     store_stmt: Any = tir.BufferStore(buf, val_expr, list(indices))
     if mask_ssa is not None:
@@ -876,10 +984,9 @@ def emit_tt_make_range(op: Any, ctx: WalkerCtx) -> Any:
             ctx.bind(_results(op)[0], ramp)
         return ramp
 
-    # Wide range -- spill to a buffer with a serial init loop.
+    # Wide range -- spill to a tile-scoped buffer with a serial init loop.
     buf_name = ctx.fresh("range")
-    buf = tir.decl_buffer([lanes], "int32", name=buf_name)
-    ctx.buffers[buf_name] = buf
+    buf = _alloc_tile_buffer(ctx, [lanes], "int32", buf_name)
     iv = tir.Var(ctx.fresh("ri"), "int32")
     body = tir.BufferStore(buf, tir.const(start, "int32") + iv, [iv])
     loop = tir.For(
@@ -1071,8 +1178,7 @@ def _materialise_vector_into_buffer(
     out_shape_list = [int(s) for s in out_shape]
     if not out_shape_list:
         raise ValueError("_materialise_vector_into_buffer: out_shape is empty")
-    dst = tir.decl_buffer(out_shape_list, dtype, name=ctx.fresh("vec"))
-    ctx.buffers[dst.name] = dst
+    dst = _alloc_tile_buffer(ctx, out_shape_list, dtype, ctx.fresh("vec"))
 
     loop_vars = [tir.Var(ctx.fresh(f"v{axis}"), "int32") for axis in range(len(out_shape_list))]
     lane_idx = loop_vars[-1]
@@ -1250,8 +1356,7 @@ def emit_tt_broadcast(op: Any, ctx: WalkerCtx) -> Any:
     if dtype in ("", "handle"):
         dtype = _vector_scalar_dtype(src)
     if out_shape and (out_lanes > src_lanes or src_is_buffer or src_vec_lanes > 1):
-        out_buf = tir.decl_buffer(out_shape, dtype, name=ctx.fresh("bcast"))
-        ctx.buffers[out_buf.name] = out_buf
+        out_buf = _alloc_tile_buffer(ctx, out_shape, dtype, ctx.fresh("bcast"))
         loop_vars = [tir.Var(ctx.fresh(f"b{i}"), "int32") for i in range(len(out_shape))]
         # Index the source with the trailing dims that map into the source
         # shape (the broadcast convention is to match trailing dims).
@@ -1506,8 +1611,9 @@ def emit_tts_make_tptr(op: Any, ctx: WalkerCtx) -> Any:
         import tilelang.language as T  # type: ignore
         frag = T.alloc_fragment(out_shape, out_dtype)
     except ImportError:  # pragma: no cover -- TileLang absent
-        frag = tir.decl_buffer(out_shape, out_dtype, name=ctx.fresh("tptr"))
-        ctx.buffers[frag.name] = frag
+        # Fragment fallback: tile-scoped buffer (see ``_alloc_tile_buffer``)
+        # so VerifyMemory's host-memory check skips it.
+        frag = _alloc_tile_buffer(ctx, out_shape, out_dtype, ctx.fresh("tptr"))
 
     if result_value is not None:
         ctx.bind(result_value, frag)

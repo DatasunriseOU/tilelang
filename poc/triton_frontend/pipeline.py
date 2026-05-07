@@ -25,6 +25,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple
 
+from .op_mapping import TritonFrontendError
+
 __all__ = [
     "PassStatus",
     "PassRole",
@@ -40,10 +42,17 @@ __all__ = [
 ]
 
 
-class PipelineError(RuntimeError):
+class PipelineError(TritonFrontendError):
     """Raised when a pre-walker pipeline stage fails in a way that should NOT
     silently degrade. Carries enough context (op name, SSA, state count) to
     point a maintainer at the missing PtrState wiring without a debug build.
+
+    Wave G4: ``PipelineError`` is now a subclass of
+    :class:`poc.triton_frontend.op_mapping.TritonFrontendError` so it shares
+    a common ancestor with :class:`EmitError`. This lets a single
+    ``except TritonFrontendError`` clause in driver code catch any
+    deliberate frontend failure (emitter-side or pipeline-side) without
+    swallowing unrelated ``RuntimeError``s from TVM/TileLang internals.
     """
 
 

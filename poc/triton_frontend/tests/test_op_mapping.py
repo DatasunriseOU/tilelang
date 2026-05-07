@@ -53,8 +53,9 @@ from poc.triton_frontend.op_mapping import (  # noqa: E402
 from ._fixtures import FakeMlirOp as _FakeMlirOp, FakeSSA as _HashableSSA  # noqa: E402
 
 
-def _ssa(name: str, *, shape=(), dtype: str = "float32") -> dict:
-    return {"name": name, "shape": tuple(shape), "dtype": dtype}
+def _ssa(name: str, *, shape=(), dtype: str = "float32") -> _HashableSSA:
+    """Hashable SSA stand-in (delegates to :class:`FakeSSA`)."""
+    return _HashableSSA(name=name, shape=tuple(shape), dtype=dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -280,3 +281,37 @@ def test_normalize_mlir_dtype_still_raises_on_unknown() -> None:
     """Hard constraint: unknown dtypes raise -- no silent float32 default."""
     with pytest.raises(ValueError, match="unsupported MLIR dtype"):
         _normalize_mlir_dtype("totally_made_up")
+
+
+# ---------------------------------------------------------------------------
+# Wave G4: error-class hierarchy
+# ---------------------------------------------------------------------------
+
+
+def test_emit_error_is_triton_frontend_error_subclass() -> None:
+    """Wave G4: ``EmitError`` must subclass :class:`TritonFrontendError`
+    so a single ``except TritonFrontendError`` clause in driver code
+    catches every deliberate frontend failure.
+    """
+    from poc.triton_frontend.op_mapping import EmitError, TritonFrontendError
+
+    assert issubclass(EmitError, TritonFrontendError)
+    # Sanity: the catch-clause shape advertised in the docstring works.
+    try:
+        raise EmitError("hierarchy smoke")
+    except TritonFrontendError as exc:
+        assert "hierarchy smoke" in str(exc)
+
+
+def test_pipeline_error_is_triton_frontend_error_subclass() -> None:
+    """Wave G4: ``PipelineError`` must subclass :class:`TritonFrontendError`
+    so it shares an ancestor with :class:`EmitError`.
+    """
+    from poc.triton_frontend.op_mapping import TritonFrontendError
+    from poc.triton_frontend.pipeline import PipelineError
+
+    assert issubclass(PipelineError, TritonFrontendError)
+    try:
+        raise PipelineError("pipeline hierarchy smoke")
+    except TritonFrontendError as exc:
+        assert "pipeline hierarchy smoke" in str(exc)

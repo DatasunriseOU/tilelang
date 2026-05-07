@@ -118,6 +118,55 @@ def test_make_range_wide_spills_to_for_loop() -> None:
     assert "for" in text.lower(), f"expected serial For loop in: {text!r}"
 
 
+def test_make_range_uses_alloc_fragment_not_decl_buffer() -> None:
+    """Wide ``tt.make_range`` spill must produce a *tile-scoped* buffer.
+
+    Regression for "Memory verification failed -- Variable 'range_2' is
+    directly accessed by host memory". The fix routes the spill through
+    ``op_mapping._alloc_tile_buffer`` so the buffer:
+
+    * is registered in ``ctx.local_buffers`` (NOT ``ctx.buffers``), so
+      it doesn't end up in the PrimFunc ``buffer_map`` / become a
+      function arg, and
+    * carries a non-empty storage scope (``"local"`` by default), so
+      downstream lowering treats it as thread-private storage.
+    """
+    ctx = WalkerCtx()
+    out = _ssa("wide_range_out", shape=[4096], dtype="int32")
+    op = {
+        "name": "tt.make_range",
+        "operands": [],
+        "results": [out],
+        "attrs": {"start": 0, "end": 4096},
+    }
+    buf = emit_tt_make_range(op, ctx)
+    assert isinstance(buf, tvm.tir.Buffer)
+    # Tile-scoped allocation contract: the spill buffer is in
+    # ``local_buffers`` (so ``_make_prim_func`` wraps it in an
+    # ``AllocBuffer`` stmt) and NOT in ``buffers`` (so it doesn't get
+    # promoted to a PrimFunc argument).
+    assert buf in ctx.local_buffers, (
+        "wide tt.make_range must register its spill buffer in "
+        "ctx.local_buffers so VerifyMemory sees it as locally allocated"
+    )
+    assert buf.name not in ctx.buffers, (
+        "wide tt.make_range MUST NOT promote its spill buffer to "
+        "ctx.buffers (which would make it a PrimFunc argument and trip "
+        "VerifyMemory's host-memory access check)"
+    )
+    # Storage scope check: tile-scoped buffers carry a non-empty scope
+    # so the LowerOpaqueBlock / FlattenBuffer passes treat them as
+    # thread-private.  The default helper emits ``"local"``.
+    scope = getattr(buf, "scope", None)
+    if callable(scope):
+        scope_str = scope()
+    else:
+        scope_str = str(scope) if scope is not None else ""
+    assert scope_str and scope_str != "global", (
+        f"expected non-global storage scope on spill buffer; got {scope_str!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # tt.broadcast -> tir.Broadcast
 # ---------------------------------------------------------------------------
@@ -740,6 +789,96 @@ def test_tt_load_with_buffer_other_emits_per_lane_buffer_load(
     assert "O[" in text, (
         f"expected per-lane BufferLoad on the 'other' buffer (e.g. 'O[i0]') "
         f"in printed stmts; got:\n{text}"
+    )
+
+
+def test_load_2d_tile_emits_2d_for_nest() -> None:
+    """Rank-tracking regression for matmul's 2D tile load.
+
+    matmul builds 2D pointer tiles via ``offs_m[:, None] * stride_am +
+    offs_k[None, :]`` and then issues a ``tt.load`` with a rank-2 result
+    type. Before this fix the no-PtrState branch in ``emit_tt_load``
+    declared a 2D buffer for the placeholder source but indexed it with a
+    single ``[0]`` index, which TVM rejects with
+    ``buffer->shape.size() == indices.size() (2 vs. 1) : Buffer ... is
+    2-dimensional, cannot be indexed with the 1-dimensional indices``.
+
+    The contract this test pins:
+
+    1. The emitted IR has a *nested* ``tir.For`` (rank == result rank,
+       i.e. two ``for`` keywords for a 2D tile).
+    2. The innermost ``BufferStore`` references *both* loop variables, so
+       the tile buffer is filled rank-N rather than smashed to lane 0.
+    3. The call must not raise the rank-mismatch ``InternalError``.
+    """
+    ctx = WalkerCtx()
+    ptr_ssa = _ssa("ptr2d", shape=[16, 16], dtype="float32")
+    out_ssa = _ssa("tile2d", shape=[16, 16], dtype="float32")
+    op = {
+        "name": "tt.load",
+        "operands": [ptr_ssa],
+        "results": [out_ssa],
+        "attrs": {},
+    }
+
+    result = emit_tt_load(op, ctx)
+
+    # The result must be a rank-2 tile buffer (not a scalar BufferLoad).
+    assert isinstance(result, tvm.tir.Buffer), (
+        f"expected tir.Buffer for 2D tile load; got {type(result).__name__}"
+    )
+    assert len(result.shape) == 2, (
+        f"expected rank-2 result buffer; got shape={list(result.shape)}"
+    )
+
+    text = _stringify(ctx.stmts)
+    # The TVM TIR printer collapses adjacent ``tir.For`` nodes into a
+    # single ``T.grid(...)`` call, so a rank-2 nest may print as one
+    # ``for i0, i1 in T.grid(16, 16)``. We assert on the rank-N axis
+    # extents instead: a 2D tile must show both extents.
+    assert "16, 16" in text or text.lower().count("for ") >= 2, (
+        f"expected rank-2 loop nest (T.grid(16, 16) or two nested for "
+        f"keywords) for a 2D tile; got:\n{text}"
+    )
+    # The fix must not have silently demoted the load to a single
+    # ``BufferLoad(src, [0])``. We check that two loop variables drive
+    # the rank-2 BufferStore index.
+    assert "i0" in text and "i1" in text, (
+        "expected both loop variables (i0, i1) to drive the rank-2 "
+        f"BufferStore index; got:\n{text}"
+    )
+
+
+def test_store_2d_tile_emits_2d_for_nest() -> None:
+    """Symmetric rank-tracking regression for ``tt.store`` on a 2D tile.
+
+    Same rationale as :func:`test_load_2d_tile_emits_2d_for_nest`: matmul
+    writes its 2D accumulator back through ``tt.store`` and would
+    otherwise hit the ``buffer->shape.size() == indices.size()`` check on
+    the destination buffer.
+    """
+    ctx = WalkerCtx()
+    ptr_ssa = _ssa("ptr_out_2d", shape=[16, 16], dtype="float32")
+    val_ssa = _ssa("val_2d", shape=[16, 16], dtype="float32")
+    val_buf = tvm.tir.decl_buffer([16, 16], "float32", name="V")
+    ctx.bind(val_ssa, val_buf)
+    op = {
+        "name": "tt.store",
+        "operands": [ptr_ssa, val_ssa],
+        "results": [],
+        "attrs": {},
+    }
+    emit_tt_store(op, ctx)
+    text = _stringify(ctx.stmts)
+    # See ``test_load_2d_tile_emits_2d_for_nest`` for why a single
+    # ``T.grid(16, 16)`` is also acceptable: the TIR printer collapses
+    # adjacent ``tir.For`` nodes into a grid form.
+    assert "16, 16" in text or text.lower().count("for ") >= 2, (
+        f"expected rank-2 loop nest for a 2D tile store; got:\n{text}"
+    )
+    assert "i0" in text and "i1" in text, (
+        "expected both loop variables (i0, i1) in the rank-2 BufferStore "
+        f"index list; got:\n{text}"
     )
 
 

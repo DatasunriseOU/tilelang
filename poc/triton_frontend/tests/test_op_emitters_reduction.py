@@ -35,14 +35,17 @@ from poc.triton_frontend.op_emitters.reduction import (  # noqa: E402
 )
 from poc.triton_frontend.op_mapping import OP_TABLE, WalkerCtx  # noqa: E402
 
+from ._fixtures import FakeSSA  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _ssa(name: str, *, shape: List[int] = (), dtype: str = "float32") -> Dict[str, Any]:
-    return {"name": name, "shape": tuple(shape), "dtype": dtype}
+def _ssa(name: str, *, shape: List[int] = (), dtype: str = "float32") -> FakeSSA:
+    """Hashable SSA stand-in (delegates to :class:`FakeSSA`)."""
+    return FakeSSA(name=name, shape=tuple(shape), dtype=dtype)
 
 
 def _op(

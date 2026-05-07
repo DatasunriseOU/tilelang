@@ -62,7 +62,7 @@ from typing import Any, Callable, Dict, Tuple
 # property-only attrs as an empty ``op.attributes`` dict, so we have to
 # fall back to parsing the printed op text. The same helper is used by
 # ``op_emitters/memory.py`` for ``tt.make_range`` (Wave C2 fix).
-from ..op_mapping import _attrs_with_properties_shared, EmitError
+from ..op_mapping import _alloc_tile_buffer, _attrs_with_properties_shared, EmitError
 
 # We import op_mapping lazily inside emitters when we need to reach into
 # WalkerCtx machinery; the type alias below is just for static readers.
@@ -303,8 +303,12 @@ def _emit_tile_binop(
         raise EmitError(
             f"{op_label}: _emit_tile_binop called without tile operand"
         )
-    out_buf = tir.decl_buffer(list(out_shape), out_dtype, name=ctx.fresh("tile"))
-    ctx.buffers[out_buf.name] = out_buf
+    # Tile-scoped result buffer; see ``op_mapping._alloc_tile_buffer``.
+    # Must NOT go through ``ctx.buffers`` (PrimFunc params): that would
+    # trip ``tirx::analysis::VerifyMemory`` because the per-lane
+    # BufferStore happens at host scope (the surrounding T.Kernel is
+    # introduced by a later pipeline stage).
+    out_buf = _alloc_tile_buffer(ctx, list(out_shape), out_dtype, ctx.fresh("tile"))
 
     loop_vars = [tir.Var(ctx.fresh(f"j{axis}"), "int32") for axis in range(len(out_shape))]
     lhs = _read_lane(ctx, a, tuple(loop_vars))

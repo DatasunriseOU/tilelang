@@ -27,15 +27,21 @@ from poc.triton_frontend.op_emitters.arith import (  # noqa: E402
 )
 from poc.triton_frontend.op_mapping import OP_TABLE, WalkerCtx  # noqa: E402
 
+from ._fixtures import FakeSSA  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _ssa(name: str, dtype: str = "float32") -> Dict[str, Any]:
-    """Build a dict-shaped SSA stand-in carrying just the dtype."""
-    return {"name": name, "dtype": dtype}
+def _ssa(name: str, dtype: str = "float32") -> FakeSSA:
+    """Build a hashable SSA stand-in carrying just the dtype.
+
+    Delegates to the shared :class:`FakeSSA` fixture (a ``dict`` subclass)
+    so all op-emitter tests share the same hashable-dict semantics.
+    """
+    return FakeSSA(name, dtype=dtype)
 
 
 def _op(name: str, operands: List[Any], results: List[Any], **attrs: Any) -> Dict[str, Any]:

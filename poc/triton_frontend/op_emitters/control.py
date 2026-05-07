@@ -71,6 +71,7 @@ __all__ = [
     "map_arith_constant",
     "map_tt_advance",
     "map_tt_func",
+    "emit_tt_call",
     "map_scf_for",
     "map_scf_if",
     "map_scf_yield",
@@ -883,8 +884,12 @@ def map_arith_constant(op: Any, ctx: _om.WalkerCtx) -> Any:
         # Strip a leading '%' so the buffer name reads cleanly in dumps.
         ssa_clean = nm_for_buf.lstrip("%").replace(".", "_")
         buf_name = f"const_{ssa_clean}"
-        buf = tir.decl_buffer(list(shape) if shape else [1], dtype, name=buf_name)
-        ctx.buffers[buf_name] = buf
+        # Tile-scoped allocation: see ``op_mapping._alloc_tile_buffer``.
+        # The dense constant lives entirely inside the kernel body; making
+        # it a PrimFunc parameter would trip ``VerifyMemory``.
+        buf = _om._alloc_tile_buffer(
+            ctx, list(shape) if shape else [1], dtype, buf_name
+        )
 
         # Build a serial tir.For nest writing the constant(s) into ``buf``.
         # All shapes from MLIR DenseElementsAttr are static (RankedTensorType
@@ -1763,6 +1768,275 @@ def map_llvm_inline_asm(op: Any, ctx: _om.WalkerCtx) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# tt.call -- inline expansion of a tt.func callee
+# ---------------------------------------------------------------------------
+#
+# Triton emits ``tt.call @callee(operands...)`` whenever the kernel uses a
+# helper function (e.g. the reusable softmax/sum reduction blocks pulled in
+# from ``triton.language.standard``). The TTIR module then carries a sibling
+# ``tt.func private @callee(...) {...}`` declaration. This emitter inlines
+# the callee at the call site:
+#
+#   1. Look up the callee tt.func op (registered in ``ctx.callees`` by the
+#      module-level pre-pass in ``triton_frontend.__init__:_walk_mlir_module``).
+#   2. Push a substitution frame mapping the callee's entry-block arguments
+#      to the caller's already-resolved TIR operands.
+#   3. Walk the callee's entry-block body via the OP_TABLE / CONTROL_EMITTERS
+#      dispatch, intercepting ``tt.return`` to capture the returned SSA.
+#   4. Pop the substitution frame and bind the tt.call's result SSA to the
+#      captured return value.
+#
+# We deliberately don't materialise the callee as a separate ``tir.PrimFunc``
+# / ``tir.call_extern`` because (a) it preserves SSA simplicity in the walker,
+# and (b) it matches Triton's own backend semantics, which inline these
+# helpers before lowering to GPU. Cap on call depth comes for free from
+# Python recursion limits; we don't expect helper-of-helper depth >2 in the
+# kernels we target.
+#
+# Hard constraint: an unresolvable ``@callee`` raises :class:`EmitError`
+# rather than returning silently -- a missing callee almost certainly means
+# the pre-pass missed a tt.func, and an invalid lowering is worse than a
+# loud failure (per ``feedback_no_silent_fallback``).
+
+
+# Match ``callee = @symbol_name`` inside the printed properties block.
+# Symbol names admit dots and underscores (e.g.
+# ``@triton.language.standard.max__fp32S128S_c0_cFalse_cTrue_cFalse``).
+_CALLEE_RE = __import__("re").compile(
+    r"callee\s*=\s*@(?P<sym>[A-Za-z_][\w.]*)"
+)
+
+
+def _parse_callee_attr(op: Any) -> Optional[str]:
+    """Extract the callee symbol from a ``tt.call`` op.
+
+    Tries, in order:
+      1. ``op.attrs['callee']`` (dict-fake or jaxlib registered-dialect path).
+      2. ``op.attributes['callee']`` -> stringify (real MLIR FlatSymbolRefAttr).
+      3. Regex over ``str(op)`` -- the unregistered-dialect path under
+         jaxlib's ``allow_unregistered_dialects=True`` puts the callee in
+         the printed ``<{...}>`` properties block but never surfaces it via
+         the Python attribute accessors.
+
+    Returns the symbol name WITHOUT the leading ``@``, or None when the op
+    has no parseable callee.
+    """
+    # Path 1: dict-fake.
+    if isinstance(op, dict):
+        attrs = op.get("attrs") or {}
+        if "callee" in attrs:
+            sym = str(attrs["callee"]).strip()
+            return sym.lstrip("@") or None
+
+    # Path 2: real MLIR attributes.
+    attrs_obj = getattr(op, "attributes", None)
+    if attrs_obj is not None:
+        try:
+            for a in attrs_obj:
+                if getattr(a, "name", None) == "callee":
+                    val = str(a.attr).strip()
+                    return val.lstrip("@") or None
+        except Exception:
+            pass
+
+    # Path 3: regex over the printed op text (unregistered-dialect path).
+    try:
+        text = str(op)
+    except Exception:
+        return None
+    m = _CALLEE_RE.search(text)
+    if m:
+        return m.group("sym")
+    return None
+
+
+def _func_sym_name(func_op: Any) -> Optional[str]:
+    """Return the ``sym_name`` attribute of a ``tt.func`` op (no leading @)."""
+    if isinstance(func_op, dict):
+        attrs = func_op.get("attrs") or {}
+        sym = attrs.get("sym_name") or func_op.get("sym_name")
+        return str(sym) if sym else None
+    # Try op.attributes first.
+    attrs_obj = getattr(func_op, "attributes", None)
+    if attrs_obj is not None:
+        try:
+            for a in attrs_obj:
+                if getattr(a, "name", None) == "sym_name":
+                    raw = str(a.attr).strip()
+                    if raw.startswith('"') and raw.endswith('"'):
+                        raw = raw[1:-1]
+                    return raw or None
+        except Exception:
+            pass
+    # Fall back to the printed properties block.
+    props = _om._parse_generic_properties_shared(func_op)
+    sym = props.get("sym_name")
+    return str(sym) if sym else None
+
+
+def _func_entry_block_ops(func_op: Any) -> List[Any]:
+    """Return the ops in the entry block (block 0) of a ``tt.func``.
+
+    Triton helper functions printed by Triton 3.x have a second
+    ``^bb1: // no predecessors`` block carrying ``ub.poison`` + a sentinel
+    ``tt.return``. That block is unreachable and must NOT be walked --
+    its ub.poison would error out the dispatcher. We restrict ourselves to
+    the entry block where the real body lives.
+    """
+    if isinstance(func_op, dict):
+        regions = func_op.get("regions") or []
+        if regions:
+            r0 = regions[0]
+            if isinstance(r0, dict):
+                blocks = r0.get("blocks") or []
+                if blocks:
+                    b0 = blocks[0]
+                    if isinstance(b0, dict):
+                        return list(b0.get("ops") or [])
+        # Single-region inline form: ``{"body": [op, ...]}``.
+        return list(func_op.get("body") or [])
+    regions = list(getattr(func_op, "regions", ()) or ())
+    if not regions:
+        return []
+    blocks = list(getattr(regions[0], "blocks", ()) or ())
+    if not blocks:
+        return []
+    return list(getattr(blocks[0], "operations", ()) or [])
+
+
+def _find_func_return_operand(func_op: Any) -> Optional[Any]:
+    """Find the ``tt.return`` op in the entry block and return its operand SSA.
+
+    Returns ``None`` for a void return (``tt.return`` with no operands) or
+    when the entry block has no ``tt.return`` at all (defensive; every
+    well-formed tt.func has one).
+    """
+    for inner in _func_entry_block_ops(func_op):
+        op_name = inner.get("name") if isinstance(inner, dict) else getattr(inner, "name", "")
+        if str(op_name) == "tt.return":
+            operands = _om._operands(inner)
+            if operands:
+                return operands[0]
+            return None
+    return None
+
+
+def emit_tt_call(op: Any, ctx: _om.WalkerCtx) -> Any:
+    """Inline-expand a ``tt.call @callee(operands...)`` into the caller body.
+
+    See module header for the full strategy. Raises :class:`EmitError` on
+    an unresolvable callee or a callee whose body has no ``tt.return``
+    when the call site expects a result.
+    """
+    sym = _parse_callee_attr(op)
+    if not sym:
+        raise EmitError(
+            "tt.call: could not extract a callee symbol from the op. "
+            "Expected ``callee = @<name>`` in the properties block; got: "
+            f"{str(op)!r}"
+        )
+
+    callee_func = ctx.lookup_callee(sym)
+    if callee_func is None:
+        known = sorted(ctx.callees.keys())
+        raise EmitError(
+            f"tt.call: references unknown callee '@{sym}'. The module-level "
+            f"pre-pass found these tt.func symbols: {known}. Either the "
+            "pre-pass skipped this tt.func or the symbol name in the call "
+            "is mistyped."
+        )
+
+    # Mark the callee as referenced so the module walker knows to skip
+    # re-emitting its body at module-level (a helper that's only inlined
+    # via tt.call must not also be walked as a top-level kernel).
+    ctx.callee_used.add(sym)
+
+    # Resolve the call's operands to TIR values via the caller's value_map.
+    operands = list(_om._operands(op))
+    resolved_operands: List[Any] = []
+    for o in operands:
+        if o in ctx.value_map:
+            resolved_operands.append(ctx.value_map[o])
+        else:
+            # ctx.get raises with a useful diagnostic if missing, but we
+            # also want to allow operands that are themselves unhashable
+            # MLIR Value objects -- ctx.get handles that uniformly.
+            resolved_operands.append(ctx.get(o))
+
+    # Build the substitution frame from callee block-args -> caller operands.
+    block_args = _func_block_args(callee_func)
+    if len(block_args) != len(resolved_operands):
+        raise EmitError(
+            f"tt.call @{sym}: arity mismatch: callee declares "
+            f"{len(block_args)} block-arg(s) but the call site passes "
+            f"{len(resolved_operands)} operand(s)."
+        )
+
+    subst: Dict[Any, Any] = {}
+    for arg, val in zip(block_args, resolved_operands):
+        # Bind under the SSA Value object (if hashable) AND its printed
+        # name. The double-keyed binding mirrors what map_tt_func does so
+        # downstream operand lookups resolve regardless of how they were
+        # captured (Value-object key or "%argN" string key).
+        try:
+            subst[arg] = val
+        except Exception:
+            pass
+        ssa = _ssa_name(arg)
+        if ssa:
+            subst[ssa] = val
+
+    # Walk the callee's entry block. We dispatch each inner op via OP_TABLE
+    # / CONTROL_EMITTERS just like the module walker would, but inside a
+    # ``push_substitution`` overlay so that block-arg lookups resolve to
+    # the caller's operands. Captured return operand is bound after the
+    # walk closes the substitution scope (so its TIR value -- already
+    # bound under the inlined SSA -- survives).
+    return_value: Any = None
+    body_ops = _func_entry_block_ops(callee_func)
+    with ctx.push_substitution(subst):
+        for inner in body_ops:
+            inner_name = inner.get("name") if isinstance(inner, dict) else getattr(inner, "name", "")
+            inner_name = str(inner_name)
+            if inner_name == "tt.return":
+                ret_operands = _om._operands(inner)
+                if ret_operands:
+                    # Resolve THROUGH the substitution frame so a tt.return
+                    # that yields a block-arg directly (rare, but legal)
+                    # resolves to the caller's operand.
+                    ret_ssa = ret_operands[0]
+                    if ret_ssa in ctx.value_map:
+                        return_value = ctx.value_map[ret_ssa]
+                    else:
+                        # Try the ctx.get path (consults the substitution
+                        # stack first, then value_map). Falls through to
+                        # KeyError if genuinely unbound.
+                        return_value = ctx.get(ret_ssa)
+                continue
+            emitter = _om.OP_TABLE.get(inner_name) or CONTROL_EMITTERS.get(inner_name)
+            if emitter is None:
+                raise EmitError(
+                    f"tt.call @{sym}: callee body contains op {inner_name!r} "
+                    "which has no emitter in OP_TABLE / CONTROL_EMITTERS. "
+                    "Register it before lowering kernels that depend on "
+                    f"@{sym}."
+                )
+            emitter(inner, ctx)
+
+    # Bind the call's result SSA to whatever the callee returned.
+    results = _om._results(op)
+    if results:
+        if return_value is None:
+            raise EmitError(
+                f"tt.call @{sym}: call site has a result SSA but the "
+                "callee body had no ``tt.return <value>``. Did the helper "
+                "lose its return op during a transform?"
+            )
+        ctx.bind(results[0], return_value)
+    return return_value
+
+
+# ---------------------------------------------------------------------------
 # Public dispatch table
 # ---------------------------------------------------------------------------
 
@@ -1797,6 +2071,8 @@ CONTROL_EMITTERS: Dict[str, Callable[..., Any]] = {
     # downstream emitters can look up ``%arg0`` via ctx.get(). The walker
     # owns recursion into the body region itself.
     "tt.func": map_tt_func,
+    # tt.call -- inline-expand a helper tt.func at the call site.
+    "tt.call": emit_tt_call,
     # scf
     "scf.for": map_scf_for,
     "scf.if": map_scf_if,
