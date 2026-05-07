@@ -434,8 +434,16 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
         solver.add(var_expr < MakeIntVal(max_value));
         commit_memo = false;  // already committed
       } else {
-        // Empty range — drop the memo write to avoid leaking a free var
-        // with no range. (Pre-fix-A3 we'd memoize anyway.)
+        // CPPMEGA fix-round-2 (HIGH correctness): empty range (min >= max)
+        // is logically UNSAT for any valuation of `var`. Previously we
+        // returned WITHOUT writing memo_, which meant a subsequent
+        // Visit(var) would mint a fresh free Z3 symbol, with no
+        // constraints — silently dropping the caller's intent. Commit
+        // the memo so subsequent uses bind to the same symbol, then
+        // assert `false` so any CanProve under this scope is sound
+        // (vacuously true) rather than reasoning about a free variable.
+        memo_.emplace(var, var_expr);
+        solver.add(ctx->bool_val(false));
         commit_memo = false;
         return;
       }
@@ -487,6 +495,19 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     // on every CanProve. The condition also covers width=0 → width=0
     // (Int → Int) which previously rebuilt unnecessarily.
     if (width == bv_width_) return;
+    // CPPMEGA fix-round-2 (HIGH correctness): a mode change rebuilds the
+    // solver, which clears `scope_stack_` and re-pushes a fresh root
+    // frame. If we did this while inside an active `EnterConstraint`
+    // scope, the recovery lambda's `solver.pop()` / `scope_stack_.pop_back()`
+    // would target a fresh stack — corrupting the prover state. Require
+    // the caller to be at the root scope before flipping modes.
+    ICHECK_EQ(scope_stack_.size(), 1u)
+        << "Z3Prover::SetBitVectorMode called with " << scope_stack_.size()
+        << " scope frames; recover all EnterConstraint scopes first.";
+    ICHECK(scope_stack_.front().empty())
+        << "Z3Prover::SetBitVectorMode called with non-empty root scope; "
+        << "the rebuild would discard " << scope_stack_.front().size()
+        << " bound vars / constraints.";
     bv_width_ = width;
     // Mode change: invalidate any pre-existing variable / sub-expression
     // encodings (declared at the old sort) by rebuilding the solver.

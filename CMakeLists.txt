@@ -264,9 +264,11 @@ option(TILELANG_RELEASE_BUILD "Strip source paths from log messages (for wheel r
 # CPPMEGA z3-stack fix-A5: gate test-only FFI surface behind a build flag
 # so we don't ship `tl.z3.bv_can_prove` / `tl.z3.bv_scoped_round_trip`
 # in release wheels (these are diagnostic helpers only used by tests).
-# Default ON to avoid breaking existing test infra; release wheels can
-# pass `-DTILELANG_BUILD_TESTS=OFF` to drop the symbols.
-option(TILELANG_BUILD_TESTS "Build test-only FFI helpers (e.g. Z3 bv probes)" ON)
+# CPPMEGA fix-round-2 (HIGH design+sec): default flipped to OFF so a
+# stock release wheel does NOT ship the test-only Z3 probe FFIs (they
+# expose internal prover state and bypass scope discipline). CI/test
+# runs must pass `-DTILELANG_BUILD_TESTS=ON` explicitly.
+option(TILELANG_BUILD_TESTS "Build test-only FFI helpers (e.g. Z3 bv probes)" OFF)
 
 # Include tvm after configs have been populated
 add_subdirectory(${TVM_SOURCE} tvm EXCLUDE_FROM_ALL)

@@ -7,6 +7,27 @@ from tilelang.transform import PassContext
 from tilelang.contrib.nvcc import have_tma, have_pdl
 
 
+# CPPMEGA fix-round-2 (MED perf): per-compile sentinel so the Z3 prover
+# cache clear runs once per (LowerAndLegalize + OptimizeForTarget) pair
+# instead of twice. Keyed by id(IRModule) — short-lived, uniquely
+# identifies the in-flight compile. The set is bounded by consume-on-read
+# in OptimizeForTarget so a stale id (after GC) never spuriously skips.
+_Z3_CLEARED_COMPILE_IDS: set[int] = set()
+
+
+def _mark_z3_cleared_for_compile(mod: IRModule) -> None:
+    _Z3_CLEARED_COMPILE_IDS.add(id(mod))
+
+
+def _consume_z3_cleared_for_compile(mod: IRModule) -> bool:
+    """Return True if this mod was already cleared, and drop the marker."""
+    key = id(mod)
+    if key in _Z3_CLEARED_COMPILE_IDS:
+        _Z3_CLEARED_COMPILE_IDS.discard(key)
+        return True
+    return False
+
+
 def allow_warp_specialized(pass_ctx: PassContext | None = None, target: Target | None = None) -> bool:
     # avoid circular import
     from tilelang.jit.adapter.utils import is_cuda_target
@@ -169,10 +190,14 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     # keyed by `Analyzer*`; a freed Analyzer's address can be reused by a
     # fresh Analyzer in this pass, which would otherwise inherit the
     # prior pass's memo / scope / bv-mode state. Cheap, idempotent.
+    # CPPMEGA fix-round-2 (MED perf): record the clear so the matching
+    # call in OptimizeForTarget is a no-op when both phases run back-to-
+    # back (the common compile path).
     _z3_clear = tvm.ffi.get_global_func("tl.z3.clear_prover_cache",
                                         allow_missing=True)
     if _z3_clear is not None:
         _z3_clear()
+        _mark_z3_cleared_for_compile(mod)
     # CPPMEGA: Lower TileLang's vendored `tilelang::tl_tir::LetStmt` and
     # `tilelang::tl_tir::Allocate` IR nodes to apache TIR equivalents
     # (Bind+SeqStmt, AllocBuffer+SeqStmt) BEFORE any apache TIR pass runs.
@@ -268,10 +293,15 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # invoked in isolation by tools, and the per-thread Z3 prover cache
     # outlives both. Clearing at every phase entry keeps the prover state
     # scoped to the current pass invocation.
-    _z3_clear = tvm.ffi.get_global_func("tl.z3.clear_prover_cache",
-                                        allow_missing=True)
-    if _z3_clear is not None:
-        _z3_clear()
+    # CPPMEGA fix-round-2 (MED perf): skip the clear if LowerAndLegalize
+    # already cleared for this compile (common full-pipeline path). The
+    # marker is consumed so a re-entrant compile of the same module id
+    # post-GC does not skip its own clear.
+    if not _consume_z3_cleared_for_compile(mod):
+        _z3_clear = tvm.ffi.get_global_func("tl.z3.clear_prover_cache",
+                                            allow_missing=True)
+        if _z3_clear is not None:
+            _z3_clear()
     # CPPMEGA: Defensive re-run of vendored-IR converters in case any TileLang
     # pass in `LowerAndLegalize` re-introduced `tilelang::tl_tir::LetStmt` or
     # `tilelang::tl_tir::Allocate` nodes. This guarantees the IR contains only
