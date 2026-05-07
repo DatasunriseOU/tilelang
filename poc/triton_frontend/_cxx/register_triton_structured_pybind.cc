@@ -29,7 +29,11 @@
 
 #include "mlir/IR/MLIRContext.h"
 
-#include "triton_shared/RegisterTritonStructured.h"
+// Note: RegisterTritonStructured.h lives at the root of vendored/triton_shared/
+// (alongside RegisterTritonStructured.cc), not under include/triton-shared/.
+// The CMakeLists.txt for the vendored target adds vendored/triton_shared as a
+// direct include directory, so we include it without a path prefix.
+#include "RegisterTritonStructured.h"
 
 namespace py = pybind11;
 

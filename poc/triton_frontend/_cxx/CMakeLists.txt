@@ -126,9 +126,19 @@ if(TRITON_FRONTEND_STUB_BUILD)
   message(STATUS "TRITON_FRONTEND_STUB_BUILD=ON: skipping vendored PtrAnalysis.cpp")
   set(VENDORED_SOURCES "")
 else()
-  set(VENDORED_SOURCES
-    ${VENDORED_DIR}/lib/AnalysisStructured/PtrAnalysis.cpp
-  )
+  # In non-stub mode add the vendored triton-shared CMakeLists as a subdirectory
+  # so its TableGen step (TritonStructuredVendoredTableGen) generates the
+  # required `*.h.inc` headers and so the resulting STATIC libs
+  # (TritonStructuredDialect, TritonSharedAnalysisStructured) are built and
+  # linked correctly. We then add the build-tree include dir so the shim's TUs
+  # can resolve the generated `triton-shared/.../*.h.inc` headers.
+  add_subdirectory("${VENDORED_DIR}"
+                   "${CMAKE_BINARY_DIR}/vendored_triton_shared")
+  include_directories("${CMAKE_BINARY_DIR}/vendored_triton_shared/include")
+  list(APPEND TL_PA_LINK_LIBS
+       TritonSharedAnalysisStructured
+       TritonStructuredDialect)
+  set(VENDORED_SOURCES "")
 endif()
 
 # ---- Library + Python module ----------------------------------------
@@ -156,6 +166,9 @@ target_include_directories(_triton_frontend_cxx PRIVATE
   ${VENDORED_DIR}/include
 )
 target_link_libraries(_triton_frontend_cxx PRIVATE ${TL_PA_LINK_LIBS})
+if(TARGET TritonStructuredVendoredTableGen)
+  add_dependencies(_triton_frontend_cxx TritonStructuredVendoredTableGen)
+endif()
 
 if(TRITON_FRONTEND_USE_NLOHMANN_JSON)
   set(_NLOHMANN_HDR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann/json.hpp")
@@ -192,7 +205,7 @@ set_target_properties(_triton_frontend_cxx PROPERTIES
 # TritonSharedRegister is unbuildable since it pulls in `tt.*` op
 # declarations from TRITON_INSTALL_DIR.
 # ---------------------------------------------------------------------
-if(TARGET TritonSharedRegister)
+if(TARGET TritonSharedRegister AND NOT TARGET register_triton_structured)
   set(_VENDOR_REGISTER_DIR
       "${CMAKE_CURRENT_SOURCE_DIR}/../vendored/triton_shared")
   pybind11_add_module(register_triton_structured

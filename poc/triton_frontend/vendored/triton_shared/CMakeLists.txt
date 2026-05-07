@@ -161,7 +161,7 @@ _tl_add_vendored_library(TritonStructuredDialect
 add_dependencies(TritonStructuredDialect TritonStructuredVendoredTableGen)
 target_include_directories(TritonStructuredDialect PUBLIC
   "${_VENDOR_INCLUDE}"
-  "${_VENDOR_BUILD_INCLUDE}"
+  "$<BUILD_INTERFACE:${_VENDOR_BUILD_INCLUDE}>"
   "${TRITON_INSTALL_DIR}/include"
   ${MLIR_INCLUDE_DIRS}
   ${LLVM_INCLUDE_DIRS}
@@ -194,7 +194,7 @@ _tl_add_vendored_library(TritonSharedUseAnalysis
 add_dependencies(TritonSharedUseAnalysis TritonStructuredVendoredTableGen)
 target_include_directories(TritonSharedUseAnalysis PUBLIC
   "${_VENDOR_INCLUDE}"
-  "${_VENDOR_BUILD_INCLUDE}"
+  "$<BUILD_INTERFACE:${_VENDOR_BUILD_INCLUDE}>"
   "${TRITON_INSTALL_DIR}/include"
   ${MLIR_INCLUDE_DIRS}
   ${LLVM_INCLUDE_DIRS}
@@ -223,7 +223,7 @@ _tl_add_vendored_library(TritonSharedAnalysisStructured
 add_dependencies(TritonSharedAnalysisStructured TritonStructuredVendoredTableGen)
 target_include_directories(TritonSharedAnalysisStructured PUBLIC
   "${_VENDOR_INCLUDE}"
-  "${_VENDOR_BUILD_INCLUDE}"
+  "$<BUILD_INTERFACE:${_VENDOR_BUILD_INCLUDE}>"
   "${TRITON_INSTALL_DIR}/include"
   ${MLIR_INCLUDE_DIRS}
   ${LLVM_INCLUDE_DIRS}
@@ -254,7 +254,7 @@ add_dependencies(TritonSharedRegister TritonStructuredVendoredTableGen)
 target_include_directories(TritonSharedRegister PUBLIC
   "${_VENDOR_ROOT}"
   "${_VENDOR_INCLUDE}"
-  "${_VENDOR_BUILD_INCLUDE}"
+  "$<BUILD_INTERFACE:${_VENDOR_BUILD_INCLUDE}>"
   "${TRITON_INSTALL_DIR}/include"
   ${MLIR_INCLUDE_DIRS}
   ${LLVM_INCLUDE_DIRS}
@@ -268,14 +268,10 @@ target_link_libraries(TritonSharedRegister PUBLIC
 # Export targets so super-projects can `add_subdirectory(... vendored/triton_shared)`
 # and immediately `target_link_libraries(... PRIVATE TritonSharedAnalysisStructured)`.
 # -----------------------------------------------------------------------------
-set_target_properties(
-  TritonStructuredDialect
-  TritonSharedUseAnalysis
-  TritonSharedAnalysisStructured
-  TritonSharedRegister
-  PROPERTIES
-    EXPORT_NAME ${PROJECT_NAME}::$<TARGET_PROPERTY:NAME>
-)
+# EXPORT_NAME defaults to the target name and may not contain ':' or generator
+# expressions. The `NAMESPACE triton_shared_vendored::` argument on
+# `install(EXPORT ...)` below prepends the prefix at consumer side, so an
+# explicit set_target_properties() call here is unnecessary.
 
 # `EXPORT` keyword on install() is what super-projects use to grab the
 # imported targets. Even when consumers use add_subdirectory, the targets

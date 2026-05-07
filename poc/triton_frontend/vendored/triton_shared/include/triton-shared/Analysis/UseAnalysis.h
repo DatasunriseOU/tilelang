@@ -1,6 +1,6 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright (c) Microsoft Corporation.
+// Copyright (c) Meta Platforms, Inc. and affiliates, Microsoft Corporation.
 // Licensed under the MIT license.
 //
 //===----------------------------------------------------------------------===//
@@ -86,6 +86,12 @@ public:
   void visitBranchOperand(OpOperand &operand) override { return; }
 
   void visitCallOperand(OpOperand &operand) override { return; }
+
+  void
+  visitNonControlFlowArguments(RegionSuccessor &successor,
+                               ArrayRef<BlockArgument> arguments) override {
+    return;
+  }
 
   void setToExitState(UseInfo *lattice) override {
     lattice->type = UseType::Undefined;
