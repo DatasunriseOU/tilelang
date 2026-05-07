@@ -62,7 +62,7 @@ from typing import Any, Callable, Dict, Tuple
 # property-only attrs as an empty ``op.attributes`` dict, so we have to
 # fall back to parsing the printed op text. The same helper is used by
 # ``op_emitters/memory.py`` for ``tt.make_range`` (Wave C2 fix).
-from ..op_mapping import _attrs_with_properties_shared
+from ..op_mapping import _attrs_with_properties_shared, EmitError
 
 # We import op_mapping lazily inside emitters when we need to reach into
 # WalkerCtx machinery; the type alias below is just for static readers.
@@ -73,10 +73,6 @@ __all__ = [
     "ARITH_EMITTERS",
     "EmitError",
 ]
-
-
-class EmitError(RuntimeError):
-    """Raised when an emitter cannot lower an op (precise, never silent)."""
 
 
 # ---------------------------------------------------------------------------

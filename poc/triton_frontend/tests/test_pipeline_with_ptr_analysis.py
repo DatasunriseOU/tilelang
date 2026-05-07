@@ -70,41 +70,11 @@ module {
 """
 
 
-class _FakeValue:
-    """Hashable stand-in for an MLIR SSA value in test fixtures.
-
-    ``WalkerCtx.bind`` and ``ctx.value_map.get`` use the value as a dict key,
-    so it must be hashable. The original ``Dict``-shaped fake hit
-    ``TypeError: unhashable type: 'dict'`` from inside the emitters.
-    """
-    __slots__ = ("name", "shape", "dtype")
-
-    def __init__(self, name: str, *, shape=(), dtype: str = "float32") -> None:
-        self.name = name
-        self.shape = tuple(shape)
-        self.dtype = dtype
-
-    def __hash__(self) -> int:
-        return hash((self.name, self.shape, self.dtype))
-
-    def __eq__(self, other: object) -> bool:
-        return (
-            isinstance(other, _FakeValue)
-            and self.name == other.name
-            and self.shape == other.shape
-            and self.dtype == other.dtype
-        )
-
-    def __repr__(self) -> str:
-        return f"_FakeValue({self.name!r}, shape={self.shape}, dtype={self.dtype!r})"
-
-    def __getitem__(self, key: str) -> Any:
-        # Some emitter probes still treat the value as dict-shaped (e.g.,
-        # ``ssa.get('shape')``); preserve the dict-like surface read-only.
-        return getattr(self, key)
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return getattr(self, key, default)
+# ``_FakeValue`` previously lived inline; the canonical implementation
+# now lives in :mod:`poc.triton_frontend.tests._fixtures` (as ``FakeSSA``)
+# so the pipeline test and the op-emitter tests share the same hashing
+# semantics.
+from ._fixtures import FakeSSA as _FakeValue  # noqa: E402
 
 
 def _fake_value(name: str, *, shape=(), dtype: str = "float32") -> _FakeValue:

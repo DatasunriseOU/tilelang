@@ -29,8 +29,10 @@ from poc.triton_frontend.op_emitters.memory import (  # noqa: E402
     MEMORY_EMITTERS,
     emit_tt_addptr,
     emit_tt_broadcast,
+    emit_tt_expand_dims,
     emit_tt_load,
     emit_tt_make_range,
+    emit_tt_splat,
     emit_tt_store,
     has_cxx_shim,
 )
@@ -46,31 +48,10 @@ def _fake_value(name: str, *, shape: List[int] = (), dtype: str = "float32") -> 
     return {"name": name, "shape": tuple(shape), "dtype": dtype}
 
 
-class _HashableSSA(dict):
-    """Hashable dict-shaped SSA fixture.
-
-    The legacy ``_fake_value`` returns a plain ``dict`` which the old
-    ``WalkerCtx.bind`` happily accepted (TVM's value_map used to allow
-    unhashable keys via a list-of-pairs lookup). ``WalkerCtx.bind`` now
-    indexes ``self.value_map[ssa_value]`` directly, so a plain dict keys
-    raise ``TypeError: unhashable type: 'dict'`` -- exactly the symptom
-    that took the existing test suite offline.
-
-    The fix that's compatible with every emitter helper (``_shape_of``
-    / ``_dtype_of`` / ``_ssa_name`` -- all of them check ``isinstance(v,
-    dict)``) is a tiny ``dict`` subclass that overrides ``__hash__`` to
-    use ``id()``. It is still a real dict so the helpers see the
-    ``shape`` / ``dtype`` / ``name`` keys; ``bind`` is happy because
-    ``hash(_HashableSSA(...))`` returns an int.
-    """
-
-    __slots__ = ()
-
-    def __hash__(self) -> int:  # type: ignore[override]
-        return id(self)
-
-    def __eq__(self, other: object) -> bool:  # type: ignore[override]
-        return self is other
+# ``_HashableSSA`` previously lived inline; the canonical implementation
+# now lives in :mod:`poc.triton_frontend.tests._fixtures` so all
+# op-emitter tests share the same hashable-dict surface.
+from ._fixtures import FakeSSA as _HashableSSA  # noqa: E402
 
 
 def _ssa(name: str, *, shape: Sequence[int] = (), dtype: str = "float32") -> _HashableSSA:
@@ -616,3 +597,109 @@ def test_dtype_helper_normalises_short_mlir_spellings() -> None:
     # fallback rule).
     with pytest.raises(ValueError, match="unsupported MLIR dtype"):
         _normalize_mlir_dtype("complex_who_knows")
+
+
+# ---------------------------------------------------------------------------
+# Vector-src lowering regressions for expand_dims / broadcast / splat.
+#
+# Bug: TVM's ``tir.Broadcast(value, lanes)`` REQUIRES a scalar ``value``.
+# Calling it with a vector PrimExpr (e.g. ``Broadcast(pid*64, 64) +
+# Ramp(0,1,64)`` whose dtype is ``int32x64``) blows up with
+# ``Check failed: (value.dtype().is_scalar()) is false``.
+# A separate symptom in the same call -- passing the result-shape tuple
+# (an ``ffi.Array``) for ``lanes`` instead of an int -- raises
+# ``TypeError: ... Expected ir.PrimExpr but got ffi.Array``.
+#
+# The fix in ``op_emitters/memory.py``:
+#  * Vector-src case: emit a serial ``tir.For`` nest into a fresh buffer,
+#    indexing the source per-lane via the innermost loop var.
+#  * ``ffi.Array`` lanes: ``_coerce_lanes_to_int`` unwraps tile shapes
+#    before they reach ``tir.Broadcast``.
+# ---------------------------------------------------------------------------
+
+
+def test_expand_dims_on_vector_primexpr_emits_for_nest() -> None:
+    """``tt.expand_dims`` on a vector PrimExpr lowers to a For-nest, not Broadcast.
+
+    Regression: emit_tt_expand_dims used to call ``tir.Broadcast(src, lanes)``
+    unconditionally, which blows up on a vector ``src``.
+    """
+    ctx = WalkerCtx()
+    src_ssa = _ssa("offsets", shape=[64], dtype="int32")
+    out_ssa = _ssa("offsets_2d", shape=[1, 64], dtype="int32")
+
+    # Build a real vector PrimExpr: Broadcast(pid*64, 64) + Ramp(0, 1, 64).
+    pid = tvm.tir.Var("pid", "int32")
+    base = tvm.tir.Broadcast(pid * tvm.tir.const(64, "int32"), 64)
+    ramp = tvm.tir.Ramp(tvm.tir.const(0, "int32"), tvm.tir.const(1, "int32"), 64)
+    vec = base + ramp
+    assert "x" in str(vec.dtype), "test precondition: src must be a vector PrimExpr"
+    ctx.bind(src_ssa, vec)
+
+    op = {
+        "name": "tt.expand_dims",
+        "operands": [src_ssa],
+        "results": [out_ssa],
+        "attrs": {"axis": 0},
+    }
+    out = emit_tt_expand_dims(op, ctx)
+    # Result must be a fresh Buffer of shape [1, 64], NOT a Broadcast PrimExpr.
+    assert isinstance(out, tvm.tir.Buffer), (
+        f"expected tir.Buffer (For-nest result), got {type(out).__name__}"
+    )
+    assert tuple(int(s) for s in out.shape) == (1, 64)
+    text = _stringify(ctx.stmts)
+    assert "for" in text.lower(), f"expected For-nest in stmts; got:\n{text}"
+
+
+def test_broadcast_vector_to_tile_emits_for_nest() -> None:
+    """``tt.broadcast`` from a vector PrimExpr to a tile lowers to a For-nest."""
+    ctx = WalkerCtx()
+    src_ssa = _ssa("offs", shape=[64], dtype="int32")
+    out_ssa = _ssa("offs_tile", shape=[16, 64], dtype="int32")
+
+    # Vector PrimExpr source.
+    base = tvm.tir.Broadcast(tvm.tir.const(7, "int32"), 64)
+    ramp = tvm.tir.Ramp(tvm.tir.const(0, "int32"), tvm.tir.const(1, "int32"), 64)
+    vec = base + ramp
+    ctx.bind(src_ssa, vec)
+
+    op = {
+        "name": "tt.broadcast",
+        "operands": [src_ssa],
+        "results": [out_ssa],
+        "attrs": {},
+    }
+    out = emit_tt_broadcast(op, ctx)
+    assert isinstance(out, tvm.tir.Buffer), (
+        f"expected tir.Buffer (For-nest result), got {type(out).__name__}"
+    )
+    assert tuple(int(s) for s in out.shape) == (16, 64)
+    text = _stringify(ctx.stmts)
+    assert "for" in text.lower(), f"expected For-nest in stmts; got:\n{text}"
+
+
+def test_splat_pointer_buffer_passthrough() -> None:
+    """``tt.splat`` of a pointer-backed Buffer must propagate the buffer unchanged.
+
+    The downstream ``tt.addptr`` needs to see the underlying base buffer so
+    it can pair it with the per-lane offset tile. Wrapping the buffer in
+    ``tir.Broadcast`` would defeat that and also crash (Broadcast rejects
+    non-PrimExpr operands).
+    """
+    ctx = WalkerCtx()
+    ptr_ssa = _ssa("ptr", shape=[], dtype="float32")
+    out_ssa = _ssa("ptrs", shape=[256], dtype="float32")
+    buf = tvm.tir.decl_buffer([1024], "float32", name="P")
+    ctx.bind(ptr_ssa, buf)
+    op = {
+        "name": "tt.splat",
+        "operands": [ptr_ssa],
+        "results": [out_ssa],
+        "attrs": {},
+    }
+    out = emit_tt_splat(op, ctx)
+    assert out is buf, (
+        "pointer-typed splat must passthrough the source buffer unchanged "
+        f"(got {type(out).__name__})"
+    )

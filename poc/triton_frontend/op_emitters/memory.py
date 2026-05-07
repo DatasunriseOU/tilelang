@@ -790,12 +790,206 @@ def _is_buffer(ctx: WalkerCtx, val: Any) -> bool:
         return False
 
 
-def emit_tt_expand_dims(op: Any, ctx: WalkerCtx) -> Any:
-    """Lower ``tt.expand_dims`` to a Broadcast / buffer alias.
+def _vector_lanes(value: Any) -> int:
+    """Return per-lane count for a vector PrimExpr (dtype ``Tx<N>``), else 1.
 
-    * Vector-shaped PrimExpr input -> ``tir.Broadcast`` over the new dim.
-    * Buffer input               -> ``tir.decl_buffer`` alias with the new
-                                    shape (no data movement; rebind only).
+    A vector PrimExpr is what ``tir.Broadcast(scalar, N)``,
+    ``tir.Ramp(start, 1, N)``, and the result of a vector-vector binop print
+    as ``int32xN`` / ``float32xN`` etc. TVM's ``tir.Broadcast`` REQUIRES a
+    SCALAR ``value`` operand and rejects vector ones with
+    ``Check failed: (value.dtype().is_scalar()) is false``.
+
+    We detect vector-ness by parsing the ``"x"`` suffix of ``value.dtype``.
+    Non-PrimExpr inputs (Buffer, dict, None) get ``1`` so callers don't
+    need to special-case them.
+    """
+    dt = getattr(value, "dtype", None)
+    if dt is None:
+        return 1
+    s = str(dt)
+    if "x" not in s:
+        return 1
+    try:
+        return int(s.rsplit("x", 1)[-1])
+    except ValueError:
+        return 1
+
+
+def _vector_scalar_dtype(value: Any) -> str:
+    """Return the per-lane scalar dtype of a vector PrimExpr (``int32xN`` -> ``int32``)."""
+    dt = getattr(value, "dtype", None)
+    s = str(dt) if dt is not None else "float32"
+    if "x" in s:
+        s = s.rsplit("x", 1)[0]
+    return s
+
+
+def _read_vector_lane(ctx: WalkerCtx, value: Any, lane_idx: Any) -> Any:
+    """Per-lane read from a vector PrimExpr or Buffer at ``lane_idx``.
+
+    Mirrors ``op_emitters.arith._read_lane`` but is local so this module
+    has no cross-emitter import dependency. Recognises:
+
+    * ``tir.Buffer`` -> ``BufferLoad(buf, [lane_idx])`` (rank-1 view).
+    * ``tir.Broadcast`` -> the splat scalar (constant per lane).
+    * ``tir.Ramp`` -> ``base + stride * lane_idx``.
+    * Vector elementwise binops (``Add``/``Sub``/``Mul``/``Div``/``Mod``/
+      ``Min``/``Max``/``FloorDiv``/``FloorMod``) -> recurse on ``a`` and
+      ``b`` and re-apply the op per-lane. This covers the softmax /
+      vector_add case where ``tt.make_range`` + ``tt.splat`` produces
+      ``Broadcast(pid*N, N) + Ramp(0,1,N)`` -- a generic ``Add`` PrimExpr
+      with vector dtype.
+    * Vector unary nodes (``Cast``) -> recurse on ``value.value``.
+    * Anything else -> raise ``EmitError`` so a missing branch surfaces
+      loudly instead of silently degrading.
+    """
+    from ..op_mapping import EmitError  # local import to avoid circulars at module import
+
+    tir = ctx.tir()
+    tvm_mod = ctx.tvm()
+    if isinstance(value, tvm_mod.tir.Buffer):
+        rank = len(value.shape)
+        if rank == 0:
+            return tir.BufferLoad(value, [tir.const(0, "int32")])
+        return tir.BufferLoad(value, [lane_idx])
+    bcast_cls = getattr(tir, "Broadcast", None)
+    if bcast_cls is not None and isinstance(value, bcast_cls):
+        return value.value
+    ramp_cls = getattr(tir, "Ramp", None)
+    if ramp_cls is not None and isinstance(value, ramp_cls):
+        return value.base + value.stride * lane_idx
+
+    # Scalar PrimExpr: dtype has no ``"x"`` lane suffix; broadcast.
+    dt = getattr(value, "dtype", None)
+    if dt is not None and "x" not in str(dt):
+        return value
+
+    # Vector elementwise binop / unary: recurse on subterms. We use Python
+    # operators so the result re-typechecks under TVM's PrimExpr rules.
+    binop_pyops = {
+        "Add": lambda a, b: a + b,
+        "Sub": lambda a, b: a - b,
+        "Mul": lambda a, b: a * b,
+        "Div": lambda a, b: a / b,
+        "Mod": lambda a, b: a % b,
+        "FloorDiv": lambda a, b: a // b,
+        "FloorMod": lambda a, b: a % b,
+    }
+    for cls_name, pyop in binop_pyops.items():
+        cls = getattr(tir, cls_name, None)
+        if cls is not None and isinstance(value, cls):
+            la = _read_vector_lane(ctx, value.a, lane_idx)
+            lb = _read_vector_lane(ctx, value.b, lane_idx)
+            return pyop(la, lb)
+    # Min/Max via tir constructors.
+    for cls_name, fn_name in (("Min", "min"), ("Max", "max")):
+        cls = getattr(tir, cls_name, None)
+        if cls is not None and isinstance(value, cls):
+            la = _read_vector_lane(ctx, value.a, lane_idx)
+            lb = _read_vector_lane(ctx, value.b, lane_idx)
+            fn = getattr(tir, fn_name, None)
+            if fn is not None:
+                return fn(la, lb)
+            # Fallback: select.
+            return tir.Select(la < lb, la, lb) if fn_name == "min" else tir.Select(la > lb, la, lb)
+    cast_cls = getattr(tir, "Cast", None)
+    if cast_cls is not None and isinstance(value, cast_cls):
+        scalar_dt = _vector_scalar_dtype(value)
+        return tir.Cast(scalar_dt, _read_vector_lane(ctx, value.value, lane_idx))
+
+    raise EmitError(
+        f"vector PrimExpr of type {type(value).__name__} (dtype "
+        f"{getattr(value, 'dtype', '?')!s}) is not lane-indexable; "
+        "extend _read_vector_lane to cover this node"
+    )
+
+
+def _coerce_lanes_to_int(lanes: Any) -> int:
+    """Unwrap ``lanes`` to a Python int.
+
+    Tile-shape values reach the emitters as MLIR ``ffi.Array`` shape tuples
+    (when ``out_shape`` is forwarded directly instead of ``int(out_shape[-1])``).
+    TVM's ``tir.Broadcast(value, lanes)`` rejects ``ffi.Array`` with
+    ``Expected ir.PrimExpr but got ffi.Array``. Coerce to int -- raise if
+    we cannot, so we never silently pass an opaque type through.
+    """
+    if isinstance(lanes, int):
+        return lanes
+    if isinstance(lanes, (tuple, list)):
+        # Tile shape was passed in by mistake; take the trailing dim.
+        if not lanes:
+            return 1
+        return int(lanes[-1])
+    # ffi.Array / other shape-like objects.
+    try:
+        return int(lanes)
+    except (TypeError, ValueError):
+        # Best-effort: iterate, take the last entry.
+        try:
+            seq = list(lanes)
+            if seq:
+                return int(seq[-1])
+        except TypeError:
+            pass
+    raise ValueError(f"cannot coerce lanes={lanes!r} (type {type(lanes).__name__}) to int")
+
+
+def _materialise_vector_into_buffer(
+    ctx: WalkerCtx, src: Any, out_shape: Sequence[int], dtype: str
+) -> Any:
+    """Lower a vector PrimExpr / Buffer source into a fresh tile Buffer.
+
+    Emits a serial ``tir.For`` nest over ``out_shape`` whose innermost body
+    is ``BufferStore(dst, _read_vector_lane(src, lane_idx), [outer..., lane_idx])``.
+    Returns the freshly allocated ``tir.Buffer``. The store nest is appended
+    to ``ctx.stmts`` via ``ctx.emit``.
+
+    The convention matches the broadcast semantics used by
+    ``_emit_tile_binop`` in ``op_emitters/arith.py``: outer (rank-promoted)
+    axes drive the splat, the innermost axis indexes the source vector
+    lane-for-lane.
+    """
+    tir = ctx.tir()
+    out_shape_list = [int(s) for s in out_shape]
+    if not out_shape_list:
+        raise ValueError("_materialise_vector_into_buffer: out_shape is empty")
+    dst = tir.decl_buffer(out_shape_list, dtype, name=ctx.fresh("vec"))
+    ctx.buffers[dst.name] = dst
+
+    loop_vars = [tir.Var(ctx.fresh(f"v{axis}"), "int32") for axis in range(len(out_shape_list))]
+    lane_idx = loop_vars[-1]
+    # Per-lane scalar read from the vector source.
+    rhs = _read_vector_lane(ctx, src, lane_idx)
+    body: Any = tir.BufferStore(dst, rhs, list(loop_vars))
+    for axis in range(len(loop_vars) - 1, -1, -1):
+        extent = out_shape_list[axis]
+        body = tir.For(
+            loop_vars[axis],
+            tir.const(0, "int32"),
+            tir.const(int(extent), "int32"),
+            tir.ForKind.SERIAL,
+            body,
+        )
+    ctx.emit(body)
+    return dst
+
+
+def emit_tt_expand_dims(op: Any, ctx: WalkerCtx) -> Any:
+    """Lower ``tt.expand_dims`` to a Broadcast / buffer alias / For-nest.
+
+    Behaviour matrix
+    ----------------
+    * Buffer input            -> ``tir.decl_buffer`` alias with the new
+                                  shape (no data movement; rebind only).
+    * Vector PrimExpr input   -> ``tir.For`` nest over the result shape,
+                                  reading per-lane from the source vector
+                                  (Broadcast/Ramp/Buffer). This is the
+                                  only correct lowering -- ``tir.Broadcast``
+                                  REQUIRES a scalar ``value`` operand and
+                                  blows up with ``Check failed:
+                                  (value.dtype().is_scalar()) is false``
+                                  on a vector source.
+    * Scalar PrimExpr input   -> ``tir.Broadcast(scalar, lanes)``.
     """
     tir = ctx.tir()
     operands = _operands(op)
@@ -817,9 +1011,31 @@ def emit_tt_expand_dims(op: Any, ctx: WalkerCtx) -> Any:
             ctx.bind(result_value, new_buf)
         return new_buf
 
-    # Vector PrimExpr path: broadcast along the new axis. We materialise
-    # a Broadcast with lanes equal to the new total element count when we
-    # can compute it; otherwise fall back to a no-op rebind.
+    # Pointer-descriptor passthrough. ``tt.expand_dims`` on a pointer tile
+    # is a logical-only rebind; the downstream ``tt.addptr`` / ``tt.load``
+    # consume the descriptor.
+    if isinstance(src, tuple) and len(src) == 2:
+        if result_value is not None:
+            ctx.bind(result_value, src)
+        return src
+    if isinstance(src, dict) and "_ptrstate" in src:
+        if result_value is not None:
+            ctx.bind(result_value, src)
+        return src
+
+    src_vec_lanes = _vector_lanes(src)
+
+    # Vector PrimExpr path: emit a For nest over out_shape, NOT tir.Broadcast
+    # (which only accepts scalar ``value``). The innermost lane axis pulls
+    # per-lane scalars out of the source vector via ``_read_vector_lane``.
+    if src_vec_lanes > 1 and out_shape:
+        dtype = _dtype_of(result_value) if result_value is not None else _vector_scalar_dtype(src)
+        dst = _materialise_vector_into_buffer(ctx, src, out_shape, dtype)
+        if result_value is not None:
+            ctx.bind(result_value, dst)
+        return dst
+
+    # Scalar PrimExpr path: tir.Broadcast(scalar, lanes) is correct.
     lanes = 1
     for s in out_shape:
         try:
@@ -828,7 +1044,8 @@ def emit_tt_expand_dims(op: Any, ctx: WalkerCtx) -> Any:
             lanes = 0
             break
     if lanes > 1 and hasattr(tir, "Broadcast"):
-        out = tir.Broadcast(src, lanes)
+        # Coerce in case lanes ended up as an ffi.Array shape (defensive).
+        out = tir.Broadcast(src, _coerce_lanes_to_int(lanes))
     else:
         out = src
     if result_value is not None:
@@ -839,9 +1056,14 @@ def emit_tt_expand_dims(op: Any, ctx: WalkerCtx) -> Any:
 def emit_tt_broadcast(op: Any, ctx: WalkerCtx) -> Any:
     """Lower ``tt.broadcast`` to ``tir.Broadcast`` or a ``tir.For`` rebuild.
 
-    * Scalar -> tile : ``tir.Broadcast(value, lanes)``.
-    * Vector -> tile : emit a ``tir.For`` that copies the source vector
-                       into each row/column of the destination.
+    Behaviour matrix
+    ----------------
+    * Scalar PrimExpr -> tile : ``tir.Broadcast(value, lanes)``.
+    * Vector PrimExpr / Buffer -> tile (rank promotion) : emit a serial
+      ``tir.For`` nest into a fresh buffer. The innermost loop indexes the
+      source per-lane (Broadcast.value, Ramp.base+stride*idx, or
+      BufferLoad). NEVER ``tir.Broadcast(vector_src, ...)`` -- TVM's
+      Broadcast node rejects vector ``value`` outright.
     """
     tir = ctx.tir()
     operands = _operands(op)
@@ -852,6 +1074,17 @@ def emit_tt_broadcast(op: Any, ctx: WalkerCtx) -> Any:
     src_shape = list(_shape_of(src_ssa))
     result_value = _results(op)[0] if _results(op) else None
     out_shape = list(_shape_of(result_value)) if result_value is not None else []
+
+    # Pointer-descriptor passthrough. ``tt.broadcast`` on a pointer tile
+    # is logical-only; downstream load/store consumes the descriptor.
+    if isinstance(src, tuple) and len(src) == 2:
+        if result_value is not None:
+            ctx.bind(result_value, src)
+        return src
+    if isinstance(src, dict) and "_ptrstate" in src:
+        if result_value is not None:
+            ctx.bind(result_value, src)
+        return src
 
     out_lanes = 1
     for s in out_shape:
@@ -869,27 +1102,49 @@ def emit_tt_broadcast(op: Any, ctx: WalkerCtx) -> Any:
             src_lanes = 0
             break
 
-    # Scalar -> tile : Broadcast.
-    if src_lanes == 1 and out_lanes > 1 and hasattr(tir, "Broadcast"):
-        out = tir.Broadcast(src, out_lanes)
+    # Refine src_lanes: a vector PrimExpr (e.g. ``int32x64``) carries lane
+    # info in its dtype suffix even when ``_shape_of`` returned ``()``
+    # because the SSA value had no MLIR type info attached.
+    src_vec_lanes = _vector_lanes(src)
+    if src_vec_lanes > 1 and src_lanes <= 1:
+        src_lanes = src_vec_lanes
+
+    # Scalar -> tile : Broadcast. Only emit ``tir.Broadcast`` when the
+    # source is a *scalar* PrimExpr; vectors must take the For-nest path.
+    src_is_buffer = _is_buffer(ctx, src)
+    if (
+        src_lanes == 1
+        and not src_is_buffer
+        and src_vec_lanes == 1
+        and out_lanes > 1
+        and hasattr(tir, "Broadcast")
+    ):
+        out = tir.Broadcast(src, _coerce_lanes_to_int(out_lanes))
         if result_value is not None:
             ctx.bind(result_value, out)
         return out
 
-    # Vector -> tile : emit a tir.For that materialises the broadcast into
-    # a fresh buffer. We pick a 2-D shape when the destination is rank-2;
-    # higher ranks fall back to a flat buffer with a single loop.
+    # Vector / Buffer -> tile : emit a tir.For that materialises the
+    # broadcast into a fresh buffer.
     dtype = _dtype_of(result_value) if result_value is not None else _dtype_of(src_ssa)
-    if out_shape and out_lanes > src_lanes:
+    # Normalise a possibly-short MLIR dtype (e.g. ``f32``) so decl_buffer
+    # accepts it.
+    if dtype in ("", "handle"):
+        dtype = _vector_scalar_dtype(src)
+    if out_shape and (out_lanes > src_lanes or src_is_buffer or src_vec_lanes > 1):
         out_buf = tir.decl_buffer(out_shape, dtype, name=ctx.fresh("bcast"))
         ctx.buffers[out_buf.name] = out_buf
         loop_vars = [tir.Var(ctx.fresh(f"b{i}"), "int32") for i in range(len(out_shape))]
         # Index the source with the trailing dims that map into the source
         # shape (the broadcast convention is to match trailing dims).
-        if _is_buffer(ctx, src):
+        if src_is_buffer:
             tail = loop_vars[-len(src_shape):] if src_shape else []
             rhs = tir.BufferLoad(src, tail or [tir.const(0, "int32")])
+        elif src_vec_lanes > 1:
+            # Vector PrimExpr: index the lane via the innermost loop var.
+            rhs = _read_vector_lane(ctx, src, loop_vars[-1])
         else:
+            # Scalar PrimExpr broadcast across all lanes.
             rhs = src
         body: Any = tir.BufferStore(out_buf, rhs, list(loop_vars))
         for axis in range(len(loop_vars) - 1, -1, -1):
@@ -943,10 +1198,32 @@ def emit_tt_splat(op: Any, ctx: WalkerCtx) -> Any:
     tvm_mod = ctx.tvm()
     if isinstance(src, tvm_mod.tir.Buffer):
         out = src
-    elif lanes > 1 and hasattr(tir, "Broadcast"):
-        out = tir.Broadcast(src, lanes)
-    else:
+    elif isinstance(src, tuple) and len(src) == 2:
+        # ``(buffer, indices)`` descriptor from a prior ``tt.addptr`` --
+        # passthrough so the downstream load/store consumes the tile-shaped
+        # pointer descriptor unchanged. Wrapping in ``tir.Broadcast`` would
+        # crash (tuple is not a PrimExpr) and is semantically wrong: the
+        # splat is widening a scalar pointer to a per-lane pointer tile;
+        # the underlying address arithmetic is already encoded in the
+        # tuple's ``indices`` list.
         out = src
+    elif isinstance(src, dict) and "_ptrstate" in src:
+        # PtrState descriptor -- same passthrough rationale as the tuple.
+        out = src
+    else:
+        src_vec_lanes = _vector_lanes(src)
+        if src_vec_lanes > 1 and lanes > 1 and out_shape:
+            # Defensive: ``tt.splat`` is contractually scalar->tile, but if
+            # the producer accidentally bound a vector PrimExpr to the
+            # source SSA we cannot pass it to ``tir.Broadcast`` (which
+            # rejects vector ``value``). Lower via the same For-nest path
+            # used by ``emit_tt_expand_dims`` / ``emit_tt_broadcast``.
+            dtype = _dtype_of(result_value) if result_value is not None else _vector_scalar_dtype(src)
+            out = _materialise_vector_into_buffer(ctx, src, out_shape, dtype)
+        elif lanes > 1 and hasattr(tir, "Broadcast"):
+            out = tir.Broadcast(src, _coerce_lanes_to_int(lanes))
+        else:
+            out = src
     if result_value is not None:
         ctx.bind(result_value, out)
     return out

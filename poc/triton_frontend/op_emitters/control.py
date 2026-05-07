@@ -52,6 +52,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # attribute / shape helpers, both to stay DRY and so any future shape
 # extraction tweaks made there propagate here automatically.
 from .. import op_mapping as _om
+from ..op_mapping import EmitError
 
 __all__ = [
     "CONTROL_EMITTERS",
@@ -78,16 +79,6 @@ __all__ = [
     "SCF_WHILE_MAX_ITERATIONS",
     "PTX_TO_TIR",
 ]
-
-
-class EmitError(RuntimeError):
-    """Raised when an emitter cannot lower an op for a precise, named reason.
-
-    We use a dedicated subclass (rather than ``ValueError`` /
-    ``NotImplementedError``) so the walker / pipeline driver can
-    distinguish "user input needs adjustment" from "frontend is missing a
-    feature": ``EmitError`` always means the former.
-    """
 
 
 # ---------------------------------------------------------------------------
@@ -782,6 +773,58 @@ def _normalize_dtype(dtype_str: str) -> str:
     return s
 
 
+def _is_dense_attr(value_attr: Any) -> bool:
+    """Detect an MLIR ``DenseElementsAttr`` (FP or integer variant).
+
+    We check for the trio of accessors the real bindings expose
+    (``is_splat`` / ``get_splat_value`` / ``type.shape``) rather than
+    importing the MLIR class directly so the test harness's dict / list
+    fakes don't false-positive here.
+    """
+    if not (hasattr(value_attr, "is_splat") and hasattr(value_attr, "type")):
+        return False
+    return getattr(value_attr.type, "shape", None) is not None
+
+
+def _extract_dense_attr(
+    value_attr: Any, result_value: Any
+) -> Tuple[Tuple[int, ...], str, bool, Any]:
+    """Return ``(shape, dtype, is_splat, payload)`` for a dense attr.
+
+    ``payload`` is a Python scalar when ``is_splat`` is True; otherwise a
+    materialised list of element values (one per tile slot) obtained by
+    iterating the attribute. Element dtypes that we can't safely round-trip
+    to a Python primitive (e.g. complex) raise :class:`EmitError`.
+    """
+    shape: Tuple[int, ...] = tuple(value_attr.type.shape)
+    dtype: str = _normalize_dtype(str(value_attr.type.element_type))
+    if dtype not in {"bool"} and not (
+        dtype.startswith("int")
+        or dtype.startswith("uint")
+        or dtype.startswith("float")
+        or dtype.startswith("bfloat")
+    ):
+        raise EmitError(
+            f"arith.constant: dense attr with unsupported element dtype "
+            f"{dtype!r} (from {value_attr.type.element_type!r})"
+        )
+    if value_attr.is_splat:
+        # ``get_splat_value()`` returns an IntegerAttr / FloatAttr; ``.value``
+        # is the Python scalar.
+        sv = value_attr.get_splat_value().value
+        return shape, dtype, True, sv
+    # Per-element: iterate the attribute (jaxlib bindings yield Python
+    # scalars in row-major order).
+    try:
+        elements = list(value_attr)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise EmitError(
+            f"arith.constant: dense attr is non-splat but not iterable: "
+            f"{value_attr!r}"
+        ) from exc
+    return shape, dtype, False, elements
+
+
 def map_arith_constant(op: Any, ctx: _om.WalkerCtx) -> Any:
     """Lower ``arith.constant`` to a ``tir.IntImm`` / ``tir.FloatImm``.
 
@@ -794,9 +837,11 @@ def map_arith_constant(op: Any, ctx: _om.WalkerCtx) -> Any:
     * Bind the result SSA into ``ctx.value_map`` under both the result
       Value object and its printed name string.
 
-    The hard-constraint branch lives in :func:`_parse_value_attr`: an
-    ``arith.constant`` carrying an array (``dense<...>`` / ``ArrayAttr``)
-    raises :class:`EmitError` rather than silently lowering to a scalar.
+    Dense / array attrs (e.g. ``dense<0.0> : tensor<256xf32>`` produced by
+    Triton's ``tt.load %ptr, %mask, other=0.0`` materialisation) are
+    materialised into a freshly declared ``tir.decl_buffer`` initialised
+    via a serial ``tir.For`` nest; the buffer is bound into the value map
+    so downstream loads/stores resolve through it.
     """
     attrs = _om._attrs(op)
     value_attr: Any = attrs.get("value")
@@ -821,10 +866,98 @@ def map_arith_constant(op: Any, ctx: _om.WalkerCtx) -> Any:
         raise EmitError(
             "arith.constant: missing 'value' attribute"
         )
+
+    tir = ctx.tir()
+    results = _om._results(op)
+    result = results[0] if results else None
+
+    # Dense / DenseFPElementsAttr / DenseIntElementsAttr branch: materialise
+    # as a buffer initialised by a serial For nest writing the constant
+    # value(s) to every element. Triton's ``tt.load %ptrs, %mask, other=0.0``
+    # round-trips the ``other`` operand through this op shape.
+    if _is_dense_attr(value_attr):
+        shape, dtype, is_splat, payload = _extract_dense_attr(
+            value_attr, result
+        )
+        nm_for_buf = (_ssa_name(result) if result is not None else None) or ctx.fresh("c")
+        # Strip a leading '%' so the buffer name reads cleanly in dumps.
+        ssa_clean = nm_for_buf.lstrip("%").replace(".", "_")
+        buf_name = f"const_{ssa_clean}"
+        buf = tir.decl_buffer(list(shape) if shape else [1], dtype, name=buf_name)
+        ctx.buffers[buf_name] = buf
+
+        # Build a serial tir.For nest writing the constant(s) into ``buf``.
+        # All shapes from MLIR DenseElementsAttr are static (RankedTensorType
+        # constants), so we can safely fold to integer extents.
+        if not all(isinstance(s, int) for s in shape):  # pragma: no cover
+            raise EmitError(
+                f"arith.constant: dense attr with non-static shape {shape!r}"
+            )
+
+        if shape:
+            # Allocate one induction var per axis.
+            ivars = [tir.Var(ctx.fresh(f"i{a}"), "int32") for a in range(len(shape))]
+            if is_splat:
+                value_expr = (
+                    tir.IntImm(dtype, int(payload))
+                    if (dtype == "bool" or dtype.startswith("int") or dtype.startswith("uint"))
+                    else tir.FloatImm(dtype, float(payload))
+                )
+                body = tir.BufferStore(buf, value_expr, list(ivars))
+            else:
+                # Per-element: linearise (i0 * s1 * s2 * ... + i1 * s2 * ... + ...)
+                # then dispatch through tir.if_then_else cascades. For correctness
+                # and simplicity, unroll: emit a SeqStmt of N stores at constant
+                # indices since ``payload`` is fully known.
+                stmts = []
+                strides: List[int] = []
+                acc = 1
+                for s in reversed(shape):
+                    strides.append(acc)
+                    acc *= s
+                strides.reverse()
+                for lin_idx, elt in enumerate(payload):
+                    idxs = []
+                    rem = lin_idx
+                    for st in strides:
+                        idxs.append(tir.const(rem // st, "int32"))
+                        rem = rem % st
+                    value_expr = (
+                        tir.IntImm(dtype, int(elt))
+                        if (dtype == "bool" or dtype.startswith("int") or dtype.startswith("uint"))
+                        else tir.FloatImm(dtype, float(elt))
+                    )
+                    stmts.append(tir.BufferStore(buf, value_expr, idxs))
+                body = tir.SeqStmt(stmts) if len(stmts) > 1 else stmts[0]
+            if is_splat:
+                # Wrap in a serial For nest, innermost axis last.
+                nest = body
+                for axis_idx in reversed(range(len(shape))):
+                    nest = tir.For(
+                        ivars[axis_idx],
+                        tir.const(0, "int32"),
+                        tir.const(int(shape[axis_idx]), "int32"),
+                        tir.ForKind.SERIAL,
+                        nest,
+                    )
+                ctx.emit(nest)
+            else:
+                ctx.emit(body)
+        # Bind the buffer under the result SSA value and printed name so
+        # downstream consumers (loads / elementwise) resolve.
+        if result is not None:
+            try:
+                ctx.bind(result, buf)
+            except Exception:
+                pass
+            nm = _ssa_name(result)
+            if nm:
+                ctx.value_map[nm] = buf
+        return buf
+
     dtype_str, scalar_val = _parse_value_attr(value_attr)
     dtype = _normalize_dtype(dtype_str)
 
-    tir = ctx.tir()
     if dtype == "bool" or dtype.startswith("int") or dtype.startswith("uint"):
         const = tir.IntImm(dtype, int(scalar_val))
     elif dtype.startswith("float") or dtype.startswith("bfloat"):
@@ -834,9 +967,7 @@ def map_arith_constant(op: Any, ctx: _om.WalkerCtx) -> Any:
             f"arith.constant: unsupported dtype {dtype!r} (from {dtype_str!r})"
         )
 
-    results = _om._results(op)
-    if results:
-        result = results[0]
+    if result is not None:
         try:
             ctx.bind(result, const)
         except Exception:

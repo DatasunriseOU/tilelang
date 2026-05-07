@@ -62,6 +62,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from ..op_mapping import EmitError
+
 # WalkerCtx alias only -- imported lazily so this module stays cheap to load.
 EmitContext = Any  # poc.triton_frontend.op_mapping.WalkerCtx
 
@@ -71,10 +73,6 @@ __all__ = [
     "EmitError",
     "detect_combiner_kind",
 ]
-
-
-class EmitError(RuntimeError):
-    """Raised when an emitter cannot lower an op (precise, never silent)."""
 
 
 # ---------------------------------------------------------------------------

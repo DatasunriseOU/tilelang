@@ -40,23 +40,10 @@ from poc.triton_frontend.op_emitters.control import (  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
-class _FakeSSA(dict):
-    """Hashable dict wrapper for fake SSA values.
-
-    The op_mapping helpers (``_dtype_of`` / ``_shape_of`` / ``_attrs``) treat
-    SSA values as opaque dicts when they don't expose MLIR-style attributes;
-    that's fine for inspection but the ``WalkerCtx.value_map`` keys need to
-    be hashable. A plain dict isn't, so we wrap with this thin subclass that
-    hashes on identity (each fake SSA is a distinct value, by construction).
-    """
-
-    __slots__ = ()
-
-    def __hash__(self) -> int:  # type: ignore[override]
-        return id(self)
-
-    def __eq__(self, other: Any) -> bool:  # type: ignore[override]
-        return self is other
+# ``_FakeSSA`` previously lived inline; the canonical implementation now
+# lives in :mod:`poc.triton_frontend.tests._fixtures` so all op-emitter
+# tests share the same hashable-dict surface.
+from ._fixtures import FakeSSA as _FakeSSA  # noqa: E402
 
 
 def _val(name: str, *, shape: List[int] = (), dtype: str = "float32") -> Dict[str, Any]:
@@ -722,3 +709,155 @@ def test_arith_constant_registered_in_dispatch_table() -> None:
     """Both new emitters appear in CONTROL_EMITTERS for the walker to find."""
     assert CONTROL_EMITTERS.get("arith.constant") is map_arith_constant
     assert CONTROL_EMITTERS.get("tt.func") is map_tt_func
+
+
+# ---------------------------------------------------------------------------
+# arith.constant  -> dense / DenseFPElementsAttr / DenseIntElementsAttr path
+# ---------------------------------------------------------------------------
+#
+# Triton's ``tt.load %ptrs, %mask, other=0.0`` materialises ``other`` as
+# ``arith.constant dense<0.0> : tensor<...xf32>``; we lower that to a
+# freshly-declared buffer initialised by a serial ``tir.For`` nest.
+
+
+class _FakeDenseTensorType:
+    """Minimal stand-in for ``RankedTensorType`` exposing ``.shape`` and
+    ``.element_type``. Lets the dense path test without spinning up an
+    MLIR Context."""
+
+    def __init__(self, shape, element_type):
+        self.shape = list(shape)
+        self.element_type = element_type
+
+
+class _FakeFloatAttr:
+    def __init__(self, v: float, dtype: str = "f32") -> None:
+        self.value = float(v)
+        self.type = dtype
+
+
+class _FakeIntAttr:
+    def __init__(self, v: int, dtype: str = "i32") -> None:
+        self.value = int(v)
+        self.type = dtype
+
+
+class _FakeDenseAttr:
+    """Stand-in for ``DenseFPElementsAttr`` / ``DenseIntElementsAttr``.
+
+    Mirrors the jaxlib bindings' surface: ``is_splat`` flag,
+    ``get_splat_value()`` -> scalar Attr, ``__iter__`` yields per-element
+    Python primitives, and ``.type`` exposes ``.shape`` / ``.element_type``.
+    """
+
+    def __init__(self, shape, element_type: str, payload, is_splat: bool):
+        self.type = _FakeDenseTensorType(shape, element_type)
+        self.is_splat = is_splat
+        self._payload = payload
+        self._element_type = element_type
+
+    def get_splat_value(self):
+        if not self.is_splat:
+            raise ValueError("get_splat_value called on a non-splat attribute")
+        elt = self._element_type
+        if elt.startswith("f"):
+            return _FakeFloatAttr(self._payload, elt)
+        return _FakeIntAttr(self._payload, elt)
+
+    def __iter__(self):
+        if self.is_splat:
+            n = 1
+            for s in self.type.shape:
+                n *= int(s)
+            return iter([self._payload] * n)
+        return iter(self._payload)
+
+
+def test_arith_constant_dense_splat_zero() -> None:
+    """``dense<0.0> : tensor<4xf32>`` lowers to a buffer of zeros via a For nest."""
+    ctx = WalkerCtx()
+    result = _FakeSSA({"name": "%c0", "dtype": "f32", "shape": (4,)})
+    attr = _FakeDenseAttr(shape=[4], element_type="f32", payload=0.0, is_splat=True)
+    op = {
+        "name": "arith.constant",
+        "operands": [],
+        "results": [result],
+        "attrs": {"value": attr},
+    }
+    out = map_arith_constant(op, ctx)
+    # Result is a buffer, not an Imm.
+    assert isinstance(out, tvm.tir.Buffer)
+    assert list(out.shape) == [4]
+    assert str(out.dtype) == "float32"
+    # Buffer is bound under both the SSA Value object and printed name.
+    assert ctx.value_map[result] is out
+    assert ctx.value_map["%c0"] is out
+    # Buffer registered in ctx.buffers under the constructed name.
+    assert any(b is out for b in ctx.buffers.values())
+    # A serial For nest writing the splat value was emitted.
+    assert len(ctx.stmts) == 1
+    stmt = ctx.stmts[0]
+    assert isinstance(stmt, tvm.tir.For)
+    # The body BufferStore writes a 0.0 FloatImm.
+    inner = stmt.body
+    assert isinstance(inner, tvm.tir.BufferStore)
+    assert isinstance(inner.value, tvm.tir.FloatImm)
+    assert float(inner.value.value) == 0.0
+
+
+def test_arith_constant_dense_per_element() -> None:
+    """``dense<[1.0, 2.0, 3.0, 4.0]> : tensor<4xf32>`` materialises each slot."""
+    ctx = WalkerCtx()
+    result = _FakeSSA({"name": "%cp", "dtype": "f32", "shape": (4,)})
+    attr = _FakeDenseAttr(
+        shape=[4],
+        element_type="f32",
+        payload=[1.0, 2.0, 3.0, 4.0],
+        is_splat=False,
+    )
+    op = {
+        "name": "arith.constant",
+        "operands": [],
+        "results": [result],
+        "attrs": {"value": attr},
+    }
+    out = map_arith_constant(op, ctx)
+    assert isinstance(out, tvm.tir.Buffer)
+    assert list(out.shape) == [4]
+    # An unrolled SeqStmt of 4 BufferStores (one per element) was emitted.
+    assert len(ctx.stmts) == 1
+    stmt = ctx.stmts[0]
+    assert isinstance(stmt, tvm.tir.SeqStmt)
+    seq = list(stmt.seq)
+    assert len(seq) == 4
+    written = [float(s.value.value) for s in seq]
+    assert written == [1.0, 2.0, 3.0, 4.0]
+    # Each store's index is the constant lin_idx.
+    for lin_idx, s in enumerate(seq):
+        assert isinstance(s, tvm.tir.BufferStore)
+        assert int(s.indices[0].value) == lin_idx
+
+
+def test_arith_constant_dense_int_splat() -> None:
+    """``dense<7> : tensor<8xi32>`` lowers to an i32 buffer initialised to 7."""
+    ctx = WalkerCtx()
+    result = _FakeSSA({"name": "%ci", "dtype": "i32", "shape": (8,)})
+    attr = _FakeDenseAttr(shape=[8], element_type="i32", payload=7, is_splat=True)
+    op = {
+        "name": "arith.constant",
+        "operands": [],
+        "results": [result],
+        "attrs": {"value": attr},
+    }
+    out = map_arith_constant(op, ctx)
+    assert isinstance(out, tvm.tir.Buffer)
+    assert list(out.shape) == [8]
+    assert str(out.dtype) == "int32"
+    assert len(ctx.stmts) == 1
+    stmt = ctx.stmts[0]
+    assert isinstance(stmt, tvm.tir.For)
+    inner = stmt.body
+    assert isinstance(inner, tvm.tir.BufferStore)
+    assert isinstance(inner.value, tvm.tir.IntImm)
+    assert int(inner.value.value) == 7
+    assert str(inner.value.dtype) == "int32"

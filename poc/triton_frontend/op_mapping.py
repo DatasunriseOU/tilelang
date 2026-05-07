@@ -42,6 +42,7 @@ _USE_LOGEXP_PROD = False
 
 __all__ = [
     "OP_TABLE",
+    "EmitError",
     "EmitFn",
     "WalkerCtx",
     # Memory ops
@@ -71,6 +72,21 @@ __all__ = [
     # Misc
     "map_tt_print",
 ]
+
+
+class EmitError(RuntimeError):
+    """Raised when an emitter cannot lower an op for a precise, named reason.
+
+    We use a dedicated subclass (rather than ``ValueError`` /
+    ``NotImplementedError``) so the walker / pipeline driver can
+    distinguish "user input needs adjustment" from "frontend is missing a
+    feature": ``EmitError`` always means the former.
+
+    This is the canonical definition. ``op_emitters/{arith,control,reduction}``
+    re-export this class via ``from ..op_mapping import EmitError`` so all
+    emitter modules raise the same exception type and ``except EmitError``
+    in the pipeline catches every emitter-side failure.
+    """
 
 
 EmitFn = Callable[..., Any]
@@ -749,7 +765,11 @@ def _atomic_rmw_kind(op: Any) -> str:
     canonicalize to ``add``/``max``/``min``/``xchg``/``and``/``or``/``xor``
     after stripping the ``f``/``u`` integer-vs-float prefix.
     """
-    attrs = _attrs(op)
+    # Wave E3: ``rmw_op`` is a Triton 3.6 inherent (Properties-storage) attr.
+    # Use the shared helper so jaxlib's empty op.attributes path falls back
+    # to parsing the printed ``<{rmw_op = ...}>`` block instead of silently
+    # defaulting to None and tripping the "missing 'rmw_op'" error.
+    attrs = _attrs_with_properties_shared(op)
     raw = attrs.get("rmw_op") or attrs.get("atomic_rmw_op") or attrs.get("kind")
     if raw is None:
         raise ValueError("tt.atomic_rmw: missing 'rmw_op' attribute")
@@ -883,7 +903,11 @@ def map_tt_dot(op: Any, ctx: WalkerCtx) -> Any:
     a = ctx.get(a_ssa)
     b = ctx.get(b_ssa)
 
-    attrs = _attrs(op)
+    # Wave E3: ``transpose_A``/``transpose_B`` (and the lowered ``trans_a``/
+    # ``trans_b`` aliases plus ``out_dtype``) are Triton 3.6 inherent attrs
+    # stored as Properties. Use the shared helper so jaxlib's empty
+    # op.attributes path doesn't silently treat the dot as un-transposed.
+    attrs = _attrs_with_properties_shared(op)
     transpose_A = bool(attrs.get("transpose_A", False) or attrs.get("trans_a", False))
     transpose_B = bool(attrs.get("transpose_B", False) or attrs.get("trans_b", False))
 
@@ -983,7 +1007,11 @@ def map_tt_reduce(op: Any, ctx: WalkerCtx) -> Any:
     src_ssa = operands[0]
     src = ctx.get(src_ssa)
 
-    attrs = _attrs(op)
+    # Wave E3: ``axis`` is a Triton 3.6 inherent (Properties) attr; the
+    # shared helper falls back to parsing ``<{axis = N : i32}>`` from the
+    # printed op text when jaxlib's op.attributes view is empty. Without
+    # this, every reduce silently collapses on axis=-1 (last axis).
+    attrs = _attrs_with_properties_shared(op)
     axis = int(attrs.get("axis", -1))
     kind = _reduce_combiner_kind(op)
 
@@ -1151,7 +1179,11 @@ def map_tt_trans(op: Any, ctx: WalkerCtx) -> Any:
         raise ValueError("tt.trans: missing source operand")
     src_ssa = operands[0]
     src = ctx.get(src_ssa)
-    attrs = _attrs(op)
+    # Wave E3: ``order`` (Triton's permutation tuple) is an inherent attr in
+    # Triton 3.6 stored as a Property. Without the shared helper, jaxlib's
+    # op.attributes view is empty and we'd default to the last-two-axes
+    # swap even when the kernel asked for a different permutation.
+    attrs = _attrs_with_properties_shared(op)
     # Default to flipping the last two axes; honour an explicit ``order``
     # attribute when it carries a 2-element permutation that swaps two
     # axes (Triton's general form, but matmul callers always use a swap).
@@ -1181,7 +1213,13 @@ def map_tt_make_range(op: Any, ctx: WalkerCtx) -> Any:
     folds it into strided indexing.
     """
     tir = ctx.tir()
-    attrs = _attrs(op)
+    # Wave E3: ``start``/``end`` live in Properties storage in Triton 3.6.
+    # NOTE: this legacy emitter is currently superseded by
+    # ``op_emitters/memory.py:emit_tt_make_range`` via OP_TABLE.update(...)
+    # at module-init. We still migrate the helper here defensively in case
+    # the merge order ever shifts -- otherwise this dead path would
+    # silently re-introduce the C2 zero-length-Ramp bug (start=end=0).
+    attrs = _attrs_with_properties_shared(op)
     start = int(attrs.get("start", 0))
     end = int(attrs.get("end", 0))
     lanes = end - start
@@ -1264,7 +1302,11 @@ def map_tt_mbarrier(op: Any, ctx: WalkerCtx) -> Any:
     """
     op_name = op.get("name") if isinstance(op, dict) else getattr(op, "name", "")
     name = str(op_name).lower()
-    attrs = _attrs(op)
+    # Wave E3: ``count``/``arrive_count``/``parity`` (i.e. the barrier_kind
+    # tunables) are Triton 3.6 inherent attrs stored as Properties. Use the
+    # shared helper so jaxlib's empty op.attributes path falls back to
+    # parsing ``<{count = N : i32}>`` from the printed op text.
+    attrs = _attrs_with_properties_shared(op)
 
     import tilelang.language as T  # type: ignore  # lazy
 

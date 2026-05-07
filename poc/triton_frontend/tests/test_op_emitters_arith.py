@@ -430,42 +430,10 @@ def test_registry_covers_required_ops():
 # ---------------------------------------------------------------------------
 
 
-class _FakeMlirOp:
-    """Minimal stand-in for a jaxlib ``mlir.ir.Operation`` whose inherent
-    attrs live in MLIR Properties storage.
-
-    Under ``allow_unregistered_dialects=True`` jaxlib hides the dialect's
-    Properties from ``op.attributes`` (it stays empty), but the printed
-    op text still includes the ``<{predicate = N : i64}>`` block.  This
-    fake mirrors that exact shape so the emitter is forced through the
-    ``_attrs_with_properties_shared`` fallback in op_mapping.py.
-    """
-
-    def __init__(self, name: str, operands, results, printed: str) -> None:
-        self.name = name
-        self.operands = list(operands)
-        self.results = list(results)
-        self.attributes = []  # empty -- jaxlib Properties path
-        self._printed = printed
-
-    def __str__(self) -> str:  # what _parse_generic_properties_shared reads
-        return self._printed
-
-
-class _HashableSSA:
-    """Hashable SSA stand-in carrying a dtype.
-
-    The existing dict-shaped ``_ssa`` helper in this file isn't hashable
-    so it can't be used as a key in ``WalkerCtx.value_map``. The arith
-    emitter only reads ``.dtype`` off operands, so a tiny class with that
-    one attribute is enough to drive the regression test end-to-end.
-    """
-
-    __slots__ = ("name", "dtype")
-
-    def __init__(self, name: str, dtype: str) -> None:
-        self.name = name
-        self.dtype = dtype
+# ``_FakeMlirOp`` and ``_HashableSSA`` previously lived inline; they now
+# come from the shared fixtures module so all op-emitter tests use the
+# same hashing / Properties-shape behaviour.
+from ._fixtures import FakeMlirOp as _FakeMlirOp, FakeSSA as _HashableSSA
 
 
 def test_cmpi_predicate_from_properties_block():
