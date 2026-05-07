@@ -1,0 +1,11 @@
+---
+aspect: correctness
+provider: grok
+model: grok-4
+range: (uncommitted)
+base_ref: 
+head_ref: 
+timestamp: 2026-05-07T02:32:21.835816+00:00
+files: ['/private/tmp/tl_poc_review/poc/triton_frontend/ptr_analysis.py', '/private/tmp/tl_poc_review/poc/triton_frontend/_cxx/ptr_analysis_shim.h', '/private/tmp/tl_poc_review/poc/triton_frontend/_cxx/ptr_analysis_shim.cc', '/private/tmp/tl_poc_review/poc/triton_frontend/_cxx/pybind_module.cc', '/private/tmp/tl_poc_review/poc/triton_frontend/_cxx/CMakeLists.txt', '/private/tmp/tl_poc_review/poc/triton_frontend/tests/test_ptr_analysis.py']
+---
+(no response)

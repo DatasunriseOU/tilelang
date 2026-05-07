@@ -1,0 +1,11 @@
+---
+aspect: correctness
+provider: grok
+model: grok-4
+range: (uncommitted)
+base_ref: 
+head_ref: 
+timestamp: 2026-05-07T01:40:43.416554+00:00
+files: ['/private/tmp/tl_poc_review/tilelang/language/extern.py', '/private/tmp/tl_poc_review/tilelang/language/extern_registry.py', '/private/tmp/tl_poc_review/tilelang/language/__init__.py', '/private/tmp/tl_poc_review/poc/extern_intrinsic_examples/simdgroup_mma.py', '/private/tmp/tl_poc_review/poc/extern_intrinsic_examples/test_extern_smoke.py', '/private/tmp/tl_poc_review/src/transform/extern_intrinsic_meta.h', '/private/tmp/tl_poc_review/src/transform/layout_inference.cc', '/private/tmp/tl_poc_review/src/transform/inject_pipeline.cc', '/private/tmp/tl_poc_review/src/transform/thread_storage_sync.cc', '/private/tmp/tl_poc_review/testing/python/transform/test_extern_intrinsic_passes.py']
+---
+(no response)
