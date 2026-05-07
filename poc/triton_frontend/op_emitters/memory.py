@@ -363,6 +363,81 @@ def _emit_degraded_tile_store(
     return annotated
 
 
+def _emit_tile_copy_tir(
+    op: Any,
+    ctx: WalkerCtx,
+    src_buf: Any,
+    base_indices: Sequence[Any],
+    out_shape: Sequence[int],
+    out_dtype: str,
+    mask_ssa: Any,
+    other_ssa: Any,
+) -> Any:
+    """Non-DEGRADED tile copy fallback: rolled ``tir.For`` over ``BufferLoad``.
+
+    Used when PtrAnalysis has surfaced a tile descriptor (so we know the load
+    is a real tile, not a silent fallback) but the TileLang ``T`` builder
+    scope is not active (e.g., unit-test environment that calls the emitter
+    directly without ``T.prim_func``). The emitted IR has the same shape as
+    ``_emit_load_copy``'s ImportError fallback -- a per-lane BufferLoad/Store
+    nest -- but **without** the ``# DEGRADED:`` AttrStmt, because we DO have
+    PtrState; it is the *builder scope* that's absent, not the analysis.
+
+    This is the contractually-correct artifact for the
+    ``test_tile_load_with_seeded_state_skips_degraded_marker`` invariant
+    documented in ``tests/test_pipeline_with_ptr_analysis.py``.
+    """
+    tir = ctx.tir()
+    result_value = _results(op)[0] if _results(op) else None
+    out_buf_name = ctx.fresh("tile_load")
+    tile_buf = tir.decl_buffer(list(out_shape) or [1], out_dtype, name=out_buf_name)
+    ctx.buffers[out_buf_name] = tile_buf
+
+    loop_vars: List[Any] = []
+    body_indices: List[Any] = list(base_indices) if base_indices else []
+    for axis, _extent in enumerate(out_shape or [1]):
+        loop_vars.append(tir.Var(ctx.fresh(f"i{axis}"), "int32"))
+
+    src_indices: List[Any] = []
+    for axis, lv in enumerate(loop_vars):
+        base = body_indices[axis] if axis < len(body_indices) else tir.const(0, "int32")
+        src_indices.append(base + lv)
+
+    load_expr: Any = tir.BufferLoad(src_buf, src_indices)
+    if mask_ssa is not None:
+        try:
+            mask_expr = ctx.get(mask_ssa)
+        except KeyError:
+            mask_expr = None
+        if mask_expr is not None:
+            if other_ssa is not None:
+                try:
+                    other_expr = ctx.get(other_ssa)
+                except KeyError:
+                    other_expr = tir.const(0, out_dtype)
+            else:
+                other_expr = tir.const(0, out_dtype)
+            load_expr = tir.if_then_else(mask_expr, load_expr, other_expr)
+
+    body = tir.BufferStore(tile_buf, load_expr, list(loop_vars) or [tir.const(0, "int32")])
+    for axis in range(len(loop_vars) - 1, -1, -1):
+        extent = out_shape[axis] if axis < len(out_shape) else 1
+        body = tir.For(
+            loop_vars[axis],
+            tir.const(0, "int32"),
+            tir.const(int(extent), "int32"),
+            tir.ForKind.SERIAL,
+            body,
+        )
+
+    # Emit the loop nest WITHOUT the ``# DEGRADED:`` AttrStmt -- the
+    # PtrAnalysis pre-pass succeeded, so the breadcrumb does not apply.
+    ctx.emit(body)
+    if result_value is not None:
+        ctx.bind(result_value, tile_buf)
+    return tile_buf
+
+
 def _is_tile_shape(shape: Sequence[int]) -> bool:
     """Return True iff ``shape`` describes more than one element."""
     if not shape:
@@ -409,6 +484,28 @@ def emit_tt_load(op: Any, ctx: WalkerCtx) -> Any:
     out_shape = list(_shape_of(result_value)) if result_value is not None else []
     out_dtype = _dtype_of(result_value) if result_value is not None else "float32"
 
+    # Fallback: ``_shape_of`` only inspects MLIR ``RankedTensorType`` and
+    # the dict-shaped fake; bare Python objects that expose ``.shape`` (e.g.
+    # the ``_FakeValue`` test fixture) slip through and present as scalar.
+    # That silent rank-0 path is exactly what masked the no-shim ``# DEGRADED:``
+    # invariant: a 32-element tile fake was being routed into the scalar
+    # BufferLoad branch with no breadcrumb. Mirror the dict probe on
+    # attribute access -- and on the ptr operand as a secondary source --
+    # so any value that *says* it's a tile is treated as one here.
+    if not out_shape:
+        for candidate in (result_value, ptr_ssa):
+            cand_shape = getattr(candidate, "shape", None)
+            if cand_shape:
+                out_shape = [int(s) if not isinstance(s, str) else s for s in cand_shape]
+                break
+    if out_dtype in {"", "handle", "float32"} and result_value is not None:
+        # Honour an explicit ``.dtype`` when ``_dtype_of`` defaulted us back
+        # to float32 with no MLIR type info. (Cheap; doesn't affect the dict
+        # path because dicts are caught by ``_dtype_of`` directly.)
+        attr_dtype = getattr(result_value, "dtype", None)
+        if isinstance(attr_dtype, str) and attr_dtype:
+            out_dtype = attr_dtype
+
     # Pre-pass-seeded PtrState lookup (run_ptr_analysis_pre_pass populated
     # ``ctx.ptr_states`` keyed by SSA name). When found, we synthesize the
     # legacy tagged-dict shape that ``_emit_load_copy`` already understands
@@ -434,7 +531,26 @@ def emit_tt_load(op: Any, ctx: WalkerCtx) -> Any:
             # knows how to talk to ``T.copy`` once PtrAnalysis is in.
             from ..op_mapping import _emit_load_copy
 
-            return _emit_load_copy(op, ctx, resolved, mask_ssa, other_ssa)
+            try:
+                return _emit_load_copy(op, ctx, resolved, mask_ssa, other_ssa)
+            except ValueError as exc:
+                # ``_emit_load_copy`` calls into ``tilelang.language``
+                # builders (``T.alloc_fragment`` / ``T.copy``) which require
+                # an active ``T.prim_func`` builder scope. When the emitter
+                # is invoked outside that scope (unit tests, dict-walker
+                # plumbing) TVM raises ``ValueError: No builder in current
+                # scope``. PtrAnalysis still gave us a real tile descriptor,
+                # so we fall back to a rolled ``tir.For`` over BufferLoad
+                # *without* the ``# DEGRADED:`` AttrStmt -- the breadcrumb
+                # is reserved for the no-PtrState path. Re-raise anything
+                # that is NOT the builder-scope error so genuine emitter
+                # bugs still surface.
+                if "No builder in current scope" not in str(exc):
+                    raise
+                return _emit_tile_copy_tir(
+                    op, ctx, tile_buf, tile_offsets, tile_shape, out_dtype,
+                    mask_ssa, other_ssa,
+                )
         # No shim: degrade visibly.
         return _emit_degraded_tile_load(
             op, ctx, tile_buf, tile_offsets, tile_shape, out_dtype,
