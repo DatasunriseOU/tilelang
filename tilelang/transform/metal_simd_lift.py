@@ -210,6 +210,16 @@ def _butterfly_stages(extent: int) -> list[int]:
     while s >= 1:
         out.append(s)
         s //= 2
+    # Defense-in-depth: every emitted shift becomes the `mask` arg to
+    # `tl.shfl_xor_sync` and must lie strictly inside the Apple simdgroup
+    # width [1, 32). The caller guards against extent>32 / non-power-of-2,
+    # but assert here so any future caller misuse fails loudly instead of
+    # producing out-of-range shuffle indices.
+    for shift in out:
+        assert 1 <= shift < 32, (
+            f"butterfly stage {shift} out of [1,32) for Apple simdgroup "
+            f"(extent={extent})"
+        )
     return out
 
 
@@ -333,8 +343,15 @@ class _ButterflyRewriter:
                 node.loop_var, node.min, node.extent, node.kind, recursed_body,
                 node.thread_binding, node.annotations, node.span,
             )
-        proved, _ = _z3_extent_le_32(node.extent)
+        proved, query = _z3_extent_le_32(node.extent)
         if not proved:
+            # Annotated loop but Z3 cannot prove extent <= 32 — log so CI can
+            # surface the missed rewrite instead of dropping silently.
+            logger.warning(
+                "simd-lift-rewrite: declining annotated loop var=%s extent=%s "
+                "reason=z3_extent_unproved query=%s",
+                str(node.loop_var.name), str(node.extent), query,
+            )
             return tir.For(
                 node.loop_var, node.min, node.extent, node.kind, recursed_body,
                 node.thread_binding, node.annotations, node.span,
@@ -347,7 +364,13 @@ class _ButterflyRewriter:
             extent_val = int(node.extent)
         else:
             # Symbolic-but-proved is rare here; without a numeric we cannot
-            # emit the static stage list. Conservative: skip.
+            # emit the static stage list. Conservative: skip — log so CI can
+            # diagnose why an annotated/proved loop wasn't rewritten.
+            logger.warning(
+                "simd-lift-rewrite: declining annotated loop var=%s extent=%s "
+                "reason=symbolic_extent_no_static_value",
+                str(node.loop_var.name), str(node.extent),
+            )
             return tir.For(
                 node.loop_var, node.min, node.extent, node.kind, recursed_body,
                 node.thread_binding, node.annotations, node.span,
@@ -359,6 +382,11 @@ class _ButterflyRewriter:
         # cannot be served by a single shfl_xor_sync chain.
         if (extent_val < 2 or extent_val > 32 or
                 (extent_val & (extent_val - 1)) != 0):
+            logger.warning(
+                "simd-lift-rewrite: declining annotated loop var=%s extent=%d "
+                "reason=extent_not_pow2_in_[2,32]",
+                str(node.loop_var.name), extent_val,
+            )
             return tir.For(
                 node.loop_var, node.min, node.extent, node.kind, recursed_body,
                 node.thread_binding, node.annotations, node.span,
