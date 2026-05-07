@@ -15,7 +15,9 @@ from tilelang.language.extern import (
     Frag,
     extern_intrinsic,
     simdgroup_a,
+    simdgroup_a_fp8,
     simdgroup_b,
+    simdgroup_b_fp8,
     simdgroup_c,
 )
 
@@ -202,6 +204,65 @@ def test_simdgroup_factories_produce_canonical_frags():
     # Non-2D rejected.
     with pytest.raises(ValueError, match="2-D tile shape"):
         simdgroup_a("a", shape=(8, 8, 8))
+
+
+def test_simdgroup_fp8_factories_produce_canonical_frags():
+    """FP8 forward-compat factories must pin the call-site contract.
+
+    Importable + returns a Frag with the documented placeholder Layout
+    (i.e. layout-string ``simdgroup_a_fp8`` / ``simdgroup_b_fp8`` that
+    ``layout_inference.cc`` will treat as opaque, matching the existing
+    fp16 simdgroup factories). No Apple FP8 hardware required for this
+    level of test — we only check the metadata contract.
+    """
+    a = simdgroup_a_fp8("a")
+    b = simdgroup_b_fp8("b")
+    assert (a.scope, a.dtype, a.layout, a.alignment, a.is_output) == (
+        "simdgroup", "float8_e4m3", "simdgroup_a_fp8", 16, False,
+    )
+    assert (b.scope, b.dtype, b.layout, b.alignment, b.is_output) == (
+        "simdgroup", "float8_e4m3", "simdgroup_b_fp8", 16, False,
+    )
+    # E5M2 variant (unsigned-zero / IEEE-style fp8) reachable via dtype override.
+    a_e5m2 = simdgroup_a_fp8("a", dtype="float8_e5m2")
+    assert a_e5m2.dtype == "float8_e5m2"
+    # Default tile is (8, 8); larger tiles are accepted by the factory contract.
+    assert simdgroup_a_fp8("a").shape == (8, 8)
+    assert simdgroup_a_fp8("a", shape=(16, 16)).shape == (16, 16)
+    # Non-2D rejected (matches fp16 contract).
+    with pytest.raises(ValueError, match="2-D tile shape"):
+        simdgroup_a_fp8("a", shape=(8, 8, 8))
+
+
+@pytest.mark.xfail(
+    reason=(
+        "Apple has not shipped simdgroup_matrix<float8_e4m3> as of 2026-05. "
+        "When Apple FP8 silicon ships and codegen_metal lowers the FP8 MMA "
+        "intrinsic, flip this xfail off — the test currently locks the "
+        "factory contract but the runtime call is not yet executable."
+    ),
+    strict=False,
+)
+def test_simdgroup_fp8_factories_produce_canonical_frags_fp8_runtime():
+    """Runtime tracking marker for Apple FP8 silicon.
+
+    Auto-flips to passing the moment Metal codegen materialises an FP8
+    simdgroup MMA call from a TileLang intrinsic. Until then we only
+    assert the factory contract; the runtime path is xfail (strict=False
+    so accidental flips are caught early).
+    """
+    # The factory must keep working regardless of hardware.
+    a = simdgroup_a_fp8("a")
+    b = simdgroup_b_fp8("b")
+    assert (a.layout, b.layout) == ("simdgroup_a_fp8", "simdgroup_b_fp8")
+    # Forward-compat: when codegen ships FP8, this assertion will become a
+    # real runtime check (compile + launch a tiny FP8 simdgroup MMA kernel).
+    # For now we deliberately fail the xfail by asserting hardware is not
+    # there yet. Replace with a real launcher when Apple ships.
+    raise NotImplementedError(
+        "Apple float8_e4m3 simdgroup_matrix not shipped — see extern.py "
+        "module docstring for the precise edits required to flip this on."
+    )
 
 
 def test_validate_body_warns_on_missing_frag_name(recwarn):

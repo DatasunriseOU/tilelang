@@ -71,6 +71,49 @@ simdgroup_mma_8x8 = extern_intrinsic(
 )
 
 
+# ---------------------------------------------------------------------------
+# FP8 forward-compat variant. Apple has not (as of 2026-05) shipped
+# ``simdgroup_matrix<float8_e4m3>`` — the MSL body below is therefore
+# ILLUSTRATIVE ONLY and references types Metal does not yet declare. It
+# documents the expected call shape so cppmega.mlx kernels that already
+# carry FP8 fragments (``fp8_msl_kernels.py``, ``sparse_mla_fp8.py``,
+# ``fp8_vecmat_path_c.py``) can swap their inline raw-MSL into this
+# extern_intrinsic registration the moment Apple ships FP8 simdgroup MMA.
+# ---------------------------------------------------------------------------
+
+# pragma: no cover — FP8 factories forward-compat
+from tilelang.language.extern import simdgroup_a_fp8, simdgroup_b_fp8
+
+# pragma: no cover — FP8 factories forward-compat
+SIMDGROUP_MMA_8x8_FP8_MSL: str = r"""
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+// FORWARD-COMPATIBLE STUB — Apple has not shipped float8_e4m3 simdgroup_matrix
+// types as of 2026-05. The body below names types that Metal does not yet
+// declare; it serves only to document the expected lowering shape.
+inline void simdgroup_mma_8x8_fp8(
+    thread simdgroup_float8_e4m3_8x8 a,    // not yet a Metal type
+    thread simdgroup_float8_e4m3_8x8 b,    // not yet a Metal type
+    thread simdgroup_float8x8         c    // fp32 accumulator (already exists)
+) {
+    simdgroup_multiply_accumulate(c, a, b, c);
+}
+"""
+
+# pragma: no cover — FP8 factories forward-compat
+simdgroup_mma_8x8_fp8 = extern_intrinsic(
+    name="simdgroup_mma_8x8_fp8",
+    signature=lambda: (
+        simdgroup_a_fp8("a", pipeline_stage=0),
+        simdgroup_b_fp8("b", pipeline_stage=0),
+        simdgroup_c("c", pipeline_stage=1),
+    ),
+    bodies={"metal": SIMDGROUP_MMA_8x8_FP8_MSL},
+)
+
+
 if __name__ == "__main__":
     # Sanity check at import time — registry sees the entry and the contract is
     # well-formed.
@@ -84,3 +127,7 @@ if __name__ == "__main__":
     for f in frags:
         print(f"  - {f.name}: {f.shape} {f.dtype} scope={f.scope} layout={f.layout} "
               f"stage={f.pipeline_stage} out={f.is_output}")
+
+    fp8_entry = extern_registry.lookup("simdgroup_mma_8x8_fp8")
+    assert fp8_entry is not None, "simdgroup_mma_8x8_fp8 not registered"
+    print(f"registered {fp8_entry.name} (forward-compat — Apple FP8 silicon pending)")

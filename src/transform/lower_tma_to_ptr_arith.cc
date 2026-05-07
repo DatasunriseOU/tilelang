@@ -80,6 +80,7 @@
 #include "../op/builtin.h"
 #include "../target/utils.h"
 #include "lower_tma_to_ptr_arith.h"
+#include "vendored/allocate_visit_passthrough.h"
 #include "vendored/let_stmt.h"
 
 namespace tvm {
@@ -480,6 +481,25 @@ class TMAToPtrArithMutator : public StmtExprMutator {
 public:
   explicit TMAToPtrArithMutator(Target target)
       : target_(std::move(target)) {}
+
+  // Pass-through dispatch for the vendored `tilelang::tl_tir::AllocateNode`.
+  // Without this override the apache `StmtFunctor` vtable rejects the
+  // vendored type with `Check failed: (can_dispatch(n)) is false: NodeFunctor
+  // calls un-registered function on type tilelang.Allocate`, breaking every
+  // engine-path lowering of a Path-C TileLang DSL kernel that uses
+  // `T.alloc_shared(...)`. The downstream `LowerTileLangAllocate` pass
+  // converts the vendored Allocate into apache-native `AllocBuffer + SeqStmt`
+  // before strict apache TIR passes run, so we just recurse into the body
+  // and rebuild the Allocate inert. See
+  // `src/transform/vendored/allocate_visit_passthrough.h` for the canonical
+  // helper used by every other TileLang mutator that may see the vendored
+  // node (e.g. `lower_thread_allreduce.cc`, `vectorize_loop.cc`).
+  Stmt VisitStmt(const Stmt &stmt) override {
+    if (auto out = ::tilelang::tl_tir::TryVisitAllocateMutator(this, stmt)) {
+      return *out;
+    }
+    return StmtExprMutator::VisitStmt(stmt);
+  }
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
     if (const auto *call = op->value.as<CallNode>()) {

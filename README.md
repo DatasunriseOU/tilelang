@@ -108,6 +108,30 @@ across `poc/`, `src/transform/`, `src/target/`, `src/op/`, `tilelang/language/`,
 `tilelang/transform/`, and the testing tree. See `git log
 metal-gemm-upstream-rebase..main` for the full audit trail.
 
+### 2026-05-07 — Wave-7/8: empirical test matrix & remaining bugs
+
+The 5 waves of static review-fix loops produced multiple "GREEN ship-ready"
+verdicts that did NOT survive empirical runtime testing on Apple M4 Max
+(macOS 26.4.1, Metal 3.2). Real test results, FP8 research, and remaining
+backlog are documented under [`docs/research/`](./docs/research/):
+
+- [`runtime_test_matrix.md`](./docs/research/runtime_test_matrix.md) — 142 tests, 30 pass / 31 fail / 74 skip / 2 collect-error; 6 distinct runtime-bug clusters that no `pytest --collect-only` would have caught.
+- [`numerical_parity_metal.md`](./docs/research/numerical_parity_metal.md) — what really runs on Metal: `tt.dot trans_b` (5/5), wave-3+wave-4 #09 autograd (12/12), PtrAnalysis (8/8), vendor_drift (2/2), `sync_threads_partial_mapping` (2/2). cppmega.mlx engine-path tests all skip because of an MLX venv-vs-brew dylib ABI mismatch — needs `pip install --force-reinstall mlx`.
+- [`engine_vs_shim_parity.md`](./docs/research/engine_vs_shim_parity.md) — 24/28 cells OK, 4 ERR all in fp8_amax (one root cause: `get_type_hints` does not enumerate `__closure__`, breaking the wave-7 #1 closure-rebind fix). 6 of 7 migrated kernels green on all 3 dispatch modes.
+- [`torch_compile_e2e.md`](./docs/research/torch_compile_e2e.md) — **3 of 4 cases work end-to-end** after wave-7 #4 redo: `relu(x)`, `x + y`, `relu(addmm(...))`. Case (d) `scaled_dot_product_attention` blocked on missing `aten._scaled_dot_product_flash_attention_for_cpu` ATEN_DISPATCH wiring (FA TileLang kernel exists at `poc/torch_dynamo/_kernels/flash_attention.py`).
+- [`wave5_q_hoist_bench.md`](./docs/research/wave5_q_hoist_bench.md) — wave-5 stage-2 Q hoist budget gate is too tight for production DSA shapes (only `AH≤4 + AD≤64` fits Metal 16 KB threadgroup); the "~2× speedup" claim cannot fire on real `AH≥8` decoder workloads.
+- FP8 research bundle ([`fp8_simdgroup_layout.md`](./docs/research/fp8_simdgroup_layout.md), [`apple_silicon_fp8_hardware.md`](./docs/research/apple_silicon_fp8_hardware.md), [`fp8_codegen_patterns.md`](./docs/research/fp8_codegen_patterns.md), [`nvfp4_mlx_metal.md`](./docs/research/nvfp4_mlx_metal.md)) — Apple has NOT published FP8 simdgroup layout constants and no shipping Apple Silicon GPU (M3/M4/M5/A18/A19) exposes native FP8 matmul intrinsics. Recommended forward-compat layout for `simdgroup_a/b_fp8` factories: 8×8 tile, K=32, kWidth=4 (mirrors NVIDIA SM89 + CUTLASS + AMD CDNA3 + Triton). NVFP4 IS available on Apple via MLX `mlx.core.quantize(mode="nvfp4")` as software Metal compute shaders (no FP4 tensor core hardware).
+
+Wave-7 fixes already in this branch (commits `5dc4b743`, `27392ded`,
+`bce67cf9`, `99e6e638`, `4e487af7`, `5a3dc4bb`, `303f45cf`) plus wave-8
+queued: fp8_amax `__globals__` injection, dsa_splitk tiled Q-cache for
+production AH, ATEN_DISPATCH FA wiring, reduce_prod C++ pass mul-kind
+handling, MLX ABI check script (cppmega.mlx side).
+
+Cppmega.mlx wave-7/8 fixes are in
+[`DatasunriseOU/cppmega_mlx@main`](https://github.com/DatasunriseOU/cppmega_mlx)
+under commits `a439df0`, `cac10a0`, `bbe9334`, `fb73493`.
+
 ### 2026-05-07 — Z3 prover safety gate for CUDA / gb10
 
 A correctness regression has been observed on the gb10 (CUDA `sm_120`) target
