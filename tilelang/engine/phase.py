@@ -1,4 +1,5 @@
 from __future__ import annotations
+import tvm
 from tvm import tir, IRModule
 from tvm.target import Target
 import tilelang
@@ -163,6 +164,15 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     Returns:
         IRModule: The transformed module, ready for target-specific optimization passes.
     """
+    # CPPMEGA z3-stack fix-A8 (NEW-2): drop any stale per-thread Z3 prover
+    # cache entries before this pass pipeline runs. The prover cache is
+    # keyed by `Analyzer*`; a freed Analyzer's address can be reused by a
+    # fresh Analyzer in this pass, which would otherwise inherit the
+    # prior pass's memo / scope / bv-mode state. Cheap, idempotent.
+    _z3_clear = tvm.ffi.get_global_func("tl.z3.clear_prover_cache",
+                                        allow_missing=True)
+    if _z3_clear is not None:
+        _z3_clear()
     # CPPMEGA: Lower TileLang's vendored `tilelang::tl_tir::LetStmt` and
     # `tilelang::tl_tir::Allocate` IR nodes to apache TIR equivalents
     # (Bind+SeqStmt, AllocBuffer+SeqStmt) BEFORE any apache TIR pass runs.
@@ -248,6 +258,15 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
 
 def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     pass_ctx = tilelang.transform.get_pass_context()
+    # CPPMEGA z3-stack fix-A8 (NEW-2): also clear here. `LowerAndLegalize`
+    # and `OptimizeForTarget` are called as separate phases; either may be
+    # invoked in isolation by tools, and the per-thread Z3 prover cache
+    # outlives both. Clearing at every phase entry keeps the prover state
+    # scoped to the current pass invocation.
+    _z3_clear = tvm.ffi.get_global_func("tl.z3.clear_prover_cache",
+                                        allow_missing=True)
+    if _z3_clear is not None:
+        _z3_clear()
     # CPPMEGA: Defensive re-run of vendored-IR converters in case any TileLang
     # pass in `LowerAndLegalize` re-introduced `tilelang::tl_tir::LetStmt` or
     # `tilelang::tl_tir::Allocate` nodes. This guarantees the IR contains only

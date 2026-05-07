@@ -156,6 +156,15 @@ class ScopedBVMode {
 // own context is not thread-safe).
 Z3Prover& GetOrCreate(::tvm::arith::Analyzer* analyzer);
 
+// CPPMEGA z3-stack fix-A8 (NEW-2): per-pass cache hygiene. Pass drivers
+// MUST call `ClearProverCache()` (or `ResetProverFor(specific_analyzer)`)
+// at pass entry to prevent cross-pass contamination — the per-thread
+// `Analyzer*`-keyed cache survives across passes and a heap-address
+// reuse for a freed Analyzer would otherwise hand a stale prover (with
+// stale memo/scope/bv-mode) to the new owner. Cheap; idempotent.
+void ClearProverCache();
+void ResetProverFor(::tvm::arith::Analyzer* analyzer);
+
 }  // namespace tlz3
 }  // namespace tilelang
 

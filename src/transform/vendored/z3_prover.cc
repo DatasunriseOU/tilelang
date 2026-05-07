@@ -1018,15 +1018,46 @@ void Z3Prover::Reset() { impl_->Reset(); }
 // Z3ProverImpl is also thread_local; mixing analyzers across threads would
 // hand out provers wired to the wrong context.
 
-Z3Prover& GetOrCreate(::tvm::arith::Analyzer* analyzer) {
+// CPPMEGA z3-stack fix-A8: per-thread cache accessor. Factored out so
+// `ClearProverCache()` (below) can reach the same map. Returning by
+// reference is safe: the map itself is `static thread_local`, so its
+// storage outlives any caller frame on this thread.
+static std::unordered_map<::tvm::arith::Analyzer*, std::unique_ptr<Z3Prover>>&
+GetProverCache_() {
   static thread_local std::unordered_map<::tvm::arith::Analyzer*,
                                          std::unique_ptr<Z3Prover>>
       cache;
+  return cache;
+}
+
+Z3Prover& GetOrCreate(::tvm::arith::Analyzer* analyzer) {
+  auto& cache = GetProverCache_();
   auto& slot = cache[analyzer];
   if (!slot) {
     slot = std::make_unique<Z3Prover>(analyzer);
   }
   return *slot;
+}
+
+// CPPMEGA z3-stack fix-A8 (NEW-2): clear the entire per-thread prover
+// cache. Intended to be called at every pass-driver entry point so two
+// consecutive passes that happen to receive the same `Analyzer*`
+// (either by deliberate reuse or by heap-address coincidence after a
+// previous Analyzer was freed) cannot inherit memo / scope / bv-mode
+// state from the prior pass. Cheap (drops unique_ptrs) and safe to call
+// any number of times.
+void ClearProverCache() { GetProverCache_().clear(); }
+
+// CPPMEGA z3-stack fix-A8 (NEW-2): targeted reset for a specific
+// Analyzer's cached prover. Use when the caller knows the precise
+// Analyzer it owns; safer than a thread-wide clear inside library code
+// that doesn't own the Analyzer lifetime.
+void ResetProverFor(::tvm::arith::Analyzer* analyzer) {
+  auto& cache = GetProverCache_();
+  auto it = cache.find(analyzer);
+  if (it != cache.end() && it->second) {
+    it->second->Reset();
+  }
 }
 
 // CPPMEGA: Auto-driver hooks. Registered at static init so apache
@@ -1113,6 +1144,16 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::GlobalDef().def("tl.z3.bv_scoped_round_trip", BvScopedRoundTrip);
 }
 #endif  // TILELANG_BUILD_TESTS
+
+// CPPMEGA z3-stack fix-A8 (NEW-2): production FFI for cache hygiene.
+// Registered unconditionally (NOT inside the TILELANG_BUILD_TESTS gate)
+// because the pass driver in `tilelang/engine/phase.py` calls these at
+// every pass entry. Both functions are no-ops on an empty cache.
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = ::tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.z3.clear_prover_cache",
+                        []() { ClearProverCache(); });
+}
 
 }  // namespace tlz3
 }  // namespace tilelang
