@@ -309,7 +309,11 @@ private:
            op == atomic_addx2_elem_op() || op == atomic_addx4_elem_op() ||
            op == atomic_load_elem_op() || op == atomic_store_elem_op() ||
            op == atomic_max_elem_op() || op == atomic_max_ret_elem_op() ||
-           op == atomic_min_elem_op() || op == atomic_min_ret_elem_op();
+           op == atomic_min_elem_op() || op == atomic_min_ret_elem_op() ||
+           op == atomic_xchg_elem_op() || op == atomic_xchg_ret_elem_op() ||
+           op == atomic_and_elem_op() || op == atomic_and_ret_elem_op() ||
+           op == atomic_or_elem_op() || op == atomic_or_ret_elem_op() ||
+           op == atomic_xor_elem_op() || op == atomic_xor_ret_elem_op();
   }
 
   bool IsCPAsyncOp(const Op &op) {

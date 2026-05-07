@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "../op/builtin.h"
+#include "../transform/vendored/tl_runtime_symbols.h"
 #include "arith/pattern_match.h"
 
 namespace tvm {

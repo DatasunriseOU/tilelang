@@ -354,6 +354,161 @@ def atomic_addx4(dst: Buffer, value: PrimExpr, return_prev: bool = False) -> Pri
     return T.call_intrin(return_type, atomic_addx4_op, T.access_ptr(dst, "rw"), T.access_ptr(value, "r"))
 
 
+def atomic_xchg(dst: Buffer, value: PrimExpr, memory_order: str | None = None, return_prev: bool = False) -> PrimExpr:
+    """
+    Atomically exchange (xchg) the value at `dst` with `value`.
+
+    Performs a scalar atomic exchange: the value at `dst` is replaced with
+    `value` and (optionally) the previous value at `dst` is returned. Only the
+    scalar/addressed extern atomic path is supported; tile-region semantics
+    are not defined for exchange. The optional `memory_order` (one of
+    "relaxed", "consume", "acquire", "release", "acq_rel", "seq_cst") selects
+    the C++/CUDA memory ordering for the underlying hardware primitive.
+
+    Parameters:
+        dst (Buffer): Destination buffer/address to apply the atomic exchange.
+        value (PrimExpr): Value to atomically write into `dst`.
+        memory_order (Optional[str]): Optional memory-order name controlling
+            the atomic operation's ordering.
+        return_prev (bool): If True, return the previous value at `dst`; if
+            False, return a handle (default False).
+
+    Returns:
+        PrimExpr: A handle representing the atomic exchange operation, or the
+        previous value if `return_prev` is True.
+
+    Examples:
+        >>> # Basic atomic exchange
+        >>> flag = T.Tensor([1], "int32", name="flag")
+        >>> atomic_xchg(flag, 1)
+
+        >>> # Capture the previous value (compare-and-swap-style usage)
+        >>> old = atomic_xchg(flag, 0, return_prev=True)
+    """
+    atomic_xchg_op = op.Op.get("tl.atomic_xchg_ret_elem_op") if return_prev else op.Op.get("tl.atomic_xchg_elem_op")
+    return_type = dst.dtype if return_prev else "handle"
+    memory_order_id = _MEMORY_ORDER_ID_MAP[memory_order] if memory_order else 0
+
+    return T.call_intrin(
+        return_type,
+        atomic_xchg_op,
+        T.access_ptr(dst, "rw"),
+        value,
+        memory_order_id,
+    )
+
+
+def atomic_and(dst: Buffer, value: PrimExpr, memory_order: str | None = None, return_prev: bool = False) -> PrimExpr:
+    """
+    Atomically bitwise-AND the value at `dst` with `value`.
+
+    Performs a scalar atomic bitwise-AND on integer-typed buffers. The optional
+    `memory_order` (one of "relaxed", "consume", "acquire", "release",
+    "acq_rel", "seq_cst") selects the underlying memory ordering.
+
+    Parameters:
+        dst (Buffer): Destination buffer/address to apply the atomic AND.
+        value (PrimExpr): Mask value to AND atomically with `dst`.
+        memory_order (Optional[str]): Optional memory-order name controlling
+            the atomic operation's ordering.
+        return_prev (bool): If True, return the previous value at `dst`; if
+            False, return a handle (default False).
+
+    Returns:
+        PrimExpr: A handle representing the atomic AND operation, or the
+        previous value if `return_prev` is True.
+
+    Examples:
+        >>> bits = T.Tensor([1], "int32", name="bits")
+        >>> atomic_and(bits, 0xF0F0F0F0)
+    """
+    atomic_and_op = op.Op.get("tl.atomic_and_ret_elem_op") if return_prev else op.Op.get("tl.atomic_and_elem_op")
+    return_type = dst.dtype if return_prev else "handle"
+    memory_order_id = _MEMORY_ORDER_ID_MAP[memory_order] if memory_order else 0
+
+    return T.call_intrin(
+        return_type,
+        atomic_and_op,
+        T.access_ptr(dst, "rw"),
+        value,
+        memory_order_id,
+    )
+
+
+def atomic_or(dst: Buffer, value: PrimExpr, memory_order: str | None = None, return_prev: bool = False) -> PrimExpr:
+    """
+    Atomically bitwise-OR the value at `dst` with `value`.
+
+    Performs a scalar atomic bitwise-OR on integer-typed buffers. The optional
+    `memory_order` (one of "relaxed", "consume", "acquire", "release",
+    "acq_rel", "seq_cst") selects the underlying memory ordering.
+
+    Parameters:
+        dst (Buffer): Destination buffer/address to apply the atomic OR.
+        value (PrimExpr): Mask value to OR atomically with `dst`.
+        memory_order (Optional[str]): Optional memory-order name controlling
+            the atomic operation's ordering.
+        return_prev (bool): If True, return the previous value at `dst`; if
+            False, return a handle (default False).
+
+    Returns:
+        PrimExpr: A handle representing the atomic OR operation, or the
+        previous value if `return_prev` is True.
+
+    Examples:
+        >>> flags = T.Tensor([1], "int32", name="flags")
+        >>> atomic_or(flags, 0x1)
+    """
+    atomic_or_op = op.Op.get("tl.atomic_or_ret_elem_op") if return_prev else op.Op.get("tl.atomic_or_elem_op")
+    return_type = dst.dtype if return_prev else "handle"
+    memory_order_id = _MEMORY_ORDER_ID_MAP[memory_order] if memory_order else 0
+
+    return T.call_intrin(
+        return_type,
+        atomic_or_op,
+        T.access_ptr(dst, "rw"),
+        value,
+        memory_order_id,
+    )
+
+
+def atomic_xor(dst: Buffer, value: PrimExpr, memory_order: str | None = None, return_prev: bool = False) -> PrimExpr:
+    """
+    Atomically bitwise-XOR the value at `dst` with `value`.
+
+    Performs a scalar atomic bitwise-XOR on integer-typed buffers. The
+    optional `memory_order` (one of "relaxed", "consume", "acquire", "release",
+    "acq_rel", "seq_cst") selects the underlying memory ordering.
+
+    Parameters:
+        dst (Buffer): Destination buffer/address to apply the atomic XOR.
+        value (PrimExpr): Mask value to XOR atomically with `dst`.
+        memory_order (Optional[str]): Optional memory-order name controlling
+            the atomic operation's ordering.
+        return_prev (bool): If True, return the previous value at `dst`; if
+            False, return a handle (default False).
+
+    Returns:
+        PrimExpr: A handle representing the atomic XOR operation, or the
+        previous value if `return_prev` is True.
+
+    Examples:
+        >>> bits = T.Tensor([1], "int32", name="bits")
+        >>> atomic_xor(bits, 0xFFFFFFFF)
+    """
+    atomic_xor_op = op.Op.get("tl.atomic_xor_ret_elem_op") if return_prev else op.Op.get("tl.atomic_xor_elem_op")
+    return_type = dst.dtype if return_prev else "handle"
+    memory_order_id = _MEMORY_ORDER_ID_MAP[memory_order] if memory_order else 0
+
+    return T.call_intrin(
+        return_type,
+        atomic_xor_op,
+        T.access_ptr(dst, "rw"),
+        value,
+        memory_order_id,
+    )
+
+
 def atomic_load(src: Buffer, memory_order: str = "seq_cst") -> PrimExpr:
     """
     Load a value from the given buffer using the specified atomic memory ordering.

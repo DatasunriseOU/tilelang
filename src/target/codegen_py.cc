@@ -473,7 +473,9 @@ void CodeGenTileLangPY::VisitStmt_(const BufferStoreNode *op) {
 }
 
 void CodeGenTileLangPY::VisitStmt_(const DeclBufferNode *op) {
-  PrintStmt_(op->body);
+  // apache/tvm-latest stripped `body` from DeclBufferNode (it is now a leaf
+  // stmt; the surrounding SeqStmt carries what was previously the body).
+  // Nothing to emit here — Python source for the body follows in the SeqStmt.
 }
 
 void CodeGenTileLangPY::VisitStmt_(const LetStmtNode *op) {
@@ -567,16 +569,23 @@ void CodeGenTileLangPY::VisitStmt_(const EvaluateNode *op) {
 }
 
 void CodeGenTileLangPY::VisitStmt_(const AssertStmtNode *op) {
+  // apache/tvm-latest replaced AssertStmt's single `message` field with
+  // `error_kind` + `message_parts` (an Array<StringImm> concatenated at
+  // runtime), and dropped the embedded `body` (the trailing body now lives in
+  // the surrounding SeqStmt).
   std::string cond = PrintExpr_(op->condition);
   PrintIndent();
-  if (const auto *str = op->message.as<StringImmNode>()) {
+  std::string joined;
+  for (const auto &part : op->message_parts) {
+    joined += static_cast<std::string>(part->value);
+  }
+  if (!joined.empty()) {
     stream << "assert " << cond << ", ";
-    EscapeStringLiteral_(str->value, stream);
+    EscapeStringLiteral_(joined, stream);
     stream << "\n";
   } else {
     stream << "assert " << cond << "\n";
   }
-  PrintStmt_(op->body);
 }
 
 std::string CodeGenTileLangPY::CastFromTo_(const std::string &value,

@@ -5,6 +5,8 @@
 
 #include "reduce.h"
 
+#include <cmath>
+
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/op_attr_types.h>

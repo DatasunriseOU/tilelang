@@ -90,6 +90,14 @@ static constexpr const char *kConfigIndexBitwidth = "tl.config_index_bitwidth";
 // Deprecated pass config, temporarily re-enabled. Prevents plain T.copy()
 // from auto-lowering to TMA store. Will be removed in v0.1.10.
 static constexpr const char *kDisableTMALower = "tl.disable_tma_lower";
+// Z3 idea #6: when enabled, CheckGlobalStrides requires a positive proof
+// of stride alignment (16-byte) before admitting TMA. Symbolic strides
+// without an explicit `T.assume(stride % 16 == 0)` (or equivalent
+// shape-derived constraint visible to the analyzer) cause TMA to be
+// rejected, with a conservative fallback to per-thread cp.async. Default
+// off; enabling tightens correctness for symbolic shapes at the cost of
+// possibly rejecting TMA for cases that were silently admitted before.
+static constexpr const char *kTMALegalityZ3 = "tl.tma_legality_z3";
 static constexpr const char *kEnableAggressiveSharedMemoryMerge =
     "tl.enable_aggressive_shared_memory_merge";
 static constexpr const char *kDisableFastMath = "tl.disable_fast_math";
@@ -110,6 +118,28 @@ static constexpr const char *kDisableLoopUnswitching =
 // non-trivial (has side effects). Default: false (conservative).
 static constexpr const char *kLoopUnswitchingAllowNonTrivialElse =
     "tl.loop_unswitching_allow_non_trivial_else";
+// CPPMEGA: Z3 idea #7 — predicate fusion. When enabled, fuse adjacent
+// `if(a) { if(b) { body } }` patterns into `if(a && b) { body }` ONLY when
+// Z3 proves that evaluating `b` outside the `a` guard is safe (no
+// out-of-bounds buffer access, no side effects). Default: false (off — the
+// pass is a pure throughput optimization and must remain conservative).
+static constexpr const char *kPredicateFusion = "tl.predicate_fusion";
+// CPPMEGA: Z3 idea #12 — vectorize alignment proof companion. When enabled,
+// after `loop_vectorize` rewrites a loop body to a `kVectorized` For, try
+// to prove the buffer base address is aligned to `vec_width * dtype_bytes`
+// using Z3. On success, an `tl.vec_aligned` annotation is attached to the
+// inner For so MSL/CUDA codegen can emit `vec.load_aligned`/`vec.store_aligned`
+// instead of the unaligned default. Default: false (additive optimization
+// on top of #1's contiguity proof).
+static constexpr const char *kVectorizeAlignmentProof =
+    "tl.vectorize_alignment_proof";
+
+// CPPMEGA: Z3 idea #4 — drop provable buffer-bound checks.
+// When enabled, IfThenElse nodes whose condition is a buffer-bound predicate
+// (e.g. `i < N`) are stripped when the default analyzer or the vendored Z3
+// prover can conclusively prove the condition. Default: OFF.
+static constexpr const char *kDropProvableBoundChecks =
+    "tl.drop_provable_bound_checks";
 
 /*!
  * \brief Enable lowering non-predicated global load/store to ldg/stg intrinsics
@@ -690,6 +720,21 @@ TVM_DLL const Op &sync_grid();
 TVM_DLL const Op &sync_warp();
 
 /*!
+ * \brief Partial-warp / subgroup barrier across a subset of lanes.
+ *
+ * sync_threads_partial(mask, n_threads)
+ *
+ * - CUDA: __syncwarp(mask) — only the lanes set in `mask` participate.
+ * - HIP : wave is always convergent → no-op (mask + n ignored).
+ * - Metal: simdgroup_barrier(mem_flags::mem_threadgroup) — SIMD group
+ *   is always convergent on Apple GPUs, mask + n are ignored.
+ *
+ * Used by Triton-style radix-select / partial-warp reductions ported
+ * via the triton_frontend (cppmega.mlx topk_selector).
+ */
+TVM_DLL const Op &sync_threads_partial();
+
+/*!
  * \brief Programmatic dependency trigger.
  *
  * pdl_trigger()
@@ -1074,6 +1119,53 @@ TVM_DLL const Op &atomic_min_elem_op();
  * tilelang that returns the previous value.
  */
 TVM_DLL const Op &atomic_min_ret_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic exchange.
+ *
+ *  This op is used to represent an element-wise atomic exchange (xchg)
+ *  operation in tilelang.
+ */
+TVM_DLL const Op &atomic_xchg_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic exchange with return
+ * value.
+ */
+TVM_DLL const Op &atomic_xchg_ret_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic bitwise AND.
+ */
+TVM_DLL const Op &atomic_and_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic bitwise AND with
+ * return value.
+ */
+TVM_DLL const Op &atomic_and_ret_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic bitwise OR.
+ */
+TVM_DLL const Op &atomic_or_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic bitwise OR with
+ * return value.
+ */
+TVM_DLL const Op &atomic_or_ret_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic bitwise XOR.
+ */
+TVM_DLL const Op &atomic_xor_elem_op();
+
+/*!
+ * \brief tilelang intrinsic for element-wise atomic bitwise XOR with
+ * return value.
+ */
+TVM_DLL const Op &atomic_xor_ret_elem_op();
 
 /*!
  * \brief tilelang intrinsic for assert on device.

@@ -99,6 +99,7 @@ Public attribution
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 from tilelang import tvm as _tvm  # noqa: F401
@@ -106,6 +107,18 @@ import tilelang.language as T
 from tilelang._typing import BufferLikeType
 from tvm import tir
 from tvm.target import Target
+
+# CPPMEGA Z3 idea #10 (fp4/fp8 dot4 packed legality): optional Z3 import. We
+# fail closed if z3-solver is not installed -- no auto-promotion to the
+# packed-dot4 fast path -- so symbolic-shape callers always keep the legacy
+# scalar / simd_sum path. Constant-shape callers don't need Z3 at all (the
+# static fast path discharges the predicate in plain Python).
+try:
+    import z3 as _z3  # type: ignore
+    _Z3_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised when z3-solver isn't installed
+    _z3 = None  # type: ignore
+    _Z3_AVAILABLE = False
 
 from .blockscaled_layout import (
     BlockScaledLayout,
@@ -216,6 +229,397 @@ def _target_thread_warp_size(target: Optional[Target]) -> int:
     if hasattr(value, "value"):
         return int(value.value)
     return int(value)
+
+
+# CPPMEGA Z3 idea #10: env-controlled disable knob for the auto-promote
+# behaviour. Set TILELANG_DISABLE_FP8_DOT4_AUTO=1 to force the legacy/scalar
+# path even when the static / Z3 prover proves the fast-path legal (useful for
+# A/B benchmarking and bisection).
+def _fp8_dot4_auto_disabled() -> bool:
+    return os.environ.get("TILELANG_DISABLE_FP8_DOT4_AUTO", "0") not in ("0", "", "false", "False")
+
+
+# CPPMEGA Z3 idea #10: probe whether the Metal dot4 / SIMD-position TIR ops
+# are registered. The dot4 vecmat macro emits intrinsics that exist in the
+# stack-c branch of the Metal codegen but aren't always registered in apache-tvm
+# trees. The auto-promote dispatcher must skip the dot4 path when they're
+# missing, otherwise lowering raises ``AttributeError: Operator ... is not
+# registered`` and we regress every previously-passing kernel.
+_DOT4_INTRINSICS = (
+    "tir.metal.thread_position_in_grid_x",
+    "tir.metal.thread_index_in_simdgroup",
+    "tir.metal.fp8_e4m3_dot4",
+)
+_dot4_intrinsics_registered_cache: Optional[bool] = None
+
+
+def _dot4_intrinsics_registered() -> bool:
+    """Return True iff every dot4 intrinsic op is registered (cached)."""
+    global _dot4_intrinsics_registered_cache
+    if _dot4_intrinsics_registered_cache is not None:
+        return _dot4_intrinsics_registered_cache
+    try:
+        from tvm.ir import Op  # type: ignore
+    except Exception:
+        _dot4_intrinsics_registered_cache = False
+        return False
+    for name in _DOT4_INTRINSICS:
+        try:
+            Op.get(name)
+        except Exception:
+            _dot4_intrinsics_registered_cache = False
+            return False
+    _dot4_intrinsics_registered_cache = True
+    return True
+
+
+def _buffer_innermost_stride(buffer) -> Optional[int]:
+    """Return the innermost stride of a buffer if statically known, else None.
+
+    A row-major buffer with no explicit strides has innermost stride 1 by
+    construction; if explicit strides are present we read the last one.
+    """
+    strides = getattr(buffer, "strides", None)
+    if not strides:
+        # Empty / None means contiguous row-major -> innermost stride == 1.
+        return 1
+    last = strides[-1]
+    if isinstance(last, int):
+        return last
+    if hasattr(last, "value"):
+        try:
+            return int(last.value)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(last, tir.IntImm):
+        return int(last.value)
+    return None
+
+
+def _buffer_element_offset(buffer) -> Optional[int]:
+    """Return ``elem_offset`` if statically known, else None (assume 0)."""
+    eo = getattr(buffer, "elem_offset", None)
+    if eo is None:
+        return 0
+    if isinstance(eo, int):
+        return int(eo)
+    if hasattr(eo, "value"):
+        try:
+            return int(eo.value)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(eo, tir.IntImm):
+        return int(eo.value)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# CPPMEGA Z3 idea #10: fp4/fp8 dot4 packed legality
+# ---------------------------------------------------------------------------
+# The Metal ``metal_fp8_e4m3_dot4`` intrinsic packs 4 fp8 bytes into a uint32
+# word and emits one LUT-decoded dot4 per word. For this to be safe we need a
+# linear-arith predicate to hold:
+#
+#     K_a == K_b
+#     K  % 4 == 0       (whole number of u32 words)
+#     stride_a == 1     (contiguous K)
+#     stride_b == 1
+#     addr_a % 4 == 0   (each row starts on a u32-word boundary)
+#     addr_b % 4 == 0
+#
+# We discharge the predicate with a TWO-tier strategy:
+#
+#  * Static fast path: when every numeric arg is a Python int / IntImm we
+#    evaluate the predicate inline, which avoids the ~5-10 ms of Z3 setup
+#    that previous reviewers flagged as overly heavy for the constant case.
+#  * Z3 fallback: when any arg is symbolic we ask Z3 to prove ``Not(legality)``
+#    is unsat under non-negativity / range bounds. The bit-bound encoding
+#    ``EnterConstraint(0 <= addr < (1<<32))`` emulates the upcoming
+#    ``Z3Prover::SetBitVectorMode(32)`` (branch z3-bv-mode); without it Z3
+#    is happy to satisfy ``addr % 4 != 0`` with a giant negative witness on
+#    free Int sort, which is sound but useless. Timeout is 50 ms; UNKNOWN /
+#    timeout / exceptions all return False (conservative).
+#
+# Either path returning False keeps the caller on the legacy macro. That is
+# the conservative-by-default rule -- a wrong proof here would silently emit
+# packed-dot4 against an unaligned buffer and trigger a Metal crash on first
+# dispatch.
+_Z3_DOT4_TIMEOUT_MS = 50
+
+# Address bit width used by the symbolic ``0 <= addr < (1 << _BITS)`` bound.
+# 32 matches the eventual ``Z3Prover::SetBitVectorMode(32)`` semantics.
+_Z3_DOT4_ADDR_BITS = 32
+
+# CPPMEGA Z3 idea #10 audit-fix: bound the symbolic stride search space. Without
+# an upper bound the solver is free to consider absurd strides (the Int sort is
+# unbounded), which inflates the search and hits UNKNOWN/timeout when combined
+# with the addr % 4 modular obligation. Real kernels never use innermost
+# strides above this knob (one stride-1024 row is already 4 KiB / 8 KiB which
+# exceeds typical Metal threadgroup-buffer slabs); legality outside [1, 1024)
+# is conservative-False by construction. Configurable for future kernels with
+# wider K, but the constant is a deliberate "tightening" rather than a hint.
+_DOT4_MAX_STRIDE = 1024
+
+
+def _is_int_imm_or_int(value) -> bool:
+    """Return True if ``value`` is a Python int or ``tir.IntImm``."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, tir.IntImm):
+        return True
+    return False
+
+
+def _const_int_value(value) -> Optional[int]:
+    """Coerce ``value`` to a Python int when it's a constant; else ``None``."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, tir.IntImm):
+        return int(value.value)
+    if hasattr(value, "value"):
+        try:
+            return int(value.value)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _z3_prove_dot4_legal(
+    K_a,
+    K_b,
+    stride_a,
+    stride_b,
+    addr_a,
+    addr_b,
+    A_buf=None,
+    B_buf=None,
+) -> tuple[bool, str]:
+    """Prove the FP8 packed-dot4 fast path is legal for these args.
+
+    Args:
+        K_a, K_b: Contracted-dim extents on A and B (``IntImm`` / ``int`` /
+            ``tir.PrimExpr``).
+        stride_a, stride_b: Innermost (contiguous-K) strides.
+        addr_a, addr_b: Buffer element offsets (used as proxies for the start
+            addresses; alignment is verified modulo 4).
+        A_buf, B_buf: Buffer objects accepted for diagnostic context only.
+
+    The predicate proven is exactly::
+
+        K_a == K_b && K_a % 4 == 0
+            && stride_a == 1 && stride_b == 1
+            && addr_a % 4 == 0 && addr_b % 4 == 0
+
+    Conservative-on-stride!=1 (audit finding 2026-05-06):
+        We intentionally reject any ``stride != 1`` even when the buffer
+        layout is contiguous in some other algebraic sense (e.g. row-major
+        linearised). The packed-dot4 intrinsic loads a u32 word at
+        ``ptr[word_idx]``; if the FP8 byte stream is anything other than
+        4-byte contiguous along K, the four bytes packed into one u32 word
+        would no longer correspond to four consecutive K elements. So
+        ``stride==1`` is the safe, target-independent invariant the proof
+        pins. This matches the audit recommendation that "conservative
+        rejection on non-unit stride" is the correct posture for the
+        Metal dot4 fast path and any future CUDA / ROCm port.
+
+    Symbolic-negative-address invariant (audit finding 2026-05-06):
+        When ``addr_a`` / ``addr_b`` are symbolic and the caller has NOT
+        added a ``addr >= 0`` constraint, the prover returns False. The
+        BV32 emulation (``0 <= addr < (1<<32)``) inside this function only
+        clamps the *named* free variables; if the caller substitutes a
+        ``tir.Var`` that the prover sees as opaque, the conservative
+        outcome is False. Once the C++-side ``Z3Prover::SetBitVectorMode(32)``
+        FFI bridge lands, signed wrap-around will be encoded properly via
+        BV sort and this invariant becomes part of the BV semantics.
+
+    Returns:
+        ``(proved, reason)``. ``proved=True`` means every conjunct is
+        established; the caller can route to ``metal_fp8_e4m3_dot4``.
+        ``proved=False`` always means the caller MUST keep the legacy path.
+        UNKNOWN / timeout / solver exceptions all map to
+        ``proved=False`` -- conservative by construction.
+    """
+    # ----- Static fast path -------------------------------------------------
+    # Common case: M=1 vecmat with concrete shapes baked in. Skip Z3 entirely.
+    if all(_is_int_imm_or_int(v) for v in (K_a, K_b, stride_a, stride_b, addr_a, addr_b)):
+        ka = _const_int_value(K_a)
+        kb = _const_int_value(K_b)
+        sa = _const_int_value(stride_a)
+        sb = _const_int_value(stride_b)
+        aa = _const_int_value(addr_a)
+        ab = _const_int_value(addr_b)
+        if None in (ka, kb, sa, sb, aa, ab):
+            return False, "static path could not coerce to int"
+        if ka <= 0 or kb <= 0 or ka != kb:
+            return False, f"static: K mismatch / non-positive ({ka}, {kb})"
+        if ka % 4 != 0:
+            return False, f"static: K={ka} not divisible by 4"
+        if sa != 1 or sb != 1:
+            return False, f"static: stride != 1 ({sa}, {sb})"
+        if aa % 4 != 0 or ab % 4 != 0:
+            return False, f"static: addr not 4-aligned ({aa}, {ab})"
+        # CPPMEGA Z3 idea #5: the alignment proof above is necessary but not
+        # sufficient -- the Metal dot4 lane accumulates in int24, so we
+        # additionally need ``K * 127 * 127 < 2^23``. Without this gate the
+        # fast path silently overflows for K beyond 520. See
+        # ``tilelang.analysis.int24_overflow_proof`` for the full obligation;
+        # the int8/e4m3 max-abs of 127 is the worst case for the LUT-decoded
+        # path on Apple Silicon.
+        from tilelang.analysis.int24_overflow_proof import prove_dot4_int24_safe
+        if not prove_dot4_int24_safe(ka):
+            return False, f"static: int24 overflow at K={ka} (K*127*127 >= 2^23)"
+        return True, (
+            f"static fast path: K={ka}, strides=(1,1), addrs=({aa}%4=0,{ab}%4=0), "
+            "int24 safe"
+        )
+
+    # ----- Symbolic / Z3 fallback -------------------------------------------
+    # If z3 isn't installed in this interpreter we MUST fall back to the
+    # legacy macro -- otherwise we'd silently emit packed-dot4 against a
+    # buffer whose alignment we can't prove.
+    if not _Z3_AVAILABLE:
+        return False, "z3 not available; symbolic dot4 legality cannot be proven"
+
+    # Note: the Python-side ``tvm.arith.Z3Prover`` bridge described in the
+    # roadmap is not yet exposed by this TVM submodule. The C++-side prover
+    # ships in ``src/transform/vendored/z3_prover.{h,cc}`` but its API
+    # (CanProve / EnterConstraint / SetTimeoutMs / SetBitVectorMode) is not
+    # FFI-registered. We fall back to the standalone z3-solver Python package
+    # and emulate ``EnterConstraint`` / ``SetTimeoutMs`` / BV-mode via the
+    # solver's native API, which is sufficient for the linear-arith fragment
+    # this proof needs. When the FFI bridge lands, swap the body here for an
+    # ``arith.Z3Prover(analyzer)`` call.
+    try:
+        s = _z3.Solver()
+        s.set("timeout", int(_Z3_DOT4_TIMEOUT_MS))
+
+        ka_v = _z3.Int("K_a")
+        kb_v = _z3.Int("K_b")
+        sa_v = _z3.Int("stride_a")
+        sb_v = _z3.Int("stride_b")
+        aa_v = _z3.Int("addr_a")
+        ab_v = _z3.Int("addr_b")
+
+        # Pin any concrete args; symbolic args remain free Ints. The caller
+        # is responsible for any tighter range invariants -- we add only the
+        # bare-minimum non-negativity / BV32 emulation below.
+        for slot, py_val in (
+            (ka_v, K_a), (kb_v, K_b), (sa_v, stride_a), (sb_v, stride_b),
+            (aa_v, addr_a), (ab_v, addr_b),
+        ):
+            cv = _const_int_value(py_val)
+            if cv is not None:
+                s.add(slot == cv)
+
+        # CPPMEGA Z3 idea #10: emulate Z3Prover::SetBitVectorMode(32) until
+        # the C++-side branch (z3-bv-mode) lands. Without these range bounds
+        # Z3 can satisfy ``addr % 4 != 0`` with a giant negative witness on
+        # symbolic addresses -- sound over Int but spurious for any real
+        # address. ``EnterConstraint(0 <= addr && addr < (1<<32))`` matches
+        # the C++ Z3Prover semantics the BV-mode branch ships and is the
+        # conservative thing to encode here.
+        bound = 1 << _Z3_DOT4_ADDR_BITS
+        s.add(aa_v >= 0, aa_v < bound)
+        s.add(ab_v >= 0, ab_v < bound)
+        # CPPMEGA Z3 idea #10 audit-fix: bound strides on both sides. Without
+        # ``sa < _DOT4_MAX_STRIDE`` the solver explores arbitrary positive
+        # values (Int sort), which is sound but inflates the search and
+        # frequently times out (UNKNOWN -> conservative-False) when paired
+        # with the modular addr obligations. Pinning a high but finite max
+        # gives Z3 a closed search space; legality outside that range
+        # remains conservative-False at the dispatcher (see
+        # ``_buffer_innermost_stride`` callers).
+        s.add(
+            ka_v > 0,
+            kb_v > 0,
+            sa_v > 0, sa_v < _DOT4_MAX_STRIDE,
+            sb_v > 0, sb_v < _DOT4_MAX_STRIDE,
+        )
+
+        legality = _z3.And(
+            ka_v == kb_v,
+            ka_v % 4 == 0,
+            sa_v == 1,
+            sb_v == 1,
+            aa_v % 4 == 0,
+            ab_v % 4 == 0,
+        )
+
+        # Ask Z3 for a counter-example. ``unsat`` => legality is implied;
+        # anything else (sat, unknown, timeout) is conservative-False.
+        s.push()
+        s.add(_z3.Not(legality))
+        res = s.check()
+        s.pop()
+        if res == _z3.unsat:
+            # CPPMEGA Z3 idea #5: pair the alignment proof with the int24
+            # non-overflow proof. If K is symbolic-and-unbounded the int24
+            # prover returns False (see its docstring), keeping us on the
+            # legacy scalar path. If K is constant or pinned the int24
+            # prover discharges the overflow obligation in plain Python.
+            from tilelang.analysis.int24_overflow_proof import prove_dot4_int24_safe
+            int24_ok = prove_dot4_int24_safe(K_a)
+            if not int24_ok:
+                return False, (
+                    "z3 proved dot4 alignment but int24 overflow proof failed; "
+                    "falling back to scalar accumulator"
+                )
+            return True, (
+                "z3 proved dot4 legal under symbolic constraints "
+                f"(timeout={_Z3_DOT4_TIMEOUT_MS}ms, addr_bits={_Z3_DOT4_ADDR_BITS}, "
+                "int24 safe)"
+            )
+        if res == _z3.unknown:
+            return False, "z3 returned UNKNOWN (timeout / incomplete); falling back"
+        return False, "z3 found a counter-example to dot4 legality; falling back"
+    except Exception as exc:  # pragma: no cover - defensive
+        # Solver-construction or query errors must NOT crash lowering.
+        return False, f"z3 raised {type(exc).__name__}: {exc}; falling back"
+
+
+def _z3_prove_dot4_legal_for_buffers(
+    A_fp8,
+    B_fp8,
+    *,
+    transpose_B: bool,
+) -> tuple[bool, str]:
+    """Adapter from buffer objects to the numeric proof obligation.
+
+    Extracts ``(K, stride, addr)`` tuples plus dtype/transpose checks. The
+    caller (``fp8_scaled_matmul``) uses this to decide whether to route to
+    the packed-dot4 macro.
+    """
+    a_dtype = str(getattr(A_fp8, "dtype", ""))
+    b_dtype = str(getattr(B_fp8, "dtype", ""))
+    if not a_dtype.startswith("float8_e4m3"):
+        return False, f"A dtype {a_dtype!r} is not float8_e4m3"
+    if not b_dtype.startswith("float8_e4m3"):
+        return False, f"B dtype {b_dtype!r} is not float8_e4m3"
+    if not transpose_B:
+        return False, "transpose_B=False; dot4 requires K-contiguous B"
+
+    K_a = _shape_extent(A_fp8, 1)
+    K_b = _shape_extent(B_fp8, 1) if transpose_B else _shape_extent(B_fp8, 0)
+    if K_a <= 0 or K_b <= 0:
+        return False, "K extent is symbolic / unknown"
+
+    a_stride = _buffer_innermost_stride(A_fp8)
+    b_stride = _buffer_innermost_stride(B_fp8)
+    if a_stride is None or b_stride is None:
+        return False, "buffer innermost stride is symbolic"
+
+    a_off = _buffer_element_offset(A_fp8)
+    b_off = _buffer_element_offset(B_fp8)
+    if a_off is None or b_off is None:
+        return False, "buffer elem_offset is symbolic"
+
+    return _z3_prove_dot4_legal(
+        K_a, K_b, a_stride, b_stride, a_off, b_off, A_fp8, B_fp8,
+    )
 
 
 def _normalize_block_scale_layout(
@@ -819,12 +1223,65 @@ def fp8_scaled_matmul(
     if c_col_offset is None:
         c_col_offset = 0
 
+    # CPPMEGA Z3 idea #10: before falling back to the scalar legacy M=1 vecmat
+    # macro, ask the dot4-legality prover whether the packed fast path is
+    # provably legal for this call site. Auto-promote ONLY when:
+    #   * Metal target, transpose_B=True, M=1 (vecmat shape).
+    #   * Caller has not opted out via TILELANG_DISABLE_FP8_DOT4_AUTO.
+    #   * Both dot4 intrinsics are registered in this TVM build.
+    #   * The prover returns True (static fast path or Z3-discharged).
+    # When proven, route to the fragment-store dot4 macro
+    # (``_fp8_scaled_matmul_m1_vecmat_metal_macro``); otherwise fall through
+    # to the legacy scalar simd_sum path. This preserves semantics for any
+    # case the prover cannot fully discharge and avoids regressing existing
+    # kernels that depend on the legacy emission.
+    if (
+        layout is None
+        and transpose_B
+        and not direct_global_store
+        and _is_metal_target(target)
+        and _shape_extent(A_fp8, 0) == 1
+        and not _fp8_dot4_auto_disabled()
+        and _dot4_intrinsics_registered()
+    ):
+        proved, _reason = _z3_prove_dot4_legal_for_buffers(
+            A_fp8, B_fp8, transpose_B=transpose_B,
+        )
+        if proved:
+            sgw = simd_group_width
+            if sgw is None:
+                sgw = _target_thread_warp_size(target)
+            if int(sgw) <= 0:
+                raise ValueError(
+                    f"T.fp8_scaled_matmul: simd_group_width must be positive, got {sgw!r}"
+                )
+            opb = outputs_per_block
+            if opb is None:
+                opb = _shape_extent(B_fp8, 0)
+            if int(opb) <= 0:
+                raise ValueError(
+                    f"T.fp8_scaled_matmul: outputs_per_block must be positive, got {opb!r}"
+                )
+            return _fp8_scaled_matmul_m1_vecmat_metal_macro(
+                A_fp8,
+                A_scale,
+                B_fp8,
+                B_scale,
+                C_out,
+                inferred_a_scale_offset,
+                inferred_b_scale_offset,
+                c_col_offset,
+                int(sgw),
+                int(opb),
+            )
+
     # CPPMEGA: keep swap's broader M=1 vecmat dispatch via the legacy macro
     # (uses `tirx.metal.simd_sum` only) when no direct-global-store offsets
     # are passed. The stack-c packed-dot4 vecmat path uses
     # `tir.metal.thread_index_in_simdgroup` and `tir.metal.fp8_e4m3_dot4`
     # which are not registered in apache TVM, so it only fires when the
-    # direct-global-store offsets opt the caller into that fast path.
+    # direct-global-store offsets opt the caller into that fast path, OR
+    # when the Z3 idea #10 prover above proved legality.
     if (
         layout is None
         and transpose_B

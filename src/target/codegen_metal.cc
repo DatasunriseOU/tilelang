@@ -124,6 +124,42 @@ CodeGenTileLangMetal::CodeGenTileLangMetal(Target target) : target_(target) {
   decl_stream << "union __TVMArgUnion {\n"
               << " int v_int[2];\n"
               << "};\n\n";
+  // RFC §5.4 / lower_tma_to_ptr_arith.cc:249 — the non-NV TMA fallback
+  // emits ``tl::call_extern("__tl_ptr_copy_elem", dst, src, bytes)`` for
+  // each per-element memcpy in the rewritten pointer-arith For-nest. We
+  // emit MSL inline overloads here so that the resulting .metal source
+  // compiles as-is. Address-space-qualified overloads cover the four
+  // combinations the TMA decomposition can produce:
+  //   - device -> threadgroup  (tma_load    : global -> shared)
+  //   - threadgroup -> device  (tma_store   : shared -> global)
+  //   - device -> device       (global -> global, defensive)
+  //   - threadgroup -> threadgroup (shared -> shared, defensive)
+  // The body is a simple byte loop; MSL's compiler will vectorize when
+  // the alignment is statically known.
+  decl_stream << "static inline void __tl_ptr_copy_elem("
+                 "device void* dst, device const void* src, int bytes) {\n"
+              << "  device char* d = (device char*)dst;\n"
+              << "  device const char* s = (device const char*)src;\n"
+              << "  for (int i = 0; i < bytes; ++i) { d[i] = s[i]; }\n"
+              << "}\n"
+              << "static inline void __tl_ptr_copy_elem("
+                 "threadgroup void* dst, device const void* src, int bytes) {\n"
+              << "  threadgroup char* d = (threadgroup char*)dst;\n"
+              << "  device const char* s = (device const char*)src;\n"
+              << "  for (int i = 0; i < bytes; ++i) { d[i] = s[i]; }\n"
+              << "}\n"
+              << "static inline void __tl_ptr_copy_elem("
+                 "device void* dst, threadgroup const void* src, int bytes) {\n"
+              << "  device char* d = (device char*)dst;\n"
+              << "  threadgroup const char* s = (threadgroup const char*)src;\n"
+              << "  for (int i = 0; i < bytes; ++i) { d[i] = s[i]; }\n"
+              << "}\n"
+              << "static inline void __tl_ptr_copy_elem("
+                 "threadgroup void* dst, threadgroup const void* src, int bytes) {\n"
+              << "  threadgroup char* d = (threadgroup char*)dst;\n"
+              << "  threadgroup const char* s = (threadgroup const char*)src;\n"
+              << "  for (int i = 0; i < bytes; ++i) { d[i] = s[i]; }\n"
+              << "}\n\n";
 }
 
 // CPPMEGA: hybrid tl_pr_c granularity + stack-c switch dispatch.
@@ -328,6 +364,40 @@ class MetalFp8DTypeCollector final : public StmtExprVisitor {
 public:
   std::set<int> referenced_codes;
   bool uses_dot4{false};
+  // CPPMEGA / Path C: track usage of the two MSL kernel-attribute intrinsics
+  // emitted by tilelang/language/fp8_op.py. These do not have a matching
+  // ``[[thread_position_in_grid]]`` / ``[[thread_index_in_simdgroup]]``
+  // declaration in the default Metal kernel signature, so we have to inject
+  // them on demand when the body actually references the intrinsic.
+  bool uses_grid_tid_x{false};
+  bool uses_simd_lane_id{false};
+
+  // Names accepted as the FP8 packed dot4 intrinsic. We accept BOTH the
+  // legacy ``tir.metal.*`` namespace (still emitted by the tilelang macro at
+  // tilelang/language/fp8_op.py) AND the post-rename ``tirx.metal.*``
+  // namespace (which is what cppmega_mlx/nn/_tilelang/_msl_transform.py
+  // registers as a TVM Op so ``Op.get(...)`` succeeds via the python compat
+  // shim in 3rdparty/tvm/python/tvm/tir/__init__.py). The shim translates
+  // ``Op.get("tir.metal.X")`` -> ``Op.get("tirx.metal.X")`` on lookup
+  // failure; the resolved Op carries the registered (``tirx.*``) name into
+  // the C++ CallNode, but older PrimFuncs cached pre-shim may still arrive
+  // carrying the original ``tir.*`` literal. Recognising both keeps codegen
+  // working regardless of which side resolved the lookup. DO NOT delete the
+  // ``tir.metal.*`` branches even if a future canonicalisation makes them
+  // unreachable in practice — per repo policy "Never silently delete dead
+  // code" they document the namespace ambiguity for the next bisection.
+  static bool IsFp8Dot4Intrin(const std::string &name) {
+    return name == "tir.metal.fp8_e4m3_dot4" ||
+           name == "tirx.metal.fp8_e4m3_dot4";
+  }
+  static bool IsGridTidXIntrin(const std::string &name) {
+    return name == "tir.metal.thread_position_in_grid_x" ||
+           name == "tirx.metal.thread_position_in_grid_x";
+  }
+  static bool IsSimdLaneIdIntrin(const std::string &name) {
+    return name == "tir.metal.thread_index_in_simdgroup" ||
+           name == "tirx.metal.thread_index_in_simdgroup";
+  }
 
   void Note(const DataType &t) {
     if (t.is_float8() || t.is_float4()) {
@@ -356,8 +426,12 @@ public:
       Note(arg.dtype());
     }
     if (auto *opn = op->op.as<OpNode>()) {
-      if (opn->name == "tir.metal.fp8_e4m3_dot4") {
+      if (IsFp8Dot4Intrin(opn->name)) {
         uses_dot4 = true;
+      } else if (IsGridTidXIntrin(opn->name)) {
+        uses_grid_tid_x = true;
+      } else if (IsSimdLaneIdIntrin(opn->name)) {
+        uses_simd_lane_id = true;
       }
     }
     StmtExprVisitor::VisitExpr_(op);
@@ -384,6 +458,25 @@ public:
     StmtExprVisitor::VisitExpr_(op);
   }
 };
+
+// CPPMEGA / Path C: side-table mapping each CodeGenTileLangMetal instance to
+// the freshly-supplied MSL identifiers it chose for the
+// ``[[thread_position_in_grid]]`` and ``[[thread_index_in_simdgroup]]``
+// kernel arguments (when used). This lives in a free helper rather than as a
+// member because the Path-C task scope is restricted to codegen_metal.cc and
+// the header may not be modified for this fix; see the explanatory comment in
+// AddFunction below. Keyed by ``this`` because emission is single-threaded
+// per codegen and entries are overwritten when the same instance starts a
+// new function. Empty strings mean "not used in this kernel".
+struct MetalScalarIntrinIds {
+  std::string grid_tid_x;
+  std::string simd_lane_id;
+};
+inline std::unordered_map<const void *, MetalScalarIntrinIds> &
+GetMetalScalarIntrinIdMap() {
+  static std::unordered_map<const void *, MetalScalarIntrinIds> kMap;
+  return kMap;
+}
 
 } // namespace
 
@@ -600,6 +693,34 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
     }
   }
 
+  // CPPMEGA / Path C: scan the body for the two MSL kernel-attribute
+  // intrinsics emitted by tilelang/language/fp8_op.py
+  // (``tir[x].metal.thread_position_in_grid_x``,
+  // ``tir[x].metal.thread_index_in_simdgroup``). Each one we see has to
+  // become an extra kernel argument bearing the matching MSL attribute,
+  // because Metal exposes those builtins exclusively as kernel-signature
+  // attributes — there is no free function spelling for them.
+  bool needs_grid_tid_x = false;
+  bool needs_simd_lane_id = false;
+  {
+    MetalFp8DTypeCollector kernel_intrin_collector;
+    kernel_intrin_collector(func->body);
+    needs_grid_tid_x = kernel_intrin_collector.uses_grid_tid_x;
+    needs_simd_lane_id = kernel_intrin_collector.uses_simd_lane_id;
+  }
+  std::string grid_tid_x_id;
+  std::string simd_lane_id_id;
+  if (needs_grid_tid_x) {
+    // Identifier name is observable from cppmega.mlx tests
+    // (tests/test_tilelang_fp8_vecmat_path_c.py asserts the substring
+    // ``gridThreadIdx`` in the generated MSL); keep the prefix stable.
+    // FreshName still suffixes "_<n>" if it collides with a user var.
+    grid_tid_x_id = name_supply_->FreshName("gridThreadIdx");
+  }
+  if (needs_simd_lane_id) {
+    simd_lane_id_id = name_supply_->FreshName("simdLaneId");
+  }
+
   if (work_dim != 0) {
     // use ushort by default for now
     stream << "  ";
@@ -607,8 +728,35 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
     stream << " blockIdx [[threadgroup_position_in_grid]],\n";
     stream << "  ";
     PrintType(DataType::UInt(thread_index_bits_, work_dim), stream);
-    stream << " threadIdx [[thread_position_in_threadgroup]]\n";
+    // Trailing-comma handling: if extra MSL-attribute args follow we need a
+    // comma here, otherwise none. Done explicitly so the no-extras path
+    // remains byte-identical with the pre-Path-C output.
+    if (needs_grid_tid_x || needs_simd_lane_id) {
+      stream << " threadIdx [[thread_position_in_threadgroup]],\n";
+    } else {
+      stream << " threadIdx [[thread_position_in_threadgroup]]\n";
+    }
   }
+  if (needs_grid_tid_x) {
+    stream << "  uint " << grid_tid_x_id << " [[thread_position_in_grid]]";
+    if (needs_simd_lane_id) {
+      stream << ",\n";
+    } else {
+      stream << "\n";
+    }
+  }
+  if (needs_simd_lane_id) {
+    stream << "  uint " << simd_lane_id_id << " [[thread_index_in_simdgroup]]\n";
+  }
+  // Stash the resolved MSL identifiers on the codegen instance via a
+  // function-static map keyed by ``this``; the call-site visitor reads them
+  // back when lowering the corresponding intrinsic. We use a function-static
+  // (not a member) because per the Path-C task contract the .h header is not
+  // part of this fix.
+  GetMetalScalarIntrinIdMap()[this] = MetalScalarIntrinIds{
+      needs_grid_tid_x ? grid_tid_x_id : std::string(),
+      needs_simd_lane_id ? simd_lane_id_id : std::string(),
+  };
   thread_work_dim_ = work_dim;
 
   // the function scope.
@@ -1092,6 +1240,95 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
     os << ">(";
     this->PrintExpr(op->args[0], os);
     os << "))";
+  } else if (op->op.same_as(tl::sync_threads_partial())) {
+    // Apple SIMD groups are always convergent at the simd-group level, so
+    // partial-lane sync collapses to a simdgroup_barrier. mask + n_threads
+    // are accepted for source compatibility but ignored at codegen time.
+    ICHECK_EQ(op->args.size(), 2U)
+        << "tl.sync_threads_partial expects <mask, n_threads>.";
+    this->PrintIndent();
+    this->stream << "simdgroup_barrier(mem_flags::mem_threadgroup);\n";
+  } else if (op->op.same_as(tl::atomic_xchg_elem_op()) ||
+             op->op.same_as(tl::atomic_xchg_ret_elem_op()) ||
+             op->op.same_as(tl::atomic_and_elem_op()) ||
+             op->op.same_as(tl::atomic_and_ret_elem_op()) ||
+             op->op.same_as(tl::atomic_or_elem_op()) ||
+             op->op.same_as(tl::atomic_or_ret_elem_op()) ||
+             op->op.same_as(tl::atomic_xor_elem_op()) ||
+             op->op.same_as(tl::atomic_xor_ret_elem_op())) {
+    // Metal atomic_xchg/and/or/xor: emit MSL ``atomic_*_explicit`` from the
+    // ``<metal_atomic>`` header. Metal restricts these primitives to
+    // ``atomic_int`` / ``atomic_uint`` storage; for fp dtypes the runtime
+    // would need a CAS loop, so we error out cleanly here. The Op enum is
+    // statically registered in src/op/builtin.cc.
+    bool is_int_atomic = op->args.size() >= 2 &&
+                         (op->args[1].dtype().is_int() ||
+                          op->args[1].dtype().is_uint());
+    ICHECK(is_int_atomic)
+        << "Metal atomic xchg/and/or/xor only supports atomic_int / "
+        << "atomic_uint dtypes; got value dtype " << op->args[1].dtype()
+        << ". TODO: implement <op> for fp dtype on Metal via CAS";
+    std::string fn;
+    if (op->op.same_as(tl::atomic_xchg_elem_op()) ||
+        op->op.same_as(tl::atomic_xchg_ret_elem_op())) {
+      fn = "atomic_exchange_explicit";
+    } else if (op->op.same_as(tl::atomic_and_elem_op()) ||
+               op->op.same_as(tl::atomic_and_ret_elem_op())) {
+      fn = "atomic_fetch_and_explicit";
+    } else if (op->op.same_as(tl::atomic_or_elem_op()) ||
+               op->op.same_as(tl::atomic_or_ret_elem_op())) {
+      fn = "atomic_fetch_or_explicit";
+    } else {
+      fn = "atomic_fetch_xor_explicit";
+    }
+    os << fn << "(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]) << ", memory_order_relaxed)";
+  } else if (auto *opn = op->op.as<OpNode>();
+             opn != nullptr &&
+             MetalFp8DTypeCollector::IsFp8Dot4Intrin(opn->name)) {
+    // CPPMEGA / Path C: lower ``T.call_intrin("tir[x].metal.fp8_e4m3_dot4",
+    //   a_ptr, b_ptr, a_word_idx, b_word_idx)`` to the overloaded MSL helper
+    // emitted by ``EmitFp8Dot4Helpers`` (see decl_stream block around line
+    // 290-315). The helper is overloaded across address spaces, so we just
+    // print the call literally — MSL overload resolution picks the right
+    // body based on the buffer pointer's storage qualifier.
+    ICHECK_EQ(op->args.size(), 4)
+        << "tir[x].metal.fp8_e4m3_dot4 expects 4 args (a_ptr, b_ptr, "
+        << "a_word_idx, b_word_idx), got " << op->args.size();
+    os << "__tvm_fp8_e4m3_dot4_packed("
+       << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]) << ", "
+       << PrintExpr(op->args[2]) << ", "
+       << PrintExpr(op->args[3]) << ")";
+  } else if (auto *opn = op->op.as<OpNode>();
+             opn != nullptr &&
+             MetalFp8DTypeCollector::IsGridTidXIntrin(opn->name)) {
+    // CPPMEGA / Path C: ``tir[x].metal.thread_position_in_grid_x`` lowers to
+    // the kernel argument we declared with the
+    // ``[[thread_position_in_grid]]`` MSL attribute in
+    // PrintFuncDecl. Look up the freshly-supplied identifier on the
+    // side-table populated during signature emission.
+    auto it = GetMetalScalarIntrinIdMap().find(this);
+    ICHECK(it != GetMetalScalarIntrinIdMap().end() &&
+           !it->second.grid_tid_x.empty())
+        << "tir[x].metal.thread_position_in_grid_x referenced from a kernel "
+        << "whose signature was not augmented with [[thread_position_in_grid]]"
+        << " — body collector missed the call site, file a bug.";
+    os << it->second.grid_tid_x;
+  } else if (auto *opn = op->op.as<OpNode>();
+             opn != nullptr &&
+             MetalFp8DTypeCollector::IsSimdLaneIdIntrin(opn->name)) {
+    // CPPMEGA / Path C: ``tir[x].metal.thread_index_in_simdgroup`` lowers to
+    // the kernel argument we declared with the
+    // ``[[thread_index_in_simdgroup]]`` MSL attribute. Same lookup pattern
+    // as above.
+    auto it = GetMetalScalarIntrinIdMap().find(this);
+    ICHECK(it != GetMetalScalarIntrinIdMap().end() &&
+           !it->second.simd_lane_id.empty())
+        << "tir[x].metal.thread_index_in_simdgroup referenced from a kernel "
+        << "whose signature was not augmented with [[thread_index_in_simdgroup]]"
+        << " — body collector missed the call site, file a bug.";
+    os << it->second.simd_lane_id;
   } else {
     CodeGenC::VisitExpr_(op, os);
   }

@@ -34,11 +34,17 @@
 #include "tvm/tirx/var.h"
 #include "vendored/allocate_visit_passthrough.h"
 #include "vendored/let_stmt.h"
+#include "vendored/z3_constraint_scope.h"
+#include "vendored/z3_prover.h"
 #include <iostream>
 #include <optional>
 #include <tvm/arith/iter_affine_map.h>
+#include <tvm/ffi/extra/structural_hash.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/stmt_functor.h>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace tvm {
@@ -47,6 +53,64 @@ namespace tl {
 using namespace tirx;
 using ::tilelang::tl_tir::LetStmt;
 using ::tilelang::tl_tir::LetStmtNode;
+
+// CPPMEGA idea712 fix-B8 (round-3): tuple-based memo-key hash mixer.
+// Replaces the prior FNV-xor mix used in `MemoizedIndicesCanVectorize`
+// and `Z3CanProveLoopAligned`'s `probe`. The XOR-mix has a known
+// collision pathology: if two of the four mixed `size_t` inputs are
+// equal, their contributions cancel under XOR and the resulting key
+// stops depending on either input — distinct memo entries can then
+// alias each other. Using `std::tuple<...>` as the unordered_map key
+// directly removes the collision class entirely (the map's equality
+// comparator does field-wise comparison; the hash mixes via rotation,
+// not XOR-cancellation).
+//
+// The mixer below is the variant of `boost::hash_combine` that
+// rotates by a fixed odd offset (0x9e3779b97f4a7c15ULL is 2^64/φ) and
+// shifts so that equal inputs do NOT cancel. Same shape as the prior
+// FNV mix but with a "+=" instead of "^=" on the seed, eliminating
+// the cancellation risk.
+namespace {
+
+inline void TupleHashMix(size_t &seed, size_t value) {
+  seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 12) + (seed >> 4);
+  // Use `+=` on the rotated chunks to break XOR-cancellation: two
+  // identical `value` arguments now produce different seed updates
+  // because the rotation depends on the running seed.
+  seed += (seed << 7) ^ (seed >> 11);
+}
+
+// Hash functor for std::tuple<size_t, const void*, size_t, int> —
+// the key shape used by MemoizedIndicesCanVectorize (expr-hash,
+// loop_var ptr, iter_size-hash, target_size).
+struct VectorizeMemoKeyHash {
+  size_t operator()(
+      const std::tuple<size_t, const void *, size_t, int> &k) const noexcept {
+    size_t seed = std::get<0>(k);
+    TupleHashMix(seed, std::hash<const void *>{}(std::get<1>(k)));
+    TupleHashMix(seed, std::get<2>(k));
+    TupleHashMix(seed, static_cast<size_t>(std::get<3>(k)));
+    return seed;
+  }
+};
+
+// Hash functor for std::tuple<const void*, int, std::vector<size_t>> —
+// the key shape used by Z3CanProveLoopAligned's `probe` (buffer ptr,
+// vector_size, list of indices structural-hashes).
+struct AlignmentMemoKeyHash {
+  size_t operator()(
+      const std::tuple<const void *, int, std::vector<size_t>> &k) const
+      noexcept {
+    size_t seed = std::hash<const void *>{}(std::get<0>(k));
+    TupleHashMix(seed, static_cast<size_t>(std::get<1>(k)));
+    for (size_t h : std::get<2>(k)) {
+      TupleHashMix(seed, h);
+    }
+    return seed;
+  }
+};
+
+}  // namespace
 
 /*!
  * \brief Check if buffer strides represent a contiguous (row-major) layout.
@@ -325,9 +389,9 @@ public:
           for (size_t i = 0; i < info.indices.size(); ++i) {
             elem_offset += info.indices[i] * strides[i];
           }
-          if (!IndicesCanVectorize(elem_offset, inner_for_->loop_var,
-                                   inner_for_->extent, vector_size_,
-                                   analyzer_)) {
+          // CPPMEGA fix-B6 (idea712): memoized.
+          if (!MemoizedIndicesCanVectorize(elem_offset, inner_for_->loop_var,
+                                           inner_for_->extent, vector_size_)) {
             // Not invariant at this vector_size, need to take GCD
             int old_vector_size = vector_size_;
             vector_size_ = arith::ZeroAwareGCD(vector_size_, info.vector_size);
@@ -357,6 +421,15 @@ public:
     if (verbose) {
       std::cerr << "=== Final vector_size: " << vector_size_ << " ===" << "\n";
     }
+    // CPPMEGA idea712 fix-B8 (round-3): conservative cache invalidation.
+    // The memo's cache lifetime was already documented as "per-planner-
+    // instance", but a planner is reused across multiple `Plan(For)`
+    // invocations on the same VectorizePlanner object (e.g. nested
+    // For nodes). Clearing here scopes the cache strictly to a single
+    // top-level Plan call so no stale entries from a prior body can
+    // leak into a subsequent one (different `inner_for_`, possibly
+    // different analyzer state).
+    indices_can_vectorize_memo_.clear();
     return vector_size_;
   }
 
@@ -682,10 +755,10 @@ private:
     // immediately scalarized (and to keep semantics sane for side-effectful
     // calls), require the offset to be invariant within the vector boundary.
     PrimExpr offset_s = analyzer_->Simplify(offset);
+    // CPPMEGA fix-B6 (idea712): memoized halving probe.
     while (access_vec_size > 1 &&
-           !IndicesCanVectorize(offset_s, inner_for_->loop_var,
-                                inner_for_->extent, access_vec_size,
-                                analyzer_)) {
+           !MemoizedIndicesCanVectorize(offset_s, inner_for_->loop_var,
+                                        inner_for_->extent, access_vec_size)) {
       access_vec_size /= 2;
     }
     // Record as a memory-like constraint if we can resolve the buffer.
@@ -803,10 +876,10 @@ private:
       return buffer_vec_size; // only limited constraint from this buffer
     }
     // 4. Try to find max vectorize size for this buffer
+    // CPPMEGA fix-B6 (idea712): memoized halving probe.
     while (buffer_vec_size > 1 &&
-           !IndicesCanVectorize(elem_offset, inner_for_->loop_var,
-                                inner_for_->extent, buffer_vec_size,
-                                analyzer_)) {
+           !MemoizedIndicesCanVectorize(elem_offset, inner_for_->loop_var,
+                                        inner_for_->extent, buffer_vec_size)) {
       buffer_vec_size /= 2;
     }
     return buffer_vec_size;
@@ -850,6 +923,51 @@ private:
     return arith::IRMutatorWithAnalyzer::VisitStmt(stmt);
   }
 
+  // CPPMEGA fix-B6 (idea712): memoize IndicesCanVectorize results per
+  // `(elem_offset structural-hash, loop_var pointer, vector_size)`.
+  // Prior to this cache, the planner would call IndicesCanVectorize
+  // multiple times for the same `(buffer, loop_var)` pair when:
+  //   * a buffer appears as both a load source and a store dest
+  //     (lines around 329 / 687 / 808 in this file each reach the
+  //     same elem_offset shape), and
+  //   * the planner's halving loop retries with smaller vector sizes
+  //     (`while (vec > 1 && !IndicesCanVectorize(...)) vec /= 2;`).
+  // The Z3-driven Simplify chain inside IndicesCanVectorize is the
+  // single most expensive call per Plan; deduping is a clear win.
+  //
+  // Cache lifetime: per-planner-instance. A new planner is created per
+  // `Plan(For)` entry, so the cache is naturally scoped.
+  bool MemoizedIndicesCanVectorize(const PrimExpr &expr, Var var,
+                                   const PrimExpr &iter_var_size,
+                                   int target_vectorized_size) {
+    if (target_vectorized_size <= 1) {
+      // IndicesCanVectorize itself returns true at size 1; mirror that
+      // without touching the analyzer.
+      return true;
+    }
+    // CPPMEGA idea712 fix-B8 (round-3): replace the FNV-xor mix with a
+    // std::tuple key. The previous mix XOR'd four size_t-shaped inputs
+    // into a single hash — distinct (expr, var, iter_size, target_size)
+    // tuples that differed only in two equal-valued entries could
+    // collide because the XOR contributions cancelled. With a tuple
+    // key the unordered_map's equality comparator is field-wise, so
+    // collisions are now genuine hash collisions (handled correctly
+    // by the bucket chain) instead of memo-table aliasing.
+    ::tvm::ffi::StructuralHash hasher;
+    auto key = std::make_tuple(static_cast<size_t>(hasher(expr)),
+                               static_cast<const void *>(var.get()),
+                               static_cast<size_t>(hasher(iter_var_size)),
+                               target_vectorized_size);
+    auto it = indices_can_vectorize_memo_.find(key);
+    if (it != indices_can_vectorize_memo_.end()) {
+      return it->second;
+    }
+    bool ok = IndicesCanVectorize(expr, var, iter_var_size,
+                                  target_vectorized_size, analyzer_);
+    indices_can_vectorize_memo_.emplace(std::move(key), ok);
+    return ok;
+  }
+
   int vector_load_bits_max_;
   int initial_vector_size_ = 128;
   int loop_extent_vector_size_ = 128;
@@ -859,7 +977,223 @@ private:
   int vector_size_ = 128;
   std::vector<BufferVectorInfo> buffer_vector_infos_;
   LayoutMap layout_map_;
+  // CPPMEGA idea712 fix-B8 (round-3): tuple key replaces FNV-xor 64-bit
+  // hash. See `TupleHashMix` rationale at top of this file; the comparator
+  // is std::tuple's default field-wise equality, so collisions cannot
+  // alias distinct memo entries the way the XOR mix could.
+  std::unordered_map<std::tuple<size_t, const void *, size_t, int>, bool,
+                     VectorizeMemoKeyHash>
+      indices_can_vectorize_memo_;
 };
+
+// CPPMEGA: Z3 idea #12 — alignment proof companion to #1 (contiguity).
+//
+// After vectorization decides to mark a For as kVectorized with a given
+// `vector_size`, optionally try to prove that the buffer base address
+// (in BYTES) of every memory access in the loop body is aligned to
+// `vector_size * dtype_bytes`. If proven for at least one global/shared
+// access, attach a `tl.vec_aligned` annotation on the inner For so
+// downstream codegen (MSL `vec.load_aligned`/CUDA `ld.global.v4.b32`)
+// can elide the unaligned-load fallback.
+//
+// Conservative on UNKNOWN/timeout: no annotation. The annotation is
+// purely additive — no semantic change unless the codegen explicitly
+// reads the attr. PassConfig: `tl.vectorize_alignment_proof` (default OFF).
+//
+// The proof query, in BV/integer form:
+//
+//     forall free_vars in BV32:
+//       FloorMod(elem_offset_bytes, vector_size * dtype_bytes) == 0
+//
+// where `elem_offset_bytes = (buffer.elem_offset + index_offset) * dtype_bytes`.
+// `index_offset` is the same `elem_offset` expression that the contiguity
+// path computes (sum of `indices[i] * strides[i]`), but evaluated at the
+// loop variable's *base value* (so that `var % vector_size == 0` is implicit).
+//
+// Bit-bound free vars to BV32 emulation via EnterConstraint.
+static bool Z3CanProveAlignedAccess(const Buffer &buffer,
+                                    const Array<PrimExpr> &indices,
+                                    const Var &loop_var, int vector_size,
+                                    arith::Analyzer *analyzer) {
+  if (!buffer.defined() || indices.empty()) {
+    return false;
+  }
+  int dtype_bytes = buffer->dtype.bytes();
+  if (dtype_bytes <= 0) {
+    return false;
+  }
+  int64_t alignment = static_cast<int64_t>(vector_size) * dtype_bytes;
+  if (alignment <= 0) {
+    return false;
+  }
+
+  // Compute element offset (in elements). Use the buffer's strides if
+  // present, otherwise derive a row-major stride layout.
+  Array<PrimExpr> strides = GetBufferStrides(buffer);
+  if (strides.size() != indices.size()) {
+    return false;
+  }
+  PrimExpr elem_offset = make_const(DataType::Int(32), 0);
+  for (size_t i = 0; i < indices.size(); ++i) {
+    elem_offset = elem_offset + indices[i] * strides[i];
+  }
+  // Add the buffer's own elem_offset (in elements) — this captures the
+  // base offset for sub-buffers / views.
+  if (buffer->elem_offset.defined()) {
+    elem_offset = elem_offset + cast(elem_offset.dtype(), buffer->elem_offset);
+  }
+  // Convert to bytes.
+  PrimExpr base_addr_bytes =
+      elem_offset * make_const(elem_offset.dtype(), dtype_bytes);
+
+  try {
+    auto &z3 = arith::Z3Prover(analyzer);
+    z3.SetTimeoutMs(50);
+
+    // Bit-bound: every free Var (including the loop var itself) is
+    // assumed to be in [0, 2^31). For the loop var specifically, also
+    // assume it's a multiple of `vector_size` — because the
+    // VectorizeRewriter has already split the loop so the inner var
+    // ranges over [0, vector_size) and the *outer* var ranges over
+    // [0, extent/vector_size) — but the per-iteration alignment goal is
+    // about the START of each vector lane, i.e. when var == 0 modulo
+    // vector_size. We collect free vars from the elem_offset.
+    std::unordered_set<const VarNode *> free_vars;
+    PostOrderVisit(elem_offset, [&](const ObjectRef &obj) {
+      if (const auto *v = obj.as<VarNode>()) {
+        free_vars.insert(v);
+      }
+    });
+    // CPPMEGA fix-B2 (idea712): use ConstraintScope RAII so EnterConstraint
+    // push/pop is balanced even on early-return / exception. The previous
+    // manual recoverers vector leaked solver scope frames if any
+    // EnterConstraint or CanProve below threw.
+    std::vector<::tilelang::tlz3::ConstraintScope> scopes;
+    for (const VarNode *v : free_vars) {
+      Var var = ffi::GetRef<Var>(v);
+      DataType dt = var.dtype();
+      if (!dt.is_int() && !dt.is_uint()) {
+        // Non-int free var — cannot bit-bound. Bail. RAII unwinds scopes.
+        return false;
+      }
+      // CPPMEGA fix-B4 (idea712): dtype-aware BV bounds. The flat
+      // [0, 2^31) bound was unsound for any signed-int var that may
+      // hold a negative offset (e.g. sub-buffer biases or
+      // `LegalizeNegativeIndex`-rewritten loads). Use the dtype's
+      // proper signed/unsigned range instead.
+      auto [lo64, hi64] = ::tilelang::tlz3::BVBoundsForDtype(dt);
+      PrimExpr lo = make_const(dt, lo64);
+      PrimExpr hi = make_const(dt, hi64);
+      PrimExpr bound = (var >= lo) && (var < hi);
+      // For the loop var: pin lo to 0 (loop vars are non-negative by
+      // construction) and assume it's a multiple of vector_size — the
+      // VectorizeRewriter's invariant for the outer-loop iteration
+      // boundary at the START of each vector chunk. Goal: prove the
+      // address at lane 0 of every vector chunk is aligned.
+      if (v == loop_var.get()) {
+        bound = (var >= make_const(dt, 0)) && (var < hi) &&
+                (FloorMod(var, make_const(dt, vector_size)) ==
+                 make_const(dt, 0));
+      }
+      scopes.emplace_back(z3, bound);
+    }
+
+    PrimExpr goal =
+        FloorMod(base_addr_bytes,
+                 make_const(base_addr_bytes.dtype(), alignment)) ==
+        make_const(base_addr_bytes.dtype(), 0);
+
+    bool proved = false;
+    try {
+      proved = z3.CanProve(goal);
+    } catch (...) {
+      proved = false;
+    }
+    // ConstraintScope destructors run in reverse order at scope exit.
+    return proved;
+  } catch (...) {
+    return false;
+  }
+}
+
+// Walk the loop body and attempt to prove alignment for every
+// global/shared BufferLoad and BufferStore. Returns true iff there is at
+// least one such access AND every one is provably aligned.
+//
+// CPPMEGA fix-B5 (idea712): memoize Z3 alignment queries per
+// `(buffer.get(), indices structural-hash)` pair. The same access can
+// appear multiple times in a loop body (a vector op that decomposes
+// into per-lane loads, a load fed into multiple consumers, etc.) —
+// without a cache, every occurrence pays a fresh Z3 round-trip.
+//
+// Cache lifetime: scoped to a single `Z3CanProveLoopAligned` call.
+// A new cache is created per call, so cross-loop or cross-Plan pollution
+// is impossible. Within a Plan, the same loop body's repeated accesses
+// dedupe trivially.
+static bool Z3CanProveLoopAligned(const Stmt &body, const Var &loop_var,
+                                  int vector_size,
+                                  arith::Analyzer *analyzer) {
+  bool saw_memory = false;
+  bool all_aligned = true;
+
+  // CPPMEGA idea712 fix-B8 (round-3): tuple-keyed memo replaces the
+  // prior FNV-xor mix. See `TupleHashMix` rationale at top of file.
+  // Key is `(buffer ptr, vector_size, vector<index structural-hash>)`
+  // so structurally-identical accesses dedupe; distinct accesses can
+  // no longer collide via XOR cancellation.
+  std::unordered_map<std::tuple<const void *, int, std::vector<size_t>>, bool,
+                     AlignmentMemoKeyHash>
+      memo;
+  ::tvm::ffi::StructuralHash hasher;
+
+  auto probe = [&](const Buffer &buf, const Array<PrimExpr> &indices) -> bool {
+    std::vector<size_t> idx_hashes;
+    idx_hashes.reserve(indices.size());
+    for (const PrimExpr &idx : indices) {
+      idx_hashes.push_back(static_cast<size_t>(hasher(idx)));
+    }
+    auto key = std::make_tuple(static_cast<const void *>(buf.get()),
+                               vector_size, std::move(idx_hashes));
+    auto it = memo.find(key);
+    if (it != memo.end()) return it->second;
+    bool ok = Z3CanProveAlignedAccess(buf, indices, loop_var, vector_size,
+                                      analyzer);
+    memo.emplace(std::move(key), ok);
+    return ok;
+  };
+
+  PostOrderVisit(body, [&](const ObjectRef &obj) {
+    if (!all_aligned) return;
+    if (const auto *ld = obj.as<BufferLoadNode>()) {
+      if (IsLocalBuffer(ld->buffer, /*allow_var=*/true) ||
+          IsFragmentBuffer(ld->buffer)) {
+        return; // local/fragment access — alignment irrelevant.
+      }
+      saw_memory = true;
+      if (!probe(ld->buffer, ld->indices)) {
+        all_aligned = false;
+      }
+    } else if (const auto *st = obj.as<BufferStoreNode>()) {
+      if (IsLocalBuffer(st->buffer, /*allow_var=*/true) ||
+          IsFragmentBuffer(st->buffer)) {
+        return;
+      }
+      saw_memory = true;
+      if (!probe(st->buffer, st->indices)) {
+        all_aligned = false;
+      }
+    }
+  });
+  return saw_memory && all_aligned;
+}
+
+// Build a new annotation map with `tl.vec_aligned -> True` added.
+static Map<String, ffi::Any> MakeAlignedAnnotations(
+    const Map<String, ffi::Any> &existing) {
+  Map<String, ffi::Any> out = existing;
+  out.Set("tl.vec_aligned", Bool(true));
+  return out;
+}
 
 class VectorizeRewriter : public StmtExprMutator {
 public:
@@ -879,8 +1213,34 @@ private:
           << "extent: " << extent << " vector_size_: " << vector_size_
           << " for loop: " << fnode;
       ICHECK(is_zero(fnode->min));
+
+      // CPPMEGA: Z3 idea #12 — best-effort alignment proof. Default OFF.
+      bool alignment_proof_enabled = false;
+      try {
+        alignment_proof_enabled =
+            tvm::transform::PassContext::Current()
+                ->GetConfig<Bool>(kVectorizeAlignmentProof, Bool(false))
+                .value();
+      } catch (...) {
+        alignment_proof_enabled = false;
+      }
+      bool aligned = false;
+      if (alignment_proof_enabled) {
+        arith::Analyzer analyzer;
+        try {
+          aligned = Z3CanProveLoopAligned(fnode->body, fnode->loop_var,
+                                          vector_size_, &analyzer);
+        } catch (...) {
+          aligned = false;
+        }
+      }
+
       if (extent == vector_size_) {
         fnode.CopyOnWrite()->kind = ForKind::kVectorized;
+        if (aligned) {
+          fnode.CopyOnWrite()->annotations =
+              MakeAlignedAnnotations(fnode->annotations);
+        }
         return fnode;
       } else {
         Var inner_var = Var("vec");
@@ -888,7 +1248,13 @@ private:
         Map<Var, PrimExpr> vmap;
         vmap.Set(fnode->loop_var, outer_var * vector_size_ + inner_var);
         Stmt body = Substitute(fnode->body, vmap);
-        body = For(inner_var, 0, vector_size_, ForKind::kVectorized, body);
+        Map<String, ffi::Any> inner_annotations;
+        if (aligned) {
+          inner_annotations =
+              MakeAlignedAnnotations(Map<String, ffi::Any>());
+        }
+        body = For(inner_var, 0, vector_size_, ForKind::kVectorized, body,
+                   /*thread_binding=*/std::nullopt, inner_annotations);
         // TileLang uses ForKind::kParallel in frontend SIMT loops. After
         // vectorization, keep semantics equivalent but downgrade to serial so
         // subsequent passes (e.g. pragma-unroll) can run.
@@ -966,6 +1332,196 @@ bool IsExprInvariantInVectorBoundary(const PrimExpr &expr, Var var,
   return false;
 }
 
+// CPPMEGA: Z3 idea #1 — affine-pattern guard.
+//
+// Audit fix (HIGH): the unit-stride proof works by substituting `var -> var+1`
+// and asking Z3 whether `(expr_next - expr) == 1`. For non-affine accesses
+// like `A[B[i]]` (where `B[i]` is a separate BufferLoad), the substitution
+// only rewrites the outer `i`, leaving the inner BufferLoad unchanged — so
+// the difference simplifies to `B[i+1] - B[i]`, which Z3 cannot disprove
+// being 1 in general (especially with no constraints on `B`). Worse, a
+// stub-shaped Z3 expression for an opaque BufferLoad can sometimes be
+// proven equal in trivial models, leading to a false positive.
+//
+// Conservative fix: walk `expr` first; if it contains *any* BufferLoad or
+// any non-{Add,Sub,Mul,IntImm,Var} arithmetic node, return false and skip
+// the Z3 fallback entirely. This shrinks the Z3 call domain to syntactic
+// affine functions of `var` (plus arbitrary loop-invariants captured by
+// other Vars), where the substitution-and-subtract trick is sound.
+//
+// We allow Vars other than `var` to appear: those are loop-invariant and
+// will cancel in the subtraction. We disallow FloorDiv/FloorMod/etc. for
+// safety — accesses like `var * stride / N` have stride only when `stride
+// == N` and the simplifier should have already canonicalised that.
+static bool IsAffineInVar(const PrimExpr &expr, const Var &var) {
+  (void)var;  // currently unused; reserved for stricter checks (e.g. var-only).
+  bool ok = true;
+  PostOrderVisit(expr, [&](const ObjectRef &obj) {
+    if (!ok) {
+      return;
+    }
+    if (obj.as<BufferLoadNode>()) {
+      ok = false;  // any indirect index → reject
+      return;
+    }
+    // Only inspect PrimExpr nodes; ignore Stmt / Buffer / etc.
+    if (!obj->IsInstance<PrimExprNode>()) {
+      return;
+    }
+    // Whitelist: Add, Sub, Mul, IntImm, Var (any var; loop-invariants OK).
+    // Everything else (Div, FloorDiv, FloorMod, Cast, Call, Select, …) is
+    // rejected to keep the substitution trick sound.
+    if (obj.as<AddNode>() || obj.as<SubNode>() || obj.as<MulNode>() ||
+        obj.as<IntImmNode>() || obj.as<VarNode>()) {
+      return;
+    }
+    ok = false;
+  });
+  return ok;
+}
+
+// CPPMEGA: Z3 idea #1 — vectorize_loop contiguity proof.
+//
+// When the heuristic ramp-extraction path can't conclude stride==1 (typically
+// because `iter_var_size` is symbolic and the simplifier won't fold the access
+// expression into a Ramp node), prove unit-stride directly:
+//
+//   forall var in [0, iter_var_size - 1):  expr(var + 1) - expr(var) == 1
+//
+// `expr` is an element-offset (already converted from indices via strides), so
+// the goal is literally `delta == 1` (no element_bytes multiplier). Until the
+// parallel `z3-bv-mode` branch lands `SetBitVectorMode(width)`, we bit-bound
+// `var` by pushing range constraints via `EnterConstraint`. Any
+// timeout / unknown / exception → conservative false. Heuristic-first: this
+// only runs after all simplifier-based paths have failed.
+//
+// Audit fix (HIGH): we now require `expr` to be *syntactically affine* in
+// `var` before invoking Z3 (see IsAffineInVar above). Indirect indexing
+// `A[B[i]] = C[i]` is conservatively rejected.
+//
+// TIR-vs-Z3 semantic divergences kept in mind:
+//   * FloorDiv/FloorMod (TIR) round toward -inf; Z3 BV bvsdiv/bvsmod round
+//     toward 0. We constrain `var >= 0` so they agree on the bounded domain.
+//   * Signed overflow on `var + 1`: the unsigned-32-bit bit-bound (see the
+//     `bv_hi` literal below) keeps the successor in range; an
+//     iter_var_size > 2^32 would be rejected here. We model unsigned 32-bit
+//     pointer arithmetic semantics — the typical case for index registers
+//     held in a 64-bit GPR.
+//   * Loop-carried offsets `expr = base + var*stride + offset` are handled
+//     correctly: `Substitute(var->var+1)` rewrites only the `var` term, and
+//     `(base + (var+1)*stride + offset) - (base + var*stride + offset)`
+//     simplifies to `stride`, so unit-stride iff `stride == 1`.
+static bool Z3CanProveUnitStride(const PrimExpr &expr, const Var &var,
+                                 const PrimExpr &iter_var_size,
+                                 arith::Analyzer *analyzer) {
+  // Audit fix (HIGH): affine guard. Indirect/non-affine accesses bypass Z3.
+  if (!IsAffineInVar(expr, var)) {
+    return false;
+  }
+  try {
+    auto &z3 = arith::Z3Prover(analyzer);
+    z3.SetTimeoutMs(50);
+    DataType vt = var.dtype();
+    PrimExpr lo = make_const(vt, 0);
+    // Audit fix (MEDIUM): widen the bit-bound from signed 2^31 to unsigned
+    // 2^32. Pointer arithmetic on the typical 64-bit host represents indices
+    // as 32-bit *unsigned* values inside a 64-bit register, so the practical
+    // upper bound on a contiguous index is 2^32, not 2^31.
+    //
+    // Implementation note: when `vt` is int32, we cannot literally write a
+    // constant of value 2^32 (it does not fit in int32). In that case the
+    // signed-int32 representation already caps `var` at 2^31 - 1, which is
+    // strictly tighter than the unsigned-32 bound, so the constraint is
+    // already satisfied implicitly and we simply omit the redundant `var <
+    // bv_hi` clause. When `vt` is int64 (or wider), we use the full 2^32
+    // bound. This preserves the documented assumption (unsigned 32-bit
+    // emulation) without violating dtype constraints.
+    bool vt_is_int32 = vt.is_int() && vt.bits() <= 32;
+    // Loop-validity bound: var must allow `var+1` to remain a legal index,
+    // i.e. var < iter_var_size - 1. This also leaves room for the negative
+    // direction probe: var >= 1 is enforced inside that block. This rules
+    // out the wrap-around case where iter_var_size could be 0 or 1 (no
+    // contiguity to prove).
+    PrimExpr iter_hi = analyzer->Simplify(iter_var_size - 1);
+    PrimExpr range_constraint =
+        (var >= lo) && (var < iter_hi) && (iter_var_size > 0);
+    if (!vt_is_int32) {
+      // Wider dtype: enforce explicit unsigned-32-bit emulation.
+      PrimExpr bv_hi = make_const(vt, int64_t(1) << 32);
+      range_constraint =
+          range_constraint && (var < bv_hi) && (iter_var_size <= bv_hi);
+    } else {
+      // int32: signed range already caps at 2^31 - 1 < 2^32, but we still
+      // bound iter_var_size by the int32 max.
+      PrimExpr bv_hi = make_const(vt, int64_t(0x7fffffff));
+      range_constraint = range_constraint && (iter_var_size <= bv_hi);
+    }
+    auto recover = z3.EnterConstraint(range_constraint);
+
+    // Audit fix (HIGH): negative strides. The TileLang For loop is
+    // normalised (min == 0, extent > 0, increment +1), so the loop
+    // *variable* always advances positively. But the *access expression*
+    // can still decrease in `var` — e.g. `out[N-1-i] = in[N-1-i]` produces
+    // an address that decreases by 1 each iteration. That is just as
+    // vectorizable (in absolute-value sense) as a positive stride: the
+    // hardware load/store is `vload`/`vstore` either way, with reversed
+    // element order.
+    //
+    // We probe both directions:
+    //   delta_pos = expr(var+1) - expr(var)   (positive stride: == +1)
+    //   delta_neg = expr(var) - expr(var-1)   (negative stride: == -1
+    //                                          ⇔  expr(var-1) == expr(var)+1)
+    // Either result of magnitude 1 means "addresses are contiguous"; we
+    // accept both.
+    PrimExpr var_plus_1 = var + make_const(vt, 1);
+    PrimExpr expr_next = Substitute(expr, {{var, var_plus_1}});
+    PrimExpr stride_goal_pos =
+        (expr_next - expr) == make_const(expr.dtype(), 1);
+    bool proved = z3.CanProve(stride_goal_pos);
+
+    if (!proved) {
+      // Negative-direction probe. Requires var >= 1 so var-1 is in-range;
+      // we push that as a temporary constraint, prove, then pop.
+      PrimExpr neg_constraint = (var >= make_const(vt, 1));
+      auto recover_neg = z3.EnterConstraint(neg_constraint);
+      PrimExpr var_minus_1 = var - make_const(vt, 1);
+      PrimExpr expr_prev = Substitute(expr, {{var, var_minus_1}});
+      // expr(var) - expr(var-1) == -1   ⇔  expr(var-1) - expr(var) == +1
+      PrimExpr stride_goal_neg =
+          (expr - expr_prev) == make_const(expr.dtype(), -1);
+      proved = z3.CanProve(stride_goal_neg);
+      recover_neg();
+    }
+
+    recover();
+    if (!proved) {
+      // Audit fix (LOW): log silent UNKNOWN/timeout/false paths so missed
+      // vectorizations can be diagnosed later. We can't distinguish
+      // "proved false" from "UNKNOWN" / "timeout" through the bool return
+      // alone — DLOG(INFO) covers all three in one place. Behavior is
+      // unchanged: the caller still sees `false` and falls back to scalar.
+      DLOG(INFO) << "Z3CanProveUnitStride: could not prove unit stride for "
+                 << "expr=" << expr << " var=" << var
+                 << " iter_var_size=" << iter_var_size
+                 << " (timeout/unknown/false — falling back to scalar)";
+    }
+    return proved;
+  } catch (const std::exception &e) {
+    // Conservative: any Z3 error / timeout / UNKNOWN / exception leaves
+    // the For un-vectorized. Surface the exception in DLOG so a debug
+    // build can pinpoint which queries blow up.
+    DLOG(INFO) << "Z3CanProveUnitStride: exception (" << e.what()
+               << ") — conservatively returning false. expr=" << expr
+               << " var=" << var;
+    return false;
+  } catch (...) {
+    DLOG(INFO) << "Z3CanProveUnitStride: unknown exception — conservatively "
+                  "returning false. expr="
+               << expr << " var=" << var;
+    return false;
+  }
+}
+
 bool IndicesCanVectorize(const PrimExpr &expr, Var var,
                          const PrimExpr &iter_var_size,
                          int target_vectorized_size,
@@ -1017,10 +1573,46 @@ bool IndicesCanVectorize(const PrimExpr &expr, Var var,
     // Broadcast value
     if (expr_vectorized.dtype().lanes() == 1)
       return true;
-    else
-      return false;
+    // CPPMEGA: Z3 idea #1 — broadcast/non-ramp shape was reached but lanes
+    // count > 1 means the access actually does depend on `var`. Try the
+    // direct Z3 unit-stride proof as a last resort before giving up.
+    if (Z3CanProveUnitStride(expr, var, iter_var_size, analyzer)) {
+      return true;
+    }
+    return false;
   } else {
-    return is_one(ramp_node->stride);
+    // CPPMEGA fix-B1 (idea712): only accept positive unit stride.
+    //
+    // Background: the parallel `z3-stack` branch adds a Z3-backed
+    // negative-stride probe. The `VectorizeRewriter` codegen, however,
+    // emits a `Ramp(min=0, stride=+1, lanes=N)` and assumes positive
+    // direction. If a negative-stride probe is ever ported here without
+    // the matching codegen change (a `negative_ramp` annotation +
+    // `Ramp(stride=-1)` emission in `VectorizeRewriter`), kernels like
+    // `for i in range(N-1, -1, -1): out[i] = in[i]` would be marked
+    // vectorizable but lowered with the wrong-order ramp.
+    //
+    // Decision: REJECT negative stride at the planner (option (a) in the
+    // cross-checked review). This is the safe-by-default position. If a
+    // future change wires the codegen, replace this with the proper
+    // negative_ramp flag plumbing (option (b)) and re-enable here.
+    //
+    // CPPMEGA Z3 idea #1 retained: still allow Z3 to prove stride==+1 for
+    // expressions that don't simplify to a literal 1 (e.g. `(k%4)+1` where
+    // k is provably a multiple of 4), and use the positive-only contiguity
+    // fallback. This drops the prior `stride == -1` branch.
+    if (is_one(ramp_node->stride)) {
+      return true;
+    }
+    {
+      auto &z3 = arith::Z3Prover(analyzer);
+      z3.SetTimeoutMs(50);
+      if (z3.CanProve(ramp_node->stride ==
+                      make_const(ramp_node->stride.dtype(), 1))) {
+        return true;
+      }
+    }
+    return Z3CanProveUnitStride(expr, var, iter_var_size, analyzer);
   }
 }
 

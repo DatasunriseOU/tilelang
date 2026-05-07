@@ -709,8 +709,10 @@ private:
 
 struct TileLangThreadSyncPlanner : public ConstrVisitor {
   explicit TileLangThreadSyncPlanner(StorageScope sync_scope,
-                                     int warp_size = 32)
-      : sync_scope_(std::move(sync_scope)), warp_size_(warp_size) {
+                                     int warp_size = 32,
+                                     bool is_metal = false)
+      : sync_scope_(std::move(sync_scope)), warp_size_(warp_size),
+        is_metal_(is_metal) {
     scope_.push_back(std::vector<StmtEntry>());
   }
 
@@ -1175,7 +1177,15 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
                call_op.same_as(tl::atomic_max_elem_op()) ||
                call_op.same_as(tl::atomic_max_ret_elem_op()) ||
                call_op.same_as(tl::atomic_min_elem_op()) ||
-               call_op.same_as(tl::atomic_min_ret_elem_op());
+               call_op.same_as(tl::atomic_min_ret_elem_op()) ||
+               call_op.same_as(tl::atomic_xchg_elem_op()) ||
+               call_op.same_as(tl::atomic_xchg_ret_elem_op()) ||
+               call_op.same_as(tl::atomic_and_elem_op()) ||
+               call_op.same_as(tl::atomic_and_ret_elem_op()) ||
+               call_op.same_as(tl::atomic_or_elem_op()) ||
+               call_op.same_as(tl::atomic_or_ret_elem_op()) ||
+               call_op.same_as(tl::atomic_xor_elem_op()) ||
+               call_op.same_as(tl::atomic_xor_ret_elem_op());
       }
       return false;
     }();
@@ -1556,6 +1566,23 @@ private:
   StorageScope sync_scope_;
   // warp size from target
   int warp_size_;
+  // CPPMEGA: Z3 Apple intra-warp barrier elision
+  // When the active target is Metal, Apple's MSL spec guarantees an
+  // implicit simdgroup barrier inside each 32-lane simdgroup (threads in a
+  // simdgroup execute in lockstep). If Z3 can prove that every shared-memory
+  // RAW/WAR conflict between writer thread `tx1` and reader thread `tx2`
+  // satisfies `tx1 / 32 == tx2 / 32`, the threadgroup_barrier emitted by
+  // ThreadStorageSync is redundant and can be elided. We *only* drop the
+  // barrier when Z3 conclusively proves intra-warp; on timeout/unknown we
+  // keep the barrier (safety mode).
+  bool is_metal_{false};
+
+public:
+  // Diagnostic counter — incremented every time we elide a barrier via the
+  // Apple intra-warp Z3 path. Exposed for tests / logging.
+  mutable int apple_intra_warp_elisions_{0};
+
+private:
 
   void insert_syncs(const Object *obj) {
     if (syncs_inserted_.count(obj))
@@ -1608,6 +1635,268 @@ private:
     }
     return false;
   }
+
+  // CPPMEGA: Z3 Apple intra-warp barrier elision
+  //
+  // Returns true iff Z3 conclusively proves that, given the access-level
+  // constraints captured in `prev` and `curr`, every (writer, reader) thread
+  // pair that could collide on shared memory satisfies
+  //
+  //   (tx_w / 32) == (tx_r / 32)   AND
+  //   (ty_w == ty_r) AND (tz_w == tz_r)
+  //
+  // — i.e., both threads belong to the same Metal simdgroup. Apple's MSL
+  // spec guarantees implicit simdgroup-level lockstep execution, so a
+  // threadgroup_barrier between such accesses is redundant.
+  //
+  // Safety: returns false on any kind of solver uncertainty (timeout,
+  // unknown, missing thread vars, mismatched dtypes). This means: when in
+  // doubt, *keep* the barrier. We only elide on a positive Z3 proof.
+  bool ProveIntraWarpRAW(const AccessEntry &prev, const AccessEntry &curr) {
+    if (!is_metal_) {
+      return false;
+    }
+    // Only meaningful for cross-thread (RAW/WAR) on shared scope.
+    bool same_access_type = (prev.type == kWrite && curr.type == kWrite) ||
+                            (prev.type == kRead && curr.type == kRead);
+    if (same_access_type) {
+      return false;
+    }
+    if (prev.threads.size() < 1 || curr.threads.size() < 1) {
+      return false;
+    }
+    if (prev.scope.rank != StorageRank::kShared ||
+        curr.scope.rank != StorageRank::kShared) {
+      return false;
+    }
+
+    arith::Analyzer analyzer;
+    ConstrSet prev_cset{prev.cset};
+    ConstrSet curr_cset{curr.cset};
+
+    // CPPMEGA: Z3 idea #11 bug fix — tag-based axis mapping.
+    //
+    // The original positional indexing `prev.threads.size() + idx - 3`
+    // assumed the IterVar ordering `[z, y, x]` in `threads`, *and* that all
+    // three axes are present. For 2-D launches (n_dims == 2) this maps
+    // idx=1 → tx slot, idx=2 → ty slot — but the actual y- and x-axis
+    // IterVars end up assigned to `ty_w` and `tz_w` respectively, leaving
+    // `tx_w` undefined. The function then early-returns false at the
+    // tx_w/tx_r defined-ness check, so the barrier is never elided for any
+    // 2-D launch (which is exactly the launch shape used by sparse_mla and
+    // topk_selector on Apple).
+    //
+    // The fix: scan `threads` by `thread_tag` and bind by axis identity,
+    // not by position. Audit-tightened to a strict-equality allowlist
+    // (no substring match): a custom vendor tag like `__wmma_x` or a
+    // split tag like `threadIdx.x_outer` does NOT count as the canonical
+    // `threadIdx.x` axis, and we keep the barrier in that case
+    // (conservative-by-default).
+    auto is_canonical_thread_tag = [](const std::string &tag) -> bool {
+      return tag == "threadIdx.x" || tag == "threadIdx.y" ||
+             tag == "threadIdx.z" || tag == "blockIdx.x" ||
+             tag == "blockIdx.y" || tag == "blockIdx.z";
+    };
+    auto find_axis = [&](const Array<IterVar> &v,
+                         const char *tag) -> Optional<IterVar> {
+      // Strict equality match: avoids matching custom tags such as
+      // `__wmma_x`, `threadIdx.x_outer`, or `threadIdx.x_inner` as if
+      // they were the canonical `threadIdx.x` axis. If multiple axes
+      // share the canonical tag (shouldn't happen, but guard anyway),
+      // the first one wins by IterVar binding order.
+      for (const IterVar &iv : v) {
+        if (std::string(iv->thread_tag) == tag) {
+          return iv;
+        }
+      }
+      return std::nullopt;
+    };
+    // Audit logging: if either side carries any non-canonical thread_tag
+    // (e.g. `__wmma_x`, `threadIdx.x_outer`), surface it via LOG(WARNING)
+    // so flaky CI runs are diagnosable. We do NOT bail just because a
+    // non-canonical tag exists — the canonical axes still drive the
+    // proof; we only refuse to elide if `threadIdx.x` itself is missing.
+    auto log_unknown_tags = [&](const Array<IterVar> &v, const char *side) {
+      for (const IterVar &iv : v) {
+        std::string tag(iv->thread_tag);
+        if (!tag.empty() && !is_canonical_thread_tag(tag)) {
+          LOG(WARNING) << "ProveIntraWarpRAW: non-canonical thread_tag '"
+                       << tag << "' on " << side
+                       << " — ignored by strict-equality matcher.";
+        }
+      }
+    };
+    log_unknown_tags(prev.threads, "prev");
+    log_unknown_tags(curr.threads, "curr");
+
+    auto tx_p_iv = find_axis(prev.threads, "threadIdx.x");
+    auto tx_c_iv = find_axis(curr.threads, "threadIdx.x");
+    if (!tx_p_iv.has_value() || !tx_c_iv.has_value()) {
+      // No canonical threadIdx.x in scope on either side — cannot reason
+      // about simdgroup membership at all. Keep the barrier
+      // (conservative-by-default early exit).
+      LOG(WARNING) << "ProveIntraWarpRAW: no canonical threadIdx.x found "
+                      "(prev or curr); keeping barrier.";
+      return false;
+    }
+    auto ty_p_iv = find_axis(prev.threads, "threadIdx.y");
+    auto ty_c_iv = find_axis(curr.threads, "threadIdx.y");
+    auto tz_p_iv = find_axis(prev.threads, "threadIdx.z");
+    auto tz_c_iv = find_axis(curr.threads, "threadIdx.z");
+
+    ffi::Map<Var, PrimExpr> prev_sub, curr_sub;
+    // CRITICAL: default `Var()` creates a *fresh, named* variable
+    // ("v", "v_1", ...) — it's not a null handle. Initialize explicitly
+    // to NullValue<Var>() so `.defined()` returns false until bind_axis
+    // populates the slot.
+    Var tx_w = NullValue<Var>();
+    Var tx_r = NullValue<Var>();
+    Var ty_w = NullValue<Var>();
+    Var ty_r = NullValue<Var>();
+    Var tz_w = NullValue<Var>();
+    Var tz_r = NullValue<Var>();
+
+    auto bind_axis = [&](const Optional<IterVar> &p_iv,
+                         const Optional<IterVar> &c_iv, const char *name,
+                         Var *w_out, Var *r_out) {
+      if (!p_iv.has_value() || !c_iv.has_value()) return;
+      Var old_p = p_iv.value()->var;
+      Var old_c = c_iv.value()->var;
+      Var fresh_w(std::string(name) + "_w", old_p.dtype());
+      Var fresh_r(std::string(name) + "_r", old_c.dtype());
+      *w_out = fresh_w;
+      *r_out = fresh_r;
+      prev_sub.Set(old_p, fresh_w);
+      curr_sub.Set(old_c, fresh_r);
+    };
+    bind_axis(tx_p_iv, tx_c_iv, "tx", &tx_w, &tx_r);
+    bind_axis(ty_p_iv, ty_c_iv, "ty", &ty_w, &ty_r);
+    bind_axis(tz_p_iv, tz_c_iv, "tz", &tz_w, &tz_r);
+
+    if (!tx_w.defined() || !tx_r.defined()) {
+      // Defensive: bind_axis on tx must have populated these.
+      return false;
+    }
+
+    prev_cset.Substitute(prev_sub).Populate(analyzer);
+    curr_cset.Substitute(curr_sub).Populate(analyzer);
+
+    // Build the goal: (tx_w / warp_size == tx_r / warp_size) ∧
+    //                 (ty_w == ty_r) ∧ (tz_w == tz_r)
+    //
+    // FloorDiv semantics — TIR's FloorDiv rounds toward negative infinity
+    // (Python-style). For the simdgroup partition we only ever feed
+    // non-negative thread indices in [0, threadgroup_extent_x), so
+    // FloorDiv coincides with Euclidean division and matches Apple's
+    // 32-lane partition exactly: lane = tx mod 32, simd = tx / 32. The
+    // bit-bound EnterConstraint pushed below pins tx into that
+    // non-negative range explicitly so the solver cannot cherry-pick a
+    // negative witness that would otherwise violate the goal.
+    auto warp_const = make_const(tx_w.dtype(), warp_size_);
+    // Audit (gpt-5-5-pro #4): null-safety — tx_w / tx_r are guaranteed
+    // `.defined()` here by the early-exit above (`!tx_w.defined()` →
+    // return false at line ~1735). Optional<IterVar> for tx_p_iv /
+    // tx_c_iv was checked via `has_value()` immediately after find_axis.
+    //
+    // FloorDiv safety: Sound only because the EnterConstraint above pins
+    // tx_w, tx_r >= 0. If a transformation introduces negative thread
+    // indices, this query becomes unsound (TIR FloorDiv rounds toward
+    // -infinity, so e.g. FloorDiv(-1, 32) = -1 ≠ FloorDiv(-33, 32) = -2
+    // even though both fall in the "same simdgroup" colloquially).
+    PrimExpr goal = tirx::EQ(tirx::FloorDiv(tx_w, warp_const),
+                             tirx::FloorDiv(tx_r, warp_const));
+    // Audit (gpt-5-5-pro #2): null-safety — `.defined()` checks below
+    // gate the EQ build on bind_axis having actually populated the
+    // ty/tz slots. Optional<IterVar> sources are themselves null-safe
+    // via has_value() inside bind_axis.
+    if (ty_w.defined() && ty_r.defined()) {
+      goal = tirx::And(goal, tirx::EQ(ty_w, ty_r));
+    }
+    if (tz_w.defined() && tz_r.defined()) {
+      goal = tirx::And(goal, tirx::EQ(tz_w, tz_r));
+    }
+
+    // CPPMEGA: Z3 idea #11 hardening — bit-bound emulation via
+    // EnterConstraint. Until the parallel `z3-bv-mode` branch lands
+    // `SetBitVectorMode(width)`, we encode the implicit signed-32 thread-
+    // index range (`0 <= tx < threadgroup_extent`) as additional Z3
+    // assertions. This:
+    //   1) Prevents the solver from picking pathological negative-tx
+    //      witnesses for the floor-div-by-32 partition (FloorDiv is
+    //      negative-infinity rounding in TIR; without bounding tx >= 0,
+    //      a negative witness like tx_w == -33, tx_r == -1 falsifies
+    //      `tx_w / 32 == tx_r / 32` even though no real launch can
+    //      reach that state).
+    //   2) Lets Z3 actually solve floor-div on small finite domains
+    //      instead of timing out on the unbounded Int sort.
+    auto extract_extent = [](const Optional<IterVar> &iv) -> Optional<PrimExpr> {
+      if (!iv.has_value() || !iv.value()->dom.defined()) return std::nullopt;
+      return iv.value()->dom->extent;
+    };
+    auto add_axis_bounds = [&](const Var &w_var, const Var &r_var,
+                               const Optional<IterVar> &p_iv,
+                               const Optional<IterVar> &c_iv,
+                               PrimExpr &constraint) {
+      if (!w_var.defined() || !r_var.defined()) return;
+      PrimExpr zero = make_const(w_var.dtype(), 0);
+      constraint = tirx::And(
+          constraint, tirx::And(tirx::GE(w_var, zero), tirx::GE(r_var, zero)));
+      auto ext_p = extract_extent(p_iv);
+      if (ext_p.has_value()) {
+        constraint = tirx::And(
+            constraint, tirx::LT(w_var, Cast(w_var.dtype(), ext_p.value())));
+      }
+      auto ext_c = extract_extent(c_iv);
+      if (ext_c.has_value()) {
+        constraint = tirx::And(
+            constraint, tirx::LT(r_var, Cast(r_var.dtype(), ext_c.value())));
+      }
+    };
+    PrimExpr range_constraint = make_const(DataType::Bool(), true);
+    add_axis_bounds(tx_w, tx_r, tx_p_iv, tx_c_iv, range_constraint);
+    add_axis_bounds(ty_w, ty_r, ty_p_iv, ty_c_iv, range_constraint);
+    add_axis_bounds(tz_w, tz_r, tz_p_iv, tz_c_iv, range_constraint);
+
+    // Use Z3 with a tight timeout to avoid pathological slowdowns. On
+    // timeout/unknown/exception, `proven` stays false → we keep the
+    // barrier (conservative-by-default).
+    //
+    // CPPMEGA: Z3 simdgroup load opt — apache/tvm `arith::Z3Prover` is a
+    // free function returning a reference to a per-Analyzer cached prover
+    // (see vendored/z3_prover.h), not a constructor.
+    //
+    // Timeout tuning: 500 ms in the initial draft; the floor-div-by-32
+    // query closes in single-digit ms once range constraints are present,
+    // so 200 ms is plenty (per second-pass review feedback).
+    auto &prover = arith::Z3Prover(analyzer);
+    prover.SetTimeoutMs(200);
+    bool proven = false;
+    // Push range constraints via EnterConstraint so the recovery handle
+    // restores the prover state on every exit path (success, exception,
+    // early return). Both reviewers (gpt-5-5-pro, grok) flagged that an
+    // unhandled Z3 exception here would crash the entire ThreadSync pass;
+    // `catch (...)` ensures we degrade to "barrier kept" no matter what.
+    auto recover = prover.EnterConstraint(range_constraint);
+    try {
+      proven = prover.CanProve(goal);
+    } catch (const std::exception &e) {
+      // Audit (gpt-5-5-pro #5): surface UNKNOWN/exception path so flaky
+      // CI timeouts are visible. Conservative-by-default: barrier kept.
+      LOG(WARNING)
+          << "ProveIntraWarpRAW: Z3 prover threw '" << e.what()
+          << "' on goal `" << goal
+          << "` (timeout=200ms); keeping barrier (conservative).";
+      proven = false;
+    } catch (...) {
+      LOG(WARNING) << "ProveIntraWarpRAW: Z3 prover threw unknown exception "
+                      "on goal `"
+                   << goal << "`; keeping barrier (conservative).";
+      proven = false;
+    }
+    recover();
+    return proven;
+  }
+
   void print_access_tentry(const AccessEntry &access,
                            bool print_constr = false) {
     std::ostringstream output;
@@ -1972,6 +2261,17 @@ private:
       }
     }
 
+    // CPPMEGA: Z3 Apple intra-warp barrier elision
+    // If we still believe the accesses overlap on Metal, ask Z3 whether
+    // every potentially-conflicting (writer, reader) pair belongs to the
+    // same simdgroup. If so, the threadgroup_barrier between them is a
+    // no-op (intra-simdgroup execution is implicitly lockstep on Apple GPUs)
+    // and we can drop the conflict report.
+    if (range_is_overlap && is_metal_ && ProveIntraWarpRAW(prev, curr)) {
+      ++apple_intra_warp_elisions_;
+      return false;
+    }
+
     return range_is_overlap;
   }
 
@@ -1995,13 +2295,18 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
   }
   // Get warp size from target, defaulting to 32 if not available
   int warp_size = 32;
+  // CPPMEGA: Z3 Apple intra-warp barrier elision — only enabled when target
+  // is Metal. We extract the kind name in the same scope as warp_size for
+  // forwarding into the planner.
+  bool is_metal = false;
   if (auto target = func->GetAttr<Target>(tvm::attr::kTarget)) {
     warp_size = target.value()
                     ->GetAttr<Integer>("thread_warp_size", 32)
                     .value()
                     .IntValue();
+    is_metal = target.value()->kind->name == "metal";
   }
-  TileLangThreadSyncPlanner planner(sync_scope, warp_size);
+  TileLangThreadSyncPlanner planner(sync_scope, warp_size, is_metal);
   for (const auto &[_, buffer] : func->buffer_map) {
     planner.SetBufferDataToBuffer(buffer->data, buffer);
   }

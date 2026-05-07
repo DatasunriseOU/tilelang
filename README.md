@@ -47,6 +47,67 @@ Defensive fix in `tilelang/jit/adapter/torch/metal.py`: extract trailing `'x'`/`
 
 Test summary at HEAD: 36 CPU + 61 Metal + 3 skipped (opt-in benchmarks) = 100 / 103 pass, 0 fail. Cold compile time 0.015 s (≈39× faster than the tl_pr_c baseline). Bench parity vs `/tmp/tl_pr_c`: swap mean 0.984× of tl_pr_c on the metal benchmarks (within MPS variance).
 
+### 2026-05-07 — Unified fused-kernel compiler integrations (waves 1-3 + Phase 1 migration unblockers)
+
+The 9 integration packets under `poc/` ingest external IR (Triton TTIR,
+torch.fx, raw cute-dsl, custom MSL) and lower through TileLang TIR to a single
+fused CUDA / HIP / Apple Metal SIMDgroup kernel. Each packet went through three
+review-fix loops with grok-4; integration #09 received a fourth wave to fix a
+broken AOT autograd path. See [`RFC_unified_fused_kernel.md`](./RFC_unified_fused_kernel.md)
+for the full design.
+
+Packets and their canonical entry files:
+
+1. **Triton TTIR mapper** (`poc/triton_frontend/`) — TTIR walker + OP_TABLE,
+   PtrAnalysis pre-pass, conformance kernels (vector_add, dot_reduce_atomic,
+   softmax, matmul, layer_norm). Wave-3 added `tt.dot trans_b`,
+   `tl.sync_threads_partial`, printf `%n`-sanitisation.
+2. **torch.compile backend** (`poc/torch_dynamo/`) — FX → TileLang via
+   `torch.compile(backend="tilelang")`, multi-region launcher, sequential
+   binary/unary emitters, contiguity guard, 128-bit content hash.
+3. **PtrAnalysis pybind wrapper** (`poc/triton_frontend/_cxx/`) — vendors
+   microsoft/triton-shared `PtrAnalysis` (MIT) behind a JSON-safe shim with
+   single-`Module`-lifetime caching and rewrite-error de-duplication.
+4. **TritonStructured dialect vendoring** (`poc/triton_frontend/vendored/`) —
+   self-contained CMake build of `tts` dialect + `UseAnalysis`; Python
+   registration via `register_triton_structured_pybind`; vendor-drift
+   detector + `tts.make_gather_scatter_tptr` walk regression.
+5. **FP8 amax port** (in cppmega.mlx `_tilelang/fp8_amax.py`) — Megatron Triton
+   reference → TileLang Path-C with NaN/Inf guard, JIT bucket cache, dynamic
+   target-aware `BLOCK_SIZE` picker, partial-block invariant.
+6. **DSA splitK indexer-loss port** (in cppmega.mlx) — full
+   fwd+bwd Path-C kernel with causal SK trim, Q hoist, debug-gated GPU↔CPU
+   sync, head-0 fragment alloc gate, and (wave-5) budget-gated full Q-cache
+   shared-memory hoist.
+7. **TMA → ptr-arith fallback** (`src/transform/lower_tma_to_ptr_arith.{h,cc}`,
+   `src/transform/inject_pipeline.cc`) — Hopper-only TMA copies degrade to
+   portable `BufferStore(BufferLoad(...))` + `pragma_async_scope` /
+   `pragma_tma_swizzle` propagation so the same source compiles on AMD HIP
+   and Apple Metal. Dtype recovery + i64 stride accumulation.
+8. **`tl.extern_intrinsic` + 8-field Frag contract**
+   (`tilelang/language/{extern,extern_registry}.py`,
+   `src/transform/extern_intrinsic_meta.h`) — opaque-call boundary with
+   register/shared fragment metadata so `layout_inference`,
+   `inject_pipeline`, `thread_storage_sync` reason across the boundary.
+   `simdgroup_a/b/c` Fragment factories for Apple SIMDgroup MMA. Body-name
+   regex validator with raw-string + comment scrubbing.
+9. **AOT autograd via `torch.library.custom_op`** (`poc/torch_dynamo/`) —
+   `aot_autograd` joint capture; `register_double_backward` with atomic
+   accumulator analytical zero-grad; symbolic-tile codegen path
+   (`compile_symbolic`); autotune shortlist with shape-bucketed cache;
+   thread-safe `_AUTOTUNE_LOCK`.
+
+Phase 1 cppmega.mlx → unified pipeline migration unblockers also landed:
+`tl.sync_threads_partial(mask, n_threads)` primitive (CUDA `__syncwarp`,
+HIP wave barrier, Metal `simdgroup_barrier`); `tt.trans` + `tt.dot`
+`transpose_a/transpose_b` op-table extension; `LowerTMAToPtrArith` 64-bit
+stride accumulator and dtype-recovery matrix tests.
+
+The branch ships 78 commits over the prior `metal-gemm-upstream-rebase` HEAD
+across `poc/`, `src/transform/`, `src/target/`, `src/op/`, `tilelang/language/`,
+`tilelang/transform/`, and the testing tree. See `git log
+metal-gemm-upstream-rebase..main` for the full audit trail.
+
 <img src=./images/MatmulExample.png />
 
 ## Latest News

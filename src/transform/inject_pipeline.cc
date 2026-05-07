@@ -2,6 +2,14 @@
  * \file inject_software_pipeline.cc
  * \brief Transform annotated loops into pipelined one that parallelize
  * producers and consumers
+ *
+ * Modified for integration #9 follow-up: extern_intrinsic metadata pickup.
+ * We add a minimal hook in ``PipelineInjector::VisitStmt_(SBlockNode*)``
+ * that promotes the ``pipeline_stage`` field of the
+ * ``tl.extern_intrinsic_meta`` block annotation into the existing
+ * ``tl.pipeline_context_num_stages`` AttrStmt scope so the rest of the
+ * pipeline pipeline picks it up unchanged. See
+ * :file:`extern_intrinsic_meta.h` for the shared helper.
  */
 #include <tvm/arith/analyzer.h>
 #include <tvm/target/target.h>
@@ -25,6 +33,7 @@
 #include "../op/utils.h"
 #include "common/mbarrier.h"
 #include "common/pipeline_utils.h"
+#include "extern_intrinsic_meta.h"
 #include "support/utils.h"
 #include "s_tir/schedule/utils.h"
 #include "tirx/transform/ir_utils.h"
@@ -312,6 +321,23 @@ bool ContainsExplicitAsyncIntrinsics(const Stmt &stmt) {
         found = true;
         return;
       }
+      // LowerTMAToPtrArith emits two string-keyed pragmas around the
+      // rewritten copy:
+      //   * "pragma_async_scope"  — same intent as the typed
+      //     `tirx::attr::async_scope`, but emitted as a string literal so
+      //     the fallback-lowered IR is human-readable in dumps.
+      //   * "pragma_tma_swizzle"  — preserved cuTensorMap swizzle value
+      //     so downstream codegens (Metal / HIP layout passes, future
+      //     re-typing passes) can recover the original mode without
+      //     re-decoding the descriptor.
+      // Treat both as "already-async" so the SW pipeliner does not stack
+      // a second async protocol on top of the synchronous pointer-arith
+      // copy. See `BuildPointerArithCopy` in lower_tma_to_ptr_arith.cc.
+      if (attr->attr_key == "pragma_async_scope" ||
+          attr->attr_key == "pragma_tma_swizzle") {
+        found = true;
+        return;
+      }
     }
     const auto *call = obj.as<CallNode>();
     if (!call) {
@@ -449,6 +475,31 @@ private:
     }
     if (op->attr_key == tirx::attr::async_wait_inflight_count) {
       return VisitStmt(op->body);
+    }
+    // String-keyed pragmas emitted by `LowerTMAToPtrArith`. By the time we
+    // reach this lowerer the synchronous pointer-arith copy is already
+    // pattern-matched as "explicit-async" by `ContainsExplicitAsyncIntrinsics`
+    // upstream, so the markers have served their purpose. Strip
+    // `pragma_async_scope` (a structural tag with no codegen meaning past
+    // the pipeline scan) and forward `pragma_tma_swizzle` onto the inner
+    // For-loop annotations under the `tl_tma_swizzle` key so target
+    // codegens (Metal swizzled-tile, HIP LDS layout) can still reach the
+    // value. If the body is not an immediate For, fall back to leaving
+    // the AttrStmt in place — pragmas with non-For bodies travel as a
+    // wrapper to the next pass.
+    if (op->attr_key == "pragma_async_scope") {
+      return VisitStmt(op->body);
+    }
+    if (op->attr_key == "pragma_tma_swizzle") {
+      Stmt body = VisitStmt(op->body);
+      if (const auto *forn = body.as<ForNode>()) {
+        auto annotations = forn->annotations;
+        annotations.Set("tl_tma_swizzle", op->value);
+        return For(forn->loop_var, forn->min, forn->extent, forn->kind,
+                   forn->body, forn->thread_binding, annotations, forn->step,
+                   forn->span);
+      }
+      return AttrStmt(op->node, op->attr_key, op->value, body);
     }
     return StmtExprMutator::VisitStmt_(op);
   }
@@ -3503,7 +3554,31 @@ private:
       buffer_data_to_buffer_.erase(buffer->data);
       allocated_buffers_.erase(buffer);
     }
+    // Integration #9 follow-up: extern_intrinsic pipeline_stage hint.
+    MaybeWrapExternPipelineStage(op, &block);
     return block;
+  }
+
+  // Integration #9 follow-up: turn the block-level ``pipeline_stage`` hint
+  // (from the ``tl.extern_intrinsic_meta`` annotation) into a
+  // ``kPipelineContextNumStages`` AttrStmt wrapped around the block body.
+  // ``pipeline_stage == -1`` (default) is a passthrough; ``0`` means "no
+  // pipelining hint"; ``stage >= 1`` becomes ``num_stages = stage + 1``,
+  // matching the convention in :func:`GetPipelineNumStages`.
+  void MaybeWrapExternPipelineStage(const SBlockNode *op,
+                                    SBlock *block) const {
+    auto meta_opt = GetExternBlockMeta(op);
+    if (!meta_opt.defined()) return;
+    auto stage_any = meta_opt.value().Get("pipeline_stage");
+    if (!stage_any.defined()) return;
+    const auto *imm = stage_any.value().as<IntImmNode>();
+    if (imm == nullptr) return;
+    int stage = static_cast<int>(imm->value);
+    if (stage < 1) return;
+    PrimExpr ns = IntImm(DataType::Int(32), stage + 1);
+    SBlockNode *bn = block->CopyOnWrite();
+    bn->body =
+        AttrStmt(Integer(0), kPipelineContextNumStages, ns, bn->body);
   }
 
   bool HasPipelineAnnotation(const ForNode *op) const {

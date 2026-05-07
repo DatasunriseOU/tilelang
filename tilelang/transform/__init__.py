@@ -132,6 +132,28 @@ def LowerHopperIntrin():
     return _ffi_api.LowerHopperIntrin() if hasattr(_ffi_api, "LowerHopperIntrin") else lambda f: f  # type: ignore
 
 
+def LowerTMAToPtrArith():
+    """LowerTMAToPtrArith.
+
+    Decomposes Hopper-style TMA descriptor loads/stores
+    (``tl::tma_load`` / ``tl::tma_store`` / ``tl::tma_load_im2col``) into
+    explicit pointer-arith copy loops on non-Hopper targets (Apple Metal
+    SIMDgroup, AMD HIP, pre-Hopper CUDA, CPU). NV Hopper+ paths are
+    passed through unchanged so the existing ``LowerHopperIntrin`` pipeline
+    keeps owning the native lowering.
+
+    See ``src/transform/lower_tma_to_ptr_arith.cc`` for the lowering rules.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass.
+    """
+    if hasattr(_ffi_api, "LowerTMAToPtrArith"):
+        return _ffi_api.LowerTMAToPtrArith()  # type: ignore
+    return lambda f: f
+
+
 def ThreadSync(storage_scope: str):
     """Insert sync between parallel read/write of shared buffers.
 
@@ -179,6 +201,63 @@ def LoopUnswitching():
         The result pass
     """
     return _ffi_api.LoopUnswitching()  # type: ignore
+
+
+def DropProvableBoundChecks():
+    """Drop runtime ``if (i < N) buf[i] = ...`` bound-check guards when the
+    default analyzer or the vendored Z3 prover can conclusively prove the
+    condition (idea #4 of the Z3 roadmap).
+
+    Conservative-by-default: any prover error / timeout / UNKNOWN keeps the
+    guard intact. Pass is gated by the ``tl.drop_provable_bound_checks``
+    PassConfig (default ``False``); calling this pass without the config
+    enabled is a no-op.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.DropProvableBoundChecks()  # type: ignore
+
+
+def AutoDoubleBuffer():
+    """AutoDoubleBuffer: Auto-detect canonical shared-memory tile-load
+    patterns and (when Z3 can prove soundness) ping-pong them.
+
+    Default OFF. Enable by setting the PassConfig
+    ``tl.auto_double_buffer = True``.
+
+    Currently a SAFE STUB: when enabled and a candidate is detected, the
+    pass logs the detection and the Z3 verdict, but leaves the IR
+    unchanged. This lets the wiring (PassConfig, phase slot, FFI binding)
+    ship without committing to a specific transformation; a future
+    iteration can replace the stub with the real ping-pong rewrite.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.AutoDoubleBuffer()  # type: ignore
+
+
+def PredicateFusion():
+    """PredicateFusion (Z3 idea #7): fuse adjacent guarded ``if`` statements.
+
+    Rewrites ``if(a) { if(b) { body } }`` to ``if(a && b) { body }`` when
+    Z3 proves the inner predicate is well-defined unconditionally (i.e.
+    every BufferLoad/BufferStore index is in-range without assuming the
+    outer guard ``a``). Conservative on UNKNOWN/timeout — keeps nesting.
+
+    Controlled by pass config ``tl.predicate_fusion`` (default OFF).
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass.
+    """
+    return _ffi_api.PredicateFusion()  # type: ignore
 
 
 def ProducerConsumerWarpSpecialized():

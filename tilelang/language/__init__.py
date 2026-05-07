@@ -71,6 +71,7 @@ from .reduce_op import (
     reduce_max,  # noqa: F401
     reduce_min,  # noqa: F401
     reduce_sum,  # noqa: F401
+    reduce_prod,  # noqa: F401
     reduce_abssum,  # noqa: F401
     reduce_absmax,  # noqa: F401
     reduce_bitand,  # noqa: F401
@@ -97,6 +98,10 @@ from .customize import (
     view,  # noqa: F401
     atomic_load,  # noqa: F401
     atomic_store,  # noqa: F401
+    atomic_xchg,  # noqa: F401
+    atomic_and,  # noqa: F401
+    atomic_or,  # noqa: F401
+    atomic_xor,  # noqa: F401
     loop_break,  # noqa: F401
 )
 from .logical import any_of, all_of  # noqa: F401
@@ -114,6 +119,7 @@ from .builtin import stg128 as stg128  # noqa: F401
 from .builtin import stg256 as stg256  # noqa: F401
 from .builtin import any_sync as any_sync  # noqa: F401
 from .builtin import all_sync as all_sync  # noqa: F401
+from .builtin import sync_threads_partial as sync_threads_partial  # noqa: F401
 from .fp8_op import fp8_scaled_matmul as fp8_scaled_matmul  # noqa: F401
 # CPPMEGA pull from stack-c — blockscaled E8M0 + Metal dot4 DSL surface
 from .blockscaled_layout import BlockScaledLayout, e8m0_to_float  # noqa: F401
@@ -126,6 +132,9 @@ from .builtin import syncthreads_and as syncthreads_and  # noqa: F401
 from .builtin import syncthreads_or as syncthreads_or  # noqa: F401
 
 from .utils import index_to_coordinates  # noqa: F401
+
+# RFC §6 — cross-source extern intrinsic declaration mechanism.
+from .extern import extern_intrinsic, Frag  # noqa: F401
 
 from .symbolics import dynamic, symbolic  # noqa: F401
 from .annotations import (  # noqa: F401

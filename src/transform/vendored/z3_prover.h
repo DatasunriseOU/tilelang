@@ -70,8 +70,100 @@ class Z3Prover {
   void SetTimeoutMs(unsigned timeout_ms);
   void SetRLimit(unsigned rlimit);
 
+  // Switch the prover between unbounded Int sort (default, width=0) and a
+  // signed BitVector sort of the given width (32 or 64). In BV mode, all
+  // arithmetic uses bvadd/bvsub/bvmul/bvsdiv/bvsmod and comparisons use the
+  // signed bv predicates (bvslt/bvsle/bvsgt/bvsge); equality stays as
+  // operator==/operator!=, which work for either sort. The mode is
+  // per-Analyzer-cached-instance and persists across calls until reset by
+  // another `SetBitVectorMode(width)`. Switching mode invalidates any
+  // previously declared variables: callers must re-`Bind` after a mode
+  // change. Default behavior (width=0) is bit-identical to the prior API.
+  //
+  // PREFER `ScopedBVMode` (defined below) over raw `SetBitVectorMode` calls.
+  // Because the prover instance is cached per-Analyzer, a bare
+  // `SetBitVectorMode(32)` leaks BV semantics into the next caller that
+  // expects Int mode. `ScopedBVMode` records the prior width and restores it
+  // on scope exit.
+  //
+  // CPPMEGA fix-A2 audit (z3-stack, 2026-05-07): the only call sites of
+  // `SetBitVectorMode` outside this header/impl are the test-FFI helpers
+  // `BvCanProve` and `BvScopedRoundTrip` (see z3_prover.cc, both of which
+  // create a fresh `Analyzer` and exit immediately after the call, so
+  // mode leak is impossible). There are zero production call sites today.
+  // Future production callers MUST use `ScopedBVMode` and not the raw
+  // method — adding a new direct call requires reviewer sign-off.
+  void SetBitVectorMode(int width);
+  int GetBitVectorWidth() const;
+
+  // CPPMEGA z3-stack fix-A6: per-pass solver reset. Clears memo/scope
+  // stack and rebuilds the solver while preserving the current
+  // `bv_width_`. Use this between pass invocations instead of
+  // `SetBitVectorMode(currentWidth)` (which is a no-op due to the
+  // mode-equality fast-path and therefore does NOT clear state).
+  // Currently has no in-tree caller; provided for future pass drivers
+  // that want a clean proof context without flipping mode.
+  //
+  // CPPMEGA fix-B7 (idea712): atomic reset of (var memo + solver assertions
+  // + scope stack). This is the audit hook for any future
+  // `SetBitVectorMode(width)` port from the parallel `z3-stack` branch:
+  // when the prover swaps int sort for BV<width>, every memoized
+  // `PrimExpr -> z3::expr` mapping becomes invalid (it's still pointing at
+  // the old sort), AND the solver's accumulated assertions reference those
+  // stale exprs, AND the scope stack remembers their push/pop pairings.
+  //
+  // The right invariant is "state is one indivisible unit". Tearing it
+  // apart — clearing memo_ but not the solver, or vice versa — produces
+  // exactly the silent correctness bugs the cross-checked review flagged.
+  //
+  // `Reset()` enforces the invariant: must be called when the constraint
+  // scope stack is at its root (no outstanding `EnterConstraint`
+  // recoverers); fails-fast otherwise to surface the lifecycle violation.
+  void Reset();
+
  private:
   std::unique_ptr<Z3ProverImpl> impl_;
+};
+
+// RAII guard that switches a `Z3Prover` to a target BV width on
+// construction and restores the previous width on destruction. Strongly
+// preferred over raw `SetBitVectorMode(width)` calls because the prover
+// instance is per-Analyzer-cached and the mode persists across calls; a
+// bare `SetBitVectorMode(32)` therefore leaks BV state into the next
+// caller (which may want Int-mode proofs). Use `ScopedBVMode` whenever a
+// caller needs BV semantics for a bounded scope:
+//
+//   {
+//     ScopedBVMode g(prover, 32);
+//     prover.Bind(...);
+//     prover.CanProve(...);
+//   }  // <-- prover is back in its prior mode here.
+//
+// Switching mode invalidates previously declared variables (see
+// `SetBitVectorMode` docs); on enter and on exit the solver state is
+// reset, so do not nest scopes that share variable bindings.
+class ScopedBVMode {
+ public:
+  ScopedBVMode(Z3Prover& prover, int width)
+      : prover_(prover), prev_width_(prover.GetBitVectorWidth()) {
+    prover_.SetBitVectorMode(width);
+  }
+  // CPPMEGA fix-A1: dtor is `noexcept` because RAII destructors must not
+  // throw — terminate() if SetBitVectorMode ever propagated an exception
+  // would be the only safe outcome. The infallible variant of
+  // SetBitVectorMode (catches any internal exception, logs, defaults to
+  // bv_width=0) means we don't actually rely on this in practice, but the
+  // marker makes the contract explicit at the type-system level.
+  ~ScopedBVMode() noexcept { prover_.SetBitVectorMode(prev_width_); }
+
+  ScopedBVMode(const ScopedBVMode&) = delete;
+  ScopedBVMode& operator=(const ScopedBVMode&) = delete;
+  ScopedBVMode(ScopedBVMode&&) = delete;
+  ScopedBVMode& operator=(ScopedBVMode&&) = delete;
+
+ private:
+  Z3Prover& prover_;
+  int prev_width_;
 };
 
 // Per-Analyzer cache — owns the real `Z3Prover` instances. Keyed by
@@ -79,6 +171,15 @@ class Z3Prover {
 // scope share solver state. `thread_local` guards Z3 context affinity (Z3's
 // own context is not thread-safe).
 Z3Prover& GetOrCreate(::tvm::arith::Analyzer* analyzer);
+
+// CPPMEGA z3-stack fix-A8 (NEW-2): per-pass cache hygiene. Pass drivers
+// MUST call `ClearProverCache()` (or `ResetProverFor(specific_analyzer)`)
+// at pass entry to prevent cross-pass contamination — the per-thread
+// `Analyzer*`-keyed cache survives across passes and a heap-address
+// reuse for a freed Analyzer would otherwise hand a stale prover (with
+// stale memo/scope/bv-mode) to the new owner. Cheap; idempotent.
+void ClearProverCache();
+void ResetProverFor(::tvm::arith::Analyzer* analyzer);
 
 }  // namespace tlz3
 }  // namespace tilelang

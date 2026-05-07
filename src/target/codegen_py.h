@@ -166,8 +166,23 @@ protected:
   // statment
   void VisitStmt_(const BufferStoreNode *op) override;
   void VisitStmt_(const DeclBufferNode *op) override;
-  void VisitStmt_(const LetStmtNode *op) override;
-  void VisitStmt_(const AllocateNode *op) override;
+  // CPPMEGA: LetStmtNode here is the TileLang-vendored
+  // `tilelang::tl_tir::LetStmtNode`, not apache's `tirx::BindNode`. Apache's
+  // `StmtFunctor` dispatch table doesn't know this type, so the method
+  // cannot mark `override`. The vendored LetStmt is lowered to
+  // SeqStmt({Bind(var, value), body}) before codegen (see lower_let_stmt.cc),
+  // so this method is dead code in the apache pipeline. Kept for source
+  // compatibility with sites that explicitly call it.
+  void VisitStmt_(const LetStmtNode *op);
+  // CPPMEGA: AllocateNode here is the TileLang-vendored
+  // `tilelang::tl_tir::AllocateNode` (see vendored/allocate.h and the alias
+  // installed in vendored/tl_compat.h). Apache's `StmtFunctor` dispatch table
+  // does not list this vendored type, so the method cannot be marked
+  // `override`. The vendored `Allocate` is lowered to apache `tirx::AllocBuffer`
+  // before codegen (see vendored/lower_allocate.cc); this method is kept for
+  // source compatibility with sites that dispatch to it explicitly via
+  // `as<AllocateNode>()`.
+  void VisitStmt_(const AllocateNode *op);
   void VisitStmt_(const AttrStmtNode *op) override;
   void VisitStmt_(const ForNode *op) override;
   void VisitStmt_(const WhileNode *op) override;

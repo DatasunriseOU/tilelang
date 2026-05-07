@@ -52,6 +52,7 @@
 
 #include "tvm/ffi/cast.h"
 #include "tvm/ffi/object.h"
+#include "tvm/ffi/reflection/registry.h"
 #include "tvm/ffi/string.h"
 
 namespace tilelang {
@@ -141,6 +142,64 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
   Namespace ns;
   unsigned timeout_ms{UINT_MAX};
   unsigned rlimit{UINT_MAX};
+  // 0 == unbounded Int sort (default, bit-identical to prior behavior).
+  // 32 / 64 == signed BitVector sort of that width. See SetBitVectorMode().
+  int bv_width_{0};
+  // First-occurrence flags for once-per-Analyzer warnings about silent
+  // BV truncation (MakeIntVal) and out-of-range range binds (Bind/Range).
+  bool bv_truncation_warned_{false};
+  bool bv_range_warned_{false};
+
+  // Helpers that hide the Int-vs-BV sort dispatch. In default mode
+  // (bv_width_ == 0) these behave exactly like the old direct calls into
+  // ctx->int_*; in BV mode they produce sized bv_const / bv_val with the
+  // current width, and bv_sort for the sort.
+  ::z3::sort MakeIntSort() {
+    if (bv_width_ > 0) return ctx->bv_sort(static_cast<unsigned>(bv_width_));
+    return ctx->int_sort();
+  }
+  ::z3::expr MakeIntConst(const std::string& name) {
+    if (bv_width_ > 0) {
+      return ctx->bv_const(name.c_str(), static_cast<unsigned>(bv_width_));
+    }
+    return ctx->int_const(name.c_str());
+  }
+  ::z3::expr MakeIntVal(int64_t value) {
+    if (bv_width_ > 0) {
+      // Z3 bv_val sign-extends/truncates to the requested width; for an
+      // int64 IntImm that "doesn't fit" in BV32 the high bits are
+      // dropped, matching standard two's-complement wrapping. Warn once
+      // per Analyzer when this happens — the result is well-defined but
+      // usually indicates an upstream bug (e.g. BV32 mode against an
+      // INT64-typed constant). Don't fail; the caller may still want the
+      // wrapped value (e.g. to test wrap-aware proofs).
+      if (!bv_truncation_warned_ && bv_width_ < 64) {
+        int64_t lo = (bv_width_ == 32) ? static_cast<int64_t>(INT32_MIN)
+                                       : -(int64_t{1} << (bv_width_ - 1));
+        int64_t hi = (bv_width_ == 32) ? static_cast<int64_t>(INT32_MAX)
+                                       : ((int64_t{1} << (bv_width_ - 1)) - 1);
+        if (value < lo || value > hi) {
+          LOG(WARNING) << "Z3Prover BV" << bv_width_
+                       << ": MakeIntVal(" << value
+                       << ") wraps (signed range [" << lo << ", " << hi
+                       << "]); proof results may reflect two's-complement "
+                          "wrap, not unbounded Int semantics. "
+                          "(further occurrences suppressed)";
+          bv_truncation_warned_ = true;
+        }
+      }
+      return ctx->bv_val(static_cast<long long>(value),
+                         static_cast<unsigned>(bv_width_));
+    }
+    return ctx->int_val(value);
+  }
+  ::z3::expr MakeUIntVal(uint64_t value) {
+    if (bv_width_ > 0) {
+      return ctx->bv_val(static_cast<unsigned long long>(value),
+                         static_cast<unsigned>(bv_width_));
+    }
+    return ctx->int_val(value);
+  }
 
   static ::z3::solver CreateSolver(::z3::context& ctx) {
     ::z3::solver solver(ctx);
@@ -162,8 +221,12 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     if (dtype.is_bool()) {
       return ctx->bool_const(name.c_str());
     } else {
-      ::z3::expr e = ctx->int_const(name.c_str());
-      if (dtype.is_uint() && dtype.bits() == 64) {
+      ::z3::expr e = MakeIntConst(name);
+      if (bv_width_ > 0) {
+        // In BV mode the variable is already bounded by its sort width.
+        // Adding range constraints in terms of int_val would mix sorts;
+        // skip them.
+      } else if (dtype.is_uint() && dtype.bits() == 64) {
         solver.add(ctx->int_val(0) <= e &&
                    e <= ctx->int_val((uint64_t)UINT64_MAX));
       } else {
@@ -200,10 +263,30 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     this->is_assume = is_assume_in;
     solver.add(VisitBool(constraint));
     this->is_assume = false;
-    auto side_effect_exprs = std::move(side_effect_exprs_);
-    side_effect_exprs_.clear();
+    // CPPMEGA fix-A4: snapshot `side_effect_exprs_` into a local. The
+    // member is then explicitly cleared so subsequent
+    // VisitBool/ConvertInt calls (between EnterConstraint and the
+    // returned recovery lambda firing) start with a fresh accumulator.
+    // The recovery lambda below captures the snapshot by VALUE — this
+    // is critical because:
+    //   (1) the `side_effect_exprs_` member is rewritten by every
+    //       subsequent VisitBool/ConvertInt that runs while the
+    //       constraint is on the stack, so a `[this, &]` capture would
+    //       see the wrong set at lambda-fire time, and
+    //   (2) the lambda may outlive the local snapshot — the caller
+    //       hands the std::function back up the call stack, so a
+    //       reference-to-local capture is a use-after-scope.
+    // We move out of the member to avoid an extra copy, then explicitly
+    // copy into the lambda capture (the `=` form spells it out).
+    std::vector<PrimExpr> side_effect_exprs = std::move(side_effect_exprs_);
+    side_effect_exprs_.clear();  // moved-from is valid-but-unspecified;
+                                 // make the member explicitly empty.
     if (is_assume_in) {
-      return [this, side_effect_exprs]() {
+      // Capture-by-value (explicit): `side_effect_exprs` is copied into
+      // the lambda. The original local will go out of scope at the end
+      // of EnterConstraint; the lambda's copy survives until the
+      // recovery fires.
+      return [this, side_effect_exprs = std::move(side_effect_exprs)]() {
         solver.pop();
         for (const auto& expr : side_effect_exprs) {
           memo_.erase(expr);
@@ -211,6 +294,12 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
         scope_stack_.pop_back();
       };
     } else {
+      // Non-is_assume path: side effects are erased *now* (the local
+      // snapshot is consumed before the lambda is constructed), so the
+      // lambda only needs `this`. Doing the erase here matches the
+      // pre-fix behavior and keeps the constraint scope's solver state
+      // tight (we don't carry the side_effect set forward into the
+      // recovery closure).
       for (const auto& expr : side_effect_exprs) {
         memo_.erase(expr);
       }
@@ -250,11 +339,19 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
   bool CanProve(const PrimExpr& expr) {
     if (CheckTrivilBadCases(expr)) return false;
     if (!IsValidDType(expr->dtype)) return false;
-    ::z3::expr_vector constr(*ctx);
-    constr.push_back(!ConvertBool(expr));
-    auto result = solver.check(constr);
-    constr.pop_back();
-    return result == ::z3::unsat;
+    try {
+      ::z3::expr_vector constr(*ctx);
+      constr.push_back(!ConvertBool(expr));
+      auto result = solver.check(constr);
+      constr.pop_back();
+      return result == ::z3::unsat;
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "Z3 query exception: " << e.what();
+      return false;
+    } catch (...) {
+      LOG(WARNING) << "Z3 query unknown exception";
+      return false;
+    }
   }
 
   void Bind(const Var& var, const PrimExpr& value, bool /*allow_override*/) {
@@ -267,21 +364,90 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     if (!IsValidDType(var->dtype)) return;
     scope_stack_.back().push_back(
         Scope{Scope::BindRange, var, PrimExpr(), range->min, range->extent});
+    // CPPMEGA fix-A3: defer memoization until after the BV-range check.
+    // Previously we wrote `memo_.emplace(var, var_expr)` here unconditionally,
+    // which meant an out-of-range bind in BV mode left the var memoized at
+    // the current sort but with no range constraint asserted in the solver.
+    // A subsequent CanProve over the same var would then see a free symbol
+    // and silently skip the intended bound. Compute `var_expr` but only
+    // commit it to memo_ once we know we're going to assert the constraints.
+    //
+    // CPPMEGA fix-A7: round-3 update — when the caller's range exceeds
+    // the BV width, we now ALWAYS commit a memoization (clamped to the
+    // BV range) rather than silently dropping the bind. See the
+    // out-of-range branch below for the full rationale.
     auto var_expr = Create(var.as<PrimExprNode>());
-    memo_.emplace(var, var_expr);
+    bool commit_memo = true;
     if (tirx_op::is_const_int(range->min) &&
         tirx_op::is_const_int(range->min + range->extent)) {
       int64_t min_value = *tirx_op::as_const_int(range->min);
       int64_t max_value = *tirx_op::as_const_int(range->min + range->extent);
       if (min_value < max_value) {
-        solver.add(ctx->int_val(min_value) <= var_expr);
-        solver.add(var_expr < ctx->int_val(max_value));
+        // In BV mode, skip binds with bounds outside the BV width's
+        // signed range rather than synthesize wrap-around BV constants
+        // that would silently misrepresent intent. Warn at most once per
+        // Analyzer to avoid log spam in a long compile.
+        if (bv_width_ > 0 && bv_width_ < 64) {
+          int64_t lo = (bv_width_ == 32) ? static_cast<int64_t>(INT32_MIN)
+                                         : -(int64_t{1} << (bv_width_ - 1));
+          int64_t hi = (bv_width_ == 32) ? static_cast<int64_t>(INT32_MAX)
+                                         : ((int64_t{1} << (bv_width_ - 1)) - 1);
+          if (min_value < lo || max_value > hi) {
+            if (!bv_range_warned_) {
+              LOG(WARNING) << "Z3Prover BV" << bv_width_
+                           << ": clamping out-of-range bind " << var
+                           << " in [" << min_value << ", " << max_value
+                           << ") to signed BV range [" << lo << ", " << hi
+                           << "]. (further occurrences suppressed)";
+              bv_range_warned_ = true;
+            }
+            // CPPMEGA fix-A7: NEW-1 (round-3): the previous fix-A3 bailed
+            // here without writing memo_, which left a hole — a later
+            // Visit(var) would mint a *fresh* free Z3 symbol, so the
+            // caller's range request was silently dropped while the
+            // prover happily reasoned about an unconstrained variable.
+            // Conservative fallback: memoize `var_expr` and assert the
+            // BV-clamped range [lo, hi+1) so subsequent uses see the
+            // tightest sound approximation we can express in this sort.
+            // This is over-approximation (the BV interval is wider than
+            // the caller's intent), so any CanProve we return remains
+            // sound; we only lose precision, never correctness.
+            int64_t clamped_min = std::max<int64_t>(min_value, lo);
+            int64_t clamped_max =
+                std::min<int64_t>(max_value, hi + int64_t{1});
+            if (clamped_min >= clamped_max) {
+              // Caller's range is entirely outside BV bounds — there's
+              // no representable interval. Fall back to the full BV
+              // range to keep the var bound at the right sort.
+              clamped_min = lo;
+              clamped_max = hi + int64_t{1};
+            }
+            memo_.emplace(var, var_expr);
+            solver.add(MakeIntVal(clamped_min) <= var_expr);
+            solver.add(var_expr < MakeIntVal(clamped_max));
+            commit_memo = false;
+            return;
+          }
+        }
+        memo_.emplace(var, var_expr);
+        solver.add(MakeIntVal(min_value) <= var_expr);
+        solver.add(var_expr < MakeIntVal(max_value));
+        commit_memo = false;  // already committed
+      } else {
+        // Empty range — drop the memo write to avoid leaking a free var
+        // with no range. (Pre-fix-A3 we'd memoize anyway.)
+        commit_memo = false;
+        return;
       }
     } else {
+      memo_.emplace(var, var_expr);
       solver.add(ConvertBool(range->extent <= 0 ||
                              (range->min <= var &&
                               var < range->min + range->extent)));
+      commit_memo = false;
     }
+    (void)commit_memo;  // explicit: every code path that exits this
+                        // function has either committed memo or returned.
   }
 
   void SetTimeoutMs(unsigned timeout_ms_in) {
@@ -293,6 +459,48 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     this->rlimit = rlimit_in;
     solver.set("rlimit", rlimit_in);
   }
+
+  // CPPMEGA fix-A6: factored solver-rebuild helper. Used by both
+  // `SetBitVectorMode` (when the mode actually changes) and the new
+  // public `Reset()` (per-pass reseed). Centralizing the rebuild
+  // sequence avoids drift between the two paths.
+  void RebuildSolver_() {
+    bv_truncation_warned_ = false;
+    bv_range_warned_ = false;
+    memo_.clear();
+    side_effect_exprs_.clear();
+    solver = CreateSolver(*ctx);
+    solver.set("timeout", timeout_ms);
+    solver.set("rlimit", rlimit);
+    scope_stack_.clear();
+    scope_stack_.push_back({});
+    ns = Namespace{};
+  }
+
+  void SetBitVectorMode(int width) {
+    ICHECK(width == 0 || width == 32 || width == 64)
+        << "Z3Prover::SetBitVectorMode only supports width in {0, 32, 64}, "
+        << "got " << width;
+    // CPPMEGA fix-A6: same-width fast-path. Mode-equality short-circuits
+    // the full solver rebuild — important because compile-time blowup
+    // was traced to passes calling `SetBitVectorMode(32)` redundantly
+    // on every CanProve. The condition also covers width=0 → width=0
+    // (Int → Int) which previously rebuilt unnecessarily.
+    if (width == bv_width_) return;
+    bv_width_ = width;
+    // Mode change: invalidate any pre-existing variable / sub-expression
+    // encodings (declared at the old sort) by rebuilding the solver.
+    RebuildSolver_();
+  }
+
+  // CPPMEGA fix-A6: public per-pass reset. Callers (pass drivers) that
+  // want to start a fresh proof context without flipping bv_width
+  // should use `Reset()` instead of `SetBitVectorMode(currentWidth)` —
+  // the latter is a no-op (see fast-path above) and would NOT actually
+  // clear memo / scope stack. `Reset()` does. Bv_width is preserved.
+  void Reset() { RebuildSolver_(); }
+
+  int GetBitVectorWidth() const { return bv_width_; }
 
   std::string GetSMTLIB2() {
     std::stringstream ss;
@@ -391,7 +599,7 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
       }
       found_values.push_back(val);
       count++;
-      solver.add(z3_var != ctx->int_val(val));
+      solver.add(z3_var != MakeIntVal(val));
     }
 
     solver.pop();
@@ -476,7 +684,7 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
   ::z3::expr VisitInt(const PrimExpr& expr) {
     auto e = VisitExpr(expr);
     if (e.is_bool()) {
-      return ::z3::ite(e, ctx->int_val(1), ctx->int_val(0));
+      return ::z3::ite(e, MakeIntVal(1), MakeIntVal(0));
     } else {
       return e;
     }
@@ -485,7 +693,7 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
   ::z3::expr VisitBool(const PrimExpr& e) {
     auto expr = VisitExpr(e);
     if (expr.is_bool()) return expr;
-    return expr != ctx->int_val(0);
+    return expr != MakeIntVal(0);
   }
 
   ::z3::expr VisitArith(Z3BinOp signed_op, const PrimExprNode* op,
@@ -516,14 +724,38 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     return Create(op);
   }
   ::z3::expr VisitExpr_(const ReduceNode* op) override { return Create(op); }
+  // In BV mode every Z3 operand of an arithmetic / relational op must be a
+  // BV of the current width; in Int mode operands must be Int. The Z3 C++
+  // overloads will raise an error if you mix sorts (e.g. an Int operand
+  // accidentally surfacing inside a BV computation), but the resulting
+  // diagnostic is opaque. Assert sorts up front so misroutes blow up with a
+  // useful message at the source-level node that produced the mismatch.
+  void AssertOperandSort(const ::z3::expr& e, const char* where) const {
+    if (bv_width_ > 0) {
+      ICHECK(e.is_bv())
+          << "Z3Prover " << where << ": expected BV operand at width "
+          << bv_width_ << ", got non-BV sort";
+      ICHECK_EQ(e.get_sort().bv_size(), static_cast<unsigned>(bv_width_))
+          << "Z3Prover " << where << ": BV operand width mismatch (have "
+          << e.get_sort().bv_size() << ", want " << bv_width_ << ")";
+    } else {
+      ICHECK(e.is_int())
+          << "Z3Prover " << where
+          << ": expected Int operand in default (non-BV) mode";
+    }
+  }
   ::z3::expr VisitExpr_(const MinNode* op) override {
     auto a = VisitInt(op->a);
     auto b = VisitInt(op->b);
+    AssertOperandSort(a, "MinNode.a");
+    AssertOperandSort(b, "MinNode.b");
     return ::z3::ite(a < b, a, b);
   }
   ::z3::expr VisitExpr_(const MaxNode* op) override {
     auto a = VisitInt(op->a);
     auto b = VisitInt(op->b);
+    AssertOperandSort(a, "MaxNode.a");
+    AssertOperandSort(b, "MaxNode.b");
     return ::z3::ite(a > b, a, b);
   }
   static ::z3::expr floordiv(const ::z3::expr& a, const ::z3::expr& b) {
@@ -551,7 +783,27 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     return VisitArith(floordiv, op, op->a, op->b);
   }
   ::z3::expr VisitExpr_(const FloorModNode* op) override {
-    return VisitArith(floormod, op, op->a, op->b);
+    // BV-aware FloorMod dispatch.
+    //
+    // In Int mode (bv_width_ == 0) Z3's `operator%` lowers to `Z3_mk_mod`,
+    // which implements SMT-LIB Int mod (Euclidean / non-negative remainder).
+    // That does NOT match TIR FloorMod semantics (sign-of-divisor) when
+    // `b < 0`, so the `floormod` helper is required to reconstruct
+    // sign-of-divisor floor-mod from the Int-mod primitive.
+    //
+    // In BV mode (bv_width_ > 0) Z3's `operator%` lowers to `Z3_mk_bvsmod`,
+    // which is the SMT-LIB signed BV mod and ALREADY implements
+    // sign-of-divisor semantics — exactly TIR FloorMod. Applying the
+    // `ite(b > 0, a % b, -((-a) % b))` helper on top of `bvsmod` is a
+    // double-correction (it would re-flip the sign for negative divisors,
+    // producing the wrong result for FloorMod(5, -3) etc.).
+    if (IsValidDType(op->a->dtype) && IsValidDType(op->b->dtype)) {
+      auto a = VisitInt(op->a);
+      auto b = VisitInt(op->b);
+      if (bv_width_ > 0) return a % b;  // bvsmod, already TIR FloorMod.
+      return floormod(a, b);
+    }
+    return Create(op);
   }
   ::z3::expr VisitExpr_(const EQNode* op) override {
     return VisitArith(::z3::operator==, op, op->a, op->b);
@@ -581,11 +833,14 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     return !VisitBool(op->a);
   }
   ::z3::expr VisitExpr_(const SelectNode* op) override {
-    return ::z3::ite(VisitBool(op->condition), VisitInt(op->true_value),
-                     VisitInt(op->false_value));
+    auto t = VisitInt(op->true_value);
+    auto f = VisitInt(op->false_value);
+    AssertOperandSort(t, "SelectNode.true_value");
+    AssertOperandSort(f, "SelectNode.false_value");
+    return ::z3::ite(VisitBool(op->condition), t, f);
   }
   ::z3::expr VisitExpr_(const IntImmNode* op) override {
-    return ctx->int_val(op->value);
+    return MakeIntVal(op->value);
   }
 
   ::z3::expr VisitExpr_(const CallNode* op) override {
@@ -615,6 +870,10 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     unsigned bit_width =
         std::max(op->args[0].dtype().bits(), op->args[1].dtype().bits());
     if (IsValidDType(a->dtype) && IsValidDType(b->dtype)) {
+      if (bv_width_ > 0) {
+        // Already BV; bitwise op directly on the BV values.
+        return op_func(VisitInt(a), VisitInt(b));
+      }
       return ::z3::bv2int(
           op_func(::z3::int2bv(bit_width, VisitInt(a)),
                   ::z3::int2bv(bit_width, VisitInt(b))),
@@ -628,6 +887,9 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     ICHECK_EQ(op->args.size(), 1u);
     const PrimExpr& a = op->args[0];
     if (IsValidDType(a->dtype)) {
+      if (bv_width_ > 0) {
+        return ~VisitInt(a);
+      }
       unsigned bit_width = a.dtype().bits();
       ::z3::expr a_int = VisitInt(a);
       ::z3::expr a_bv = ::z3::int2bv(bit_width, a_int);
@@ -644,6 +906,13 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     const PrimExpr& a = op->args[0];
     const PrimExpr& b = op->args[1];
     if (IsValidDType(a->dtype) && IsValidDType(b->dtype)) {
+      if (bv_width_ > 0) {
+        ::z3::expr a_bv = VisitInt(a);
+        ::z3::expr b_bv = VisitInt(b);
+        solver.add(b_bv >= MakeIntVal(0));
+        solver.add(b_bv < MakeIntVal(bv_width_));
+        return op_func(a_bv, b_bv);
+      }
       ::z3::expr a_expr = VisitInt(a);
       ::z3::expr b_expr = VisitInt(b);
       solver.add(b_expr >= 0);
@@ -708,21 +977,129 @@ void Z3Prover::SetTimeoutMs(unsigned timeout_ms) {
   impl_->SetTimeoutMs(timeout_ms);
 }
 void Z3Prover::SetRLimit(unsigned rlimit) { impl_->SetRLimit(rlimit); }
+// CPPMEGA fix-A1: infallible facade. `SetBitVectorMode` may invoke
+// `CreateSolver` / Z3 reset, which can theoretically throw (e.g., OOM,
+// invalid config). Because this method is invoked by `~ScopedBVMode()`
+// (a noexcept destructor), any propagated exception would call
+// std::terminate. Catch any internal failure here, log once, and fall
+// back to bv_width=0 (Int sort) — that mode is the most permissive and
+// preserves correctness at the cost of losing BV-mode wrap semantics.
+void Z3Prover::SetBitVectorMode(int width) {
+  try {
+    impl_->SetBitVectorMode(width);
+  } catch (const ::z3::exception& e) {
+    LOG(WARNING) << "Z3Prover::SetBitVectorMode(" << width
+                 << ") failed (" << e.msg() << "); falling back to "
+                 << "Int sort (bv_width=0).";
+    try {
+      impl_->SetBitVectorMode(0);
+    } catch (...) {
+      // Even fallback failed; swallow — the prover is in an undefined
+      // state, but we cannot throw from this entry point.
+    }
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "Z3Prover::SetBitVectorMode(" << width
+                 << ") failed (" << e.what() << "); falling back to "
+                 << "Int sort (bv_width=0).";
+    try {
+      impl_->SetBitVectorMode(0);
+    } catch (...) {
+    }
+  } catch (...) {
+    LOG(WARNING) << "Z3Prover::SetBitVectorMode(" << width
+                 << ") failed with unknown exception; falling back to "
+                 << "Int sort (bv_width=0).";
+    try {
+      impl_->SetBitVectorMode(0);
+    } catch (...) {
+    }
+  }
+}
+int Z3Prover::GetBitVectorWidth() const {
+  return impl_->GetBitVectorWidth();
+}
+// CPPMEGA z3-stack fix-A6/A8 + idea712 fix-B7: atomic reset of
+// (memo + solver + scope_stack). The B7 implementation supersedes the
+// earlier A8 forwarder (`impl_->Reset()`); it adds lifecycle checks and
+// directly manages each piece of state for invariant-preserving teardown.
+
+// CPPMEGA fix-B7 (idea712): atomic reset of (memo + solver + scope_stack).
+// See the header doc for the audit rationale. The function is exposed for
+// the future `SetBitVectorMode(width)` port; today it is also a useful
+// "hard reset" hook for tests that want to ensure prior queries on the
+// same Analyzer cannot pollute a new probe.
+void Z3Prover::Reset() {
+  // Lifecycle check: refuse to reset while there are outstanding
+  // EnterConstraint scopes. The prover impl manages a `scope_stack_` of
+  // `std::vector<Scope>`; at construction it pushes a single root frame,
+  // and every EnterConstraint/Bind appends. The invariant for a clean
+  // reset: only the root frame is present and it is empty. Anything else
+  // means a caller forgot to recover() or destructed a ConstraintScope
+  // out of order.
+  ICHECK(impl_) << "Z3Prover::Reset called on null impl";
+  ICHECK_EQ(impl_->scope_stack_.size(), 1u)
+      << "Z3Prover::Reset called with " << impl_->scope_stack_.size()
+      << " scope frames; recover all EnterConstraint scopes first.";
+  ICHECK(impl_->scope_stack_.front().empty())
+      << "Z3Prover::Reset called with non-empty root scope frame; "
+      << "Bind/Constraint records still pending.";
+  // Atomic teardown: solver gets a fresh instance (drops all assertions),
+  // memo_ is cleared. Same-thread context affinity is preserved (Z3's
+  // context is per-thread and reused). `side_effect_exprs_` is private to
+  // the impl and is only ever populated during Convert{Bool,Int} calls;
+  // at idle (root scope, no in-flight conversion) it is already empty.
+  impl_->solver = Z3ProverImpl::CreateSolver(*impl_->ctx);
+  impl_->memo_.clear();
+  // scope_stack_ retains the (now-empty) root frame, matching the
+  // post-construction state. is_assume gets reset for safety.
+  impl_->is_assume = false;
+}
 
 // ---------------------------------------------------------------------------
 // Per-Analyzer cache. `thread_local` because the Z3 context inside
 // Z3ProverImpl is also thread_local; mixing analyzers across threads would
 // hand out provers wired to the wrong context.
 
-Z3Prover& GetOrCreate(::tvm::arith::Analyzer* analyzer) {
+// CPPMEGA z3-stack fix-A8: per-thread cache accessor. Factored out so
+// `ClearProverCache()` (below) can reach the same map. Returning by
+// reference is safe: the map itself is `static thread_local`, so its
+// storage outlives any caller frame on this thread.
+static std::unordered_map<::tvm::arith::Analyzer*, std::unique_ptr<Z3Prover>>&
+GetProverCache_() {
   static thread_local std::unordered_map<::tvm::arith::Analyzer*,
                                          std::unique_ptr<Z3Prover>>
       cache;
+  return cache;
+}
+
+Z3Prover& GetOrCreate(::tvm::arith::Analyzer* analyzer) {
+  auto& cache = GetProverCache_();
   auto& slot = cache[analyzer];
   if (!slot) {
     slot = std::make_unique<Z3Prover>(analyzer);
   }
   return *slot;
+}
+
+// CPPMEGA z3-stack fix-A8 (NEW-2): clear the entire per-thread prover
+// cache. Intended to be called at every pass-driver entry point so two
+// consecutive passes that happen to receive the same `Analyzer*`
+// (either by deliberate reuse or by heap-address coincidence after a
+// previous Analyzer was freed) cannot inherit memo / scope / bv-mode
+// state from the prior pass. Cheap (drops unique_ptrs) and safe to call
+// any number of times.
+void ClearProverCache() { GetProverCache_().clear(); }
+
+// CPPMEGA z3-stack fix-A8 (NEW-2): targeted reset for a specific
+// Analyzer's cached prover. Use when the caller knows the precise
+// Analyzer it owns; safer than a thread-wide clear inside library code
+// that doesn't own the Analyzer lifetime.
+void ResetProverFor(::tvm::arith::Analyzer* analyzer) {
+  auto& cache = GetProverCache_();
+  auto it = cache.find(analyzer);
+  if (it != cache.end() && it->second) {
+    it->second->Reset();
+  }
 }
 
 // CPPMEGA: Auto-driver hooks. Registered at static init so apache
@@ -753,6 +1130,72 @@ struct Z3HookRegistrar {
 };
 static Z3HookRegistrar _z3_hook_registrar;
 }  // namespace
+
+// CPPMEGA: Test-only FFI helpers. Exposes Z3Prover with the bv-mode
+// switch so Python tests can drive the prover directly without needing
+// a full Python binding for the C++ class. The signature is
+//    bv_can_prove(var, lo, hi, expr, bv_width) -> bool
+// where `var` is bound to the half-open range [lo, hi) before the
+// proof attempt; `bv_width` is 0 / 32 / 64 (see SetBitVectorMode).
+//
+// CPPMEGA z3-stack fix-A5: gated by `TILELANG_BUILD_TESTS` (default ON).
+// Release wheels can pass `-DTILELANG_BUILD_TESTS=OFF` to drop these
+// helpers from the FFI surface.
+#ifdef TILELANG_BUILD_TESTS
+bool BvCanProve(const ::tvm::tirx::Var& var, int64_t lo, int64_t hi,
+                const ::tvm::PrimExpr& expr, int bv_width) {
+  ::tvm::arith::Analyzer ana;
+  Z3Prover& prover = GetOrCreate(&ana);
+  prover.SetBitVectorMode(bv_width);
+  ::tvm::Range range = ::tvm::Range::FromMinExtent(
+      ::tvm::IntImm(var->dtype, lo),
+      ::tvm::IntImm(var->dtype, hi - lo));
+  prover.Bind(var, range);
+  return prover.CanProve(expr);
+}
+
+// CPPMEGA: ScopedBVMode round-trip exerciser. Creates a fresh Analyzer's
+// prover at `outer_width`, opens a `ScopedBVMode(inner_width)` block,
+// optionally runs a trivial CanProve inside it, then on scope exit
+// confirms the prover is back at `outer_width`. Returns the *observed*
+// width after the inner scope closes; the test asserts it equals
+// `outer_width`. This is the only public way (without a full Z3Prover
+// Python binding) to confirm RAII restoration in-process.
+int BvScopedRoundTrip(int outer_width, int inner_width) {
+  ::tvm::arith::Analyzer ana;
+  Z3Prover& prover = GetOrCreate(&ana);
+  prover.SetBitVectorMode(outer_width);
+  {
+    ScopedBVMode guard(prover, inner_width);
+    ICHECK_EQ(prover.GetBitVectorWidth(), inner_width)
+        << "ScopedBVMode failed to enter target width";
+    // Trivial proof inside the inner scope to make sure the solver works
+    // at the inner sort.
+    ::tvm::tirx::Var x("x", ::tvm::DataType::Int(32));
+    ::tvm::Range r = ::tvm::Range::FromMinExtent(
+        ::tvm::IntImm(x->dtype, 0), ::tvm::IntImm(x->dtype, 1));
+    prover.Bind(x, r);
+    (void)prover.CanProve(x == ::tvm::IntImm(x->dtype, 0));
+  }
+  return prover.GetBitVectorWidth();
+}
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = ::tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.z3.bv_can_prove", BvCanProve);
+  refl::GlobalDef().def("tl.z3.bv_scoped_round_trip", BvScopedRoundTrip);
+}
+#endif  // TILELANG_BUILD_TESTS
+
+// CPPMEGA z3-stack fix-A8 (NEW-2): production FFI for cache hygiene.
+// Registered unconditionally (NOT inside the TILELANG_BUILD_TESTS gate)
+// because the pass driver in `tilelang/engine/phase.py` calls these at
+// every pass entry. Both functions are no-ops on an empty cache.
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = ::tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.z3.clear_prover_cache",
+                        []() { ClearProverCache(); });
+}
 
 }  // namespace tlz3
 }  // namespace tilelang

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import tvm
 from tvm import tir, IRModule
 from tvm.target import Target
 import tilelang
@@ -163,6 +164,15 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     Returns:
         IRModule: The transformed module, ready for target-specific optimization passes.
     """
+    # CPPMEGA z3-stack fix-A8 (NEW-2): drop any stale per-thread Z3 prover
+    # cache entries before this pass pipeline runs. The prover cache is
+    # keyed by `Analyzer*`; a freed Analyzer's address can be reused by a
+    # fresh Analyzer in this pass, which would otherwise inherit the
+    # prior pass's memo / scope / bv-mode state. Cheap, idempotent.
+    _z3_clear = tvm.ffi.get_global_func("tl.z3.clear_prover_cache",
+                                        allow_missing=True)
+    if _z3_clear is not None:
+        _z3_clear()
     # CPPMEGA: Lower TileLang's vendored `tilelang::tl_tir::LetStmt` and
     # `tilelang::tl_tir::Allocate` IR nodes to apache TIR equivalents
     # (Bind+SeqStmt, AllocBuffer+SeqStmt) BEFORE any apache TIR pass runs.
@@ -213,6 +223,12 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     from tilelang.transform.metal_fragment_to_simdgroup import MetalFragmentToSimdgroup
 
     mod = MetalFragmentToSimdgroup(mod)
+    # Idea #9 (Z3 roadmap): detect reductions that fit a single simdgroup
+    # and could be lifted off threadgroup memory. Default OFF — gated by
+    # PassConfig key ``tl.simd_lift_reductions``. Detection-only for now.
+    from tilelang.transform.metal_simd_lift import MetalSimdLiftReductions
+
+    mod = MetalSimdLiftReductions(mod)
     # Infer memory layouts for fragments and shared memory
     mod = tilelang.transform.LayoutInference()(mod)
     # Visualize the layout
@@ -227,6 +243,11 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.LegalizeVectorizedLoop()(mod)
     # Add safety checks for memory accesses
     mod = tilelang.transform.LegalizeSafeMemoryAccess()(mod)
+    # CPPMEGA: Z3 idea #7 — predicate fusion. Runs immediately after the
+    # safe-memory-access pass (which materializes the `if(a){if(b){...}}`
+    # nesting we target) and before vectorization / async-copy lowering.
+    # Default OFF; opt-in via PassConfig `tl.predicate_fusion`.
+    mod = tilelang.transform.PredicateFusion()(mod)
     # Lower frontend pointer metadata op to standard tvm_access_ptr
     mod = tilelang.transform.LowerAccessPtr()(mod)
     # Simplify again to clean up any duplicated conditions
@@ -242,6 +263,15 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
 
 def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     pass_ctx = tilelang.transform.get_pass_context()
+    # CPPMEGA z3-stack fix-A8 (NEW-2): also clear here. `LowerAndLegalize`
+    # and `OptimizeForTarget` are called as separate phases; either may be
+    # invoked in isolation by tools, and the per-thread Z3 prover cache
+    # outlives both. Clearing at every phase entry keeps the prover state
+    # scoped to the current pass invocation.
+    _z3_clear = tvm.ffi.get_global_func("tl.z3.clear_prover_cache",
+                                        allow_missing=True)
+    if _z3_clear is not None:
+        _z3_clear()
     # CPPMEGA: Defensive re-run of vendored-IR converters in case any TileLang
     # pass in `LowerAndLegalize` re-introduced `tilelang::tl_tir::LetStmt` or
     # `tilelang::tl_tir::Allocate` nodes. This guarantees the IR contains only
@@ -258,6 +288,11 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # InjectSoftwarePipeline, so no late MVB barrier fixup is needed.
     # Buffer allocation placement is handled uniformly for both paths.
     mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
+    # AutoDoubleBuffer: opt-in (PassConfig `tl.auto_double_buffer`, default
+    # OFF). Detects canonical shared-memory tile-load patterns and (when Z3
+    # can prove soundness) inserts ping-pong buffers. Currently a safe stub
+    # — see src/transform/auto_double_buffer.cc.
+    mod = tilelang.transform.AutoDoubleBuffer()(mod)
     mod = tilelang.transform.LowerSharedBarrier()(mod)
     if has_tma:
         mod = tilelang.transform.FuseMBarrierArriveExpectTx()(mod)
@@ -270,6 +305,10 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # as it will flatten index computing
     mod = tilelang.transform.ConfigIndexBitwidth()(mod)
     mod = tir.transform.Simplify()(mod)
+    # CPPMEGA: Z3 roadmap idea #4 — drop provable buffer-bound guards before
+    # vectorization. Gated by `tl.drop_provable_bound_checks` PassConfig
+    # (default OFF). See src/transform/drop_provable_bound_checks.cc.
+    mod = tilelang.transform.DropProvableBoundChecks()(mod)
     mod = tilelang.transform.VectorizeLoop(enable_vectorize=allow_vectorize(pass_ctx=pass_ctx))(mod)
     mod = tilelang.transform.StorageRewrite()(mod)
     mod = tilelang.transform.LoopUnswitching()(mod)
@@ -293,6 +332,15 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tir.transform.InferFragment()(mod)
     mod = tilelang.transform.LowerThreadAllreduce()(mod)
     mod = tilelang.transform.LowerLDGSTG()(mod)
+    # RFC §5.4: decompose Hopper TMA descriptor copies into pointer-arith
+    # `T.copy` loops on non-Hopper targets (Apple Metal SIMDgroup, AMD HIP,
+    # pre-Hopper CUDA, CPU). On NV Hopper+ this is a no-op so the
+    # `LowerHopperIntrin` pass below still owns the native lowering. Slot
+    # is BEFORE `LowerHopperIntrin` (which is gated on CUDA_MAJOR_VERSION
+    # >= 12) and AFTER `LowerTileOp` (which produces the TMA Calls). The
+    # software-pipeliner (`InjectSoftwarePipeline`) runs earlier on tile-op
+    # `T.copy`, so pipelining is unaffected by this pass.
+    mod = tilelang.transform.LowerTMAToPtrArith()(mod)
     mod = tilelang.transform.LowerHopperIntrin()(mod)
     # Global Barrier Synchronization must be applied before
     # SplitHostDevice pass, as the global barrier

@@ -102,3 +102,56 @@ __forceinline__ __device__ float4 AtomicAddx4Ret(float *ref, float *val,
   ret.w = atomicAdd(ref + 3, add_val.w);
   return ret;
 }
+
+// AtomicXchg / AtomicAnd / AtomicOr / AtomicXor — HIP mirrors CUDA's
+// builtin names (``atomicExch`` / ``atomicAnd`` / ``atomicOr`` /
+// ``atomicXor``); these wrappers exist so the codegen emits the same call
+// sites for both targets.
+
+template <typename T1, typename T2>
+__forceinline__ __device__ void AtomicXchg(T1 *ref, T2 val,
+                                           int memory_order = 0) {
+  atomicExch(ref, static_cast<T1>(val));
+}
+
+template <typename T1, typename T2>
+__forceinline__ __device__ T1 AtomicXchgRet(T1 *ref, T2 val,
+                                            int memory_order = 0) {
+  return atomicExch(ref, static_cast<T1>(val));
+}
+
+template <typename T1, typename T2>
+__forceinline__ __device__ void AtomicAnd(T1 *ref, T2 val,
+                                          int memory_order = 0) {
+  atomicAnd(ref, static_cast<T1>(val));
+}
+
+template <typename T1, typename T2>
+__forceinline__ __device__ T1 AtomicAndRet(T1 *ref, T2 val,
+                                           int memory_order = 0) {
+  return atomicAnd(ref, static_cast<T1>(val));
+}
+
+template <typename T1, typename T2>
+__forceinline__ __device__ void AtomicOr(T1 *ref, T2 val,
+                                         int memory_order = 0) {
+  atomicOr(ref, static_cast<T1>(val));
+}
+
+template <typename T1, typename T2>
+__forceinline__ __device__ T1 AtomicOrRet(T1 *ref, T2 val,
+                                          int memory_order = 0) {
+  return atomicOr(ref, static_cast<T1>(val));
+}
+
+template <typename T1, typename T2>
+__forceinline__ __device__ void AtomicXor(T1 *ref, T2 val,
+                                          int memory_order = 0) {
+  atomicXor(ref, static_cast<T1>(val));
+}
+
+template <typename T1, typename T2>
+__forceinline__ __device__ T1 AtomicXorRet(T1 *ref, T2 val,
+                                           int memory_order = 0) {
+  return atomicXor(ref, static_cast<T1>(val));
+}

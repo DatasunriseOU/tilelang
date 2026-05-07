@@ -155,14 +155,73 @@ class PassConfigKey(str, Enum):
     TL_DISABLE_SHUFFLE_ELECT = "tl.disable_shuffle_elect"
     """Disable shuffle election optimization. Default: False"""
 
+    TL_SIMD_LIFT_REDUCTIONS = "tl.simd_lift_reductions"
+    """Idea #9 (Z3 roadmap): on Metal, lift reductions whose tile extent fits
+    within a single simdgroup (<= 32 lanes) into ``simd_shuffle_xor``-based
+    reductions, bypassing threadgroup memory.
+
+    Behaviour:
+
+    * Detection (always): the pass walks reduction loops, runs a Z3 query
+      asserting ``tile_extent <= 32 /\\ reduce_op ∈ {add, max, min, or, and,
+      xor}``, and stashes proved candidates on
+      ``tl.simd_lift_candidates`` for downstream tooling.
+    * Rewrite (gated by this PassConfig + a per-loop ``tl.simd_butterfly_lane``
+      annotation): when both the PassConfig is True *and* the loop is
+      explicitly annotated as a lane-mapped reduction (i.e. ``loop_var``
+      maps to ``lane_id`` within a single simdgroup), the threadgroup-mem
+      reduction is replaced by a butterfly sequence of
+      ``tl.shfl_xor_sync`` calls. The annotation is required because a
+      bare serial reduction loop does not carry lane-mapping information,
+      and rewriting blindly would change semantics.
+
+    Default: False.
+    """
+
     TL_DISABLE_LOOP_UNSWITCHING = "tl.disable_loop_unswitching"
     """Disable loop unswitching optimization. Default: False"""
+
+    TL_DROP_PROVABLE_BOUND_CHECKS = "tl.drop_provable_bound_checks"
+    """Z3 roadmap idea #4: drop runtime buffer-bound `if (i < N) ...` guards
+    when the default analyzer or the vendored Z3 prover can conclusively
+    prove the condition. Conservative — any prover error/timeout/UNKNOWN
+    keeps the guard. Default: False (OFF for safety)."""
+
+    TL_AUTO_DOUBLE_BUFFER = "tl.auto_double_buffer"
+    """Enable auto-detection of canonical shared-memory tile-load patterns
+    and Z3-gated ping-pong (double-buffer) insertion. Default: False (OFF).
+
+    This is an experimental optimization, not a correctness fix. When
+    enabled, the AutoDoubleBuffer pass walks each ``For`` loop searching
+    for the canonical pattern::
+
+        for k in range(N):
+            shared_buf[i] = global_buf[k * stride + i]
+            use(shared_buf[i])
+
+    For each candidate it builds a Z3 soundness obligation and only
+    transforms the IR when the obligation is provable. When the
+    obligation is unknown/disproved, it falls back to single-buffer
+    (no transformation). The current implementation is a safe stub: it
+    detects candidates and logs the Z3 verdict but does not yet emit the
+    ping-pong rewrite — flipping this flag is a no-op for IR shape.
+    """
 
     TL_LOOP_UNSWITCHING_ALLOW_NON_TRIVIAL_ELSE = "tl.loop_unswitching_allow_non_trivial_else"
     """Allow loop unswitching even when the else-version of the loop body has side effects.
 
     This is more aggressive and may increase code size. Default: False.
     """
+
+    TL_PREDICATE_FUSION = "tl.predicate_fusion"
+    """Z3 idea #7: fuse adjacent guarded ``if`` statements when Z3 proves the
+    inner predicate is well-defined unconditionally. Default: False (off)."""
+
+    TL_VECTORIZE_ALIGNMENT_PROOF = "tl.vectorize_alignment_proof"
+    """Z3 idea #12: companion to #1's contiguity proof. Annotate the
+    inner vectorized For with ``tl.vec_aligned`` when Z3 proves the
+    buffer base address is aligned to ``vec_width * dtype_bytes``.
+    Default: False (additive optimization)."""
 
     TL_DISABLE_THREAD_STORAGE_SYNC = "tl.disable_thread_storage_sync"
     """Disable thread storage synchronization pass. When enabled, disables the

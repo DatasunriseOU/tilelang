@@ -17,6 +17,7 @@
 
 #include "../op/builtin.h"
 #include "../transform/common/attr.h"
+#include "../transform/vendored/tl_runtime_symbols.h"
 #include "./ptx.h"
 #include "./utils.h"
 #include "arith/pattern_match.h"
@@ -633,6 +634,20 @@ std::string CodeGenTileLangCUDA::Finish() {
                 << " = 0;\n";
   }
   decl_stream << "\n";
+
+  // RFC §5.4 / lower_tma_to_ptr_arith.cc:249 — pre-Hopper CUDA goes
+  // through the same pointer-arith fallback path as Metal/HIP/CPU, so
+  // ``tl::call_extern("__tl_ptr_copy_elem", dst, src, bytes)`` may
+  // appear in the lowered IR for sm_70/sm_80/sm_86 etc. The Hopper+
+  // path skips the rewrite (TargetNeedsRewrite returns false on sm_90+),
+  // so this helper is dead code there but harmless. Body is a byte
+  // loop — nvcc unrolls + vectorizes when the bytes count is constant.
+  decl_stream << "__device__ inline void __tl_ptr_copy_elem("
+                 "void* dst, const void* src, int bytes) {\n"
+              << "  char* d = (char*)dst;\n"
+              << "  const char* s = (const char*)src;\n"
+              << "  for (int i = 0; i < bytes; ++i) { d[i] = s[i]; }\n"
+              << "}\n\n";
 
   return CodeGenC::Finish();
 }
@@ -2318,6 +2333,14 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << this->PrintExpr(op->args[0]);
     }
     this->stream << ");\n";
+  } else if (op->op.same_as(tl::sync_threads_partial())) {
+    // Partial-warp barrier: only the lanes in `mask` participate. The
+    // n_threads count (op->args[1]) is informational on CUDA — __syncwarp
+    // takes the mask alone.
+    ICHECK_EQ(op->args.size(), 2U)
+        << "tl.sync_threads_partial expects <mask, n_threads>.";
+    this->PrintIndent();
+    this->stream << "__syncwarp(" << this->PrintExpr(op->args[0]) << ");\n";
   } else if (op->op.same_as(tl::pdl_trigger())) {
     this->PrintIndent();
     this->stream << "cudaTriggerProgrammaticLaunchCompletion();\n";
@@ -3921,6 +3944,71 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
       os << ", " << PrintExpr(op->args[2]);
     }
     os << ")";
+  } else if (op->op.same_as(tl::atomic_xchg_elem_op())) {
+    // atomic_xchg_elem_op(dst_ptr, src_value[, memory_order])
+    std::string dst_ptr = PrintExpr(op->args[0]);
+    std::string src_value = PrintExpr(op->args[1]);
+    this->PrintIndent();
+    this->stream << "AtomicXchg(" << dst_ptr << ", " << src_value;
+    if (op->args.size() > 2) {
+      this->stream << ", " << PrintExpr(op->args[2]);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::atomic_xchg_ret_elem_op())) {
+    os << "AtomicXchgRet(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]);
+    if (op->args.size() > 2) {
+      os << ", " << PrintExpr(op->args[2]);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::atomic_and_elem_op())) {
+    std::string dst_ptr = PrintExpr(op->args[0]);
+    std::string src_value = PrintExpr(op->args[1]);
+    this->PrintIndent();
+    this->stream << "AtomicAnd(" << dst_ptr << ", " << src_value;
+    if (op->args.size() > 2) {
+      this->stream << ", " << PrintExpr(op->args[2]);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::atomic_and_ret_elem_op())) {
+    os << "AtomicAndRet(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]);
+    if (op->args.size() > 2) {
+      os << ", " << PrintExpr(op->args[2]);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::atomic_or_elem_op())) {
+    std::string dst_ptr = PrintExpr(op->args[0]);
+    std::string src_value = PrintExpr(op->args[1]);
+    this->PrintIndent();
+    this->stream << "AtomicOr(" << dst_ptr << ", " << src_value;
+    if (op->args.size() > 2) {
+      this->stream << ", " << PrintExpr(op->args[2]);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::atomic_or_ret_elem_op())) {
+    os << "AtomicOrRet(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]);
+    if (op->args.size() > 2) {
+      os << ", " << PrintExpr(op->args[2]);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::atomic_xor_elem_op())) {
+    std::string dst_ptr = PrintExpr(op->args[0]);
+    std::string src_value = PrintExpr(op->args[1]);
+    this->PrintIndent();
+    this->stream << "AtomicXor(" << dst_ptr << ", " << src_value;
+    if (op->args.size() > 2) {
+      this->stream << ", " << PrintExpr(op->args[2]);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::atomic_xor_ret_elem_op())) {
+    os << "AtomicXorRet(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]);
+    if (op->args.size() > 2) {
+      os << ", " << PrintExpr(op->args[2]);
+    }
+    os << ")";
   } else {
     CodeGenC::VisitExpr_(op, os);
   }
@@ -3936,11 +4024,11 @@ void CodeGenTileLangCUDA::VisitStmt_(const AttrStmtNode *op) {
     PrintIndent();
     stream << "}\n";
     return;
-  } else if (op->attr_key == tirx::attr::fragment_shape) {
+  } else if (op->attr_key == s_tir::attr::fragment_shape) {
     const VarNode *buffer = op->node.as<VarNode>();
     const StringImmNode *shape_str = op->value.as<StringImmNode>();
     fragment_shapes[buffer] = shape_str->value;
-  } else if (op->attr_key == tirx::attr::fragment_layout) {
+  } else if (op->attr_key == s_tir::attr::fragment_layout) {
     const VarNode *buffer = op->node.as<VarNode>();
     const StringImmNode *layout_str = op->value.as<StringImmNode>();
     fragment_layouts[buffer] = layout_str->value;
