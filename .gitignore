@@ -125,3 +125,5 @@ maint/host_checks/logs/*
 # agent skills folder
 .humanize*
 /poc/triton_frontend/_cxx/build*/
+/lib
+/tvm

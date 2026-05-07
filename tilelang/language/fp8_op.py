@@ -767,10 +767,20 @@ def _validate_buffers(
     sa_size = _shape_extent(A_scale, 0)
     sb_size = _shape_extent(B_scale, 0)
     if block_scale_layout is not None:
+        # When A_scale / B_scale are passed as ``Buffer[lo:hi]`` the result
+        # is a ``BufferRegion`` (not a ``Buffer``) and has no ``.shape``
+        # attribute. Fall back to the underlying buffer's ``shape`` in
+        # that case so the layout validator still gets concrete extents.
+        a_scale_shape_src = getattr(A_scale, "shape", None)
+        if a_scale_shape_src is None:
+            a_scale_shape_src = getattr(getattr(A_scale, "buffer", None), "shape", ())
+        b_scale_shape_src = getattr(B_scale, "shape", None)
+        if b_scale_shape_src is None:
+            b_scale_shape_src = getattr(getattr(B_scale, "buffer", None), "shape", ())
         block_scale_layout.validate_scale_shapes(
             k_extent=K,
-            a_scale_shape=tuple(int(v) for v in A_scale.shape),
-            b_scale_shape=tuple(int(v) for v in B_scale.shape),
+            a_scale_shape=tuple(int(v) for v in a_scale_shape_src),
+            b_scale_shape=tuple(int(v) for v in b_scale_shape_src),
             n_extent=N,
         )
         return
