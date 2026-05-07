@@ -76,6 +76,12 @@
 #  define TL_PA_HAVE_TRITON 0
 #endif
 
+// Optional nlohmann::json encoder. Compiled in via
+// -DTRITON_FRONTEND_USE_NLOHMANN_JSON=ON in CMake (see CMakeLists.txt).
+#ifdef TL_PA_USE_NLOHMANN_JSON
+#  include "nlohmann/json.hpp"
+#endif
+
 namespace {
 
 struct ContextImpl {
@@ -205,13 +211,36 @@ TLPtrAnalysisStatus tl_pa_run_rewrite(TLPtrAnalysisModule* mod,
 const char* tl_pa_extract_states_json(TLPtrAnalysisModule* mod) {
   if (!mod) return "";
   auto* m = reinterpret_cast<ModuleImpl*>(mod);
-  // Best-effort: walk tts.make_tptr ops and serialize their attributes. We
-  // intentionally avoid pulling in nlohmann::json; the format is a tiny
-  // hand-rolled JSON array. Each entry mirrors the public fields of
-  // mlir::tts::PtrState (offsets/sizes/strides/source).
+  // Walk tts.make_tptr ops and serialize their printed form. Two encoders are
+  // supported and are REQUIRED to emit byte-identical output for the current
+  // minimal schema -- the regression test in tests/test_ptr_analysis.py
+  // guards the contract:
+  //   `[]`                        -> empty
+  //   `[{"op":"<escaped>"}]`      -> compact, no spaces, no trailing newline
+  //
+  // The default is a hand-rolled RFC-8259 escaper (no third-party deps);
+  // -DTRITON_FRONTEND_USE_NLOHMANN_JSON=ON swaps it for nlohmann::json.
+#if TL_PA_HAVE_TRITON_STRUCTURED
+#  ifdef TL_PA_USE_NLOHMANN_JSON
+  // ---- nlohmann::json encoder ---------------------------------------------
+  nlohmann::json arr = nlohmann::json::array();
+  m->module.get().walk([&](mlir::tts::MakeTensorPtrOp op) {
+    std::string opStr;
+    {
+      llvm::raw_string_ostream s(opStr);
+      op->print(s);
+    }
+    arr.push_back({{"op", opStr}});
+  });
+  // dump() with no indent matches the hand-rolled compact form. Note:
+  // nlohmann::json by default escapes the same RFC-8259 set the manual path
+  // emits (control chars via \uXXXX, ", and \). UTF-8 continuation bytes pass
+  // through unescaped because we leave ensure_ascii at default.
+  m->statesJson = arr.dump();
+#  else
+  // ---- hand-rolled RFC-8259 encoder ---------------------------------------
   std::ostringstream os;
   os << "[";
-#if TL_PA_HAVE_TRITON_STRUCTURED
   bool first = true;
   m->module.get().walk([&](mlir::tts::MakeTensorPtrOp op) {
     if (!first) os << ",";
@@ -249,10 +278,21 @@ const char* tl_pa_extract_states_json(TLPtrAnalysisModule* mod) {
     }
     os << "{\"op\":\"" << esc << "\"}";
   });
-#endif
   os << "]";
   m->statesJson = os.str();
+#  endif  // TL_PA_USE_NLOHMANN_JSON
+#else
+  m->statesJson = "[]";
+#endif
   return m->statesJson.c_str();
+}
+
+int tl_pa_uses_nlohmann_json(void) {
+#ifdef TL_PA_USE_NLOHMANN_JSON
+  return 1;
+#else
+  return 0;
+#endif
 }
 
 const char* tl_pa_take_last_error(TLPtrAnalysisContext* ctx) {

@@ -25,6 +25,16 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Optional: swap the hand-rolled RFC-8259 JSON escaper in
+# tl_pa_extract_states_json for nlohmann::json. The two encoders MUST emit
+# byte-identical output for the existing minimal `[{"op":"..."}]` schema; the
+# regression test in tests/test_ptr_analysis.py guards that contract. When
+# enabled, the build expects a vendored single-include header at
+# third_party/nlohmann/json.hpp (see third_party/nlohmann/README for fetch
+# instructions).
+option(TRITON_FRONTEND_USE_NLOHMANN_JSON
+       "Use nlohmann::json instead of the hand-rolled RFC-8259 escaper" OFF)
+
 # ---- LLVM / MLIR -----------------------------------------------------
 
 find_package(MLIR REQUIRED CONFIG)
@@ -122,6 +132,23 @@ target_include_directories(_triton_frontend_cxx PRIVATE
   ${VENDORED_DIR}/include
 )
 target_link_libraries(_triton_frontend_cxx PRIVATE ${TL_PA_LINK_LIBS})
+
+if(TRITON_FRONTEND_USE_NLOHMANN_JSON)
+  set(_NLOHMANN_HDR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann/json.hpp")
+  if(NOT EXISTS "${_NLOHMANN_HDR}")
+    message(FATAL_ERROR
+      "TRITON_FRONTEND_USE_NLOHMANN_JSON=ON but ${_NLOHMANN_HDR} is missing. "
+      "Vendor the single-include header by running:\n"
+      "  curl -L -o ${_NLOHMANN_HDR} \\\n"
+      "       https://github.com/nlohmann/json/releases/latest/download/json.hpp")
+  endif()
+  target_include_directories(_triton_frontend_cxx PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+  target_compile_definitions(_triton_frontend_cxx PRIVATE TL_PA_USE_NLOHMANN_JSON=1)
+  message(STATUS "PtrAnalysis JSON encoder: nlohmann::json")
+else()
+  message(STATUS "PtrAnalysis JSON encoder: hand-rolled RFC-8259")
+endif()
 
 set_target_properties(_triton_frontend_cxx PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"

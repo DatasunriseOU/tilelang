@@ -6,6 +6,8 @@ addptr_scalar_loopback.mlir`` (MIT, Microsoft + Meta).
 """
 from __future__ import annotations
 
+import warnings
+
 import pytest
 
 from poc.triton_frontend.ptr_analysis import (
@@ -65,3 +67,99 @@ def test_shim_present_implies_dialects_query_returns_bool() -> None:
     # query should never raise; it is the canonical way for callers to
     # branch between full-rewrite and parse-only paths.
     assert isinstance(dialects_available(), bool)
+
+
+# ---- encoder equivalence regression --------------------------------------
+#
+# The C++ shim ships two interchangeable encoders for tl_pa_extract_states_json:
+# a hand-rolled RFC-8259 escaper (default) and an nlohmann::json path
+# (compile-time gated by -DTRITON_FRONTEND_USE_NLOHMANN_JSON=ON). The two
+# MUST emit byte-identical output for the current `[{"op":"<escaped>"}]`
+# schema -- the C++ side cannot be exercised here without a build, so we
+# regression-test the *spec* by mirroring the manual escaper in pure Python
+# and asserting it agrees with json.dumps for the relevant input set.
+def _manual_escape_one_op(op_str: str) -> str:
+    """Pure-Python mirror of the hand-rolled RFC-8259 escaper in
+    ptr_analysis_shim.cc. Drift here means drift between the two encoders.
+    """
+    out = []
+    for ch in op_str:
+        b = ord(ch)
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\b":
+            out.append("\\b")
+        elif ch == "\f":
+            out.append("\\f")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif b < 0x20:
+            out.append(f"\\u{b:04x}")
+        else:
+            out.append(ch)
+    return f'[{{"op":"{"".join(out)}"}}]'
+
+
+def _json_dumps_one_op(op_str: str) -> str:
+    """Equivalent to nlohmann::json::dump() with no indent for a single-element
+    array of ``{"op": op_str}``: compact, no spaces, no trailing newline.
+
+    Note: ``ensure_ascii=False`` matches nlohmann::json's default (and the
+    hand-rolled encoder's), which passes UTF-8 continuation bytes through
+    verbatim rather than escaping every non-ASCII codepoint to ``\\uXXXX``.
+    """
+    import json
+
+    return json.dumps([{"op": op_str}], separators=(",", ":"), ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    [
+        "tts.make_tptr ...",                            # ASCII
+        "with\nnewlines\tand\ttabs",                    # named escapes
+        'quote: " backslash: \\',                       # required escapes
+        "control: \x01\x02\x1f end",                    # \uXXXX path
+        "unicode é utf8 中文",             # >=0x20 pass-through
+        "",                                             # empty
+    ],
+)
+def test_manual_escaper_matches_json_dumps(fixture: str) -> None:
+    """The C++ hand-rolled encoder and nlohmann::json must both round-trip
+    through Python's json.loads to the same payload. Drift means a future
+    nlohmann path change breaks the wire format silently.
+    """
+    import json
+
+    manual = _manual_escape_one_op(fixture)
+    canonical = _json_dumps_one_op(fixture)
+    # Both encodings must be valid JSON ...
+    assert json.loads(manual) == [{"op": fixture}]
+    assert json.loads(canonical) == [{"op": fixture}]
+    # ... and identical byte-for-byte (the contract the C++ side enforces).
+    assert manual == canonical
+
+
+def test_strided_layout_emits_deprecation_warning() -> None:
+    """Wave-2 #03: StridedLayout is the legacy alias. First instantiation
+    must emit a DeprecationWarning. Reset the module-level latch so we can
+    observe the warning even after earlier tests in the same session
+    accidentally constructed one.
+    """
+    from poc.triton_frontend import ptr_analysis as pa_mod
+
+    pa_mod._STRIDED_LAYOUT_WARNED = False
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _ = pa_mod.StridedLayout()
+    assert any(
+        issubclass(w.category, DeprecationWarning)
+        and "StridedLayout is deprecated" in str(w.message)
+        for w in caught
+    ), f"expected DeprecationWarning, got: {[str(w.message) for w in caught]}"

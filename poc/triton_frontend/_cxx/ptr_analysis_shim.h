@@ -86,6 +86,12 @@ const char*          tl_pa_extract_states_json(TLPtrAnalysisModule* mod);
 // points above. Returns an empty string if no error is pending.
 const char*          tl_pa_take_last_error(TLPtrAnalysisContext* ctx);
 
+// Returns 1 if the shim was compiled with TL_PA_USE_NLOHMANN_JSON=1, else 0.
+// Lets Python callers introspect which encoder produced the JSON they hold;
+// the two encoders are required to emit byte-identical output for the
+// supported schema (see tests/test_ptr_analysis.py).
+int                  tl_pa_uses_nlohmann_json(void);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

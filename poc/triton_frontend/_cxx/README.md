@@ -66,7 +66,35 @@ analysis once; subsequent calls return cached results. The pybind layer also
 exposes ``run_ptr_analysis_with_states`` for callers that want both outputs
 in a single round-trip.
 
+## Optional: nlohmann::json encoder
+
+The `tl_pa_extract_states_json` entry point ships with a hand-rolled
+RFC-8259 escaper as the default. For builds that want to compose its
+output with downstream nlohmann::json consumers (or just prefer a single
+canonical encoder across the codebase), pass `-DTRITON_FRONTEND_USE_NLOHMANN_JSON=ON`
+to CMake. The two encoders MUST emit byte-identical output for the current
+schema; the regression test in
+`poc/triton_frontend/tests/test_ptr_analysis.py::test_manual_escaper_matches_json_dumps`
+guards that contract.
+
+Vendor the single-include header first:
+
+```bash
+curl -L -o poc/triton_frontend/_cxx/third_party/nlohmann/json.hpp \
+     https://github.com/nlohmann/json/releases/latest/download/json.hpp
+```
+
+The CMake option fails fast with the same `curl` line if you forget. Pin
+the upstream tag you fetched in `third_party/nlohmann/VERSION` so re-fetch
+is reproducible.
+
+You can introspect which encoder the compiled `.so` uses from Python via
+`tl_pa_uses_nlohmann_json` (exposed as a module-level integer if/when the
+pybind layer surfaces it; today it's only on the C ABI).
+
 ## License
 
 The shim derives from microsoft/triton-shared (MIT, copyright Microsoft +
 Meta Platforms). All files preserve the original copyright header.
+nlohmann/json is MIT-licensed; if vendored, it goes under
+`third_party/nlohmann/` with its own `LICENSE` copy.

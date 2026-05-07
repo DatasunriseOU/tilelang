@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence, Tuple
 
@@ -104,10 +105,23 @@ class PtrState:
 
 
 # Backwards-compatible alias for the prior scaffold name.
+#
+# DEPRECATED: scheduled for removal once external callers migrate to PtrState.
+# We emit a single DeprecationWarning per process on first instantiation
+# (cheaper than per-instance) so noisy logs don't drown out real output but
+# the deprecation is impossible to miss in CI.
+_STRIDED_LAYOUT_WARNED = False
+
+
 @dataclass
 class StridedLayout:
     """Legacy alias of :class:`PtrState`. Kept so the scaffold imports do not
     break for external callers that grew up against the stub.
+
+    .. deprecated::
+        Use :class:`PtrState` (immutable, populated by :meth:`PtrAnalysis.extract_states`).
+        Scheduled for removal in the next release; first instantiation emits
+        a :class:`DeprecationWarning`.
     """
 
     base: Any = None
@@ -115,6 +129,18 @@ class StridedLayout:
     sizes: List[Any] = field(default_factory=list)
     strides: List[Any] = field(default_factory=list)
     order: Tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        global _STRIDED_LAYOUT_WARNED
+        if not _STRIDED_LAYOUT_WARNED:
+            _STRIDED_LAYOUT_WARNED = True
+            warnings.warn(
+                "poc.triton_frontend.ptr_analysis.StridedLayout is deprecated; "
+                "use PtrState instead. StridedLayout will be removed in the "
+                "next release.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
 
 class PtrAnalysis:
