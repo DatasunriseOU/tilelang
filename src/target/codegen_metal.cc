@@ -357,7 +357,13 @@ public:
       Note(arg.dtype());
     }
     if (auto *opn = op->op.as<OpNode>()) {
-      if (opn->name == "tir.metal.fp8_e4m3_dot4") {
+      // CPPMEGA: the python ``T.call_intrin("tir.metal.fp8_e4m3_dot4", ...)``
+      // wrapper rewrites legacy ``tir.*`` names to ``tirx.*`` (see
+      // 3rdparty/tvm/python/tvm/tirx/expr.py:Call.__init__), so the registered
+      // op name is ``tirx.metal.fp8_e4m3_dot4``. Match both spellings to avoid
+      // a silent miss on the helper-prelude emission.
+      if (opn->name == "tirx.metal.fp8_e4m3_dot4" ||
+          opn->name == "tir.metal.fp8_e4m3_dot4") {
         uses_dot4 = true;
       }
     }
