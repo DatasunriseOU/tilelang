@@ -185,10 +185,24 @@ class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
         // upper-bound constant in Int64 to avoid the silent wrap. Z3's
         // sort-coercion will then promote `v` (int32) on the LT to a
         // common int sort.
-        recover_stack.push_back(z3.EnterConstraint(
-            v >= IntImm(tvm::DataType::Int(64), 0)));
-        recover_stack.push_back(z3.EnterConstraint(
-            v < IntImm(tvm::DataType::Int(64), kBitBound)));
+        // fix-round-6 C3: pair EnterConstraint calls so the lower-bound
+        // recoverer is invoked on stack-unwind if the upper-bound call
+        // throws. Without the explicit try/catch the first recoverer
+        // (a `std::function`) would be destroyed without firing, leaking
+        // a solver scope frame. Push to recover_stack only after BOTH
+        // succeed (LIFO so upper-bound pops first).
+        auto r_lo = z3.EnterConstraint(v >= IntImm(tvm::DataType::Int(64), 0));
+        try {
+          auto r_hi =
+              z3.EnterConstraint(v < IntImm(tvm::DataType::Int(64), kBitBound));
+          recover_stack.push_back(std::move(r_hi));
+          recover_stack.push_back(std::move(r_lo));
+        } catch (...) {
+          // Roll back the lower-bound push and rethrow into the outer
+          // catch (which will mark `proved=false` and keep the guard).
+          if (r_lo) r_lo();
+          throw;
+        }
       }
 
       proved = z3.CanProve(cond);
