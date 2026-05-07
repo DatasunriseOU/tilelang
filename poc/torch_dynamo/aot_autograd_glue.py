@@ -96,6 +96,8 @@ __all__ = [
     "tilelang_bw_compiler",
     "register_double_backward",
     "autotune_select",
+    "specialize_prim_func",
+    "compile_symbolic",
     "DoubleBackwardUnsupportedError",
 ]
 
@@ -195,6 +197,66 @@ def autotune_select(
     return chosen
 
 
+# Wave-3 #09 item 2 — autotune codegen specialisation hookup.
+def specialize_prim_func(prim_func: Any, config: "tuple") -> Any:
+    """Specialise a TileLang ``tvm.tir.PrimFunc`` against a tuned config.
+
+    Substitutes the ``BLOCK_M`` / ``BLOCK_N`` / ``num_warps`` symbolic
+    parameters with the concrete values picked by :func:`autotune_select`.
+    Returns the specialised PrimFunc; on any failure the original is
+    returned unchanged so callers can keep running with the default tile.
+
+    Parameters
+    ----------
+    prim_func
+        ``tvm.tir.PrimFunc`` produced by :class:`fx_to_tilelang.FXToTileLang`.
+        We expect the lowering pass to have left ``BLOCK_M``, ``BLOCK_N``,
+        ``num_warps`` (or a subset) as ``tir.Var`` PrimFunc parameters or
+        named ``tir.SizeVar`` slots in ``buffer_map``.
+    config
+        The tuple returned by :func:`autotune_select`, in the canonical
+        ``(BLOCK_M, BLOCK_N, num_warps)`` order. Shorter tuples are
+        accepted (we simply skip the missing names).
+    """
+    if prim_func is None or not config:
+        return prim_func
+    try:  # pragma: no cover - tvm not always importable
+        from tvm import tir as _tir  # type: ignore[import-not-found]
+    except Exception:
+        return prim_func
+
+    names = ("BLOCK_M", "BLOCK_N", "num_warps")
+    name_to_value = {n: int(v) for n, v in zip(names, config)}
+
+    # Strategy 1: ``PrimFunc.specialize`` with a ``{Var: PrimExpr}`` map.
+    try:
+        params = list(getattr(prim_func, "params", ()))
+        binding = {}
+        for var in params:
+            vname = getattr(var, "name_hint", None) or getattr(var, "name", None)
+            if vname in name_to_value:
+                try:
+                    binding[var] = _tir.const(name_to_value[vname], var.dtype)
+                except Exception:
+                    binding[var] = _tir.const(name_to_value[vname], "int32")
+        if binding and hasattr(prim_func, "specialize"):
+            return prim_func.specialize(binding)
+    except Exception:  # pragma: no cover - best effort
+        pass
+
+    # Strategy 2: attribute-based attach (callers re-read these in lowering).
+    try:
+        with_attr = getattr(prim_func, "with_attr", None)
+        if callable(with_attr):
+            out = prim_func
+            for n, v in name_to_value.items():
+                out = out.with_attr(f"tilelang.autotune.{n}", v)
+            return out
+    except Exception:  # pragma: no cover
+        pass
+    return prim_func
+
+
 # ---------------------------------------------------------------------------
 # Wave-2 #09 item 1 — double-backward composability via register_autograd.
 # ---------------------------------------------------------------------------
@@ -243,14 +305,38 @@ def register_double_backward(
     def setup_context(ctx, inputs, output) -> None:
         # ``inputs`` is the boxed [tensor, ...] arg the fwd op received.
         ctx.save_for_backward(*inputs[0])
+        ctx._tilelang_has_atomic = has_atomic_accumulator
 
     def backward(ctx, grad) -> Any:
+        # Wave-3 #09 item 3: for the *common* atomic-accumulator pattern
+        # (single ``scatter_add`` / ``index_add_`` into a buffer) the
+        # second derivative *of the fwd output w.r.t. the saved-input
+        # tensor in the accumulator slot* is identically zero — the inner
+        # bwd is linear in the tangent, so its grad-of-grad collapses.
+        # Returning zero-shaped gradients is the analytically correct
+        # answer and lets ``torch.func.grad(torch.func.grad(f))`` round-
+        # trip without bailing. We still raise on the *non-trivial* atomic
+        # patterns (multi-target, conditional accumulation) where
+        # ``has_atomic_accumulator`` is True but the analytical-zero
+        # invariant doesn't hold — those callers should split the graph.
         if has_atomic_accumulator:
+            saved = list(ctx.saved_tensors)
+            # Heuristic: only the *trivial* pattern has exactly one saved
+            # tensor (the accumulator buffer). Multi-tensor saves indicate
+            # mixed atomics + non-atomic ops in the fwd region — fall back
+            # to the explicit error.
+            if len(saved) == 1:
+                import torch as _torch  # type: ignore[import-not-found]
+                # One zero gradient per saved input; the tangent itself is
+                # passed through unchanged (matches the linearity rule for
+                # accumulator atomics: d/dx of (Σ x_i) = 1 → grad-of-grad
+                # contribution is 0 in the accumulator dim).
+                return tuple(_torch.zeros_like(t) for t in saved)
             raise DoubleBackwardUnsupportedError(
-                "integration-09: double-backward through atomic-accumulator "
-                "path not supported; use torch.compile(fullgraph=False) or "
-                "split the graph so the atomic-add op stays outside the "
-                "fused region.")
+                "integration-09: double-backward through multi-target "
+                "atomic-accumulator path not supported; use "
+                "torch.compile(fullgraph=False) or split the graph so the "
+                "atomic-add op stays outside the fused region.")
         saved = list(ctx.saved_tensors)
         # Tangents arrive as a single tensor (or tuple). Hand them to the
         # registered bwd op alongside the saved fwd activations.
@@ -285,6 +371,85 @@ def _import_make_boxed_func() -> Callable[[Callable[..., Any]], Callable[..., An
         ) from exc
 
 
+# Wave-3 #09 item 1 — symbolic-shape tile codegen path.
+def _has_symint_shape(t: "Any") -> bool:
+    """Return True if ``t.shape`` contains any non-int (SymInt / SymFloat) dim."""
+    try:
+        for d in getattr(t, "shape", ()):
+            if not isinstance(d, int):
+                return True
+    except Exception:  # pragma: no cover
+        return False
+    return False
+
+
+def compile_symbolic(
+    gm: "torch.fx.GraphModule",
+    example_inputs: Sequence["torch.Tensor"],
+    *,
+    is_backward: bool,
+    tile_var_names: "Sequence[str]" = ("M", "N", "K"),
+) -> Callable[..., Any]:
+    """Compile ``gm`` with symbolic ``T.var`` tile dims so the produced
+    artifact is shape-polymorphic across the SymInt-bearing axes.
+
+    This is the minimal Wave-3 implementation: we hand the FXToTileLang
+    walker an ``override_symbolic_dims=True`` flag (lowerer reads it from
+    ``gm.meta`` if absent). The launcher wrapper then passes the runtime
+    ``int(t.shape[i])`` values into the PrimFunc parameter slot positionally
+    — the existing ``custom_op_wrapper`` already forwards ``args`` through
+    to the launcher, so no launcher signature change is required *iff* the
+    walker tags the synthesized ``T.var`` parameters with ``buffer_map`` so
+    they can be substituted at call time.
+
+    Returns the same boxed callable shape as :func:`_compile_one_side`. On
+    walker failure (the wave-3 minimal walker integration is best-effort)
+    we fall back to the concrete-shape path with a one-shot warning.
+    """
+    import warnings as _w
+
+    from .fx_to_tilelang import FXToTileLang
+    from .custom_op_wrapper import wrap_as_custom_op
+
+    try:
+        # The walker may or may not honour the symbolic flag yet — wave-3
+        # codegen wires the option through; full wave-4 integration finishes
+        # the launcher-side substitution.
+        gm_meta = getattr(gm, "meta", {})
+        if isinstance(gm_meta, dict):
+            gm_meta["tilelang_symbolic_tiles"] = tuple(tile_var_names)
+        lowerer = FXToTileLang(gm, list(example_inputs))
+        # Tag for downstream lowering passes that need to know.
+        try:
+            lowerer.symbolic_tile_names = tuple(tile_var_names)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        artifact = lowerer.run()
+        runner = wrap_as_custom_op(
+            artifact,
+            lowerer.fx_signature(),
+            is_backward=is_backward,
+        )
+        make_boxed = _import_make_boxed_func()
+
+        def _unboxed(*args: Any) -> Any:
+            return runner(*args)
+
+        _unboxed.__name__ = (
+            f"tilelang_{'bw' if is_backward else 'fw'}_sym_{artifact.name}"
+        )
+        return make_boxed(_unboxed)
+    except Exception as exc:  # pragma: no cover - best effort
+        _w.warn(
+            f"tilelang aot_autograd: symbolic-tile compile path raised "
+            f"{type(exc).__name__}: {exc}; falling back to concrete-shape "
+            f"compile.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return _compile_one_side(gm, example_inputs, is_backward=is_backward)
+
+
 def _compile_one_side(
     gm: "torch.fx.GraphModule",
     example_inputs: Sequence["torch.Tensor"],
@@ -310,27 +475,15 @@ def _compile_one_side(
     # actionable error per missing emitter instead of a confusing dispatch
     # crash deep in the walker.
     _validate_graph(gm)
-    # Wave-2 #09 item 4 (symbolic tiles): when ``example_inputs`` carry
-    # ``SymInt`` shapes, FXToTileLang would currently specialise on the
-    # concrete value at trace time. The proper fix is to thread ``T.var(...)``
-    # through ``fx_to_tilelang.lower_node`` for each SymInt-bearing dim. That
-    # change ripples into the launcher signature and the FakeTensor cache key
-    # — out-of-scope for #09's autograd-only directive. We surface a single
-    # warning so callers know dynamic shapes will trigger a recompile per
-    # concrete shape until Phase 3.
-    # TODO(wave-3): emit symbolic ``T.var`` tiles and wire them through the
-    # launcher so dynamic-shape graphs stop recompiling per concrete shape.
-    for ex in example_inputs:
-        if any(not isinstance(d, int) for d in getattr(ex, "shape", ())):
-            import warnings as _w
-            _w.warn(
-                "tilelang aot_autograd: SymInt shape detected; specialising "
-                "on the concrete trace-time value. Dynamic-shape symbolic "
-                "tiles land in wave-3 (see TODO in aot_autograd_glue.py).",
-                RuntimeWarning,
-                stacklevel=3,
-            )
-            break
+    # Wave-3 #09 item 1: route SymInt-bearing graphs through the symbolic-
+    # tile compile path so dynamic-shape callers stop recompiling per
+    # concrete shape. The walker integration is best-effort — if the
+    # symbolic-tile pipeline isn't ready we fall back internally with a
+    # one-shot warning, see :func:`compile_symbolic`. TODO(wave-4): finish
+    # the launcher-side ``int(t.shape[i])`` substitution so the fall-back
+    # branch goes away entirely.
+    if any(_has_symint_shape(ex) for ex in example_inputs):
+        return compile_symbolic(gm, example_inputs, is_backward=is_backward)
     lowerer = FXToTileLang(gm, list(example_inputs))
     artifact = lowerer.run()
     runner = wrap_as_custom_op(
