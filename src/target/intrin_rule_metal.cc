@@ -27,12 +27,19 @@ using tirx::FLowerIntrinsic;
 using tirx::TGlobalSymbol;
 using tirx::TCallEffectKind;
 using tirx::CallEffectKind;
+using tirx::TScriptPrinterName;
 
 // FP8 E4M3 packed dot4 — 4-byte packed FP8 dot product.
 // The Metal codegen (`CodeGenTileLangMetal::EmitFp8E4M3Helper`) emits an
 // overload set named ``__tvm_fp8_e4m3_dot4_packed`` that accepts
 // (uchar* a, uchar* b, uint a_word_idx, uint b_word_idx) across
 // device / threadgroup / constant address-space combinations.
+//
+// TScriptPrinterName is required so the TVMScript printer can render
+// ``T.<name>(...)`` for this op when it appears in IR dumps and error
+// messages. Without it, the printer falls back to a basic-address printer
+// and emits a "No TScriptPrinterName attribute" warning that escalates
+// inside TVM_FFI_ICHECK on certain pass-error paths.
 TVM_REGISTER_OP("tirx.metal.fp8_e4m3_dot4")
     .set_num_inputs(4)
     .add_argument("a_ptr", "Expr", "Pointer to packed FP8 e4m3 byte buffer A.")
@@ -40,7 +47,8 @@ TVM_REGISTER_OP("tirx.metal.fp8_e4m3_dot4")
     .add_argument("a_word_idx", "Expr", "uint32 word index into A (4 bytes per word).")
     .add_argument("b_word_idx", "Expr", "uint32 word index into B (4 bytes per word).")
     .set_attr<TGlobalSymbol>("TGlobalSymbol", "__tvm_fp8_e4m3_dot4_packed")
-    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure));
+    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure))
+    .set_attr<TScriptPrinterName>("TScriptPrinterName", "metal_fp8_e4m3_dot4");
 
 // Metal thread-position / SIMD-lane intrinsics used by the dot4 vecmat macro.
 // MSL exposes these as the ``thread_position_in_grid`` / ``thread_index_in_simdgroup``
@@ -48,12 +56,14 @@ TVM_REGISTER_OP("tirx.metal.fp8_e4m3_dot4")
 TVM_REGISTER_OP("tirx.metal.thread_position_in_grid_x")
     .set_num_inputs(0)
     .set_attr<TGlobalSymbol>("TGlobalSymbol", "thread_position_in_grid_x")
-    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure));
+    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure))
+    .set_attr<TScriptPrinterName>("TScriptPrinterName", "metal_thread_position_in_grid_x");
 
 TVM_REGISTER_OP("tirx.metal.thread_index_in_simdgroup")
     .set_num_inputs(0)
     .set_attr<TGlobalSymbol>("TGlobalSymbol", "thread_index_in_simdgroup")
-    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure));
+    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure))
+    .set_attr<TScriptPrinterName>("TScriptPrinterName", "metal_thread_index_in_simdgroup");
 
 }  // namespace intrin
 }  // namespace codegen

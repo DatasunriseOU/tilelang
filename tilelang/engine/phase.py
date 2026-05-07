@@ -262,6 +262,18 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.LowerTileOp()(mod)
     # Lower l2 persistent map
     mod = tilelang.transform.LowerL2Persistent()(mod)
+    # CPPMEGA: re-run the vendored-IR converters here. ``LowerTileOp`` and the
+    # tile-op chain above can re-introduce ``tilelang::tl_tir::Allocate`` /
+    # ``LetStmt`` nodes after the entry-point conversion at the top of
+    # ``LowerAndLegalize``. Without a re-run, the python-side
+    # ``DecoupleTypeCast`` mutator (a ``tirx::PyStmtExprMutator`` subclass)
+    # crashes with "NodeFunctor calls un-registered function on type
+    # tilelang.Allocate" because apache's ``StmtFunctor`` vtable does not
+    # know about the vendored types. The converters are idempotent on
+    # already-lowered IR, so the re-run is cheap when nothing was
+    # re-introduced.
+    mod = tilelang.transform.LowerTileLangLetStmt()(mod)
+    mod = tilelang.transform.LowerTileLangAllocate()(mod)
     # Decouple type cast vectorization constraints before vectorization
     mod = tilelang.transform.DecoupleTypeCast()(mod)
     # Legalize vectorized loops to ensure they are valid
