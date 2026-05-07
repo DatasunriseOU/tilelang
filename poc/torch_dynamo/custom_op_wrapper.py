@@ -29,7 +29,7 @@ from __future__ import annotations
 import threading
 import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, FrozenSet, Sequence, Tuple, TYPE_CHECKING  # noqa: F401
+from typing import Any, Callable, Dict, FrozenSet, List, Sequence, Tuple, TYPE_CHECKING  # noqa: F401
 
 if TYPE_CHECKING:  # pragma: no cover
     import torch
@@ -260,7 +260,7 @@ def wrap_as_custom_op(
         _bound_launcher = artifact.launcher
 
         @custom_op(op_qualname, mutates_args=())
-        def _impl(args: Sequence[torch.Tensor]) -> Any:  # type: ignore[name-defined]
+        def _impl(args: List[torch.Tensor]) -> Any:  # type: ignore[name-defined]
             _check_no_grad(args, allow_grad=allow_grad)
             # Wave-2 fix-pack: contiguity guard at the custom_op boundary.
             args = _ensure_contiguous_inputs(op_qualname, args)
@@ -269,7 +269,7 @@ def wrap_as_custom_op(
             return _bound_launcher(*args)
 
         @register_fake(op_qualname)
-        def _fake(args: Sequence[torch.Tensor]) -> Any:  # type: ignore[name-defined]
+        def _fake(args: List[torch.Tensor]) -> Any:  # type: ignore[name-defined]
             # Shape inference flows for both fwd and bwd: aot_autograd
             # consults this when partitioning the joint graph and when
             # caching FakeTensor results across recompiles.
