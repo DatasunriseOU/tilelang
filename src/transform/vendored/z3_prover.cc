@@ -166,26 +166,27 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
   }
   ::z3::expr MakeIntVal(int64_t value) {
     if (bv_width_ > 0) {
-      // Z3 bv_val sign-extends/truncates to the requested width; for an
-      // int64 IntImm that "doesn't fit" in BV32 the high bits are
-      // dropped, matching standard two's-complement wrapping. Warn once
-      // per Analyzer when this happens — the result is well-defined but
-      // usually indicates an upstream bug (e.g. BV32 mode against an
-      // INT64-typed constant). Don't fail; the caller may still want the
-      // wrapped value (e.g. to test wrap-aware proofs).
-      if (!bv_truncation_warned_ && bv_width_ < 64) {
+      // fix-round-6 C8: previously, when `value` was outside the signed
+      // BV range we let Z3's bv_val silently truncate (two's-complement
+      // wrap). That makes proofs over wide constants unsound. Conservative
+      // fix: mint an unconstrained fresh symbol of the BV sort so any
+      // predicate depending on the constant fails to be proved.
+      if (bv_width_ < 64) {
         int64_t lo = (bv_width_ == 32) ? static_cast<int64_t>(INT32_MIN)
                                        : -(int64_t{1} << (bv_width_ - 1));
         int64_t hi = (bv_width_ == 32) ? static_cast<int64_t>(INT32_MAX)
                                        : ((int64_t{1} << (bv_width_ - 1)) - 1);
         if (value < lo || value > hi) {
-          LOG(WARNING) << "Z3Prover BV" << bv_width_
-                       << ": MakeIntVal(" << value
-                       << ") wraps (signed range [" << lo << ", " << hi
-                       << "]); proof results may reflect two's-complement "
-                          "wrap, not unbounded Int semantics. "
-                          "(further occurrences suppressed)";
-          bv_truncation_warned_ = true;
+          if (!bv_truncation_warned_) {
+            LOG(WARNING)
+                << "Z3Prover BV" << bv_width_ << ": MakeIntVal(" << value
+                << ") out of signed range [" << lo << ", " << hi
+                << "]; returning unconstrained symbol (any proof "
+                   "depending on this constant will conservatively fail). "
+                   "(further occurrences suppressed)";
+            bv_truncation_warned_ = true;
+          }
+          return MakeIntConst("oor_" + std::to_string(memo_.size()));
         }
       }
       return ctx->bv_val(static_cast<long long>(value),
@@ -395,36 +396,23 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
           if (min_value < lo || max_value > hi) {
             if (!bv_range_warned_) {
               LOG(WARNING) << "Z3Prover BV" << bv_width_
-                           << ": clamping out-of-range bind " << var
+                           << ": dropping out-of-range bind " << var
                            << " in [" << min_value << ", " << max_value
-                           << ") to signed BV range [" << lo << ", " << hi
-                           << "]. (further occurrences suppressed)";
+                           << ") (signed BV range [" << lo << ", " << hi
+                           << "]). Subsequent CanProve over this var will"
+                           << " fail closed. (further occurrences suppressed)";
               bv_range_warned_ = true;
             }
-            // CPPMEGA fix-A7: NEW-1 (round-3): the previous fix-A3 bailed
-            // here without writing memo_, which left a hole — a later
-            // Visit(var) would mint a *fresh* free Z3 symbol, so the
-            // caller's range request was silently dropped while the
-            // prover happily reasoned about an unconstrained variable.
-            // Conservative fallback: memoize `var_expr` and assert the
-            // BV-clamped range [lo, hi+1) so subsequent uses see the
-            // tightest sound approximation we can express in this sort.
-            // This is over-approximation (the BV interval is wider than
-            // the caller's intent), so any CanProve we return remains
-            // sound; we only lose precision, never correctness.
-            int64_t clamped_min = std::max<int64_t>(min_value, lo);
-            int64_t clamped_max =
-                std::min<int64_t>(max_value, hi + int64_t{1});
-            if (clamped_min >= clamped_max) {
-              // Caller's range is entirely outside BV bounds — there's
-              // no representable interval. Fall back to the full BV
-              // range to keep the var bound at the right sort.
-              clamped_min = lo;
-              clamped_max = hi + int64_t{1};
-            }
-            memo_.emplace(var, var_expr);
-            solver.add(MakeIntVal(clamped_min) <= var_expr);
-            solver.add(var_expr < MakeIntVal(clamped_max));
+            // CPPMEGA fix-C2 (round-7): the round-3 fix wrote a clamped memo
+            // here, which over-approximated the caller's intent. Wave-5
+            // audit flagged this as unsound under composition: a downstream
+            // CanProve on `var` would see the *clamped* range and could
+            // prove tautologies that the caller never asserted. Round-7
+            // tightens to NOT emplace memo on OOR. A subsequent Visit(var)
+            // will still mint a fresh symbol, but with no range constraint
+            // asserted, CanProve will fail closed (return false) for any
+            // non-trivial query — preserving soundness. Callers that need
+            // the bind must keep variables within the BV width.
             commit_memo = false;
             return;
           }
