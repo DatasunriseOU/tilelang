@@ -315,3 +315,69 @@ def test_pipeline_error_is_triton_frontend_error_subclass() -> None:
         raise PipelineError("pipeline hierarchy smoke")
     except TritonFrontendError as exc:
         assert "pipeline hierarchy smoke" in str(exc)
+
+
+# ---------------------------------------------------------------------------
+# H4 Wave-I: OP_TABLE size pin + EmitError migration smoke
+# ---------------------------------------------------------------------------
+
+
+def test_op_table_has_expected_size() -> None:
+    """Pin the :data:`OP_TABLE` size to catch accidental drops or
+    unintentional adds.
+
+    Update this constant ONLY when you intentionally add or remove an op
+    from OP_TABLE (and update the README at the same time -- see
+    ``poc/triton_frontend/README.md`` for the three places the count
+    appears). H4 Wave-I noted the README claimed 83 while the actual
+    table held 84 (G1 added ``tt.call``); this test prevents that drift.
+    """
+    from poc.triton_frontend.op_mapping import OP_TABLE
+
+    EXPECTED = 84
+    assert len(OP_TABLE) == EXPECTED, (
+        f"OP_TABLE size changed from {EXPECTED} to {len(OP_TABLE)}; "
+        f"if intentional, update this constant + the three README "
+        f"occurrences (poc/triton_frontend/README.md). Current keys: "
+        f"{sorted(OP_TABLE.keys())}"
+    )
+
+
+def test_op_mapping_emitters_raise_emit_error_not_value_error() -> None:
+    """H4 Wave-I: emitter-internal preconditions raise :class:`EmitError`
+    (not plain ``ValueError``) so callers can ``except EmitError``
+    uniformly.
+
+    We exercise a representative subset (``tt.load`` / ``tt.dot`` /
+    ``tt.where`` / ``tt.broadcast``) by feeding each a dict-shaped op with
+    missing operands. Each must raise ``EmitError``. ``ValueError`` is
+    explicitly rejected (the migration must not have left these as
+    ``ValueError`` so generic ``except ValueError`` catches stop swallowing
+    real bugs).
+    """
+    from poc.triton_frontend.op_mapping import (
+        EmitError,
+        WalkerCtx,
+        map_tt_broadcast,
+        map_tt_dot,
+        map_tt_load,
+        map_tt_where,
+    )
+
+    ctx = WalkerCtx()
+
+    # tt.load: missing pointer operand
+    with pytest.raises(EmitError, match="tt.load: missing pointer operand"):
+        map_tt_load({"name": "tt.load", "operands": []}, ctx)
+
+    # tt.dot: needs 2 operands
+    with pytest.raises(EmitError, match=r"tt\.dot: expected at least 2"):
+        map_tt_dot({"name": "tt.dot", "operands": ["%a"]}, ctx)
+
+    # tt.where: needs 3 operands
+    with pytest.raises(EmitError, match=r"tt\.where: expected 3 operands"):
+        map_tt_where({"name": "tt.where", "operands": ["%c", "%t"]}, ctx)
+
+    # tt.broadcast: missing source
+    with pytest.raises(EmitError, match=r"tt\.broadcast: missing source"):
+        map_tt_broadcast({"name": "tt.broadcast", "operands": []}, ctx)

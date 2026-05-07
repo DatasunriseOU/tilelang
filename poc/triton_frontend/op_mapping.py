@@ -907,7 +907,7 @@ def map_tt_load(op: Any, ctx: WalkerCtx) -> Any:
     tir = ctx.tir()
     operands = _operands(op)
     if len(operands) < 1:
-        raise ValueError("tt.load: missing pointer operand")
+        raise EmitError("tt.load: missing pointer operand")
     ptr_ssa = operands[0]
     mask_ssa = operands[1] if len(operands) >= 2 else None
     other_ssa = operands[2] if len(operands) >= 3 else None
@@ -1001,7 +1001,7 @@ def map_tt_store(op: Any, ctx: WalkerCtx) -> Any:
     tir = ctx.tir()
     operands = _operands(op)
     if len(operands) < 2:
-        raise ValueError("tt.store: missing pointer or value operand")
+        raise EmitError("tt.store: missing pointer or value operand")
     ptr_ssa, val_ssa = operands[0], operands[1]
     mask_ssa = operands[2] if len(operands) >= 3 else None
 
@@ -1068,7 +1068,7 @@ def _atomic_rmw_kind(op: Any) -> str:
     attrs = _attrs_with_properties_shared(op)
     raw = attrs.get("rmw_op") or attrs.get("atomic_rmw_op") or attrs.get("kind")
     if raw is None:
-        raise ValueError("tt.atomic_rmw: missing 'rmw_op' attribute")
+        raise EmitError("tt.atomic_rmw: missing 'rmw_op' attribute")
     s = str(raw).lower().strip()
     # Strip MLIR-style prefixes/suffixes that occasionally appear.
     if s.startswith("rmw_op."):
@@ -1098,7 +1098,7 @@ def map_tt_atomic_rmw(op: Any, ctx: WalkerCtx) -> Any:
     """
     operands = _operands(op)
     if len(operands) < 2:
-        raise ValueError("tt.atomic_rmw: expected at least (ptr, val) operands")
+        raise EmitError("tt.atomic_rmw: expected at least (ptr, val) operands")
     ptr_ssa, val_ssa = operands[0], operands[1]
     mask_ssa = operands[2] if len(operands) >= 3 else None
 
@@ -1192,7 +1192,7 @@ def map_tt_dot(op: Any, ctx: WalkerCtx) -> Any:
     """
     operands = _operands(op)
     if len(operands) < 2:
-        raise ValueError("tt.dot: expected at least 2 operands (A, B)")
+        raise EmitError("tt.dot: expected at least 2 operands (A, B)")
     a_ssa, b_ssa = operands[0], operands[1]
     c_ssa = operands[2] if len(operands) >= 3 else None
 
@@ -1279,7 +1279,7 @@ def _reduce_combiner_kind(op: Any) -> str:
                     return "min"
                 if "mul" in low:
                     return "mul"
-    raise ValueError("tt.reduce: cannot determine combiner kind from op")
+    raise EmitError("tt.reduce: cannot determine combiner kind from op")
 
 
 def map_tt_reduce(op: Any, ctx: WalkerCtx) -> Any:
@@ -1299,7 +1299,7 @@ def map_tt_reduce(op: Any, ctx: WalkerCtx) -> Any:
     """
     operands = _operands(op)
     if not operands:
-        raise ValueError("tt.reduce: missing source operand")
+        raise EmitError("tt.reduce: missing source operand")
     src_ssa = operands[0]
     src = ctx.get(src_ssa)
 
@@ -1364,7 +1364,7 @@ def map_tt_where(op: Any, ctx: WalkerCtx) -> Any:
     tir = ctx.tir()
     operands = _operands(op)
     if len(operands) != 3:
-        raise ValueError(
+        raise EmitError(
             f"tt.where: expected 3 operands (cond, true, false); got {len(operands)}"
         )
     cond, t_val, f_val = (ctx.get(o) for o in operands)
@@ -1390,7 +1390,7 @@ def map_tt_broadcast(op: Any, ctx: WalkerCtx) -> Any:
     """
     operands = _operands(op)
     if not operands:
-        raise ValueError("tt.broadcast: missing source operand")
+        raise EmitError("tt.broadcast: missing source operand")
     src = ctx.get(operands[0])
     if _results(op):
         ctx.bind(_results(op)[0], src)
@@ -1406,7 +1406,7 @@ def map_tt_splat(op: Any, ctx: WalkerCtx) -> Any:
     """
     operands = _operands(op)
     if not operands:
-        raise ValueError("tt.splat: missing source operand")
+        raise EmitError("tt.splat: missing source operand")
     src = ctx.get(operands[0])
     if _results(op):
         ctx.bind(_results(op)[0], src)
@@ -1422,7 +1422,7 @@ def map_tt_expand_dims(op: Any, ctx: WalkerCtx) -> Any:
     """
     operands = _operands(op)
     if not operands:
-        raise ValueError("tt.expand_dims: missing source operand")
+        raise EmitError("tt.expand_dims: missing source operand")
     src = ctx.get(operands[0])
     if _results(op):
         ctx.bind(_results(op)[0], src)
@@ -1440,7 +1440,7 @@ def map_tt_reshape(op: Any, ctx: WalkerCtx) -> Any:
     """
     operands = _operands(op)
     if not operands:
-        raise ValueError("tt.reshape: missing source operand")
+        raise EmitError("tt.reshape: missing source operand")
     src = ctx.get(operands[0])
     # If the source is a buffer (e.g. shared/local), call into TileLang
     # to materialize the new view; otherwise rebind as PrimExpr.
@@ -1472,7 +1472,7 @@ def map_tt_trans(op: Any, ctx: WalkerCtx) -> Any:
     """
     operands = _operands(op)
     if not operands:
-        raise ValueError("tt.trans: missing source operand")
+        raise EmitError("tt.trans: missing source operand")
     src_ssa = operands[0]
     src = ctx.get(src_ssa)
     # Wave E3: ``order`` (Triton's permutation tuple) is an inherent attr in
@@ -1520,7 +1520,7 @@ def map_tt_make_range(op: Any, ctx: WalkerCtx) -> Any:
     end = int(attrs.get("end", 0))
     lanes = end - start
     if lanes <= 0:
-        raise ValueError(
+        raise EmitError(
             f"tt.make_range: invalid range [{start}, {end}); end must be > start"
         )
     ramp = tir.Ramp(tir.const(start, "int32"), tir.const(1, "int32"), lanes)
@@ -1558,7 +1558,7 @@ def map_tt_async_copy(op: Any, ctx: WalkerCtx) -> Any:
 
     operands = _operands(op)
     if len(operands) < 2:
-        raise ValueError("async_copy: expected (src_ptr, dst_ptr) operands")
+        raise EmitError("async_copy: expected (src_ptr, dst_ptr) operands")
     src_ssa, dst_ssa = operands[0], operands[1]
     src_resolved = ctx.get(src_ssa)
     dst_resolved = ctx.get(dst_ssa)
@@ -1617,7 +1617,7 @@ def map_tt_mbarrier(op: Any, ctx: WalkerCtx) -> Any:
     tir = ctx.tir()
     if "arrive" in name:
         if not operands:
-            raise ValueError("mbarrier.arrive: missing barrier operand")
+            raise EmitError("mbarrier.arrive: missing barrier operand")
         bar = ctx.get(operands[0])
         # Prefer the high-level T.barrier_arrive (re-exported via
         # tilelang.language.builtin). Fall back to a raw call_intrin so
@@ -1634,7 +1634,7 @@ def map_tt_mbarrier(op: Any, ctx: WalkerCtx) -> Any:
 
     if "wait" in name:
         if not operands:
-            raise ValueError("mbarrier.wait: missing barrier operand")
+            raise EmitError("mbarrier.wait: missing barrier operand")
         bar = ctx.get(operands[0])
         parity = int(attrs.get("parity", 0))
         # Prefer the high-level T.barrier_wait; fall back to call_intrin.
@@ -1669,7 +1669,7 @@ def map_tt_sync_threads_partial(op: Any, ctx: WalkerCtx) -> Any:
     """
     operands = _operands(op)
     if len(operands) < 2:
-        raise ValueError(
+        raise EmitError(
             f"tt.sync_threads_partial: expected (mask, n_threads); got "
             f"{len(operands)} operands"
         )
@@ -1723,7 +1723,7 @@ def _emit_descriptor_copy(op: Any, ctx: WalkerCtx, *, is_load: bool) -> Any:
     """
     operands = _operands(op)
     if len(operands) < 2:
-        raise ValueError(
+        raise EmitError(
             f"{'descriptor_load' if is_load else 'descriptor_store'}: expected "
             f"(desc, tile, ...offsets) operands"
         )
@@ -1861,7 +1861,7 @@ def map_tt_program_id(op: Any, ctx: WalkerCtx) -> Any:
     attrs = _attrs(op)
     axis = int(attrs.get("axis", 0))
     if axis < 0 or axis > 2:
-        raise ValueError(
+        raise EmitError(
             f"tt.program_id: axis must be in [0, 2]; got {axis}"
         )
 

@@ -68,6 +68,333 @@ __all__ = [
 _FALLBACK_WARNED: bool = False
 
 
+# ---------------------------------------------------------------------------
+# tt.load / tt.store wiring helper (input-buffer plumbing)
+#
+# The op_emitters/memory.py emit_tt_load/emit_tt_store have a fallback path
+# (``_is_tile_shape(out_shape)``) that synthesises a fresh tile-scoped
+# placeholder buffer when no PtrState is found via ``ctx.ptr_states``.
+# In the production path, the PtrAnalysis pre-pass populates
+# ``ctx.value_map`` only with stringly-keyed PtrState entries (NOT
+# ``ctx.ptr_states``); the walker sees the original (pre-rewrite) TTIR;
+# ``tt.addptr`` does correctly carry the input Buffer through as a
+# ``(buffer, [offset])`` tuple via the post-rewrite no-op shim path.
+# However, the tile-shape branch in emit_tt_load IGNORES that tuple and
+# allocates a fresh local placeholder, so the body never references the
+# function-arg buffers and the Metal codegen prunes them from the kernel
+# signature -- producing the ``buffer count mismatch`` failure observed
+# in the e2e numeric harness.
+#
+# The wrappers below intercept tt.load / tt.store BEFORE delegating to the
+# upstream emitter and, when the resolved value is a ``(buffer, indices)``
+# tuple whose buffer is a real PrimFunc parameter (i.e. lives in
+# ``ctx.buffers``), emit a rolled ``tir.For`` over the real buffer via
+# ``_emit_tile_copy_tir`` / ``_emit_tile_store_tir``. This wires the
+# function-arg buffers into the body so TileLang's Metal codegen keeps
+# them in the kernel signature.
+# ---------------------------------------------------------------------------
+
+
+def _value_is_input_buffer(ctx: Any, val: Any) -> bool:
+    """Return True if ``val`` is a Buffer that lives in ``ctx.buffers``."""
+    try:
+        buffers = getattr(ctx, "buffers", {}) or {}
+        for buf in buffers.values():
+            if buf is val:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _redecl_input_buffer(ctx: Any, buf: Any, shape: Any, dtype: str) -> Any:
+    """Re-declare an input buffer with the right tile shape.
+
+    ``map_tt_func`` / ``_materialize_func_args`` declares input buffers
+    with shape ``[1]`` (no kernel-level info available at func-args time).
+    When the load/store later observes the tile size, we redecl the buffer
+    in-place (same key in ``ctx.buffers``, new shape) so ``BufferLoad/Store``
+    indexing is in-bounds. Without this, ``tir.BufferLoad(arg0, [off + lv])``
+    against a ``T.Buffer((1,))`` would fail TVM's bound checks at lower time.
+    """
+    try:
+        tir = ctx.tir()
+    except Exception:
+        return buf
+
+    name = getattr(buf, "name", None) or "buf"
+    target_key: Any = None
+    for k, v in (getattr(ctx, "buffers", {}) or {}).items():
+        if v is buf:
+            target_key = k
+            break
+    if target_key is None:
+        return buf
+
+    try:
+        new_buf = tir.decl_buffer(shape=list(shape) or [1], dtype=dtype, name=name)
+    except Exception:
+        return buf
+    ctx.buffers[target_key] = new_buf
+    if hasattr(ctx, "value_map"):
+        try:
+            for k, v in list(ctx.value_map.items()):
+                if v is buf:
+                    ctx.value_map[k] = new_buf
+                elif isinstance(v, tuple) and len(v) == 2 and v[0] is buf:
+                    ctx.value_map[k] = (new_buf, v[1])
+        except Exception:
+            pass
+    return new_buf
+
+
+def _emit_tile_load_from_input_buffer(
+    op: Any,
+    ctx: Any,
+    src_buf: Any,
+    offset_indices: Any,
+    out_shape: Any,
+    out_dtype: str,
+    mask_ssa: Any,
+    other_ssa: Any,
+) -> Any:
+    """Emit a per-lane ``tir.For`` over ``src_buf`` using ``offset_indices``.
+
+    Unlike ``_emit_tile_copy_tir`` (which assumes ``base_indices`` are
+    scalar PrimExprs and forms ``base + lv`` for the per-lane index), the
+    tt.addptr fallback hands us indices that may be **tile buffers** (the
+    common ``%offsets = pid * BLOCK + arange(BLOCK)`` pattern). For those
+    we form the per-lane index as ``offset_buf[lv]``; for plain PrimExprs
+    we keep ``offset + lv``.
+    """
+    tir = ctx.tir()
+    tvm_mod = ctx.tvm()
+    from .op_emitters.memory import _alloc_tile_buffer, _resolve_lane_operand, _results
+
+    result_value = _results(op)[0] if _results(op) else None
+    out_buf_name = ctx.fresh("tile_load")
+    tile_buf = _alloc_tile_buffer(ctx, list(out_shape) or [1], out_dtype, out_buf_name)
+
+    loop_vars: List[Any] = []
+    for axis, _extent in enumerate(out_shape or [1]):
+        loop_vars.append(tir.Var(ctx.fresh(f"i{axis}"), "int32"))
+
+    src_indices: List[Any] = []
+    for axis, lv in enumerate(loop_vars):
+        if axis < len(offset_indices):
+            base = offset_indices[axis]
+        else:
+            base = tir.const(0, "int32")
+        if isinstance(base, tvm_mod.tir.Buffer):
+            # Tile-buffer offset: index per-lane.
+            src_indices.append(tir.BufferLoad(base, [lv]))
+        else:
+            src_indices.append(base + lv)
+
+    load_expr: Any = tir.BufferLoad(src_buf, src_indices)
+    if mask_ssa is not None:
+        try:
+            mask_expr = ctx.get(mask_ssa)
+        except KeyError:
+            mask_expr = None
+        if mask_expr is not None:
+            if other_ssa is not None:
+                try:
+                    other_expr = ctx.get(other_ssa)
+                except KeyError:
+                    other_expr = tir.const(0, out_dtype)
+            else:
+                other_expr = tir.const(0, out_dtype)
+            mask_lane = _resolve_lane_operand(ctx, mask_expr, loop_vars, role="mask")
+            other_lane = _resolve_lane_operand(ctx, other_expr, loop_vars, role="other")
+            load_expr = tir.if_then_else(mask_lane, load_expr, other_lane)
+
+    body = tir.BufferStore(tile_buf, load_expr, list(loop_vars) or [tir.const(0, "int32")])
+    for axis in range(len(loop_vars) - 1, -1, -1):
+        extent = out_shape[axis] if axis < len(out_shape) else 1
+        body = tir.For(
+            loop_vars[axis],
+            tir.const(0, "int32"),
+            tir.const(int(extent), "int32"),
+            tir.ForKind.SERIAL,
+            body,
+        )
+
+    ctx.emit(body)
+    if result_value is not None:
+        ctx.bind(result_value, tile_buf)
+    return tile_buf
+
+
+def _wrap_tile_load_emitter(orig_emit: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap ``emit_tt_load`` so a tile load on a function-arg Buffer wires
+    the read into the actual PrimFunc parameter rather than a fresh local.
+    """
+
+    def _wrapped(op: Any, ctx: Any) -> Any:
+        try:
+            from .op_emitters.memory import (
+                _is_tile_shape,
+                _operands,
+                _resolved_or_none,
+                _results,
+                _shape_of,
+                _dtype_of,
+            )
+        except Exception:
+            return orig_emit(op, ctx)
+
+        operands = _operands(op)
+        if not operands:
+            return orig_emit(op, ctx)
+        ptr_ssa = operands[0]
+        mask_ssa = operands[1] if len(operands) >= 2 else None
+        other_ssa = operands[2] if len(operands) >= 3 else None
+        resolved = _resolved_or_none(ctx, ptr_ssa)
+        if not (isinstance(resolved, tuple) and len(resolved) == 2):
+            return orig_emit(op, ctx)
+        buf, indices = resolved
+        if not _value_is_input_buffer(ctx, buf):
+            return orig_emit(op, ctx)
+        result_value = _results(op)[0] if _results(op) else None
+        out_shape = list(_shape_of(result_value)) if result_value is not None else []
+        out_dtype = _dtype_of(result_value) if result_value is not None else "float32"
+        if not _is_tile_shape(out_shape):
+            return orig_emit(op, ctx)
+        buf = _redecl_input_buffer(ctx, buf, out_shape, out_dtype)
+        return _emit_tile_load_from_input_buffer(
+            op, ctx, buf, list(indices), out_shape, out_dtype,
+            mask_ssa, other_ssa,
+        )
+
+    return _wrapped
+
+
+def _emit_tile_store_to_input_buffer(
+    op: Any,
+    ctx: Any,
+    dst_buf: Any,
+    offset_indices: Any,
+    val_expr: Any,
+    val_shape: Any,
+    mask_ssa: Any,
+) -> Any:
+    """Symmetric to :func:`_emit_tile_load_from_input_buffer` for stores.
+
+    Indices may be tile-buffers (typical ``offsets = pid*BLOCK + arange``
+    pattern); for those we form the per-lane index as ``offset_buf[lv]``.
+    Otherwise we form ``offset + lv``.
+    """
+    tir = ctx.tir()
+    tvm_mod = ctx.tvm()
+    from .op_emitters.memory import _resolve_lane_operand
+
+    loop_vars: List[Any] = []
+    for axis, _extent in enumerate(val_shape or [1]):
+        loop_vars.append(tir.Var(ctx.fresh(f"i{axis}"), "int32"))
+
+    dst_indices: List[Any] = []
+    for axis, lv in enumerate(loop_vars):
+        if axis < len(offset_indices):
+            base = offset_indices[axis]
+        else:
+            base = tir.const(0, "int32")
+        if isinstance(base, tvm_mod.tir.Buffer):
+            dst_indices.append(tir.BufferLoad(base, [lv]))
+        else:
+            dst_indices.append(base + lv)
+
+    # Pull the per-lane value from val_expr. val_expr is typically a tile
+    # Buffer (alloced as the result of a prior tt.load / arith op).
+    if isinstance(val_expr, tvm_mod.tir.Buffer):
+        val_lane = tir.BufferLoad(val_expr, list(loop_vars) or [tir.const(0, "int32")])
+    else:
+        val_lane = _resolve_lane_operand(ctx, val_expr, loop_vars, role="value")
+
+    store_stmt: Any = tir.BufferStore(dst_buf, val_lane, dst_indices)
+    if mask_ssa is not None:
+        try:
+            mask_expr = ctx.get(mask_ssa)
+        except KeyError:
+            mask_expr = None
+        if mask_expr is not None:
+            mask_lane = _resolve_lane_operand(ctx, mask_expr, loop_vars, role="mask")
+            store_stmt = tir.IfThenElse(mask_lane, store_stmt, None)
+
+    body: Any = store_stmt
+    for axis in range(len(loop_vars) - 1, -1, -1):
+        extent = val_shape[axis] if axis < len(val_shape) else 1
+        body = tir.For(
+            loop_vars[axis],
+            tir.const(0, "int32"),
+            tir.const(int(extent), "int32"),
+            tir.ForKind.SERIAL,
+            body,
+        )
+
+    ctx.emit(body)
+    return body
+
+
+def _wrap_tile_store_emitter(orig_emit: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap ``emit_tt_store`` so a tile store on a function-arg Buffer wires
+    the write into the actual PrimFunc parameter rather than a fresh local.
+    """
+
+    def _wrapped(op: Any, ctx: Any) -> Any:
+        try:
+            from .op_emitters.memory import (
+                _is_tile_shape,
+                _operands,
+                _resolved_or_none,
+                _shape_of,
+                _dtype_of,
+            )
+        except Exception:
+            return orig_emit(op, ctx)
+
+        operands = _operands(op)
+        if len(operands) < 2:
+            return orig_emit(op, ctx)
+        ptr_ssa, val_ssa = operands[0], operands[1]
+        mask_ssa = operands[2] if len(operands) >= 3 else None
+        resolved = _resolved_or_none(ctx, ptr_ssa)
+        if not (isinstance(resolved, tuple) and len(resolved) == 2):
+            return orig_emit(op, ctx)
+        buf, indices = resolved
+        if not _value_is_input_buffer(ctx, buf):
+            return orig_emit(op, ctx)
+        val_shape = list(_shape_of(val_ssa))
+        if not _is_tile_shape(val_shape):
+            return orig_emit(op, ctx)
+        val_expr = ctx.get(val_ssa)
+        dtype = _dtype_of(val_ssa) or "float32"
+        buf = _redecl_input_buffer(ctx, buf, val_shape, dtype)
+        return _emit_tile_store_to_input_buffer(
+            op, ctx, buf, list(indices), val_expr, val_shape, mask_ssa,
+        )
+
+    return _wrapped
+
+
+_LOAD_STORE_WRAPPERS_INSTALLED: bool = False
+
+
+def _install_tile_load_store_wrappers() -> None:
+    """Idempotently install tt.load/tt.store wrappers in OP_TABLE."""
+    global _LOAD_STORE_WRAPPERS_INSTALLED
+    if _LOAD_STORE_WRAPPERS_INSTALLED:
+        return
+    if "tt.load" in OP_TABLE:
+        OP_TABLE["tt.load"] = _wrap_tile_load_emitter(OP_TABLE["tt.load"])
+    if "tt.store" in OP_TABLE:
+        OP_TABLE["tt.store"] = _wrap_tile_store_emitter(OP_TABLE["tt.store"])
+    _LOAD_STORE_WRAPPERS_INSTALLED = True
+
+
+_install_tile_load_store_wrappers()
+
+
 # Sentinel type alias. The real return type is ``tvm.tir.PrimFunc``;
 # we keep an opaque alias here so callers can type-hint without dragging
 # in TVM during scaffold review.
@@ -215,8 +542,13 @@ def _walk_mlir_module(
             name = op.get("name")
         return str(name) if name else ""
 
-    # Lazy import to avoid a top-of-file cycle with mlir_walker.
-    from .mlir_walker import OPS_THAT_HANDLE_OWN_REGIONS  # noqa: WPS433
+    # Lazy import to avoid a top-of-file cycle with mlir_walker. We use the
+    # per-emitter ``owns_regions`` attribute (H4 Wave-I) but keep the legacy
+    # set as a fallback for emitters that forgot to set the attribute.
+    from .mlir_walker import (  # noqa: WPS433
+        OPS_THAT_HANDLE_OWN_REGIONS,
+        _emitter_owns_regions,
+    )
     # Lazy import of the tt.func sym_name extractor + tt.call callee parser
     # (live in the control emitters module). Used by the pre-pass below to
     # seed ``ctx.callees`` so ``emit_tt_call`` can look up callees without
@@ -276,17 +608,16 @@ def _walk_mlir_module(
         # Skip region descent for ops whose emitters walk their own
         # regions (``tt.reduce`` / ``tt.scan`` consume the combiner
         # region; ``scf.for`` / ``scf.if`` / ``scf.while`` use
-        # ``_emit_region``). Descending here would dispatch inner ops
-        # before their parent emitter bound the region's block
-        # arguments, surfacing as ``KeyError: WalkerCtx: SSA value not
-        # yet mapped`` on the next downstream op.
-        if op_name_str in OPS_THAT_HANDLE_OWN_REGIONS:
-            return
-        # tt.call: emit_tt_call inline-walks the callee's body itself, so
-        # we must not re-recurse into the (empty) tt.call op regions here.
-        # tt.call has no regions in practice but we defensively short-circuit
-        # for parity with the OPS_THAT_HANDLE_OWN_REGIONS branch above.
-        if op_name_str == "tt.call":
+        # ``_emit_region``; ``tt.call`` inline-walks its callee). Descending
+        # here would dispatch inner ops before their parent emitter bound
+        # the region's block arguments, surfacing as
+        # ``KeyError: WalkerCtx: SSA value not yet mapped`` on the next
+        # downstream op.
+        #
+        # H4 Wave-I refactor: dispatch via the per-emitter ``owns_regions``
+        # attribute (``_emitter_owns_regions``). Fall back to the legacy
+        # set for emitters that haven't been migrated yet.
+        if _emitter_owns_regions(op_name_str) or op_name_str in OPS_THAT_HANDLE_OWN_REGIONS:
             return
         # Helper tt.func: a tt.func whose sym_name is referenced by some
         # tt.call is inlined at the call site. We must NOT re-walk its

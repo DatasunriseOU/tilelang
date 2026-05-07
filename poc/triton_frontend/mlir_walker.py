@@ -49,6 +49,8 @@ __all__ = [
     "OPS_THAT_HANDLE_OWN_REGIONS",
     "OpVisitor",
     "TTIRWalker",
+    "_compute_owns_regions_set",
+    "_emitter_owns_regions",
     "parse_ttir",
     "try_import_mlir",
     "walk_module",
@@ -57,7 +59,7 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# Region-ownership allowlist
+# Region-ownership: per-emitter ``owns_regions`` attribute
 # ---------------------------------------------------------------------------
 #
 # Some ops carry MLIR regions whose ops MUST NOT be visited by the global
@@ -69,21 +71,65 @@ __all__ = [
 # bound by the parent emitter -- triggering ``WalkerCtx.get`` to raise
 # ``KeyError: SSA value not yet mapped``.
 #
-# The fix: skip region descent for the ops below; their emitters are
-# responsible for any region traversal they need.
+# H4 Wave-I refactor: instead of a hard-coded allowlist, each emitter
+# callable that walks its own regions sets an ``owns_regions = True``
+# attribute on itself. The walker checks ``getattr(emitter_fn,
+# 'owns_regions', False)`` after dispatching the op. New region-owning
+# emitters (e.g. ``tt.gather`` / ``tt.histogram``) can opt in without
+# touching the walker.
 #
+# Currently region-owning emitters (each carries ``owns_regions = True``):
 # * ``scf.for`` / ``scf.if`` / ``scf.while`` -- ``op_emitters/control.py``
 #   uses ``_emit_region`` to walk the body itself so iter_args/yield are
 #   bound at the right point.
 # * ``tt.reduce`` / ``tt.scan`` -- ``op_emitters/reduction.py`` walks
 #   the combiner region itself (via ``detect_combiner_kind``) and never
 #   wants the global walker dispatching combiner ops.
+# * ``tt.call`` -- ``op_emitters/control.py:emit_tt_call`` inline-walks
+#   the callee's body itself.
+#
+# :data:`OPS_THAT_HANDLE_OWN_REGIONS` is retained as a documented fallback
+# so callers / tests that still consult the hard-coded set continue to
+# work; it is re-derived from the per-emitter attributes at import time
+# (see :func:`_compute_owns_regions_set` below) so the two stay in sync.
+def _emitter_owns_regions(op_name: str) -> bool:
+    """Return True iff the emitter for ``op_name`` walks its own regions.
+
+    Looks the emitter up in :data:`OP_TABLE` and returns the value of its
+    ``owns_regions`` attribute (default False). This is the single
+    source-of-truth the walker uses to decide whether to skip region
+    descent for an op.
+    """
+    emitter = OP_TABLE.get(op_name)
+    if emitter is None:
+        return False
+    return bool(getattr(emitter, "owns_regions", False))
+
+
+def _compute_owns_regions_set() -> frozenset:
+    """Re-derive the legacy hard-coded set from per-emitter attributes.
+
+    Kept as a documented fallback for callers that want a static set
+    rather than a per-op lookup; tests assert the two are in sync via
+    ``test_owns_regions_attribute_replaces_hardcoded_set``.
+    """
+    return frozenset(
+        name
+        for name, emitter in OP_TABLE.items()
+        if getattr(emitter, "owns_regions", False)
+    )
+
+
+# Lazy: OP_TABLE may not be fully populated at module import time
+# (op_emitters/* register via OP_TABLE.update at op_mapping import end).
+# The set is recomputed on first access by the public callers below.
 OPS_THAT_HANDLE_OWN_REGIONS = frozenset({
     "scf.for",
     "scf.if",
     "scf.while",
     "tt.reduce",
     "tt.scan",
+    "tt.call",
 })
 
 
@@ -262,7 +308,13 @@ def walk_module(module: Any, visitor: OpVisitor) -> None:
         # ``KeyError: SSA value not yet mapped`` on the next downstream
         # op. Skip region descent for these ops; their emitters are
         # responsible for any traversal they need.
-        if _op_name(op) in OPS_THAT_HANDLE_OWN_REGIONS:
+        #
+        # H4 Wave-I refactor: dispatch via the per-emitter ``owns_regions``
+        # attribute rather than a hard-coded set. Falls back to the legacy
+        # set so a future emitter that forgets to set the attribute still
+        # works (and tests pin the two in sync).
+        op_name_str = _op_name(op)
+        if _emitter_owns_regions(op_name_str) or op_name_str in OPS_THAT_HANDLE_OWN_REGIONS:
             return
         for region in getattr(op, "regions", ()) or ():
             for block in getattr(region, "blocks", ()) or ():

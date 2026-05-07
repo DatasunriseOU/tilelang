@@ -99,6 +99,116 @@ def test_arith_select_wrong_arity_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Wave F2 regression: arith.select with Buffer-typed operand
+# ---------------------------------------------------------------------------
+#
+# After Wave E2 lowered broadcasted constants / per-lane comparators into
+# ``tir.decl_buffer``, ``arith.select`` operands can resolve to a
+# ``tir.Buffer`` rather than a scalar PrimExpr. The pre-F2 emitter fed the
+# Buffer straight into ``tir.if_then_else``, which TVM rejects with
+# ``_OpIfThenElse: Expected PrimExpr but got tirx.Buffer``. The fix
+# materialises a per-lane ``tir.For`` nest with ``BufferLoad`` on each
+# Buffer-shaped operand, identical to Wave F1's tt.load mask path.
+
+
+def test_arith_select_buffer_then_else_per_lane_materialisation() -> None:
+    """Buffer-typed cond/true/false operands must materialise as a For nest.
+
+    The legacy scalar path called ``tir.if_then_else`` directly with the
+    Buffer as ``arg #0`` and exploded; we now allocate a tile-scoped result
+    buffer and emit a ``tir.For`` over the result shape, with ``BufferLoad``
+    on each Buffer-typed operand.
+    """
+    ctx = WalkerCtx()
+
+    cond = _val("c", shape=[16], dtype="bool")
+    t = _val("t", shape=[16], dtype="float32")
+    f = _val("f", shape=[16], dtype="float32")
+    out = _val("o", shape=[16], dtype="float32")
+
+    cond_buf = tvm.tir.decl_buffer((16,), "bool", name="cond_tile")
+    t_buf = tvm.tir.decl_buffer((16,), "float32", name="t_tile")
+    f_buf = tvm.tir.decl_buffer((16,), "float32", name="f_tile")
+
+    ctx.bind(cond, cond_buf)
+    ctx.bind(t, t_buf)
+    ctx.bind(f, f_buf)
+
+    op = {
+        "name": "arith.select",
+        "operands": [cond, t, f],
+        "results": [out],
+        "attrs": {},
+    }
+
+    result = map_arith_select(op, ctx)
+
+    # Result is a tile-scoped Buffer, not a raw PrimExpr.
+    assert isinstance(result, tvm.tir.Buffer), f"expected tir.Buffer, got {type(result).__name__}"
+    assert ctx.value_map[out] is result
+
+    # A For-nest must have been emitted into the kernel body.
+    assert ctx.stmts, "expected map_arith_select to emit a For-nest stmt"
+    emitted = ctx.stmts[-1]
+    text = str(emitted)
+    assert "for" in text.lower(), f"expected For-nest, got: {text!r}"
+    # The lane-loaded operands and the if_then_else call must all appear.
+    assert "if_then_else" in text or "select" in text, (
+        f"expected if_then_else / select node inside For nest, got: {text!r}"
+    )
+
+
+def test_arith_select_buffer_cond_scalar_branches_per_lane() -> None:
+    """Only the cond is a Buffer; true/false are scalar PrimExprs."""
+    ctx = WalkerCtx()
+
+    cond = _val("c", shape=[8], dtype="bool")
+    t = _val("t", shape=[], dtype="float32")
+    f = _val("f", shape=[], dtype="float32")
+    out = _val("o", shape=[8], dtype="float32")
+
+    cond_buf = tvm.tir.decl_buffer((8,), "bool", name="cond_tile")
+    ctx.bind(cond, cond_buf)
+    ctx.bind(t, tvm.tir.const(1.0, "float32"))
+    ctx.bind(f, tvm.tir.const(0.0, "float32"))
+
+    op = {
+        "name": "arith.select",
+        "operands": [cond, t, f],
+        "results": [out],
+        "attrs": {},
+    }
+
+    result = map_arith_select(op, ctx)
+    assert isinstance(result, tvm.tir.Buffer)
+    assert ctx.value_map[out] is result
+    assert ctx.stmts, "expected For-nest emission for Buffer-typed cond"
+
+
+def test_arith_select_buffer_operand_rank0_result_raises() -> None:
+    """Sanity: Buffer-typed operand on a rank-0 result must error, not fold."""
+    ctx = WalkerCtx()
+
+    cond = _val("c", shape=[], dtype="bool")
+    t = _val("t", shape=[4], dtype="float32")
+    f = _val("f", shape=[], dtype="float32")
+    out = _val("o", shape=[], dtype="float32")  # rank-0 result, intentional mismatch
+
+    ctx.bind(cond, tvm.tir.const(1, "bool"))
+    ctx.bind(t, tvm.tir.decl_buffer((4,), "float32", name="t_tile"))
+    ctx.bind(f, tvm.tir.const(0.0, "float32"))
+
+    op = {
+        "name": "arith.select",
+        "operands": [cond, t, f],
+        "results": [out],
+        "attrs": {},
+    }
+    with pytest.raises(EmitError, match="rank-0 result"):
+        map_arith_select(op, ctx)
+
+
+# ---------------------------------------------------------------------------
 # arith.extf  fp16 -> fp32
 # ---------------------------------------------------------------------------
 
@@ -302,6 +412,68 @@ def test_scf_for_emits_tir_for_with_iter_arg() -> None:
     body_text = _stringify(for_stmt.body)
     assert "let" in body_text.lower() or "Let" in body_text, \
         f"expected LetStmt for iter_arg in body, got: {body_text!r}"
+
+
+def test_scf_for_buffer_iter_arg_does_not_letstmt() -> None:
+    """Regression: matmul-style ``scf.for`` with a buffer/tile carry must not
+    emit ``tir.LetStmt(var, buffer_descriptor, body)``.
+
+    Prior to the fix, an iter_arg whose resolved value was a buffer
+    descriptor (e.g. a ``T.gemm`` accumulator surfaced as
+    ``(tir.Buffer, shape_list)``) crashed the lowering with::
+
+        TypeError: Mismatched type on argument #1 when calling: tirx.Bind
+        ... Expected ir.PrimExpr but got ffi.Array.
+
+    The emitter now bypasses ``LetStmt`` for non-scalar carries and binds
+    the block-arg SSA directly to the descriptor.
+    """
+    ctx = WalkerCtx()
+    lb = _val("lb", shape=[], dtype="int32")
+    ub = _val("ub", shape=[], dtype="int32")
+    step = _val("step", shape=[], dtype="int32")
+    init = _val("acc_init", shape=[16, 16], dtype="float32")
+    out = _val("acc_final", shape=[16, 16], dtype="float32")
+
+    ind_arg = _val("i", shape=[], dtype="int32")
+    iter_arg = _val("acc", shape=[16, 16], dtype="float32")
+
+    _bind_const(ctx, lb, 0)
+    _bind_const(ctx, ub, 4)
+    _bind_const(ctx, step, 1)
+    # Bind init to a (Buffer, shape) tuple -- the matmul T.gemm
+    # accumulator pattern. This previously tripped tirx.Bind.
+    acc_buf = tvm.tir.decl_buffer((16, 16), "float32", name="acc")
+    ctx.bind(init, (acc_buf, [16, 16]))
+
+    op = {
+        "name": "scf.for",
+        "operands": [lb, ub, step, init],
+        "results": [out],
+        "attrs": {},
+        "block_args": [ind_arg, iter_arg],
+        "regions": [
+            {
+                "ops": [
+                    {
+                        "name": "scf.yield",
+                        "operands": [iter_arg],
+                        "results": [],
+                        "attrs": {},
+                    },
+                ],
+            },
+        ],
+    }
+    # Must not raise.
+    for_stmt = map_scf_for(op, ctx)
+    assert isinstance(for_stmt, tvm.tir.For)
+    # The body should NOT contain a LetStmt for the buffer iter_arg --
+    # only the loop's induction structure and the (empty / yielded) body.
+    body_text = _stringify(for_stmt.body)
+    # If a LetStmt with the buffer slipped through, TVM would have raised
+    # already; re-stringifying as a sanity check should still print fine.
+    assert body_text  # any non-empty repr is fine
 
 
 def test_scf_for_too_many_iter_args_raises() -> None:

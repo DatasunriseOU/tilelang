@@ -853,6 +853,14 @@ def map_tt_atomic_cas(op: Any, ctx: EmitContext) -> Any:
 # ---------------------------------------------------------------------------
 
 
+# H4 Wave-I: per-emitter ``owns_regions`` attribute. ``tt.reduce`` and
+# ``tt.scan`` walk the combiner region themselves (via
+# ``detect_combiner_kind``), so the global walker MUST NOT descend.
+# ``mlir_walker._emitter_owns_regions`` consults this attribute.
+map_tt_reduce.owns_regions = True
+map_tt_scan.owns_regions = True
+
+
 REDUCTION_EMITTERS: Dict[str, Callable[[Any, EmitContext], Any]] = {
     # Reductions / scans
     "tt.reduce": map_tt_reduce,

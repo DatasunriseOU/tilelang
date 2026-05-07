@@ -136,6 +136,47 @@ def _is_float_dtype(dt: str) -> bool:
     return False
 
 
+def _is_scalar_primexpr(value: Any) -> bool:
+    """Return True if ``value`` can be used as a scalar ``tir.LetStmt`` value.
+
+    ``tir.LetStmt(var, value, body)`` requires ``value`` to satisfy
+    ``ir.PrimExpr`` (scalar). Iter-args of ``scf.for`` / ``scf.while`` are
+    sometimes buffer-typed tiles -- we materialise them as
+    ``(buffer, shape)`` tuples or raw ``tir.Buffer`` objects upstream.
+    Feeding those to ``LetStmt`` raises::
+
+        TypeError: Mismatched type on argument #1 ... Expected
+        ir.PrimExpr but got ffi.Array
+
+    This helper lets the caller distinguish the two paths cleanly.
+    """
+    # Fast paths for plain Python numeric types -- ``tir.Var`` and
+    # ``tir.PrimExpr`` are TVM Object subclasses; numeric scalars get
+    # auto-promoted by TVM's argument coercion. Anything that's clearly
+    # a tuple-shaped descriptor / collection / Buffer is *not* scalar.
+    if value is None:
+        return False
+    if isinstance(value, (bool, int, float)):
+        return True
+    if isinstance(value, (tuple, list, dict, set)):
+        return False
+    # tvm.tir.Buffer is not a PrimExpr.
+    try:
+        import tvm  # noqa: WPS433
+        if isinstance(value, tvm.tir.Buffer):
+            return False
+        # ffi.Array (TVM-wrapped tuple, e.g. shape descriptors).
+        ffi_array = getattr(getattr(tvm, "ffi", None), "Array", None)
+        if ffi_array is not None and isinstance(value, ffi_array):
+            return False
+        return isinstance(value, tvm.ir.PrimExpr)
+    except Exception:
+        # If TVM probing fails, fall back to "treat as scalar" so we don't
+        # silently mask a real bug -- the LetStmt call itself will surface
+        # the type error if we got it wrong.
+        return True
+
+
 def _validate_int_float_pair(src_dt: str, dst_dt: str, op_label: str) -> None:
     """Raise :class:`EmitError` when an int<->float pair is non-standard.
 
@@ -219,15 +260,25 @@ def _emit_cast(op: Any, ctx: _om.WalkerCtx, *, expect: str) -> Any:
 def map_arith_select(op: Any, ctx: _om.WalkerCtx) -> Any:
     """Lower ``arith.select(cond, t, f)`` to ``tir.if_then_else(cond, t, f)``.
 
-    Vector form: when the result type is a tile (rank>0), we still emit
-    ``tir.if_then_else`` over PrimExprs because tile ops in our IR are
-    represented lazily (broadcast/splat are no-op rebinds). The
-    ``LowerTileOp`` pass materialises the elementwise ``tir.For``
-    afterwards. We document the lowered shape via the ``out_shape`` we
-    record so layout inference can pick this up; for genuinely-scalar
-    selects nothing extra is emitted.
+    Scalar form: emits a single ``tir.if_then_else`` over PrimExprs.
+
+    Buffer form (Wave F2): when **any** of ``cond`` / ``t`` / ``f`` resolves
+    to a ``tir.Buffer`` -- which happens after Wave E2 lowered a broadcasted
+    constant tile or a per-lane comparator into a ``decl_buffer`` -- the
+    scalar ``tir.if_then_else`` path explodes with::
+
+        Mismatched type on argument #N when calling _OpIfThenElse:
+        Expected `ir.PrimExpr` but got `tirx.Buffer`
+
+    Mirroring Wave F1's fix in :func:`emit_tt_load`, we materialise a
+    per-lane ``tir.For`` nest: allocate a fresh tile-scoped result buffer,
+    iterate over the result shape, and ``BufferLoad`` each Buffer-typed
+    operand at the loop indices before feeding it into
+    ``tir.if_then_else``. The result SSA is rebound to the new buffer so
+    downstream consumers see a tile-shaped value just like before.
     """
     tir = ctx.tir()
+    tvm_mod = ctx.tvm()
     operands = _om._operands(op)
     if len(operands) != 3:
         raise EmitError(
@@ -235,18 +286,79 @@ def map_arith_select(op: Any, ctx: _om.WalkerCtx) -> Any:
         )
     cond, t_val, f_val = (ctx.get(o) for o in operands)
 
-    out_shape = _result_shape(op)
-    if out_shape and len(out_shape) > 0:
-        # Vector form: still produce tir.if_then_else over PrimExprs. The
-        # elementwise materialisation lives in LowerTileOp; we emit a
-        # lowering hint via a no-op tir.For wrapping when an explicit
-        # elementwise index is needed downstream. For now the lazy-tile
-        # representation is sufficient — tile ops above us (broadcast /
-        # splat / make_range) are also lazy.
-        sel = tir.if_then_else(cond, t_val, f_val)
-    else:
-        sel = tir.if_then_else(cond, t_val, f_val)
+    # Per-lane materialisation when any operand is a Buffer-shaped tile.
+    # We keep the scalar fast-path (no allocation, no loop nest) for the
+    # common case where Wave E2 lowering hasn't fired.
+    buffer_cls = tvm_mod.tir.Buffer
+    has_buffer_operand = (
+        isinstance(cond, buffer_cls)
+        or isinstance(t_val, buffer_cls)
+        or isinstance(f_val, buffer_cls)
+    )
+    if has_buffer_operand:
+        out_shape = _result_shape(op)
+        if not out_shape:
+            # A Buffer-typed operand with a rank-0 result is structurally
+            # impossible: report it loudly rather than silently returning a
+            # bogus scalar.
+            raise EmitError(
+                "arith.select: Buffer-typed operand on a rank-0 result; "
+                "expected a tile result shape (post-broadcast)."
+            )
+        out_dtype = _result_dtype(op)
+        out_buf_name = ctx.fresh("select_result")
+        out_buf = _om._alloc_tile_buffer(
+            ctx, list(out_shape), out_dtype, out_buf_name
+        )
 
+        # One ``tir.Var`` per axis -- innermost-last, matching ``BufferStore``
+        # / ``BufferLoad`` indexing convention used elsewhere in the emitter.
+        loop_vars: List[Any] = [
+            tir.Var(ctx.fresh(f"i{axis}"), "int32") for axis in range(len(out_shape))
+        ]
+
+        def _lane(value: Any, role: str) -> Any:
+            """Pull a scalar lane out of ``value`` for the current loop_vars."""
+            if isinstance(value, buffer_cls):
+                rank = len(value.shape)
+                if rank == 0:
+                    return tir.BufferLoad(value, [tir.const(0, "int32")])
+                lv = list(loop_vars)
+                if len(lv) >= rank:
+                    indices = lv[-rank:]
+                else:
+                    indices = [tir.const(0, "int32")] * (rank - len(lv)) + lv
+                return tir.BufferLoad(value, indices)
+            # Scalar PrimExpr (or python int/float/bool) passes through;
+            # ``tir.if_then_else`` will type-check it for us.
+            if hasattr(value, "dtype") or isinstance(value, (int, float, bool)):
+                return value
+            raise EmitError(
+                f"arith.select: unsupported {role} operand type "
+                f"{type(value).__name__}; expected tir.PrimExpr or tir.Buffer"
+            )
+
+        cond_lane = _lane(cond, "cond")
+        t_lane = _lane(t_val, "true")
+        f_lane = _lane(f_val, "false")
+        body_expr = tir.if_then_else(cond_lane, t_lane, f_lane)
+        body = tir.BufferStore(out_buf, body_expr, list(loop_vars))
+        for axis in range(len(loop_vars) - 1, -1, -1):
+            extent = out_shape[axis]
+            body = tir.For(
+                loop_vars[axis],
+                tir.const(0, "int32"),
+                tir.const(int(extent), "int32"),
+                tir.ForKind.SERIAL,
+                body,
+            )
+        ctx.emit(body)
+        if _om._results(op):
+            ctx.bind(_om._results(op)[0], out_buf)
+        return out_buf
+
+    # Scalar fast-path: identical to the pre-F2 behaviour.
+    sel = tir.if_then_else(cond, t_val, f_val)
     if _om._results(op):
         ctx.bind(_om._results(op)[0], sel)
     return sel
@@ -1195,22 +1307,32 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
     induction_ssa = block_args[0] if block_args else None
     iter_arg_block_ssas = block_args[1:1 + len(iter_arg_ssas)] if len(block_args) > 1 else []
 
-    # Materialise iter_args as fresh tir.Vars of the appropriate dtype, and
-    # pre-bind them in the parent ctx to the *initial* (operand) values so
-    # the loop body sees them. We rely on tir.LetStmt nesting (or BufferStore
-    # for buffer-typed iter_args) to thread updates -- that is delegated
-    # to the parent walker after this emitter returns.
+    # Materialise iter_args. Scalar carries get a fresh tir.Var bound via
+    # ``tir.LetStmt(var, init, body)``; buffer / tuple carries (e.g. a
+    # ``T.gemm`` accumulator tile, surfaced as ``(buffer, shape)``) cannot
+    # go through LetStmt -- ``tirx.Bind`` rejects non-PrimExpr values with
+    # ``Expected ir.PrimExpr but got ffi.Array``. For those we bind the
+    # block-arg SSA *directly* to the buffer descriptor so the body's
+    # BufferLoad / BufferStore on the iter_arg resolves to the actual
+    # buffer; mutation threads forward by in-place store, which is exactly
+    # how matmul / reduce-into-tile loops are written in TTIR.
     iter_arg_pairs: List[Tuple[Any, Any]] = []
     init_pairs: List[Tuple[Any, Any]] = []
     for blk_ssa, init_ssa in zip(iter_arg_block_ssas, iter_arg_ssas):
-        dt = _om._dtype_of(blk_ssa) or _om._dtype_of(init_ssa) or "float32"
-        var = tir.Var(ctx.fresh("carry"), dt)
-        iter_arg_pairs.append((blk_ssa, var))
         try:
             init_val = ctx.get(init_ssa)
         except KeyError:
             init_val = init_ssa
-        init_pairs.append((var, init_val))
+        if _is_scalar_primexpr(init_val):
+            dt = _om._dtype_of(blk_ssa) or _om._dtype_of(init_ssa) or "float32"
+            var = tir.Var(ctx.fresh("carry"), dt)
+            iter_arg_pairs.append((blk_ssa, var))
+            init_pairs.append((var, init_val))
+        else:
+            # Buffer / tuple / ffi.Array carry: skip LetStmt; bind the
+            # block-arg SSA directly to the descriptor so body emitters
+            # see the buffer. This is the matmul T.gemm path.
+            iter_arg_pairs.append((blk_ssa, init_val))
 
     body, yielded = _emit_region(
         region,
@@ -1220,14 +1342,25 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
         iter_arg_pairs=iter_arg_pairs,
     )
 
-    # Wrap the body so each iter_arg is *visible* to the body via LetStmt.
-    # The yielded values become the next-iteration values; full SSA-style
+    # Wrap the body so each *scalar* iter_arg is visible via LetStmt. The
+    # yielded values become the next-iteration values; full SSA-style
     # rotation requires a more involved transform pass, so for now we mark
     # the loop kind as "serial" and record yielded values in ctx for the
     # parent walker to consume (via ctx.value_map). This matches scf.for's
     # forwarding semantics for the common pattern where iter_args carry an
     # accumulator buffer that the body has *already* mutated in place.
     for var, init_val in init_pairs:
+        if not _is_scalar_primexpr(init_val):
+            # Defence in depth: ctx.get(init_ssa) may have returned a
+            # non-scalar even after our triage above (e.g. an emitter
+            # rebound the SSA between collection time and now). Surface a
+            # clear EmitError instead of a cryptic tirx.Bind type error.
+            raise EmitError(
+                f"map_scf_for: iter_arg init value for {var!r} is not a "
+                f"scalar PrimExpr (got type={type(init_val).__name__}); "
+                f"buffer-typed carries should be routed through the "
+                f"non-LetStmt branch above."
+            )
         body = tir.LetStmt(var, init_val, body)
 
     # Compute extent = ub - lb. step == 1 is the common case; for non-unit
@@ -1515,25 +1648,33 @@ def map_scf_while(op: Any, ctx: _om.WalkerCtx) -> Any:
         except (AttributeError, IndexError):
             after_block_args = []
 
-    # Materialise carry vars (one tir.Var per iter_arg). Same pattern as
-    # ``map_scf_for``: bind the *parent* ctx so the body's Let wrappers see
-    # the initial value, then thread the same Var into both regions.
+    # Materialise carry vars (one entry per iter_arg). For scalar carries we
+    # allocate a fresh ``tir.Var`` and emit a ``tir.LetStmt`` that binds the
+    # initial value -- same pattern as ``map_scf_for``. For buffer / tuple
+    # carries (e.g. a fragment passed in as state) we thread the descriptor
+    # itself; ``tir.LetStmt`` would otherwise raise ``tirx.Bind expected
+    # ir.PrimExpr but got ffi.Array``. ``carry_vars`` may therefore contain
+    # either a ``tir.Var`` or a buffer descriptor.
     carry_vars: List[Any] = []
     init_pairs: List[Tuple[Any, Any]] = []
     for idx, init_ssa in enumerate(init_ssas):
-        dt = _om._dtype_of(init_ssa) or "float32"
-        # Prefer the before-region block-arg dtype when richer.
-        if idx < len(before_block_args):
-            blk_dt = _om._dtype_of(before_block_args[idx])
-            if blk_dt:
-                dt = blk_dt
-        var = tir.Var(ctx.fresh("wcarry"), dt)
-        carry_vars.append(var)
         try:
             init_val = ctx.get(init_ssa)
         except KeyError:
             init_val = init_ssa
-        init_pairs.append((var, init_val))
+        if _is_scalar_primexpr(init_val):
+            dt = _om._dtype_of(init_ssa) or "float32"
+            # Prefer the before-region block-arg dtype when richer.
+            if idx < len(before_block_args):
+                blk_dt = _om._dtype_of(before_block_args[idx])
+                if blk_dt:
+                    dt = blk_dt
+            var = tir.Var(ctx.fresh("wcarry"), dt)
+            carry_vars.append(var)
+            init_pairs.append((var, init_val))
+        else:
+            # Buffer-typed carry: thread the descriptor itself; no LetStmt.
+            carry_vars.append(init_val)
 
     # Walk the before-region: detect ``scf.condition`` as terminator and
     # capture (cond_expr, forwarded_values).
@@ -1633,12 +1774,19 @@ def map_scf_while(op: Any, ctx: _om.WalkerCtx) -> Any:
     body_stmts.append(guarded_after)
     loop_body = tir.SeqStmt(body_stmts) if len(body_stmts) > 1 else body_stmts[0]
 
-    # Wrap the body in LetStmts that bind the carry vars to their initial
-    # values. NOTE: this matches map_scf_for's structure (Let on entry);
-    # the carry vars are *mutable* tir.Vars whose updates the after-region
-    # is responsible for emitting via BufferStore on a sibling buffer. The
-    # downstream LowerLetStmt pass folds the binding correctly.
+    # Wrap the body in LetStmts that bind the *scalar* carry vars to their
+    # initial values. NOTE: this matches map_scf_for's structure (Let on
+    # entry); the carry vars are *mutable* tir.Vars whose updates the
+    # after-region is responsible for emitting via BufferStore on a sibling
+    # buffer. The downstream LowerLetStmt pass folds the binding correctly.
+    # Buffer-typed carries skipped the init_pairs collection above.
     for var, init_val in init_pairs:
+        if not _is_scalar_primexpr(init_val):
+            raise EmitError(
+                f"map_scf_while: carry init for {var!r} is not a scalar "
+                f"PrimExpr (got type={type(init_val).__name__}); buffer "
+                f"carries should not enter the LetStmt path."
+            )
         loop_body = tir.LetStmt(var, init_val, loop_body)
 
     loop_var = tir.Var(ctx.fresh("wi"), "int32")
@@ -2048,6 +2196,17 @@ def emit_tt_call(op: Any, ctx: _om.WalkerCtx) -> Any:
 # ---------------------------------------------------------------------------
 # Public dispatch table
 # ---------------------------------------------------------------------------
+
+
+# H4 Wave-I: per-emitter ``owns_regions`` attribute. Each emitter that walks
+# its own region(s) (so the global walker MUST NOT descend) sets this to
+# True; ``mlir_walker._emitter_owns_regions`` reads it. Adding a new
+# region-owning op (e.g. ``tt.gather`` / ``tt.histogram``) requires only
+# setting the attribute -- no walker change.
+map_scf_for.owns_regions = True
+map_scf_if.owns_regions = True
+map_scf_while.owns_regions = True
+emit_tt_call.owns_regions = True
 
 
 CONTROL_EMITTERS: Dict[str, Callable[..., Any]] = {

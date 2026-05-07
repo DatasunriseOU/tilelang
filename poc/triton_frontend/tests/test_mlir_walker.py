@@ -309,3 +309,51 @@ def test_wrap_module_for_walker_adapts_jaxlib_shape():
     # take the body branch and silently bottom out).
     assert getattr(wrapped, "body", None) is None
     assert wrapped.operation is fm.operation
+
+
+def test_owns_regions_attribute_replaces_hardcoded_set():
+    """H4 Wave-I: per-emitter ``owns_regions`` attribute is the single
+    source-of-truth for region-ownership. Every entry in the legacy
+    ``OPS_THAT_HANDLE_OWN_REGIONS`` set MUST have ``owns_regions = True``
+    on the OP_TABLE emitter so adding a new region-owning op (e.g.
+    ``tt.gather`` / ``tt.histogram``) only requires setting the attribute.
+
+    Pins the contract that a future emitter dropping ``owns_regions`` on
+    one of these ops would FAIL this test, alerting the author that the
+    walker would now incorrectly descend into the region.
+    """
+    from poc.triton_frontend.mlir_walker import (  # noqa: WPS433
+        OPS_THAT_HANDLE_OWN_REGIONS,
+        _compute_owns_regions_set,
+        _emitter_owns_regions,
+    )
+    from poc.triton_frontend.op_mapping import OP_TABLE  # noqa: WPS433
+
+    # Every legacy hard-coded entry must have a registered emitter that
+    # carries ``owns_regions = True``.
+    for op_name in OPS_THAT_HANDLE_OWN_REGIONS:
+        emitter = OP_TABLE.get(op_name)
+        assert emitter is not None, (
+            f"{op_name} listed in OPS_THAT_HANDLE_OWN_REGIONS but no emitter "
+            f"registered in OP_TABLE -- the walker can't dispatch it."
+        )
+        assert getattr(emitter, "owns_regions", False) is True, (
+            f"{op_name} emitter {emitter!r} missing ``owns_regions = True``. "
+            f"The walker (mlir_walker._emitter_owns_regions) reads this "
+            f"attribute to decide whether to skip region descent; without "
+            f"it, the walker would dispatch inner ops out of program order."
+        )
+        assert _emitter_owns_regions(op_name), (
+            f"_emitter_owns_regions({op_name!r}) returned False even though "
+            f"the emitter carries owns_regions=True; the helper is broken."
+        )
+
+    # The dynamic set computed from per-emitter attributes must be a
+    # superset of the hard-coded fallback (it can include MORE ops than
+    # the legacy set if a new emitter has been added).
+    dynamic = _compute_owns_regions_set()
+    assert OPS_THAT_HANDLE_OWN_REGIONS.issubset(dynamic), (
+        f"OPS_THAT_HANDLE_OWN_REGIONS ({sorted(OPS_THAT_HANDLE_OWN_REGIONS)}) "
+        f"is not a subset of the dynamic owns_regions set ({sorted(dynamic)}). "
+        f"An emitter dropped its owns_regions=True attribute."
+    )
