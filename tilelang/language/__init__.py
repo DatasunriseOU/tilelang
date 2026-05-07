@@ -71,6 +71,7 @@ from .reduce_op import (
     reduce_max,  # noqa: F401
     reduce_min,  # noqa: F401
     reduce_sum,  # noqa: F401
+    reduce_prod,  # noqa: F401
     reduce_abssum,  # noqa: F401
     reduce_absmax,  # noqa: F401
     reduce_bitand,  # noqa: F401

@@ -18,7 +18,7 @@ def _legalize_dim(buffer: tir.Buffer, dim: int):
 
 _REDUCE_OP_KEY = "tl.tileop.reduce"
 
-ReduceKind = Literal["sum", "abssum", "max", "absmax", "min", "bitand", "bitor", "bitxor"]
+ReduceKind = Literal["sum", "abssum", "max", "absmax", "min", "mul", "bitand", "bitor", "bitxor"]
 
 
 # NOTE(chaofan): T.reduce is implemented as a macro, so no return
@@ -208,6 +208,25 @@ def reduce_sum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
     """
     dim = _legalize_dim(buffer, dim)
     reduce(buffer, out, "sum", dim, clear, batch=batch)
+
+
+def reduce_prod(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, batch: int = 1) -> None:
+    """Perform reduce product on input buffer, store the result to output buffer.
+
+    Backend lowering uses the ``"mul"`` reduction kind. Some backends do not
+    yet implement multiplicative all-reduce; callers compiling on those
+    targets will see a codegen error and should fall back to the
+    log/exp synthesis (see :mod:`poc.triton_frontend.op_mapping`).
+
+    Args:
+        buffer (tir.Buffer): The input buffer
+        out (tir.Buffer): The output buffer
+        dim (int): The dimension to perform reduce on
+        clear (bool): If True, output buffer is initialised to 1 before the reduction.
+        batch (int): Number of output elements per batched AllReduce call (default 1).
+    """
+    dim = _legalize_dim(buffer, dim)
+    reduce(buffer, out, "mul", dim, clear, batch=batch)
 
 
 def reduce_abssum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, batch: int = 1) -> None:

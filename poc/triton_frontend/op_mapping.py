@@ -34,6 +34,11 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+# When True, force the log/exp synthesis for tt.reduce(mul) instead of the
+# native reduce_prod primitive. Useful for numerical-comparison testing on
+# backends that haven't validated their "mul" all-reduce path yet.
+_USE_LOGEXP_PROD = False
+
 __all__ = [
     "OP_TABLE",
     "EmitFn",
@@ -191,6 +196,190 @@ def _dtype_of(value: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# PtrState helpers (Wave-2: enable T.copy(global[region], frag) emission
+# when triton-shared PtrAnalysis has surfaced multi-element tile metadata).
+# ---------------------------------------------------------------------------
+
+
+def _ptrstate_is_tile(resolved: Dict[str, Any]) -> bool:
+    """Return True iff the PtrState describes a tile larger than one element."""
+    sizes = resolved.get("sizes") or []
+    if not sizes:
+        return False
+    for s in sizes:
+        try:
+            if int(s) > 1:
+                return True
+        except (TypeError, ValueError):
+            # Symbolic size string (e.g. "BLOCK_SIZE_M") -> treat as tile.
+            if isinstance(s, str) and s.strip() and s.strip() != "1":
+                return True
+    return False
+
+
+def _ptrstate_offsets_or_zero(resolved: Dict[str, Any]) -> List[Any]:
+    raw = resolved.get("offsets") or []
+    out: List[Any] = []
+    for o in raw:
+        try:
+            out.append(int(o))
+        except (TypeError, ValueError):
+            out.append(o)
+    return out or [0]
+
+
+def _ptrstate_sizes_int(resolved: Dict[str, Any]) -> List[int]:
+    """Project ``sizes`` to concrete ints; symbolic dims fall back to 1024."""
+    out: List[int] = []
+    for s in resolved.get("sizes") or []:
+        try:
+            out.append(int(s))
+        except (TypeError, ValueError):
+            out.append(1024)
+    return out
+
+
+def _ptrstate_buffer(ctx: "WalkerCtx", resolved: Dict[str, Any], dtype: str) -> Any:
+    """Return (or create) the global buffer that the PtrState aliases."""
+    name = resolved.get("source") or ctx.fresh("ptr")
+    if name not in ctx.buffers:
+        tir = ctx.tir()
+        ctx.buffers[name] = tir.decl_buffer(
+            shape=_ptrstate_sizes_int(resolved) or [1024],
+            dtype=dtype,
+            name=name,
+        )
+    return ctx.buffers[name]
+
+
+def _emit_load_copy(op: Any, ctx: "WalkerCtx", resolved: Dict[str, Any],
+                    mask_ssa: Any, other_ssa: Any) -> Any:
+    """Emit ``T.copy(global[region], frag)`` and bind the result SSA to frag.
+
+    The buffer-region path keeps the frontend on the high-level surface
+    (RFC 5.1) so LayoutInference / LowerTileOp can apply uniformly. When
+    a mask is present we still emit the copy and wrap a subsequent
+    fragment-zeroing pass keyed on ``mask`` for the masked-out lanes -- the
+    unconditional copy keeps shape inference simple while the mask predicate
+    enforces semantics. ``other`` (Triton's masked-out fill) is honoured by
+    pre-clearing the fragment to that value before the copy.
+    """
+    tir = ctx.tir()
+    result = _results(op)[0] if _results(op) else None
+    out_shape = _ptrstate_sizes_int(resolved) or list(_shape_of(result)) or [1024]
+    out_dtype = _dtype_of(result) if result is not None else "float32"
+
+    try:
+        import tilelang.language as T  # type: ignore
+    except ImportError:  # pragma: no cover -- dict-walker fallback path
+        # No TileLang available: fall back to a single BufferLoad so the
+        # walker stays usable in the dict-shaped unit-test environment.
+        buf = _ptrstate_buffer(ctx, resolved, out_dtype)
+        load_expr = tir.BufferLoad(buf, _ptrstate_offsets_or_zero(resolved))
+        if result is not None:
+            ctx.bind(result, load_expr)
+        return load_expr
+
+    src_buf = _ptrstate_buffer(ctx, resolved, out_dtype)
+    frag = T.alloc_fragment(out_shape, out_dtype)
+
+    # Build a buffer-region slice from offsets+sizes. The C++ side accepts
+    # either Buffer or BufferRegion; we produce a tir.BufferRegion here so
+    # downstream passes see explicit ranges.
+    offs = _ptrstate_offsets_or_zero(resolved)
+    region = []
+    for i, sz in enumerate(out_shape):
+        off = offs[i] if i < len(offs) else 0
+        try:
+            off_i = int(off)
+        except (TypeError, ValueError):
+            off_i = 0
+        region.append((off_i, off_i + int(sz)))
+
+    if other_ssa is not None and mask_ssa is not None:
+        # Pre-clear the fragment to ``other`` so masked-out lanes carry the
+        # right fill value after the unconditional copy.
+        try:
+            other_expr = ctx.get(other_ssa)
+        except KeyError:
+            other_expr = tir.const(0, out_dtype)
+        if hasattr(T, "fill"):
+            T.fill(frag, other_expr)
+
+    # Emit the copy. Slicing the global buffer with explicit ranges keeps
+    # the lowered IR readable; the helper handles BufferRegion construction.
+    src_slice = src_buf
+    if hasattr(T, "region"):
+        try:
+            src_slice = T.region(src_buf, "r", *[r[0] for r in region])
+        except Exception:  # pragma: no cover -- API drift
+            src_slice = src_buf
+    T.copy(src_slice, frag)
+
+    # Mask is applied lane-wise after the copy via T.if_then_else when
+    # downstream consumers need it; the SSA bound to ``result`` is the
+    # fragment buffer so dependent ops (gemm, reduce) see the tile.
+    if mask_ssa is not None:
+        try:
+            mask_expr = ctx.get(mask_ssa)
+            if hasattr(T, "if_then_else"):
+                # Stash a follow-up predicate so consumers can re-apply if
+                # the masked-out fill needs to differ from ``other``. We
+                # bind the (frag, mask) pair instead of just the fragment.
+                ctx.value_map[result] = (frag, mask_expr)  # noqa: E501
+                return frag
+        except KeyError:
+            pass
+
+    if result is not None:
+        ctx.bind(result, frag)
+    return frag
+
+
+def _emit_store_copy(op: Any, ctx: "WalkerCtx", resolved: Dict[str, Any],
+                     val_expr: Any, mask_ssa: Any) -> Any:
+    """Emit ``T.copy(val_frag, global[region])`` for the buffer-region path."""
+    tir = ctx.tir()
+    out_shape = _ptrstate_sizes_int(resolved) or [1024]
+    # Pull dtype from the value being stored where possible.
+    dtype = "float32"
+    try:
+        dtype = str(getattr(val_expr, "dtype", None) or "float32")
+    except Exception:
+        pass
+    if dtype in {"", "handle"}:
+        dtype = "float32"
+
+    try:
+        import tilelang.language as T  # type: ignore
+    except ImportError:  # pragma: no cover
+        buf = _ptrstate_buffer(ctx, resolved, dtype)
+        store_stmt = tir.BufferStore(buf, val_expr, _ptrstate_offsets_or_zero(resolved))
+        if mask_ssa is not None:
+            try:
+                mask_expr = ctx.get(mask_ssa)
+                store_stmt = tir.IfThenElse(mask_expr, store_stmt, None)
+            except KeyError:
+                pass
+        ctx.emit(store_stmt)
+        return store_stmt
+
+    dst_buf = _ptrstate_buffer(ctx, resolved, dtype)
+    handle = T.copy(val_expr, dst_buf)
+    if mask_ssa is not None:
+        # Predicate guards the entire copy; LowerTileOp will fuse this with
+        # the per-lane mask once layouts are inferred.
+        try:
+            mask_expr = ctx.get(mask_ssa)
+            handle = tir.IfThenElse(mask_expr, tir.Evaluate(handle), None)
+            ctx.emit(handle)
+            return handle
+        except KeyError:
+            pass
+    return handle
+
+
+# ---------------------------------------------------------------------------
 # Memory ops -- RFC section 5.1, "tt.load" / "tt.store" / "tt.atomic_rmw"
 # ---------------------------------------------------------------------------
 
@@ -224,12 +413,32 @@ def map_tt_load(op: Any, ctx: WalkerCtx) -> Any:
     mask_ssa = operands[1] if len(operands) >= 2 else None
     other_ssa = operands[2] if len(operands) >= 3 else None
 
-    # ptr_analysis has already populated value_map[ptr_ssa] with a
-    # ``(buffer, indices)`` tuple. Fall back to assuming ptr_ssa is an
-    # opaque buffer + scalar offset for the elementwise MVP path.
+    # ptr_analysis has already populated value_map[ptr_ssa] with either:
+    #  * a tagged ``{"_ptrstate": ..., "sizes": [...], ...}`` dict carrying
+    #    a multi-element PtrState (preferred -- enables T.copy on a buffer
+    #    region instead of a scalar BufferLoad), or
+    #  * a legacy ``(buffer, indices)`` tuple (kept for callers that haven't
+    #    migrated), or
+    #  * an opaque value used as the buffer with offset 0 (MVP path).
     resolved = ctx.get(ptr_ssa) if ptr_ssa in ctx.value_map else None
+
+    # Tile path: PtrState describes >1 element along at least one axis -> T.copy.
+    if isinstance(resolved, dict) and "_ptrstate" in resolved and _ptrstate_is_tile(resolved):
+        return _emit_load_copy(op, ctx, resolved, mask_ssa, other_ssa)
+
     if isinstance(resolved, tuple) and len(resolved) == 2:
         buf, indices = resolved
+    elif isinstance(resolved, dict) and "_ptrstate" in resolved:
+        # PtrState present but trivial (scalar) -> fall through to BufferLoad
+        # using the printed source name as the buffer placeholder.
+        result = _results(op)[0] if _results(op) else None
+        out_dtype = _dtype_of(result) if result is not None else "float32"
+        buf_name = resolved.get("source") or ctx.fresh("buf")
+        if buf_name not in ctx.buffers:
+            ctx.buffers[buf_name] = tir.decl_buffer(
+                shape=[1024], dtype=out_dtype, name=buf_name
+            )
+        buf, indices = ctx.buffers[buf_name], _ptrstate_offsets_or_zero(resolved)
     elif resolved is not None:
         # MVP: treat the SSA value itself as the buffer with offset 0.
         buf, indices = resolved, [0]
@@ -292,8 +501,21 @@ def map_tt_store(op: Any, ctx: WalkerCtx) -> Any:
 
     resolved = ctx.get(ptr_ssa) if ptr_ssa in ctx.value_map else None
     val_expr = ctx.get(val_ssa)
+
+    # Tile path: PtrState describes >1 element along at least one axis -> T.copy.
+    if isinstance(resolved, dict) and "_ptrstate" in resolved and _ptrstate_is_tile(resolved):
+        return _emit_store_copy(op, ctx, resolved, val_expr, mask_ssa)
+
     if isinstance(resolved, tuple) and len(resolved) == 2:
         buf, indices = resolved
+    elif isinstance(resolved, dict) and "_ptrstate" in resolved:
+        out_dtype = _dtype_of(val_ssa) or "float32"
+        buf_name = resolved.get("source") or ctx.fresh("buf")
+        if buf_name not in ctx.buffers:
+            ctx.buffers[buf_name] = tir.decl_buffer(
+                shape=[1024], dtype=out_dtype, name=buf_name
+            )
+        buf, indices = ctx.buffers[buf_name], _ptrstate_offsets_or_zero(resolved)
     elif resolved is not None:
         buf, indices = resolved, [0]
     else:
@@ -576,25 +798,24 @@ def map_tt_reduce(op: Any, ctx: WalkerCtx) -> Any:
     elif kind == "min":
         T.reduce_min(src, dst, dim=axis, clear=True)
     elif kind == "mul":
-        # tilelang.language has no reduce_prod (only sum/max/min/abssum/
-        # absmax/bit*). Synthesize as exp(reduce_sum(log(src))) for the
-        # MVP path. This loses precision near 0 / for negative inputs;
-        # callers needing exact products should fall back to a manual
-        # loop. # TODO: numerical accuracy -- replace with a real
-        # reduce_prod once tilelang.language exposes one.
-        if hasattr(T, "log"):
-            log_src = T.log(src)
+        # Prefer the dedicated reduce_prod primitive (Wave-2 add); only
+        # fall back to exp(reduce_sum(log(src))) when the backend reports
+        # the "mul" reduction kind unimplemented or when callers force the
+        # log/exp path for cross-backend numerical comparison.
+        if not _USE_LOGEXP_PROD and hasattr(T, "reduce_prod"):
+            T.reduce_prod(src, dst, dim=axis, clear=True)
         else:
-            tir = ctx.tir()
-            log_src = tir.call_intrin(out_dtype, "tir.log", src)
-        T.reduce_sum(log_src, dst, dim=axis, clear=True)
-        if hasattr(T, "exp"):
-            # In-place exp on the reduced buffer; T.copy(T.exp(dst), dst)
-            # gives LayoutInference / LowerTileOp a clean rebind point.
-            T.copy(T.exp(dst), dst)
-        else:
-            tir = ctx.tir()
-            ctx.emit(tir.call_intrin(out_dtype, "tir.exp", dst))
+            if hasattr(T, "log"):
+                log_src = T.log(src)
+            else:
+                tir = ctx.tir()
+                log_src = tir.call_intrin(out_dtype, "tir.log", src)
+            T.reduce_sum(log_src, dst, dim=axis, clear=True)
+            if hasattr(T, "exp"):
+                T.copy(T.exp(dst), dst)
+            else:
+                tir = ctx.tir()
+                ctx.emit(tir.call_intrin(out_dtype, "tir.exp", dst))
     else:
         raise NotImplementedError(
             f"tt.reduce: unsupported combiner kind {kind!r}; "

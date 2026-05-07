@@ -341,14 +341,22 @@ def from_ttir(
                 for state in pa.extract_states():
                     if state.source is None:
                         continue
-                    # The shim emits printed-form keys; emitters look up
-                    # via ``ctx.value_map[ssa_value]`` which uses the
-                    # MLIR Value as the key. We surface the recovered
-                    # PtrState as a (source, indices) tuple keyed by the
-                    # printed source so emitters can match it lazily.
-                    ctx.value_map[state.source] = (
-                        state.source, list(state.offsets) or [0]
-                    )
+                    # Surface the full ``PtrState`` keyed by the printed
+                    # source so emitters in ``op_mapping`` can either:
+                    #   * synthesize ``T.copy(global[region], frag)`` when
+                    #     the state describes a multi-element tile (sizes
+                    #     non-trivial), or
+                    #   * fall back to the scalar BufferLoad/Store path
+                    #     when only an offset is available.
+                    # Stored as a tagged dict so the legacy 2-tuple
+                    # ``(buf, indices)`` shape stays unambiguous.
+                    ctx.value_map[state.source] = {
+                        "_ptrstate": state,
+                        "source": state.source,
+                        "offsets": list(state.offsets),
+                        "sizes": list(state.sizes),
+                        "strides": list(state.strides),
+                    }
             except Exception as exc:  # pragma: no cover -- shim build issues
                 warnings.warn(
                     f"triton_frontend: PtrAnalysis pre-pass failed; "
