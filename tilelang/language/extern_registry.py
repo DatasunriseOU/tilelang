@@ -106,6 +106,16 @@ def clear() -> None:
     _REGISTRY.clear()
 
 
+def unregister(name: str) -> None:
+    """Remove a single entry by name (raises ``KeyError`` if absent).
+
+    Public counterpart to the test-only ``clear()`` helper. Tests should
+    prefer this over reaching into ``_REGISTRY.unregister`` so the surface
+    stays stable across refactors.
+    """
+    _REGISTRY.unregister(name)
+
+
 def valid_targets() -> frozenset[str]:
     """Return the set of supported codegen targets."""
     return _VALID_TARGETS
@@ -117,5 +127,6 @@ __all__ = [
     "lookup",
     "keys",
     "clear",
+    "unregister",
     "valid_targets",
 ]

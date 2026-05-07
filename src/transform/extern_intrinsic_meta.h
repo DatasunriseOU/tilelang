@@ -18,6 +18,8 @@
 #ifndef TVM_TL_TRANSFORM_EXTERN_INTRINSIC_META_H_
 #define TVM_TL_TRANSFORM_EXTERN_INTRINSIC_META_H_
 
+#include <cstring>
+
 #include <tvm/ffi/string.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tirx/expr.h>
@@ -45,10 +47,14 @@ inline bool IsExternIntrinsicCall(const tir::CallNode *call) {
   if (call->args.empty()) return false;
   const auto *name_imm = call->args[0].as<tvm::ffi::StringObj>();
   if (name_imm == nullptr) return false;
-  ffi::String s = ffi::GetRef<ffi::String>(name_imm);
-  const std::string prefix(kExternCallPrefix);
-  if (s.length() < prefix.size()) return false;
-  return std::string(s).compare(0, prefix.size(), prefix) == 0;
+  // Zero-copy prefix check: ``ffi::String`` exposes ``data()``/``size()``;
+  // we compare the first ``prefix_len`` bytes via ``strncmp`` instead of
+  // materialising a ``std::string`` copy on every call (perf review #2).
+  const ffi::String s = ffi::GetRef<ffi::String>(name_imm);
+  static constexpr size_t kPrefixLen =
+      sizeof("tl.extern_intrinsic.") - 1;  // matches kExternCallPrefix
+  if (s.size() < kPrefixLen) return false;
+  return std::strncmp(s.data(), kExternCallPrefix, kPrefixLen) == 0;
 }
 
 /*!

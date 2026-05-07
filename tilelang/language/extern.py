@@ -43,6 +43,17 @@ are user contract):
    etc.). Host-side ``half2`` / ``__nv_bfloat162`` packed types are not
    recognised by ``layout_inference``.
 
+.. warning::
+
+   **Trusted-bodies-only contract.** Body strings supplied via ``bodies=`` are
+   emitted verbatim into the final GPU kernel; downstream codegen MUST treat
+   them as literal text without further string interpolation. They must come
+   from trusted developer code. Arbitrary or attacker-controlled bodies can
+   compromise the entire kernel (RCE on the GPU, driver crashes, silent data
+   corruption). The framework deliberately does NOT sandbox or sanitise
+   bodies — that is the price of letting the DSL drop down to raw device
+   code. See RFC §6 for the discussion behind this decision.
+
 Citations:
     - RFC: ``RFC_unified_fused_kernel.md`` §6 (cross-source extern intrinsic).
     - TIR call entry point: see :func:`tilelang.language.tir.op.call_extern`.
@@ -364,13 +375,24 @@ def extern_intrinsic(
     _registry.register(intrinsic)
 
     def _emit(*runtime_args: Any, **runtime_kwargs: Any) -> Any:
-        """Resolve the signature with shape args and emit the TIR call."""
-        frags = tuple(intrinsic.signature(*runtime_args, **runtime_kwargs))
+        """Resolve the signature with shape args and emit the TIR call.
+
+        ``signature`` only sees shape args — buffer-like positional args (and
+        any buffer-valued kwargs) are stripped first so a user can write the
+        natural ``intrin(M, N, A_frag, B_frag, C_frag)`` and the shape factory
+        ``lambda M, N: ...`` still receives the right tuple. Without this
+        split, the signature factory would receive Buffer objects and either
+        raise ``TypeError`` or silently produce wrong frags (perf review
+        finding #1).
+        """
+        shape_args, buffer_args = _split_shape_and_buffer_args(runtime_args)
+        shape_kwargs, buffer_kwargs = _split_shape_and_buffer_kwargs(runtime_kwargs)
+        frags = tuple(intrinsic.signature(*shape_args, **shape_kwargs))
         _check_signature(name, frags)
         if probe_frags is None:
             for tgt, body in bodies.items():
                 _validate_body(tgt, name, body, frags)
-        return _emit_tir_call(intrinsic.name, frags, runtime_args, runtime_kwargs)
+        return _emit_tir_call(intrinsic.name, frags, buffer_args, buffer_kwargs)
 
     _emit.__name__ = f"extern_intrinsic_{name}"
     _emit.__doc__ = f"Emit TIR call_extern for registered intrinsic {name!r}."
@@ -379,44 +401,107 @@ def extern_intrinsic(
     # ``EXTERN_BLOCK_ATTR`` payload (see :func:`build_meta`). Users wire this
     # into a sibling ``T.block_attr({EXTERN_BLOCK_ATTR: emit.meta(...)})``.
     def _meta(*runtime_args: Any, pipeline_stage: int = -1, **runtime_kwargs: Any) -> dict:
-        frags = tuple(intrinsic.signature(*runtime_args, **runtime_kwargs))
+        shape_args, _ = _split_shape_and_buffer_args(runtime_args)
+        shape_kwargs, _ = _split_shape_and_buffer_kwargs(runtime_kwargs)
+        frags = tuple(intrinsic.signature(*shape_args, **shape_kwargs))
         return build_meta(frags, pipeline_stage=pipeline_stage)
     _emit.meta = _meta  # type: ignore[attr-defined]
     return _emit
 
 
+def _looks_like_buffer(obj: Any) -> bool:
+    """Heuristic: True if ``obj`` quacks like a TIR buffer.
+
+    Used to separate shape-parameter args (ints, sym vars) from buffer args
+    in the signature/emit split. We cannot ``isinstance(obj, tir.Buffer)``
+    here without forcing a TVM import at module load — keep duck-typing.
+    """
+    return (
+        hasattr(obj, "data")
+        and hasattr(obj, "dtype")
+        and hasattr(obj, "shape")
+    )
+
+
+def _split_shape_and_buffer_args(
+    runtime_args: tuple[Any, ...],
+) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    """Partition positional args into (shape_args, buffer_args).
+
+    Order is preserved within each group so the user-facing call shape
+    ``intrin(M, N, A_frag, B_frag, C_frag)`` produces ``shape=(M, N)`` and
+    ``buffers=(A_frag, B_frag, C_frag)``. Mixed orderings (buffers between
+    shape args) preserve the buffer-vs-shape classification but lose the
+    original interleaving, which is fine because shape factories don't see
+    buffers and ``_emit_tir_call`` matches buffers by Frag order.
+    """
+    shape_args = tuple(a for a in runtime_args if not _looks_like_buffer(a))
+    buffer_args = tuple(a for a in runtime_args if _looks_like_buffer(a))
+    return shape_args, buffer_args
+
+
+def _split_shape_and_buffer_kwargs(
+    runtime_kwargs: Mapping[str, Any],
+) -> tuple[dict, dict]:
+    """Same partition for kwargs. Returns ``(shape_kwargs, buffer_kwargs)``."""
+    shape_kwargs: dict = {}
+    buffer_kwargs: dict = {}
+    for k, v in runtime_kwargs.items():
+        if _looks_like_buffer(v):
+            buffer_kwargs[k] = v
+        else:
+            shape_kwargs[k] = v
+    return shape_kwargs, buffer_kwargs
+
+
 def _emit_tir_call(
     name: str,
     frags: Sequence[Frag],
-    runtime_args: tuple[Any, ...],
-    runtime_kwargs: Mapping[str, Any],
+    buffer_args: tuple[Any, ...],
+    buffer_kwargs: Mapping[str, Any],
 ) -> Any:
-    """Build the TIR ``call_extern`` node. TVM imports are lazy so this module
-    can be imported without TVM installed (registration-only flows)."""
+    """Build the TIR ``call_extern`` node.
+
+    Inputs are already pre-filtered by the caller:
+
+    - ``buffer_args``: positional buffer-likes in user-supplied order.
+    - ``buffer_kwargs``: keyword buffers; matched by ``Frag.name``.
+
+    Mixing the two is allowed but kwargs win when a frag-name appears in both
+    (this disambiguates the otherwise-brittle positional zip flagged by the
+    security review). TVM imports are lazy so this module can be imported
+    without TVM installed (registration-only flows).
+    """
     # Lazy imports: keep top-level import-free for testability.
     from tvm import tir  # noqa: WPS433
 
     import tilelang.language as T  # noqa: WPS433  # circular-safe at call time
 
-    # Buffers come either positionally after the shape args or by keyword.
-    # We accept both: ``intrin(M, N, A, B, C)`` or ``intrin(A, B, C)`` (no shape
-    # args needed when the signature is zero-arg).
-    buffers = [
-        a for a in runtime_args
-        if hasattr(a, "data") and hasattr(a, "dtype") and hasattr(a, "shape")
-    ]
-    buffers += [
-        v for v in runtime_kwargs.values()
-        if hasattr(v, "data") and hasattr(v, "dtype") and hasattr(v, "shape")
-    ]
-    if len(buffers) != len(frags):
+    # Resolve the per-frag buffer:
+    #   1. If a kwarg matches the frag name, use it.
+    #   2. Else fall back to the next positional buffer (preserving order).
+    by_name: dict = dict(buffer_kwargs)
+    positional = list(buffer_args)
+    resolved: list[Any] = []
+    for frag in frags:
+        if frag.name in by_name:
+            resolved.append(by_name.pop(frag.name))
+        elif positional:
+            resolved.append(positional.pop(0))
+        else:
+            raise ValueError(
+                f"extern_intrinsic '{name}': missing buffer for Frag {frag.name!r} "
+                f"(declared frags: {[f.name for f in frags]!r})."
+            )
+    if positional or by_name:
+        leftover = [type(b).__name__ for b in positional] + sorted(by_name)
         raise ValueError(
-            f"extern_intrinsic '{name}': received {len(buffers)} buffer arg(s) "
-            f"but contract declares {len(frags)} Frag(s) ({[f.name for f in frags]})."
+            f"extern_intrinsic '{name}': received unexpected buffer arg(s) "
+            f"{leftover!r}; contract declares {[f.name for f in frags]!r}."
         )
 
     access_ptrs = []
-    for buf, frag in zip(buffers, frags):
+    for buf, frag in zip(resolved, frags):
         mode = "rw" if frag.is_output else "r"
         access_ptrs.append(T.access_ptr(buf, mode))
 

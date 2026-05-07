@@ -845,32 +845,52 @@ private:
         }
         return Layout();
       };
-      // The extern call sits inside the block body. Walk it once to pair
-      // each call_extern arg buffer with the i-th Frag entry of the meta.
-      PostOrderVisit(op->body, [&](const ObjectRef &node) {
-        const auto *call = node.as<CallNode>();
+      // The extern call is emitted by the Python decorator as a single
+      // ``Evaluate(call_extern(...))`` directly under the block body — fast
+      // path: pattern-match that without a full subtree walk (perf review
+      // #2). For unusual nesting (e.g. a user wrapped the call in extra
+      // ``IfThenElse``) we fall back to a one-pass ``PostOrderVisit`` so
+      // existing kernels keep working.
+      auto handle_call = [&](const CallNode *call) {
         if (!IsExternIntrinsicCall(call)) return;
         // Per-frag layout list lives under "layouts" (Array<String>) when
         // the decorator chose to serialise it; otherwise meta is a flat
         // map keyed by frag name. We accept both shapes here.
-        if (auto layouts_any = meta.Get("layouts")) {
-          auto layouts =
-              layouts_any.value().as<Array<ffi::String>>().value_or({});
-          for (size_t i = 0;
-               i < layouts.size() && i + 1 < call->args.size(); ++i) {
-            auto buf_opt = getBufferFromAccessPtr(call->args[i + 1]);
-            if (!buf_opt.defined()) continue;
-            Layout l = layout_for_string(layouts[i]);
-            if (l.defined() && IsRegisterBuffer(buf_opt.value())) {
-              annotated_layout_map_.Set(buf_opt.value(), l);
-            } else {
-              LOG(INFO) << "[LayoutInference] tl.extern_intrinsic: layout '"
-                        << layouts[i] << "' is opaque for buffer "
-                        << buf_opt.value() << "; skipped.";
-            }
+        auto layouts_any = meta.Get("layouts");
+        if (!layouts_any) return;
+        auto layouts = layouts_any.value().as<Array<ffi::String>>().value_or({});
+        for (size_t i = 0;
+             i < layouts.size() && i + 1 < call->args.size(); ++i) {
+          auto buf_opt = getBufferFromAccessPtr(call->args[i + 1]);
+          if (!buf_opt.defined()) continue;
+          Layout l = layout_for_string(layouts[i]);
+          if (l.defined() && IsRegisterBuffer(buf_opt.value())) {
+            annotated_layout_map_.Set(buf_opt.value(), l);
+          } else {
+            // Demoted from LOG(INFO) so release builds with many extern
+            // intrinsics don't spam stderr (perf review #2).
+            DLOG(INFO) << "[LayoutInference] tl.extern_intrinsic: layout '"
+                       << layouts[i] << "' is opaque for buffer "
+                       << buf_opt.value() << "; skipped.";
           }
         }
-      });
+      };
+      bool matched_fast_path = false;
+      if (const auto *eval = op->body.as<EvaluateNode>()) {
+        if (const auto *call = eval->value.as<CallNode>()) {
+          if (IsExternIntrinsicCall(call)) {
+            handle_call(call);
+            matched_fast_path = true;
+          }
+        }
+      }
+      if (!matched_fast_path) {
+        PostOrderVisit(op->body, [&](const ObjectRef &node) {
+          if (const auto *call = node.as<CallNode>()) {
+            handle_call(call);
+          }
+        });
+      }
     }
 
     // After visiting, apply layouts to all collected buffers

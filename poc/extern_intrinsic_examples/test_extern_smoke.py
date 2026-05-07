@@ -34,10 +34,14 @@ __device__ void fused_relu_add(const float *a, const float *b, float *out) {
 
 @pytest.fixture(autouse=True)
 def _isolate_registry():
-    """Drop our test entry between tests to avoid cross-test pollution."""
+    """Drop our test entry between tests to avoid cross-test pollution.
+
+    Uses the public ``unregister`` API rather than poking at the private
+    ``_REGISTRY`` attribute (security/test-fragility nit from grok review).
+    """
     yield
     try:
-        extern_registry._REGISTRY.unregister("fused_relu_add_16")  # type: ignore[attr-defined]
+        extern_registry.unregister("fused_relu_add_16")
     except KeyError:
         pass
 
@@ -84,6 +88,82 @@ def test_emit_returns_tir_call(monkeypatch):
     assert isinstance(node, tir.Call)
     # Symbol must use the documented prefix so codegen can grep for it.
     assert any(EXTERN_CALL_PREFIX + "fused_relu_add_16" in str(arg) for arg in node.args)
+
+
+@pytest.mark.skipif(not _HAS_TVM, reason="TVM not importable")
+def test_emit_separates_shape_and_buffer_args(monkeypatch):
+    """Regression test for grok perf review #1.
+
+    The user calls ``intrin(M, N, A, B, C)`` — the shape factory sees only
+    ``(M, N)`` and the buffers go to ``_emit_tir_call``. Previously the
+    factory received the buffers and would TypeError or produce wrong frags.
+    """
+    from tvm import tir
+
+    seen_shape_args: list[tuple] = []
+
+    def factory(M: int, N: int):
+        seen_shape_args.append((M, N))
+        return (
+            Frag("a", (M, N), "shared", "float32"),
+            Frag("b", (M, N), "shared", "float32"),
+            Frag("out", (M, N), "shared", "float32", is_output=True),
+        )
+
+    op = extern_intrinsic(
+        name="fused_relu_add_16",
+        signature=factory,
+        bodies={"cuda": _FUSED_RELU_ADD_CU},
+    )
+    a = tir.decl_buffer((4, 4), "float32", scope="shared", name="a")
+    b = tir.decl_buffer((4, 4), "float32", scope="shared", name="b")
+    c = tir.decl_buffer((4, 4), "float32", scope="shared", name="out")
+    node = op(4, 4, a, b, c)
+    assert isinstance(node, tir.Call)
+    assert seen_shape_args == [(4, 4)]
+
+
+@pytest.mark.skipif(not _HAS_TVM, reason="TVM not importable")
+def test_emit_resolves_buffer_kwargs_by_frag_name():
+    """Regression test for grok security review buffer-collection nit.
+
+    Buffer kwargs must bind to frags by name, not by iteration order.
+    """
+    from tvm import tir
+
+    op = extern_intrinsic(
+        name="fused_relu_add_16",
+        signature=lambda: (
+            Frag("a", (16,), "shared", "float32"),
+            Frag("b", (16,), "shared", "float32"),
+            Frag("out", (16,), "shared", "float32", is_output=True),
+        ),
+        bodies={"cuda": _FUSED_RELU_ADD_CU},
+    )
+    a = tir.decl_buffer((16,), "float32", scope="shared", name="a")
+    b = tir.decl_buffer((16,), "float32", scope="shared", name="b")
+    c = tir.decl_buffer((16,), "float32", scope="shared", name="out")
+    # Pass them out of frag order by kwarg — emission must still match by name.
+    node = op(out=c, a=a, b=b)
+    assert isinstance(node, tir.Call)
+
+
+def test_unregister_public_api():
+    """Public ``unregister`` removes the entry; second call raises KeyError."""
+    extern_intrinsic(
+        name="fused_relu_add_16",
+        signature=lambda: (
+            Frag("a", (16,), "shared", "float32"),
+            Frag("b", (16,), "shared", "float32"),
+            Frag("out", (16,), "shared", "float32", is_output=True),
+        ),
+        bodies={"cuda": _FUSED_RELU_ADD_CU},
+    )
+    assert extern_registry.lookup("fused_relu_add_16") is not None
+    extern_registry.unregister("fused_relu_add_16")
+    assert extern_registry.lookup("fused_relu_add_16") is None
+    with pytest.raises(KeyError):
+        extern_registry.unregister("fused_relu_add_16")
 
 
 @pytest.mark.skipif(not _HAS_CUDA, reason="CUDA not available")
