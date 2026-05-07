@@ -161,6 +161,11 @@ class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
     }
 
     // 2) Z3 fallback under BV32-emulated free-var constraints.
+    // CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_DROP_BOUND_CHECKS
+    // bypasses the Z3 fallback, keeping every guard in place (idea #4).
+    if (!::tilelang::tlz3::Z3PassGate::IsEnabled("DROP_BOUND_CHECKS")) {
+      return IRMutatorWithAnalyzer::VisitStmt_(op);
+    }
     bool proved = false;
     try {
       auto &z3 = arith::Z3Prover(analyzer_);
@@ -176,17 +181,21 @@ class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
       std::vector<std::function<void()>> recover_stack;
       recover_stack.reserve(vc.vars.size() * 2);
       for (const VarNode *vn : vc.vars) {
-        Var v = GetRef<Var>(vn);
+        Var v = tvm::ffi::GetRef<Var>(vn);
         // Only int-typed vars get the BV32 box.
         if (!v.dtype().is_int()) {
           continue;
         }
         // fix-round-6 C2: IntImm(int32, 1<<31) overflows int32. Build the
-        // upper-bound constant in Int64 to avoid the silent wrap.
+        // upper-bound constant in Int64 to avoid the silent wrap. Z3's
+        // sort-coercion will then promote `v` (int32) on the LT to a
+        // common int sort.
         // fix-round-6 C3: pair EnterConstraint calls so the lower-bound
         // recoverer is invoked on stack-unwind if the upper-bound call
-        // throws (a `std::function` destructor would otherwise drop the
-        // recover lambda and leak a solver scope frame).
+        // throws. Without the explicit try/catch the first recoverer
+        // (a `std::function`) would be destroyed without firing, leaking
+        // a solver scope frame. Push to recover_stack only after BOTH
+        // succeed (LIFO so upper-bound pops first).
         auto r_lo = z3.EnterConstraint(v >= IntImm(tvm::DataType::Int(64), 0));
         try {
           auto r_hi =
@@ -194,6 +203,8 @@ class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
           recover_stack.push_back(std::move(r_hi));
           recover_stack.push_back(std::move(r_lo));
         } catch (...) {
+          // Roll back the lower-bound push and rethrow into the outer
+          // catch (which will mark `proved=false` and keep the guard).
           if (r_lo) r_lo();
           throw;
         }

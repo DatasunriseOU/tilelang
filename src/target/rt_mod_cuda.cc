@@ -60,6 +60,15 @@ ExtractFuncInfo(const IRModule &mod) {
         << "Can only lower IR Module with PrimFuncs";
     auto f = Downcast<tirx::PrimFunc>(kv.second);
 
+    // z3-final: validate params before constructing FunctionInfo.  An empty
+    // params array is permitted (kernels can take zero args); but a defined
+    // PrimFunc must not have null param Vars in the array.
+    ICHECK(f.defined()) << "ExtractFuncInfo: PrimFunc is undefined";
+    for (size_t i = 0; i < f->params.size(); ++i) {
+      ICHECK(f->params[i].defined())
+          << "ExtractFuncInfo: PrimFunc has undefined param at index " << i;
+    }
+
     ffi::Array<DLDataType> arg_types;
     ffi::Array<runtime::ArgExtraTags> arg_extra_tags;
     auto is_tensormap = [](const tirx::Var &var) -> bool {

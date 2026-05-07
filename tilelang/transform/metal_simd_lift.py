@@ -100,24 +100,22 @@ def _z3_extent_le_32(extent_expr) -> tuple[bool, str]:
         proved = int(extent_expr.value) <= _SIMD_LANES
         return proved, f"static: extent={int(extent_expr.value)} <= {_SIMD_LANES}? {proved}"
 
-    try:
-        import z3  # type: ignore
-    except Exception as exc:  # pragma: no cover - z3 missing
-        return False, f"z3 unavailable: {exc!r}"
+    # CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_SIMDGROUP (or
+    # global TILELANG_DISABLE_Z3) bypasses the symbolic-extent Z3 path
+    # (idea #8/#9). The current implementation already rejects symbolic
+    # extents conservatively, but we surface the gate explicitly so the
+    # log message is consistent with the other Z3-using passes.
+    for _gate_var in ("TILELANG_DISABLE_Z3", "TILELANG_DISABLE_Z3_SIMDGROUP"):
+        _v = os.environ.get(_gate_var, "")
+        if _v and _v != "0":
+            return False, f"z3-disabled-by-{_gate_var}; symbolic extent rejected"
 
-    solver = z3.Solver()
-    solver.set("timeout", 500)
-    z_ext = z3.Int("extent")
-    solver.add(z_ext > 0)
-    solver.push()
-    solver.add(z3.Not(z_ext <= _SIMD_LANES))
-    res = solver.check()
-    solver.pop()
-    proved = (res == z3.unsat)
-    query = (
-        f"assert extent <= {_SIMD_LANES}; check_sat(neg)={res}; proved={proved}"
-    )
-    return proved, query
+    # fix-round-4: previous version constructed `z3.Int("extent")` with only
+    # `z_ext > 0` — no link to the actual TIR expression — so the query was
+    # vacuous (always SAT under negation, hence always returning False but
+    # advertising a "z3 proof" in the log). Reject symbolic extents
+    # conservatively without spinning up z3.
+    return False, f"symbolic extent rejected (expr={extent_expr!s})"
 
 
 def _is_butterfly_annotated(node: tir.For) -> bool:
@@ -210,6 +208,16 @@ def _butterfly_stages(extent: int) -> list[int]:
     while s >= 1:
         out.append(s)
         s //= 2
+    # Defense-in-depth: every emitted shift becomes the `mask` arg to
+    # `tl.shfl_xor_sync` and must lie strictly inside the Apple simdgroup
+    # width [1, 32). The caller guards against extent>32 / non-power-of-2,
+    # but assert here so any future caller misuse fails loudly instead of
+    # producing out-of-range shuffle indices.
+    for shift in out:
+        assert 1 <= shift < 32, (
+            f"butterfly stage {shift} out of [1,32) for Apple simdgroup "
+            f"(extent={extent})"
+        )
     return out
 
 
@@ -333,8 +341,15 @@ class _ButterflyRewriter:
                 node.loop_var, node.min, node.extent, node.kind, recursed_body,
                 node.thread_binding, node.annotations, node.span,
             )
-        proved, _ = _z3_extent_le_32(node.extent)
+        proved, query = _z3_extent_le_32(node.extent)
         if not proved:
+            # Annotated loop but Z3 cannot prove extent <= 32 — log so CI can
+            # surface the missed rewrite instead of dropping silently.
+            logger.warning(
+                "simd-lift-rewrite: declining annotated loop var=%s extent=%s "
+                "reason=z3_extent_unproved query=%s",
+                str(node.loop_var.name), str(node.extent), query,
+            )
             return tir.For(
                 node.loop_var, node.min, node.extent, node.kind, recursed_body,
                 node.thread_binding, node.annotations, node.span,
@@ -347,7 +362,29 @@ class _ButterflyRewriter:
             extent_val = int(node.extent)
         else:
             # Symbolic-but-proved is rare here; without a numeric we cannot
-            # emit the static stage list. Conservative: skip.
+            # emit the static stage list. Conservative: skip — log so CI can
+            # diagnose why an annotated/proved loop wasn't rewritten.
+            logger.warning(
+                "simd-lift-rewrite: declining annotated loop var=%s extent=%s "
+                "reason=symbolic_extent_no_static_value",
+                str(node.loop_var.name), str(node.extent),
+            )
+            return tir.For(
+                node.loop_var, node.min, node.extent, node.kind, recursed_body,
+                node.thread_binding, node.annotations, node.span,
+            )
+
+        # #9 butterfly guard: only rewrite when extent is a power-of-2 in
+        # [2, 32]. Non-power-of-2 extents would yield bad shuffle indices,
+        # and SIMD-group width on Metal/Apple GPUs is 32, so larger extents
+        # cannot be served by a single shfl_xor_sync chain.
+        if (extent_val < 2 or extent_val > 32 or
+                (extent_val & (extent_val - 1)) != 0):
+            logger.warning(
+                "simd-lift-rewrite: declining annotated loop var=%s extent=%d "
+                "reason=extent_not_pow2_in_[2,32]",
+                str(node.loop_var.name), extent_val,
+            )
             return tir.For(
                 node.loop_var, node.min, node.extent, node.kind, recursed_body,
                 node.thread_binding, node.annotations, node.span,

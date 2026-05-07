@@ -47,6 +47,68 @@ Defensive fix in `tilelang/jit/adapter/torch/metal.py`: extract trailing `'x'`/`
 
 Test summary at HEAD: 36 CPU + 61 Metal + 3 skipped (opt-in benchmarks) = 100 / 103 pass, 0 fail. Cold compile time 0.015 s (≈39× faster than the tl_pr_c baseline). Bench parity vs `/tmp/tl_pr_c`: swap mean 0.984× of tl_pr_c on the metal benchmarks (within MPS variance).
 
+### 2026-05-07 — Z3 prover safety gate for CUDA / gb10
+
+A correctness regression has been observed on the gb10 (CUDA `sm_120`) target
+when the vendored Z3 prover (`src/transform/vendored/z3_prover.{h,cc}`) is
+allowed to short-circuit conservative paths in `AutoDoubleBuffer`,
+`DropProvableBoundChecks`, intra-warp barrier-elide, and related transforms.
+The root cause has not yet been bisected. Until it is, CUDA / gb10 users
+should opt out of the prover via the env gate:
+
+```bash
+export TILELANG_DISABLE_Z3=1
+```
+
+When set to any non-empty value other than `"0"`, every
+`tilelang::tlz3::Z3Prover::CanProve` call returns `false`, which keeps the
+slow / conservative path in every consumer pass. Default behavior (env
+unset) is unchanged, so Mac / Apple-Silicon builds still benefit from the
+real prover (≈39× cold-compile speedup, 0.984× swap perf parity vs
+`/tmp/tl_pr_c`). The gate lives at the top of `Z3Prover::CanProve`
+(`src/transform/vendored/z3_prover.cc`) and is read once per process via a
+function-local `static`. Remove the env once the gb10 regression is
+root-caused and a targeted fix lands.
+
+#### Per-pass Z3 gates (granular bisection, 2026-05-07)
+
+The blanket `TILELANG_DISABLE_Z3` is a hammer; once the regression is
+narrowed to a specific pass, you can re-enable Z3 everywhere except the
+suspect site by *unsetting* the global gate and setting only the per-pass
+env var. The Python side honours these via `os.getenv`; the C++ side
+honours them via `tilelang::tlz3::Z3PassGate::IsEnabled(...)` (declared in
+`src/transform/vendored/z3_prover.h`, implemented in `z3_prover.cc`).
+
+| Env var | Pass | Roadmap idea | Source file |
+|---|---|---|---|
+| `TILELANG_DISABLE_Z3_VECTORIZE` | Loop vectorize (alignment + unit-stride proofs) | #1, #12 | `src/transform/loop_vectorize.cc` |
+| `TILELANG_DISABLE_Z3_PREDICATE_FUSION` | Predicate fusion (b-cond / inner-body well-defined) | #7 | `src/transform/predicate_fusion.cc` |
+| `TILELANG_DISABLE_Z3_DROP_BOUND_CHECKS` | Drop provable bound checks (BV32 fallback) | #4 | `src/transform/drop_provable_bound_checks.cc` |
+| `TILELANG_DISABLE_Z3_TMA_LEGALITY` | TMA cp.async stride-aligned-16 proof | #6 | `src/op/copy.cc` |
+| `TILELANG_DISABLE_Z3_BARRIER_ELISION` | Intra-warp barrier elision (RAW proof) | #11 | `src/transform/thread_storage_sync.cc` |
+| `TILELANG_DISABLE_Z3_AUTO_DOUBLE_BUFFER` | Auto double buffer (reserved; stub mode currently has no live Z3 call) | #2 | `src/transform/auto_double_buffer.cc` |
+| `TILELANG_DISABLE_Z3_INT24` | int8 dot4 int24 overflow proof | #5 | `tilelang/analysis/int24_overflow_proof.py` |
+| `TILELANG_DISABLE_Z3_DOT4_LEGALITY` | FP8 packed-dot4 legality proof | #10 | `tilelang/language/fp8_op.py` |
+| `TILELANG_DISABLE_Z3_SIMDGROUP` | Metal simdgroup eligibility / simd-lift | #8, #9 | `tilelang/transform/metal_fragment_to_simdgroup.py`, `tilelang/transform/metal_simd_lift.py` |
+
+Truthiness convention matches the global gate: an env var is "set" when its
+value is non-empty AND not `"0"`. Unset / `""` / `"0"` all mean *enabled*.
+The blanket `TILELANG_DISABLE_Z3` remains as a backstop — even if a future
+pass forgets to call `Z3PassGate::IsEnabled`, setting the global env still
+disables it via the kill-switch at `Z3Prover::CanProve`.
+
+Example bisection workflow (CUDA / gb10):
+
+```bash
+unset TILELANG_DISABLE_Z3
+# Try disabling each pass in turn until the regression disappears.
+export TILELANG_DISABLE_Z3_VECTORIZE=1   # idea #1/#12
+# python -m pytest …  (run the failing test)
+unset TILELANG_DISABLE_Z3_VECTORIZE
+export TILELANG_DISABLE_Z3_DROP_BOUND_CHECKS=1   # idea #4
+# python -m pytest …
+```
+
 <img src=./images/MatmulExample.png />
 
 ## Latest News

@@ -484,6 +484,19 @@ def _z3_prove_dot4_legal(
     if not _Z3_AVAILABLE:
         return False, "z3 not available; symbolic dot4 legality cannot be proven"
 
+    # CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_DOT4_LEGALITY (or
+    # the global TILELANG_DISABLE_Z3) bypasses the dot4-legality proof
+    # (idea #10). Conservative default — keep the legacy scalar / simd_sum
+    # path when disabled.
+    for _gate_var in ("TILELANG_DISABLE_Z3", "TILELANG_DISABLE_Z3_DOT4_LEGALITY"):
+        _v = os.environ.get(_gate_var, "")
+        if _v and _v != "0":
+            return (
+                False,
+                f"z3 dot4-legality gated off by {_gate_var}; "
+                "keeping legacy macro path",
+            )
+
     # Note: the Python-side ``tvm.arith.Z3Prover`` bridge described in the
     # roadmap is not yet exposed by this TVM submodule. The C++-side prover
     # ships in ``src/transform/vendored/z3_prover.{h,cc}`` but its API

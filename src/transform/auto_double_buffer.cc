@@ -168,8 +168,12 @@ PrimExpr BuildSoundnessObligation(const CandidateInfo &info,
   // fix-round-6 C4: stub: no real obligation; return False to never claim
   // Z3 proved soundness. Previously this returned Bool(true), which made
   // CanProve(...) trivially succeed and gave the audit trail false
-  // confidence. Detector is the safety gate; the Z3 result is discarded
-  // in stub mode, so returning False is strictly safer.
+  // confidence — `BuildSoundnessObligation` looked like a real prover
+  // gate but was a tautology. Since this pass is detector-gated and the
+  // Z3 result is *discarded* in stub mode anyway, returning False is
+  // strictly safer: any future code that begins to act on the proof
+  // result will see "unproved" and refuse to transform until the real
+  // obligation is wired.
   (void)k_next;
   (void)info;
   return Bool(false);

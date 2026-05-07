@@ -1883,6 +1883,12 @@ private:
     // Timeout tuning: 500 ms in the initial draft; the floor-div-by-32
     // query closes in single-digit ms once range constraints are present,
     // so 200 ms is plenty (per second-pass review feedback).
+    // CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_BARRIER_ELISION
+    // bypasses the intra-warp RAW proof (idea #11). Conservative default —
+    // keep the barrier when disabled.
+    if (!::tilelang::tlz3::Z3PassGate::IsEnabled("BARRIER_ELISION")) {
+      return false;
+    }
     auto &prover = arith::Z3Prover(analyzer);
     prover.SetTimeoutMs(200);
     bool proven = false;

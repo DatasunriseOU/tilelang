@@ -25,6 +25,7 @@
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/transform.h>
 
+#include <cmath>
 #include <algorithm>
 #include <sstream>
 #include <string>
@@ -426,6 +427,11 @@ public:
       Note(arg.dtype());
     }
     if (auto *opn = op->op.as<OpNode>()) {
+      // CPPMEGA: the python ``T.call_intrin("tir.metal.fp8_e4m3_dot4", ...)``
+      // wrapper rewrites legacy ``tir.*`` names to ``tirx.*`` (see
+      // 3rdparty/tvm/python/tvm/tirx/expr.py:Call.__init__), so the registered
+      // op name is ``tirx.metal.fp8_e4m3_dot4``. ``IsFp8Dot4Intrin`` matches
+      // both spellings to avoid a silent miss on the helper-prelude emission.
       if (IsFp8Dot4Intrin(opn->name)) {
         uses_dot4 = true;
       } else if (IsGridTidXIntrin(opn->name)) {

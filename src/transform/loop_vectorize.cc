@@ -1018,6 +1018,20 @@ static bool Z3CanProveAlignedAccess(const Buffer &buffer,
   if (!buffer.defined() || indices.empty()) {
     return false;
   }
+  // CPPMEGA idea712 round-final fix-N0: vector_size <= 1 is a degenerate
+  // request — there is nothing to align (every byte address is "aligned"
+  // to width 1). The caller's loop-level affine substitution
+  // `loop_var % vector_size == 0` collapses to `loop_var % 1 == 0` which
+  // is trivially true and yields a meaningless proof. Skip Z3.
+  if (vector_size <= 1) {
+    return false;
+  }
+  // CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_VECTORIZE bypasses
+  // the Z3-aided alignment proof for this pass (idea #1/#12). Conservative
+  // default — pass behaves as if proof failed.
+  if (!::tilelang::tlz3::Z3PassGate::IsEnabled("VECTORIZE")) {
+    return false;
+  }
   int dtype_bytes = buffer->dtype.bytes();
   if (dtype_bytes <= 0) {
     return false;
@@ -1418,6 +1432,22 @@ static bool Z3CanProveUnitStride(const PrimExpr &expr, const Var &var,
   if (!IsAffineInVar(expr, var)) {
     return false;
   }
+  // CPPMEGA idea712 round-final fix-N0: degenerate-extent guard. If the
+  // loop trip count is statically 0 or 1, the substitution `var -> var + 1`
+  // steps outside the loop domain and the affine "delta == 1" comparison
+  // is meaningless. Skip Z3 entirely. The runtime BV constraint
+  // `iter_var_size > 0` below still defends the symbolic-extent case;
+  // this short-circuit defends the constant-extent case.
+  if (const auto *iv_imm = iter_var_size.as<IntImmNode>()) {
+    if (iv_imm->value <= 1) {
+      return false;
+    }
+  }
+  // CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_VECTORIZE bypasses
+  // the unit-stride / contiguity proof (idea #1/#12). Conservative default.
+  if (!::tilelang::tlz3::Z3PassGate::IsEnabled("VECTORIZE")) {
+    return false;
+  }
   try {
     auto &z3 = arith::Z3Prover(analyzer);
     z3.SetTimeoutMs(50);
@@ -1443,9 +1473,11 @@ static bool Z3CanProveUnitStride(const PrimExpr &expr, const Var &var,
     // out the wrap-around case where iter_var_size could be 0 or 1 (no
     // contiguity to prove).
     // fix-round-6 C5: previous bound `var < iter_var_size - 1` excluded
-    // the last iteration from the proof. Use `var + 1 < iter_var_size`
-    // — semantically equivalent for unbounded ints but more explicit
-    // about covering EVERY iteration of the loop.
+    // the last iteration from the proof, so a contiguity violation on
+    // the final element could slip past Z3 unnoticed (unsound). Use
+    // `var + 1 < iter_var_size` instead — this still ensures `var+1`
+    // remains a legal index for the substitution `expr(var+1)` while
+    // covering EVERY iteration of the loop.
     PrimExpr one = make_const(vt, 1);
     PrimExpr range_constraint =
         (var >= lo) && (var + one < iter_var_size) && (iter_var_size > 0);
@@ -1488,7 +1520,19 @@ static bool Z3CanProveUnitStride(const PrimExpr &expr, const Var &var,
     // proved-negative case would lower to wrong-order ramp and produce
     // incorrect results for kernels like `out[N-1-i] = in[N-1-i]`.
     // TODO: enable when negative_ramp codegen support lands.
-    // if (!proved) { ... negative-direction substitution ... }
+    // if (!proved) {
+    //   // Negative-direction probe. Requires var >= 1 so var-1 is in-range;
+    //   // we push that as a temporary constraint, prove, then pop.
+    //   PrimExpr neg_constraint = (var >= make_const(vt, 1));
+    //   auto recover_neg = z3.EnterConstraint(neg_constraint);
+    //   PrimExpr var_minus_1 = var - make_const(vt, 1);
+    //   PrimExpr expr_prev = Substitute(expr, {{var, var_minus_1}});
+    //   // expr(var) - expr(var-1) == -1   ⇔  expr(var-1) - expr(var) == +1
+    //   PrimExpr stride_goal_neg =
+    //       (expr - expr_prev) == make_const(expr.dtype(), -1);
+    //   proved = z3.CanProve(stride_goal_neg);
+    //   recover_neg();
+    // }
 
     recover();
     if (!proved) {
@@ -1526,6 +1570,17 @@ bool IndicesCanVectorize(const PrimExpr &expr, Var var,
   ICHECK(target_vectorized_size >= 1);
   if (target_vectorized_size == 1)
     return true;
+
+  // CPPMEGA idea712 round-final fix-N0: extent 0/1 short-circuit. If the
+  // loop trip count is statically 0 or 1 there is no contiguity to prove
+  // (the affine substitution `var -> var + 1` would step outside the loop
+  // domain and the resulting comparisons are nonsensical). Bail to scalar
+  // before invoking Z3.
+  if (const auto *iv_imm = iter_var_size.as<IntImmNode>()) {
+    if (iv_imm->value <= 1) {
+      return false;
+    }
+  }
 
   // Extent must be divisible
   PrimExpr target_size_for_iter =
@@ -1601,7 +1656,9 @@ bool IndicesCanVectorize(const PrimExpr &expr, Var var,
     if (is_one(ramp_node->stride)) {
       return true;
     }
-    {
+    // CPPMEGA z3-final per-pass gate: skip both the inline stride==1 probe
+    // and the affine fallback when TILELANG_DISABLE_Z3_VECTORIZE is set.
+    if (::tilelang::tlz3::Z3PassGate::IsEnabled("VECTORIZE")) {
       auto &z3 = arith::Z3Prover(analyzer);
       z3.SetTimeoutMs(50);
       if (z3.CanProve(ramp_node->stride ==

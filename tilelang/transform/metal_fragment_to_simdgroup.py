@@ -102,57 +102,41 @@ def _z3_simdgroup_eligible(shape, dtype,
     about an unbounded symbolic addr). When set, we plug in the value and
     insist on alignment.
     """
-    query_lines = []
     if not _is_simdgroup_dtype(dtype):
         return False, f"dtype {dtype!s} not in simdgroup set; reject"
     if len(shape) < 2:
         return False, "rank<2; reject"
 
-    try:
-        import z3  # type: ignore
-    except Exception as exc:  # pragma: no cover - z3 missing
-        return False, f"z3 unavailable: {exc!r}"
-
     s0, s1 = shape[-2], shape[-1]
-    solver = z3.Solver()
-    solver.set("timeout", 500)  # 500 ms cap
 
-    z_s0 = z3.Int("shape0")
-    z_s1 = z3.Int("shape1")
+    # fix-round-4: previous version created `z3.Int("shape0/shape1")` without
+    # binding them to TIR — for non-IntImm shapes the solver had no relation
+    # to the actual extent, so any "proof" was vacuous. Drop the symbolic
+    # path: require static IntImm shapes (matches the conservative behaviour
+    # the caller already expects on UNKNOWN).
+    if not isinstance(s0, (int, tir.IntImm)) or not isinstance(s1, (int, tir.IntImm)):
+        return False, f"symbolic shape rejected (s0={s0!s}, s1={s1!s})"
 
-    solver.add(z_s0 > 0, z_s1 > 0)
+    s0_val = int(s0) if isinstance(s0, int) else int(s0.value)
+    s1_val = int(s1) if isinstance(s1, int) else int(s1.value)
+    if s0_val <= 0 or s1_val <= 0:
+        return False, f"non-positive shape ({s0_val},{s1_val}); reject"
+    if s0_val % _SIMDGROUP_TILE != 0 or s1_val % _SIMDGROUP_TILE != 0:
+        return False, (
+            f"static-reject shape0={s0_val} shape1={s1_val} "
+            f"both must be multiples of {_SIMDGROUP_TILE}"
+        )
+    if addr_value is not None and int(addr_value) % addr_align_bytes != 0:
+        return False, f"static-reject addr({addr_value})%{addr_align_bytes}!=0"
 
-    if isinstance(s0, (int, tir.IntImm)):
-        solver.add(z_s0 == int(s0 if isinstance(s0, int) else s0.value))
-    if isinstance(s1, (int, tir.IntImm)):
-        solver.add(z_s1 == int(s1 if isinstance(s1, int) else s1.value))
-
-    conjuncts = [
-        z_s0 % _SIMDGROUP_TILE == 0,
-        z_s1 % _SIMDGROUP_TILE == 0,
-    ]
-    if addr_value is not None:
-        # Concrete address — directly check alignment.
-        z_addr = z3.IntVal(int(addr_value))
-        conjuncts.append(z_addr % addr_align_bytes == 0)
-        addr_clause = f" /\\ addr({addr_value})%{addr_align_bytes}==0"
-    else:
-        addr_clause = " /\\ addr-skipped"
-    query = z3.And(*conjuncts)
-
-    # Conservative: we want to PROVE the conjunction holds. That is, the
-    # negation must be UNSAT.
-    solver.push()
-    solver.add(z3.Not(query))
-    res = solver.check()
-    solver.pop()
-    query_str = (
-        f"assert shape[0]%{_SIMDGROUP_TILE}==0 /\\ shape[1]%{_SIMDGROUP_TILE}==0"
-        f"{addr_clause}; check_sat(neg)={res}"
+    addr_clause = (
+        f" /\\ addr({addr_value})%{addr_align_bytes}==0"
+        if addr_value is not None else " /\\ addr-skipped"
     )
-    query_lines.append(query_str)
-    proved = (res == z3.unsat)
-    return proved, "; ".join(query_lines)
+    return True, (
+        f"static-prove shape0={s0_val} shape1={s1_val}"
+        f"{addr_clause} (no z3 needed)"
+    )
 
 
 def _log_simdgroup_decision(buf, decided_static: bool, decided_z3: bool, query: str):
@@ -186,6 +170,13 @@ def is_simdgroup_eligible(buffer_like, *, use_z3: bool = True
         return True, "static"
     if not use_z3:
         return False, "static-fail; z3-disabled"
+    # CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_SIMDGROUP (or
+    # global TILELANG_DISABLE_Z3) bypasses the simdgroup-eligibility Z3
+    # fallback (idea #8/#9). Conservative default — keep the fragment path.
+    for _gate_var in ("TILELANG_DISABLE_Z3", "TILELANG_DISABLE_Z3_SIMDGROUP"):
+        _v = os.environ.get(_gate_var, "")
+        if _v and _v != "0":
+            return False, f"static-fail; z3-disabled-by-{_gate_var}"
     proved, query = _z3_simdgroup_eligible(shape, dtype)
     _log_simdgroup_decision(buffer_like, False, proved, query)
     return False, f"static-fail; z3-proved={proved}; {query}"
