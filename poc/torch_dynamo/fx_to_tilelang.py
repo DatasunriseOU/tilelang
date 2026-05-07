@@ -153,6 +153,16 @@ class LoweringContext:
 # ---------------------------------------------------------------------------
 
 
+class FXToTileLangMetalBridgeError(RuntimeError):
+    """Raised by ``_build_metal_launcher`` when the MLX bridge cannot wrap.
+
+    Distinct exception type so callers (and the ``expose_metal=True`` path
+    in :py:meth:`FXToTileLang.run`) can surface the failure verbatim instead
+    of silently falling back to the extern launcher. Per the Wave C3 brief:
+    ``expose_metal=True`` MUST raise rather than degrade.
+    """
+
+
 def _spec_to_torch_dtype_runtime(dtype_name: str) -> Any:
     """Map a TileLang dtype string back to ``torch.dtype`` (runtime helper).
 
@@ -187,6 +197,225 @@ def _torch_dtype_to_tl(dtype: Any) -> str:
         torch.bool: "bool",
     }
     return M.get(dtype, str(dtype).rsplit(".", 1)[-1])
+
+
+def _tl_dtype_to_mlx(mx: Any, dtype_name: str) -> Any:
+    """Map a TileLang dtype string to an ``mlx.core`` dtype object."""
+    table = {
+        "float16": getattr(mx, "float16", None),
+        "bfloat16": getattr(mx, "bfloat16", None),
+        "float32": getattr(mx, "float32", None),
+        "int32": getattr(mx, "int32", None),
+        "int64": getattr(mx, "int64", None),
+    }
+    out = table.get(dtype_name)
+    if out is None:
+        raise FXToTileLangMetalBridgeError(
+            f"unsupported TileLang dtype for MLX bridge: {dtype_name!r}")
+    return out
+
+
+def _extract_metal_grid(
+    artifact: Any,
+) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+    """Extract ``(grid, threadgroup)`` from a TileLang Metal CompiledArtifact.
+
+    Reads each device function's ``thread_extent`` attr (the same source
+    ``tilelang/jit/adapter/wrapper.py`` consults to populate ``grid_info`` /
+    ``block_info``). Falls back to ``(1,1,1)`` along axes the kernel did not
+    annotate. Raises :class:`FXToTileLangMetalBridgeError` if the artifact
+    has no device module — that means the lowering produced host-only IR
+    and the MLX bridge has nothing to launch.
+    """
+    device_mod = getattr(artifact, "device_mod", None)
+    if device_mod is None:
+        raise FXToTileLangMetalBridgeError(
+            "compiled artifact has no device_mod — Metal lowering produced "
+            "host-only IR; cannot build mx.fast.metal_kernel launcher")
+    funcs = list(device_mod.functions.items())
+    if not funcs:
+        raise FXToTileLangMetalBridgeError(
+            "compiled artifact device_mod has zero functions")
+    # Pick the first device function. Multi-device-function artifacts
+    # surface from cluster lowering (sm90+) which has no Metal counterpart.
+    _g_var, func = funcs[0]
+    block_info = [1, 1, 1]
+    grid_info = [1, 1, 1]
+    attrs = getattr(func, "attrs", None) or {}
+    thread_extent = attrs["thread_extent"] if "thread_extent" in attrs else {}
+    for tag, extent in thread_extent.items():
+        try:
+            ex_val = int(extent)
+        except Exception:  # noqa: BLE001
+            ex_val = 1
+        axis = "xyz".index(tag[-1]) if tag and tag[-1] in "xyz" else 0
+        if "threadIdx" in tag:
+            block_info[axis] = ex_val
+        elif "blockIdx" in tag:
+            grid_info[axis] = ex_val
+    return (
+        (int(grid_info[0]), int(grid_info[1]), int(grid_info[2])),
+        (int(block_info[0]), int(block_info[1]), int(block_info[2])),
+    )
+
+
+def _build_metal_launcher(
+    prim_func: Any,
+    *,
+    input_specs: Sequence[_TensorSpec],
+    output_specs: Sequence[_TensorSpec],
+    name: Optional[str] = None,
+) -> Callable[..., Any]:
+    """Compile ``prim_func`` for Metal and wrap via the MLX runtime adapter.
+
+    Returns a python callable ``launcher(*torch_inputs) -> torch.Tensor | tuple``
+    that:
+
+      1. Converts each input ``torch.Tensor`` to ``mlx.core.array`` via
+         ``mx.array(t.detach().contiguous().cpu().numpy())`` (zero-copy on
+         shared-memory hosts; copy-back is unavoidable for MPS-resident
+         inputs because ``numpy()`` requires CPU).
+      2. Runs the Metal kernel through ``mx.fast.metal_kernel`` (the same
+         path Triton's ``vector_add`` uses, see
+         ``poc/triton_frontend/_test_harness/numeric_smoke.py``).
+      3. Converts each MLX output back to a ``torch.Tensor`` via
+         ``torch.from_numpy(np.array(o))``.
+
+    Failures (MLX import, Metal lower, kernel signature mismatch, runtime
+    launch error) raise :class:`FXToTileLangMetalBridgeError` rather than
+    falling back to the extern launcher. The ``expose_metal=True`` contract
+    in :py:meth:`FXToTileLang.run` requires no silent degradation.
+    """
+    if not input_specs:
+        raise FXToTileLangMetalBridgeError(
+            "metal launcher requires at least one input tensor spec")
+    if not output_specs:
+        raise FXToTileLangMetalBridgeError(
+            "metal launcher requires at least one output tensor spec")
+
+    # 1. Lower the PrimFunc to a Metal CompiledArtifact.
+    try:
+        import tilelang  # type: ignore[import-not-found]
+        import tvm  # type: ignore[import-not-found]
+    except Exception as exc:  # noqa: BLE001
+        raise FXToTileLangMetalBridgeError(
+            f"tilelang/tvm import failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    try:
+        with tvm.transform.PassContext(), tvm.target.Target("metal"):
+            artifact = tilelang.lower(prim_func, target="metal")
+    except Exception as exc:  # noqa: BLE001
+        raise FXToTileLangMetalBridgeError(
+            f"tilelang.lower(target='metal') raised: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    # 2. Pull the launch grid + threadgroup out of the device module.
+    cuda_grid, threadgroup = _extract_metal_grid(artifact)
+    # ``mx.fast.metal_kernel`` follows Metal's
+    # ``dispatchThreads(threads_per_grid, threads_per_threadgroup)``
+    # convention: ``grid`` is the *total* thread count, NOT the block
+    # count. TileLang's ``thread_extent`` records CUDA-style
+    # ``(gridDim, blockDim)`` (block-count + threads-per-block); convert
+    # by multiplying axis-wise. Without this the kernel only runs in a
+    # single threadgroup's worth of threads and large 1D ranges produce
+    # silently zero-filled tail elements.
+    grid = (
+        cuda_grid[0] * threadgroup[0],
+        cuda_grid[1] * threadgroup[1],
+        cuda_grid[2] * threadgroup[2],
+    )
+
+    # 3. Wrap the MSL source via the cppmega_mlx runtime adapter.
+    try:
+        from cppmega_mlx.nn._tilelang._mlx_runtime import (  # type: ignore[import-not-found]
+            wrap_tilelang_metal_kernel,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise FXToTileLangMetalBridgeError(
+            f"cppmega_mlx._mlx_runtime import failed: "
+            f"{type(exc).__name__}: {exc}. Set expose_metal=False or install "
+            f"the cppmega_mlx package on PYTHONPATH."
+        ) from exc
+
+    args_struct_inline: Dict[str, int] = {}
+    for i in range(3):
+        # ``gridDim_<i>`` in TileLang's args struct mirrors CUDA-style
+        # block-count gridDim, NOT the MLX ``dispatchThreads`` total.
+        args_struct_inline[f"gridDim_{i}"] = cuda_grid[i]
+
+    try:
+        adapter = wrap_tilelang_metal_kernel(
+            artifact,
+            input_count=len(input_specs),
+            output_count=len(output_specs),
+            name=name,
+            args_struct_inline=args_struct_inline,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise FXToTileLangMetalBridgeError(
+            f"wrap_tilelang_metal_kernel failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    # 4. Build the torch <-> MLX launcher closure.
+    output_shapes = tuple(tuple(int(d) for d in s.shape) for s in output_specs)
+    output_dtype_names = tuple(s.dtype for s in output_specs)
+
+    def _launcher(*torch_inputs: Any) -> Any:
+        try:
+            import mlx.core as mx  # type: ignore[import-not-found]
+            import numpy as np  # type: ignore[import-not-found]
+            import torch  # type: ignore[import-not-found]
+        except Exception as exc:  # noqa: BLE001
+            raise FXToTileLangMetalBridgeError(
+                f"runtime import failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        if len(torch_inputs) < len(input_specs):
+            raise FXToTileLangMetalBridgeError(
+                f"metal launcher: expected {len(input_specs)} input tensors, "
+                f"got {len(torch_inputs)}")
+
+        mlx_inputs = []
+        for t in torch_inputs[: len(input_specs)]:
+            arr = t.detach().contiguous().cpu().numpy()
+            mlx_inputs.append(mx.array(arr))
+
+        out_dtypes = [_tl_dtype_to_mlx(mx, n) for n in output_dtype_names]
+        try:
+            outs = adapter(
+                inputs=mlx_inputs,
+                output_shapes=[tuple(s) for s in output_shapes],
+                output_dtypes=out_dtypes,
+                grid=grid,
+                threadgroup=threadgroup,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise FXToTileLangMetalBridgeError(
+                f"mx.fast.metal_kernel raised: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        try:
+            mx.eval(outs)
+        except Exception as exc:  # noqa: BLE001
+            raise FXToTileLangMetalBridgeError(
+                f"mx.eval raised: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        torch_outputs = []
+        for o, spec in zip(outs, output_specs):
+            np_arr = np.array(o, copy=False)
+            t_dtype = _spec_to_torch_dtype_runtime(spec.dtype)
+            torch_outputs.append(torch.from_numpy(np_arr).to(t_dtype))
+
+        if len(torch_outputs) == 1:
+            return torch_outputs[0]
+        return tuple(torch_outputs)
+
+    _launcher._tilelang_metal_bridge = True  # type: ignore[attr-defined]
+    return _launcher
 
 
 def _spec_from_value(val: Any) -> _TensorSpec:
@@ -1202,7 +1431,7 @@ class FXToTileLang:
     # Top-level driver
     # ------------------------------------------------------------------
 
-    def run(self) -> "FusedKernelArtifact":  # type: ignore[name-defined]
+    def run(self, *, expose_metal: bool = False) -> "FusedKernelArtifact":  # type: ignore[name-defined]
         """Lower the entire FX graph to a compiled TileLang artifact.
 
         Walks the FX graph in topological order, dispatches each
@@ -1215,6 +1444,21 @@ class FXToTileLang:
         chains the compiled regions in order; if ``tilelang.compile`` fails
         for any region we keep a per-op extern-fallback launcher for that
         slot only.
+
+        Parameters
+        ----------
+        expose_metal : bool, default False
+            When True AND every region produced a real ``tvm.tir.PrimFunc``
+            (``HAS_PRIM_FUNC=True``), replace the default extern-replay /
+            CUDA-target launcher with a Metal-backed launcher that drives
+            ``mx.fast.metal_kernel`` via
+            :func:`cppmega_mlx.nn._tilelang._mlx_runtime.wrap_tilelang_metal_kernel`.
+            Inputs are converted ``torch.Tensor -> mlx.core.array`` and the
+            outputs back to ``torch.Tensor`` (Wave C3 brief). On failure
+            (no PrimFunc, MLX import error, lower-to-Metal error, kernel
+            signature mismatch) raises
+            :class:`FXToTileLangMetalBridgeError` — there is no silent
+            fallback to the extern launcher in this mode.
         """
         from .custom_op_wrapper import FusedKernelArtifact
 
@@ -1256,6 +1500,45 @@ class FXToTileLang:
             object.__setattr__(artifact, "prim_funcs", tuple(prim_funcs))
         except Exception:  # pragma: no cover - defensive
             pass
+
+        # Wave C3: torch -> MLX zero-copy bridge. When the caller asks for
+        # ``expose_metal=True`` we rebuild the launcher to dispatch on Mac
+        # GPU through ``mx.fast.metal_kernel`` instead of the extern-replay
+        # launcher (which routes to CPU torch eager). This is the path the
+        # brief asks for: launchers backed by real Metal kernels, not CPU
+        # fallback masquerading as a TileLang win.
+        if expose_metal:
+            if not prim_funcs:
+                raise FXToTileLangMetalBridgeError(
+                    "expose_metal=True requires at least one fully lowered "
+                    "tvm.tir.PrimFunc; got prim_funcs=() (every region fell "
+                    "back to the extern slot). source="
+                    f"{source_info!r}")
+            if len(prim_funcs) > 1:
+                raise FXToTileLangMetalBridgeError(
+                    f"expose_metal=True currently supports only single-region "
+                    f"FX graphs (got {len(prim_funcs)} regions). Multi-region "
+                    "Metal chaining is a future extension; the existing CUDA "
+                    "extern-replay path handles it correctly today.")
+            metal_launcher = _build_metal_launcher(
+                prim_funcs[0],
+                input_specs=tuple(self.ctx.input_specs),
+                output_specs=tuple(self.ctx.output_specs),
+                name=f"fx_metal_{self.content_hash()}",
+            )
+            try:
+                object.__setattr__(artifact, "launcher", metal_launcher)
+                object.__setattr__(
+                    artifact,
+                    "source",
+                    (artifact.source or "")
+                    + " | metal_bridge=mx.fast.metal_kernel",
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                raise FXToTileLangMetalBridgeError(
+                    f"could not attach metal launcher to artifact: {exc}"
+                ) from exc
+
         return artifact
 
     def _linearised_nodes(self) -> List["torch.fx.Node"]:

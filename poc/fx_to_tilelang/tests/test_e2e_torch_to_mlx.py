@@ -124,6 +124,31 @@ def _lower_and_launch(fn, example_inputs):
     return out, artifact
 
 
+def _try_metal_launch(fn, example_inputs):
+    """Same as ``_lower_and_launch`` but with ``expose_metal=True``.
+
+    Returns ``(out, artifact)`` on success, or ``(None, error_string)`` on
+    expected failure (e.g. MLX unavailable, prim_func unsupported on
+    Metal). Callers decide whether to skip or assert based on whether the
+    op is in the "should work" set (relu, add) vs. the "may not yet" set
+    (sum, matmul) per the Wave C3 brief.
+    """
+    import torch.fx as fx
+
+    from poc.torch_dynamo.fx_to_tilelang import (
+        FXToTileLang,
+        FXToTileLangMetalBridgeError,
+    )
+
+    gm = fx.symbolic_trace(fn)
+    try:
+        artifact = FXToTileLang(gm, list(example_inputs)).run(expose_metal=True)
+    except FXToTileLangMetalBridgeError as exc:
+        return None, str(exc)
+    out = artifact.launcher(*example_inputs)
+    return out, artifact
+
+
 def _maybe_mlx_check(t_a, t_b):
     """Best-effort MLX-side allclose smoke. No-op if MLX unimportable."""
     if not _has("mlx"):
@@ -173,6 +198,23 @@ def test_relu_unary_lowers_and_runs():
     assert "tilelang.compile ok" in artifact.source, (
         f"expected 'tilelang.compile ok' in source, got {artifact.source!r}")
 
+    # Wave C3: when MLX is available, the launcher MUST run on Mac GPU
+    # via mx.fast.metal_kernel — not on CPU through extern replay.
+    if _has("mlx") and _has("cppmega_mlx"):
+        m_out, m_artifact = _try_metal_launch(fn, [x])
+        assert m_out is not None, (
+            f"[relu metal] expected Metal launcher to succeed, got error: "
+            f"{m_artifact!r}")
+        assert getattr(m_artifact.launcher, "_tilelang_metal_bridge", False)
+        torch.testing.assert_close(m_out, y_ref, rtol=1e-3, atol=1e-3)
+        # mx.allclose against torch reference for explicit Metal-vs-torch.
+        import mlx.core as mx  # type: ignore[import-not-found]
+        assert bool(mx.allclose(
+            mx.array(m_out.detach().cpu().numpy()),
+            mx.array(y_ref.detach().cpu().numpy()),
+            rtol=1e-3, atol=1e-3,
+        ).item())
+
 
 def test_add_binary_lowers_and_runs():
     """Binary elementwise: ``a + b``.
@@ -201,6 +243,21 @@ def test_add_binary_lowers_and_runs():
         f"would mask the closure-capture bug. source={artifact.source!r}")
     assert "tilelang.compile ok" in artifact.source, (
         f"expected 'tilelang.compile ok' in source, got {artifact.source!r}")
+
+    # Wave C3: Metal path should also succeed for binary elementwise.
+    if _has("mlx") and _has("cppmega_mlx"):
+        m_out, m_artifact = _try_metal_launch(fn, [a, b])
+        assert m_out is not None, (
+            f"[add metal] expected Metal launcher to succeed, got error: "
+            f"{m_artifact!r}")
+        assert getattr(m_artifact.launcher, "_tilelang_metal_bridge", False)
+        torch.testing.assert_close(m_out, y_ref, rtol=1e-3, atol=1e-3)
+        import mlx.core as mx  # type: ignore[import-not-found]
+        assert bool(mx.allclose(
+            mx.array(m_out.detach().cpu().numpy()),
+            mx.array(y_ref.detach().cpu().numpy()),
+            rtol=1e-3, atol=1e-3,
+        ).item())
 
 
 def test_sum_reduction_lowers_and_runs():
@@ -232,6 +289,19 @@ def test_sum_reduction_lowers_and_runs():
     assert "tilelang.compile ok" in artifact.source, (
         f"expected 'tilelang.compile ok' in source, got {artifact.source!r}")
 
+    # Wave C3: best-effort Metal path. Per the brief, sum/matmul may not
+    # yet route cleanly through MLX (the reduction kernel uses 0-D output
+    # buffers that mx.fast.metal_kernel hasn't been smoke-tested with);
+    # we record the outcome but do NOT fail the test if Metal lowering /
+    # launch raises — the launcher contract is already pinned by the
+    # ``_lower_and_launch`` assertions above.
+    if _has("mlx") and _has("cppmega_mlx"):
+        m_out, m_meta = _try_metal_launch(fn, [x])
+        if m_out is None:
+            print(f"[sum metal] expected-soft-failure: {m_meta!r}")
+        else:
+            torch.testing.assert_close(m_out, y_ref, rtol=1e-2, atol=1e-2)
+
 
 def test_matmul_lowers_and_runs():
     """Matmul: ``torch.matmul(x, x.T)``.
@@ -261,6 +331,18 @@ def test_matmul_lowers_and_runs():
     assert "tilelang.compile ok" in artifact.source, (
         f"expected 'tilelang.compile ok' in source, got {artifact.source!r}")
 
+    # Wave C3: best-effort Metal path. T.gemm + shared-memory tiles haven't
+    # been wired through mx.fast.metal_kernel yet (the kernel uses
+    # alloc_shared which lowers to a Metal threadgroup-memory pragma the
+    # MLX runtime adapter doesn't currently surface). We record the
+    # outcome without failing the test.
+    if _has("mlx") and _has("cppmega_mlx"):
+        m_out, m_meta = _try_metal_launch(fn, [x])
+        if m_out is None:
+            print(f"[matmul metal] expected-soft-failure: {m_meta!r}")
+        else:
+            torch.testing.assert_close(m_out, y_ref, rtol=1e-1, atol=1e-1)
+
 
 def test_artifact_invariants():
     """Sanity-check the ``FusedKernelArtifact`` contract used downstream."""
@@ -282,3 +364,10 @@ def test_artifact_invariants():
     # ``prim_funcs`` may be empty (extern-fallback path) but the attribute
     # must exist as the wrapper consults it.
     assert hasattr(artifact, "prim_funcs")
+    # Wave C3: the Metal bridge entry-point exists at module scope.
+    from poc.torch_dynamo.fx_to_tilelang import (
+        FXToTileLangMetalBridgeError,
+        _build_metal_launcher,
+    )
+    assert callable(_build_metal_launcher)
+    assert issubclass(FXToTileLangMetalBridgeError, RuntimeError)

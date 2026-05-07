@@ -1080,3 +1080,227 @@ def test_splat_pointer_buffer_passthrough() -> None:
         "pointer-typed splat must passthrough the source buffer unchanged "
         f"(got {type(out).__name__})"
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression: matmul LOWER_FAIL (Cannot store value with 4096, expected 1)
+# ---------------------------------------------------------------------------
+
+
+def test_addptr_compose_handles_buffer_plus_vector_primexpr_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``tt.addptr`` inside ``scf.for`` with a Buffer prev-tile and a
+    *vector* PrimExpr offset (e.g. ``Broadcast(scalar, prod(out_shape))``)
+    must scalarise the vector per-lane via the flat lane index.
+
+    Regression for: ``InternalError: Cannot store value with 4096, expected
+    value with 1`` -- ``_compose_addptr_index._lane`` previously returned
+    the full ``Broadcast(int32x4096)`` operand verbatim, so the
+    ``tir.BufferStore(out_buf, _lane(prev) + _lane(off), [i0, i1])``
+    inside the surrounding ``T.grid(64, 64)`` saw a 4096-lane RHS against
+    a single-lane storage slot.
+    """
+    _force_no_shim(monkeypatch)
+    ctx = WalkerCtx()
+
+    ptr_ssa = _ssa("a_ptrs", shape=[64, 64], dtype="float32")
+    off_ssa = _ssa("k_step", shape=[64, 64], dtype="int32")
+    out_ssa = _ssa("a_ptrs_new", shape=[64, 64], dtype="float32")
+
+    base_buf = tvm.tir.decl_buffer([1024 * 1024], "float32", name="A")
+    # Previous iteration's trailing index entry is a 2-D offset Buffer
+    # (matmul's a_ptrs in-loop accumulator).
+    prev_off = tvm.tir.decl_buffer([64, 64], "int32", name="prev_off")
+    # The new offset is a vector PrimExpr -- exactly what tt.splat +
+    # arith.muli produces upstream of an in-loop tt.addptr (a single
+    # ``BLOCK_K * stride_ak`` constant broadcast across all 4096 lanes).
+    vec_off = tvm.tir.Broadcast(tvm.tir.const(7, "int32"), 64 * 64)
+
+    ctx.bind(ptr_ssa, (base_buf, [prev_off]))
+    ctx.bind(off_ssa, vec_off)
+
+    op = {
+        "name": "tt.addptr",
+        "operands": [ptr_ssa, off_ssa],
+        "results": [out_ssa],
+        "attrs": {},
+    }
+    # MUST NOT raise.
+    result = emit_tt_addptr(op, ctx)
+    assert isinstance(result, tuple) and len(result) == 2
+    out_buf, out_indices = result
+    assert out_buf is base_buf
+    assert isinstance(out_indices[0], tvm.tir.Buffer)
+    # Resulting accumulator buffer must inherit the 2-D shape (one slot
+    # per lane), not collapse to scalar or to the vector lane count.
+    assert tuple(int(d) for d in out_indices[0].shape) == (64, 64)
+
+
+def test_tt_load_scalarizes_buffer_typed_index_per_lane() -> None:
+    """``emit_tt_load`` scalar path must scalarise a Buffer-typed index.
+
+    Post Wave L2 the in-loop ``tt.addptr`` may leave the trailing index
+    of its ``(buf, indices)`` descriptor as a ``tir.Buffer``. The scalar
+    ``tt.load`` path has no enclosing per-lane ``tir.For`` to index that
+    Buffer with, so it must conservatively read lane 0 instead of feeding
+    the bare Buffer into ``tir.BufferLoad`` (which would expand to
+    ``buf.shape[0]`` lanes against a single storage slot and trip the
+    ``index_lanes * buffer_lanes == value_dtype_lanes`` check).
+    """
+    ctx = WalkerCtx()
+    # Scalar result -- forces the scalar BufferLoad path.
+    ptr_ssa = _ssa("ptr", shape=[], dtype="float32")
+    result_ssa = _ssa("loaded", shape=[], dtype="float32")
+    base_buf = tvm.tir.decl_buffer([1024], "float32", name="A")
+    offset_tile = tvm.tir.decl_buffer([32], "int32", name="off_tile")
+    ctx.bind(ptr_ssa, (base_buf, [offset_tile]))
+    op = {
+        "name": "tt.load",
+        "operands": [ptr_ssa],
+        "results": [result_ssa],
+        "attrs": {},
+    }
+    # MUST NOT raise. The bare Buffer-typed index would otherwise trip
+    # ``index_lanes * buffer_lanes == value_dtype_lanes``.
+    out = emit_tt_load(op, ctx)
+    text = _stringify(out)
+    # The index must read off the offset buffer rather than embed it
+    # raw -- look for a BufferLoad against the offset buffer's name.
+    assert "off_tile" in text, (
+        f"expected off_tile to appear via BufferLoad-as-index; got:\n{text}"
+    )
+
+
+def test_tt_store_scalarizes_buffer_typed_index_per_lane() -> None:
+    """Symmetric to :func:`test_tt_load_scalarizes_buffer_typed_index_per_lane`."""
+    ctx = WalkerCtx()
+    ptr_ssa = _ssa("ptr", shape=[], dtype="float32")
+    val_ssa = _ssa("v", shape=[], dtype="float32")
+    base_buf = tvm.tir.decl_buffer([1024], "float32", name="C")
+    offset_tile = tvm.tir.decl_buffer([32], "int32", name="off_tile_s")
+    ctx.bind(ptr_ssa, (base_buf, [offset_tile]))
+    ctx.bind(val_ssa, tvm.tir.const(1.0, "float32"))
+    op = {
+        "name": "tt.store",
+        "operands": [ptr_ssa, val_ssa],
+        "results": [],
+        "attrs": {},
+    }
+    # MUST NOT raise.
+    emit_tt_store(op, ctx)
+    text = _stringify(ctx.stmts)
+    assert "off_tile_s" in text, (
+        f"expected off_tile_s BufferLoad inside the BufferStore index; got:\n{text}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression: per-row store-ptr bound must thread the row-base offset.
+#
+# Bug: ``softmax`` / ``layer_norm`` emitted ``tl.store(out + pid*stride +
+# col_offsets, ...)`` lowered to a BufferStore on a buffer whose declared
+# shape was the **tile extent** (e.g. ``(128,)``). TileLang's
+# ``LegalizeSafeMemoryAccess`` then synthesised a runtime guard
+# ``if (pid * stride + i < 128)`` against the global store, which silently
+# dropped every row beyond ``pid == 0`` -- rows 1..3 came out as zeros and
+# the kernel reported ``NUMERIC_DIVERGE`` with row 0 correct.
+#
+# Fix: ``_redecl_input_buffer`` now consumes the offset_indices and, when
+# the index references a program_id Var, derives a buffer extent that
+# upper-bounds ``(gridDim - 1) * stride + tile_extent``. The per-row
+# guard then becomes ``idx < (gridDim - 1) * stride + tile_extent``,
+# which the analyzer can prove for the actual runtime values.
+# ---------------------------------------------------------------------------
+
+
+def test_tt_store_threads_row_base_into_flat_index() -> None:
+    """``_redecl_input_buffer`` must derive a pid-aware flat extent.
+
+    For a softmax-shaped pattern (``pid * stride + col_offsets``) the
+    redecl'd buffer shape must NOT be the per-row tile extent (128) --
+    it must symbolically encompass every reachable index across the
+    full launch grid (4 rows -> at least 4 * 128 = 512 elements).
+    """
+    from poc.triton_frontend import (  # noqa: WPS433
+        _flat_extent_for_indices,
+        _redecl_input_buffer,
+    )
+
+    ctx = WalkerCtx()
+
+    # Simulate the kernel-level state: input buffer ``arg1`` registered
+    # in ctx.buffers and one program_id Var with ``gridDim_0`` extent.
+    arg1 = tvm.tir.decl_buffer([1], "float32", name="arg1")
+    ctx.buffers["arg1"] = arg1
+    pid = tvm.tir.Var("pid0", "int32")
+    grid_dim_0 = tvm.tir.Var("gridDim_0", "int32")
+    ctx.program_id_vars.append((pid, 0, grid_dim_0))
+
+    # Build the offset expression as the wrapper sees it. The trailing
+    # index entry, after addptr fold, is ``Broadcast(pid * stride, 128)
+    # + Ramp(0, 1, 128)``.
+    stride = tvm.tir.Var("arg3", "int32")
+    base = tvm.tir.Broadcast(pid * stride, 128)
+    ramp = tvm.tir.Ramp(tvm.tir.const(0, "int32"), tvm.tir.const(1, "int32"), 128)
+    offset_indices = [base + ramp]
+    tile_shape = [128]
+
+    # Direct probe of the helper -- the shape must reference both
+    # ``gridDim_0`` and the stride Var.
+    extent_shape = _flat_extent_for_indices(ctx, offset_indices, tile_shape)
+    assert len(extent_shape) == 1
+    extent_text = str(extent_shape[0])
+    assert "gridDim_0" in extent_text, (
+        f"derived extent must reference gridDim_0; got {extent_text!r}"
+    )
+    assert "arg3" in extent_text, (
+        f"derived extent must reference the stride Var; got {extent_text!r}"
+    )
+
+    # End-to-end: redecl returns a Buffer whose shape is NOT the bare
+    # tile extent. This is the load-bearing property -- the
+    # downstream LegalizeSafeMemoryAccess upper-bound check uses
+    # ``buffer->shape`` directly.
+    new_buf = _redecl_input_buffer(
+        ctx, arg1, tile_shape, "float32",
+        offset_indices=offset_indices,
+    )
+    assert isinstance(new_buf, tvm.tir.Buffer)
+    assert len(new_buf.shape) == 1
+    new_shape_text = str(new_buf.shape[0])
+    # The bug-state shape was a literal ``128``; the fix produces a
+    # symbolic expression mentioning gridDim_0 and the stride Var.
+    assert new_shape_text != "128", (
+        "redecl returned the per-row tile extent; row-base was lost"
+    )
+    assert "gridDim_0" in new_shape_text and "arg3" in new_shape_text, (
+        f"redecl shape must thread row base + stride; got {new_shape_text!r}"
+    )
+
+
+def test_tt_store_redecl_falls_back_to_tile_shape_without_pid() -> None:
+    """Without ``program_id_vars``, redecl keeps the original tile shape.
+
+    Vector_add-class kernels that do not reference a program_id (or a
+    single-launch grid where the whole buffer fits in one tile) must
+    not get the symbolic-extent rewrite -- otherwise the analyzer
+    might generate weaker guards or break the "no-regression" property
+    for the pre-fix passing kernel.
+    """
+    from poc.triton_frontend import (  # noqa: WPS433
+        _flat_extent_for_indices,
+    )
+
+    ctx = WalkerCtx()
+    # Empty program_id_vars -- mimics a pre-launch-context test fixture.
+    assert ctx.program_id_vars == []
+
+    # A pure ramp index, no pid involvement.
+    ramp = tvm.tir.Ramp(tvm.tir.const(0, "int32"), tvm.tir.const(1, "int32"), 256)
+    offset_indices = [ramp]
+    extent_shape = _flat_extent_for_indices(ctx, offset_indices, [256])
+    # Falls back to the original tile shape.
+    assert extent_shape == [256], (
+        f"expected fallback to tile shape [256]; got {extent_shape!r}"
+    )

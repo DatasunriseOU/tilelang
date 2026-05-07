@@ -808,7 +808,28 @@ def emit_tt_load(op: Any, ctx: WalkerCtx) -> Any:
             buf = ctx.buffers[buf_name]
         indices = [0]
 
-    load_expr: Any = tir.BufferLoad(buf, list(indices))
+    # Scalarise any Buffer-typed index entries before the BufferLoad. After
+    # Wave L2's tt.addptr in-loop accumulator, the trailing index of a
+    # ``(buf, indices)`` tuple may be a ``tir.Buffer`` (a per-lane offset
+    # tile). Passing that Buffer directly to ``tir.BufferLoad(buf, [...,
+    # Buffer])`` trips ``index_lanes * buffer_lanes == value_dtype_lanes``
+    # because the load expands to ``buf.shape[0]`` lanes against a single
+    # storage slot. The scalar path has no enclosing per-lane ``tir.For`` to
+    # index the offset tile with, so we fall back to lane 0 -- conservative
+    # but loud (any caller that should have hit the tile path instead is
+    # caught by the rank/lane-count assertions below).
+    indices = list(indices)
+    for axis_i, idx_v in enumerate(indices):
+        if isinstance(idx_v, ctx.tvm().tir.Buffer):
+            buf_rank = len(idx_v.shape)
+            if buf_rank == 0:
+                indices[axis_i] = tir.BufferLoad(idx_v, [tir.const(0, "int32")])
+            else:
+                indices[axis_i] = tir.BufferLoad(
+                    idx_v, [tir.const(0, "int32")] * buf_rank,
+                )
+
+    load_expr: Any = tir.BufferLoad(buf, indices)
     if mask_ssa is not None:
         mask_expr = ctx.get(mask_ssa)
         if other_ssa is not None:
@@ -938,7 +959,22 @@ def emit_tt_store(op: Any, ctx: WalkerCtx) -> Any:
             buf = ctx.buffers[buf_name]
         indices = [0]
 
-    store_stmt: Any = tir.BufferStore(buf, val_expr, list(indices))
+    # Scalarise any Buffer-typed index entries (see emit_tt_load above for
+    # rationale: post Wave L2 the in-loop tt.addptr can leave a Buffer in
+    # the trailing index slot, which the scalar BufferStore path cannot
+    # consume directly because there is no surrounding per-lane For).
+    indices = list(indices)
+    for axis_i, idx_v in enumerate(indices):
+        if isinstance(idx_v, ctx.tvm().tir.Buffer):
+            buf_rank = len(idx_v.shape)
+            if buf_rank == 0:
+                indices[axis_i] = tir.BufferLoad(idx_v, [tir.const(0, "int32")])
+            else:
+                indices[axis_i] = tir.BufferLoad(
+                    idx_v, [tir.const(0, "int32")] * buf_rank,
+                )
+
+    store_stmt: Any = tir.BufferStore(buf, val_expr, indices)
     if mask_ssa is not None:
         mask_expr = ctx.get(mask_ssa)
         # Scalar store path: lane-resolve so a Buffer mask doesn't crash
@@ -1547,6 +1583,22 @@ def _compose_addptr_index(ctx: WalkerCtx, prev: Any, off: Any) -> Any:
     out_buf = _alloc_tile_buffer(ctx, out_shape, out_dtype, ctx.fresh("addptr_acc"))
     loop_vars = [tir.Var(ctx.fresh(f"a{axis}"), "int32") for axis in range(len(out_shape))]
 
+    def _flat_lane_idx() -> Any:
+        """Linearise the surrounding loop-var nest to a single lane index.
+
+        Vector PrimExpr offsets (``Broadcast``/``Ramp``/elementwise vector
+        binops produced by ``tt.make_range`` + ``tt.splat``) carry a flat
+        lane count equal to ``prod(out_shape)``. To read one scalar lane
+        out of such a vector we need a single linear index that matches
+        the position the surrounding ``tir.For`` nest is currently at.
+        """
+        if not loop_vars:
+            return tir.const(0, "int32")
+        idx: Any = loop_vars[0]
+        for axis in range(1, len(loop_vars)):
+            idx = idx * tir.const(int(out_shape[axis]), "int32") + loop_vars[axis]
+        return idx
+
     def _lane(operand: Any) -> Any:
         if isinstance(operand, Buffer):
             rank = len(operand.shape)
@@ -1560,6 +1612,13 @@ def _compose_addptr_index(ctx: WalkerCtx, prev: Any, off: Any) -> Any:
             else:
                 idx = [tir.const(0, "int32")] * (rank - len(loop_vars)) + list(loop_vars)
             return tir.BufferLoad(operand, idx)
+        # Vector PrimExpr (e.g. ``Broadcast(scalar, N)`` or
+        # ``Ramp(base, 1, N) + Broadcast(...)``): read a single scalar lane
+        # via the flattened lane index so the BufferStore below sees a
+        # scalar value (not a vector with ``prod(out_shape)`` lanes, which
+        # tripsx ``index_lanes * buffer_lanes == value_dtype_lanes``).
+        if _vector_lanes(operand) > 1:
+            return _read_vector_lane(ctx, operand, _flat_lane_idx())
         # Scalar PrimExpr broadcasts across every lane.
         return operand
 

@@ -107,7 +107,140 @@ def _value_is_input_buffer(ctx: Any, val: Any) -> bool:
     return False
 
 
-def _redecl_input_buffer(ctx: Any, buf: Any, shape: Any, dtype: str) -> Any:
+def _flat_extent_for_indices(
+    ctx: Any,
+    offset_indices: Any,
+    tile_shape: Any,
+) -> Any:
+    """Compute a symbolic flat extent that upper-bounds ``offset_indices``.
+
+    The tile-load/store wrappers redecl the input buffer with the **tile
+    shape** (e.g. ``(128,)``). When the kernel uses ``program_id`` based
+    addressing -- for instance ``tl.store(out_ptr + pid * row_stride +
+    col_offsets, ...)`` -- the per-lane index reaches up to ``(gridDim - 1)
+    * row_stride + tile_extent - 1``, which exceeds the tile-shape bound.
+    TileLang's ``LegalizeSafeMemoryAccess`` pass then synthesises a runtime
+    guard ``if (idx < tile_shape) { store }`` and silently drops every
+    store outside the first row.
+
+    We avoid that by deriving a buffer shape that is symbolically large
+    enough to subsume every reachable index. The pattern we need to match
+    is
+
+        Broadcast(pid * stride, lanes) + Ramp(0, 1, lanes)
+
+    or its scalar form ``pid * stride + i`` (post per-lane lowering). For
+    each ``pid * stride`` we substitute the pid Var by ``gridDim - 1`` and
+    add the tile extent, producing ``(gridDim - 1) * stride + tile_extent``
+    -- a sound upper bound the analyzer can use to discharge the
+    ``LegalizeSafeMemoryAccess`` upper-bound check.
+
+    Returns a ``[extent]`` 1D shape. If the indices contain no recognised
+    pid-pattern, falls back to the input ``tile_shape``.
+    """
+    try:
+        tir = ctx.tir()
+        tvm_mod = ctx.tvm()
+    except Exception:
+        return list(tile_shape) or [1]
+
+    program_id_vars = list(getattr(ctx, "program_id_vars", []) or [])
+    if not program_id_vars:
+        return list(tile_shape) or [1]
+
+    pid_to_extent = {var: extent for (var, _axis, extent) in program_id_vars}
+
+    flat_tile_extent = 1
+    for d in (tile_shape or [1]):
+        flat_tile_extent *= int(d)
+
+    Broadcast = getattr(tvm_mod.tir, "Broadcast", None)
+    Ramp = getattr(tvm_mod.tir, "Ramp", None)
+    BufferLoad = getattr(tvm_mod.tir, "BufferLoad", None)
+
+    # Walk the (single, post-flatten) offset expression collecting Vars
+    # that are program_id Vars. For the typical ``pid * stride + col``
+    # form we want to substitute pid -> (gridDim - 1) so the resulting
+    # expression upper-bounds every reachable index.
+    def _scalar_form(expr: Any) -> Any:
+        # Strip Broadcast/Ramp wrappers used pre-vectorize.
+        if Broadcast is not None and isinstance(expr, Broadcast):
+            return _scalar_form(expr.value)
+        if Ramp is not None and isinstance(expr, Ramp):
+            # Ramp(base, stride, lanes): the maximum is base + stride*(lanes-1).
+            return expr.base + expr.stride * (int(expr.lanes) - 1)
+        if hasattr(expr, "a") and hasattr(expr, "b"):
+            # Add/Sub/Mul expressions: recurse into both children. We
+            # rebuild the expression with scalar-form subterms so that
+            # Substitute below sees a plain PrimExpr DAG.
+            try:
+                a = _scalar_form(expr.a)
+                b = _scalar_form(expr.b)
+                # Reconstruct the same node type with substituted children.
+                if isinstance(expr, tvm_mod.tir.Add):
+                    return a + b
+                if isinstance(expr, tvm_mod.tir.Sub):
+                    return a - b
+                if isinstance(expr, tvm_mod.tir.Mul):
+                    return a * b
+            except Exception:
+                pass
+        return expr
+
+    if not offset_indices:
+        return list(tile_shape) or [1]
+
+    # We collapse the offset expression to a single scalar that bounds
+    # every per-lane index. Concatenate via "+"; downstream we substitute
+    # pid Vars for their max.
+    expr = None
+    for entry in offset_indices:
+        # Tile-buffer offsets are opaque to us here; fall back to the
+        # tile shape (those paths are exercised by the matmul ladder and
+        # already use explicit pid + iter Vars in their Ramp folds).
+        if isinstance(entry, tvm_mod.tir.Buffer):
+            return list(tile_shape) or [1]
+        scalar = _scalar_form(entry)
+        expr = scalar if expr is None else (expr + scalar)
+
+    if expr is None:
+        return list(tile_shape) or [1]
+
+    # Substitute every program_id Var by ``extent - 1`` (its maximum).
+    # ``tir.stmt_functor.substitute`` expects Var -> PrimExpr.
+    substitute = getattr(tvm_mod.tir.stmt_functor, "substitute", None)
+    if substitute is None:
+        return list(tile_shape) or [1]
+
+    sub_map = {}
+    for var, extent in pid_to_extent.items():
+        sub_map[var] = extent - tir.const(1, "int32")
+
+    try:
+        upper_idx = substitute(expr, sub_map)
+    except Exception:
+        return list(tile_shape) or [1]
+
+    # The buffer must contain ``upper_idx`` (inclusive); declare shape as
+    # ``upper_idx + 1`` so ``index < shape`` is provable.
+    extent_expr = upper_idx + tir.const(1, "int32")
+    # Add tile slack: when the offset_indices already encode the full
+    # ramp (matmul case), this is a no-op; for the scalar-fold path
+    # (softmax: the trailing index is just ``pid * stride``), the per-
+    # lane loop adds 0..tile_extent-1 on top, so the buffer must cover
+    # tile_extent more elements.
+    extent_expr = extent_expr + tir.const(int(flat_tile_extent), "int32")
+    return [extent_expr]
+
+
+def _redecl_input_buffer(
+    ctx: Any,
+    buf: Any,
+    shape: Any,
+    dtype: str,
+    *,
+    offset_indices: Any = None,
+) -> Any:
     """Re-declare an input buffer with the right tile shape.
 
     ``map_tt_func`` / ``_materialize_func_args`` declares input buffers
@@ -116,6 +249,15 @@ def _redecl_input_buffer(ctx: Any, buf: Any, shape: Any, dtype: str) -> Any:
     in-place (same key in ``ctx.buffers``, new shape) so ``BufferLoad/Store``
     indexing is in-bounds. Without this, ``tir.BufferLoad(arg0, [off + lv])``
     against a ``T.Buffer((1,))`` would fail TVM's bound checks at lower time.
+
+    When ``offset_indices`` is provided and the indices reference one of
+    the kernel's ``program_id`` Vars, the actual reachable index runs up
+    to ``(gridDim - 1) * stride + tile_extent``. Declaring the buffer
+    with the tile shape (e.g. ``(128,)``) in that case causes
+    ``LegalizeSafeMemoryAccess`` to inject a runtime ``idx < 128`` guard
+    on the global store and silently drops every row beyond the first.
+    See :func:`_flat_extent_for_indices` for the per-lane upper-bound
+    derivation.
     """
     try:
         tir = ctx.tir()
@@ -131,8 +273,13 @@ def _redecl_input_buffer(ctx: Any, buf: Any, shape: Any, dtype: str) -> Any:
     if target_key is None:
         return buf
 
+    if offset_indices is not None:
+        decl_shape = _flat_extent_for_indices(ctx, offset_indices, shape)
+    else:
+        decl_shape = list(shape) or [1]
+
     try:
-        new_buf = tir.decl_buffer(shape=list(shape) or [1], dtype=dtype, name=name)
+        new_buf = tir.decl_buffer(shape=decl_shape, dtype=dtype, name=name)
     except Exception:
         return buf
     ctx.buffers[target_key] = new_buf
@@ -317,7 +464,10 @@ def _wrap_tile_load_emitter(orig_emit: Callable[..., Any]) -> Callable[..., Any]
         out_dtype = _dtype_of(result_value) if result_value is not None else "float32"
         if not _is_tile_shape(out_shape):
             return orig_emit(op, ctx)
-        buf = _redecl_input_buffer(ctx, buf, out_shape, out_dtype)
+        buf = _redecl_input_buffer(
+            ctx, buf, out_shape, out_dtype,
+            offset_indices=list(indices),
+        )
         return _emit_tile_load_from_input_buffer(
             op, ctx, buf, list(indices), out_shape, out_dtype,
             mask_ssa, other_ssa,
@@ -461,7 +611,10 @@ def _wrap_tile_store_emitter(orig_emit: Callable[..., Any]) -> Callable[..., Any
             return orig_emit(op, ctx)
         val_expr = ctx.get(val_ssa)
         dtype = _dtype_of(val_ssa) or "float32"
-        buf = _redecl_input_buffer(ctx, buf, val_shape, dtype)
+        buf = _redecl_input_buffer(
+            ctx, buf, val_shape, dtype,
+            offset_indices=list(indices),
+        )
         return _emit_tile_store_to_input_buffer(
             op, ctx, buf, list(indices), val_expr, val_shape, mask_ssa,
         )

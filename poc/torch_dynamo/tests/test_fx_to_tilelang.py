@@ -144,3 +144,101 @@ def test_bug2_matmul_lowers_to_real_prim_func() -> None:
     assert "contains non-unary-elementwise ops" not in artifact.source, (
         "Bug 2 regression: matmul routing fell back to the wave-3 extern "
         f"path. source={artifact.source!r}")
+
+
+# ---------------------------------------------------------------------------
+# Wave C3 — torch -> MLX zero-copy bridge regression. The launcher MUST
+# now run on Mac M-series GPU via ``mx.fast.metal_kernel`` instead of CPU
+# extern replay when ``expose_metal=True`` is requested.
+# ---------------------------------------------------------------------------
+
+
+def test_relu_lowers_to_metal_via_mlx_and_matches_torch() -> None:
+    """Wave C3: ``torch.relu(x)`` lowers via ``expose_metal=True`` and
+    runs on Mac GPU through ``mx.fast.metal_kernel``, matching torch eager.
+
+    Skipped when MLX or the cppmega_mlx runtime adapter is unimportable.
+    On hosts where MLX is available we assert:
+
+      1. The launcher carries the ``_tilelang_metal_bridge`` marker, NOT
+         the extern-replay marker — this is the contract test that pins
+         the bridge to the artifact.
+      2. The launcher's outputs match ``torch.relu(x)`` numerically.
+      3. ``artifact.source`` records the Metal bridge attachment.
+
+    On hosts WITHOUT MLX we still run the lowering (so the
+    ``HAS_PRIM_FUNC`` invariant holds) and assert that
+    :class:`FXToTileLangMetalBridgeError` fires with a clear "no silent
+    fallback" message — per the brief, ``expose_metal=True`` must NOT
+    quietly degrade to CPU.
+    """
+    import torch
+    import torch.fx as fx
+
+    from poc.torch_dynamo.fx_to_tilelang import (
+        FXToTileLang,
+        FXToTileLangMetalBridgeError,
+    )
+
+    x = torch.randn(8, 16, dtype=torch.float32)
+
+    def fn(a):
+        return torch.relu(a)
+
+    gm = fx.symbolic_trace(fn)
+
+    have_mlx = _has("mlx") and _has("cppmega_mlx")
+    if not have_mlx:
+        # No silent fallback contract: must raise, not return an extern
+        # launcher dressed up as a Metal one.
+        with pytest.raises(FXToTileLangMetalBridgeError):
+            FXToTileLang(gm, [x]).run(expose_metal=True)
+        pytest.skip("mlx / cppmega_mlx unavailable on this host")
+
+    artifact = FXToTileLang(gm, [x]).run(expose_metal=True)
+    # Pin the bridge marker — the launcher MUST be the Metal-backed one,
+    # not the extern-replay closure or the CUDA-target chain launcher.
+    assert getattr(artifact.launcher, "_tilelang_metal_bridge", False), (
+        f"expected metal-bridge launcher, got marker="
+        f"{getattr(artifact.launcher, '_tilelang_metal_bridge', None)!r} "
+        f"(source={artifact.source!r})")
+    assert "metal_bridge=mx.fast.metal_kernel" in artifact.source, (
+        f"expected metal bridge tag in source, got {artifact.source!r}")
+
+    out = artifact.launcher(x)
+    y_ref = torch.relu(x)
+    assert tuple(out.shape) == tuple(y_ref.shape)
+    torch.testing.assert_close(out, y_ref, rtol=1e-5, atol=1e-5)
+
+
+def test_metal_bridge_raises_when_no_prim_func() -> None:
+    """Wave C3 hard-constraint: ``expose_metal=True`` MUST raise when no
+    region produced a real PrimFunc — never silently fall through to the
+    extern launcher.
+
+    We provoke an empty ``prim_funcs`` by stubbing ``_build_kernel_chain``
+    to return all-extern. This pins the "no silent fallback" contract
+    independent of which ops happen to lower today.
+    """
+    import torch
+    import torch.fx as fx
+
+    from poc.torch_dynamo.fx_to_tilelang import (
+        FXToTileLang,
+        FXToTileLangMetalBridgeError,
+    )
+
+    x = torch.randn(4, 4, dtype=torch.float32)
+    gm = fx.symbolic_trace(lambda a: torch.relu(a))
+    lowering = FXToTileLang(gm, [x])
+    # Force the "no PrimFunc" branch.
+    original = lowering._build_kernel_chain
+
+    def _empty_chain():
+        _, launcher, source = original()
+        return [], launcher, source + " | forced empty for metal-no-fallback test"
+
+    lowering._build_kernel_chain = _empty_chain  # type: ignore[assignment]
+    with pytest.raises(FXToTileLangMetalBridgeError) as excinfo:
+        lowering.run(expose_metal=True)
+    assert "prim_funcs=()" in str(excinfo.value) or "at least one" in str(excinfo.value)
