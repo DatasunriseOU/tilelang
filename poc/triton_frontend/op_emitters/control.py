@@ -645,6 +645,15 @@ def map_tt_func(op: Any, ctx: _om.WalkerCtx) -> Any:
             dt = _normalize_dtype(type_str) if type_str else "int32"
             if tir_mod is not None:
                 bound = tir_mod.Var(clean, dt)
+                # Track the runtime scalar arg so ``_make_prim_func`` can
+                # append it to ``PrimFunc.params``. Triton 3.x folds
+                # ``tl.constexpr`` parameters at the TTIR stage, so anything
+                # that survives as a non-pointer block arg is an actual
+                # runtime arg (e.g. ``n_elements``). Without this MakePackedAPI
+                # rejects the Var as a free variable in the body.
+                runtime_args = getattr(ctx, "runtime_args", None)
+                if runtime_args is not None and bound not in runtime_args:
+                    runtime_args.append(bound)
             else:
                 bound = {"_var_placeholder": True, "name": clean, "dtype": dt}
 

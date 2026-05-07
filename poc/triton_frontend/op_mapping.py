@@ -179,6 +179,23 @@ class WalkerCtx:
         # environment (see 3rdparty/tvm/src/tirx/analysis/verify_memory.cc
         # ``HandleLoadStoreToVariable``).
         self.local_buffers: List[Any] = []
+        # Ordered list of runtime scalar ``tir.Var`` objects originating from
+        # ``tt.func`` non-pointer block args (e.g. ``n_elements``). These must
+        # be appended to the ``PrimFunc.params`` list so ``MakePackedAPI``
+        # sees them as proper API arguments rather than free Vars in the body.
+        # Constexprs (``BLOCK_SIZE`` etc.) are already substituted by Triton
+        # at the TTIR stage, so anything that survives as a block arg is a
+        # runtime arg.
+        self.runtime_args: List[Any] = []
+        # ``tt.get_program_id(axis=N)`` Vars that the emitter created when no
+        # active TileLang KernelLaunchFrame was available to supply a real
+        # block binding. ``_make_prim_func`` wraps the body in a
+        # ``tir.AttrStmt(IterVar, "thread_extent", extent, body)`` per entry
+        # so MakePackedAPI accepts the Var as a thread-environment binding
+        # rather than a free Var. Each entry is a ``(var, axis, extent)``
+        # tuple; extent defaults to a symbolic placeholder when grid info is
+        # not available at lowering time.
+        self.program_id_vars: List[Tuple[Any, int, Any]] = []
 
     # ---- helpers --------------------------------------------------------
 
@@ -260,7 +277,40 @@ class WalkerCtx:
         self.value_map[ssa_value] = tir_value
 
     def emit(self, stmt: Any) -> None:
-        """Append a TIR statement to the current function body."""
+        """Append a TIR statement to the current function body.
+
+        Safety net: emitters occasionally hand us a ``tir.PrimExpr`` (most
+        often a ``tir.Call`` produced by ``tilelang.language.gemm`` or
+        ``tir.call_intrin``) instead of a Stmt. Inserting a PrimExpr here
+        makes ``tir.SeqStmt(stmts: Array<Stmt>)`` reject the list at the
+        walker boundary with::
+
+            TypeError: Mismatched type on argument #0 ... Expected
+            Array<tirx.Stmt> but got Array[index N: tirx.Call]
+
+        We auto-wrap in ``tir.Evaluate`` and emit a one-shot
+        DeprecationWarning so the offending emitter still gets diagnosed.
+        Fix the emitter -- this safety net should never quietly absorb a
+        production bug.
+        """
+        if stmt is None:
+            return
+        try:
+            tir = self.tir()
+        except Exception:  # pragma: no cover - tvm not importable yet
+            self.stmts.append(stmt)
+            return
+        if isinstance(stmt, tir.PrimExpr):
+            import warnings
+            warnings.warn(
+                f"WalkerCtx.emit() received a PrimExpr "
+                f"({type(stmt).__name__}); auto-wrapping in tir.Evaluate. "
+                f"The producing emitter should wrap the call itself "
+                f"(`ctx.emit(tir.Evaluate(call))`).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            stmt = tir.Evaluate(stmt)
         self.stmts.append(stmt)
 
     # ---- tt.call inline-expansion plumbing ------------------------------
@@ -1833,6 +1883,17 @@ def map_tt_program_id(op: Any, ctx: WalkerCtx) -> Any:
     if var is None:
         tir = ctx.tir()
         var = tir.Var(ctx.fresh(f"pid{axis}"), "int32")
+        # Record so ``_make_prim_func`` can wrap the body in a
+        # ``tir.AttrStmt(IterVar, "thread_extent", extent, body)`` -- without
+        # this binding MakePackedAPI flags the Var as a free variable that
+        # was neither a function parameter nor a thread-environment-bound
+        # iter Var. Extent comes from a kernel-launch grid hint when one is
+        # threaded through ``ctx`` (future work); for now we record a
+        # symbolic ``tir.Var`` named ``gridDim_<axis>`` that the host
+        # launcher fills in. Using a Var (rather than a numeric IntImm)
+        # keeps the IR independent of a hard-coded block count.
+        extent = tir.Var(f"gridDim_{axis}", "int32")
+        ctx.program_id_vars.append((var, axis, extent))
 
     if _results(op):
         ctx.bind(_results(op)[0], var)

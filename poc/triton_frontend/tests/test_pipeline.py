@@ -94,3 +94,81 @@ def test_round_trip_through_cxx_shim_passthrough_on_failure():
     # raises (returns input via the except branch). Both end up with
     # the original string.
     assert out == junk
+
+
+def test_program_id_wrapped_in_thread_extent():
+    """``_make_prim_func`` wraps the body with ``AttrStmt(thread_extent)`` for
+    every program_id Var the walker recorded.
+
+    Regression test for the ``MakePackedAPI`` failure
+    ``variables (pid0_*, ...) are used, but are not passed in as API
+    arguments``: the lowering pipeline rejects free Vars in the body unless
+    they're either function parameters or thread-environment-bound IterVars.
+    Wrapping ``pid`` with ``tir.AttrStmt(IterVar, "thread_extent", extent,
+    body)`` puts it in the latter bucket and lets MakePackedAPI through.
+    """
+    pytest.importorskip("tvm")
+    from tvm import tir
+
+    from poc.triton_frontend import _make_prim_func
+    from poc.triton_frontend.op_mapping import WalkerCtx
+
+    ctx = WalkerCtx()
+    # Synthesize a minimal kernel body: ``pid = ...; tile[pid] = 1.0``.
+    pid = tir.Var("pid0_1", "int32")
+    extent = tir.Var("gridDim_0", "int32")
+    ctx.program_id_vars.append((pid, 0, extent))
+    # A buffer-less Evaluate stmt that *uses* pid keeps the test focused on
+    # the AttrStmt wrap; verifying the inner body just needs to be non-empty.
+    ctx.stmts.append(tir.Evaluate(pid))
+
+    func = _make_prim_func(ctx, name="kernel_with_pid")
+
+    # The outermost stmt must be an AttrStmt with attr_key="thread_extent"
+    # whose IterVar.var is the same Var the body references.
+    assert isinstance(func.body, tir.AttrStmt), (
+        f"expected outer AttrStmt(thread_extent), got {type(func.body).__name__}"
+    )
+    assert func.body.attr_key == "thread_extent", (
+        f"expected attr_key='thread_extent', got {func.body.attr_key!r}"
+    )
+    iter_var = func.body.node
+    assert iter_var.var.same_as(pid), (
+        "AttrStmt IterVar.var must be the program_id Var"
+    )
+    assert "blockIdx" in str(iter_var.thread_tag), (
+        f"expected blockIdx.* thread_tag, got {iter_var.thread_tag!r}"
+    )
+    # The extent Var must also appear in params so MakePackedAPI sees it as
+    # a packed arg rather than a free Var.
+    param_names = {str(getattr(p, "name", p)) for p in func.params}
+    assert "gridDim_0" in param_names, (
+        f"extent Var must be promoted to a PrimFunc param; got {param_names}"
+    )
+
+
+def test_runtime_scalar_arg_added_to_params():
+    """Scalar block args from ``tt.func`` (e.g. ``n_elements``) are appended
+    to ``PrimFunc.params``.
+
+    Regression test for the ``arg3`` half of the MakePackedAPI failure.
+    Triton 3.x already folds ``tl.constexpr`` parameters at the TTIR stage,
+    so anything that survives as a non-pointer ``tt.func`` block arg is a
+    runtime arg and must appear in the packed-API signature.
+    """
+    pytest.importorskip("tvm")
+    from tvm import tir
+
+    from poc.triton_frontend import _make_prim_func
+    from poc.triton_frontend.op_mapping import WalkerCtx
+
+    ctx = WalkerCtx()
+    n_elements = tir.Var("n_elements", "int32")
+    ctx.runtime_args.append(n_elements)
+    ctx.stmts.append(tir.Evaluate(n_elements))
+
+    func = _make_prim_func(ctx, name="kernel_with_runtime_scalar")
+    param_names = {str(getattr(p, "name", p)) for p in func.params}
+    assert "n_elements" in param_names, (
+        f"runtime scalar arg must be a PrimFunc param; got {param_names}"
+    )

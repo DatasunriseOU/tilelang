@@ -163,7 +163,7 @@ _KEYWORD_TO_KIND: Tuple[Tuple[str, str], ...] = (
 )
 
 
-def _detect_via_mlir(op: Any) -> Optional[str]:
+def _detect_via_mlir(op: Any, ctx: Any = None) -> Optional[str]:
     """Walk an MLIR region tree and return the combiner kind, or None.
 
     Uses ``mlir.ir`` Python bindings when available. We only consider the
@@ -172,6 +172,13 @@ def _detect_via_mlir(op: Any) -> Optional[str]:
     ``tt.reduce.return``, so this is enough for every pattern produced
     upstream. Mixed-combiner regions (theoretically allowed by the
     dialect) raise via the caller.
+
+    H1 fix: Triton 3.6 wraps the combiner body in a helper ``tt.func``
+    invoked via ``tt.call`` (e.g. ``_sum_combine__fp32_fp32`` containing
+    a single ``arith.addf``). When we encounter a ``tt.call`` here, we
+    look up the callee's body via ``ctx`` (the WalkerCtx that already
+    has every helper ``tt.func`` registered) and treat the call as if
+    its single-arith-op body had been inlined.
     """
     try:
         import mlir.ir  # type: ignore  # noqa: F401
@@ -184,6 +191,15 @@ def _detect_via_mlir(op: Any) -> Optional[str]:
                 name = str(getattr(inner, "name", "")).lower()
                 if not name or "return" in name:
                     continue
+                # tt.call: inline-detect via the callee's body.
+                if name == "tt.call":
+                    callee_kind = _detect_via_callee(inner, ctx)
+                    if callee_kind is not None:
+                        return callee_kind
+                    # Couldn't resolve the callee or its body wasn't a
+                    # single supported arith op -- bail out so the caller
+                    # raises a precise EmitError.
+                    return "__unsupported__:tt.call"
                 for keyword, kind in _KEYWORD_TO_KIND:
                     if keyword in name:
                         return kind
@@ -191,6 +207,46 @@ def _detect_via_mlir(op: Any) -> Optional[str]:
                 # can raise a precise EmitError.
                 return f"__unsupported__:{name}"
     return None
+
+
+def _detect_via_callee(call_op: Any, ctx: Any) -> Optional[str]:
+    """Resolve a ``tt.call`` inside a combiner region to its underlying kind.
+
+    Looks up the callee ``tt.func`` registered on ``ctx.callees`` (the
+    module pre-pass populates this) and inspects its entry-block body.
+    Recognised when the body is a single ``arith.*`` op + ``tt.return``.
+    Returns ``None`` (or an ``__unsupported__:...`` sentinel) when the
+    callee is missing or its body isn't a single supported op.
+    """
+    if ctx is None:
+        return None
+    # Lazy import: control.py owns the parsers and module loading.
+    try:
+        from .control import _parse_callee_attr, _func_entry_block_ops
+    except ImportError:
+        return None
+    sym = _parse_callee_attr(call_op)
+    if not sym:
+        return None
+    callee = ctx.lookup_callee(sym) if hasattr(ctx, "lookup_callee") else None
+    if callee is None:
+        return None
+    body_ops = _func_entry_block_ops(callee)
+    non_return: List[Any] = []
+    for b in body_ops:
+        b_name = b.get("name") if isinstance(b, dict) else getattr(b, "name", "")
+        b_name = str(b_name).lower()
+        if "return" in b_name:
+            continue
+        non_return.append((b_name, b))
+    if len(non_return) != 1:
+        # Multi-op callee body: surface as unsupported (caller raises).
+        return f"__unsupported__:tt.call->{sym}(body has {len(non_return)} ops)"
+    inner_name, _ = non_return[0]
+    for keyword, kind in _KEYWORD_TO_KIND:
+        if keyword in inner_name:
+            return kind
+    return f"__unsupported__:tt.call->{sym}({inner_name})"
 
 
 def _detect_via_dict(op: Any) -> Optional[str]:
@@ -225,14 +281,21 @@ def _detect_via_dict(op: Any) -> Optional[str]:
     return None
 
 
-def detect_combiner_kind(op: Any) -> str:
+def detect_combiner_kind(op: Any, ctx: Any = None) -> str:
     """Public entry: return one of ``'add' / 'mul' / 'max' / 'min'``.
 
     Raises :class:`EmitError` when the combiner cannot be determined or
     contains an unsupported op (for example ``arith.divf`` -- division
     isn't a meaningful associative reducer for tensor reductions).
+
+    ``ctx`` (optional): a ``WalkerCtx`` whose ``callees`` table lets us
+    resolve ``tt.call`` ops inside the combiner region to a registered
+    helper ``tt.func`` body. Triton 3.6 wraps reduce combiners in such
+    helpers (e.g. ``_sum_combine__fp32_fp32`` -> ``arith.addf``); when
+    ``ctx`` is provided we inline-detect through the call. Without
+    ``ctx`` a ``tt.call`` combiner is rejected as unsupported.
     """
-    candidate = _detect_via_mlir(op)
+    candidate = _detect_via_mlir(op, ctx)
     if candidate is None:
         candidate = _detect_via_dict(op)
     if candidate is None:
@@ -246,7 +309,9 @@ def detect_combiner_kind(op: Any) -> str:
         raise EmitError(
             f"tt.reduce combiner contains unsupported op {bad!r}; "
             f"supported: addf, addi, maximumf, maxnumf, maxsi, "
-            f"minimumf, minnumf, minsi, mulf, muli."
+            f"minimumf, minnumf, minsi, mulf, muli. "
+            f"Note: tt.call combiners are supported only when the callee "
+            f"body is a single arith.* op + tt.return."
         )
     if candidate not in _COMBINER_TABLE:  # pragma: no cover - guarded above
         raise EmitError(f"tt.reduce: unrecognised combiner kind {candidate!r}")
@@ -315,7 +380,7 @@ def map_tt_reduce(op: Any, ctx: EmitContext) -> Any:
     result_value = _results(op)[0] if _results(op) else None
     out_dtype = _dtype_of(result_value) if result_value is not None else _dtype_of(src_ssa)
 
-    kind = detect_combiner_kind(op)
+    kind = detect_combiner_kind(op, ctx)
     binop_name, identity_fn = _COMBINER_TABLE[kind]
     BinOp = getattr(tir, binop_name)
     identity = identity_fn(tir, out_dtype)
@@ -447,7 +512,7 @@ def map_tt_scan(op: Any, ctx: EmitContext) -> Any:
 
     result_value = _results(op)[0] if _results(op) else None
     out_dtype = _dtype_of(result_value) if result_value is not None else _dtype_of(src_ssa)
-    kind = detect_combiner_kind(op)
+    kind = detect_combiner_kind(op, ctx)
     binop_name, identity_fn = _COMBINER_TABLE[kind]
     BinOp = getattr(tir, binop_name)
     identity = identity_fn(tir, out_dtype)
@@ -576,7 +641,17 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
             c = T.alloc_fragment([M, N], acc_dtype)  # type: ignore[union-attr]
 
         handle = gemm(a, b, c, transpose_A=transpose_A, transpose_B=transpose_B)
-        ctx.emit(handle)
+        # ``tilelang.language.gemm`` returns a ``tir.Call`` (a PrimExpr).
+        # ``ctx.stmts`` is consumed by ``tir.SeqStmt(stmts: Array<Stmt>)`` in
+        # the walker -- a PrimExpr inserted directly there triggers
+        # ``TypeError: Mismatched type ... Expected Array<tirx.Stmt> but got
+        # Array[index N: tirx.Call]``. Wrap in ``tir.Evaluate`` so the call
+        # becomes a side-effect-only Stmt.
+        tir_mod = ctx.tir()
+        if isinstance(handle, tir_mod.PrimExpr):
+            ctx.emit(tir_mod.Evaluate(handle))
+        else:
+            ctx.emit(handle)
         if result_value is not None:
             ctx.bind(result_value, c)
         return handle
@@ -731,7 +806,16 @@ def _emit_atomic(
     if return_prev:
         ctx.bind(_results(op)[0], intrinsic_call)
     else:
-        ctx.emit(intrinsic_call)
+        # ``intrinsic_call`` is a ``tir.Call`` (PrimExpr) when produced by
+        # either the TileLang surface (``T.atomic_*``) or our own
+        # ``tir.call_intrin`` path. ``ctx.stmts`` becomes a
+        # ``tir.SeqStmt(Array<Stmt>)`` in the walker, so a PrimExpr there
+        # blows up with "Expected Array<tirx.Stmt> but got
+        # Array[index N: tirx.Call]". Wrap in ``tir.Evaluate``.
+        if isinstance(intrinsic_call, tir.PrimExpr):
+            ctx.emit(tir.Evaluate(intrinsic_call))
+        else:
+            ctx.emit(intrinsic_call)
     return intrinsic_call
 
 

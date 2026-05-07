@@ -339,6 +339,16 @@ def _make_prim_func(ctx: WalkerCtx, name: str = "main") -> Any:
         params.append(var)
         buffer_map[var] = buf
 
+    # Runtime scalar args (e.g. ``n_elements``) are tracked by ``map_tt_func``
+    # as the body Vars are created -- adding them to ``params`` here is what
+    # turns a free Var into a packed-API argument. Triton folds constexprs
+    # at the TTIR stage so anything left in ``runtime_args`` is genuinely
+    # passed in at launch time. We extend ``params`` with the SAME Var that
+    # the body references (no fresh Var) so ``MakePackedAPI`` matches them.
+    for var in getattr(ctx, "runtime_args", []) or []:
+        if var not in params:
+            params.append(var)
+
     if not ctx.stmts:
         body = tir.Evaluate(tir.const(0, "int32"))
     elif len(ctx.stmts) == 1:
@@ -362,6 +372,31 @@ def _make_prim_func(ctx: WalkerCtx, name: str = "main") -> Any:
             alloc_stmts = [AllocBuffer(buf) for buf in local_buffers]
             wrapped = tir.SeqStmt(alloc_stmts + [body])
         body = wrapped
+
+    # Wrap body with one ``tir.AttrStmt(IterVar, "thread_extent", extent, body)``
+    # per program_id var. ``MakePackedAPI``'s free-Var check accepts a Var as
+    # bound when it appears as the ``var`` field of an IterVar attached via a
+    # thread-environment AttrStmt (see ``tir/ir/stmt.h`` IterVar; the
+    # canonical ``thread_extent`` attribute is what marks a CUDA/Metal
+    # blockIdx/threadIdx binding). The extent ``Var`` becomes a free Var in
+    # turn, so we add it to ``params`` as an int32 packed-API argument that
+    # the host launcher fills in with the launch grid size for that axis.
+    program_id_vars = list(getattr(ctx, "program_id_vars", []) or [])
+    if program_id_vars:
+        # ``tt.get_program_id(axis=N)`` -> ``blockIdx.{x,y,z}``.
+        thread_tags = ("blockIdx.x", "blockIdx.y", "blockIdx.z")
+        # Outermost AttrStmt corresponds to the innermost wrap call, so build
+        # bottom-up (axis 0 ends up outermost when emitters request it first).
+        for var, axis, extent in program_id_vars:
+            tag = thread_tags[axis] if 0 <= axis < len(thread_tags) else f"blockIdx.{axis}"
+            iter_var = tir.IterVar(
+                (0, extent), var, tir.IterVar.ThreadIndex, tag,
+            )
+            body = tir.AttrStmt(iter_var, "thread_extent", extent, body)
+            # The extent Var (e.g. ``gridDim_0``) is itself a free Var unless
+            # it's a packed-API param, so promote it.
+            if hasattr(extent, "name") and extent not in params:
+                params.append(extent)
 
     func = tir.PrimFunc(params=params, body=body, buffer_map=buffer_map)
     func = func.with_attr("tir.noalias", True)
