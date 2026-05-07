@@ -194,6 +194,94 @@ def test_wrap_module_for_walker_passthrough_for_non_jaxlib():
     assert wrap_module_for_walker(fm) is fm
 
 
+def test_walker_skips_regions_of_self_handling_ops():
+    """The walker MUST NOT descend into regions of ops that walk their
+    own regions (``tt.reduce`` / ``tt.scan`` / ``scf.for`` / ``scf.if``
+    / ``scf.while``). If it did, inner combiner / loop-body ops would be
+    dispatched out of program order -- their operands are block
+    arguments of the inner block, never bound by the parent emitter --
+    and ``WalkerCtx.get`` would raise ``KeyError: SSA value not yet
+    mapped`` on the next downstream op.
+
+    Regression for the softmax / layer_norm e2e failures where
+    ``tt.reduce``'s combiner region contained ``arith.maximumf`` whose
+    operands were the combiner block arguments. The previous walker
+    descended into the combiner, dispatched ``arith.maximumf``, and
+    immediately tried to look up the unbound block-arg SSA values.
+    """
+    from poc.triton_frontend.mlir_walker import (  # noqa: WPS433
+        OPS_THAT_HANDLE_OWN_REGIONS,
+        walk_module,
+    )
+
+    # ``tt.reduce`` / ``tt.scan`` and the scf.* trio must all be in the
+    # allowlist; this is the contract the test pins.
+    for op_name in ("tt.reduce", "tt.scan", "scf.for", "scf.if", "scf.while"):
+        assert op_name in OPS_THAT_HANDLE_OWN_REGIONS, (
+            f"{op_name} must be in OPS_THAT_HANDLE_OWN_REGIONS so the "
+            f"walker doesn't dispatch its inner region ops out of order."
+        )
+
+    # Build a fake op tree with a tt.reduce that has an inner arith.addf.
+    # The walker should visit tt.reduce but NOT recurse into its region.
+    class _FakeBlockArg:
+        pass
+
+    class _FakeOp:
+        def __init__(self, name, regions=()):
+            self.name = name
+            self.regions = regions
+
+    class _FakeBlock:
+        def __init__(self, ops):
+            self.operations = ops
+            self.arguments = ()
+
+    class _FakeRegion:
+        def __init__(self, blocks):
+            self.blocks = blocks
+
+    # tt.reduce { arith.addf }
+    inner_addf = _FakeOp("arith.addf")
+    reduce_region = _FakeRegion([_FakeBlock([inner_addf])])
+    reduce_op = _FakeOp("tt.reduce", regions=[reduce_region])
+
+    # scf.for { tt.load }
+    inner_load = _FakeOp("tt.load")
+    for_region = _FakeRegion([_FakeBlock([inner_load])])
+    for_op = _FakeOp("scf.for", regions=[for_region])
+
+    # tt.func body: tt.reduce, scf.for, plus a sibling arith.mulf
+    sibling = _FakeOp("arith.mulf")
+    func_region = _FakeRegion([_FakeBlock([reduce_op, for_op, sibling])])
+    func_op = _FakeOp("tt.func", regions=[func_region])
+
+    class _FakeModule:
+        body = None
+        operation = func_op
+
+    seen: list[str] = []
+
+    class Recorder:
+        def visit_op(self, op):  # noqa: D401
+            seen.append(op.name)
+
+    walk_module(_FakeModule(), Recorder())
+
+    # Parent ops must be visited.
+    assert "tt.reduce" in seen, seen
+    assert "scf.for" in seen, seen
+    # Sibling at func body level must be visited.
+    assert "arith.mulf" in seen, seen
+    # CRITICAL: inner ops of self-handling regions must NOT be visited.
+    assert "arith.addf" not in seen, (
+        f"walker descended into tt.reduce's combiner region: {seen}"
+    )
+    assert "tt.load" not in seen, (
+        f"walker descended into scf.for's body region: {seen}"
+    )
+
+
 def test_wrap_module_for_walker_adapts_jaxlib_shape():
     """When ``module.body`` is a Block (no ``regions``), the wrapper
     produces an adapter that forwards ``operation`` and hides ``body``.

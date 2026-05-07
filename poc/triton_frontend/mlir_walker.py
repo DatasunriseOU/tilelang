@@ -46,6 +46,7 @@ from .op_mapping import OP_TABLE, WalkerCtx
 __all__ = [
     "DEGRADED_WARNING_MESSAGE",
     "MLIR_WALKER_AVAILABLE",
+    "OPS_THAT_HANDLE_OWN_REGIONS",
     "OpVisitor",
     "TTIRWalker",
     "parse_ttir",
@@ -53,6 +54,37 @@ __all__ = [
     "walk_module",
     "wrap_module_for_walker",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Region-ownership allowlist
+# ---------------------------------------------------------------------------
+#
+# Some ops carry MLIR regions whose ops MUST NOT be visited by the global
+# walker -- their parent emitter walks the region itself and is responsible
+# for emitting/binding the inner ops in the right order. If the global
+# walker descended into these regions it would dispatch the inner ops
+# (e.g. ``arith.maximumf`` inside ``tt.reduce``'s combiner) before their
+# operands -- which are block arguments of the combiner block, never
+# bound by the parent emitter -- triggering ``WalkerCtx.get`` to raise
+# ``KeyError: SSA value not yet mapped``.
+#
+# The fix: skip region descent for the ops below; their emitters are
+# responsible for any region traversal they need.
+#
+# * ``scf.for`` / ``scf.if`` / ``scf.while`` -- ``op_emitters/control.py``
+#   uses ``_emit_region`` to walk the body itself so iter_args/yield are
+#   bound at the right point.
+# * ``tt.reduce`` / ``tt.scan`` -- ``op_emitters/reduction.py`` walks
+#   the combiner region itself (via ``detect_combiner_kind``) and never
+#   wants the global walker dispatching combiner ops.
+OPS_THAT_HANDLE_OWN_REGIONS = frozenset({
+    "scf.for",
+    "scf.if",
+    "scf.while",
+    "tt.reduce",
+    "tt.scan",
+})
 
 
 # Public single-source-of-truth for the warning text used by both the
@@ -222,6 +254,16 @@ def walk_module(module: Any, visitor: OpVisitor) -> None:
 
     def _recurse(op: Any) -> None:
         visitor.visit_op(op)
+        # Ops whose emitters walk their own regions (e.g. ``tt.reduce``
+        # consumes the combiner region itself, ``scf.for`` walks the loop
+        # body via ``_emit_region``). Descending here would dispatch the
+        # inner ops before their parent's emitter has bound the region's
+        # block arguments, which surfaces as ``WalkerCtx.get`` raising
+        # ``KeyError: SSA value not yet mapped`` on the next downstream
+        # op. Skip region descent for these ops; their emitters are
+        # responsible for any traversal they need.
+        if _op_name(op) in OPS_THAT_HANDLE_OWN_REGIONS:
+            return
         for region in getattr(op, "regions", ()) or ():
             for block in getattr(region, "blocks", ()) or ():
                 for child in getattr(block, "operations", ()) or ():

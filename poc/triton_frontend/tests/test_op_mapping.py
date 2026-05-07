@@ -35,6 +35,8 @@ from poc.triton_frontend.op_mapping import (  # noqa: E402
     WalkerCtx,
     _atomic_rmw_kind,
     _attrs_with_properties_shared,
+    _is_ptr_type,
+    _normalize_mlir_dtype,
     map_tt_make_range,
     map_tt_trans,
 )
@@ -237,3 +239,44 @@ def test_tt_mbarrier_count_from_properties_block() -> None:
     )
     wait_attrs = _attrs_with_properties_shared(op_wait)
     assert wait_attrs.get("parity") == 1
+
+
+# ---------------------------------------------------------------------------
+# Wave C2 follow-up: _normalize_mlir_dtype must unwrap ``!tt.ptr<T>`` so
+# matmul-style kernels (whose tt.func block args are pointer-typed) lower
+# without raising. Sibling helper _is_ptr_type lets callers distinguish
+# pointer-vs-scalar without re-doing the regex.
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_mlir_dtype_unwraps_ptr() -> None:
+    """``!tt.ptr<f32>`` collapses to the storage dtype ``float32``.
+
+    This was the matmul lowering blocker: the helper raised
+    ``unsupported MLIR dtype: '!tt.ptr<f32>'`` because the alias map only
+    knew the bare element spellings. Unwrapping is correct because every
+    caller wants the storage dtype (BufferLoad / decl_buffer).
+    """
+    assert _normalize_mlir_dtype("!tt.ptr<f32>") == "float32"
+    assert _normalize_mlir_dtype("!tt.ptr<i32>") == "int32"
+    assert _normalize_mlir_dtype("!tt.ptr<bf16>") == "bfloat16"
+
+
+def test_normalize_mlir_dtype_nested_ptr() -> None:
+    """Nested pointers (``!tt.ptr<!tt.ptr<f32>>``) recurse to the leaf."""
+    assert _normalize_mlir_dtype("!tt.ptr<!tt.ptr<f32>>") == "float32"
+
+
+def test_is_ptr_type_detects_ptr() -> None:
+    """``!tt.ptr<T>`` is a pointer; bare scalar dtypes are not."""
+    assert _is_ptr_type("!tt.ptr<f32>") is True
+    assert _is_ptr_type("!tt.ptr<!tt.ptr<f32>>") is True
+    assert _is_ptr_type("f32") is False
+    assert _is_ptr_type("int32") is False
+    assert _is_ptr_type("") is False
+
+
+def test_normalize_mlir_dtype_still_raises_on_unknown() -> None:
+    """Hard constraint: unknown dtypes raise -- no silent float32 default."""
+    with pytest.raises(ValueError, match="unsupported MLIR dtype"):
+        _normalize_mlir_dtype("totally_made_up")

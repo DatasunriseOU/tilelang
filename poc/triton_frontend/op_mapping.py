@@ -151,9 +151,33 @@ class WalkerCtx:
         """Resolve an MLIR SSA value to its TIR equivalent."""
         if ssa_value in self.value_map:
             return self.value_map[ssa_value]
+        # Best-effort context: identify the producing op and (if the SSA
+        # value is a BlockArgument) the parent op + region index. This
+        # is invaluable when the walker descends into a region it should
+        # not have (ops in OPS_THAT_HANDLE_OWN_REGIONS) -- the trace
+        # points straight at the offending parent.
+        producer = "<unknown>"
+        try:
+            owner = getattr(ssa_value, "owner", None)
+            if owner is not None:
+                # OpResult.owner -> Operation
+                producer = getattr(owner, "name", None) or producer
+                # BlockArgument.owner -> Block; climb to its parent op.
+                if not getattr(owner, "name", None):
+                    parent_op = getattr(owner, "parent_op", None) or getattr(
+                        owner, "owner", None
+                    )
+                    parent_name = getattr(parent_op, "name", None)
+                    if parent_name:
+                        producer = f"<block-arg of {parent_name}>"
+        except Exception:
+            pass
         raise KeyError(
-            f"WalkerCtx: SSA value {ssa_value!r} not yet mapped; emitter "
-            f"called out of TTIR program order?"
+            f"WalkerCtx: SSA value {ssa_value!r} not yet mapped "
+            f"(producer={producer}); emitter called out of TTIR program "
+            f"order? If this SSA originates inside a region (e.g. a "
+            f"tt.reduce combiner or scf.for body), the parent op should "
+            f"be in mlir_walker.OPS_THAT_HANDLE_OWN_REGIONS."
         )
 
     def bind(self, ssa_value: Any, tir_value: Any) -> None:
@@ -377,8 +401,27 @@ _MLIR_DTYPE_ALIASES: Dict[str, str] = {
 }
 
 
+# Pointer-typed values print as ``!tt.ptr<T>`` (or, occasionally,
+# ``tt.ptr<T>`` without the leading bang in some legacy spellings).
+# ``_normalize_mlir_dtype`` unwraps the inner element type because every
+# caller of this helper wants the *storage* dtype: ``emit_tt_load`` pulls
+# values out of a buffer (so the element dtype is what ``BufferLoad``
+# needs), and ``emit_tt_func`` (Wave C1) calls ``decl_buffer`` with the
+# unwrapped element dtype. Callers that need to *distinguish* a pointer
+# from a scalar should use :func:`_is_ptr_type` instead. Nested pointers
+# (``!tt.ptr<!tt.ptr<f32>>``) -- vanishingly rare in Triton kernels but
+# technically representable -- are handled by the recursion.
+_PTR_RE = re.compile(r"^!?tt\.ptr<(.+)>$")
+
+
 def _normalize_mlir_dtype(dtype: str) -> str:
     """Canonicalise an MLIR-printed dtype string to TVM's spelling.
+
+    Pointer types (``!tt.ptr<T>``) are recursively unwrapped to their
+    element dtype since every caller of this helper operates on the
+    storage dtype, not the pointer itself. See module-level note on
+    ``_PTR_RE`` for the rationale; use :func:`_is_ptr_type` if a caller
+    actually needs to know whether the original spelling was a pointer.
 
     Raises ``ValueError`` when the input is genuinely unknown so that a
     coverage gap surfaces immediately rather than silently lowering as
@@ -390,6 +433,12 @@ def _normalize_mlir_dtype(dtype: str) -> str:
         # a resolvable element dtype keep working; downstream emitters
         # that need a real dtype will already have replaced it.
         return "handle"
+    m = _PTR_RE.match(s)
+    if m is not None:
+        # Recurse on the inner type; nested ``!tt.ptr<!tt.ptr<f32>>``
+        # collapses to ``float32`` because the storage dtype is what the
+        # caller ultimately operates on.
+        return _normalize_mlir_dtype(m.group(1))
     if s in _MLIR_DTYPE_ALIASES:
         return _MLIR_DTYPE_ALIASES[s]
     # Already-canonical TVM spellings pass through (the alias map already
@@ -398,6 +447,17 @@ def _normalize_mlir_dtype(dtype: str) -> str:
     if s.startswith(("float", "int", "uint")) or s == "bool":
         return s
     raise ValueError(f"unsupported MLIR dtype: {dtype!r}")
+
+
+def _is_ptr_type(dtype: str) -> bool:
+    """Return True iff ``dtype`` is an MLIR pointer spelling.
+
+    Sibling to :func:`_normalize_mlir_dtype` for callers that need to
+    branch on pointer-vs-scalar (e.g. an emitter that decides between
+    ``decl_buffer`` and ``Var``). Accepts both ``!tt.ptr<T>`` and the
+    bang-less ``tt.ptr<T>`` variant.
+    """
+    return _PTR_RE.match((dtype or "").strip()) is not None
 
 
 # ---------------------------------------------------------------------------

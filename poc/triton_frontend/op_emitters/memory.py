@@ -146,6 +146,76 @@ def _resolved_or_none(ctx: WalkerCtx, ssa_value: Any) -> Any:
         return None
 
 
+def _resolve_lane_operand(
+    ctx: WalkerCtx,
+    value: Any,
+    loop_vars: Sequence[Any],
+    *,
+    role: str,
+) -> Any:
+    """Coerce an ``IfThenElse`` mask/other operand to a scalar PrimExpr lane.
+
+    After Wave E2 lowered ``arith.constant dense<0.0>`` (and the broadcasted
+    boolean mask comparator) into a ``tir.decl_buffer`` with a per-lane store
+    nest, both the ``mask`` and the ``other`` operands of ``tt.load`` /
+    ``tt.store`` may resolve to a ``tir.Buffer`` rather than a scalar
+    PrimExpr. ``tir.IfThenElse``/``tir.if_then_else`` reject Buffer args
+    outright (``Mismatched type on argument #N: Expected ir.PrimExpr but got
+    tirx.Buffer``), so we materialise a per-lane ``BufferLoad`` indexed by
+    the surrounding loop vars instead.
+
+    Parameters
+    ----------
+    ctx
+        Walker context (provides ``tir`` / ``tvm`` modules).
+    value
+        Resolved operand: scalar ``PrimExpr`` (passes through), ``tir.Buffer``
+        (rewritten to ``BufferLoad(buf, loop_vars)``), or ``None`` (returned
+        unchanged for the no-operand sentinel).
+    loop_vars
+        The enclosing per-lane ``tir.Var`` indices. Must have length matching
+        the buffer rank when ``value`` is a Buffer; we trim/pad with the
+        trailing axes to match the buffer's rank, mirroring the broadcast
+        convention used by ``_emit_tile_binop``.
+    role
+        ``"mask"`` or ``"other"`` -- only used to give a precise EmitError
+        message when the operand has an unexpected type.
+
+    Raises
+    ------
+    EmitError
+        If ``value`` is neither a Buffer nor a PrimExpr (and not None).
+    """
+    if value is None:
+        return None
+    tvm_mod = ctx.tvm()
+    tir = ctx.tir()
+    if isinstance(value, tvm_mod.tir.Buffer):
+        rank = len(value.shape)
+        if rank == 0:
+            return tir.BufferLoad(value, [tir.const(0, "int32")])
+        # Match the trailing ``rank`` axes of ``loop_vars`` so a rank-1
+        # mask/other indexed by the innermost lane works as expected; if
+        # the caller has fewer loop vars than the buffer rank we zero-pad
+        # the leading axes (the conservative scalar-broadcast read).
+        lv = list(loop_vars)
+        if len(lv) >= rank:
+            indices = lv[-rank:]
+        else:
+            indices = [tir.const(0, "int32")] * (rank - len(lv)) + lv
+        return tir.BufferLoad(value, indices)
+    # Scalar PrimExpr passes through. We accept anything that quacks like a
+    # PrimExpr (has a ``dtype`` attr) -- the actual type-check happens inside
+    # ``tir.IfThenElse`` / ``tir.if_then_else`` for free.
+    if hasattr(value, "dtype") or isinstance(value, (int, float, bool)):
+        return value
+    from ..op_mapping import EmitError  # local import: avoid circular at import time
+    raise EmitError(
+        f"unsupported tt.load/tt.store {role!r} operand type: "
+        f"{type(value).__name__}; expected tir.PrimExpr or tir.Buffer"
+    )
+
+
 def _ssa_name(value: Any) -> Optional[str]:
     """Best-effort printed SSA name for a TTIR value (e.g. ``"%2"``).
 
@@ -284,7 +354,13 @@ def _emit_degraded_tile_load(
                     other_expr = tir.const(0, out_dtype)
             else:
                 other_expr = tir.const(0, out_dtype)
-            load_expr = tir.if_then_else(mask_expr, load_expr, other_expr)
+            # Per-lane materialisation: when the mask/other resolve to a
+            # ``tir.Buffer`` (post Wave E2 broadcast lowering) we must pull
+            # one scalar lane out via ``BufferLoad(..., loop_vars)`` because
+            # ``tir.if_then_else`` only accepts scalar PrimExpr operands.
+            mask_lane = _resolve_lane_operand(ctx, mask_expr, loop_vars, role="mask")
+            other_lane = _resolve_lane_operand(ctx, other_expr, loop_vars, role="other")
+            load_expr = tir.if_then_else(mask_lane, load_expr, other_lane)
 
     body = tir.BufferStore(tile_buf, load_expr, list(loop_vars) or [tir.const(0, "int32")])
     # Wrap loops innermost-out.
@@ -328,7 +404,11 @@ def _emit_degraded_tile_store(
         if mask_ssa is not None:
             try:
                 mask_expr = ctx.get(mask_ssa)
-                store = tir.IfThenElse(mask_expr, store, None)
+                # Scalar store with no enclosing loop -> pass an empty
+                # loop-var list; ``_resolve_lane_operand`` will index a
+                # rank-0 mask buffer as ``BufferLoad(buf, [0])``.
+                mask_lane = _resolve_lane_operand(ctx, mask_expr, [], role="mask")
+                store = tir.IfThenElse(mask_lane, store, None)
             except KeyError:
                 pass
         ctx.emit(store)
@@ -356,7 +436,11 @@ def _emit_degraded_tile_store(
     if mask_ssa is not None:
         try:
             mask_expr = ctx.get(mask_ssa)
-            store = tir.IfThenElse(mask_expr, store, None)
+            # Per-lane: if the mask is a Buffer, ``BufferLoad`` it at the
+            # current loop-var index instead of feeding the bare Buffer
+            # into IfThenElse arg #0 (which TVM rejects).
+            mask_lane = _resolve_lane_operand(ctx, mask_expr, loop_vars, role="mask")
+            store = tir.IfThenElse(mask_lane, store, None)
         except KeyError:
             pass
     body: Any = store
@@ -434,7 +518,9 @@ def _emit_tile_copy_tir(
                     other_expr = tir.const(0, out_dtype)
             else:
                 other_expr = tir.const(0, out_dtype)
-            load_expr = tir.if_then_else(mask_expr, load_expr, other_expr)
+            mask_lane = _resolve_lane_operand(ctx, mask_expr, loop_vars, role="mask")
+            other_lane = _resolve_lane_operand(ctx, other_expr, loop_vars, role="other")
+            load_expr = tir.if_then_else(mask_lane, load_expr, other_lane)
 
     body = tir.BufferStore(tile_buf, load_expr, list(loop_vars) or [tir.const(0, "int32")])
     for axis in range(len(loop_vars) - 1, -1, -1):
@@ -627,7 +713,12 @@ def emit_tt_load(op: Any, ctx: WalkerCtx) -> Any:
             other_expr = ctx.get(other_ssa)
         else:
             other_expr = tir.const(0, out_dtype)
-        load_expr = tir.if_then_else(mask_expr, load_expr, other_expr)
+        # Scalar load path -- if the mask/other are Buffers (post Wave E2)
+        # we have no enclosing loop var, so ``_resolve_lane_operand`` falls
+        # back to a rank-0 BufferLoad at index 0.
+        mask_lane = _resolve_lane_operand(ctx, mask_expr, [], role="mask")
+        other_lane = _resolve_lane_operand(ctx, other_expr, [], role="other")
+        load_expr = tir.if_then_else(mask_lane, load_expr, other_lane)
 
     if result_value is not None:
         ctx.bind(result_value, load_expr)
@@ -686,11 +777,35 @@ def emit_tt_store(op: Any, ctx: WalkerCtx) -> Any:
             ctx.buffers[buf_name] = tir.decl_buffer(val_shape, dtype, name=buf_name)
         dst_buf = ctx.buffers[buf_name]
         if has_cxx_shim():
+            # Detect Buffer-shaped mask early: the single-statement path
+            # below has no enclosing loop to index a per-lane mask, so we
+            # must fall through to the per-lane ``_emit_degraded_tile_store``
+            # which DOES emit the surrounding tir.For nest. (E2 lowers the
+            # bool tile mask to a tir.decl_buffer, so this is the
+            # vector_add hot path.) The store is still a real tile-shaped
+            # write -- we just lose the T.copy fast path until the shim
+            # learns to consume Buffer masks directly.
+            mask_is_buffer = False
+            if mask_ssa is not None:
+                try:
+                    mask_probe = ctx.get(mask_ssa)
+                    mask_is_buffer = isinstance(
+                        mask_probe, ctx.tvm().tir.Buffer
+                    )
+                except KeyError:
+                    pass
+            if mask_is_buffer:
+                return _emit_degraded_tile_store(
+                    op, ctx, dst_buf, [0], val_expr, val_shape, mask_ssa,
+                )
             store_stmt = tir.BufferStore(dst_buf, val_expr, [tir.const(0, "int32")])
             if mask_ssa is not None:
                 try:
                     mask_expr = ctx.get(mask_ssa)
-                    store_stmt = tir.IfThenElse(mask_expr, store_stmt, None)
+                    mask_lane = _resolve_lane_operand(
+                        ctx, mask_expr, [], role="mask"
+                    )
+                    store_stmt = tir.IfThenElse(mask_lane, store_stmt, None)
                 except KeyError:
                     pass
             ctx.emit(store_stmt)
@@ -718,7 +833,10 @@ def emit_tt_store(op: Any, ctx: WalkerCtx) -> Any:
     store_stmt: Any = tir.BufferStore(buf, val_expr, list(indices))
     if mask_ssa is not None:
         mask_expr = ctx.get(mask_ssa)
-        store_stmt = tir.IfThenElse(mask_expr, store_stmt, None)
+        # Scalar store path: lane-resolve so a Buffer mask doesn't crash
+        # IfThenElse arg #0.
+        mask_lane = _resolve_lane_operand(ctx, mask_expr, [], role="mask")
+        store_stmt = tir.IfThenElse(mask_lane, store_stmt, None)
     ctx.emit(store_stmt)
     return store_stmt
 

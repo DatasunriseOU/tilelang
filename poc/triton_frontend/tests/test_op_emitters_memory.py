@@ -679,6 +679,70 @@ def test_broadcast_vector_to_tile_emits_for_nest() -> None:
     assert "for" in text.lower(), f"expected For-nest in stmts; got:\n{text}"
 
 
+def test_tt_load_with_buffer_other_emits_per_lane_buffer_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tile load whose ``other`` resolved to a Buffer (post Wave E2 lowering)
+    must emit ``BufferLoad(other_buf, [lane])`` inside the IfThenElse arg #2,
+    NOT a bare buffer reference (which TVM rejects with
+    ``Mismatched type on argument #N: Expected ir.PrimExpr but got
+    tirx.Buffer``).
+
+    Setup mirrors ``vector_add`` post-E2: the ``other`` operand resolves to
+    a freshly declared buffer (the lowered ``arith.constant dense<0.0>``)
+    and the ``mask`` likewise resolves to a Buffer-shaped boolean tile.
+    """
+    _force_no_shim(monkeypatch)
+    ctx = WalkerCtx()
+
+    src_buf = tvm.tir.decl_buffer([256], "float32", name="A")
+    mask_buf = tvm.tir.decl_buffer([256], "bool", name="M")
+    other_buf = tvm.tir.decl_buffer([256], "float32", name="O")
+
+    ptr_ssa = _ssa("ptr", shape=[256], dtype="float32")
+    mask_ssa = _ssa("mask", shape=[256], dtype="bool")
+    other_ssa = _ssa("other", shape=[256], dtype="float32")
+    out_ssa = _ssa("loaded", shape=[256], dtype="float32")
+
+    ctx.bind(ptr_ssa, src_buf)
+    ctx.bind(mask_ssa, mask_buf)
+    ctx.bind(other_ssa, other_buf)
+
+    op = {
+        "name": "tt.load",
+        "operands": [ptr_ssa, mask_ssa, other_ssa],
+        "results": [out_ssa],
+        "attrs": {},
+    }
+
+    # The crucial assertion is that the call does NOT raise the TVM
+    # ``Mismatched type ... Expected ir.PrimExpr but got tirx.Buffer``
+    # error -- which it would if we fed bare Buffers into ``if_then_else``.
+    result = emit_tt_load(op, ctx)
+    assert isinstance(result, tvm.tir.Buffer), (
+        "tile-shaped tt.load must produce a tir.Buffer; got "
+        f"{type(result).__name__}"
+    )
+
+    text = _stringify(ctx.stmts)
+    # The IfThenElse / if_then_else expression must reference the other
+    # buffer via a per-lane BufferLoad. We assert the buffer name appears
+    # AND the if_then_else marker is present, so a reviewer can see the
+    # buffer is accessed lane-wise rather than passed through bare.
+    assert "if_then_else" in text.lower(), (
+        f"expected if_then_else mask guard in stmts; got:\n{text}"
+    )
+    # The other buffer name appearing in the printed text means it was
+    # consumed as a BufferLoad (a bare Buffer reference would not survive
+    # the IfThenElse type-check, so the absence of an exception above
+    # already proves the per-lane path; the substring assertion locks in
+    # the readable contract.)
+    assert "O[" in text, (
+        f"expected per-lane BufferLoad on the 'other' buffer (e.g. 'O[i0]') "
+        f"in printed stmts; got:\n{text}"
+    )
+
+
 def test_splat_pointer_buffer_passthrough() -> None:
     """``tt.splat`` of a pointer-backed Buffer must propagate the buffer unchanged.
 

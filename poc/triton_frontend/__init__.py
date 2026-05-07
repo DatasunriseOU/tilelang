@@ -215,6 +215,9 @@ def _walk_mlir_module(
             name = op.get("name")
         return str(name) if name else ""
 
+    # Lazy import to avoid a top-of-file cycle with mlir_walker.
+    from .mlir_walker import OPS_THAT_HANDLE_OWN_REGIONS  # noqa: WPS433
+
     def _recurse(op: Any) -> None:
         op_name_str = _op_name(op)
         if op_name_str in OP_TABLE:
@@ -224,6 +227,15 @@ def _walk_mlir_module(
             # Same scaffolding skip as the text walker (tt.func / tt.return
             # are wrappers; recurse into them but emit nothing).
             visited.append(op_name_str)
+        # Skip region descent for ops whose emitters walk their own
+        # regions (``tt.reduce`` / ``tt.scan`` consume the combiner
+        # region; ``scf.for`` / ``scf.if`` / ``scf.while`` use
+        # ``_emit_region``). Descending here would dispatch inner ops
+        # before their parent emitter bound the region's block
+        # arguments, surfacing as ``KeyError: WalkerCtx: SSA value not
+        # yet mapped`` on the next downstream op.
+        if op_name_str in OPS_THAT_HANDLE_OWN_REGIONS:
+            return
         # Recurse into regions/blocks.
         for region in getattr(op, "regions", ()) or ():
             for block in getattr(region, "blocks", ()) or ():
