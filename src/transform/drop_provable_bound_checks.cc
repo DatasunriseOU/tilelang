@@ -161,6 +161,11 @@ class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
     }
 
     // 2) Z3 fallback under BV32-emulated free-var constraints.
+    // CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_DROP_BOUND_CHECKS
+    // bypasses the Z3 fallback, keeping every guard in place (idea #4).
+    if (!::tilelang::tlz3::Z3PassGate::IsEnabled("DROP_BOUND_CHECKS")) {
+      return IRMutatorWithAnalyzer::VisitStmt_(op);
+    }
     bool proved = false;
     try {
       auto &z3 = arith::Z3Prover(analyzer_);

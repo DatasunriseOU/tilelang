@@ -1248,5 +1248,43 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                         []() { ClearProverCache(); });
 }
 
+// ---------------------------------------------------------------------------
+// CPPMEGA z3-final per-pass gate (2026-05-07).
+// See `Z3PassGate` doc in z3_prover.h for the rationale & env-var table.
+// ---------------------------------------------------------------------------
+//
+// Cheap-by-design: the global lookup is amortized via a function-local
+// `static const`; per-pass lookups go through a small thread-local cache
+// keyed on the env-var name string. The cache is bounded by the small set
+// of pass names hard-coded at call sites (~10), so its memory footprint is
+// O(1) per thread for any realistic compile.
+//
+// Truthiness convention matches the existing `TILELANG_DISABLE_Z3` gate at
+// `Z3Prover::CanProve` (above): "set" means env != nullptr AND env[0] != 0
+// AND env[0] != '0'. So `=0`, ``, and unset are all "enabled".
+bool Z3PassGate::IsEnabled(const char* pass_name) {
+  // Fast path: global gate. Same predicate as `Z3Prover::CanProve`'s.
+  static const bool global_disabled = []() {
+    const char* g = std::getenv("TILELANG_DISABLE_Z3");
+    return g != nullptr && g[0] != '\0' && g[0] != '0';
+  }();
+  if (global_disabled) return false;
+
+  // Per-pass gate: cache by full env-var name. `pass_name` is a string
+  // literal at every call site, so the std::string allocation here is
+  // a one-time-per-name cost (then served from the cache).
+  static thread_local std::unordered_map<std::string, bool> cache;
+  std::string key("TILELANG_DISABLE_Z3_");
+  key += pass_name;
+  auto it = cache.find(key);
+  if (it != cache.end()) {
+    return !it->second;
+  }
+  const char* v = std::getenv(key.c_str());
+  bool disabled = v != nullptr && v[0] != '\0' && v[0] != '0';
+  cache.emplace(std::move(key), disabled);
+  return !disabled;
+}
+
 }  // namespace tlz3
 }  // namespace tilelang

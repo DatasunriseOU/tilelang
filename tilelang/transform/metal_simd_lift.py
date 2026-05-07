@@ -100,6 +100,16 @@ def _z3_extent_le_32(extent_expr) -> tuple[bool, str]:
         proved = int(extent_expr.value) <= _SIMD_LANES
         return proved, f"static: extent={int(extent_expr.value)} <= {_SIMD_LANES}? {proved}"
 
+    # CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_SIMDGROUP (or
+    # global TILELANG_DISABLE_Z3) bypasses the symbolic-extent Z3 path
+    # (idea #8/#9). The current implementation already rejects symbolic
+    # extents conservatively, but we surface the gate explicitly so the
+    # log message is consistent with the other Z3-using passes.
+    for _gate_var in ("TILELANG_DISABLE_Z3", "TILELANG_DISABLE_Z3_SIMDGROUP"):
+        _v = os.environ.get(_gate_var, "")
+        if _v and _v != "0":
+            return False, f"z3-disabled-by-{_gate_var}; symbolic extent rejected"
+
     # fix-round-4: previous version constructed `z3.Int("extent")` with only
     # `z_ext > 0` — no link to the actual TIR expression — so the query was
     # vacuous (always SAT under negation, hence always returning False but

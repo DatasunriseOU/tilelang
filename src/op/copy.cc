@@ -570,6 +570,12 @@ static bool Z3ProveStrideAligned16(arith::Analyzer *analyzer,
                                    const PrimExpr &addr_bytes,
                                    const PrimExpr &stride_bytes,
                                    Optional<Target> target = std::nullopt) {
+  // CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_TMA_LEGALITY bypasses
+  // the TMA stride-alignment proof (idea #6). Conservative default — keep
+  // the slow `cp.async` path when the gate is disabled.
+  if (!::tilelang::tlz3::Z3PassGate::IsEnabled("TMA_LEGALITY")) {
+    return false;
+  }
   try {
     auto &z3 = arith::Z3Prover(analyzer);
     z3.SetTimeoutMs(50);

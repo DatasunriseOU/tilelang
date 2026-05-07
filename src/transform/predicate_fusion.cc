@@ -208,6 +208,13 @@ bool Z3ProvesConditionLoadsWellDefined(const PrimExpr &cond,
   if (cl.loads.empty()) {
     return true; // no buffer loads in `b` → trivially safe
   }
+  // CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_PREDICATE_FUSION
+  // bypasses the b-condition load probe (idea #7). Conservative default —
+  // refuse to fuse if Z3 is disabled, since fusion soundness depends on
+  // proving every load in `b` is well-defined when `!a`.
+  if (!::tilelang::tlz3::Z3PassGate::IsEnabled("PREDICATE_FUSION")) {
+    return false;
+  }
   try {
     auto &z3 = arith::Z3Prover(analyzer);
     z3.SetTimeoutMs(50);
@@ -265,6 +272,11 @@ bool Z3ProvesInnerWellDefined(const Stmt &inner_body, arith::Analyzer *analyzer)
   } stores;
   stores(inner_body);
 
+  // CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_PREDICATE_FUSION
+  // bypasses the inner-body well-definedness proof (idea #7).
+  if (!::tilelang::tlz3::Z3PassGate::IsEnabled("PREDICATE_FUSION")) {
+    return false;
+  }
   try {
     auto &z3 = arith::Z3Prover(analyzer);
     z3.SetTimeoutMs(50);

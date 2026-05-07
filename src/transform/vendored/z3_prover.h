@@ -180,6 +180,36 @@ class ScopedBVMode {
 // own context is not thread-safe).
 Z3Prover& GetOrCreate(::tvm::arith::Analyzer* analyzer);
 
+// CPPMEGA z3-final per-pass gate (2026-05-07). Granular complement to the
+// blanket `TILELANG_DISABLE_Z3=1` global gate at `Z3Prover::CanProve`.
+// Each Z3-using pass calls `Z3PassGate::IsEnabled("<NAME>")` before invoking
+// the prover. The gate returns false if EITHER:
+//   * the global env `TILELANG_DISABLE_Z3` is set to a non-empty / non-"0"
+//     value (kill-switch), OR
+//   * the per-pass env `TILELANG_DISABLE_Z3_<NAME>` is set the same way.
+// Default (env unset): returns true → pass uses the prover normally.
+//
+// Pass names defined today (see README for table mapping name → idea):
+//   VECTORIZE          (loop_vectorize.cc, ideas #1/#12)
+//   PREDICATE_FUSION   (predicate_fusion.cc, idea #7)
+//   DROP_BOUND_CHECKS  (drop_provable_bound_checks.cc, idea #4)
+//   TMA_LEGALITY       (op/copy.cc, idea #6)
+//   BARRIER_ELISION    (thread_storage_sync.cc, idea #11)
+//   AUTO_DOUBLE_BUFFER (auto_double_buffer.cc, idea #2; reserved — currently
+//                       no live Z3 call sites in stub mode)
+//   INT24              (analysis/int24_overflow_proof.py, idea #5)
+//   DOT4_LEGALITY      (language/fp8_op.py, idea #10)
+//   SIMDGROUP          (transform/metal_*_to_simdgroup.py / simd_lift.py,
+//                       ideas #8/#9)
+//
+// Lookups are thread-local-cached — first hit reads `getenv`, subsequent
+// hits hit a small unordered_map. This keeps the gate cheap on the hot
+// path (vectorize/drop-bound-checks call `IsEnabled` per probe).
+class Z3PassGate {
+ public:
+  static bool IsEnabled(const char* pass_name);
+};
+
 // CPPMEGA z3-stack fix-A8 (NEW-2): per-pass cache hygiene. Pass drivers
 // MUST call `ClearProverCache()` (or `ResetProverFor(specific_analyzer)`)
 // at pass entry to prevent cross-pass contamination — the per-thread

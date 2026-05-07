@@ -1026,6 +1026,12 @@ static bool Z3CanProveAlignedAccess(const Buffer &buffer,
   if (vector_size <= 1) {
     return false;
   }
+  // CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_VECTORIZE bypasses
+  // the Z3-aided alignment proof for this pass (idea #1/#12). Conservative
+  // default — pass behaves as if proof failed.
+  if (!::tilelang::tlz3::Z3PassGate::IsEnabled("VECTORIZE")) {
+    return false;
+  }
   int dtype_bytes = buffer->dtype.bytes();
   if (dtype_bytes <= 0) {
     return false;
@@ -1437,6 +1443,11 @@ static bool Z3CanProveUnitStride(const PrimExpr &expr, const Var &var,
       return false;
     }
   }
+  // CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_VECTORIZE bypasses
+  // the unit-stride / contiguity proof (idea #1/#12). Conservative default.
+  if (!::tilelang::tlz3::Z3PassGate::IsEnabled("VECTORIZE")) {
+    return false;
+  }
   try {
     auto &z3 = arith::Z3Prover(analyzer);
     z3.SetTimeoutMs(50);
@@ -1645,7 +1656,9 @@ bool IndicesCanVectorize(const PrimExpr &expr, Var var,
     if (is_one(ramp_node->stride)) {
       return true;
     }
-    {
+    // CPPMEGA z3-final per-pass gate: skip both the inline stride==1 probe
+    // and the affine fallback when TILELANG_DISABLE_Z3_VECTORIZE is set.
+    if (::tilelang::tlz3::Z3PassGate::IsEnabled("VECTORIZE")) {
       auto &z3 = arith::Z3Prover(analyzer);
       z3.SetTimeoutMs(50);
       if (z3.CanProve(ramp_node->stride ==

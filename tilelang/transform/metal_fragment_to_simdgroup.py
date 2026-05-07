@@ -170,6 +170,13 @@ def is_simdgroup_eligible(buffer_like, *, use_z3: bool = True
         return True, "static"
     if not use_z3:
         return False, "static-fail; z3-disabled"
+    # CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_SIMDGROUP (or
+    # global TILELANG_DISABLE_Z3) bypasses the simdgroup-eligibility Z3
+    # fallback (idea #8/#9). Conservative default — keep the fragment path.
+    for _gate_var in ("TILELANG_DISABLE_Z3", "TILELANG_DISABLE_Z3_SIMDGROUP"):
+        _v = os.environ.get(_gate_var, "")
+        if _v and _v != "0":
+            return False, f"static-fail; z3-disabled-by-{_gate_var}"
     proved, query = _z3_simdgroup_eligible(shape, dtype)
     _log_simdgroup_decision(buffer_like, False, proved, query)
     return False, f"static-fail; z3-proved={proved}; {query}"
