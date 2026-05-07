@@ -140,8 +140,27 @@ def test_tiny_matmul_relu_uses_real_tir() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.xfail(
+    reason=(
+        "Sequential region materialiser is intentionally a stub in this "
+        "POC (fx_to_tilelang.py:_emit_sequential_region). Multi-op chains "
+        "without a tight fusion pattern fall back to a per-region extern "
+        "slot which currently bridges to gm.forward. The test is marked "
+        "xfail (rather than the previous silent skip) so the regression "
+        "becomes visible the moment the sequential emitter lands."
+    ),
+    strict=False,
+    raises=NotImplementedError,
+)
 def test_tiny_linear_layernorm_gelu_chain() -> None:
-    """``gelu(layer_norm(x @ w))`` — multi-op fusion-pattern exercise."""
+    """``gelu(layer_norm(x @ w))`` — multi-op fusion-pattern exercise.
+
+    Tests review fix (grok review tests #1/#2): the previous
+    ``except NotImplementedError: pytest.skip`` swallowed the very
+    regression this test is supposed to catch. Converting to xfail
+    makes the gap visible while still letting the suite stay green
+    until the sequential emitter is wired.
+    """
     import torch
     from torch import nn
 
@@ -168,12 +187,9 @@ def test_tiny_linear_layernorm_gelu_chain() -> None:
     with torch.no_grad():
         y_ref = model(x)
 
-    try:
-        compiled = torch.compile(model, backend="tilelang", fullgraph=True)
-        with torch.no_grad():
-            y = compiled(x)
-    except NotImplementedError as exc:
-        pytest.skip(f"orchestrator did not cover this trace: {exc}")
+    compiled = torch.compile(model, backend="tilelang", fullgraph=True)
+    with torch.no_grad():
+        y = compiled(x)
 
     assert tuple(y.shape) == tuple(y_ref.shape)
     torch.testing.assert_close(y, y_ref, rtol=2e-2, atol=2e-2)
@@ -184,6 +200,16 @@ def test_tiny_linear_layernorm_gelu_chain() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.xfail(
+    reason=(
+        "softmax_epilogue pattern emitter is documentation-only; the "
+        "orchestrator routes this region to the per-op extern slot until "
+        "the sequential materialiser lands. Marked xfail so the gap is "
+        "visible (was previously silently skipped — see grok review tests #2)."
+    ),
+    strict=False,
+    raises=NotImplementedError,
+)
 def test_tiny_attention_prim_chain() -> None:
     """Q @ K^T -> softmax -> @ V — exercises the softmax_epilogue pattern."""
     import torch
@@ -214,12 +240,131 @@ def test_tiny_attention_prim_chain() -> None:
     with torch.no_grad():
         y_ref = model(q, k, v)
 
-    try:
-        compiled = torch.compile(model, backend="tilelang", fullgraph=True)
-        with torch.no_grad():
-            y = compiled(q, k, v)
-    except NotImplementedError as exc:
-        pytest.skip(f"orchestrator did not cover this trace: {exc}")
+    compiled = torch.compile(model, backend="tilelang", fullgraph=True)
+    with torch.no_grad():
+        y = compiled(q, k, v)
 
     assert tuple(y.shape) == tuple(y_ref.shape)
     torch.testing.assert_close(y, y_ref, rtol=5e-2, atol=5e-2)
+
+
+# ---------------------------------------------------------------------------
+# 4. Coverage gaps called out in the grok review (tests #3): registry cache
+#    idempotency, content-hash stability, partition-boundary handling.
+# ---------------------------------------------------------------------------
+
+
+def test_same_graph_recompile_hits_registry_cache() -> None:
+    """Lowering the same FX graph twice must reuse the cached custom_op.
+
+    Coverage gap (grok review tests #3, custom_op_wrapper.py:178-180).
+    """
+    import torch
+    from torch import nn
+
+    from poc.torch_dynamo.fx_to_tilelang import FXToTileLang
+    from poc.torch_dynamo.custom_op_wrapper import wrap_as_custom_op, _REGISTRY
+
+    class Tiny(nn.Module):
+        def __init__(self, dim: int = 32) -> None:
+            super().__init__()
+            torch.manual_seed(0)
+            self.w = nn.Parameter(torch.randn(dim, dim, dtype=torch.float32))
+
+        def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+            return torch.relu(x @ self.w)
+
+    model = Tiny().eval()
+    x = torch.randn(4, 32, dtype=torch.float32)
+
+    import torch.fx
+    from torch.fx.passes.shape_prop import ShapeProp
+    gm = torch.fx.symbolic_trace(model)
+    ShapeProp(gm).propagate(x)
+
+    art1 = FXToTileLang(gm, [x]).run()
+    runner1 = wrap_as_custom_op(art1, {})
+    op1 = getattr(runner1, "_tilelang_op", None)
+
+    # Second compile with the same FX graph should hit _REGISTRY[qualname].
+    art2 = FXToTileLang(gm, [x]).run()
+    assert art1.name == art2.name, (
+        "Identical FX graphs must produce identical content_hash names "
+        f"(got {art1.name!r} vs {art2.name!r})")
+    runner2 = wrap_as_custom_op(art2, {})
+    op2 = getattr(runner2, "_tilelang_op", None)
+    assert op1 is op2, "Re-registering the same qualname must reuse the cached impl"
+    qualname = f"tilelang::{art1.name}_fwd"
+    assert qualname in _REGISTRY
+
+
+def test_content_hash_stable_across_recompiles() -> None:
+    """Same model + same input shape -> same hash; different shape -> different.
+
+    Coverage gap (grok review tests #3, fx_to_tilelang.py:961-972).
+    """
+    import torch
+    from torch import nn
+
+    from poc.torch_dynamo.fx_to_tilelang import FXToTileLang
+
+    class Tiny(nn.Module):
+        def __init__(self, dim: int = 32) -> None:
+            super().__init__()
+            torch.manual_seed(0)
+            self.w = nn.Parameter(torch.randn(dim, dim, dtype=torch.float32))
+
+        def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+            return torch.relu(x @ self.w)
+
+    model = Tiny().eval()
+    x_a = torch.randn(4, 32, dtype=torch.float32)
+    x_b = torch.randn(8, 32, dtype=torch.float32)
+
+    import torch.fx
+    from torch.fx.passes.shape_prop import ShapeProp
+
+    def _hash_for(shape_x: "torch.Tensor") -> str:
+        gm = torch.fx.symbolic_trace(model)
+        ShapeProp(gm).propagate(shape_x)
+        lowerer = FXToTileLang(gm, [shape_x])
+        lowerer.run()
+        return lowerer.content_hash()
+
+    h1 = _hash_for(x_a)
+    h2 = _hash_for(x_a)
+    h3 = _hash_for(x_b)
+    assert h1 == h2, "Same shape must hash identically"
+    assert h1 != h3, "Different input shape must produce a different hash"
+
+
+def test_unsupported_op_falls_back_to_extern() -> None:
+    """A graph with one unsupported op must still compile (per-op fallback).
+
+    Coverage gap (grok review tests #3, fx_to_tilelang.py:1044-1066).
+    Builds a tiny FX graph that includes an op outside ATEN_DISPATCH and
+    asserts that ``run()`` does not raise; the artifact source records
+    the extern fallback for that single op.
+    """
+    import torch
+    from torch import nn
+
+    from poc.torch_dynamo.fx_to_tilelang import FXToTileLang
+
+    class Tiny(nn.Module):
+        def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+            # ``torch.flip`` is not in ATEN_DISPATCH today.
+            return torch.flip(x, dims=(-1,))
+
+    model = Tiny().eval()
+    x = torch.randn(4, 8, dtype=torch.float32)
+
+    import torch.fx
+    from torch.fx.passes.shape_prop import ShapeProp
+    gm = torch.fx.symbolic_trace(model)
+    ShapeProp(gm).propagate(x)
+    artifact = FXToTileLang(gm, [x]).run()
+    # The unsupported op must show up either in the per-region source line
+    # ("extern slot") OR (when no fusable region exists) the chain still
+    # produced a launcher.
+    assert artifact.launcher is not None

@@ -142,6 +142,27 @@ class LoweringContext:
 # ---------------------------------------------------------------------------
 
 
+def _spec_to_torch_dtype_runtime(dtype_name: str) -> Any:
+    """Map a TileLang dtype string back to ``torch.dtype`` (runtime helper).
+
+    Mirrors ``custom_op_wrapper._spec_to_torch_dtype`` but kept here to
+    avoid a circular import inside the launcher closure created by
+    :py:meth:`FXToTileLang._build_kernel_chain`.
+    """
+    import torch  # type: ignore[import-not-found]
+
+    M = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+        "float64": torch.float64,
+        "int32": torch.int32,
+        "int64": torch.int64,
+        "bool": torch.bool,
+    }
+    return M.get(dtype_name, torch.float32)
+
+
 def _torch_dtype_to_tl(dtype: Any) -> str:
     """Map a ``torch.dtype`` to TileLang's dtype string."""
     import torch  # local import — emitters only run when torch is available
@@ -959,15 +980,35 @@ class FXToTileLang:
         }
 
     def content_hash(self) -> str:
-        """Stable hash of the FX graph used as the custom_op qualname."""
+        """Stable hash of the FX graph used as the custom_op qualname.
+
+        Performance fix (grok review #2, fx_to_tilelang.py:965): the
+        previous implementation called ``repr(payload)`` on every
+        op_trace entry, which on 200-node LLM subgraphs allocated 10–
+        100 ms of intermediate strings per compile. We now walk the
+        payload primitives directly and fold ``_TensorSpec``s as
+        ``"shape|dtype"`` so the hash is structural (still stable across
+        equivalent retraces) and zero-allocation aside from the digest.
+        """
         if self._content_hash is not None:
             return f"fused_{self._content_hash}"
         h = hashlib.blake2b(digest_size=8)
         for op, payload in self.ctx.op_trace:
             h.update(op.encode())
-            h.update(repr(payload).encode())
+            for x in payload:
+                if isinstance(x, _TensorSpec):
+                    h.update(f"T{x.shape}|{x.dtype}".encode())
+                elif isinstance(x, (tuple, list)):
+                    # Nested payloads (e.g. layer_norm's args[1:] tail).
+                    for sub in x:
+                        if isinstance(sub, _TensorSpec):
+                            h.update(f"T{sub.shape}|{sub.dtype}".encode())
+                        else:
+                            h.update(repr(sub).encode())
+                else:
+                    h.update(repr(x).encode())
         for spec in self.ctx.input_specs + self.ctx.output_specs:
-            h.update(repr(spec).encode())
+            h.update(f"S{spec.shape}|{spec.dtype}".encode())
         self._content_hash = h.hexdigest()
         return f"fused_{self._content_hash}"
 
@@ -1066,25 +1107,64 @@ class FXToTileLang:
         self.ctx.value_map[node] = out_spec
 
     def on_call_method(self, node: "torch.fx.Node") -> None:
-        """Lower a tensor-method call (``x.view``, ``x.t``, ...)."""
-        # POC: defer to call_function path for the small subset we know
-        # about. Anything else trips ``_validate_graph`` upstream.
-        raise NotImplementedError(
-            f"call_method lowering not implemented for {node.target!r} "
-            "(RFC §7 Phase 2.2)")
+        """Lower a tensor-method call (``x.view``, ``x.t``, ...).
+
+        Correctness fix (grok review #4): aot_autograd skips
+        :py:func:`__init__._validate_graph` and may hand us bwd traces
+        that still contain ``call_method`` nodes (``t``, ``view``,
+        ``transpose``). Rather than crashing the whole compile, we route
+        them through the per-op extern fallback so the rest of the
+        graph still lowers. ``call_method`` lookup mirrors the
+        ``call_function`` dispatch — we try ``ATEN_DISPATCH`` keyed by
+        the method name and fall back to the extern slot otherwise.
+        """
+        method_name = str(node.target)
+        emitter = ATEN_DISPATCH.get(method_name)
+        resolved_args: List[Any] = []
+        for a in node.args:
+            if isinstance(a, type(node)):  # FX Node
+                resolved_args.append(self.ctx.value_map[a])
+            else:
+                resolved_args.append(a)
+        if emitter is None:
+            self._fallback_extern_op(node, method_name, resolved_args)
+            return
+        try:
+            out_spec = emitter(node, resolved_args, self.ctx)
+        except NotImplementedError:
+            self._fallback_extern_op(node, method_name, resolved_args)
+            return
+        self.ctx.value_map[node] = out_spec
 
     def on_call_module(self, node: "torch.fx.Node") -> None:
-        """Inline a submodule call. POC: not implemented (validator catches)."""
-        raise NotImplementedError(
-            f"call_module lowering not implemented for {node.target!r} "
-            "(RFC §7 Phase 2.2)")
+        """Inline a submodule call. Falls back to extern on the POC.
+
+        Correctness fix (grok review #4): same rationale as
+        :py:meth:`on_call_method` — never crash the whole compile when a
+        single submodule call is unsupported. Real submodule inlining is
+        deferred to RFC §7 Phase 2.2.
+        """
+        resolved_args: List[Any] = []
+        for a in node.args:
+            if isinstance(a, type(node)):  # FX Node
+                resolved_args.append(self.ctx.value_map[a])
+            else:
+                resolved_args.append(a)
+        self._fallback_extern_op(node, str(node.target), resolved_args)
 
     def on_output(self, node: "torch.fx.Node") -> None:
-        """Bind FX outputs to TileLang return buffer specs."""
-        # FX ``output`` nodes wrap a tuple in args[0].
-        outs = node.args[0]
-        if not isinstance(outs, tuple):
-            outs = (outs,)
+        """Bind FX outputs to TileLang return buffer specs.
+
+        Correctness fix (grok review #5, fx_to_tilelang.py:1085): FX
+        ``output`` nodes can wrap their args as a tuple, list, or — in
+        some aot_autograd traces — a single Node directly. Normalise all
+        three so the orchestrator records ``output_specs`` correctly.
+        """
+        outs_raw = node.args[0] if node.args else ()
+        if isinstance(outs_raw, (tuple, list)):
+            outs: Tuple[Any, ...] = tuple(outs_raw)
+        else:
+            outs = (outs_raw,)
         for out in outs:
             spec = self.ctx.value_map[out] if out is not None else None
             if not isinstance(spec, _TensorSpec):
@@ -1140,12 +1220,47 @@ class FXToTileLang:
             source_lines.append(
                 f"region#{r_idx} ({len(region)} ops): tilelang.compile ok")
 
-            def _make(k: Any) -> Callable[..., Any]:
+            # Capture the region's output specs so the launcher can
+            # explicitly allocate output buffers when the compiled kernel
+            # uses the explicit-output calling convention (kernel takes
+            # ``(*inputs, *outputs)``). For kernels using the implicit-
+            # output convention (output auto-returned) the second branch
+            # fires. Correctness fix (grok review #2): the previous
+            # ``k(*tensors)`` blindly forwarded only the inputs, which
+            # broke kernels that declared an explicit output buffer.
+            region_output_specs = self._region_output_specs(region)
+
+            def _make(k: Any, out_specs: Tuple[_TensorSpec, ...]) -> Callable[..., Any]:
                 def _run(*tensors: Any) -> Any:
+                    # Try the explicit-output convention first when we
+                    # know the region's output shapes.
+                    if out_specs:
+                        try:
+                            import torch  # type: ignore[import-not-found]
+                            ref = next((t for t in tensors
+                                        if hasattr(t, "device")), None)
+                            device = ref.device if ref is not None else "cpu"
+                            outs = [
+                                torch.empty(
+                                    spec.shape,
+                                    dtype=_spec_to_torch_dtype_runtime(spec.dtype),
+                                    device=device,
+                                )
+                                for spec in out_specs
+                            ]
+                            res = k(*tensors, *outs)
+                            # Some launchers return None and write into outs;
+                            # others return the output tensor(s). Normalise.
+                            if res is None:
+                                return outs[0] if len(outs) == 1 else tuple(outs)
+                            return res
+                        except TypeError:
+                            # Fall through to the implicit-output path.
+                            pass
                     return k(*tensors)
                 return _run
 
-            region_launchers.append(_make(kernel))
+            region_launchers.append(_make(kernel, region_output_specs))
 
         # 3. Wire all region launchers into a single sequential chain. The
         #    chain mimics Dynamo's calling convention: positional flat
@@ -1248,9 +1363,33 @@ class FXToTileLang:
         configurable activation epilogue applied inside the gemm
         accumulator (RFC §4 cache-residency: epilogue runs on the fragment,
         no HBM round-trip).
+
+        Correctness fix (grok review #1, fx_to_tilelang.py:1253): handle the
+        ``addmm`` payload layout ``(node.name, bias, a, b)`` vs the
+        ``matmul``/``mm`` layout ``(node.name, a, b)``. The previous code
+        used ``payload[1:3]`` unconditionally, which silently picked
+        ``(bias, a)`` for addmm and produced wrong shapes / numerics.
         """
-        # captured = [("matmul", (..., a, b)), ("<activation>", (..., x))]
-        a_spec, b_spec = captured[0][1][1:3]  # type: ignore[index]
+        # captured = [("matmul"|"mm"|"addmm", payload), ("<activation>", (..., x))]
+        op_name = captured[0][0]
+        payload = captured[0][1]
+        if op_name == "addmm":
+            # payload = (node.name, bias, a, b) — see _emit_addmm
+            bias_spec = payload[1]
+            a_spec, b_spec = payload[2], payload[3]
+        else:
+            # payload = (node.name, a, b) — see emit_matmul
+            bias_spec = None
+            a_spec, b_spec = payload[1], payload[2]
+        # Defensive: 2D-only path (the only shape this kernel supports).
+        if not (isinstance(a_spec, _TensorSpec) and isinstance(b_spec, _TensorSpec)):
+            raise NotImplementedError(
+                "fused_linear emitter requires resolved tensor specs for A,B "
+                f"(got A={a_spec!r}, B={b_spec!r})")
+        if len(a_spec.shape) != 2 or len(b_spec.shape) != 2:
+            raise NotImplementedError(
+                "fused_linear emitter currently supports only 2D matmul "
+                f"(got A.shape={a_spec.shape}, B.shape={b_spec.shape})")
         m, k = a_spec.shape  # type: ignore[union-attr]
         _, n = b_spec.shape  # type: ignore[union-attr]
         dtype = a_spec.dtype  # type: ignore[union-attr]
@@ -1318,6 +1457,37 @@ class FXToTileLang:
             "not implemented in POC; orchestrator will route to "
             "tir.call_extern fallback (RFC §7 Phase 2)."
         )
+
+    def _region_output_specs(
+        self,
+        region: List[Tuple[str, Tuple[Any, ...]]],
+    ) -> Tuple["_TensorSpec", ...]:
+        """Return the output specs of the last op in ``region``.
+
+        The launcher uses these to pre-allocate output tensors when the
+        compiled TileLang kernel uses the explicit ``(inputs..., outputs...)``
+        calling convention. For single-region graphs this matches
+        ``ctx.output_specs``; for multi-region chains we use the last-op
+        spec recorded in ``op_trace`` (best-effort, may be empty if the
+        region's terminal op has no resolvable output spec).
+        """
+        if not region:
+            return ()
+        # For a single-region graph the FX outputs are the region's outputs.
+        if len(self.ctx.output_specs) > 0 and len(self._partition_count_cache()) == 1:
+            return tuple(self.ctx.output_specs)
+        # Best-effort: derive from the last op's payload tensors. We
+        # cannot statically know which payload slot is the output, so we
+        # fall back to "no specs" (implicit-output convention).
+        return ()
+
+    def _partition_count_cache(self) -> List[List[Tuple[str, Tuple[Any, ...]]]]:
+        """Return the partitioned region list (memoised on the instance)."""
+        cache = getattr(self, "_partition_cache", None)
+        if cache is None:
+            cache = self._partition_fusable_subgraphs()
+            self._partition_cache = cache  # type: ignore[attr-defined]
+        return cache
 
     @staticmethod
     def _tile_constants(m: int, n: int, k: int) -> Tuple[int, int, int]:

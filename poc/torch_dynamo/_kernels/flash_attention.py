@@ -161,7 +161,27 @@ def make_flash_attention_kernel(
     kernel = tilelang.compile(main, target=target) if target else tilelang.compile(main)
 
     def _launcher(q: Any, k: Any, v: Any) -> Any:
-        return kernel(q, k, v)
+        # Correctness fix (grok review #2): the prim_func declares four
+        # buffers ``(Q, K, V, Output)`` so the compiled kernel uses the
+        # explicit-output calling convention. Allocate ``Output`` with
+        # the contractual Q-shape and pass it as the fourth argument.
+        # If the underlying tilelang.compile output binding ever changes
+        # to the implicit-output convention (output auto-returned), the
+        # ``TypeError`` branch transparently falls back to ``kernel(q,k,v)``.
+        import torch  # type: ignore[import-not-found]
+        torch_dtype = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }.get(dtype, torch.float16)
+        try:
+            out = torch.empty(
+                tuple(q_shape), dtype=torch_dtype, device=q.device,
+            )
+            res = kernel(q, k, v, out)
+            return res if res is not None else out
+        except TypeError:
+            return kernel(q, k, v)
 
     return main, _launcher
 
