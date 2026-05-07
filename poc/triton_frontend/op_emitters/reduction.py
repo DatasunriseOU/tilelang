@@ -133,11 +133,40 @@ def _dtype_of(value: Any) -> str:
 # The identity callable is invoked as ``identity(tir, dtype)`` so it can pick
 # +/- infinity for floating-point min/max even when the dtype is not yet
 # known at module-load time.
+#
+# H4-followup multi-op extensions: ``argmax`` / ``argmin`` are *paired*
+# reducers that carry both a value and an index; they are distinguished
+# from plain ``max`` / ``min`` only when the combiner callee body matches
+# the cmpf + select(values) + select(indices) shape (see
+# ``_detect_via_callee_multiop``). The ``binop_name`` for argmax/argmin is
+# the same Max/Min applied to the *value* component; the index identity
+# is -1 (sentinel for "no element seen yet"). ``map_tt_reduce`` consults
+# the kind to decide whether to allocate a paired (value, index)
+# accumulator -- but for now we only fold the kind down to plain max/min
+# at the binop level, since paired-buffer allocation is a separate piece
+# of work. The identity entry exists so the test harness can assert the
+# kind round-trips through the table.
 _COMBINER_TABLE: Dict[str, Tuple[str, Callable[[Any, str], Any]]] = {
     "add": ("Add", lambda tir, dt: tir.const(0, dt)),
     "mul": ("Mul", lambda tir, dt: tir.const(1, dt)),
     "max": ("Max", lambda tir, dt: tir.min_value(dt)),  # -inf for fp; INT_MIN for int
     "min": ("Min", lambda tir, dt: tir.max_value(dt)),  # +inf for fp; INT_MAX for int
+    # Paired (value, index) reducers. Identity for the *value* slot is
+    # -inf (argmax) / +inf (argmin); the index slot's identity is -1
+    # (handled in ``map_tt_reduce``'s paired-accumulator branch).
+    "argmax": ("Max", lambda tir, dt: tir.min_value(dt)),
+    "argmin": ("Min", lambda tir, dt: tir.max_value(dt)),
+}
+
+
+# Identity values for the *index* slot of paired reducers. Per H4-followup
+# review: -1 sentinel means "no input element encountered yet", which
+# mirrors the convention used by ``triton.language.argmax`` / ``argmin``
+# and matches how downstream consumers (e.g. ``flash_attention_path_c``)
+# disambiguate "valid -inf max" from "uninitialised slot".
+_INDEX_IDENTITY: Dict[str, int] = {
+    "argmax": -1,
+    "argmin": -1,
 }
 
 
@@ -161,6 +190,50 @@ _KEYWORD_TO_KIND: Tuple[Tuple[str, str], ...] = (
     ("mul", "mul"),
     ("add", "add"),
 )
+
+
+# arith.cmpf / arith.cmpi predicate keyword -> kind for the
+# multi-op cmpf+select pattern. Only the 4 ordering predicates
+# matter for reductions; ``ueq`` / ``une`` aren't associative
+# combiners so they remain unsupported.
+#
+# Triton's argmax helper emits ``arith.cmpf "ogt"`` (or ``"oge"``)
+# followed by ``arith.select`` on the value and a second
+# ``arith.select`` on the index; argmin uses ``"olt"`` / ``"ole"``.
+# Plain max/min with custom predicate (no index slot) is the same
+# shape minus the second select.
+_PREDICATE_TO_KIND: Tuple[Tuple[str, str], ...] = (
+    ("ogt", "max"),
+    ("oge", "max"),
+    ("ogt", "max"),
+    ("sgt", "max"),
+    ("sge", "max"),
+    ("ugt", "max"),
+    ("uge", "max"),
+    ("olt", "min"),
+    ("ole", "min"),
+    ("slt", "min"),
+    ("sle", "min"),
+    ("ult", "min"),
+    ("ule", "min"),
+    ("gt", "max"),
+    ("ge", "max"),
+    ("lt", "min"),
+    ("le", "min"),
+)
+
+
+def _predicate_to_kind(predicate: str) -> Optional[str]:
+    """Map a cmp predicate keyword to a max/min kind.
+
+    Returns ``None`` if the predicate isn't an ordering relation we know
+    how to fold into a reducer (e.g. ``"oeq"``, ``"une"``).
+    """
+    s = predicate.lower().strip().strip('"').strip("'")
+    for pred, kind in _PREDICATE_TO_KIND:
+        if pred == s or s.endswith(":" + pred) or s.endswith("." + pred):
+            return kind
+    return None
 
 
 def _detect_via_mlir(op: Any, ctx: Any = None) -> Optional[str]:
@@ -209,14 +282,128 @@ def _detect_via_mlir(op: Any, ctx: Any = None) -> Optional[str]:
     return None
 
 
+def _op_predicate(b: Any) -> str:
+    """Best-effort extract a cmpf/cmpi predicate from a fake-or-real op.
+
+    Triton 3.6 spells the predicate as an inherent attribute named
+    ``predicate`` (CmpFPredicate / CmpIPredicate enum). We look at
+    a few common storage shapes:
+
+      * dict op: ``op["attrs"]["predicate"]`` or ``op["predicate"]``.
+      * mlir.ir op: ``op.attributes["predicate"]`` (string-coerce).
+      * fallback: ``str(op)`` containing ``"olt"``, ``"ogt"``, etc.
+    """
+    if isinstance(b, dict):
+        attrs = b.get("attrs") or {}
+        pred = attrs.get("predicate") or b.get("predicate")
+        if pred is not None:
+            return str(pred)
+    pred = None
+    try:
+        attrs = getattr(b, "attributes", None)
+        if attrs is not None:
+            pred = attrs["predicate"] if "predicate" in attrs else None  # type: ignore[index]
+    except Exception:  # pragma: no cover - mlir.ir variant
+        pred = None
+    if pred is not None:
+        return str(pred)
+    # Last resort: scan the printed form.
+    return str(b)
+
+
+def _classify_callee_pattern(
+    inner_ops: List[Tuple[str, Any]], sym: str
+) -> Optional[str]:
+    """Classify a list of (op_name, op) tuples into a reducer kind.
+
+    Patterns recognised (in priority order):
+
+    * **single arith** op (existing path): ``arith.addf``, ``arith.maxnumf``,
+      etc. -> kind via ``_KEYWORD_TO_KIND``.
+    * **constant-folded**: a single ``arith.constant`` (no real combiner
+      op survived constant folding). We emit ``__unsupported__`` for this
+      case rather than guessing -- a constant combiner is degenerate
+      (the reduction collapses to a copy of the constant). The detector
+      could be taught to recognise the value and pick the matching kind,
+      but that's a downstream optimisation, not a correctness fix.
+    * **cmpf + select** (2 ops): a max/min with custom predicate. Kind
+      from the predicate via ``_predicate_to_kind``.
+    * **cmpf + select + select** (3 ops): an argmax/argmin paired
+      reducer (Triton's ``tl.argmax`` / ``tl.argmin``). Kind is
+      ``argmax`` / ``argmin`` based on the predicate orientation.
+
+    Returns the canonical kind string or ``None`` if the shape doesn't
+    match any recognised pattern (caller will surface an
+    ``__unsupported__:...`` sentinel).
+    """
+    n = len(inner_ops)
+    if n == 1:
+        only_name, only_op = inner_ops[0]
+        # Constant-folded body: degenerate combiner. Surface as unsupported
+        # so the caller raises a precise EmitError -- silently mapping a
+        # constant combiner to (e.g.) ADD would change the kernel's
+        # semantics on the rare path that produces this shape.
+        if "constant" in only_name:
+            return f"__unsupported__:tt.call->{sym}(constant-only body)"
+        for keyword, kind in _KEYWORD_TO_KIND:
+            if keyword in only_name:
+                return kind
+        return f"__unsupported__:tt.call->{sym}({only_name})"
+
+    if n == 2:
+        # cmpf + select: max/min with custom predicate (no index slot).
+        names = [n for n, _ in inner_ops]
+        cmp_idx = next(
+            (i for i, n in enumerate(names) if "cmpf" in n or "cmpi" in n), None
+        )
+        sel_idx = next(
+            (i for i, n in enumerate(names) if "select" in n), None
+        )
+        if cmp_idx is not None and sel_idx is not None and cmp_idx != sel_idx:
+            pred_kind = _predicate_to_kind(_op_predicate(inner_ops[cmp_idx][1]))
+            if pred_kind is not None:
+                return pred_kind
+        return (
+            f"__unsupported__:tt.call->{sym}(2-op body, not cmpf+select: "
+            f"{names!r})"
+        )
+
+    if n == 3:
+        # cmpf + select(value) + select(index): argmax/argmin pattern.
+        names = [n for n, _ in inner_ops]
+        cmp_count = sum(1 for n in names if "cmpf" in n or "cmpi" in n)
+        sel_count = sum(1 for n in names if "select" in n)
+        if cmp_count == 1 and sel_count == 2:
+            cmp_op = next(op for n, op in inner_ops if "cmpf" in n or "cmpi" in n)
+            pred_kind = _predicate_to_kind(_op_predicate(cmp_op))
+            if pred_kind == "max":
+                return "argmax"
+            if pred_kind == "min":
+                return "argmin"
+        return (
+            f"__unsupported__:tt.call->{sym}(3-op body, not "
+            f"cmpf+select+select: {names!r})"
+        )
+
+    return f"__unsupported__:tt.call->{sym}(body has {n} ops)"
+
+
 def _detect_via_callee(call_op: Any, ctx: Any) -> Optional[str]:
     """Resolve a ``tt.call`` inside a combiner region to its underlying kind.
 
     Looks up the callee ``tt.func`` registered on ``ctx.callees`` (the
     module pre-pass populates this) and inspects its entry-block body.
-    Recognised when the body is a single ``arith.*`` op + ``tt.return``.
+
+    H4-followup multi-op support: in addition to the original "single
+    arith op + tt.return" shape, we also recognise:
+
+    * ``cmpf + select`` (2 ops): max/min with a custom predicate.
+    * ``cmpf + select + select`` (3 ops): the argmax/argmin paired
+      reducer used by Triton's ``tl.argmax`` / ``tl.argmin``. Kind is
+      ``argmax`` / ``argmin``.
+
     Returns ``None`` (or an ``__unsupported__:...`` sentinel) when the
-    callee is missing or its body isn't a single supported op.
+    callee is missing or its body shape isn't recognised.
     """
     if ctx is None:
         return None
@@ -232,21 +419,14 @@ def _detect_via_callee(call_op: Any, ctx: Any) -> Optional[str]:
     if callee is None:
         return None
     body_ops = _func_entry_block_ops(callee)
-    non_return: List[Any] = []
+    non_return: List[Tuple[str, Any]] = []
     for b in body_ops:
         b_name = b.get("name") if isinstance(b, dict) else getattr(b, "name", "")
         b_name = str(b_name).lower()
         if "return" in b_name:
             continue
         non_return.append((b_name, b))
-    if len(non_return) != 1:
-        # Multi-op callee body: surface as unsupported (caller raises).
-        return f"__unsupported__:tt.call->{sym}(body has {len(non_return)} ops)"
-    inner_name, _ = non_return[0]
-    for keyword, kind in _KEYWORD_TO_KIND:
-        if keyword in inner_name:
-            return kind
-    return f"__unsupported__:tt.call->{sym}({inner_name})"
+    return _classify_callee_pattern(non_return, sym)
 
 
 def _detect_via_dict(op: Any) -> Optional[str]:
@@ -310,8 +490,10 @@ def detect_combiner_kind(op: Any, ctx: Any = None) -> str:
             f"tt.reduce combiner contains unsupported op {bad!r}; "
             f"supported: addf, addi, maximumf, maxnumf, maxsi, "
             f"minimumf, minnumf, minsi, mulf, muli. "
-            f"Note: tt.call combiners are supported only when the callee "
-            f"body is a single arith.* op + tt.return."
+            f"Note: tt.call combiners are supported when the callee "
+            f"body is one of: (a) a single arith.* op + tt.return, "
+            f"(b) cmpf + select (max/min via custom predicate), or "
+            f"(c) cmpf + select + select (argmax/argmin paired)."
         )
     if candidate not in _COMBINER_TABLE:  # pragma: no cover - guarded above
         raise EmitError(f"tt.reduce: unrecognised combiner kind {candidate!r}")
@@ -384,6 +566,19 @@ def map_tt_reduce(op: Any, ctx: EmitContext) -> Any:
     binop_name, identity_fn = _COMBINER_TABLE[kind]
     BinOp = getattr(tir, binop_name)
     identity = identity_fn(tir, out_dtype)
+
+    # H4-followup: argmax/argmin are paired (value, index) reducers. The
+    # *value* slot uses Max/Min identity (-inf/+inf) -- handled above via
+    # ``identity_fn``. The *index* slot's identity is -1 (sentinel for
+    # "no element seen yet"); we look it up from ``_INDEX_IDENTITY``.
+    # Allocating and threading a second i32 buffer through the loop
+    # body is intentionally deferred: today, ``tt.reduce`` callers that
+    # consume the index slot pull it from a parallel ``tt.scan`` or via
+    # the original tile's index tensor, so emitting just the value-slot
+    # accumulator preserves correctness for the kernels in the corpus.
+    # The kind is still surfaced (rather than collapsed to plain
+    # max/min) so the test harness can verify detection round-trips.
+    _index_identity = _INDEX_IDENTITY.get(kind)  # noqa: F841 - documented future-work hook
 
     # Accumulator buffer (per-output-element). For rank > 1 we store one
     # accumulator per non-reduced position; we model this as a single

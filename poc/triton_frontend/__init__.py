@@ -974,9 +974,37 @@ def _make_prim_func(ctx: WalkerCtx, name: str = "main") -> Any:
             if hasattr(extent, "name") and extent not in params:
                 params.append(extent)
 
+    # Wrap the body with a ``threadIdx.x`` ``thread_extent`` AttrStmt so
+    # TileLang's tile-op lowering (notably ``gemm.lower`` which computes
+    # ``num_warps = block_size / warp_size``) sees a positive thread
+    # extent. Without this wrap ``CurrentThreadBounds()`` falls back to
+    # the default ``(0, 1)`` range and ``num_warps`` collapses to 0,
+    # tripping the ``m_warp * n_warp == num_warps`` ICHECK in
+    # ``GemmWarpPolicyNode::computeWarpPartition`` (src/op/gemm.cc:288).
+    # Triton TTIR is a tile-level IR with no explicit thread axis; we
+    # synthesise the threadIdx.x binding from ``ctx.num_warps`` (defaults
+    # to 4 warps = 128 threads, matching Triton's own default).
+    num_warps = int(getattr(ctx, "num_warps", 4) or 4)
+    num_stages = int(getattr(ctx, "num_stages", 2) or 2)
+    threads_per_block = num_warps * 32
+    tid_var = tir.Var("threadIdx_x", "int32")
+    tid_extent = tir.const(threads_per_block, "int32")
+    tid_iter = tir.IterVar(
+        (0, tid_extent), tid_var, tir.IterVar.ThreadIndex, "threadIdx.x",
+    )
+    body = tir.AttrStmt(tid_iter, "thread_extent", tid_extent, body)
+
     func = tir.PrimFunc(params=params, body=body, buffer_map=buffer_map)
     func = func.with_attr("tir.noalias", True)
     func = func.with_attr("global_symbol", name)
+    # Surface ``num_warps`` / ``num_stages`` as PrimFunc attrs as well so
+    # downstream tooling (e.g. inspectors, schedulers, future TileLang
+    # lowering passes) can read them directly without re-deriving from
+    # the AttrStmt extent. Triton kernels that drive ``from_ttir`` can
+    # override the defaults via ``ctx.num_warps`` / ``ctx.num_stages``
+    # (set by the harness from Triton's compile options).
+    func = func.with_attr("num_warps", num_warps)
+    func = func.with_attr("num_stages", num_stages)
     return func
 
 
@@ -1057,6 +1085,8 @@ def from_ttir(
     *,
     target: Optional[str] = None,
     name: str = "main",
+    num_warps: Optional[int] = None,
+    num_stages: Optional[int] = None,
     _allow_text_ttir: bool = False,
     **kwargs: Any,
 ) -> TileLangPrimFunc:
@@ -1089,6 +1119,14 @@ def from_ttir(
     """
     global _FALLBACK_WARNED
     ctx = WalkerCtx()
+    # Plumb optional ``num_warps`` / ``num_stages`` overrides supplied by
+    # the harness (which captures them from Triton's compile options) so
+    # ``_make_prim_func`` can stamp the right ``threadIdx.x`` extent and
+    # PrimFunc attrs. Falsy values keep the WalkerCtx defaults intact.
+    if num_warps is not None:
+        ctx.num_warps = int(num_warps)
+    if num_stages is not None:
+        ctx.num_stages = int(num_stages)
     if isinstance(ttir_module, str):
         # Preferred path: re-parse via mlir.ir and use the MLIR walker
         # (populates ctx.value_map / ctx.buffers properly). If

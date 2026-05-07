@@ -146,6 +146,32 @@ def test_bug2_matmul_lowers_to_real_prim_func() -> None:
         f"path. source={artifact.source!r}")
 
 
+def test_matmul_two_input_lowers_with_threadidx_extent() -> None:
+    """Two-input matmul ``A @ B`` lowers without the ``num_warps == 0``
+    failure.
+
+    Regression for the Triton-frontend ``COMPILE_FAIL: m_warp * n_warp ==
+    num_warps, num_warps: 0`` where the lowered PrimFunc lacked a
+    ``threadIdx.x`` ``thread_extent`` AttrStmt. The fx-to-tilelang
+    sequential matmul builder uses ``T.Kernel(threads=...)`` which already
+    emits the binding; this test pins that contract by asserting the
+    region lowers all the way to ``tilelang.compile ok`` without the
+    matmul PrimFunc emitter fallback.
+    """
+    import torch
+
+    torch.manual_seed(0)
+    a = torch.randn(64, 64, dtype=torch.float16)
+    b = torch.randn(64, 64, dtype=torch.float16)
+    artifact = _lower(lambda x, y: torch.matmul(x, y), [a, b])
+    assert len(artifact.prim_funcs) >= 1, (
+        f"expected matmul to lower to a real PrimFunc; source={artifact.source!r}"
+    )
+    assert "tilelang.compile ok" in artifact.source, (
+        f"expected 'tilelang.compile ok' in source, got {artifact.source!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Wave C3 — torch -> MLX zero-copy bridge regression. The launcher MUST
 # now run on Mac M-series GPU via ``mx.fast.metal_kernel`` instead of CPU

@@ -124,15 +124,36 @@ def test_program_id_wrapped_in_thread_extent():
 
     func = _make_prim_func(ctx, name="kernel_with_pid")
 
-    # The outermost stmt must be an AttrStmt with attr_key="thread_extent"
-    # whose IterVar.var is the same Var the body references.
+    # The body is wrapped with multiple ``AttrStmt(thread_extent)`` layers --
+    # the outermost is now ``threadIdx.x`` (added so TileLang's
+    # ``CurrentThreadBounds()`` resolves to a positive extent), and the
+    # inner ones are the program_id ``blockIdx.{x,y,z}`` bindings. We walk
+    # the AttrStmt chain to locate the blockIdx binding for ``pid``.
     assert isinstance(func.body, tir.AttrStmt), (
         f"expected outer AttrStmt(thread_extent), got {type(func.body).__name__}"
     )
     assert func.body.attr_key == "thread_extent", (
         f"expected attr_key='thread_extent', got {func.body.attr_key!r}"
     )
-    iter_var = func.body.node
+
+    def _find_blockidx_attrstmt(node):
+        """Walk the AttrStmt chain to find the blockIdx binding for pid."""
+        cur = node
+        while isinstance(cur, tir.AttrStmt):
+            if cur.attr_key == "thread_extent":
+                iv = cur.node
+                tag = str(iv.thread_tag)
+                if "blockIdx" in tag and iv.var.same_as(pid):
+                    return cur
+            cur = cur.body
+        return None
+
+    block_attr = _find_blockidx_attrstmt(func.body)
+    assert block_attr is not None, (
+        "no AttrStmt(thread_extent) with blockIdx tag and the program_id "
+        f"Var found anywhere in the body chain; got: {func.body!r}"
+    )
+    iter_var = block_attr.node
     assert iter_var.var.same_as(pid), (
         "AttrStmt IterVar.var must be the program_id Var"
     )
@@ -172,3 +193,93 @@ def test_runtime_scalar_arg_added_to_params():
     assert "n_elements" in param_names, (
         f"runtime scalar arg must be a PrimFunc param; got {param_names}"
     )
+
+
+def test_make_prim_func_stamps_num_warps_threadidx_extent():
+    """``_make_prim_func`` wraps the body in a ``threadIdx.x`` ``thread_extent``
+    AttrStmt sized by ``ctx.num_warps * 32`` and stamps matching
+    ``num_warps`` / ``num_stages`` PrimFunc attrs.
+
+    Regression for the matmul ``COMPILE_FAIL`` where TileLang's
+    ``GemmWarpPolicyNode::computeWarpPartition`` (src/op/gemm.cc:288)
+    raised ``Check failed: m_warp * n_warp == num_warps`` because no
+    ``threadIdx.x`` thread_extent existed on the body and ``num_warps``
+    collapsed to ``block_size (1) / warp_size (32) == 0``.
+    """
+    pytest.importorskip("tvm")
+    from tvm import tir
+
+    from poc.triton_frontend import _make_prim_func
+    from poc.triton_frontend.op_mapping import WalkerCtx
+
+    ctx = WalkerCtx()
+    ctx.num_warps = 4
+    ctx.num_stages = 2
+    # Trivial body so the wrap is the only structural feature.
+    ctx.stmts.append(tir.Evaluate(tir.const(0, "int32")))
+
+    func = _make_prim_func(ctx, name="kernel_for_warps")
+
+    # Outermost stmt should be the threadIdx.x AttrStmt with extent 128.
+    assert isinstance(func.body, tir.AttrStmt)
+    assert func.body.attr_key == "thread_extent"
+    iv = func.body.node
+    assert "threadIdx.x" in str(iv.thread_tag), (
+        f"expected threadIdx.x tag, got {iv.thread_tag!r}"
+    )
+    extent_value = int(func.body.value)
+    assert extent_value == 4 * 32, (
+        f"expected threadIdx.x extent == num_warps*32 == 128, got {extent_value}"
+    )
+    # PrimFunc-level attrs reflect ctx.num_warps / ctx.num_stages.
+    assert int(func.attrs["num_warps"]) == 4
+    assert int(func.attrs["num_stages"]) == 2
+
+
+def test_make_prim_func_overrides_num_warps_via_ctx():
+    """``ctx.num_warps`` overrides the default; threadIdx.x extent and the
+    matching PrimFunc attr must move in lockstep.
+    """
+    pytest.importorskip("tvm")
+    from tvm import tir
+
+    from poc.triton_frontend import _make_prim_func
+    from poc.triton_frontend.op_mapping import WalkerCtx
+
+    ctx = WalkerCtx()
+    ctx.num_warps = 8
+    ctx.num_stages = 3
+    ctx.stmts.append(tir.Evaluate(tir.const(0, "int32")))
+
+    func = _make_prim_func(ctx, name="kernel_eight_warps")
+    extent_value = int(func.body.value)
+    assert extent_value == 8 * 32 == 256
+    assert int(func.attrs["num_warps"]) == 8
+    assert int(func.attrs["num_stages"]) == 3
+
+
+def test_from_ttir_plumbs_num_warps_kwarg():
+    """``from_ttir(ttir_module, num_warps=...)`` overrides ``WalkerCtx``
+    defaults so the harness can plumb Triton's compile options through.
+    """
+    pytest.importorskip("tvm")
+    from poc.triton_frontend import from_ttir
+
+    # Minimal text TTIR — empty module body. The text walker just builds
+    # an empty ctx; we only care that the kwargs land on the PrimFunc.
+    ttir = """
+module {
+  tt.func public @noop() attributes {noinline = false} {
+    tt.return
+  }
+}
+"""
+    func = from_ttir(
+        ttir,
+        name="noop",
+        num_warps=2,
+        num_stages=1,
+        _allow_text_ttir=True,
+    )
+    assert int(func.attrs["num_warps"]) == 2
+    assert int(func.attrs["num_stages"]) == 1

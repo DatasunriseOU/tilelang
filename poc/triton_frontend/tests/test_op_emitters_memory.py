@@ -86,7 +86,7 @@ def _force_no_shim(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_make_range_emits_ramp() -> None:
     """``tt.make_range(0, 16)`` becomes ``tir.Ramp(0, 1, 16)``."""
     ctx = WalkerCtx()
-    out = _fake_value("range_out", shape=[16], dtype="int32")
+    out = _ssa("range_out", shape=[16], dtype="int32")
     op = {
         "name": "tt.make_range",
         "operands": [],
@@ -104,7 +104,7 @@ def test_make_range_emits_ramp() -> None:
 def test_make_range_wide_spills_to_for_loop() -> None:
     """A 4096-lane range exceeds the default vector width and spills to a For."""
     ctx = WalkerCtx()
-    out = _fake_value("wide_range_out", shape=[4096], dtype="int32")
+    out = _ssa("wide_range_out", shape=[4096], dtype="int32")
     op = {
         "name": "tt.make_range",
         "operands": [],
@@ -175,8 +175,8 @@ def test_make_range_uses_alloc_fragment_not_decl_buffer() -> None:
 def test_broadcast_scalar_to_tile_emits_broadcast() -> None:
     """``tt.broadcast(scalar) : f32 -> 16xf32`` becomes ``tir.Broadcast``."""
     ctx = WalkerCtx()
-    scalar_ssa = _fake_value("s", shape=[], dtype="float32")
-    out_ssa = _fake_value("v", shape=[16], dtype="float32")
+    scalar_ssa = _ssa("s", shape=[], dtype="float32")
+    out_ssa = _ssa("v", shape=[16], dtype="float32")
     # Bind the scalar to a real PrimExpr so emit_tt_broadcast resolves it.
     ctx.bind(scalar_ssa, tvm.tir.const(1.5, "float32"))
     op = {
@@ -200,12 +200,15 @@ def test_load_with_mask_emits_if_then_else(monkeypatch: pytest.MonkeyPatch) -> N
     _force_no_shim(monkeypatch)
     ctx = WalkerCtx()
     buf = tvm.tir.decl_buffer([16], "float32", name="A")
-    ptr_ssa = _fake_value("ptr", shape=[], dtype="float32")
-    mask_ssa = _fake_value("mask", shape=[], dtype="bool")
-    other_ssa = _fake_value("other", shape=[], dtype="float32")
-    out_ssa = _fake_value("loaded", shape=[], dtype="float32")
+    ptr_ssa = _ssa("ptr", shape=[], dtype="float32")
+    mask_ssa = _ssa("mask", shape=[], dtype="bool")
+    other_ssa = _ssa("other", shape=[], dtype="float32")
+    out_ssa = _ssa("loaded", shape=[], dtype="float32")
     ctx.bind(ptr_ssa, buf)
-    ctx.bind(mask_ssa, tvm.tir.const(True, "bool"))
+    # Use a non-constant mask Var so the constant-folding pass doesn't
+    # elide the IfThenElse before the test gets to inspect it.
+    mask_var = tvm.tir.Var("m", "bool")
+    ctx.bind(mask_ssa, mask_var)
     ctx.bind(other_ssa, tvm.tir.const(0.0, "float32"))
     op = {
         "name": "tt.load",
@@ -224,10 +227,10 @@ def test_store_with_mask_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = WalkerCtx()
     buf = tvm.tir.decl_buffer([16], "float32", name="B")
 
-    ptr_in = _fake_value("ptr_in", shape=[], dtype="float32")
-    mask_in = _fake_value("mask", shape=[], dtype="bool")
-    other = _fake_value("other", shape=[], dtype="float32")
-    loaded = _fake_value("loaded", shape=[], dtype="float32")
+    ptr_in = _ssa("ptr_in", shape=[], dtype="float32")
+    mask_in = _ssa("mask", shape=[], dtype="bool")
+    other = _ssa("other", shape=[], dtype="float32")
+    loaded = _ssa("loaded", shape=[], dtype="float32")
     ctx.bind(ptr_in, buf)
     ctx.bind(mask_in, tvm.tir.const(True, "bool"))
     ctx.bind(other, tvm.tir.const(0.0, "float32"))
@@ -241,7 +244,7 @@ def test_store_with_mask_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:
         ctx,
     )
 
-    ptr_out = _fake_value("ptr_out", shape=[], dtype="float32")
+    ptr_out = _ssa("ptr_out", shape=[], dtype="float32")
     ctx.bind(ptr_out, buf)
     emit_tt_store(
         {
@@ -275,8 +278,8 @@ def test_multi_element_load_without_shim_emits_degraded_marker(
     """
     _force_no_shim(monkeypatch)
     ctx = WalkerCtx()
-    ptr_ssa = _fake_value("tile_ptr", shape=[32], dtype="float32")
-    out_ssa = _fake_value("tile_out", shape=[32], dtype="float32")
+    ptr_ssa = _ssa("tile_ptr", shape=[32], dtype="float32")
+    out_ssa = _ssa("tile_out", shape=[32], dtype="float32")
     op = {
         "name": "tt.load",
         "operands": [ptr_ssa],
@@ -301,9 +304,9 @@ def test_addptr_without_shim_emits_degraded_marker(monkeypatch: pytest.MonkeyPat
     """
     _force_no_shim(monkeypatch)
     ctx = WalkerCtx()
-    ptr_ssa = _fake_value("ptr", shape=[], dtype="float32")
-    off_ssa = _fake_value("off", shape=[], dtype="int32")
-    out_ssa = _fake_value("ptr2", shape=[], dtype="float32")
+    ptr_ssa = _ssa("ptr", shape=[], dtype="float32")
+    off_ssa = _ssa("off", shape=[], dtype="int32")
+    out_ssa = _ssa("ptr2", shape=[], dtype="float32")
     buf = tvm.tir.decl_buffer([1024], "float32", name="P")
     ctx.bind(ptr_ssa, (buf, [tvm.tir.const(0, "int32")]))
     ctx.bind(off_ssa, tvm.tir.const(7, "int32"))

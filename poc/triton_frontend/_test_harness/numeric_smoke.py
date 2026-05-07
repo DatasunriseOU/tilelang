@@ -146,21 +146,33 @@ def _probe_deps() -> Dict[str, Optional[str]]:
 # ---------------------------------------------------------------------------
 
 
-def _capture_ttir(kernel_mod: Any) -> Tuple[Optional[str], Optional[str]]:
+def _capture_ttir(
+    kernel_mod: Any,
+) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
     """Run ``triton.compiler.compile`` to obtain TTIR text.
 
-    Returns ``(ttir_text, error)``. On failure ``ttir_text is None`` and
-    ``error`` is the diagnostic.
+    Returns ``(ttir_text, error, options)``. ``options`` is a small dict
+    exposing Triton's parsed compile options (``num_warps``, ``num_stages``)
+    so the reducer downstream can stamp matching attrs on the resulting
+    PrimFunc — TileLang's ``gemm.lower`` reads ``num_warps`` from the
+    ``threadIdx.x`` ``thread_extent`` AttrStmt the reducer synthesises
+    from these. On failure ``ttir_text is None``, ``error`` is the
+    diagnostic, and ``options`` is the Triton-default ``{4, 2}``.
     """
+    _default_options: Dict[str, Any] = {"num_warps": 4, "num_stages": 2}
     try:
         import triton  # type: ignore  # noqa: F401  -- import probe
         from triton.compiler.compiler import ASTSource  # type: ignore
     except Exception as exc:  # noqa: BLE001
-        return None, f"triton import failed: {type(exc).__name__}: {exc}"
+        return None, f"triton import failed: {type(exc).__name__}: {exc}", _default_options
 
     fn = kernel_mod.TRITON_KERNEL
     if fn is None:
-        return None, "TRITON_KERNEL is None (triton failed to import in kernel module)"
+        return (
+            None,
+            "TRITON_KERNEL is None (triton failed to import in kernel module)",
+            _default_options,
+        )
 
     # Triton 3.6 dropped the ``compile(src, options={"stage":"ttir"})`` knob.
     # The replacement is ``ASTSource.make_ir(target, options, codegen_fns,
@@ -229,7 +241,15 @@ def _capture_ttir(kernel_mod: Any) -> Tuple[Optional[str], Optional[str]]:
             codegen = be.get_codegen_implementation(options)
             module_map = be.get_module_map()
             module = src.make_ir(gpu_target, options, codegen, module_map, ctx)
-            return str(module), None
+            # Surface Triton's ``num_warps`` / ``num_stages`` so the
+            # reducer can wrap the body in a matching ``threadIdx.x``
+            # ``thread_extent`` AttrStmt (TileLang's ``gemm.lower`` derives
+            # ``num_warps = block_size / warp_size`` from that extent).
+            opts_dict: Dict[str, Any] = {
+                "num_warps": int(getattr(options, "num_warps", 4) or 4),
+                "num_stages": int(getattr(options, "num_stages", 2) or 2),
+            }
+            return str(module), None, opts_dict
 
         # 3.0/3.1 fallback path.
         from triton.compiler import compile as triton_compile  # type: ignore
@@ -237,14 +257,22 @@ def _capture_ttir(kernel_mod: Any) -> Tuple[Optional[str], Optional[str]]:
         compiled = triton_compile(src, options={"stage": "ttir"})
         asm = getattr(compiled, "asm", None)
         if asm is None:
-            return None, f"triton compile returned no .asm: {compiled!r}"
+            return None, f"triton compile returned no .asm: {compiled!r}", _default_options
         ttir = asm.get("ttir")
         if ttir is None:
-            return None, f"triton compile produced no 'ttir' key in asm: keys={list(asm)}"
-        return str(ttir), None
+            return (
+                None,
+                f"triton compile produced no 'ttir' key in asm: keys={list(asm)}",
+                _default_options,
+            )
+        return str(ttir), None, _default_options
     except Exception as exc:  # noqa: BLE001
         tb = traceback.format_exc(limit=6)
-        return None, f"triton.compile raised: {type(exc).__name__}: {exc}\n{tb}"
+        return (
+            None,
+            f"triton.compile raised: {type(exc).__name__}: {exc}\n{tb}",
+            _default_options,
+        )
 
 
 def _default_signature(fn: Any, constants: Dict[str, Any]) -> Dict[str, str]:
@@ -327,7 +355,11 @@ def _ensure_cxx_shim_on_syspath() -> None:
             continue
 
 
-def _lower_ttir(ttir_text: str, kernel_name: str) -> Tuple[Any, Optional[str]]:
+def _lower_ttir(
+    ttir_text: str,
+    kernel_name: str,
+    options: Optional[Dict[str, Any]] = None,
+) -> Tuple[Any, Optional[str]]:
     """Run ``poc.triton_frontend.from_ttir`` on the captured TTIR.
 
     Uses the lifted helpers:
@@ -374,7 +406,18 @@ def _lower_ttir(ttir_text: str, kernel_name: str) -> Tuple[Any, Optional[str]]:
             module = _mlir_ir.Module.parse(parse_text, ctx)
 
         adapter = wrap_module_for_walker(module)
-        prim = from_ttir(adapter, name=kernel_name)
+        # Plumb Triton's ``num_warps`` / ``num_stages`` through so
+        # ``_make_prim_func`` can wrap the body in a matching
+        # ``threadIdx.x`` ``thread_extent`` AttrStmt; without this
+        # ``gemm.lower`` defaults block_size to 1 and ``num_warps`` collapses
+        # to 0, tripping the ``m_warp * n_warp == num_warps`` ICHECK.
+        opts = options or {}
+        prim = from_ttir(
+            adapter,
+            name=kernel_name,
+            num_warps=opts.get("num_warps"),
+            num_stages=opts.get("num_stages"),
+        )
         return prim, None
     except ImportError:
         # Fall through to text path.
@@ -391,9 +434,12 @@ def _lower_ttir(ttir_text: str, kernel_name: str) -> Tuple[Any, Optional[str]]:
     # kernel that does not match the reference). We still attempt it so
     # the harness can report the *next* failing stage.
     try:
+        opts = options or {}
         prim = from_ttir(
             ttir_text,
             name=kernel_name,
+            num_warps=opts.get("num_warps"),
+            num_stages=opts.get("num_stages"),
             _allow_text_ttir=True,
         )
         return prim, "(text-walker fallback; mlir.ir bindings absent)"
@@ -633,7 +679,7 @@ def run_one(kernel_module_name: str, deps: Dict[str, Optional[str]]) -> KernelRe
         )
 
     # Stage 1: TTIR
-    ttir_text, ttir_err = _capture_ttir(kernel_mod)
+    ttir_text, ttir_err, ttir_options = _capture_ttir(kernel_mod)
     if ttir_text is None:
         return KernelResult(
             name=kernel_module_name,
@@ -643,7 +689,7 @@ def run_one(kernel_module_name: str, deps: Dict[str, Optional[str]]) -> KernelRe
         )
 
     # Stage 2: PrimFunc
-    prim, lower_err = _lower_ttir(ttir_text, kernel_module_name)
+    prim, lower_err = _lower_ttir(ttir_text, kernel_module_name, ttir_options)
     if prim is None:
         return KernelResult(
             name=kernel_module_name,

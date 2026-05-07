@@ -196,6 +196,20 @@ class WalkerCtx:
         # tuple; extent defaults to a symbolic placeholder when grid info is
         # not available at lowering time.
         self.program_id_vars: List[Tuple[Any, int, Any]] = []
+        # TileLang's ``gemm.lower`` derives ``num_warps = block_size /
+        # warp_size`` from the ``threadIdx.x`` ``thread_extent`` AttrStmt
+        # wrapping the kernel body. Triton TTIR doesn't carry this
+        # explicitly (TTIR is a tile-level IR; lowering to threads happens
+        # later in Triton's stack), so we surface ``num_warps`` /
+        # ``num_stages`` here as ctx-level metadata. ``_make_prim_func``
+        # consults these to synthesise a ``threadIdx.x`` wrap with extent
+        # ``num_warps * 32`` and stamp matching PrimFunc attrs. Defaults
+        # match Triton's own defaults for unspecified kernels (4 warps =
+        # 128 threads/block, 2 software-pipeline stages); callers (the
+        # harness, ``from_ttir``) override these from Triton's compile
+        # options or kernel autotune-config when available.
+        self.num_warps: int = 4
+        self.num_stages: int = 2
 
     # ---- helpers --------------------------------------------------------
 
@@ -969,6 +983,10 @@ def _emit_store_copy(op: Any, ctx: "WalkerCtx", resolved: Dict[str, Any],
 # pragma_comment AttrStmt that survives PrimFunc pretty-print. Per the
 # ``feedback_no_silent_delete`` policy we keep these stubs live until the
 # walker is rewired through the new overlay.
+# DEAD-BUT-LOADED: superseded by op_emitters/memory.py:emit_tt_load via
+# OP_TABLE.update(MEMORY_EMITTERS). Per feedback_no_silent_delete: kept here
+# until the migration is verified end-to-end across all kernels. Drop in
+# a future cleanup wave when no caller depends on the legacy shape.
 def map_tt_load(op: Any, ctx: WalkerCtx) -> Any:
     """Lower ``tt.load(ptr, mask, other)`` to a guarded ``BufferLoad``.
 
@@ -1075,6 +1093,10 @@ def map_tt_load(op: Any, ctx: WalkerCtx) -> Any:
     return load_expr
 
 
+# DEAD-BUT-LOADED: superseded by op_emitters/memory.py:emit_tt_store via
+# OP_TABLE.update(MEMORY_EMITTERS). Per feedback_no_silent_delete: kept here
+# until the migration is verified end-to-end across all kernels. Drop in
+# a future cleanup wave when no caller depends on the legacy shape.
 def map_tt_store(op: Any, ctx: WalkerCtx) -> Any:
     """Lower ``tt.store(ptr, val, mask)`` to a guarded ``BufferStore``.
 
@@ -1261,6 +1283,10 @@ def map_tt_atomic_rmw(op: Any, ctx: WalkerCtx) -> Any:
 # ---------------------------------------------------------------------------
 
 
+# DEAD-BUT-LOADED: superseded by op_emitters/reduction.py:map_tt_dot via
+# OP_TABLE.update(REDUCTION_EMITTERS). Per feedback_no_silent_delete: kept
+# here until the migration is verified end-to-end across all kernels. Drop
+# in a future cleanup wave when no caller depends on the legacy shape.
 def map_tt_dot(op: Any, ctx: WalkerCtx) -> Any:
     """Lower ``tt.dot(a, b, c)`` to ``T.gemm(A, B, C)``.
 
@@ -1368,6 +1394,10 @@ def _reduce_combiner_kind(op: Any) -> str:
     raise EmitError("tt.reduce: cannot determine combiner kind from op")
 
 
+# DEAD-BUT-LOADED: superseded by op_emitters/reduction.py:map_tt_reduce via
+# OP_TABLE.update(REDUCTION_EMITTERS). Per feedback_no_silent_delete: kept
+# here until the migration is verified end-to-end across all kernels. Drop
+# in a future cleanup wave when no caller depends on the legacy shape.
 def map_tt_reduce(op: Any, ctx: WalkerCtx) -> Any:
     """Lower ``tt.reduce`` to ``T.reduce_sum`` / ``T.reduce_max`` / etc.
 
@@ -1465,6 +1495,10 @@ def map_tt_where(op: Any, ctx: WalkerCtx) -> Any:
 # ---------------------------------------------------------------------------
 
 
+# DEAD-BUT-LOADED: superseded by op_emitters/memory.py:emit_tt_broadcast via
+# OP_TABLE.update(MEMORY_EMITTERS). Per feedback_no_silent_delete: kept here
+# until the migration is verified end-to-end across all kernels. Drop in
+# a future cleanup wave when no caller depends on the legacy shape.
 def map_tt_broadcast(op: Any, ctx: WalkerCtx) -> Any:
     """Lower ``tt.broadcast`` to a shape-only rebind.
 
@@ -1483,6 +1517,10 @@ def map_tt_broadcast(op: Any, ctx: WalkerCtx) -> Any:
     return src
 
 
+# DEAD-BUT-LOADED: superseded by op_emitters/memory.py:emit_tt_splat via
+# OP_TABLE.update(MEMORY_EMITTERS). Per feedback_no_silent_delete: kept here
+# until the migration is verified end-to-end across all kernels. Drop in
+# a future cleanup wave when no caller depends on the legacy shape.
 def map_tt_splat(op: Any, ctx: WalkerCtx) -> Any:
     """Lower ``tt.splat`` (scalar -> tile) by binding the scalar PrimExpr.
 
@@ -1499,6 +1537,10 @@ def map_tt_splat(op: Any, ctx: WalkerCtx) -> Any:
     return src
 
 
+# DEAD-BUT-LOADED: superseded by op_emitters/memory.py:emit_tt_expand_dims via
+# OP_TABLE.update(MEMORY_EMITTERS). Per feedback_no_silent_delete: kept here
+# until the migration is verified end-to-end across all kernels. Drop in
+# a future cleanup wave when no caller depends on the legacy shape.
 def map_tt_expand_dims(op: Any, ctx: WalkerCtx) -> Any:
     """Lower ``tt.expand_dims`` to a shape rebind (no data movement).
 
@@ -1515,6 +1557,11 @@ def map_tt_expand_dims(op: Any, ctx: WalkerCtx) -> Any:
     return src
 
 
+# DEAD-BUT-LOADED: superseded by op_emitters/memory.py:emit_tt_reshape via
+# OP_TABLE.update(MEMORY_EMITTERS) (registered for both ``tt.reshape`` and
+# ``tt.view``). Per feedback_no_silent_delete: kept here until the
+# migration is verified end-to-end across all kernels. Drop in a future
+# cleanup wave when no caller depends on the legacy shape.
 def map_tt_reshape(op: Any, ctx: WalkerCtx) -> Any:
     """Lower ``tt.reshape`` to a TileLang ``view`` over the source.
 
@@ -1585,6 +1632,14 @@ def map_tt_trans(op: Any, ctx: WalkerCtx) -> Any:
     return src
 
 
+# DEAD-BUT-LOADED: superseded by op_emitters/memory.py:emit_tt_make_range via
+# OP_TABLE.update(MEMORY_EMITTERS). Per feedback_no_silent_delete: kept here
+# until the migration is verified end-to-end across all kernels. Drop in
+# a future cleanup wave when no caller depends on the legacy shape. Wave E3
+# defensive note (preserved): the helper inside this body still migrates the
+# Properties parsing in case the merge order ever shifts -- otherwise this
+# dead path would silently re-introduce the C2 zero-length-Ramp bug
+# (start=end=0).
 def map_tt_make_range(op: Any, ctx: WalkerCtx) -> Any:
     """Lower ``tt.make_range(start, end)`` to a Ramp PrimExpr.
 

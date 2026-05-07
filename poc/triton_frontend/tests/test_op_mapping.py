@@ -448,3 +448,121 @@ def test_op_mapping_emitters_raise_emit_error_not_value_error() -> None:
     # tt.broadcast: missing source
     with pytest.raises(EmitError, match=r"tt\.broadcast: missing source"):
         map_tt_broadcast({"name": "tt.broadcast", "operands": []}, ctx)
+
+
+# ---------------------------------------------------------------------------
+# H4-followup: dead-but-loaded legacy stub markup audit
+# ---------------------------------------------------------------------------
+#
+# A handful of legacy ``map_tt_*`` emitters in op_mapping.py are superseded
+# at module-init time by the per-family overlay dicts
+# (``op_emitters/{arith,memory,reduction,control}.py``) via
+# ``OP_TABLE.update(<EMITTERS>)``. Per ``feedback_no_silent_delete`` we keep
+# the legacy implementations in tree -- but we MUST mark them with a
+# uniform comment so future readers know which entries are dead vs.
+# canonical. This test enforces that markup discipline.
+
+
+def test_map_tt_dead_stubs_are_marked() -> None:
+    """Every legacy ``map_tt_*`` superseded by an overlay must carry the
+    ``DEAD-BUT-LOADED:`` marker comment immediately above its ``def``.
+
+    The audit list below was assembled by cross-referencing each
+    ``map_tt_*`` definition in op_mapping.py against the four overlay
+    EMITTERS dicts (ARITH / MEMORY / REDUCTION / CONTROL). Live emitters
+    (``map_tt_atomic_rmw``, ``map_tt_where``, ``map_tt_trans``,
+    ``map_tt_async_copy``, ``map_tt_mbarrier``,
+    ``map_tt_sync_threads_partial``,
+    ``map_tt_experimental_descriptor_{load,store}``, ``map_tt_print``,
+    ``map_tt_program_id``) are *not* listed here -- their op-table keys
+    are never overwritten so they remain canonical.
+    """
+    import re
+    from pathlib import Path
+
+    src_path = (
+        Path(__file__).resolve().parent.parent / "op_mapping.py"
+    )
+    src = src_path.read_text()
+
+    # Dead-but-loaded names (these are overridden by the overlay
+    # EMITTERS dicts via OP_TABLE.update(...) at import time).
+    DEAD_STUBS = [
+        "map_tt_load",
+        "map_tt_store",
+        "map_tt_dot",
+        "map_tt_reduce",
+        "map_tt_broadcast",
+        "map_tt_splat",
+        "map_tt_expand_dims",
+        "map_tt_reshape",
+        "map_tt_make_range",
+    ]
+
+    missing: List[str] = []
+    for name in DEAD_STUBS:
+        # Look for a ``# DEAD-BUT-LOADED:`` comment somewhere in the
+        # block of comment lines immediately preceding ``def <name>(``.
+        pattern = re.compile(
+            r"# DEAD-BUT-LOADED:[^\n]*"  # marker + same-line text
+            r"(?:\n#[^\n]*)*"            # optional continuation comment lines
+            r"\ndef " + re.escape(name) + r"\(",
+            re.MULTILINE,
+        )
+        if not pattern.search(src):
+            missing.append(name)
+
+    assert not missing, (
+        f"Dead-but-loaded legacy emitters missing the "
+        f"'# DEAD-BUT-LOADED:' marker in op_mapping.py: {missing!r}. "
+        f"Add the standard marker block immediately above each ``def`` "
+        f"so readers know the function is superseded by the overlay "
+        f"EMITTERS dict at module-init."
+    )
+
+
+def test_op_mapping_live_canonical_emitters_unmarked() -> None:
+    """Negative control: emitters that remain canonical in OP_TABLE
+    must NOT carry the ``DEAD-BUT-LOADED:`` marker (otherwise the marker
+    becomes meaningless -- a regression where someone marks a still-live
+    emitter would let the overlay-migration audit silently miss real
+    dead code).
+    """
+    import re
+    from pathlib import Path
+
+    src_path = (
+        Path(__file__).resolve().parent.parent / "op_mapping.py"
+    )
+    src = src_path.read_text()
+
+    LIVE_STUBS = [
+        "map_tt_atomic_rmw",
+        "map_tt_where",
+        "map_tt_trans",
+        "map_tt_async_copy",
+        "map_tt_mbarrier",
+        "map_tt_sync_threads_partial",
+        "map_tt_experimental_descriptor_load",
+        "map_tt_experimental_descriptor_store",
+        "map_tt_print",
+        "map_tt_program_id",
+    ]
+
+    falsely_marked: List[str] = []
+    for name in LIVE_STUBS:
+        pattern = re.compile(
+            r"# DEAD-BUT-LOADED:[^\n]*"
+            r"(?:\n#[^\n]*)*"
+            r"\ndef " + re.escape(name) + r"\(",
+            re.MULTILINE,
+        )
+        if pattern.search(src):
+            falsely_marked.append(name)
+
+    assert not falsely_marked, (
+        f"These emitters are still canonical (their OP_TABLE entry is "
+        f"never overwritten by an overlay) but carry the "
+        f"'# DEAD-BUT-LOADED:' marker: {falsely_marked!r}. Remove the "
+        f"marker -- a false-positive label hides real dead code."
+    )

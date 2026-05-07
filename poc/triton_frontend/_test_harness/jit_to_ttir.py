@@ -1,5 +1,12 @@
 """Triton ``@triton.jit`` -> TTIR text conversion.
 
+When ``return_options=True``, callers receive a ``(ttir_text, options_dict)``
+tuple; ``options_dict`` exposes the parsed Triton compile options (notably
+``num_warps`` and ``num_stages``) so the reducer downstream can stamp them
+on the resulting PrimFunc — TileLang's ``gemm.lower`` reads ``num_warps``
+out of the ``threadIdx.x`` ``thread_extent`` AttrStmt.
+
+
 Thin wrapper that captures the *first-stage* TTIR text from a Python
 Triton kernel. The reducer in :mod:`poc.triton_frontend` accepts both
 textual TTIR and ``mlir.ir.Module`` objects; this helper produces the
@@ -125,7 +132,8 @@ def triton_jit_to_ttir(
     *,
     constexprs: Optional[Dict[str, Any]] = None,
     target: Optional[str] = "cuda",
-) -> str:
+    return_options: bool = False,
+) -> Any:
     """Compile a ``@triton.jit`` kernel just far enough to capture TTIR text.
 
     The reducer accepts the returned string via
@@ -239,16 +247,32 @@ def triton_jit_to_ttir(
             codegen = be.get_codegen_implementation(options)
             module_map = be.get_module_map()
             module = src.make_ir(gpu_target, options, codegen, module_map, ctx)
+            ttir_text = str(module)
+            if return_options:
+                # Triton 3.x ``options`` is a dataclass-like object exposing
+                # ``num_warps`` / ``num_stages``. Surface them so the
+                # reducer downstream can stamp matching attrs / threadIdx.x
+                # extent on the resulting PrimFunc (TileLang's
+                # ``gemm.lower`` reads ``num_warps`` from the
+                # ``threadIdx.x`` ``thread_extent`` AttrStmt).
+                opts_dict: Dict[str, Any] = {
+                    "num_warps": int(getattr(options, "num_warps", 4) or 4),
+                    "num_stages": int(getattr(options, "num_stages", 2) or 2),
+                }
+                return ttir_text, opts_dict
             return str(module)
 
         # Otherwise: 3.0/3.1 fallback via compile() with options dict.
         compiled = compiler.compile(src, target=target, options={"stage": "ttir"})
+        # Legacy paths don't expose options the same way; default to the
+        # Triton-default 4 warps / 2 stages when caller asked for options.
+        _legacy_opts = {"num_warps": 4, "num_stages": 2}
         if hasattr(compiled, "asm"):
             ttir = compiled.asm.get("ttir")
             if isinstance(ttir, str) and ttir:
-                return ttir
+                return (ttir, _legacy_opts) if return_options else ttir
         if isinstance(compiled, str):
-            return compiled
+            return (compiled, _legacy_opts) if return_options else compiled
     except Exception as exc:  # noqa: BLE001 -- fall through to legacy path
         primary_exc = exc
 
