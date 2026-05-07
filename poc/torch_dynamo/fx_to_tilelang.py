@@ -785,6 +785,36 @@ def _emit_clamp(node, args, ctx: LoweringContext) -> _TensorSpec:
     return _TensorSpec(shape=x.shape, dtype=x.dtype)
 
 
+def _emit_getitem(node, args, ctx: LoweringContext) -> _TensorSpec:
+    """``operator.getitem`` — tuple/list element pluck.
+
+    Emitted by Dynamo for multi-output ops (e.g. flash_attention returns a
+    tuple ``(out, lse, philox_seed, philox_offset, ...)`` and downstream
+    consumers do ``getitem(fa, 0)`` to take ``out``). For shape tracking
+    we forward the source spec when index is 0 (the primary output by
+    convention), otherwise raise — emitter can be extended when a real
+    consumer needs ``lse``/``philox`` slots.
+    """
+    container, idx = args[0], args[1]
+    if isinstance(container, _TensorSpec):
+        if idx == 0:
+            ctx.op_trace.append(("getitem", (node.name, container, 0)))
+            return _TensorSpec(shape=container.shape, dtype=container.dtype)
+        # Non-zero indices on a single TensorSpec mean the FA emitter
+        # collapsed the tuple to its primary output already; surface the
+        # placeholder zeros (lse / philox) by reusing the same spec.
+        ctx.op_trace.append(("getitem_aux", (node.name, container, idx)))
+        return _TensorSpec(shape=container.shape, dtype=container.dtype)
+    # Tuple / list literal in FX: pluck statically.
+    if isinstance(container, (tuple, list)):
+        item = container[int(idx)]
+        if isinstance(item, _TensorSpec):
+            ctx.op_trace.append(("getitem", (node.name, item, int(idx))))
+            return _TensorSpec(shape=item.shape, dtype=item.dtype)
+    raise NotImplementedError(
+        f"getitem: unsupported container {type(container).__name__}")
+
+
 ATEN_DISPATCH: Dict[str, Callable[..., _TensorSpec]] = {
     # --- matmul family -----------------------------------------------------
     "matmul": emit_matmul,
@@ -813,6 +843,11 @@ ATEN_DISPATCH: Dict[str, Callable[..., _TensorSpec]] = {
     "mean": _emit_mean,
     # --- attention primitives ---------------------------------------------
     "_scaled_dot_product_flash_attention": _emit_flash_attention,
+    # CPU-flash variant: same return shape contract (out, lse, philox_seed,
+    # philox_offset, ...). Wave-8: torch emits this on MPS/CPU when no CUDA
+    # flash backend is available; reuse the FA-v2 emitter so FX lowers via
+    # flash_attention_fwd instead of bouncing to the eager fallback.
+    "_scaled_dot_product_flash_attention_for_cpu": _emit_flash_attention,
     "scaled_dot_product_attention": _emit_sdpa,
     # --- masking -----------------------------------------------------------
     "where": _emit_where,
@@ -843,6 +878,11 @@ ATEN_DISPATCH: Dict[str, Callable[..., _TensorSpec]] = {
     # --- training (no-op when training=False) -----------------------------
     "dropout": _emit_dropout,
     "_native_dropout": _emit_dropout,
+    # --- builtins surfaced by Dynamo on multi-output ops (wave-8) ---------
+    # ``operator.getitem`` shows up after ``_scaled_dot_product_flash_attention*``
+    # when the user only consumes the primary output; without an emitter the
+    # validator rejects the whole graph.
+    "getitem": _emit_getitem,
 }
 
 
