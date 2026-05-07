@@ -746,10 +746,17 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
   }
   ::z3::expr VisitExpr_(const ReduceNode* op) override { return Create(op); }
   // Ramp(base, stride, lanes) represents the vector [base, base+stride,
-  // base+2*stride, ...]. For proof purposes we conservatively visit `base`
-  // (loses stride/lanes range info; relies on surrounding constraint context).
+  // base+2*stride, ...]. fix-round-6 C6: returning only `op->base` is
+  // unsound for the upper lanes — the prover would treat the entire
+  // ramp expression as if it equalled `base`, so any CanProve over a
+  // Ramp-containing predicate could succeed by collapsing the lanes
+  // away. Conservative replacement: mint a fresh unconstrained scalar
+  // (Int or BV depending on mode) so the prover cannot derive anything
+  // load-bearing from the Ramp. Callers that genuinely need
+  // per-lane reasoning must lower out the Ramp before invoking Z3.
   ::z3::expr VisitExpr_(const ::tvm::tirx::RampNode* op) override {
-    return VisitExpr(op->base);
+    (void)op;
+    return MakeIntConst("ramp_" + std::to_string(memo_.size()));
   }
   // Broadcast(value, lanes) is a vector of identical scalars; visit the value.
   ::z3::expr VisitExpr_(const ::tvm::tirx::BroadcastNode* op) override {
