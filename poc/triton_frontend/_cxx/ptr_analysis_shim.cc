@@ -81,6 +81,9 @@ namespace {
 struct ContextImpl {
   mlir::MLIRContext ctx;
   std::string lastError;
+  // Persists the most recent value handed back via tl_pa_take_last_error so
+  // the returned `const char*` stays valid until the next take_last_error call.
+  std::string lastErrorReturned;
 };
 
 struct ModuleImpl {
@@ -99,6 +102,10 @@ extern "C" {
 
 TLPtrAnalysisContext* tl_pa_context_create(void) {
   auto* impl = new ContextImpl();
+  // getDialectRegistry() returns the context's internal registry by reference;
+  // mutating it directly is sufficient. Do NOT appendDialectRegistry(reg) on
+  // the same registry -- that's a self-append and can cause subtle MLIR state
+  // issues in future versions.
   auto& reg = impl->ctx.getDialectRegistry();
   reg.insert<mlir::arith::ArithDialect,
              mlir::math::MathDialect,
@@ -112,7 +119,6 @@ TLPtrAnalysisContext* tl_pa_context_create(void) {
 #if TL_PA_HAVE_TRITON_STRUCTURED
   reg.insert<mlir::tts::TritonStructuredDialect>();
 #endif
-  impl->ctx.appendDialectRegistry(reg);
   impl->ctx.loadAllAvailableDialects();
   return reinterpret_cast<TLPtrAnalysisContext*>(impl);
 }
@@ -215,17 +221,30 @@ const char* tl_pa_extract_states_json(TLPtrAnalysisModule* mod) {
       llvm::raw_string_ostream s(opStr);
       op->print(s);
     }
-    // Escape backslashes and quotes for JSON.
+    // Full RFC-8259 escaping for strings: backslash, quote, the named control
+    // chars (\b \f \n \r \t), and \uXXXX for everything else in U+0000..U+001F.
+    // Bytes >= 0x20 (including UTF-8 continuation bytes) pass through verbatim.
     std::string esc;
     esc.reserve(opStr.size());
-    for (char c : opStr) {
-      switch (c) {
+    for (unsigned char uc : opStr) {
+      switch (uc) {
         case '\\': esc += "\\\\"; break;
         case '"':  esc += "\\\""; break;
+        case '\b': esc += "\\b";  break;
+        case '\f': esc += "\\f";  break;
         case '\n': esc += "\\n";  break;
         case '\r': esc += "\\r";  break;
         case '\t': esc += "\\t";  break;
-        default:   esc += c;      break;
+        default:
+          if (uc < 0x20) {
+            static const char kHex[] = "0123456789abcdef";
+            char buf[7] = {'\\', 'u', '0', '0',
+                           kHex[(uc >> 4) & 0xF], kHex[uc & 0xF], '\0'};
+            esc += buf;
+          } else {
+            esc += static_cast<char>(uc);
+          }
+          break;
       }
     }
     os << "{\"op\":\"" << esc << "\"}";
@@ -239,8 +258,13 @@ const char* tl_pa_extract_states_json(TLPtrAnalysisModule* mod) {
 const char* tl_pa_take_last_error(TLPtrAnalysisContext* ctx) {
   if (!ctx) return "";
   auto* c = reinterpret_cast<ContextImpl*>(ctx);
-  // Note: we deliberately keep the message until the next set; Python copies.
-  return c->lastError.c_str();
+  // The header documents this as "retrieve and clear". Stash the message in a
+  // per-context buffer that survives until the *next* call (so the returned
+  // pointer remains valid for the duration of the caller's expression), then
+  // empty the live `lastError` so subsequent calls don't see stale state.
+  c->lastErrorReturned = std::move(c->lastError);
+  c->lastError.clear();
+  return c->lastErrorReturned.c_str();
 }
 
 }  // extern "C"

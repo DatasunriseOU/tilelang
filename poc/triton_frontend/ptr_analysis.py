@@ -37,6 +37,7 @@ __all__ = [
     "StridedLayout",
     "PtrAnalysis",
     "shim_available",
+    "dialects_available",
     "SHIM_MODULE_NAME",
 ]
 
@@ -48,6 +49,23 @@ SHIM_MODULE_NAME = "_triton_frontend_cxx"
 def shim_available() -> bool:
     """Return True if the C++ shim is importable from ``sys.path``."""
     return importlib.util.find_spec(SHIM_MODULE_NAME) is not None
+
+
+def dialects_available() -> bool:
+    """Return True if the shim was built against TritonStructured + Triton.
+
+    When False, the shim still imports but ``rewrite()`` will raise because
+    ``tl_pa_run_rewrite`` returns ``TL_PA_ERR_INTERNAL`` in stub mode. Tests
+    that need a working rewrite should skip on this rather than just on
+    :func:`shim_available`.
+    """
+    if not shim_available():
+        return False
+    try:
+        mod = importlib.import_module(SHIM_MODULE_NAME)
+    except ImportError:  # pragma: no cover
+        return False
+    return bool(getattr(mod, "dialects_available", False))
 
 
 def _load_shim() -> Any:
@@ -124,6 +142,7 @@ class PtrAnalysis:
         self._enable_gs = bool(enable_make_gather_scatter_tensor_ptr)
         self._use_unsafe_mask = bool(use_unsafe_mask)
         self._rewritten_text: Optional[str] = None
+        self._states: Optional[List[PtrState]] = None
         self._shim: Any = None  # lazy
 
     # ---- public API ------------------------------------------------------
@@ -134,23 +153,36 @@ class PtrAnalysis:
         The return type is ``str`` rather than ``mlir.ir.Module`` to avoid a
         hard dependency on ``mlir-python-bindings`` at the package boundary.
         Callers that already have a Context can re-parse the result.
-        """
-        shim = self._ensure_shim()
-        self._rewritten_text = shim.run_ptr_analysis(
-            self._module_text,
-            self._enable_gs,
-            self._use_unsafe_mask,
-        )
-        return self._rewritten_text
 
-    def extract_states(self) -> List[PtrState]:
-        """Return ``PtrState`` descriptors recovered by the analysis."""
+        Cached: subsequent calls return the previously-rewritten text without
+        re-parsing or re-running the analysis.
+        """
+        if self._rewritten_text is not None:
+            return self._rewritten_text
         shim = self._ensure_shim()
+        # Run rewrite + states extraction in a single ``Module`` lifetime so
+        # ``extract_states`` doesn't have to re-parse the module text. We use
+        # the Context/Module pybind wrappers directly rather than the
+        # ``run_ptr_analysis`` convenience helper for that reason.
         ctx = shim.Context()
         mod = shim.Module(ctx, self._module_text)
         mod.run_rewrite(self._enable_gs, self._use_unsafe_mask)
-        raw_json = mod.extract_states_json()
-        return _parse_states_json(raw_json)
+        self._rewritten_text = mod.to_string()
+        self._states = _parse_states_json(mod.extract_states_json())
+        return self._rewritten_text
+
+    def extract_states(self) -> List[PtrState]:
+        """Return ``PtrState`` descriptors recovered by the analysis.
+
+        Cached alongside :meth:`rewrite`; the first call to either populates
+        both caches in a single C++ Module lifetime.
+        """
+        if self._states is None:
+            # ``rewrite`` populates both caches.
+            self.rewrite()
+        # ``rewrite`` always sets ``_states`` to a list (possibly empty).
+        assert self._states is not None
+        return self._states
 
     # ---- internal helpers ------------------------------------------------
 

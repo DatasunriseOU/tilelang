@@ -71,8 +71,21 @@ std::string moduleToString(Module& m) {
 
 }  // namespace
 
+// Probe whether the Triton + TritonStructured dialect headers were available
+// at compile time. When false, ``run_rewrite`` will return TL_PA_ERR_INTERNAL
+// (see ptr_analysis_shim.cc); tests use this to differentiate "shim built but
+// stub mode" from "shim built with full dialect support".
+#if __has_include("triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h") \
+    && __has_include("triton/Dialect/Triton/IR/Dialect.h")
+#  define TL_PA_DIALECTS_AVAILABLE 1
+#else
+#  define TL_PA_DIALECTS_AVAILABLE 0
+#endif
+
 PYBIND11_MODULE(_triton_frontend_cxx, m) {
   m.doc() = "TileLang Triton-frontend C++ shim around triton-shared PtrAnalysis";
+
+  m.attr("dialects_available") = bool(TL_PA_DIALECTS_AVAILABLE);
 
   py::class_<Context>(m, "Context")
       .def(py::init<>())
@@ -120,16 +133,39 @@ PYBIND11_MODULE(_triton_frontend_cxx, m) {
         py::arg("enable_make_gather_scatter_tensor_ptr") = false,
         py::arg("use_unsafe_mask") = false);
 
-  // Stub matching the spec; richer extraction lands once TritonStructured
-  // dialect is vendored (integration #5).
+  // Honour the same flags as ``run_ptr_analysis`` so callers can switch
+  // between the two without surprises. The ``PtrAnalysis`` class default
+  // (False/False) matches upstream TritonToStructuredPass.
   m.def("extract_ptr_states",
-        [](const std::string& mlir_text) -> std::string {
+        [](const std::string& mlir_text,
+           bool enable_gs,
+           bool unsafe_mask) -> std::string {
           Context ctx;
           Module mod(ctx, mlir_text);
-          mod.run_rewrite(false, false);
+          mod.run_rewrite(enable_gs, unsafe_mask);
           return std::string(tl_pa_extract_states_json(mod.get()));
         },
-        py::arg("mlir_text"));
+        py::arg("mlir_text"),
+        py::arg("enable_make_gather_scatter_tensor_ptr") = false,
+        py::arg("use_unsafe_mask") = false);
+
+  // Single-pass helper: parse the module once, run rewrite, return both the
+  // rewritten text and the states-JSON. Lets the Python facade populate both
+  // caches with a single MLIRContext + parse.
+  m.def("run_ptr_analysis_with_states",
+        [](const std::string& mlir_text,
+           bool enable_gs,
+           bool unsafe_mask) -> py::tuple {
+          Context ctx;
+          Module mod(ctx, mlir_text);
+          mod.run_rewrite(enable_gs, unsafe_mask);
+          std::string rewritten = moduleToString(mod);
+          std::string states(tl_pa_extract_states_json(mod.get()));
+          return py::make_tuple(std::move(rewritten), std::move(states));
+        },
+        py::arg("mlir_text"),
+        py::arg("enable_make_gather_scatter_tensor_ptr") = false,
+        py::arg("use_unsafe_mask") = false);
 
   // Dialect registration is handled inside Context's constructor; this is a
   // no-op kept for API symmetry with mlir-python-bindings users.

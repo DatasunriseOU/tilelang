@@ -50,26 +50,38 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(pybind11 CONFIG REQUIRED)
 
 # ---- Triton (upstream) ------------------------------------------------
-# TODO(integration#5): the upstream Triton dialect / IR is required so
-# PtrAnalysis can resolve `triton::AddPtrOp`, `triton::MakeRangeOp`, etc.
-# Until integration #5 vendors that dialect we leave the link line stubbed
-# out so this CMakeLists still configures (and tests can compile against
-# the C ABI surface for unit-style validation).
-#
-# When wiring it in, replace the block below with something like:
-#
-#   set(TRITON_INSTALL_DIR "${TRITON_INSTALL_DIR}" CACHE PATH "Triton install")
-#   include_directories(${TRITON_INSTALL_DIR}/include)
-#   find_library(TRITON_IR_LIB TritonIR PATHS ${TRITON_INSTALL_DIR}/lib REQUIRED)
-#   list(APPEND TL_PA_LINK_LIBS ${TRITON_IR_LIB})
-#
+# When TRITON_INSTALL_DIR is set, locate the Triton headers + libraries so the
+# vendored PtrAnalysis.cpp can resolve `triton::AddPtrOp`, `triton::MakeRangeOp`,
+# etc. Without it we still configure (C-ABI builds) but `tl_pa_run_rewrite`
+# returns TL_PA_ERR_INTERNAL because the `__has_include` gates in
+# ptr_analysis_shim.cc disable the rewrite path.
+set(TL_PA_LINK_LIBS "")
 if(DEFINED ENV{TRITON_INSTALL_DIR} OR DEFINED TRITON_INSTALL_DIR)
   if(NOT DEFINED TRITON_INSTALL_DIR)
     set(TRITON_INSTALL_DIR "$ENV{TRITON_INSTALL_DIR}")
   endif()
   message(STATUS "Using TRITON_INSTALL_DIR = ${TRITON_INSTALL_DIR}")
   include_directories(${TRITON_INSTALL_DIR}/include)
-  # find_library(TRITON_IR_LIB TritonIR PATHS ${TRITON_INSTALL_DIR}/lib REQUIRED)
+  link_directories(${TRITON_INSTALL_DIR}/lib)
+  # The Triton dialect splits across a handful of static libs; PtrAnalysis.cpp
+  # references symbols from at least TritonIR + TritonAnalysis. Use REQUIRED
+  # for the core library and treat the rest as best-effort so older Triton
+  # checkouts still link.
+  find_library(TRITON_IR_LIB
+    NAMES TritonIR
+    PATHS ${TRITON_INSTALL_DIR}/lib
+    NO_DEFAULT_PATH
+    REQUIRED)
+  list(APPEND TL_PA_LINK_LIBS ${TRITON_IR_LIB})
+  foreach(_optlib TritonAnalysis TritonTransforms TritonGPUIR)
+    find_library(TRITON_${_optlib}_LIB
+      NAMES ${_optlib}
+      PATHS ${TRITON_INSTALL_DIR}/lib
+      NO_DEFAULT_PATH)
+    if(TRITON_${_optlib}_LIB)
+      list(APPEND TL_PA_LINK_LIBS ${TRITON_${_optlib}_LIB})
+    endif()
+  endforeach()
 else()
   message(WARNING
     "TRITON_INSTALL_DIR not set: building C-ABI surface only; "
@@ -87,7 +99,7 @@ set(VENDORED_SOURCES
 
 # ---- Library + Python module ----------------------------------------
 
-set(TL_PA_LINK_LIBS
+list(APPEND TL_PA_LINK_LIBS
   MLIRIR
   MLIRParser
   MLIRSupport

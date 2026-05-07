@@ -46,11 +46,25 @@ succeeds.
 ## API surface
 
 ```python
-from poc.triton_frontend.ptr_analysis import PtrAnalysis, PtrState
+from poc.triton_frontend.ptr_analysis import (
+    PtrAnalysis,
+    PtrState,
+    shim_available,
+    dialects_available,
+)
+
+assert shim_available()        # the .so loaded
+assert dialects_available()    # built with -DTRITON_INSTALL_DIR
+
 pa = PtrAnalysis(mlir_text)
-rewritten = pa.rewrite()              # returns the rewritten module text
-states = pa.extract_states()          # list[PtrState]
+rewritten = pa.rewrite()       # returns the rewritten module text (cached)
+states = pa.extract_states()   # list[PtrState] (shares the same parse)
 ```
+
+The first call to either ``rewrite()`` or ``extract_states()`` runs the C++
+analysis once; subsequent calls return cached results. The pybind layer also
+exposes ``run_ptr_analysis_with_states`` for callers that want both outputs
+in a single round-trip.
 
 ## License
 

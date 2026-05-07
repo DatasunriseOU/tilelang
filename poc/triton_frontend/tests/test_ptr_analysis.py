@@ -11,6 +11,7 @@ import pytest
 from poc.triton_frontend.ptr_analysis import (
     PtrAnalysis,
     PtrState,
+    dialects_available,
     shim_available,
 )
 
@@ -32,8 +33,11 @@ module {
 
 
 @pytest.mark.skipif(
-    not shim_available(),
-    reason="poc/triton_frontend/_cxx not built (see _cxx/README.md)",
+    not dialects_available(),
+    reason=(
+        "shim built without TritonStructured/Triton dialects -- rebuild with "
+        "-DTRITON_INSTALL_DIR set (see _cxx/README.md)."
+    ),
 )
 def test_ptr_analysis_rewrites_addptr() -> None:
     pa = PtrAnalysis(ADDPTR_MLIR)
@@ -44,9 +48,20 @@ def test_ptr_analysis_rewrites_addptr() -> None:
     assert "tts.make_tptr" in rewritten
 
 
-@pytest.mark.skipif(not shim_available(), reason="C++ shim not built")
+@pytest.mark.skipif(
+    not dialects_available(),
+    reason="shim built without TritonStructured/Triton dialects",
+)
 def test_ptr_analysis_extract_states_returns_list() -> None:
     states = PtrAnalysis(ADDPTR_MLIR).extract_states()
     assert isinstance(states, list)
     for s in states:
         assert isinstance(s, PtrState)
+
+
+@pytest.mark.skipif(not shim_available(), reason="C++ shim not built")
+def test_shim_present_implies_dialects_query_returns_bool() -> None:
+    # Even in stub mode (shim_available but not dialects_available), the
+    # query should never raise; it is the canonical way for callers to
+    # branch between full-rewrite and parse-only paths.
+    assert isinstance(dialects_available(), bool)
