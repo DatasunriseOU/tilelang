@@ -1240,6 +1240,14 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
     os << ">(";
     this->PrintExpr(op->args[0], os);
     os << "))";
+  } else if (op->op.same_as(tl::sync_threads_partial())) {
+    // Apple SIMD groups are always convergent at the simd-group level, so
+    // partial-lane sync collapses to a simdgroup_barrier. mask + n_threads
+    // are accepted for source compatibility but ignored at codegen time.
+    ICHECK_EQ(op->args.size(), 2U)
+        << "tl.sync_threads_partial expects <mask, n_threads>.";
+    this->PrintIndent();
+    this->stream << "simdgroup_barrier(mem_flags::mem_threadgroup);\n";
   } else if (op->op.same_as(tl::atomic_xchg_elem_op()) ||
              op->op.same_as(tl::atomic_xchg_ret_elem_op()) ||
              op->op.same_as(tl::atomic_and_elem_op()) ||

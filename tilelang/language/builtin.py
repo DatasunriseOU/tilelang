@@ -946,6 +946,31 @@ def sync_warp(mask: int = None):
     return tir.call_intrin("void", tir.op.Op.get("tl.sync_warp"))
 
 
+def sync_threads_partial(mask: int | PrimExpr, n_threads: int | PrimExpr):
+    """Partial-warp / subgroup barrier across a subset of lanes.
+
+    Args:
+        mask: bitmask of lanes that participate. On CUDA this is the
+            32-bit mask passed to ``__syncwarp``. On HIP and Metal the
+            mask is ignored because the wave / SIMD group is always
+            hardware-convergent.
+        n_threads: informational arrive-count. Used only for source
+            compatibility with cppmega.mlx kernels (``T.sync_threads(3,
+            RADIX)``); backend codegen ignores it.
+
+    Lowering:
+        - CUDA  → ``__syncwarp(mask)``
+        - HIP   → no-op (wavefront is convergent)
+        - Metal → ``simdgroup_barrier(mem_flags::mem_threadgroup)``
+    """
+    return tir.call_intrin(
+        "void",
+        tir.op.Op.get("tl.sync_threads_partial"),
+        _as_uint32_mask(mask),
+        n_threads,
+    )
+
+
 def shfl_sync(
     value: int | PrimExpr,
     srcLane: int | PrimExpr,

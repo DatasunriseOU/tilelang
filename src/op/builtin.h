@@ -720,6 +720,21 @@ TVM_DLL const Op &sync_grid();
 TVM_DLL const Op &sync_warp();
 
 /*!
+ * \brief Partial-warp / subgroup barrier across a subset of lanes.
+ *
+ * sync_threads_partial(mask, n_threads)
+ *
+ * - CUDA: __syncwarp(mask) — only the lanes set in `mask` participate.
+ * - HIP : wave is always convergent → no-op (mask + n ignored).
+ * - Metal: simdgroup_barrier(mem_flags::mem_threadgroup) — SIMD group
+ *   is always convergent on Apple GPUs, mask + n are ignored.
+ *
+ * Used by Triton-style radix-select / partial-warp reductions ported
+ * via the triton_frontend (cppmega.mlx topk_selector).
+ */
+TVM_DLL const Op &sync_threads_partial();
+
+/*!
  * \brief Programmatic dependency trigger.
  *
  * pdl_trigger()

@@ -2333,6 +2333,14 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << this->PrintExpr(op->args[0]);
     }
     this->stream << ");\n";
+  } else if (op->op.same_as(tl::sync_threads_partial())) {
+    // Partial-warp barrier: only the lanes in `mask` participate. The
+    // n_threads count (op->args[1]) is informational on CUDA — __syncwarp
+    // takes the mask alone.
+    ICHECK_EQ(op->args.size(), 2U)
+        << "tl.sync_threads_partial expects <mask, n_threads>.";
+    this->PrintIndent();
+    this->stream << "__syncwarp(" << this->PrintExpr(op->args[0]) << ");\n";
   } else if (op->op.same_as(tl::pdl_trigger())) {
     this->PrintIndent();
     this->stream << "cudaTriggerProgrammaticLaunchCompletion();\n";

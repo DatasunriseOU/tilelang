@@ -1005,6 +1005,11 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     // AMD wavefronts execute in lockstep, so intra-wavefront convergence is
     // guaranteed by the hardware. __syncwarp() has no HIP equivalent and is a
     // no-op here. The mask argument (if present) is intentionally ignored.
+  } else if (op->op.same_as(tl::sync_threads_partial())) {
+    // AMD wavefronts are always convergent at the wave level; partial-lane
+    // sync is a hardware no-op. mask + n_threads are intentionally ignored.
+    ICHECK_EQ(op->args.size(), 2U)
+        << "tl.sync_threads_partial expects <mask, n_threads>.";
   } else if (op->op.same_as(tl::any_sync())) {
     ICHECK_EQ(op->args.size(), 2U) << "tl.any_sync expects <mask, predicate>.";
     // HIP __any takes only the predicate; the mask is ignored because
