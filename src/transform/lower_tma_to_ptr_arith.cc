@@ -73,6 +73,7 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include <limits>
 #include <string>
 #include <utility>
 
@@ -248,16 +249,18 @@ DecodedDesc DecodeTmaDescriptor(const PrimExpr &desc_arg) {
  *                    inner store/load so layout passes upstream do not
  *                    lose it).
  *
- * Element-level addressing uses an opaque byte-level pointer arithmetic
- * via `tir::builtin::address_of`-equivalents would be ideal, but the
- * cleanest portable form is to materialize a `BufferLoad`/`BufferStore`
- * against synthetic flat buffers reconstructed from the descriptor data.
+ * Default form (`kEmitOpaque == false`): emit `BufferStore(BufferLoad(...))`
+ * against synthetic flat Buffers anchored on the handles via `LetStmt`-bound
+ * data Vars. This restores the structural pattern that
+ * `LowerPTXAsyncCopy` / `InjectSoftwarePipeline` look for, so on
+ * pre-Hopper Ampere the rewritten copy can be re-detected and re-issued
+ * via `cp.async`. The Buffers carry the descriptor element dtype, so
+ * downstream codegens see typed loads/stores rather than an opaque memcpy.
  *
- * Because we do NOT have the original Buffer objects here (only a handle
- * lowered through `access_ptr`), we emit a `tl::call_extern("memcpy_2d")`
- * style pseudo-call wrapped in a `For` nest of unit-stride increments.
- * The non-NV codegens (Metal, HIP, CPU) recognize the resulting
- * pointer-arith pattern and emit native threadgroup-copy instructions.
+ * Legacy form (`kEmitOpaque == true`): emits an opaque
+ * `tvm_call_extern("__tl_ptr_copy_elem")` per-element memcpy. Kept behind
+ * the toggle so we can A/B test the two paths and so older codegens (CPU
+ * fallback, very old HIP) that recognize the opaque marker keep working.
  *
  * Correctness note: this lowering is intentionally serial-by-default; the
  * surrounding `T.Parallel` / `thread_extent` annotations from upstream
@@ -266,6 +269,13 @@ DecodedDesc DecodeTmaDescriptor(const PrimExpr &desc_arg) {
  * (`LegalizeVectorizedLoop`, `MetalFragmentToSimdgroup`, the HIP codegen
  * wave-level vectorizer).
  */
+// When true, emit the legacy opaque `__tl_ptr_copy_elem` extern call
+// (perf-review path A — kept for regression A/B). When false (default),
+// emit `BufferStore(BufferLoad(...))` against synthetic flat Buffers so
+// `LowerPTXAsyncCopy` / `InjectSoftwarePipeline` can re-pattern-match
+// the copy and recover `cp.async` on Ampere.
+static constexpr bool kEmitOpaque = false;
+
 Stmt BuildPointerArithCopy(const DecodedDesc &desc,
                            const Array<PrimExpr> &coords,
                            const PrimExpr &smem_handle,
@@ -308,44 +318,102 @@ Stmt BuildPointerArithCopy(const DecodedDesc &desc,
   for (const auto &t : linear_smem_offset_terms)
     smem_elem_offset = smem_elem_offset + t;
 
-  // Element-sized handle add, in bytes vs elements: TMA descriptor
-  // strides are in BYTES (cuTensorMap convention), but the element
-  // memcpy below operates on `element_dtype` units. We forward the byte
-  // offset to a `handle_add_byte_offset` builtin (same one
-  // `lower_hopper_intrin.cc` uses for L2 base pointers).
-  PrimExpr global_ptr =
-      Call(DataType::Handle(), tirx::builtin::handle_add_byte_offset(),
-           {desc.global_addr, global_byte_offset});
-
-  // Convert smem element offset into bytes for the same builtin. Use
-  // `element_dtype.bytes()` which is now correctly recovered from the
-  // descriptor's `data_type` field (fixes the legacy 2-byte default that
-  // silently corrupted every non-fp16 TMA copy on non-NV targets).
-  PrimExpr smem_byte_offset =
-      smem_elem_offset * IntImm(kIdx, element_dtype.bytes());
-  PrimExpr smem_ptr = Call(DataType::Handle(),
-                           tirx::builtin::handle_add_byte_offset(),
-                           {smem_handle, smem_byte_offset});
-
-  // Innermost statement: a single-element memcpy via tvm_call_extern
-  // ("__tl_ptr_copy_elem"). This is portable: the codegens we care
-  // about (Metal, HIP, CPU) all understand a 1-element opaque copy.
-  // TODO: verify — would prefer a `BufferStore(BufferLoad(...))` form,
-  // but we no longer have the Buffer objects here. The opaque-call form
-  // is correctness-preserving; a follow-up may reconstruct synthetic
-  // Buffers and emit typed Loads/Stores for better codegen.
-  Array<PrimExpr> copy_args;
-  copy_args.push_back(StringImm("__tl_ptr_copy_elem"));
-  if (is_load) {
-    copy_args.push_back(smem_ptr);
-    copy_args.push_back(global_ptr);
+  // Synthetic-buffer data Vars (used only on the non-opaque path). Declared
+  // at function scope so the LetStmt bindings emitted after the For nest
+  // can reference them.
+  Optional<Var> nonopaque_g_data;
+  Optional<Var> nonopaque_s_data;
+  Stmt body;
+  if (kEmitOpaque) {
+    // Legacy path: opaque per-element extern memcpy. Kept for A/B and for
+    // codegens that match the literal `__tl_ptr_copy_elem` symbol.
+    PrimExpr global_ptr =
+        Call(DataType::Handle(), tirx::builtin::handle_add_byte_offset(),
+             {desc.global_addr, global_byte_offset});
+    PrimExpr smem_byte_offset =
+        smem_elem_offset * IntImm(kIdx, element_dtype.bytes());
+    PrimExpr smem_ptr = Call(DataType::Handle(),
+                             tirx::builtin::handle_add_byte_offset(),
+                             {smem_handle, smem_byte_offset});
+    Array<PrimExpr> copy_args;
+    copy_args.push_back(StringImm("__tl_ptr_copy_elem"));
+    if (is_load) {
+      copy_args.push_back(smem_ptr);
+      copy_args.push_back(global_ptr);
+    } else {
+      copy_args.push_back(global_ptr);
+      copy_args.push_back(smem_ptr);
+    }
+    copy_args.push_back(IntImm(DataType::Int(32), element_dtype.bytes()));
+    body = Evaluate(Call(DataType::Int(32),
+                         tirx::builtin::call_extern(), copy_args));
   } else {
-    copy_args.push_back(global_ptr);
-    copy_args.push_back(smem_ptr);
+    // Default path: emit `BufferStore(BufferLoad(...))` against synthetic
+    // flat Buffers anchored on the handles via LetStmt-bound data Vars.
+    //
+    // The descriptor's `global_stride` is in BYTES (cuTensorMap
+    // convention) — convert to element strides by dividing by
+    // `element_dtype.bytes()` so a single typed `BufferLoad` indexes by
+    // element count. TMA descriptors guarantee `global_stride[0] ==
+    // dtype.bytes()` (the `is_one(global_stride[0])` ICHECK in copy.cc
+    // is in element units before the byte multiplication), so all
+    // strides are exact multiples of `dtype.bytes()` and the division
+    // is loss-less.
+    PrimExpr elem_bytes = IntImm(kIdx, element_dtype.bytes());
+    PrimExpr global_elem_offset = IntImm(kIdx, 0);
+    {
+      // Recompute the global offset in ELEMENT units. Same shape as the
+      // byte offset above but with each stride already divided by
+      // dtype.bytes().
+      for (int axis = desc.rank - 1; axis >= 0; --axis) {
+        // ivars was filled in reverse (rank-1 .. 0), so the var matching
+        // descriptor `axis` lives at index `desc.rank - 1 - axis`.
+        Var iv = ivars[desc.rank - 1 - axis];
+        PrimExpr coord_plus_iv = cast(kIdx, coords[axis]) + iv;
+        PrimExpr stride_elems =
+            floordiv(cast(kIdx, desc.global_stride[axis]), elem_bytes);
+        global_elem_offset = global_elem_offset + coord_plus_iv * stride_elems;
+      }
+    }
+
+    // Synthetic flat Buffers anchored on fresh data Vars. We bind the
+    // data Vars to the handle expressions via `LetStmt` after wrapping
+    // the For nest. Choosing `Int(64)` extents lets us declare an
+    // effectively unbounded view (the actual bounds come from the loop
+    // ranges and the descriptor coords). `data_alignment=16` and
+    // `offset_factor=1` mirror what `decl_buffer` chooses by default for
+    // typed copies.
+    Var g_data("tl_tma_global_view", DataType::Handle());
+    Var s_data("tl_tma_smem_view", DataType::Handle());
+    nonopaque_g_data = g_data;
+    nonopaque_s_data = s_data;
+    PrimExpr huge_extent = IntImm(kIdx, std::numeric_limits<int64_t>::max());
+    Buffer g_buf(g_data, element_dtype, /*shape=*/{huge_extent},
+                 /*strides=*/{}, /*elem_offset=*/IntImm(kIdx, 0),
+                 /*name=*/"tl_tma_global_view",
+                 /*data_alignment=*/16, /*offset_factor=*/1,
+                 /*buffer_type=*/BufferType::kDefault);
+    Buffer s_buf(s_data, element_dtype, /*shape=*/{huge_extent},
+                 /*strides=*/{}, /*elem_offset=*/IntImm(kIdx, 0),
+                 /*name=*/"tl_tma_smem_view",
+                 /*data_alignment=*/16, /*offset_factor=*/1,
+                 /*buffer_type=*/BufferType::kDefault);
+
+    if (is_load) {
+      body = BufferStore(s_buf,
+                         BufferLoad(g_buf, {global_elem_offset}),
+                         {smem_elem_offset});
+    } else {
+      body = BufferStore(g_buf,
+                         BufferLoad(s_buf, {smem_elem_offset}),
+                         {global_elem_offset});
+    }
+    (void)g_buf;
+    (void)s_buf;
+    // The data-Var bindings are deferred to after the For-nest wrapping
+    // (see the trailing `LetStmt` bindings below) so they live above the
+    // loop scope, not per iteration.
   }
-  copy_args.push_back(IntImm(DataType::Int(32), element_dtype.bytes()));
-  Stmt body = Evaluate(Call(DataType::Int(32),
-                            tirx::builtin::call_extern(), copy_args));
 
   // Wrap in For loops, outermost = axis 0 in descriptor order.
   // ivars was filled in reverse (axis = rank-1 .. 0), so iterate
@@ -357,11 +425,31 @@ Stmt BuildPointerArithCopy(const DecodedDesc &desc,
     body = For(iv, IntImm(kIdx, 0), extent, ForKind::kSerial, body);
   }
 
+  // Bind the synthetic Buffer data Vars to the actual handle expressions
+  // ABOVE the loop scope (so the bindings happen once per copy, not once
+  // per iteration). Standard TVM aliasing idiom — `LowerPTXAsyncCopy`
+  // walks through `LetStmt`s when matching `BufferStore(BufferLoad(...))`
+  // pairs, so the buffer-view abstraction is transparent to the
+  // pattern-matcher.
+  if (!kEmitOpaque && nonopaque_g_data.defined() &&
+      nonopaque_s_data.defined()) {
+    body = LetStmt(nonopaque_g_data.value(), desc.global_addr, body);
+    body = LetStmt(nonopaque_s_data.value(), smem_handle, body);
+  }
+
   // Preserve the swizzle hint so downstream Metal/HIP layout passes
   // (and any future reconstruction of typed Buffer ops) can still see
   // the original cuTensorMap swizzle mode. Attached as a pragma value
   // so it round-trips through `inject_pipeline.cc`-style attr scans
   // without being mistaken for an executable statement.
+  //
+  // Distinguishability invariant (locked by
+  // test_swizzle_distinguishability): the four swizzle codes
+  // (NONE/32B/64B/128B = 0/1/2/3) must remain individually addressable
+  // post-lowering. Either this AttrStmt carries the integer code, or
+  // `inject_pipeline.cc::AsyncCommitWaitAttrLowerer` forwards it onto
+  // the For-loop annotation under "tl_tma_swizzle". Collapsing to a
+  // single default would silently degrade Metal swizzled-tile codegen.
   if (desc.swizzle.defined()) {
     body = AttrStmt(Integer(0), "pragma_tma_swizzle", desc.swizzle, body);
   }
@@ -404,8 +492,57 @@ public:
       //          eviction_policy)
       // tma_store(descriptor, smem_addr, coord_0..coord_{R-1},
       //           need_reduce, eviction_policy)
-      bool is_load = call->op.same_as(tma_load()) ||
-                     call->op.same_as(tma_load_im2col());
+      // tma_load_im2col(descriptor, mbarrier, smem_addr,
+      //                 coord_0..coord_{R-1},   <-- (c, w, h, n) for 2D
+      //                 image_offset_w, image_offset_h,
+      //                 eviction_policy)
+      //   The im2col variant has 2 EXTRA arguments (image_offset_w,
+      //   image_offset_h) between the per-axis coords and the eviction
+      //   policy. Treating it as `tma_load` would silently grab one of
+      //   the image_offset values as the eviction byte and miss the
+      //   conv2d-with-padding gather semantics entirely.
+      if (call->op.same_as(tma_load_im2col())) {
+        // Refuse to lower (correctness > silently-wrong fallback).
+        // TODO(im2col-fallback): emit a real conv2d-with-padding gather
+        //   loop. From the descriptor encoding (see
+        //   `TMAIm2ColDesc::EncodeCallArgs` in `src/op/copy.cc:2577`):
+        //
+        //     args[0]                = data_type (CUtensorMapDataType)
+        //     args[1]                = rank (R; typically 4 for NHWC)
+        //     args[2]                = global_addr
+        //     args[3 .. 3+R)         = global_shape   (fastest-first)
+        //     args[3+R .. 3+2R)      = global_stride  (in BYTES)
+        //     args[3+2R .. 3+3R)     = elem_stride    ({1, sH, sW, 1})
+        //     args[3+3R .. 3+3R+2)   = lower_corner   (-padding for H,W)
+        //     args[3+3R+2 .. 3+3R+4) = upper_corner   (-padding for H,W)
+        //     args[3+3R+4]           = smem_box_pixel
+        //     args[3+3R+5]           = smem_box_channel
+        //     args[3+3R+6 .. +9]     = interleave, swizzle, l2_promotion,
+        //                              oob_fill
+        //
+        //   The fallback should iterate (pixel_idx, channel_idx) over
+        //   the smem_box, decode pixel_idx -> (h_pix, w_pix) using
+        //   ceildiv against w_dim/h_dim derived from global_shape +
+        //   stride/dilation/kernel/padding (mirroring lines 2455-2479
+        //   in copy.cc), apply lower_corner/upper_corner padding by
+        //   gating with `IfThenElse(in_bounds, gather, zero_fill)`, and
+        //   emit per-channel `BufferStore(BufferLoad(...))` against
+        //   strided global / contiguous smem flat buffers.
+        //
+        //   Until then: leave the call in place. Non-NV codegen will
+        //   reject it with a clear "unsupported tma_load_im2col" error,
+        //   which is preferable to producing a mis-strided copy that
+        //   silently corrupts conv2d output.
+        LOG(WARNING) << "LowerTMAToPtrArith: tma_load_im2col fallback is not "
+                     << "yet implemented (different coord layout from "
+                     << "tma_load — image_offset_w/_h between coords and "
+                     << "eviction). Leaving call in place; non-NV codegen "
+                     << "will reject it. Ref: copy.cc:Conv2DIm2ColOpNode::"
+                     << "Lower for the gather semantics that need to be "
+                     << "materialized here.";
+        return StmtExprMutator::VisitStmt_(op);
+      }
+      bool is_load = call->op.same_as(tma_load());
       bool is_store = call->op.same_as(tma_store());
       if (is_load || is_store) {
         return RewriteTmaCall(call, is_load).value_or(

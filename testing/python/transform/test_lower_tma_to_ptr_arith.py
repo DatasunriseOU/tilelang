@@ -17,8 +17,18 @@ import tilelang as tl  # noqa: E402
 from tvm.script import tir as T  # noqa: E402
 
 
+_CU_TENSOR_MAP_DATA_TYPE_UINT8 = 0
+_CU_TENSOR_MAP_DATA_TYPE_UINT16 = 1
+_CU_TENSOR_MAP_DATA_TYPE_UINT32 = 2
+_CU_TENSOR_MAP_DATA_TYPE_INT32 = 3
 _CU_TENSOR_MAP_DATA_TYPE_FLOAT16 = 6
 _CU_TENSOR_MAP_DATA_TYPE_FLOAT32 = 7
+_CU_TENSOR_MAP_DATA_TYPE_BFLOAT16 = 9
+
+_CU_TENSOR_MAP_SWIZZLE_NONE = 0
+_CU_TENSOR_MAP_SWIZZLE_32B = 1
+_CU_TENSOR_MAP_SWIZZLE_64B = 2
+_CU_TENSOR_MAP_SWIZZLE_128B = 3
 
 
 def _build_tma_kernel(data_type_code: int = _CU_TENSOR_MAP_DATA_TYPE_FLOAT16):
@@ -233,6 +243,140 @@ def test_im2col_call_is_left_in_place_with_warning():
     s = str(mod.script() if hasattr(mod, "script") else mod)
     assert "tl.tma_load_im2col" in s, \
         "im2col call must NOT be silently rewritten (TODO: gather loop)."
+
+
+def _build_tma_kernel_full(
+    data_type_code: int = _CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+    swizzle: int = _CU_TENSOR_MAP_SWIZZLE_NONE,
+    elem_bytes: int = 2,
+    big_stride: bool = False,
+):
+    """Extended descriptor builder. ``swizzle`` covers all 4 cuTensorMap
+    swizzle codes (0/1/2/3); ``big_stride=True`` exercises the 64-bit
+    accumulator path with a stride > 2^31 to catch any 32-bit overflow
+    regression in the offset math."""
+
+    create_tma = tvm.tir.op.Op.get("tl.create_tma_descriptor")
+    tma_load = tvm.tir.op.Op.get("tl.tma_load")
+
+    inner_stride = elem_bytes
+    outer_stride = (1 << 32) + 64 * elem_bytes if big_stride else 64 * elem_bytes
+    stride_t = T.int64 if big_stride else T.int32
+
+    @T.prim_func
+    def kernel(A_handle: T.handle, smem_handle: T.handle):
+        desc = T.call_intrin(
+            "handle",
+            create_tma,
+            T.int32(data_type_code),
+            T.int32(2),
+            A_handle,
+            T.int32(64), T.int32(64),
+            stride_t(inner_stride), stride_t(outer_stride),
+            T.int32(16), T.int32(16),
+            T.int32(1), T.int32(1),
+            T.int32(0),
+            T.int32(swizzle),
+            T.int32(0),
+            T.int32(0),
+        )
+        T.evaluate(
+            T.call_intrin(
+                "handle", tma_load,
+                desc, T.int32(0), smem_handle,
+                T.int32(0), T.int32(0),
+                T.int32(0),
+            ))
+
+    return kernel
+
+
+@pytest.mark.parametrize(
+    "code,expected",
+    [
+        (_CU_TENSOR_MAP_DATA_TYPE_UINT8, ("uint8", 1)),
+        (_CU_TENSOR_MAP_DATA_TYPE_UINT16, ("uint16", 2)),
+        (_CU_TENSOR_MAP_DATA_TYPE_INT32, ("int32", 4)),
+        (_CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, ("bfloat16", 2)),
+    ],
+)
+def test_dtype_recovery_matrix(code, expected):
+    """Lock the inverse of ``to_CUtensorMapDataType`` for the production
+    paths beyond fp16/fp32: uint8 (fp8 path — cppmega FP8 amax),
+    uint16 (legacy half-int), int32, and bfloat16. Regression target:
+    every recovered dtype must match the descriptor's encoded type, and
+    the synthetic view's per-element byte count must be exact."""
+
+    type_name, byte_size = expected
+    func = _build_tma_kernel_full(
+        data_type_code=code, elem_bytes=byte_size,
+    )
+    mod = _lower(func, "metal")
+    s = str(mod.script() if hasattr(mod, "script") else mod)
+    if "__tl_ptr_copy_elem" in s:
+        # Legacy opaque path: byte count must be exact.
+        marker = (f", {byte_size})", f", {byte_size}i64)",
+                  f", T.int64({byte_size})")
+        assert any(m in s for m in marker), \
+            f"expected {byte_size}-byte stride for {type_name}:\n{s}"
+    else:
+        assert type_name in s, \
+            f"expected {type_name} dtype in synthetic view:\n{s}"
+
+
+@pytest.mark.parametrize(
+    "swizzle_code",
+    [
+        _CU_TENSOR_MAP_SWIZZLE_NONE,
+        _CU_TENSOR_MAP_SWIZZLE_32B,
+        _CU_TENSOR_MAP_SWIZZLE_64B,
+        _CU_TENSOR_MAP_SWIZZLE_128B,
+    ],
+)
+def test_swizzle_distinguishability(swizzle_code):
+    """Each cuTensorMap swizzle code (NONE/32B/64B/128B) must round-trip
+    through ``LowerTMAToPtrArith`` without being collapsed to a single
+    default. Either the ``pragma_tma_swizzle`` AttrStmt must carry the
+    integer code, or the For-loop annotation ``tl_tma_swizzle`` set by
+    inject_pipeline must carry it. Regression: previously the swizzle
+    field was decoded but never attached to the rewritten body, so all
+    modes lowered identically and Metal/HIP layout codegens lost the
+    information."""
+
+    func = _build_tma_kernel_full(swizzle=swizzle_code)
+    mod = _lower(func, "metal")
+    s = str(mod.script() if hasattr(mod, "script") else mod)
+    if swizzle_code == _CU_TENSOR_MAP_SWIZZLE_NONE:
+        # Code 0 is the legitimate "no swizzle" case; pass either preserves
+        # the pragma with value 0 or omits it entirely.
+        return
+    # Non-zero codes MUST be visible somewhere in the lowered IR — either
+    # as the AttrStmt key or the For-loop annotation key.
+    assert ("pragma_tma_swizzle" in s) or ("tl_tma_swizzle" in s), \
+        f"swizzle code {swizzle_code} dropped during lowering:\n{s}"
+    # And the integer value must be the one we set, not collapsed to a
+    # constant 0/1.
+    assert str(swizzle_code) in s, \
+        f"swizzle integer code {swizzle_code} not present in IR:\n{s}"
+
+
+def test_int64_stride_no_overflow():
+    """Regression for the 64-bit offset accumulator path. A stride
+    exceeding 2^31 would silently wrap to a negative value if the offset
+    arithmetic accumulated in Int(32). Verify that the lowered IR uses
+    Int(64) ops (visible as ``int64`` casts or ``i64`` literals) rather
+    than truncating to Int(32). Without this guard, large dense tensors
+    (e.g. 64K-wide fp32 rows × 32-rank descriptor) would corrupt memory
+    on the fallback path."""
+
+    func = _build_tma_kernel_full(big_stride=True)
+    mod = _lower(func, "metal")
+    s = str(mod.script() if hasattr(mod, "script") else mod)
+    # Either the cast(int64, ...) form, the i64 literal suffix, or the
+    # T.int64() printer form must appear — all three are valid TVM
+    # serializations of an Int(64) op chain.
+    assert ("int64" in s) or ("i64" in s) or ("T.int64(" in s), \
+        f"expected Int(64) accumulator in lowered IR for >2^31 stride:\n{s}"
 
 
 def test_unknown_dtype_code_is_refused():

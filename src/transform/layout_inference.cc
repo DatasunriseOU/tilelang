@@ -834,11 +834,16 @@ private:
           // mma_C
           return makeGemmFragmentC(M, N, M, N, default_element_bits);
         }
-        // TODO: add simdgroup Fragment factories in src/op/builtin.cc /
-        // src/layout/gemm_layouts.cc (currently absent — see grep for
-        // "Simdgroup" in src/layout/). Until then, fall through to the
-        // INFO-log + empty-Layout path so existing extern intrinsics keep
-        // working.
+        // Apple Metal Shading Language Specification §6.7.2 defines
+        // simdgroup_matrix<T,8,8> as an opaque type whose per-thread element
+        // decomposition is implementation-defined. Loads/stores go through
+        // simdgroup_load / simdgroup_store, which manage the thread-element
+        // mapping internally; user code never indexes the matrix directly.
+        // Returning an empty Layout() here is the *correct* answer (not a
+        // TODO): there is no canonical thread/element mapping to encode.
+        // Codegen recognises the scope ``"metal.simdgroup"`` (see
+        // src/op/utils.h:61 ``IsMetalSimdgroupBuffer``) and emits the right
+        // builtin::simdgroup_* calls without needing layout inference here.
         if (str == "simdgroup_a" || str == "simdgroup_b" ||
             str == "simdgroup_c") {
           return Layout();

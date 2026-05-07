@@ -254,6 +254,72 @@ __device__ void clean_intrinsic(const float *a, const float *b, float *out) {
     assert not body_warns, f"unexpected body-name warning(s): {body_warns!r}"
 
 
+def test_validate_body_ignores_names_inside_raw_string(recwarn):
+    """C++11 raw-string-literal contents must not satisfy the contract scan.
+
+    Without the raw-string scrubber a body that embeds an MSL fragment as a
+    raw string would cause the regular-string regex to desync at the inner
+    ``"`` and accidentally accept the Frag name. This test pins the new
+    raw-string-aware scrub.
+    """
+    body = (
+        '__device__ void fake_intrinsic(const float *a, const float *b, float *not_out) {\n'
+        '    const char *src = R"msl(\n'
+        '        // \'out\' shows up inside the raw string but NOT in real code\n'
+        '        out = a + b;\n'
+        '    )msl";\n'
+        '    not_out[0] = a[0] + b[0];\n'
+        '    (void)src;\n'
+        '}\n'
+    )
+    extern_intrinsic(
+        name="fused_relu_add_16",
+        signature=lambda: (
+            Frag("a", (16,), "shared", "float32"),
+            Frag("b", (16,), "shared", "float32"),
+            Frag("out", (16,), "shared", "float32", is_output=True),
+        ),
+        bodies={"cuda": body},
+    )
+    msgs = [str(w.message) for w in recwarn.list if issubclass(w.category, UserWarning)]
+    assert any("'out'" in m for m in msgs), (
+        f"expected warning when 'out' only appears inside a raw-string literal; saw {msgs!r}"
+    )
+
+
+def test_register_or_replace_atomic_round_trip():
+    """``register_or_replace`` must atomically swap a prior entry."""
+    extern_intrinsic(
+        name="fused_relu_add_16",
+        signature=lambda: (
+            Frag("a", (16,), "shared", "float32"),
+            Frag("out", (16,), "shared", "float32", is_output=True),
+        ),
+        bodies={"cuda": _FUSED_RELU_ADD_CU},
+    )
+    first = extern_registry.lookup("fused_relu_add_16")
+    assert first is not None
+    replacement = extern_registry.ExternIntrinsic(
+        name="fused_relu_add_16",
+        signature=lambda: (Frag("z", (32,), "shared", "float32", is_output=True),),
+        bodies={"cuda": _FUSED_RELU_ADD_CU},
+    )
+    prev = extern_registry.register_or_replace(replacement)
+    assert prev is first
+    after = extern_registry.lookup("fused_relu_add_16")
+    assert after is replacement
+    # Calling it on a fresh name should return ``None`` (no prior entry).
+    fresh = extern_registry.ExternIntrinsic(
+        name="brand_new_intrinsic",
+        signature=lambda: (Frag("x", (8,), "shared", "float32"),),
+        bodies={"cuda": _FUSED_RELU_ADD_CU},
+    )
+    try:
+        assert extern_registry.register_or_replace(fresh) is None
+    finally:
+        extern_registry.unregister("brand_new_intrinsic")
+
+
 def test_validate_body_ignores_names_inside_comments(recwarn):
     """A Frag.name appearing only in a comment must not satisfy the check."""
     body = r"""

@@ -67,6 +67,28 @@ class _Registry:
         with self._lock:
             del self._table[name]
 
+    def register_or_replace(self, intrinsic: ExternIntrinsic) -> ExternIntrinsic | None:
+        """Register, atomically replacing any existing entry. Returns the
+        previous entry (or ``None``) so callers can verify that a replace
+        actually happened.
+
+        Use case: notebook / REPL re-decoration where the user re-evaluates
+        the same ``@extern_intrinsic`` cell. Without this, the strict
+        ``register`` raises ``KeyError`` on the second eval. The lock ensures
+        that two threads doing concurrent ``lookup`` + ``register`` cannot
+        race past the duplicate guard (TOCTOU).
+        """
+        for target in intrinsic.bodies:
+            if target not in _VALID_TARGETS:
+                raise ValueError(
+                    f"extern_intrinsic '{intrinsic.name}' has unknown target "
+                    f"'{target}'; valid targets: {sorted(_VALID_TARGETS)}"
+                )
+        with self._lock:
+            prev = self._table.get(intrinsic.name)
+            self._table[intrinsic.name] = intrinsic
+            return prev
+
     def lookup(self, name: str) -> Optional[ExternIntrinsic]:
         """Return the entry for ``name`` or None."""
         with self._lock:
@@ -116,6 +138,16 @@ def unregister(name: str) -> None:
     _REGISTRY.unregister(name)
 
 
+def register_or_replace(intrinsic: ExternIntrinsic) -> ExternIntrinsic | None:
+    """Atomically replace any prior entry for ``intrinsic.name``.
+
+    Returns the previous entry or ``None``. Intended for notebook / REPL
+    re-decoration where strict ``register`` would raise ``KeyError`` on the
+    second cell evaluation.
+    """
+    return _REGISTRY.register_or_replace(intrinsic)
+
+
 def valid_targets() -> frozenset[str]:
     """Return the set of supported codegen targets."""
     return _VALID_TARGETS
@@ -124,6 +156,7 @@ def valid_targets() -> frozenset[str]:
 __all__ = [
     "ExternIntrinsic",
     "register",
+    "register_or_replace",
     "lookup",
     "keys",
     "clear",

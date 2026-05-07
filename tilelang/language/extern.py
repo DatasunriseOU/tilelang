@@ -192,12 +192,28 @@ def _split_args(arglist: str) -> list[str]:
 
 # Strip out comments + string literals before the parameter-name scan so a
 # stray ``// uses A_frag`` / ``"a"`` doesn't satisfy the contract check.
+#
+# Order matters: raw strings (``R"tag(...)tag"``) must be removed BEFORE the
+# regular-string regex sees them, otherwise the embedded ``"`` confuses the
+# escape-aware matcher and we'd leak fragment-name-looking identifiers from
+# the raw-string body. Raw strings are common in Apple MSL bodies that embed
+# multi-line shader source.
 _C_COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
 _C_STRING_RE = re.compile(r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'")
+# C++11 raw string literals: R"delim(...)delim" or u8R"...". The delimiter is
+# captured (back-referenced) so we match the matching closing ``)delim"``.
+_C_RAW_STRING_RE = re.compile(r"(?:u8|u|U|L)?R\"([^\s()\\]{0,16})\((?:.|\n)*?\)\1\"")
 
 
 def _scrub_body_for_name_scan(body: str) -> str:
-    """Drop comments + string literals so the name scan doesn't match them."""
+    """Drop comments + raw-string + string literals before the name scan.
+
+    Raw strings are scrubbed first because their internal ``"`` would otherwise
+    desync the escape-aware regular-string matcher and cause it to either miss
+    a closing quote or eat unrelated source. Without this, an extern body with
+    a raw-string-embedded MSL shader could hide / fake fragment-name tokens.
+    """
+    body = _C_RAW_STRING_RE.sub(" ", body)
     body = _C_COMMENT_RE.sub(" ", body)
     body = _C_STRING_RE.sub(" ", body)
     return body
@@ -568,10 +584,19 @@ def _emit_tir_call(
 # concrete register-tile layouts are owned by the C++ side. The factories
 # here only make the *contract* unambiguous.
 #
-# TODO(simdgroup): once the Metal codegen lands explicit register-tile
-# layouts (per Apple MSL §6.7), factor the per-axis stride/thread mapping
-# into these factories so the example in poc/extern_intrinsic_examples/
-# doesn't have to know magic numbers.
+# Note on the missing Fragment factory for ``simdgroup_*``: Apple's Metal
+# Shading Language Specification §6.7.2 defines ``simdgroup_matrix<T,8,8>``
+# as an opaque type whose per-thread element decomposition is
+# implementation-defined. Loads/stores go through ``simdgroup_load`` /
+# ``simdgroup_store``, which themselves manage the thread-element mapping;
+# user code never indexes ``matrix[lane][elt]`` directly. Consequently
+# ``layout_inference.cc`` returns an empty ``Layout()`` for the three
+# ``simdgroup_*`` strings — there is no canonical thread/element mapping
+# to encode. The Fragment factories below pin the *call-site contract*
+# (shape (8, 8), scope=``"simdgroup"``, dtype defaults) but do NOT attempt
+# to fabricate a per-lane Layout; that decision is correct and matches
+# Apple's documented opacity. See also ``src/op/utils.h:61`` for the
+# matching ``"metal.simdgroup"`` scope check that codegen relies on.
 # ---------------------------------------------------------------------------
 
 
