@@ -57,7 +57,7 @@ namespace tvm {
  */
 namespace tl {
 
-enum class ReducerOpType { SUM, MAX, MIN };
+enum class ReducerOpType { SUM, MAX, MIN, MUL };
 enum class ReducerRepType { ALL, NONE };
 
 struct ReducerInfoNode : ffi::Object {

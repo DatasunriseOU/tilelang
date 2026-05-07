@@ -32,6 +32,15 @@ struct SumOp {
   }
 };
 
+// Wave-8 #5: product reduction warp template. Mirrors SumOp; the AllReduce
+// driver in `src/op/reduce.cc:MakeCodegenReducer()` emits "tl::MulOp" for
+// `T.reduce_prod(...)` / `tt.reduce(mul)`.
+struct MulOp {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
+    return x * y;
+  }
+};
+
 struct MaxOp {
   template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
     return cutlass::fast_max(x, y);

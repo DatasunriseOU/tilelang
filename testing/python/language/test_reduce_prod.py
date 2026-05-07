@@ -18,16 +18,13 @@ def test_reduce_prod_is_exported():
     assert hasattr(T, "reduce_prod"), "reduce_prod should be exported from tilelang.language"
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "wave-7 #5 known bug: 'mul' AllReduce lowering pass emits buffer "
-        "access with vector lane in non-last dim, tripping the invariant in "
-        "src/transform/vectorize_loop.cc:67 and storage_rewrite.cc:70. "
-        "Tracked for wave-8 C++ fix; xfail(strict=False) so the marker "
-        "auto-flips when the C++ pass is corrected."
-    ),
-)
+# Wave-8 #5 fixed: 'mul' is now registered end-to-end. See
+# src/op/reduce.{h,cc} (kMul + dispatch), src/transform/layout_reducer.{h,cc}
+# (ReducerOpType::MUL annotation), and the warp templates
+# src/tl_templates/{cuda,hip}/reduce.h (tl::MulOp). The wave-7 xfail
+# tracked an `Invalid reduce type: mul` LOG(FATAL) in ReduceType("mul")
+# that surfaced downstream as the vectorize_loop.cc invariant trip; with
+# mul now a valid kind this test should construct without raising.
 def test_reduce_prod_constructs_call():
     try:
         import tilelang

@@ -128,6 +128,9 @@ PrimExpr ReduceOpNode::MakeInitValue() const {
     return make_zero(dst->dtype);
   } else if (type->isBitXor()) {
     return make_zero(dst->dtype);
+  } else if (type->isMul()) {
+    // Wave-8 #5: identity element for product reduction is 1.
+    return make_const(dst->dtype, 1);
   } else {
     LOG(FATAL) << "Unsupported reduce type: " << type->type;
     return PrimExpr();
@@ -167,6 +170,12 @@ PrimExpr ReduceOpNode::MakeReduce(const PrimExpr &acc,
     return acc | rhs;
   } else if (type->isBitXor()) {
     return acc ^ rhs;
+  } else if (type->isMul()) {
+    // Wave-8 #5: combine via floating/integer multiply. The dtype-cast
+    // above already aligned `rhs` with `acc`, so this commutes with the
+    // sum/max paths without inserting any non-last-axis vector ops
+    // (the bug Wave-7 #5 documented).
+    return acc * rhs;
   } else {
     LOG(FATAL) << "Unsupported reduce type: " << type->type;
   }
@@ -191,6 +200,13 @@ std::string ReduceOpNode::MakeCodegenReducer() const {
     return "tl::BitOrOp";
   } else if (type->isBitXor()) {
     return "tl::BitXorOp";
+  } else if (type->isMul()) {
+    // Wave-8 #5: emits the warp-level product-reducer template.
+    // The matching `tl::MulOp` lives in the runtime templates under
+    // `src/tl_templates/{cuda,hip,metal}/reduce.h` next to `tl::SumOp`.
+    // If a backend has not added a `MulOp` template yet, codegen will
+    // surface a clean undeclared-identifier error at compile time.
+    return "tl::MulOp";
   } else {
     LOG(FATAL) << "Unsupported reduce type: " << type->type;
     return "";

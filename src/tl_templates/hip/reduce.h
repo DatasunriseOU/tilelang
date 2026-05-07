@@ -10,6 +10,13 @@ struct SumOp {
   }
 };
 
+// Wave-8 #5: product reduction warp template (HIP).
+struct MulOp {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
+    return x * y;
+  }
+};
+
 struct MaxOp {
   template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
     return ck_tile::max(x, y);
