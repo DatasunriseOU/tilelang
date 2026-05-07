@@ -10,10 +10,19 @@ symbolic shapes. The Z3 query asserts:
     /\\  addr % 16 == 0
 
 If the static check fails for symbolic inputs, the Z3 helper attempts to
-prove the shape constraint and logs the candidate. The IR rewrite remains
-gated behind the legacy static path until we wire Z3-driven lowering. This
-keeps the pass conservative-by-default: if Z3 returns False/UNKNOWN, we keep
-the legacy non-simdgroup path.
+prove the shape constraint. With the **IR rewrite path** enabled
+(``PassConfig`` key ``tl.simdgroup_matrix_rewrite``), the pass uses that
+eligibility decision per-buffer to gate the scope promotion: only buffers
+that pass the static or Z3-proved check are promoted to ``metal.simdgroup``
+(which is the IR-level surface that drives codegen of MSL
+``simdgroup_load`` / ``simdgroup_multiply_accumulate`` / ``simdgroup_store``
+intrinsics in ``codegen_metal.cc``). Ineligible buffers stay in
+``local.fragment`` (legacy scalar lowering).
+
+The PassConfig flag defaults OFF — the existing unconditional rewrite
+(every GEMM ``local.fragment`` accumulator is promoted) keeps shipping
+behavior. Conservative-by-default: if Z3 returns False/UNKNOWN we keep the
+legacy non-simdgroup path.
 """
 
 from __future__ import annotations
@@ -30,6 +39,15 @@ from tvm.tir.transform import prim_func_pass
 logger = logging.getLogger("tilelang.metal_simdgroup")
 
 _GEMM_OPS = None
+
+#: PassConfig key that enables the per-buffer eligibility-gated rewrite.
+#: Default OFF — the unconditional fragment→simdgroup promotion still runs
+#: when this is False, preserving shipping behavior.
+PASS_CONFIG_KEY = "tl.simdgroup_matrix_rewrite"
+
+#: PrimFunc attribute name where rewritten buffer names are recorded so
+#: downstream tooling and tests can inspect what the gated rewrite emitted.
+EMITTED_ATTR_KEY = "tl.simdgroup_matrix_rewrite_emitted"
 
 # ---------------------------------------------------------------------------
 # Z3 detection helpers (Idea #8)
@@ -222,6 +240,43 @@ def _collect_fragment_gemm_accum_vars(body: tir.Stmt) -> set:
     return accum_vars
 
 
+def _collect_fragment_gemm_accum_buffers(body: tir.Stmt) -> dict:
+    """Return ``{var: tir.Buffer}`` for each ``local.fragment`` GEMM accumulator.
+
+    The IR-rewrite gated path needs the underlying buffer (shape/dtype) to
+    run :func:`is_simdgroup_eligible` per-buffer. Vars whose accumulator
+    region we cannot recover a ``Buffer`` for are not included; the caller
+    treats those as ineligible (conservative).
+    """
+    accum: dict = {}
+    gemm_ops = _get_gemm_ops()
+
+    def _visitor(stmt):
+        if isinstance(stmt, tir.Evaluate) and isinstance(stmt.value, tir.Call):
+            call = stmt.value
+            if call.op in gemm_ops and len(call.args) >= 3:
+                region_call = call.args[2]
+                var = _extract_buffer_var_from_region(region_call)
+                if var is None or not hasattr(var, "type_annotation"):
+                    return
+                ta = var.type_annotation
+                if ta is None or not hasattr(ta, "storage_scope"):
+                    return
+                if ta.storage_scope != "local.fragment":
+                    return
+                # Recover Buffer from the region's BufferLoad arg.
+                buf = None
+                if (isinstance(region_call, tir.Call)
+                        and len(region_call.args) > 0
+                        and isinstance(region_call.args[0], tir.BufferLoad)):
+                    buf = region_call.args[0].buffer
+                if buf is not None and var not in accum:
+                    accum[var] = buf
+
+    tir.stmt_functor.post_order_visit(body, _visitor)
+    return accum
+
+
 def _buffer_semantic_key(buf):
     return (
         buf.name,
@@ -370,6 +425,37 @@ def _rewrite_scope(body, var_map):
     )
 
 
+def _is_rewrite_enabled() -> bool:
+    """Read the ``tl.simdgroup_matrix_rewrite`` PassConfig flag.
+
+    Default OFF — when False, the unconditional fragment→simdgroup rewrite
+    runs (legacy shipping behavior). When True, the rewrite is gated
+    per-buffer by :func:`is_simdgroup_eligible`.
+    """
+    try:
+        from tvm.transform import PassContext
+        cfg = PassContext.current().config
+        if cfg is None:
+            return False
+        val = cfg.get(PASS_CONFIG_KEY, None)
+        if val is None:
+            return False
+        return bool(val)
+    except Exception:
+        return False
+
+
+def _build_var_map(vars_iter):
+    """Allocate fresh ``metal.simdgroup``-scoped Vars for each accum Var."""
+    var_map: dict = {}
+    for var in vars_iter:
+        ptr_type = var.type_annotation
+        new_ptr = PointerType(ptr_type.element_type, "metal.simdgroup")
+        new_var = tir.Var(var.name, new_ptr)
+        var_map[var] = new_var
+    return var_map
+
+
 def _metal_fragment_to_simdgroup(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.PrimFunc:
     target = func.attrs.get("target", None)
     if target is None:
@@ -377,19 +463,121 @@ def _metal_fragment_to_simdgroup(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.
     if target is None or target.kind.name != "metal":
         return func
 
-    accum_vars = _collect_fragment_gemm_accum_vars(func.body)
-    if not accum_vars:
+    rewrite_gated = _is_rewrite_enabled()
+
+    if not rewrite_gated:
+        # Legacy unconditional path — ship behavior unchanged.
+        accum_vars = _collect_fragment_gemm_accum_vars(func.body)
+        if not accum_vars:
+            return func
+        var_map = _build_var_map(accum_vars)
+        new_body = _rewrite_scope(func.body, var_map)
+        return func.with_body(new_body)
+
+    # Idea #8 IR rewrite path: per-buffer eligibility-gated promotion.
+    accum_with_buf = _collect_fragment_gemm_accum_buffers(func.body)
+    if not accum_with_buf:
         return func
 
-    var_map: dict = {}
-    for var in accum_vars:
-        ptr_type = var.type_annotation
-        new_ptr = PointerType(ptr_type.element_type, "metal.simdgroup")
-        new_var = tir.Var(var.name, new_ptr)
-        var_map[var] = new_var
+    eligible_vars = []
+    rewritten_names = []
+    rejection_log = []
+    for var, buf in accum_with_buf.items():
+        eligible, reason = is_simdgroup_eligible(buf)
+        if eligible:
+            eligible_vars.append(var)
+            rewritten_names.append(getattr(var, "name", "?"))
+        else:
+            rejection_log.append(f"{getattr(var, 'name', '?')}={reason}")
+            if os.environ.get("TL_LOG_SIMDGROUP"):
+                logger.warning(
+                    "simdgroup-rewrite: skip buf=%s shape=%s dtype=%s reason=%s",
+                    getattr(buf, "name", "?"),
+                    tuple(str(d) for d in getattr(buf, "shape", ())),
+                    getattr(buf, "dtype", "?"),
+                    reason,
+                )
 
+    if not eligible_vars:
+        # Nothing eligible — leave the IR alone (legacy scalar lowering
+        # will handle every accumulator).
+        return func
+
+    var_map = _build_var_map(eligible_vars)
     new_body = _rewrite_scope(func.body, var_map)
-    return func.with_body(new_body)
+    new_func = func.with_body(new_body)
+
+    # Annotate with the rewritten buffer names so tests / downstream tooling
+    # can see what fired without re-walking the IR.
+    try:
+        new_attrs = dict(new_func.attrs) if new_func.attrs is not None else {}
+        new_attrs[EMITTED_ATTR_KEY] = tir.StringImm(",".join(sorted(rewritten_names)))
+        if rejection_log:
+            new_attrs["tl.simdgroup_matrix_rewrite_rejected"] = tir.StringImm(
+                ";".join(rejection_log)
+            )
+        new_func = new_func.with_attrs(new_attrs)
+    except Exception:
+        pass
+
+    return new_func
 
 
 MetalFragmentToSimdgroup = prim_func_pass(_metal_fragment_to_simdgroup, opt_level=0, name="tl.MetalFragmentToSimdgroup")
+
+
+# ---------------------------------------------------------------------------
+# Public testing helper (Idea #8 rewrite path)
+# ---------------------------------------------------------------------------
+
+def apply_simdgroup_matrix_rewrite(func: tir.PrimFunc,
+                                    *,
+                                    force_enable: bool = True
+                                    ) -> tir.PrimFunc:
+    """Run the eligibility-gated rewrite on ``func`` outside a PassContext.
+
+    Tests use this to drive the rewrite directly without setting up a
+    ``PassContext`` with the ``tl.simdgroup_matrix_rewrite`` config. The
+    target check is still enforced (the func must declare a Metal target).
+    """
+    if not force_enable:
+        return _metal_fragment_to_simdgroup(func, None, None)
+
+    target = func.attrs.get("target", None)
+    if target is None:
+        target = Target.current(allow_none=True)
+    if target is None or target.kind.name != "metal":
+        return func
+
+    accum_with_buf = _collect_fragment_gemm_accum_buffers(func.body)
+    if not accum_with_buf:
+        return func
+
+    eligible_vars = []
+    rewritten_names = []
+    rejection_log = []
+    for var, buf in accum_with_buf.items():
+        eligible, reason = is_simdgroup_eligible(buf)
+        if eligible:
+            eligible_vars.append(var)
+            rewritten_names.append(getattr(var, "name", "?"))
+        else:
+            rejection_log.append(f"{getattr(var, 'name', '?')}={reason}")
+
+    if not eligible_vars:
+        return func
+
+    var_map = _build_var_map(eligible_vars)
+    new_body = _rewrite_scope(func.body, var_map)
+    new_func = func.with_body(new_body)
+    try:
+        new_attrs = dict(new_func.attrs) if new_func.attrs is not None else {}
+        new_attrs[EMITTED_ATTR_KEY] = tir.StringImm(",".join(sorted(rewritten_names)))
+        if rejection_log:
+            new_attrs["tl.simdgroup_matrix_rewrite_rejected"] = tir.StringImm(
+                ";".join(rejection_log)
+            )
+        new_func = new_func.with_attrs(new_attrs)
+    except Exception:
+        pass
+    return new_func
