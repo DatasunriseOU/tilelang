@@ -163,3 +163,42 @@ def test_strided_layout_emits_deprecation_warning() -> None:
         and "StridedLayout is deprecated" in str(w.message)
         for w in caught
     ), f"expected DeprecationWarning, got: {[str(w.message) for w in caught]}"
+
+
+def test_rewrite_error_is_cached_and_re_raised() -> None:
+    """Wave-3: a thrown ``run_rewrite`` is remembered; the second call must
+    re-raise the same exception object instead of re-running the analysis.
+    """
+
+    pa = PtrAnalysis("not a valid module")
+
+    class _BoomShim:
+        class Context:  # noqa: D401 - simple stub
+            def __init__(self) -> None: ...
+
+        class Module:
+            calls = 0
+
+            def __init__(self, _ctx, _text) -> None: ...
+
+            def run_rewrite(self, _gs, _unsafe) -> None:
+                _BoomShim.Module.calls += 1
+                raise RuntimeError("stub-mode failure")
+
+            def to_string(self) -> str:  # pragma: no cover - never reached
+                raise AssertionError
+
+            def extract_states_json(self) -> str:  # pragma: no cover
+                raise AssertionError
+
+    pa._shim = _BoomShim  # type: ignore[assignment]
+    with pytest.raises(RuntimeError, match="stub-mode failure") as first:
+        pa.rewrite()
+    with pytest.raises(RuntimeError, match="stub-mode failure") as second:
+        pa.rewrite()
+    assert first.value is second.value, "cached exception must be the same instance"
+    assert _BoomShim.Module.calls == 1, "second rewrite() must NOT re-invoke run_rewrite"
+    # extract_states() must follow the same fail-fast path.
+    with pytest.raises(RuntimeError, match="stub-mode failure"):
+        pa.extract_states()
+    assert _BoomShim.Module.calls == 1

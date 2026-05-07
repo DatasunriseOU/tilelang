@@ -169,6 +169,7 @@ class PtrAnalysis:
         self._use_unsafe_mask = bool(use_unsafe_mask)
         self._rewritten_text: Optional[str] = None
         self._states: Optional[List[PtrState]] = None
+        self._rewrite_error: Optional[BaseException] = None
         self._shim: Any = None  # lazy
 
     # ---- public API ------------------------------------------------------
@@ -185,16 +186,25 @@ class PtrAnalysis:
         """
         if self._rewritten_text is not None:
             return self._rewritten_text
+        if self._rewrite_error is not None:
+            # Fail-fast on a previously-cached error so we don't redo the work.
+            raise self._rewrite_error
         shim = self._ensure_shim()
         # Run rewrite + states extraction in a single ``Module`` lifetime so
         # ``extract_states`` doesn't have to re-parse the module text. We use
         # the Context/Module pybind wrappers directly rather than the
         # ``run_ptr_analysis`` convenience helper for that reason.
-        ctx = shim.Context()
-        mod = shim.Module(ctx, self._module_text)
-        mod.run_rewrite(self._enable_gs, self._use_unsafe_mask)
-        self._rewritten_text = mod.to_string()
-        self._states = _parse_states_json(mod.extract_states_json())
+        try:
+            ctx = shim.Context()
+            mod = shim.Module(ctx, self._module_text)
+            mod.run_rewrite(self._enable_gs, self._use_unsafe_mask)
+            rewritten = mod.to_string()
+            states = _parse_states_json(mod.extract_states_json())
+        except BaseException as exc:
+            self._rewrite_error = exc
+            raise
+        self._rewritten_text = rewritten
+        self._states = states
         return self._rewritten_text
 
     def extract_states(self) -> List[PtrState]:
