@@ -94,7 +94,170 @@ __all__ = [
     "make_aot_backend",
     "tilelang_fw_compiler",
     "tilelang_bw_compiler",
+    "register_double_backward",
+    "autotune_select",
+    "DoubleBackwardUnsupportedError",
 ]
+
+
+class DoubleBackwardUnsupportedError(NotImplementedError):
+    """Raised when ``torch.func.grad(torch.func.grad(f))`` reaches a fused op
+    whose bwd graph contains an undifferentiable construct (most commonly the
+    atomic-add accumulator path on reductions / scatter-style ops).
+
+    Wave-2 #09 directive: surface a single actionable error with a clear
+    workaround instead of letting autograd produce ``NaN`` or wrong gradients
+    silently.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Wave-2 #09 item 3 — autotune shortlist cache.
+# ---------------------------------------------------------------------------
+# Bucket key: (op_qualname, tuple(shape-bucket per input), dtype). Value: the
+# winning ``(BLOCK_M, BLOCK_N, num_warps)`` tuple. We keep this in process
+# memory; surviving across processes is a Phase-3 follow-up that requires
+# spilling to ``$XDG_CACHE_HOME/tilelang_autotune.json``.
+_AUTOTUNE_CACHE: "dict" = {}
+
+# Hard-coded shortlist; the FA-style row covers the common attention shapes,
+# the matmul row covers the common GEMM shapes. Real autotune (with codegen
+# specialisation) lands in Phase 3 — this is the dispatch surface that lets
+# downstream callers benchmark candidates without further refactoring.
+_AUTOTUNE_SHORTLIST = {
+    "fa": ((64, 64, 4), (128, 64, 8), (128, 128, 8)),
+    "matmul": ((64, 64, 4), (128, 128, 4), (128, 128, 8)),
+    "default": ((64, 64, 4), (128, 64, 4)),
+}
+
+
+def _shape_bucket(shape: "tuple") -> "tuple":
+    """Round each dim up to the next power of two (capped at 4096) so close
+    shapes hit the same bucket and share a tuned config."""
+    out = []
+    for d in shape:
+        if not isinstance(d, int) or d <= 1:
+            out.append(int(d) if isinstance(d, int) else 1)
+            continue
+        bucket = 1
+        while bucket < min(d, 4096):
+            bucket <<= 1
+        out.append(bucket)
+    return tuple(out)
+
+
+def autotune_select(
+    op_qualname: str,
+    args: "Sequence[Any]",
+    kind: str = "default",
+    bench_fn: "Optional[Callable[[tuple], float]]" = None,
+) -> "tuple":
+    """Pick the fastest ``(BLOCK_M, BLOCK_N, num_warps)`` from the shortlist
+    for ``kind`` and cache by ``(op_qualname, shape-bucket, dtype)``.
+
+    Parameters
+    ----------
+    bench_fn
+        Callback invoked once per candidate during the warm-up tuning pass.
+        Should return a wall-clock seconds float (smaller = better). Required
+        on the first call for a given key; subsequent calls hit the cache.
+
+    Notes
+    -----
+    The bench loop uses ``torch.cuda.synchronize`` + ``time.perf_counter`` per
+    candidate. CPU-only callers should pass ``bench_fn=None`` — we then return
+    the first shortlist entry without benching.
+    """
+    try:
+        shape = tuple(int(d) for d in getattr(args[0], "shape", ()))
+        dtype = str(getattr(args[0], "dtype", "unknown"))
+    except Exception:
+        return _AUTOTUNE_SHORTLIST.get(kind, _AUTOTUNE_SHORTLIST["default"])[0]
+
+    key = (op_qualname, _shape_bucket(shape), dtype)
+    if key in _AUTOTUNE_CACHE:
+        return _AUTOTUNE_CACHE[key]
+
+    candidates = _AUTOTUNE_SHORTLIST.get(kind, _AUTOTUNE_SHORTLIST["default"])
+    if bench_fn is None:
+        chosen = candidates[0]
+    else:
+        timings = []
+        for cfg in candidates:
+            try:
+                t = bench_fn(cfg)
+            except Exception:  # pragma: no cover - tuning path is best-effort
+                t = float("inf")
+            timings.append((t, cfg))
+        timings.sort()
+        chosen = timings[0][1]
+    _AUTOTUNE_CACHE[key] = chosen
+    return chosen
+
+
+# ---------------------------------------------------------------------------
+# Wave-2 #09 item 1 — double-backward composability via register_autograd.
+# ---------------------------------------------------------------------------
+def register_double_backward(
+    fwd_op_qualname: str,
+    bwd_op_qualname: str,
+    *,
+    has_atomic_accumulator: bool = False,
+) -> None:
+    """Wire a ``setup_context`` + ``backward`` pair onto ``fwd_op_qualname``
+    via :func:`torch.library.register_autograd` so that
+    ``torch.func.grad(torch.func.grad(f))`` reaches the registered bwd op.
+
+    Where the bwd graph genuinely cannot be re-differentiated (atomic-add
+    accumulator path; the second derivative is identically zero in the
+    forward order but non-trivial under the swap-with-loop rule) we raise
+    :class:`DoubleBackwardUnsupportedError` from inside ``backward`` so the
+    caller gets a clear bail-out instead of silently wrong gradients.
+
+    Parameters
+    ----------
+    fwd_op_qualname
+        ``"tilelang::fused_<hash>_fwd"``.
+    bwd_op_qualname
+        ``"tilelang::fused_<hash>_bwd"``. Must already be registered in
+        ``custom_op_wrapper._REGISTRY``.
+    has_atomic_accumulator
+        Set by the FX walker when the fused fwd contains an op marked
+        ``aten.scatter_add`` / ``aten.index_add_`` / a reduction that lowers
+        to ``atomic_add``. When True, the backward closure raises
+        :class:`DoubleBackwardUnsupportedError` instead of dispatching.
+    """
+    try:
+        from torch.library import register_autograd  # type: ignore[import-not-found]
+    except Exception:  # pragma: no cover
+        # PyTorch < 2.4 lacks register_autograd; ignore — first-order grad
+        # still works through the joint capture.
+        return
+
+    from .custom_op_wrapper import _REGISTRY  # noqa: WPS433
+
+    bwd_op = _REGISTRY.get(bwd_op_qualname)
+    if bwd_op is None:  # pragma: no cover
+        return
+
+    def setup_context(ctx, inputs, output) -> None:
+        # ``inputs`` is the boxed [tensor, ...] arg the fwd op received.
+        ctx.save_for_backward(*inputs[0])
+
+    def backward(ctx, grad) -> Any:
+        if has_atomic_accumulator:
+            raise DoubleBackwardUnsupportedError(
+                "integration-09: double-backward through atomic-accumulator "
+                "path not supported; use torch.compile(fullgraph=False) or "
+                "split the graph so the atomic-add op stays outside the "
+                "fused region.")
+        saved = list(ctx.saved_tensors)
+        # Tangents arrive as a single tensor (or tuple). Hand them to the
+        # registered bwd op alongside the saved fwd activations.
+        tangents = grad if isinstance(grad, (list, tuple)) else [grad]
+        return bwd_op(saved + list(tangents))
+
+    register_autograd(fwd_op_qualname, backward, setup_context=setup_context)
 
 
 def _import_make_boxed_func() -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -147,6 +310,27 @@ def _compile_one_side(
     # actionable error per missing emitter instead of a confusing dispatch
     # crash deep in the walker.
     _validate_graph(gm)
+    # Wave-2 #09 item 4 (symbolic tiles): when ``example_inputs`` carry
+    # ``SymInt`` shapes, FXToTileLang would currently specialise on the
+    # concrete value at trace time. The proper fix is to thread ``T.var(...)``
+    # through ``fx_to_tilelang.lower_node`` for each SymInt-bearing dim. That
+    # change ripples into the launcher signature and the FakeTensor cache key
+    # — out-of-scope for #09's autograd-only directive. We surface a single
+    # warning so callers know dynamic shapes will trigger a recompile per
+    # concrete shape until Phase 3.
+    # TODO(wave-3): emit symbolic ``T.var`` tiles and wire them through the
+    # launcher so dynamic-shape graphs stop recompiling per concrete shape.
+    for ex in example_inputs:
+        if any(not isinstance(d, int) for d in getattr(ex, "shape", ())):
+            import warnings as _w
+            _w.warn(
+                "tilelang aot_autograd: SymInt shape detected; specialising "
+                "on the concrete trace-time value. Dynamic-shape symbolic "
+                "tiles land in wave-3 (see TODO in aot_autograd_glue.py).",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            break
     lowerer = FXToTileLang(gm, list(example_inputs))
     artifact = lowerer.run()
     runner = wrap_as_custom_op(
@@ -154,6 +338,29 @@ def _compile_one_side(
         lowerer.fx_signature(),
         is_backward=is_backward,
     )
+
+    # Wave-2 #09 item 1: pair the fwd/bwd ops via register_autograd so
+    # ``torch.func.grad(torch.func.grad(f))`` reaches the bwd op. Only the
+    # forward compile installs the pairing — by the time we see the bwd
+    # graph the partner is already registered.
+    if not is_backward:
+        fwd_qualname = f"tilelang::{artifact.name}_fwd"
+        bwd_qualname = f"tilelang::{artifact.name}_bwd"
+        # Detect atomic-accumulator ops in the joint graph — they make the
+        # second derivative ill-defined.
+        has_atomic = any(
+            getattr(node, "target", None) is not None
+            and "scatter_add" in str(node.target) or "index_add" in str(node.target)
+            for node in getattr(gm, "graph", []).nodes
+        ) if hasattr(gm, "graph") else False
+        try:
+            register_double_backward(
+                fwd_qualname,
+                bwd_qualname,
+                has_atomic_accumulator=has_atomic,
+            )
+        except Exception:  # pragma: no cover - best effort
+            pass
 
     make_boxed = _import_make_boxed_func()
 

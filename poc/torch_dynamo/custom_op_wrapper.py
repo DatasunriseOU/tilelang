@@ -51,14 +51,14 @@ def _ensure_contiguous_inputs(
     op_qualname: str,
     tensors: Sequence[Any],
 ) -> Tuple[Any, ...]:
-    """Return ``tensors`` with each non-contiguous input replaced by
-    ``.contiguous()``, warning once per ``(op, slot)`` pair.
+    """Return ``tensors`` with each non-contiguous / aliasing input replaced
+    by a fresh contiguous copy, warning once per ``(op, slot, reason)`` triple.
 
-    The current TileLang launcher convention assumes row-major contiguous
-    input strides; passing a non-contiguous view (transpose/expand result)
-    causes silent address-arithmetic corruption inside the kernel. We
-    proactively materialise a contiguous copy and warn so callers can
-    upstream a ``.contiguous()`` if the copy shows up in profiling.
+    Wave-2 #09 expansion: in addition to non-contiguous strides, we also
+    detect view-aliased inputs (``t._base is not None``). The fused TileLang
+    kernel writes through pointer arithmetic that assumes the input owns its
+    storage; a view backed by another live tensor would silently overwrite
+    the parent's memory once the launcher believes the slot is exclusive.
     """
     global _CONTIGUITY_WARN_SEEN
     fixed: list = []
@@ -76,21 +76,30 @@ def _ensure_contiguous_inputs(
             ok = t.is_contiguous()
         except Exception:  # pragma: no cover
             ok = True
-        if not ok:
-            key = (op_qualname, i)
+        # Wave-2 #09 view-aliasing guard: ``t._base is not None`` signals the
+        # tensor shares storage with another live tensor (slice / select /
+        # narrow / unbind / expand). Re-materialise so the kernel writes do
+        # not corrupt the parent.
+        try:
+            aliased = getattr(t, "_base", None) is not None
+        except Exception:  # pragma: no cover
+            aliased = False
+        if not ok or aliased:
+            reason = "non-contiguous" if not ok else "view-aliased"
+            key = (op_qualname, i, reason)
             if key not in new_seen:
                 new_seen.add(key)
                 changed = True
                 warnings.warn(
                     f"tilelang custom_op {op_qualname!r}: input #{i} "
                     f"(shape={tuple(getattr(t, 'shape', ()))}) is "
-                    f"non-contiguous; auto-materialising .contiguous(). "
-                    f"For best perf insert an explicit .contiguous() "
+                    f"{reason}; auto-materialising a fresh contiguous "
+                    f"copy. For best perf insert an explicit .contiguous() "
                     f"upstream of this op.",
                     RuntimeWarning,
                     stacklevel=4,
                 )
-            fixed.append(t.contiguous())
+            fixed.append(t.contiguous().clone() if aliased and ok else t.contiguous())
         else:
             fixed.append(t)
     if changed:
