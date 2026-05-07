@@ -1461,9 +1461,15 @@ static bool Z3CanProveUnitStride(const PrimExpr &expr, const Var &var,
     // direction probe: var >= 1 is enforced inside that block. This rules
     // out the wrap-around case where iter_var_size could be 0 or 1 (no
     // contiguity to prove).
-    PrimExpr iter_hi = analyzer->Simplify(iter_var_size - 1);
+    // fix-round-6 C5: previous bound `var < iter_var_size - 1` excluded
+    // the last iteration from the proof, so a contiguity violation on
+    // the final element could slip past Z3 unnoticed (unsound). Use
+    // `var + 1 < iter_var_size` instead — this still ensures `var+1`
+    // remains a legal index for the substitution `expr(var+1)` while
+    // covering EVERY iteration of the loop.
+    PrimExpr one = make_const(vt, 1);
     PrimExpr range_constraint =
-        (var >= lo) && (var < iter_hi) && (iter_var_size > 0);
+        (var >= lo) && (var + one < iter_var_size) && (iter_var_size > 0);
     if (!vt_is_int32) {
       // Wider dtype: enforce explicit unsigned-32-bit emulation.
       PrimExpr bv_hi = make_const(vt, int64_t(1) << 32);
