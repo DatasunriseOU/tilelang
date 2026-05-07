@@ -724,6 +724,16 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     return Create(op);
   }
   ::z3::expr VisitExpr_(const ReduceNode* op) override { return Create(op); }
+  // Ramp(base, stride, lanes) represents the vector [base, base+stride,
+  // base+2*stride, ...]. For proof purposes we conservatively visit `base`
+  // (loses stride/lanes range info; relies on surrounding constraint context).
+  ::z3::expr VisitExpr_(const ::tvm::tirx::RampNode* op) override {
+    return VisitExpr(op->base);
+  }
+  // Broadcast(value, lanes) is a vector of identical scalars; visit the value.
+  ::z3::expr VisitExpr_(const ::tvm::tirx::BroadcastNode* op) override {
+    return VisitExpr(op->value);
+  }
   // In BV mode every Z3 operand of an arithmetic / relational op must be a
   // BV of the current width; in Int mode operands must be Int. The Z3 C++
   // overloads will raise an error if you mix sorts (e.g. an Int operand
