@@ -353,6 +353,17 @@ class _ButterflyRewriter:
                 node.thread_binding, node.annotations, node.span,
             )
 
+        # #9 butterfly guard: only rewrite when extent is a power-of-2 in
+        # [2, 32]. Non-power-of-2 extents would yield bad shuffle indices,
+        # and SIMD-group width on Metal/Apple GPUs is 32, so larger extents
+        # cannot be served by a single shfl_xor_sync chain.
+        if (extent_val < 2 or extent_val > 32 or
+                (extent_val & (extent_val - 1)) != 0):
+            return tir.For(
+                node.loop_var, node.min, node.extent, node.kind, recursed_body,
+                node.thread_binding, node.annotations, node.span,
+            )
+
         # Build acc_load (BufferLoad mirroring the BufferStore).
         store: tir.BufferStore = body_stmt
         acc_load = tir.BufferLoad(store.buffer, list(store.indices))
