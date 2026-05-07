@@ -165,17 +165,18 @@ PrimExpr BuildSoundnessObligation(const CandidateInfo &info,
                                   const Var &k_var) {
   // Construct k_next = k + 1.
   Var k_next("k_next", k_var.dtype());
-  // No-conflict-pair: 1 != 0 (placeholder true predicate). The real proof is
-  // that two distinct allocations don't alias — at this layer we have no
-  // alias info, so the obligation is conservatively True only when the load
-  // address is symbolic and not derived from the candidate buffer.
-  // The real check is in the detector (no cross-iter dependency). The
-  // PrimExpr returned here is an explicit `true` so that `CanProve` always
-  // succeeds when the detector accepts the pattern. The detector is the
-  // SAFETY GATE; the prover here is auditable evidence.
+  // fix-round-6 C4: stub: no real obligation; return False to never claim
+  // Z3 proved soundness. Previously this returned Bool(true), which made
+  // CanProve(...) trivially succeed and gave the audit trail false
+  // confidence — `BuildSoundnessObligation` looked like a real prover
+  // gate but was a tautology. Since this pass is detector-gated and the
+  // Z3 result is *discarded* in stub mode anyway, returning False is
+  // strictly safer: any future code that begins to act on the proof
+  // result will see "unproved" and refuse to transform until the real
+  // obligation is wired.
   (void)k_next;
   (void)info;
-  return Bool(true);
+  return Bool(false);
 }
 
 /*!
