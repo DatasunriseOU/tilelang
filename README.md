@@ -47,6 +47,29 @@ Defensive fix in `tilelang/jit/adapter/torch/metal.py`: extract trailing `'x'`/`
 
 Test summary at HEAD: 36 CPU + 61 Metal + 3 skipped (opt-in benchmarks) = 100 / 103 pass, 0 fail. Cold compile time 0.015 s (≈39× faster than the tl_pr_c baseline). Bench parity vs `/tmp/tl_pr_c`: swap mean 0.984× of tl_pr_c on the metal benchmarks (within MPS variance).
 
+### 2026-05-07 — Z3 prover safety gate for CUDA / gb10
+
+A correctness regression has been observed on the gb10 (CUDA `sm_120`) target
+when the vendored Z3 prover (`src/transform/vendored/z3_prover.{h,cc}`) is
+allowed to short-circuit conservative paths in `AutoDoubleBuffer`,
+`DropProvableBoundChecks`, intra-warp barrier-elide, and related transforms.
+The root cause has not yet been bisected. Until it is, CUDA / gb10 users
+should opt out of the prover via the env gate:
+
+```bash
+export TILELANG_DISABLE_Z3=1
+```
+
+When set to any non-empty value other than `"0"`, every
+`tilelang::tlz3::Z3Prover::CanProve` call returns `false`, which keeps the
+slow / conservative path in every consumer pass. Default behavior (env
+unset) is unchanged, so Mac / Apple-Silicon builds still benefit from the
+real prover (≈39× cold-compile speedup, 0.984× swap perf parity vs
+`/tmp/tl_pr_c`). The gate lives at the top of `Z3Prover::CanProve`
+(`src/transform/vendored/z3_prover.cc`) and is read once per process via a
+function-local `static`. Remove the env once the gb10 regression is
+root-caused and a targeted fix lands.
+
 <img src=./images/MatmulExample.png />
 
 ## Latest News

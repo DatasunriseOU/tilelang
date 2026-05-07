@@ -42,6 +42,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -980,6 +981,19 @@ void Z3Prover::Bind(const Var& var, const PrimExpr& expr,
   impl_->Bind(var, expr, allow_override);
 }
 bool Z3Prover::CanProve(const PrimExpr& expr) {
+  // CPPMEGA z3-final safety gate (2026-05-07): a correctness regression
+  // observed on the gb10 (CUDA/sm_120) target has not been root-caused.
+  // Setting `TILELANG_DISABLE_Z3=1` makes every CanProve() return false,
+  // which keeps the conservative slow path everywhere it is queried
+  // (AutoDoubleBuffer / DropProvableBoundChecks / barrier-elide / etc.).
+  // Default behavior (env unset or `=0`) is unchanged, so Mac/Apple-Silicon
+  // performance wins are preserved. See `z3_prover.h` and `README.md` for
+  // the opt-out rationale.
+  static const bool z3_disabled = []() {
+    const char* env = std::getenv("TILELANG_DISABLE_Z3");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+  }();
+  if (z3_disabled) return false;
   return impl_->CanProve(expr);
 }
 std::function<void()> Z3Prover::EnterConstraint(const PrimExpr& constraint,
