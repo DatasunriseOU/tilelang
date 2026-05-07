@@ -166,26 +166,29 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
   }
   ::z3::expr MakeIntVal(int64_t value) {
     if (bv_width_ > 0) {
-      // Z3 bv_val sign-extends/truncates to the requested width; for an
-      // int64 IntImm that "doesn't fit" in BV32 the high bits are
-      // dropped, matching standard two's-complement wrapping. Warn once
-      // per Analyzer when this happens — the result is well-defined but
-      // usually indicates an upstream bug (e.g. BV32 mode against an
-      // INT64-typed constant). Don't fail; the caller may still want the
-      // wrapped value (e.g. to test wrap-aware proofs).
-      if (!bv_truncation_warned_ && bv_width_ < 64) {
+      // fix-round-6 C8: previously, when `value` was outside the signed
+      // BV range we let Z3's bv_val silently truncate (two's-complement
+      // wrap). That makes proofs over wide constants unsound — e.g. a
+      // BV32 prove of `x == 0x100000000` would happily say "yes, x is
+      // 0" because the constant wrapped to zero. Conservative fix: mint
+      // an unconstrained fresh symbol of the BV sort so any predicate
+      // depending on the constant fails to be proved. Sound but lossy.
+      if (bv_width_ < 64) {
         int64_t lo = (bv_width_ == 32) ? static_cast<int64_t>(INT32_MIN)
                                        : -(int64_t{1} << (bv_width_ - 1));
         int64_t hi = (bv_width_ == 32) ? static_cast<int64_t>(INT32_MAX)
                                        : ((int64_t{1} << (bv_width_ - 1)) - 1);
         if (value < lo || value > hi) {
-          LOG(WARNING) << "Z3Prover BV" << bv_width_
-                       << ": MakeIntVal(" << value
-                       << ") wraps (signed range [" << lo << ", " << hi
-                       << "]); proof results may reflect two's-complement "
-                          "wrap, not unbounded Int semantics. "
-                          "(further occurrences suppressed)";
-          bv_truncation_warned_ = true;
+          if (!bv_truncation_warned_) {
+            LOG(WARNING)
+                << "Z3Prover BV" << bv_width_ << ": MakeIntVal(" << value
+                << ") out of signed range [" << lo << ", " << hi
+                << "]; returning unconstrained symbol (any proof "
+                   "depending on this constant will conservatively fail). "
+                   "(further occurrences suppressed)";
+            bv_truncation_warned_ = true;
+          }
+          return MakeIntConst("oor_" + std::to_string(memo_.size()));
         }
       }
       return ctx->bv_val(static_cast<int64_t>(value),
