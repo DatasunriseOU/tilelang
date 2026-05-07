@@ -153,3 +153,42 @@ endif()
 set_target_properties(_triton_frontend_cxx PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
 )
+
+# ---------------------------------------------------------------------
+# Standalone pybind shim: register_triton_structured
+#
+# Imported as `poc.triton_frontend._cxx.register_triton_structured` from
+# verify_dialect_loads.py and from poc/triton_frontend/tests/
+# test_triton_structured_walk.py -- it links the small TritonSharedRegister
+# static library and exposes `register_dialects(ctx)` so callers that only
+# need dialect registration don't have to depend on the full PtrAnalysis
+# C-shim above. Only built when the vendored CMakeLists.txt has been
+# configured into this build tree (i.e. `add_subdirectory` of vendored/
+# triton_shared has run alongside this directory) -- without it,
+# TritonSharedRegister is unbuildable since it pulls in `tt.*` op
+# declarations from TRITON_INSTALL_DIR.
+# ---------------------------------------------------------------------
+if(TARGET TritonSharedRegister)
+  set(_VENDOR_REGISTER_DIR
+      "${CMAKE_CURRENT_SOURCE_DIR}/../vendored/triton_shared")
+  pybind11_add_module(register_triton_structured
+    register_triton_structured_pybind.cc
+  )
+  target_include_directories(register_triton_structured PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    "${_VENDOR_REGISTER_DIR}"
+    ${MLIR_INCLUDE_DIRS}
+    ${LLVM_INCLUDE_DIRS}
+  )
+  target_link_libraries(register_triton_structured PRIVATE
+    TritonSharedRegister
+  )
+  set_target_properties(register_triton_structured PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+  )
+else()
+  message(STATUS
+    "register_triton_structured: skipping (TritonSharedRegister target "
+    "not defined; configure via add_subdirectory(vendored/triton_shared) "
+    "with TRITON_INSTALL_DIR set to enable).")
+endif()
