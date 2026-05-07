@@ -220,8 +220,10 @@ def test_walker_dispatch_path_matrix(path):
     if path == "text":
         ops = list(_walk_text_ttir(ttir_text))
         assert ops, "text walker produced empty op stream"
-        assert any("program_id" in (o.get("name") if isinstance(o, dict) else "")
-                   for o in ops), "expected a tt.get_program_id op"
+        # Walker yields strings (op names) for the text path; the MLIR path
+        # yields op-info dicts. Normalise before substring-matching.
+        names = [o.get("name", "") if isinstance(o, dict) else str(o) for o in ops]
+        assert any("program_id" in n for n in names), "expected a tt.get_program_id op"
     else:
         try:
             import mlir.ir  # noqa: F401
