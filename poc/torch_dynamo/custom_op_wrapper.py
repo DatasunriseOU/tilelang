@@ -257,30 +257,78 @@ def wrap_as_custom_op(
         _has_params = bool(param_tensors)
         _bound_launcher = artifact.launcher
 
-        @custom_op(op_qualname, mutates_args=())
-        def _impl(args: List[torch.Tensor]) -> List[torch.Tensor]:  # type: ignore[name-defined]
-            _check_no_grad(args, allow_grad=allow_grad)
-            # Wave-2 fix-pack: contiguity guard at the custom_op boundary.
-            args = _ensure_contiguous_inputs(op_qualname, args)
-            if _has_params:
-                return _bound_launcher(*args, *param_tensors)
-            return _bound_launcher(*args)
+        # Wave-9 #1: unify _impl / _fake return contract per n_outputs.
+        # Old code annotated both as ``-> List[Tensor]`` (to satisfy
+        # ``torch.library.infer_schema``, wave-7 #4) but the bodies
+        # returned a Tensor for n=1 and a tuple for n>1 — a runtime/type
+        # mismatch flagged HIGH by grok wave-7/8 review (rev_38ff59759f).
+        # Multi-output regions (FA 9-tuple wired in wave-8 #4) made this
+        # latent bug actively brittle.
+        #
+        # New contract — branch at registration time so runtime and
+        # annotation always agree:
+        #   n=1  → -> Tensor       (returns the launcher's single output)
+        #   n>1  → -> List[Tensor] (always normalises to ``list(outs)``)
+        if n_outputs == 1:
 
-        @register_fake(op_qualname)
-        def _fake(args: List[torch.Tensor]) -> List[torch.Tensor]:  # type: ignore[name-defined]
-            # Shape inference flows for both fwd and bwd: aot_autograd
-            # consults this when partitioning the joint graph and when
-            # caching FakeTensor results across recompiles.
-            outs = []
-            for spec in artifact.output_specs:
-                outs.append(torch.empty(
+            @custom_op(op_qualname, mutates_args=())
+            def _impl(args: List[torch.Tensor]) -> torch.Tensor:  # type: ignore[name-defined]
+                _check_no_grad(args, allow_grad=allow_grad)
+                args = _ensure_contiguous_inputs(op_qualname, args)
+                if _has_params:
+                    result = _bound_launcher(*args, *param_tensors)
+                else:
+                    result = _bound_launcher(*args)
+                # Launcher may return a 1-tuple/1-list around the single
+                # tensor — unwrap to match the declared schema.
+                if isinstance(result, (list, tuple)):
+                    if len(result) != 1:
+                        raise RuntimeError(
+                            f"{op_qualname}: n_outputs=1 launcher returned "
+                            f"{len(result)} elements")
+                    return result[0]
+                return result
+
+            @register_fake(op_qualname)
+            def _fake(args: List[torch.Tensor]) -> torch.Tensor:  # type: ignore[name-defined]
+                spec = artifact.output_specs[0]
+                return torch.empty(
                     spec.shape,
                     dtype=_spec_to_torch_dtype(spec.dtype),
                     device=args[0].device if len(args) else "meta",
-                ))
-            if n_outputs == 1:
-                return outs[0]
-            return tuple(outs)
+                )
+
+        else:
+
+            @custom_op(op_qualname, mutates_args=())
+            def _impl(args: List[torch.Tensor]) -> List[torch.Tensor]:  # type: ignore[name-defined]
+                _check_no_grad(args, allow_grad=allow_grad)
+                args = _ensure_contiguous_inputs(op_qualname, args)
+                if _has_params:
+                    result = _bound_launcher(*args, *param_tensors)
+                else:
+                    result = _bound_launcher(*args)
+                # Multi-output: launcher may return tuple (FA 9-tuple) or
+                # list — coerce to the declared list[Tensor] schema.
+                if isinstance(result, (list, tuple)):
+                    return list(result)
+                # Single-Tensor return on a multi-output op_qualname is a
+                # bug in the fused emitter; fail loudly rather than silently
+                # corrupt downstream meta propagation.
+                raise RuntimeError(
+                    f"{op_qualname}: n_outputs={n_outputs} launcher "
+                    f"returned a non-iterable {type(result).__name__}")
+
+            @register_fake(op_qualname)
+            def _fake(args: List[torch.Tensor]) -> List[torch.Tensor]:  # type: ignore[name-defined]
+                outs = []
+                for spec in artifact.output_specs:
+                    outs.append(torch.empty(
+                        spec.shape,
+                        dtype=_spec_to_torch_dtype(spec.dtype),
+                        device=args[0].device if len(args) else "meta",
+                    ))
+                return outs
 
         # Phase 2.3 / integration #10:
         #   * autograd-disabled tag stays set on the *bwd* op — aot_autograd

@@ -24,6 +24,7 @@ enum class ReduceTypeEnum : uint8_t {
   kBitAnd, ///< Bitwise and reduction
   kBitOr,  ///< Bitwise or reduction
   kBitXor, ///< Bitwise xor reduction
+  kMul,    ///< Product reduction (wave-8 #5)
 };
 
 /// Node class representing a reduction type
@@ -46,6 +47,7 @@ public:
   bool isBitAnd() const { return type == int(ReduceTypeEnum::kBitAnd); }
   bool isBitOr() const { return type == int(ReduceTypeEnum::kBitOr); }
   bool isBitXor() const { return type == int(ReduceTypeEnum::kBitXor); }
+  bool isMul() const { return type == int(ReduceTypeEnum::kMul); }
 };
 
 /// Wrapper class for reduction type with string-based construction
@@ -71,6 +73,10 @@ public:
       node->type = int(ReduceTypeEnum::kBitOr);
     } else if (type == "bitxor") {
       node->type = int(ReduceTypeEnum::kBitXor);
+    } else if (type == "mul") {
+      // Wave-8 #5: product reduction (used by tilelang.language.reduce_prod
+      // and `tt.reduce(mul)` lowering in poc/triton_frontend).
+      node->type = int(ReduceTypeEnum::kMul);
     } else {
       LOG(FATAL) << "Invalid reduce type: " << type;
     }

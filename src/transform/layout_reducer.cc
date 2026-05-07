@@ -44,6 +44,10 @@ ReducerInfoNode::ReducerInfoNode(const String &op_str, const String &rep_str) {
     op = ReducerOpType::MAX;
   else if (op_str == "min")
     op = ReducerOpType::MIN;
+  else if (op_str == "mul")
+    // Wave-8 #5: product reduction shares sum's per-thread access pattern;
+    // layout annotation is identical (commutative scalar reduction over dim).
+    op = ReducerOpType::MUL;
   else
     ICHECK(false) << "Unrecognized reducer_info op: " << op_str;
 
