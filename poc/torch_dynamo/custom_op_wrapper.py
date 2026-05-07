@@ -99,7 +99,16 @@ def _ensure_contiguous_inputs(
                     RuntimeWarning,
                     stacklevel=4,
                 )
-            fixed.append(t.contiguous().clone() if aliased and ok else t.contiguous())
+            # Wave-3 perf fix (grok review #02 perf §1): only the *aliased+
+            # already-contiguous* case forces ``clone()`` — that is the slot
+            # where ``.contiguous()`` is a no-op and would still share storage
+            # with the parent tensor. For non-contiguous inputs (the common
+            # view-heavy LLM-forward case) ``.contiguous()`` already allocates
+            # fresh storage, so the extra ``clone()`` is wasted ~2× cost.
+            if aliased and ok:
+                fixed.append(t.contiguous().clone())
+            else:
+                fixed.append(t.contiguous())
         else:
             fixed.append(t)
     if changed:

@@ -1239,7 +1239,11 @@ class FXToTileLang:
         """
         if self._content_hash is not None:
             return f"fused_{self._content_hash}"
-        h = hashlib.blake2b(digest_size=8)
+        # Wave-3 (grok review #02 security): widen digest 8→16 bytes
+        # (128 bits) so adversarial-graph collision attacks against the
+        # ``tilelang::fused_<hash>`` registry move from "theoretically
+        # plausible" to "practically infeasible".
+        h = hashlib.blake2b(digest_size=16)
         for op, payload in self.ctx.op_trace:
             h.update(op.encode())
             for x in payload:
@@ -1697,6 +1701,14 @@ class FXToTileLang:
         "view", "reshape", "flatten", "permute", "transpose",
         "broadcast_to", "expand", "dropout",
     })
+    # Wave-3 (grok review #02): binary-elementwise extension. A region with
+    # exactly one binary op + 0+ unary follow-ups (e.g. ``relu(a + b)``,
+    # ``mul(scale, x).tanh()``) compiles to a single 1D launcher with two
+    # tensor inputs; multi-input fused chains beyond a single binary remain
+    # a TODO (would require dataflow analysis of payload[0]/[1] handles).
+    _SEQUENTIAL_BINARY_OPS = frozenset({
+        "add", "sub", "mul", "div", "maximum", "minimum",
+    })
 
     def _emit_sequential_region(
         self, T: Any,
@@ -1727,7 +1739,31 @@ class FXToTileLang:
             raise NotImplementedError(
                 "sequential region: only view-like ops, nothing to compile")
 
-        if not all(op in self._SEQUENTIAL_UNARY_OPS
+        # Wave-3: dispatch unary-only vs single-binary+unary-tail paths.
+        binary_ops = [
+            (idx, op) for idx, (op, _) in enumerate(compute_ops)
+            if op in self._SEQUENTIAL_BINARY_OPS
+        ]
+        if binary_ops:
+            if len(binary_ops) > 1:
+                raise NotImplementedError(
+                    "sequential region: multi-binary chains not supported; "
+                    "routing to extern (multi-input fused chains TODO).")
+            tail_unary = [op for idx, (op, _) in enumerate(compute_ops)
+                          if idx > binary_ops[0][0]]
+            if any(op not in self._SEQUENTIAL_UNARY_OPS for op in tail_unary):
+                raise NotImplementedError(
+                    "sequential region: binary op must be followed only by "
+                    f"unary ops; got tail {tail_unary!r}; routing to extern")
+            head_pre_binary = [op for idx, (op, _) in enumerate(compute_ops)
+                               if idx < binary_ops[0][0]]
+            if head_pre_binary:
+                raise NotImplementedError(
+                    "sequential region: ops before the binary op not "
+                    f"supported in this pass: {head_pre_binary!r}")
+            return self._emit_sequential_binary(
+                T, compute_ops, binary_ops[0][0])
+        elif not all(op in self._SEQUENTIAL_UNARY_OPS
                    for op, _ in compute_ops):
             raise NotImplementedError(
                 f"sequential region: op trace {ops_only!r} "
@@ -1811,6 +1847,122 @@ class FXToTileLang:
                         v = X_flat[idx]
                         for op_name in unary_op_names:
                             v = _apply_unary(T, op_name, v, dtype)
+                        Y_flat[idx] = v
+
+        return kernel
+
+    def _emit_sequential_binary(
+        self, T: Any,
+        compute_ops: List[Tuple[str, Tuple[Any, ...]]],
+        binary_idx: int,
+    ) -> Any:
+        """Emit ``binary(X1, X2)`` followed by 0+ unary ops as a single 1D
+        flat-indexed PrimFunc with two tensor inputs and one output.
+
+        Wave-3 (grok review #02 perf §2 + design §1): closes the binary-
+        elementwise gap from the wave-2 sequential emitter. Multi-input
+        fused chains (3+ inputs / multiple binary ops) remain a Wave-4 TODO
+        — they require dataflow analysis of FX node-name handles in
+        ``payload[0]``/``payload[1]``, which is non-trivial. The single-
+        binary case below covers ``a+b``, ``a*scale``, ``relu(a+b)``, etc.
+        """
+        bin_op, bin_payload = compute_ops[binary_idx]
+        # payload contract: (node_name, lhs_spec, rhs_spec) — see
+        # _emit_binary_elementwise (and per-op emitters add/sub/mul/div).
+        if len(bin_payload) < 3:
+            raise NotImplementedError(
+                f"sequential binary: payload {bin_payload!r} too short "
+                "for (node_name, lhs, rhs)")
+        lhs_spec = bin_payload[1]
+        rhs_spec = bin_payload[2]
+        if not (isinstance(lhs_spec, _TensorSpec)
+                and isinstance(rhs_spec, _TensorSpec)):
+            raise NotImplementedError(
+                "sequential binary: requires resolved tensor specs for "
+                f"both operands; got lhs={lhs_spec!r} rhs={rhs_spec!r}")
+        if lhs_spec.shape != rhs_spec.shape or lhs_spec.dtype != rhs_spec.dtype:
+            raise NotImplementedError(
+                "sequential binary: broadcast / mixed-dtype not yet "
+                f"supported (lhs={lhs_spec.shape}|{lhs_spec.dtype} vs "
+                f"rhs={rhs_spec.shape}|{rhs_spec.dtype})")
+        shape = lhs_spec.shape
+        dtype = lhs_spec.dtype
+        n_elem = 1
+        for s in shape:
+            n_elem *= int(s)
+        if n_elem <= 0:
+            raise NotImplementedError(
+                f"sequential binary: degenerate numel from shape {shape}")
+        BLOCK = 128 if n_elem >= 128 else (64 if n_elem >= 64 else max(n_elem, 1))
+
+        tail_unary = tuple(op for op, _ in compute_ops[binary_idx + 1:])
+
+        def _apply_binary(T_mod: Any, op_name: str, a: Any, b: Any) -> Any:
+            if op_name == "add":
+                return a + b
+            if op_name == "sub":
+                return a - b
+            if op_name == "mul":
+                return a * b
+            if op_name == "div":
+                return a / b
+            if op_name == "maximum":
+                return T_mod.max(a, b)
+            if op_name == "minimum":
+                return T_mod.min(a, b)
+            raise NotImplementedError(
+                f"sequential binary: op {op_name} has no TIR builder")
+
+        def _apply_unary_local(T_mod: Any, op_name: str, v: Any) -> Any:
+            if op_name == "relu":
+                return T_mod.max(v, T_mod.cast(dtype, 0))
+            if op_name == "tanh":
+                return T_mod.tanh(v)
+            if op_name == "sigmoid":
+                one = T_mod.cast(dtype, 1)
+                return one / (one + T_mod.exp(-v))
+            if op_name == "silu":
+                one = T_mod.cast(dtype, 1)
+                return v / (one + T_mod.exp(-v))
+            if op_name == "gelu":
+                return (T_mod.cast(dtype, 0.5) * v *
+                        (T_mod.cast(dtype, 1.0) +
+                         T_mod.tanh(T_mod.cast(dtype, 0.7978845608028654) *
+                                    (v + T_mod.cast(dtype, 0.044715) *
+                                     v * v * v))))
+            if op_name == "exp":
+                return T_mod.exp(v)
+            if op_name == "log":
+                return T_mod.log(v)
+            if op_name == "sqrt":
+                return T_mod.sqrt(v)
+            if op_name == "rsqrt":
+                return T_mod.rsqrt(v)
+            if op_name == "neg":
+                return -v
+            if op_name == "abs":
+                return T_mod.abs(v)
+            raise NotImplementedError(
+                f"sequential binary tail: unary op {op_name} has no TIR builder")
+
+        @T.prim_func
+        def kernel(
+            X1: T.Tensor(shape, dtype),
+            X2: T.Tensor(shape, dtype),
+            Y: T.Tensor(shape, dtype),
+        ):
+            with T.Kernel(T.ceildiv(n_elem, BLOCK), threads=BLOCK) as bx:
+                X1_flat = T.Buffer((n_elem,), dtype, data=X1.data)
+                X2_flat = T.Buffer((n_elem,), dtype, data=X2.data)
+                Y_flat = T.Buffer((n_elem,), dtype, data=Y.data)
+                for i in T.Parallel(BLOCK):
+                    idx = bx * BLOCK + i
+                    if idx < n_elem:
+                        a = X1_flat[idx]
+                        b = X2_flat[idx]
+                        v = _apply_binary(T, bin_op, a, b)
+                        for op_name in tail_unary:
+                            v = _apply_unary_local(T, op_name, v)
                         Y_flat[idx] = v
 
         return kernel
