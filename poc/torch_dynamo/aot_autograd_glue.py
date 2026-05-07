@@ -136,11 +136,17 @@ def _compile_one_side(
     compiler to return a callable that takes a single positional list of
     tensors (the "boxed" calling convention).
     """
+    from . import _validate_graph  # noqa: WPS433
     from .fx_to_tilelang import FXToTileLang
     from .custom_op_wrapper import wrap_as_custom_op
 
-    # ``__init__._validate_graph`` runs only on the user-facing backend
-    # entry; here we trust aot_autograd to hand us decomposed FX.
+    # Grok #09 correctness #4: the bwd path used to skip ``_validate_graph``
+    # under the assumption that aot_autograd hands us decomposed FX, but bwd
+    # graphs commonly reference ops (``threshold_backward``, ``expand``)
+    # absent from ``ATEN_DISPATCH``. Surfacing them here yields one
+    # actionable error per missing emitter instead of a confusing dispatch
+    # crash deep in the walker.
+    _validate_graph(gm)
     lowerer = FXToTileLang(gm, list(example_inputs))
     artifact = lowerer.run()
     runner = wrap_as_custom_op(

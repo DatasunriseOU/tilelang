@@ -840,6 +840,41 @@ def emit_sigmoid_backward(node, args, ctx: LoweringContext) -> _TensorSpec:
     return _TensorSpec(shape=grad_out.shape, dtype=grad_out.dtype)
 
 
+def emit_threshold_backward(node, args, ctx: LoweringContext) -> _TensorSpec:
+    """Emit ``aten.threshold_backward`` — the relu/threshold bwd primitive.
+
+    grad_x = where(x > threshold, grad_out, 0). Pure elementwise — same
+    shape/dtype as ``grad_out``. ``args = (grad_out, x, threshold)``; the
+    threshold scalar is recorded for the materialiser but does not affect
+    the output spec.
+    """
+    grad_out = args[0]
+    x = args[1] if len(args) > 1 else grad_out
+    threshold = args[2] if len(args) > 2 else 0
+    if not isinstance(grad_out, _TensorSpec):
+        raise TypeError("threshold_backward requires tensor inputs")
+    ctx.op_trace.append(("threshold_bwd", (node.name, grad_out, x, threshold)))
+    return _TensorSpec(shape=grad_out.shape, dtype=grad_out.dtype)
+
+
+def emit_expand(node, args, ctx: LoweringContext) -> _TensorSpec:
+    """Emit ``aten.expand`` — bias-grad broadcast in bwd graphs.
+
+    Returns a ``_TensorSpec`` shaped per ``args[1]`` (the target shape).
+    ``-1`` entries inherit the source dim. Stride-zero broadcast is handled
+    by the materialiser; here we only resolve the spec.
+    """
+    x = args[0]
+    target = tuple(args[1]) if len(args) > 1 else x.shape
+    if not isinstance(x, _TensorSpec):
+        raise TypeError("expand requires a tensor input")
+    out_shape: Tuple[int, ...] = tuple(
+        s if s != -1 else x.shape[i] for i, s in enumerate(target)
+    )
+    ctx.op_trace.append(("expand", (node.name, x, target)))
+    return _TensorSpec(shape=out_shape, dtype=x.dtype)
+
+
 # Top 8 backward ATEN ops — APPEND-ONLY to ATEN_DISPATCH.
 # (Sibling integration #9 owns the forward entries above. We use
 # ``setdefault`` semantics manually so we never clobber a forward entry
@@ -869,6 +904,9 @@ _BWD_DISPATCH: Dict[str, Callable[..., _TensorSpec]] = {
     "sum_dim_IntList": emit_sum_dim_intlist,
     # --- transpose --------------------------------------------------------
     "t": emit_t,
+    # --- threshold/relu bwd + broadcast (grok #09 review) -----------------
+    "threshold_backward": emit_threshold_backward,
+    "expand": emit_expand,
     # --- attention backward (deferred) ------------------------------------
     "_scaled_dot_product_flash_attention_backward": _hard_stub(
         "_scaled_dot_product_flash_attention_backward", _FLASH_ATTN_BWD_RECIPE),

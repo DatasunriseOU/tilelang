@@ -97,29 +97,6 @@ def _spec_to_torch_dtype(dtype_name: str) -> Any:
     return M.get(dtype_name, torch.float32)
 
 
-def _meta_kernel_factory(artifact: FusedKernelArtifact) -> Callable[..., Any]:
-    """Build a meta (FakeTensor) shape-inference function for ``artifact``.
-
-    The meta function is a pure replay of the FX output specs — no kernel
-    launch is performed. Dynamo / AOTAutograd consults this when tracing.
-    """
-
-    def _meta(*args: Any, **kwargs: Any) -> Any:
-        import torch  # type: ignore[import-not-found]
-
-        outs = []
-        for spec in artifact.output_specs:
-            outs.append(
-                torch.empty(spec.shape, dtype=_spec_to_torch_dtype(spec.dtype),
-                            device="meta"))
-        if len(outs) == 1:
-            return outs[0]
-        return tuple(outs)
-
-    _meta.__name__ = f"_meta_{artifact.name}"
-    return _meta
-
-
 def _check_no_grad(tensors: Sequence[Any], *, allow_grad: bool = False) -> None:
     """Raise if any input requires grad — unless ``allow_grad`` is True.
 
@@ -192,11 +169,19 @@ def wrap_as_custom_op(
         n_outputs = len(artifact.output_specs)
         allow_grad = is_backward
 
+        # Hot-path optimisation (grok #09 perf review): captures
+        # ``param_tensors`` as a frozen tuple and avoids the per-call
+        # ``list(args) + list(param_tensors)`` copy. If there are no
+        # captured params we route straight to ``artifact.launcher``.
+        _has_params = bool(param_tensors)
+        _bound_launcher = artifact.launcher
+
         @custom_op(op_qualname, mutates_args=())
         def _impl(args: Sequence[torch.Tensor]) -> Any:  # type: ignore[name-defined]
             _check_no_grad(args, allow_grad=allow_grad)
-            full_inputs = list(args) + list(param_tensors)
-            return artifact.launcher(*full_inputs)
+            if _has_params:
+                return _bound_launcher(*args, *param_tensors)
+            return _bound_launcher(*args)
 
         @register_fake(op_qualname)
         def _fake(args: Sequence[torch.Tensor]) -> Any:  # type: ignore[name-defined]
