@@ -405,7 +405,8 @@ protected:
    * \return true if all stride checks pass.
    */
   static bool CheckGlobalStrides(const Buffer &buffer,
-                                 arith::Analyzer *analyzer);
+                                 arith::Analyzer *analyzer,
+                                 Optional<Target> target = std::nullopt);
 
 private:
   /*!
