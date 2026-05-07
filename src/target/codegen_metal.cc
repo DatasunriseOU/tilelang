@@ -25,6 +25,7 @@
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/transform.h>
 
+#include <cmath>
 #include <algorithm>
 #include <sstream>
 #include <string>

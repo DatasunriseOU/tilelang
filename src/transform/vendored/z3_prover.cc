@@ -188,14 +188,14 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
           bv_truncation_warned_ = true;
         }
       }
-      return ctx->bv_val(static_cast<long long>(value),
+      return ctx->bv_val(static_cast<int64_t>(value),
                          static_cast<unsigned>(bv_width_));
     }
     return ctx->int_val(value);
   }
   ::z3::expr MakeUIntVal(uint64_t value) {
     if (bv_width_ > 0) {
-      return ctx->bv_val(static_cast<unsigned long long>(value),
+      return ctx->bv_val(static_cast<uint64_t>(value),
                          static_cast<unsigned>(bv_width_));
     }
     return ctx->int_val(value);

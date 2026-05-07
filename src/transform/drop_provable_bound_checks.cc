@@ -176,7 +176,7 @@ class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
       std::vector<std::function<void()>> recover_stack;
       recover_stack.reserve(vc.vars.size() * 2);
       for (const VarNode *vn : vc.vars) {
-        Var v = GetRef<Var>(vn);
+        Var v = tvm::ffi::GetRef<Var>(vn);
         // Only int-typed vars get the BV32 box.
         if (!v.dtype().is_int()) {
           continue;
