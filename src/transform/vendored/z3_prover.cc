@@ -1106,12 +1106,21 @@ void Z3Prover::Reset() {
 // `ClearProverCache()` (below) can reach the same map. Returning by
 // reference is safe: the map itself is `static thread_local`, so its
 // storage outlives any caller frame on this thread.
+//
+// CPPMEGA z3-final: the cache is heap-allocated and intentionally LEAKED at
+// TLS teardown. Z3 keeps its own thread_local context globals that are
+// destroyed before our cache during process exit on aarch64/glibc 2.39 with
+// Z3 22.x. If our cache's dtor runs after Z3's globals are gone,
+// `~Z3ProverImpl` -> `~solver` -> `Z3_solver_dec_ref` -> `~param_descrs`
+// dereferences torn-down Z3 state and SIGSEGVs (cosmetic but pollutes test
+// output). By holding the map via a raw pointer that we never delete, the
+// TLS dtor runs no Z3 code at exit; the OS reclaims the heap pages.
 static std::unordered_map<::tvm::arith::Analyzer*, std::unique_ptr<Z3Prover>>&
 GetProverCache_() {
-  static thread_local std::unordered_map<::tvm::arith::Analyzer*,
-                                         std::unique_ptr<Z3Prover>>
-      cache;
-  return cache;
+  static thread_local auto* cache =
+      new std::unordered_map<::tvm::arith::Analyzer*,
+                             std::unique_ptr<Z3Prover>>();
+  return *cache;
 }
 
 Z3Prover& GetOrCreate(::tvm::arith::Analyzer* analyzer) {
