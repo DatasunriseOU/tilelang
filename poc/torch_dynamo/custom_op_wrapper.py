@@ -157,6 +157,11 @@ class FusedKernelArtifact:
     prim_func: Any = None
     prim_funcs: Tuple[Any, ...] = ()
     source: str = ""
+    # Wave-4 #09 fix #6: atomic-accumulator flag lives on the artifact so
+    # the bwd compile can read it back (was previously sniffed inline in
+    # aot_autograd_glue, which made the metadata orthogonal to the
+    # artifact's identity and impossible to surface in tooling).
+    has_atomic_accumulator: bool = False
 
 
 def _spec_to_torch_dtype(dtype_name: str) -> Any:
