@@ -1,0 +1,11 @@
+---
+aspect: correctness
+provider: grok
+model: grok-4
+range: (uncommitted)
+base_ref: 
+head_ref: 
+timestamp: 2026-05-07T01:39:59.369223+00:00
+files: ['/private/tmp/tl_poc_review/src/transform/lower_tma_to_ptr_arith.h', '/private/tmp/tl_poc_review/src/transform/lower_tma_to_ptr_arith.cc', '/private/tmp/tl_poc_review/src/transform/lower_hopper_intrin.cc', '/private/tmp/tl_poc_review/src/transform/lower_ptx_async_copy.cc', '/private/tmp/tl_poc_review/src/transform/inject_pipeline.cc', '/private/tmp/tl_poc_review/src/op/copy.cc', '/private/tmp/tl_poc_review/tilelang/transform/__init__.py', '/private/tmp/tl_poc_review/tilelang/engine/phase.py', '/private/tmp/tl_poc_review/testing/python/transform/test_lower_tma_to_ptr_arith.py', '/private/tmp/tl_poc_review/testing/python/transform/test_tl_ptr_copy_elem_preamble.py']
+---
+(no response)
