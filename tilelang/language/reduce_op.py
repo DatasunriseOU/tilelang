@@ -213,19 +213,32 @@ def reduce_sum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
 def reduce_prod(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, batch: int = 1) -> None:
     """Perform reduce product on input buffer, store the result to output buffer.
 
-    Backend lowering uses the ``"mul"`` reduction kind. Known limitation
-    (wave-7 #5, runtime-test-matrix commit e2bd513e): the C++ TIR pass
-    that lowers ``"mul"`` AllReduce currently emits a buffer access with a
-    vector lane in a non-last dimension, which then trips the invariant
-    in ``src/transform/vectorize_loop.cc:67`` and
-    ``src/transform/storage_rewrite.cc:70`` (``"Only the last index of a
-    buffer access may be a vector type."``). The Python wrapper here is
-    correct (mirrors ``reduce_sum`` / ``reduce_max`` exactly); the bug
-    is in the C++ lowering and tracked for wave-8.
+    Backend lowering uses the ``"mul"`` reduction kind. Wave-8 #5 (commit
+    9a7d1d3e) registered the ``kMul`` path end-to-end (``src/op/reduce.h``,
+    ``src/op/reduce.cc``, CUDA + HIP warp templates).
 
-    Until the C++ pass is fixed, callers should prefer the log/exp
-    synthesis fallback (see :data:`poc.triton_frontend.op_mapping._USE_LOGEXP_PROD`).
-    A ``RuntimeWarning`` is emitted on first call as a tracking signal.
+    Wave-10 #3 (meta ``rev_c2fc451321`` HIGH) — **caller contract**: the
+    AllReduce template in ``src/tl_templates/{cuda,hip}/reduce.h`` issues
+    an XOR-butterfly across the warp / wave with the full-warp mask
+    (``0xffffffff`` on CUDA, full wave on HIP). For ``MulOp`` the
+    multiplicative identity is ``1.0``, not ``0`` — so callers MUST
+    pre-init the per-thread fragment to ``1`` for any lane that does not
+    hold a real input element. Failing to honour this produces silent
+    wrong products on shapes whose ``dim`` length is not a multiple of
+    the warp / wave width (32 on CUDA, 32 or 64 on HIP). The
+    ``reduce_macro`` below already creates a fresh ``alloc_fragment`` and
+    ``copy(buffer, red_frag_in)`` of the actual elements; the unused
+    fragment tail is filled by the codegen's default-init policy. If you
+    hit a numerical mismatch on non-power-of-2 ``dim`` length, see the
+    CUDA-template comment for the explicit identity-pad workaround.
+
+    Older known limitation (wave-7 #5, before wave-8 #5 C++ fix landed):
+    ``RuntimeWarning`` was previously emitted because the C++ lowering
+    pass tripped the ``vectorize_loop.cc`` invariant. That path is closed
+    by 9a7d1d3e; the warning is retained as a one-shot tracking signal
+    until the wave-10 regression test
+    ``testing/python/language/test_reduce_prod.py`` is verified on a
+    ``build/lib``-having host.
 
     Args:
         buffer (tir.Buffer): The input buffer

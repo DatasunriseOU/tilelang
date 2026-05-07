@@ -35,6 +35,19 @@ struct SumOp {
 // Wave-8 #5: product reduction warp template. Mirrors SumOp; the AllReduce
 // driver in `src/op/reduce.cc:MakeCodegenReducer()` emits "tl::MulOp" for
 // `T.reduce_prod(...)` / `tt.reduce(mul)`.
+//
+// Wave-10 #3 (meta rev_c2fc451321 HIGH): the AllReduce / warp_reduce templates
+// below issue an XOR-butterfly with full-warp mask 0xffffffff. That pulls the
+// partner lane's value regardless of whether the partner held a real input or
+// uninitialized garbage. SumOp is forgiving because uninit is often zeroed
+// (and 0 is the additive identity); MulOp is NOT — the multiplicative identity
+// is 1.0, not 0. Callers MUST identity-pad inactive warp lanes to 1 before
+// invoking AllReduce<MulOp, ...> / warp_reduce<MulOp>(), e.g. by initialising
+// the per-thread fragment to T(1) before the per-element load and using
+// `T x_lane = (lane_id < N_active) ? frag[lane_id] : T(1);`. The reduce
+// macro in `tilelang/language/reduce_op.py` documents this contract; failing
+// to honour it produces silent wrong products on shapes whose dim length is
+// not a multiple of the warp width (32 on CUDA, 32/64 on HIP).
 struct MulOp {
   template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
     return x * y;

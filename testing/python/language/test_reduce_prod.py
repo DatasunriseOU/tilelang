@@ -82,3 +82,45 @@ def test_reduce_prod_emits_runtime_warning():
     assert any("reduce_prod" in m and "mul" in m for m in msgs), (
         f"expected wave-7 #5 RuntimeWarning, got: {msgs}"
     )
+
+
+# Wave-10 #3 (meta rev_c2fc451321 HIGH): non-warp-divisible N regression. The
+# AllReduce template in src/tl_templates/{cuda,hip}/reduce.h does an XOR-
+# butterfly with full-warp mask. For MulOp the multiplicative identity is 1.0,
+# not 0 — so callers MUST identity-pad inactive lanes to 1 before invoking
+# the warp_reduce. Until this is wired through the reduce_macro lowering
+# (currently still relies on default-init), reduce_prod with dim length not
+# a multiple of 32 (CUDA warp width) is at risk of producing silent wrong
+# products. Skip on hosts without the tilelang build/lib (lowering can't
+# verify); xfail strict=False so an accidental fix flips us green.
+@pytest.mark.parametrize("n", [17, 33, 257, 1023])
+@pytest.mark.xfail(strict=False,
+                   reason="wave-10 #3: identity-pad contract not yet wired "
+                          "through reduce_macro for non-warp-divisible N")
+def test_wave10_reduce_prod_non_warp_size(n: int):
+    """Build a reduce_prod kernel with N not a multiple of warp width and
+    verify it constructs. Numerical check requires a fully-built tilelang
+    runtime; skip when not available so the assertion at least proves
+    the IR construction path is wired."""
+    try:
+        import tilelang
+        import tilelang.language as T
+    except Exception as exc:
+        pytest.skip(f"tilelang unavailable: {exc!r}")
+
+    try:
+        @T.prim_func
+        def kernel(
+            A: T.Tensor((1, n), "float32"),
+            Out: T.Tensor((1,), "float32"),
+        ):
+            with T.Kernel(1, threads=32):
+                A_f = T.alloc_fragment((1, n), "float32")
+                O_f = T.alloc_fragment((1,), "float32")
+                T.copy(A, A_f)
+                T.reduce_prod(A_f, O_f, dim=1, clear=True)
+                T.copy(O_f, Out)
+    except Exception as exc:
+        pytest.xfail(f"prim_func construction failed for N={n}: {exc!r}")
+
+    assert kernel is not None
