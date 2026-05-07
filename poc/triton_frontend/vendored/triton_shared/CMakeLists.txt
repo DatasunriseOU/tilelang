@@ -132,9 +132,29 @@ mlir_tablegen("${_TS_TG_OUT_DIR}/TritonStructuredOps.cpp.inc"
 add_public_tablegen_target(TritonStructuredVendoredTableGen)
 
 # -----------------------------------------------------------------------------
+# Helper: prefer MLIR's add_mlir_library when available so the resulting
+# targets integrate with downstream `find_package(MLIR)` consumers (proper
+# install rules, dependency graph, etc). Fall back to plain `add_library`
+# in environments that did not load AddMLIR (e.g. pure LLVM, no MLIR cmake
+# helpers on the module path). Both paths produce a STATIC library.
+# -----------------------------------------------------------------------------
+function(_tl_add_vendored_library NAME)
+  set(_sources ${ARGN})
+  if(COMMAND add_mlir_library)
+    add_mlir_library(${NAME}
+      ${_sources}
+      EXCLUDE_FROM_LIBMLIR
+      DISABLE_INSTALL
+    )
+  else()
+    add_library(${NAME} STATIC ${_sources})
+  endif()
+endfunction()
+
+# -----------------------------------------------------------------------------
 # Library: TritonStructuredDialect (the `tts` dialect)
 # -----------------------------------------------------------------------------
-add_library(TritonStructuredDialect STATIC
+_tl_add_vendored_library(TritonStructuredDialect
   "${_VENDOR_LIB}/Dialect/TritonStructured/IR/TritonStructuredDialect.cpp"
   "${_VENDOR_LIB}/Dialect/TritonStructured/IR/TritonStructuredOps.cpp"
 )
@@ -168,7 +188,7 @@ target_link_libraries(TritonStructuredDialect PUBLIC TritonIR)
 # -----------------------------------------------------------------------------
 # Library: TritonSharedUseAnalysis (upstream UseAnalysis sibling pass)
 # -----------------------------------------------------------------------------
-add_library(TritonSharedUseAnalysis STATIC
+_tl_add_vendored_library(TritonSharedUseAnalysis
   "${_VENDOR_LIB}/Analysis/UseAnalysis.cpp"
 )
 add_dependencies(TritonSharedUseAnalysis TritonStructuredVendoredTableGen)
@@ -195,7 +215,7 @@ target_link_libraries(TritonSharedUseAnalysis PUBLIC
 #   lib/AnalysisStructured/PtrAnalysis.cpp   <- structured tts::PtrAnalysis
 #   lib/Analysis/MaskAnalysis.cpp            <- shared mask decomposition
 #   lib/Analysis/OpFoldResultUtils.cpp       <- arithmetic helpers
-add_library(TritonSharedAnalysisStructured STATIC
+_tl_add_vendored_library(TritonSharedAnalysisStructured
   "${_VENDOR_LIB}/AnalysisStructured/PtrAnalysis.cpp"
   "${_VENDOR_LIB}/Analysis/MaskAnalysis.cpp"
   "${_VENDOR_LIB}/Analysis/OpFoldResultUtils.cpp"
@@ -227,7 +247,7 @@ target_link_libraries(TritonSharedAnalysisStructured PUBLIC
 # library so a downstream pybind module can call
 # `mlir::triton_shared_vendored::registerTritonStructured(registry)`.
 # -----------------------------------------------------------------------------
-add_library(TritonSharedRegister STATIC
+_tl_add_vendored_library(TritonSharedRegister
   "${_VENDOR_ROOT}/RegisterTritonStructured.cc"
 )
 add_dependencies(TritonSharedRegister TritonStructuredVendoredTableGen)
@@ -282,3 +302,54 @@ install(DIRECTORY "${_VENDOR_BUILD_INCLUDE}/triton-shared"
   FILES_MATCHING PATTERN "*.inc")
 install(FILES "${_VENDOR_ROOT}/RegisterTritonStructured.h"
   DESTINATION include/triton_shared_vendored)
+
+# -----------------------------------------------------------------------------
+# Optional pybind shim: register_triton_structured
+#
+# The standalone Python extension that exposes
+# `mlir::triton_shared_vendored::registerTritonStructured` to
+# `verify_dialect_loads.py` and `tests/test_triton_structured_walk.py`. The
+# source lives outside this directory at
+# `../../_cxx/register_triton_structured_pybind.cc` (Wave-1 added it there
+# alongside the existing `_triton_frontend_cxx` pybind module). Build it from
+# inside this CMakeLists so the shim ships with the vendoring step rather than
+# being entangled with the unrelated PtrAnalysis pybind module.
+#
+# Gate behind `pybind11` being findable -- when a super-project does not have
+# pybind11 available we silently skip (the rest of the vendored libs still
+# build and the dialect-walk test auto-skips when the import fails).
+# -----------------------------------------------------------------------------
+find_package(pybind11 CONFIG QUIET)
+if(pybind11_FOUND)
+  set(_REGISTER_PYBIND_SRC
+      "${_VENDOR_ROOT}/../../_cxx/register_triton_structured_pybind.cc")
+  if(EXISTS "${_REGISTER_PYBIND_SRC}")
+    pybind11_add_module(register_triton_structured
+      "${_REGISTER_PYBIND_SRC}"
+    )
+    target_include_directories(register_triton_structured PRIVATE
+      "${_VENDOR_ROOT}"
+      "${_VENDOR_INCLUDE}"
+      ${MLIR_INCLUDE_DIRS}
+      ${LLVM_INCLUDE_DIRS}
+    )
+    target_link_libraries(register_triton_structured PRIVATE
+      TritonSharedRegister
+    )
+    # Place the .so where verify_dialect_loads.py / test_triton_structured_walk.py
+    # try to import from: poc/triton_frontend/_cxx/register_triton_structured.<ext>
+    set_target_properties(register_triton_structured PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY
+        "${_VENDOR_ROOT}/../../_cxx"
+    )
+    message(STATUS "register_triton_structured: enabled (pybind11 found)")
+  else()
+    message(STATUS
+      "register_triton_structured: source not found at ${_REGISTER_PYBIND_SRC}; "
+      "skipping shim.")
+  endif()
+else()
+  message(STATUS
+    "register_triton_structured: pybind11 not found; skipping shim "
+    "(verify_dialect_loads.py + test_triton_structured_walk.py will auto-skip).")
+endif()

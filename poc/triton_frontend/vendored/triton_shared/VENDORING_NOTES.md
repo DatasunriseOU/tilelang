@@ -271,3 +271,65 @@ Applied based on grok-4 code review of this directory:
   `mlir::triton_shared_vendored::registerTritonStructured(*ctx)`, closing
   the import-name mismatch flagged by the review (correctness bug #1 in
   `grok__correctness__*.md`).
+
+## Drift detection (Wave-2)
+
+`.vendor-manifest.sha256` is a flat list of `<sha256>  <relpath>` entries
+(format identical to `shasum -a 256` output) covering everything under
+`include/`, `lib/`, plus the four top-level files `LICENSE`,
+`RegisterTritonStructured.{h,cc}`. Run
+
+```
+python -m poc.triton_frontend.vendored.triton_shared.check_vendor_drift
+```
+
+to verify the on-disk tree matches the manifest. The CI-friendly
+`poc/triton_frontend/tests/test_vendor_drift.py` asserts the same — any
+`pytest poc/triton_frontend/tests/test_vendor_drift.py` run will fail if
+a vendored file is edited locally without bumping the manifest, or if a
+file is added to the tracked sub-trees without updating the manifest.
+
+After a deliberate re-vendor against a newer upstream commit, refresh
+the manifest with:
+
+```
+python -m poc.triton_frontend.vendored.triton_shared.check_vendor_drift --refresh
+```
+
+and commit the manifest change alongside the source bump (and update the
+`Upstream commit:` line at the top of the manifest + the
+`# Source` block in this file). `CMakeLists.txt`,
+`VENDORING_NOTES.md`, `verify_dialect_loads.py`, and
+`check_vendor_drift.py` itself are intentionally NOT tracked by the
+manifest — they are our build glue / docs / tooling, not vendored
+upstream content.
+
+## End-to-end MLIR walk regression (Wave-2)
+
+`poc/triton_frontend/tests/test_triton_structured_walk.py` parses a richer
+module (mixing `tts.make_tptr` and `tts.make_gather_scatter_tptr`) under
+`mlir.ir.Context()` after invoking `register_dialects(ctx)`, walks the
+resulting module and asserts at least one `tts.*` op was visited. It is
+the canonical post-rebuild verification: when `register_triton_structured`
+has been built (see `_cxx/CMakeLists.txt`), running
+
+```
+pytest poc/triton_frontend/tests/test_triton_structured_walk.py
+```
+
+confirms (a) the dialect registry is wired up, (b) the parser accepts
+the upstream-printer form for both `tts.*` ops, and (c) the walker can
+traverse them. The test auto-skips when the shim is not built.
+
+## CMake integration with `add_mlir_library`
+
+The four library declarations (`TritonStructuredDialect`,
+`TritonSharedUseAnalysis`, `TritonSharedAnalysisStructured`,
+`TritonSharedRegister`) go through a small `_tl_add_vendored_library`
+helper that prefers MLIR's `add_mlir_library` (with `EXCLUDE_FROM_LIBMLIR
+DISABLE_INSTALL`) when it is available — that is, when downstream
+`find_package(MLIR)` consumers added `${MLIR_CMAKE_DIR}` to
+`CMAKE_MODULE_PATH` and `include(AddMLIR)` ran. In environments without
+MLIR's CMake helpers (pure LLVM, system-installed MLIR without dev
+files, …) the helper falls back to plain `add_library(... STATIC ...)`.
+Both code paths produce identical link-time semantics.
