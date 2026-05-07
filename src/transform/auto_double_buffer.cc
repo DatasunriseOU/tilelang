@@ -206,14 +206,6 @@ public:
       if (det.found_load && det.found_use_after_load) {
         candidates_detected_++;
 
-        // Build and (conservatively) evaluate the soundness obligation.
-        arith::Analyzer analyzer;
-        analyzer.Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
-        PrimExpr obligation =
-            BuildSoundnessObligation(det.info, op->loop_var);
-        bool proved =
-            arith::Z3Prover(analyzer).CanProve(analyzer.Simplify(obligation));
-
         std::ostringstream candidate_name;
         if (det.info.candidate_buffer.defined()) {
           candidate_name << det.info.candidate_buffer->name;
@@ -221,21 +213,16 @@ public:
           candidate_name << "<unnamed>";
         }
 
-        if (proved) {
-          // SAFE STUB: we have a candidate AND the obligation is provable,
-          // but we still leave IR unchanged — the actual ping-pong
-          // transformation is deferred. Future commits replace this branch
-          // with the real rewrite.
-          LOG(INFO) << "[AutoDoubleBuffer] candidate detected for buffer '"
-                    << candidate_name.str()
-                    << "', soundness obligation proved by Z3, but "
-                    << "no transformation emitted yet (safe-stub mode).";
-        } else {
-          LOG(INFO) << "[AutoDoubleBuffer] candidate detected for buffer '"
-                    << candidate_name.str()
-                    << "', but Z3 could not prove ping-pong soundness; "
-                    << "falling back to single buffer.";
-        }
+        // CPPMEGA fix-C2 (round-7): stub mode. The IR is never rewritten
+        // here, so spinning up a Z3 prover only to discard the result is
+        // pure waste — and worse, it gave reviewers the impression that
+        // a proof was actually attempted. Skip the prover entirely in
+        // stub mode and log that no transformation was performed. When
+        // the real ping-pong rewrite is implemented (see file header),
+        // this branch should re-introduce the obligation/CanProve gate.
+        LOG(INFO) << "[AutoDoubleBuffer] stub: candidate detected for buffer '"
+                  << candidate_name.str()
+                  << "'; no transformation emitted, no proof attempted.";
       }
     }
 
