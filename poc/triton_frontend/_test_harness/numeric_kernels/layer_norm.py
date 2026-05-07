@@ -32,6 +32,21 @@ EPS = 1e-5
 LAUNCH_GRID: Tuple[int, ...] = (N_ROWS,)
 META_ARGS: dict = {"BLOCK_SIZE": BLOCK_SIZE, "eps": EPS}
 
+# Mapping ``argN`` field-name -> int value for TileLang's Metal args struct.
+# Triton signature is
+#   (x_ptr, w_ptr, b_ptr, out_ptr, x_row_stride, out_row_stride, n_cols, eps,
+#    BLOCK_SIZE)
+# with BLOCK_SIZE *and* eps marked constexpr (eps is in META_ARGS), so eps
+# is folded into the kernel as a literal. PrimFunc params are the four
+# buffers (arg0..arg3) followed by the three remaining i32 scalars, so
+# arg4/arg5/arg6 = x_row_stride/out_row_stride/n_cols. All three are
+# N_COLS for our (N_ROWS, N_COLS) tile.
+KERNEL_SCALAR_ARGS: dict = {
+    "arg4": N_COLS,  # x_row_stride
+    "arg5": N_COLS,  # out_row_stride
+    "arg6": N_COLS,  # n_cols
+}
+
 ATOL = 1e-4
 RTOL = 1e-3
 

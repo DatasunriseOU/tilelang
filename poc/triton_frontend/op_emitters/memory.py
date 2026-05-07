@@ -1494,6 +1494,88 @@ def emit_tt_reshape(op: Any, ctx: WalkerCtx) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _compose_addptr_index(ctx: WalkerCtx, prev: Any, off: Any) -> Any:
+    """Return a per-lane sum ``prev + off`` for an in-loop ``tt.addptr``.
+
+    ``prev`` is the trailing entry of the previous-iteration index list and
+    may be a scalar ``tir.PrimExpr`` or a ``tir.Buffer`` (a tile of
+    per-lane offsets). ``off`` is the new addptr offset operand and may
+    likewise be either a PrimExpr or a Buffer.
+
+    * **PrimExpr + PrimExpr** -- delegate to TIR's scalar add (the existing
+      fast path).
+    * **Buffer + PrimExpr** (or symmetric) -- broadcast the scalar across
+      every lane of the buffer; allocate a fresh tile buffer and emit a
+      per-lane ``tir.For`` nest that stores ``buf[i,...] + scalar``.
+    * **Buffer + Buffer** -- per-lane elementwise add into a fresh tile
+      buffer of the broadcast shape (rank picked from the larger-rank
+      operand, padded with leading 1s for the smaller).
+
+    Always returns either a ``tir.PrimExpr`` (scalar fast path) or a fresh
+    ``tir.Buffer`` allocated via ``_alloc_tile_buffer``. The caller stores
+    this as the trailing entry of ``new_indices`` so downstream
+    ``tt.load`` / ``tt.store`` consumers see the same shape contract they
+    already handled.
+    """
+    tvm_mod = ctx.tvm()
+    tir = ctx.tir()
+    Buffer = tvm_mod.tir.Buffer
+
+    prev_is_buf = isinstance(prev, Buffer)
+    off_is_buf = isinstance(off, Buffer)
+
+    # Scalar fast path: the existing TIR ``+`` operator handles this.
+    if not prev_is_buf and not off_is_buf:
+        return prev + off
+
+    # Pick the result tile shape: whichever operand is a Buffer wins; if
+    # both, pick the higher-rank shape (matmul's case where the prev
+    # offsets are themselves a 2-D tile).
+    if prev_is_buf and off_is_buf:
+        if len(prev.shape) >= len(off.shape):
+            out_shape = list(prev.shape)
+        else:
+            out_shape = list(off.shape)
+        out_dtype = str(prev.dtype)
+    elif prev_is_buf:
+        out_shape = list(prev.shape)
+        out_dtype = str(prev.dtype)
+    else:
+        out_shape = list(off.shape)
+        out_dtype = str(off.dtype)
+
+    out_buf = _alloc_tile_buffer(ctx, out_shape, out_dtype, ctx.fresh("addptr_acc"))
+    loop_vars = [tir.Var(ctx.fresh(f"a{axis}"), "int32") for axis in range(len(out_shape))]
+
+    def _lane(operand: Any) -> Any:
+        if isinstance(operand, Buffer):
+            rank = len(operand.shape)
+            if rank == 0:
+                return tir.BufferLoad(operand, [tir.const(0, "int32")])
+            # Broadcast: align the trailing ``rank`` axes; pad the leading
+            # axes with zero so a rank-1 tile composed with a rank-2 tile
+            # behaves the same way ``_emit_tile_binop`` does.
+            if len(loop_vars) >= rank:
+                idx = list(loop_vars[-rank:])
+            else:
+                idx = [tir.const(0, "int32")] * (rank - len(loop_vars)) + list(loop_vars)
+            return tir.BufferLoad(operand, idx)
+        # Scalar PrimExpr broadcasts across every lane.
+        return operand
+
+    body: Any = tir.BufferStore(out_buf, _lane(prev) + _lane(off), list(loop_vars))
+    for axis in range(len(loop_vars) - 1, -1, -1):
+        body = tir.For(
+            loop_vars[axis],
+            tir.const(0, "int32"),
+            tir.const(int(out_shape[axis]), "int32"),
+            tir.ForKind.SERIAL,
+            body,
+        )
+    ctx.emit(body)
+    return out_buf
+
+
 def emit_tt_addptr(op: Any, ctx: WalkerCtx) -> Any:
     """Lower ``tt.addptr(ptr, offset)`` to a pointer descriptor.
 
@@ -1508,7 +1590,20 @@ def emit_tt_addptr(op: Any, ctx: WalkerCtx) -> Any:
     * Plain ``(buffer_or_None, indices_list)`` 2-tuple in the degraded
       path. ``buffer`` is a ``tir.Buffer`` (or ``None`` when the base
       pointer wasn't bound yet) and ``indices_list`` is a list of
-      ``tir.PrimExpr`` index expressions.
+      ``tir.PrimExpr`` **or** ``tir.Buffer`` index entries (the latter
+      when the offset is a per-lane tile, e.g. matmul's
+      ``a_ptrs += BLOCK_K * stride_ak`` inside ``scf.for``).
+
+    In-loop tile increments
+    -----------------------
+    For an scf.for loop body containing ``%a_ptrs_new = tt.addptr %a_ptrs,
+    %k_step``, the ``%k_step`` operand resolves to a ``tir.Buffer`` (the
+    per-lane offset tile), not a scalar PrimExpr. The previous iteration's
+    indices may also already carry a Buffer in the trailing entry. We
+    delegate the per-lane add to :func:`_compose_addptr_index`, which
+    allocates a fresh tile buffer and emits a serial ``tir.For`` nest --
+    the same shape contract that ``_emit_tile_binop`` uses in
+    ``op_emitters/arith.py``.
 
     Downstream consumers must extract the buffer + index pair (``tt.load`` /
     ``tt.store`` already do this). Pure ``arith.*`` ops MUST NOT consume an
@@ -1519,6 +1614,7 @@ def emit_tt_addptr(op: Any, ctx: WalkerCtx) -> Any:
     full strided-layout fold). Without the shim we degrade to a scalar
     offset add on the underlying var/value.
     """
+    tvm_mod = ctx.tvm()
     tir = ctx.tir()
     operands = _operands(op)
     if len(operands) < 2:
@@ -1538,7 +1634,13 @@ def emit_tt_addptr(op: Any, ctx: WalkerCtx) -> Any:
         if isinstance(base, dict) and "_ptrstate" in base:
             new_offsets = list(base.get("offsets") or [])
             if new_offsets:
-                new_offsets[-1] = new_offsets[-1] + off if not isinstance(new_offsets[-1], int) else new_offsets[-1] + 0
+                # The trailing offset slot may be a scalar PrimExpr, an
+                # int (untouched here), or a Buffer when an earlier
+                # iteration already produced a tile. Compose-or-pass.
+                if isinstance(new_offsets[-1], int):
+                    new_offsets[-1] = new_offsets[-1] + 0
+                else:
+                    new_offsets[-1] = _compose_addptr_index(ctx, new_offsets[-1], off)
             else:
                 new_offsets = [off]
             new_state = dict(base)
@@ -1548,8 +1650,8 @@ def emit_tt_addptr(op: Any, ctx: WalkerCtx) -> Any:
             return new_state
         if isinstance(base, tuple) and len(base) == 2:
             buf, indices = base
-            new_indices = list(indices) or [0]
-            new_indices[-1] = new_indices[-1] + off
+            new_indices = list(indices) or [tir.const(0, "int32")]
+            new_indices[-1] = _compose_addptr_index(ctx, new_indices[-1], off)
             value = (buf, new_indices)
             if result_value is not None:
                 ctx.bind(result_value, value)
@@ -1561,7 +1663,7 @@ def emit_tt_addptr(op: Any, ctx: WalkerCtx) -> Any:
     if isinstance(base, tuple) and len(base) == 2:
         buf, indices = base
         new_indices = list(indices) or [tir.const(0, "int32")]
-        new_indices[-1] = new_indices[-1] + off
+        new_indices[-1] = _compose_addptr_index(ctx, new_indices[-1], off)
         value = (buf, new_indices)
     elif base is None:
         # No prior binding: synthesise a flat scalar with the offset.

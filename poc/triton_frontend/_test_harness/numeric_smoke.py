@@ -704,17 +704,64 @@ def run_one(kernel_module_name: str, deps: Dict[str, Optional[str]]) -> KernelRe
 # ---------------------------------------------------------------------------
 
 
-def run_all(report_path: Optional[Path] = None) -> List[KernelResult]:
-    """Run every kernel module and write a markdown report."""
+def run_all(
+    report_path: Optional[Path] = None,
+    kernels: Optional[List[str]] = None,
+) -> List[KernelResult]:
+    """Run kernel modules and write a markdown report.
+
+    ``kernels`` -- if provided, restrict the run to these kernel module
+    names (must be members of :data:`numeric_kernels.KERNEL_MODULES`).
+    Defaults to every registered kernel.
+    """
     deps = _probe_deps()
+    if kernels is None:
+        kernels = list(numeric_kernels.KERNEL_MODULES)
+    else:
+        unknown = [k for k in kernels if k not in numeric_kernels.KERNEL_MODULES]
+        if unknown:
+            raise SystemExit(
+                f"unknown kernel(s): {unknown}; "
+                f"available: {list(numeric_kernels.KERNEL_MODULES)}"
+            )
     results: List[KernelResult] = []
-    for mod_name in numeric_kernels.KERNEL_MODULES:
+    for mod_name in kernels:
         results.append(run_one(mod_name, deps))
 
     if report_path is None:
         report_path = REPORT_PATH
     _write_report(results, deps, report_path)
     return results
+
+
+def _build_arg_parser():
+    """Build the CLI argparse parser for ``python -m ... numeric_smoke``."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="poc.triton_frontend._test_harness.numeric_smoke",
+        description=(
+            "Run the Triton -> TileLang -> Metal -> MLX numeric smoke "
+            "harness and write a markdown report."
+        ),
+    )
+    parser.add_argument(
+        "--kernel",
+        action="append",
+        default=None,
+        choices=list(numeric_kernels.KERNEL_MODULES),
+        help=(
+            "Restrict the run to the named kernel module. May be passed "
+            "multiple times to run a subset; default is every kernel."
+        ),
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        default=None,
+        help=f"Where to write the markdown report (default: {REPORT_PATH}).",
+    )
+    return parser
 
 
 def _write_report(
@@ -776,7 +823,8 @@ def _write_report(
 
 
 if __name__ == "__main__":  # pragma: no cover -- manual invocation
-    res = run_all()
+    _args = _build_arg_parser().parse_args()
+    res = run_all(report_path=_args.report, kernels=_args.kernel)
     for r in res:
         print(r.short())
-    print(f"\nReport: {REPORT_PATH}")
+    print(f"\nReport: {_args.report or REPORT_PATH}")

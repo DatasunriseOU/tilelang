@@ -104,6 +104,34 @@ def test_vector_add_numeric_pass_in_venv(deps_dict) -> None:
     )
 
 
+def test_kernel_filter_restricts_run(tmp_path) -> None:
+    """``--kernel`` (passed via ``run_all(kernels=[...])``) restricts the
+    run to the named subset and rejects unknown names. This guards
+    against the regression where the CLI flag was silently ignored.
+    """
+    target = tmp_path / "report.md"
+    results = numeric_smoke.run_all(
+        report_path=target, kernels=["vector_add"]
+    )
+    assert len(results) == 1, [r.name for r in results]
+    assert results[0].name == "vector_add"
+
+    # The CLI parser advertises the flag and rejects unknown choices --
+    # exercise that without re-launching a subprocess.
+    parser = numeric_smoke._build_arg_parser()
+    parsed = parser.parse_args(["--kernel", "vector_add"])
+    assert parsed.kernel == ["vector_add"]
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--kernel", "definitely_not_a_kernel"])
+
+    # ``run_all`` itself must reject unknown kernel names if a caller
+    # bypasses the parser (defence in depth).
+    with pytest.raises(SystemExit):
+        numeric_smoke.run_all(
+            report_path=target, kernels=["definitely_not_a_kernel"]
+        )
+
+
 def test_run_all_writes_report(tmp_path) -> None:
     """``run_all`` writes a markdown report at the requested path.
 

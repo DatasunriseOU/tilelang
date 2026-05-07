@@ -28,6 +28,19 @@ BLOCK_SIZE = 128  # >= N_COLS so the reduce is one-shot
 LAUNCH_GRID: Tuple[int, ...] = (N_ROWS,)
 META_ARGS: dict = {"BLOCK_SIZE": BLOCK_SIZE}
 
+# Mapping ``argN`` field-name -> int value for TileLang's Metal args struct.
+# Triton signature for ``_softmax_kernel`` is
+#   (x_ptr, out_ptr, x_row_stride, out_row_stride, n_cols, BLOCK_SIZE)
+# with BLOCK_SIZE constexpr-folded out. PrimFunc params are the two
+# buffers (arg0, arg1) followed by the three i32 scalars, so the args
+# struct holds arg2/arg3/arg4 = x_row_stride/out_row_stride/n_cols. All
+# three are N_COLS for our (N_ROWS, N_COLS) tile.
+KERNEL_SCALAR_ARGS: dict = {
+    "arg2": N_COLS,  # x_row_stride
+    "arg3": N_COLS,  # out_row_stride
+    "arg4": N_COLS,  # n_cols
+}
+
 ATOL = 1e-4
 RTOL = 1e-3
 

@@ -436,6 +436,113 @@ def test_arith_addf_handles_two_buffer_tile_operands() -> None:
 
 
 # ---------------------------------------------------------------------------
+# tt.addptr in-loop pointer increment (matmul scf.for body)
+# ---------------------------------------------------------------------------
+#
+# Matmul's main loop carries ``a_ptrs += BLOCK_K * stride_ak`` -- a tile-shaped
+# offset-buffer increment that can't be combined with the previous indices via
+# scalar TIR ``+`` (the operand is a Buffer, not a PrimExpr). Before this
+# Wave, ``emit_tt_addptr`` blindly evaluated ``new_indices[-1] + off`` and
+# raised ``Mismatched type ... Expected ir.PrimExpr but got tirx.Buffer``.
+# The fix routes Buffer-shaped offsets through ``_compose_addptr_index``
+# which allocates a fresh tile buffer and emits a per-lane ``tir.For`` nest.
+
+
+def test_addptr_buffer_offset_emits_per_lane_for_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``tt.addptr(ptr, buffer_offset)`` allocates a fresh tile and emits a For.
+
+    Mirrors the matmul scf.for body where the offset operand of an in-loop
+    ``tt.addptr`` is a per-lane offset Buffer (the ``BLOCK_K * stride_ak``
+    tile from a prior ``arith.muli``), not a scalar PrimExpr. The trailing
+    index entry of the result must itself be a fresh ``tir.Buffer`` so
+    downstream ``tt.load`` consumers see a tile-shaped index, and the
+    walker stmts must contain a serial ``tir.For`` that drives the
+    elementwise add.
+    """
+    _force_no_shim(monkeypatch)
+    ctx = WalkerCtx()
+    ptr_ssa = _ssa("a_ptrs", shape=[32], dtype="float32")
+    off_ssa = _ssa("k_step", shape=[32], dtype="int32")
+    out_ssa = _ssa("a_ptrs_new", shape=[32], dtype="float32")
+
+    base_buf = tvm.tir.decl_buffer([1024], "float32", name="A")
+    # Previous iteration's trailing index entry is a per-lane offset Buffer.
+    prev_off = tvm.tir.decl_buffer([32], "int32", name="prev_off")
+    step_buf = tvm.tir.decl_buffer([32], "int32", name="k_step_tile")
+
+    ctx.bind(ptr_ssa, (base_buf, [prev_off]))
+    ctx.bind(off_ssa, step_buf)
+
+    op = {
+        "name": "tt.addptr",
+        "operands": [ptr_ssa, off_ssa],
+        "results": [out_ssa],
+        "attrs": {},
+    }
+    result = emit_tt_addptr(op, ctx)
+    assert isinstance(result, tuple) and len(result) == 2, (
+        f"tt.addptr must return (buf, indices); got {type(result).__name__}"
+    )
+    out_buf, out_indices = result
+    assert out_buf is base_buf, "tt.addptr must thread the base buffer through"
+    assert isinstance(out_indices, list) and len(out_indices) == 1
+    assert isinstance(out_indices[0], tvm.tir.Buffer), (
+        f"trailing index entry must be a fresh tile Buffer; got "
+        f"{type(out_indices[0]).__name__}"
+    )
+    assert int(out_indices[0].shape[0]) == 32
+
+    text = _stringify(ctx.stmts)
+    assert "for" in text.lower(), (
+        f"expected per-lane For loop driving the addptr accumulation; got:\n"
+        f"{text}"
+    )
+    # The new tile buffer must be different from either input tile.
+    assert out_indices[0] is not prev_off
+    assert out_indices[0] is not step_buf
+
+
+def test_addptr_scalar_offset_keeps_scalar_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scalar PrimExpr offsets must NOT trigger a tile-buffer allocation.
+
+    The fast path is what the original (pre-loop) matmul ``a_ptrs =
+    a_ptr + offs_am`` lowering relies on; we must preserve it so we don't
+    regress the non-loop call site.
+    """
+    _force_no_shim(monkeypatch)
+    ctx = WalkerCtx()
+    ptr_ssa = _ssa("ptr", shape=[], dtype="float32")
+    off_ssa = _ssa("off", shape=[], dtype="int32")
+    out_ssa = _ssa("ptr_added", shape=[], dtype="float32")
+    buf = tvm.tir.decl_buffer([1024], "float32", name="A")
+    ctx.bind(ptr_ssa, (buf, [tvm.tir.const(0, "int32")]))
+    ctx.bind(off_ssa, tvm.tir.const(7, "int32"))
+
+    pre_count = len(ctx.local_buffers)
+    op = {
+        "name": "tt.addptr",
+        "operands": [ptr_ssa, off_ssa],
+        "results": [out_ssa],
+        "attrs": {},
+    }
+    result = emit_tt_addptr(op, ctx)
+    assert isinstance(result, tuple)
+    _, indices = result
+    # Trailing index must remain a scalar PrimExpr (not a Buffer).
+    assert not isinstance(indices[-1], tvm.tir.Buffer), (
+        f"scalar offset must keep scalar fast path; got "
+        f"{type(indices[-1]).__name__}"
+    )
+    assert len(ctx.local_buffers) == pre_count, (
+        "scalar offset must NOT allocate a tile buffer"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Dispatch table sanity
 # ---------------------------------------------------------------------------
 
