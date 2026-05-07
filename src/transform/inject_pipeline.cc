@@ -321,6 +321,23 @@ bool ContainsExplicitAsyncIntrinsics(const Stmt &stmt) {
         found = true;
         return;
       }
+      // LowerTMAToPtrArith emits two string-keyed pragmas around the
+      // rewritten copy:
+      //   * "pragma_async_scope"  — same intent as the typed
+      //     `tirx::attr::async_scope`, but emitted as a string literal so
+      //     the fallback-lowered IR is human-readable in dumps.
+      //   * "pragma_tma_swizzle"  — preserved cuTensorMap swizzle value
+      //     so downstream codegens (Metal / HIP layout passes, future
+      //     re-typing passes) can recover the original mode without
+      //     re-decoding the descriptor.
+      // Treat both as "already-async" so the SW pipeliner does not stack
+      // a second async protocol on top of the synchronous pointer-arith
+      // copy. See `BuildPointerArithCopy` in lower_tma_to_ptr_arith.cc.
+      if (attr->attr_key == "pragma_async_scope" ||
+          attr->attr_key == "pragma_tma_swizzle") {
+        found = true;
+        return;
+      }
     }
     const auto *call = obj.as<CallNode>();
     if (!call) {
@@ -458,6 +475,31 @@ private:
     }
     if (op->attr_key == tirx::attr::async_wait_inflight_count) {
       return VisitStmt(op->body);
+    }
+    // String-keyed pragmas emitted by `LowerTMAToPtrArith`. By the time we
+    // reach this lowerer the synchronous pointer-arith copy is already
+    // pattern-matched as "explicit-async" by `ContainsExplicitAsyncIntrinsics`
+    // upstream, so the markers have served their purpose. Strip
+    // `pragma_async_scope` (a structural tag with no codegen meaning past
+    // the pipeline scan) and forward `pragma_tma_swizzle` onto the inner
+    // For-loop annotations under the `tl_tma_swizzle` key so target
+    // codegens (Metal swizzled-tile, HIP LDS layout) can still reach the
+    // value. If the body is not an immediate For, fall back to leaving
+    // the AttrStmt in place — pragmas with non-For bodies travel as a
+    // wrapper to the next pass.
+    if (op->attr_key == "pragma_async_scope") {
+      return VisitStmt(op->body);
+    }
+    if (op->attr_key == "pragma_tma_swizzle") {
+      Stmt body = VisitStmt(op->body);
+      if (const auto *forn = body.as<ForNode>()) {
+        auto annotations = forn->annotations;
+        annotations.Set("tl_tma_swizzle", op->value);
+        return For(forn->loop_var, forn->min, forn->extent, forn->kind,
+                   forn->body, forn->thread_binding, annotations, forn->step,
+                   forn->span);
+      }
+      return AttrStmt(op->node, op->attr_key, op->value, body);
     }
     return StmtExprMutator::VisitStmt_(op);
   }

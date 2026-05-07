@@ -112,29 +112,127 @@ def test_hip_decomposes():
 def test_metal_fp32_uses_4_byte_stride():
     """Regression: the fallback used to default to fp16 (2 bytes/elem)
     regardless of the descriptor's data_type code, silently corrupting
-    every non-fp16 TMA copy on non-NV targets. Verify that an fp32
-    descriptor emits a 4-byte stride in the rewritten IR (the
-    ``__tl_ptr_copy_elem`` byte-count argument)."""
+    every non-fp16 TMA copy on non-NV targets. Verify the fp32 descriptor
+    is recovered correctly: under the default ``kEmitOpaque=false`` the
+    rewritten IR must contain ``BufferLoad``/``BufferStore`` against an
+    ``fp32`` view; under the legacy opaque path it must carry a 4-byte
+    ``__tl_ptr_copy_elem`` byte-count."""
     func = _build_tma_kernel(data_type_code=_CU_TENSOR_MAP_DATA_TYPE_FLOAT32)
     mod = _lower(func, "metal")
     s = str(mod.script() if hasattr(mod, "script") else mod)
-    assert "__tl_ptr_copy_elem" in s, \
-        "expected pointer-arith copy helper in lowered IR"
-    # The third arg to __tl_ptr_copy_elem is the element byte count; for
-    # fp32 it must be 4 (not the legacy 2-byte fp16 default).
-    assert ", 4)" in s or ", 4i64)" in s or ", T.int64(4)" in s, \
-        f"expected 4-byte element stride in fp32 fallback, got:\n{s}"
+    if "__tl_ptr_copy_elem" in s:
+        assert ", 4)" in s or ", 4i64)" in s or ", T.int64(4)" in s, \
+            f"expected 4-byte element stride in fp32 opaque fallback:\n{s}"
+    else:
+        # Non-opaque path (default): typed BufferLoad/BufferStore must
+        # appear, and the synthetic view must carry the fp32 dtype so
+        # downstream cp.async / vectorize re-detection sees correct
+        # element bytes.
+        assert "BufferLoad" in s or "tl_tma_global_view" in s, \
+            f"expected BufferLoad-shaped fallback in lowered IR:\n{s}"
+        assert "float32" in s, \
+            f"expected fp32 element dtype in synthetic view:\n{s}"
 
 
 def test_metal_fp16_uses_2_byte_stride():
-    """Companion to the fp32 test: the legacy default should now only
+    """Companion to the fp32 test: the legacy 2-byte default should only
     appear when the descriptor actually says fp16."""
     func = _build_tma_kernel(data_type_code=_CU_TENSOR_MAP_DATA_TYPE_FLOAT16)
     mod = _lower(func, "metal")
     s = str(mod.script() if hasattr(mod, "script") else mod)
-    assert "__tl_ptr_copy_elem" in s
-    assert ", 2)" in s or ", 2i64)" in s or ", T.int64(2)" in s, \
-        f"expected 2-byte element stride in fp16 fallback, got:\n{s}"
+    if "__tl_ptr_copy_elem" in s:
+        assert ", 2)" in s or ", 2i64)" in s or ", T.int64(2)" in s, \
+            f"expected 2-byte element stride in fp16 opaque fallback:\n{s}"
+    else:
+        assert "BufferLoad" in s or "tl_tma_global_view" in s, \
+            f"expected BufferLoad-shaped fallback in lowered IR:\n{s}"
+        assert "float16" in s, \
+            f"expected fp16 element dtype in synthetic view:\n{s}"
+
+
+def test_swizzle_pragma_is_preserved():
+    """The cuTensorMap ``swizzle`` field must round-trip through the
+    fallback so downstream Metal/HIP layout passes still see the
+    original mode. ``LowerTMAToPtrArith`` emits a ``pragma_tma_swizzle``
+    AttrStmt; ``inject_pipeline.cc`` may forward it onto a For-loop
+    annotation under the ``tl_tma_swizzle`` key. Either presence is OK."""
+
+    create_tma = tvm.tir.op.Op.get("tl.create_tma_descriptor")
+    tma_load = tvm.tir.op.Op.get("tl.tma_load")
+
+    @T.prim_func
+    def kernel(A_handle: T.handle, smem_handle: T.handle):
+        desc = T.call_intrin(
+            "handle",
+            create_tma,
+            T.int32(_CU_TENSOR_MAP_DATA_TYPE_FLOAT16),
+            T.int32(2),
+            A_handle,
+            T.int32(64), T.int32(64),
+            T.int32(2), T.int32(128),
+            T.int32(16), T.int32(16),
+            T.int32(1), T.int32(1),
+            T.int32(0),
+            T.int32(2),  # swizzle = CU_TENSOR_MAP_SWIZZLE_64B
+            T.int32(0),
+            T.int32(0),
+        )
+        T.evaluate(
+            T.call_intrin(
+                "handle", tma_load,
+                desc, T.int32(0), smem_handle,
+                T.int32(0), T.int32(0),
+                T.int32(0),
+            ))
+
+    mod = _lower(kernel, "metal")
+    s = str(mod.script() if hasattr(mod, "script") else mod)
+    assert ("pragma_tma_swizzle" in s) or ("tl_tma_swizzle" in s), \
+        f"expected swizzle hint to be preserved post-lowering:\n{s}"
+
+
+def test_im2col_call_is_left_in_place_with_warning():
+    """The ``tma_load_im2col`` fallback is not yet implemented because the
+    coord layout differs from ``tma_load`` (image_offset_w/h between
+    coords and eviction). Until the gather loop lands, the pass must
+    leave the call in place rather than emit a wrong-stride copy that
+    silently corrupts conv2d output. Verify that policy."""
+
+    create_im2col = tvm.tir.op.Op.get("tl.create_tma_im2col_descriptor")
+    tma_load_im2col_op = tvm.tir.op.Op.get("tl.tma_load_im2col")
+
+    @T.prim_func
+    def kernel(A_handle: T.handle, smem_handle: T.handle):
+        # Rank-4 NHWC im2col descriptor (rough shape):
+        #   data_type, rank, addr, shape×4, stride×4, elem_stride×4,
+        #   lower×2, upper×2, smem_box_pixel, smem_box_channel,
+        #   interleave, swizzle, l2_promotion, oob_fill
+        desc = T.call_intrin(
+            "handle", create_im2col,
+            T.int32(_CU_TENSOR_MAP_DATA_TYPE_FLOAT16),
+            T.int32(4),
+            A_handle,
+            T.int32(8), T.int32(64), T.int32(64), T.int32(1),  # shape
+            T.int32(2), T.int32(16), T.int32(1024), T.int32(65536),  # stride
+            T.int32(1), T.int32(1), T.int32(1), T.int32(1),  # elem_stride
+            T.int32(0), T.int32(0),                          # lower_corner
+            T.int32(0), T.int32(0),                          # upper_corner
+            T.int32(16), T.int32(8),                         # smem_box pix/ch
+            T.int32(0), T.int32(0), T.int32(0), T.int32(0),  # interleave/swiz
+        )
+        T.evaluate(
+            T.call_intrin(
+                "handle", tma_load_im2col_op,
+                desc, T.int32(0), smem_handle,
+                T.int32(0), T.int32(0), T.int32(0), T.int32(0),  # coords c,w,h,n
+                T.int32(0), T.int32(0),                          # img_off w,h
+                T.int32(0),                                      # eviction
+            ))
+
+    mod = _lower(kernel, "metal")
+    s = str(mod.script() if hasattr(mod, "script") else mod)
+    assert "tl.tma_load_im2col" in s, \
+        "im2col call must NOT be silently rewritten (TODO: gather loop)."
 
 
 def test_unknown_dtype_code_is_refused():
