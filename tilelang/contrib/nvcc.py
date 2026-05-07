@@ -344,8 +344,17 @@ def get_target_compute_version(target=None):
     # 1. input target object
     # 2. Target.current()
     target = target or Target.current()
-    if target and target.arch:
-        arch = target.arch.split("_")[1].rstrip("af")
+    # apache moved target.arch to target.attrs["arch"] (post-target-refactor)
+    target_arch = None
+    if target is not None:
+        try:
+            target_arch = target.attrs.get("arch")
+        except Exception:
+            target_arch = None
+        if target_arch is None:
+            target_arch = getattr(target, "arch", None)
+    if target and target_arch:
+        arch = target_arch.split("_")[1].rstrip("af")
         if len(arch) == 2:
             major, minor = arch
             # Handle old format like sm_89

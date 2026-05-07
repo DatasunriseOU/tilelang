@@ -45,9 +45,26 @@ audit recommends.
 
 from __future__ import annotations
 
+import os
 from typing import Union
 
 from tvm import tir
+
+
+def _z3_pass_disabled(name: str) -> bool:
+    """CPPMEGA z3-final per-pass gate (Python mirror of `Z3PassGate`).
+
+    Returns True iff Z3 use for *this* pass should be skipped. Honours the
+    blanket ``TILELANG_DISABLE_Z3`` (kill-switch) and the per-pass
+    ``TILELANG_DISABLE_Z3_<NAME>``. Truthiness convention matches the C++
+    side: a value of ``""`` or ``"0"`` means "enabled"; anything else is
+    treated as "disabled".
+    """
+    for var in ("TILELANG_DISABLE_Z3", f"TILELANG_DISABLE_Z3_{name}"):
+        v = os.environ.get(var, "")
+        if v and v != "0":
+            return True
+    return False
 
 # ---------------------------------------------------------------------------
 # Z3 import is optional. When z3-solver isn't installed, the symbolic branch
@@ -151,6 +168,12 @@ def prove_dot4_int24_safe(
     if not _Z3_AVAILABLE:
         # Without z3-solver we cannot prove the symbolic case; staying on the
         # scalar path is the safe outcome.
+        return False
+
+    # CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_INT24 bypasses the
+    # int24 overflow proof (idea #5). Conservative default — caller stays on
+    # the scalar path when disabled.
+    if _z3_pass_disabled("INT24"):
         return False
 
     try:

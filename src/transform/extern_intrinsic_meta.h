@@ -21,7 +21,7 @@
 #include <cstring>
 
 #include <tvm/ffi/string.h>
-#include <tvm/tir/builtin.h>
+#include <tvm/tirx/builtin.h>
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/stmt.h>
 
@@ -41,16 +41,16 @@ static constexpr const char *kExternBlockAttr = "tl.extern_intrinsic_meta";
  * we recognise it via the call_extern op and the symbol prefix on the first
  * string argument.
  */
-inline bool IsExternIntrinsicCall(const tir::CallNode *call) {
+inline bool IsExternIntrinsicCall(const tirx::CallNode *call) {
   if (call == nullptr) return false;
-  if (!call->op.same_as(tvm::tir::builtin::call_extern())) return false;
+  if (!call->op.same_as(tvm::tirx::builtin::call_extern())) return false;
   if (call->args.empty()) return false;
-  const auto *name_imm = call->args[0].as<tvm::ffi::StringObj>();
+  const auto *name_imm = call->args[0].as<tvm::tirx::StringImmNode>();
   if (name_imm == nullptr) return false;
   // Zero-copy prefix check: ``ffi::String`` exposes ``data()``/``size()``;
   // we compare the first ``prefix_len`` bytes via ``strncmp`` instead of
   // materialising a ``std::string`` copy on every call (perf review #2).
-  const ffi::String s = ffi::GetRef<ffi::String>(name_imm);
+  const ffi::String& s = name_imm->value;
   static constexpr size_t kPrefixLen =
       sizeof("tl.extern_intrinsic.") - 1;  // matches kExternCallPrefix
   if (s.size() < kPrefixLen) return false;

@@ -488,6 +488,15 @@ private:
               /*shape=*/{make_const(reduce_index->dtype, group_extent)},
               /*dtype=*/buffers[i]->dtype, /*name=*/"red_result",
               /*storage_scope=*/shared_scope);
+          // The broadcast shared buffer is referenced by the BufferLoad
+          // installed below (and by the BufferStore in `write_result`). It
+          // must be added to `new_alloc_bufs` so the fix-up at the end of
+          // this method emits an `Allocate` for it; otherwise the buffer's
+          // data Var leaks out as an undefined free Var and downstream
+          // `make_packed_api` aborts with
+          // "variables (red_result,) are used, but are not passed in as
+          // API arguments".
+          new_alloc_bufs.push_back(broadcast_shared_buf);
           write_result.push_back(BufferStore(broadcast_shared_buf,
                                              reduce_results[i], {group_index}));
           // Update `reduce_results`, pointing to the value loaded from the

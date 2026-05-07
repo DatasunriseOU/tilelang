@@ -793,8 +793,8 @@ private:
       // back to ``Layout()`` (the original behaviour).
       auto tile_size_arr = [&]() -> Array<Integer> {
         auto v = meta.Get("tile_size");
-        if (!v.defined()) return {};
-        return v.value().as<Array<Integer>>().value_or({});
+        if (!v.has_value()) return {};
+        return v.value().as<Array<Integer>>().value_or(Array<Integer>());
       }();
       auto tile_at = [&](size_t i, int fallback) -> int {
         return i < tile_size_arr.size()
@@ -863,7 +863,7 @@ private:
         // map keyed by frag name. We accept both shapes here.
         auto layouts_any = meta.Get("layouts");
         if (!layouts_any) return;
-        auto layouts = layouts_any.value().as<Array<ffi::String>>().value_or({});
+        auto layouts = layouts_any.value().as<Array<ffi::String>>().value_or(Array<ffi::String>());
         for (size_t i = 0;
              i < layouts.size() && i + 1 < call->args.size(); ++i) {
           auto buf_opt = getBufferFromAccessPtr(call->args[i + 1]);

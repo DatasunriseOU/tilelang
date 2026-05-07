@@ -9,6 +9,7 @@
  */
 
 #include "copy.h"
+#include <limits>
 #include "../layout/tcgen05_layout.h"
 #include "../target/utils.h"
 #include "../transform/common/loop_fusion_utils.h"
@@ -567,16 +568,37 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
 // expression to constrain.
 static bool Z3ProveStrideAligned16(arith::Analyzer *analyzer,
                                    const PrimExpr &addr_bytes,
-                                   const PrimExpr &stride_bytes) {
+                                   const PrimExpr &stride_bytes,
+                                   Optional<Target> target = std::nullopt) {
+  // CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_TMA_LEGALITY bypasses
+  // the TMA stride-alignment proof (idea #6). Conservative default — keep
+  // the slow `cp.async` path when the gate is disabled.
+  if (!::tilelang::tlz3::Z3PassGate::IsEnabled("TMA_LEGALITY")) {
+    return false;
+  }
   try {
     auto &z3 = arith::Z3Prover(analyzer);
     z3.SetTimeoutMs(50);
+    // CPPMEGA fix-C2 (round-7): the VA envelope used to be hard-coded at
+    // 48 bits (CUDA H100). Hopper-Next + AMD MI300 both expose 57-bit
+    // virtual addresses, which would let a non-aligned stride slip
+    // through the alignment proof here under the 48-bit envelope. Read
+    // the per-target attr `max_addr_bits` (default 48 for backward
+    // compat) and use it as the upper bound on both addr and stride.
+    int64_t addr_bits = 48;
+    if (target.defined()) {
+      auto attr = target.value()->GetAttr<Integer>("max_addr_bits");
+      if (attr.defined()) addr_bits = attr.value()->value;
+    }
+    int64_t addr_envelope =
+        (addr_bits >= 63) ? std::numeric_limits<int64_t>::max()
+                          : (int64_t{1} << addr_bits);
     PrimExpr addr_constraint =
         (addr_bytes >= IntImm(DataType::Int(64), 0)) &&
-        (addr_bytes < IntImm(DataType::Int(64), int64_t{1} << 48));
+        (addr_bytes < IntImm(DataType::Int(64), addr_envelope));
     PrimExpr stride_constraint =
         (stride_bytes > IntImm(DataType::Int(64), 0)) &&
-        (stride_bytes < IntImm(DataType::Int(64), int64_t{1} << 48));
+        (stride_bytes < IntImm(DataType::Int(64), addr_envelope));
     auto recover = z3.EnterConstraint(addr_constraint && stride_constraint);
     PrimExpr goal =
         (FloorMod(addr_bytes, IntImm(DataType::Int(64), 16)) ==
@@ -594,7 +616,8 @@ static bool Z3ProveStrideAligned16(arith::Analyzer *analyzer,
 
 // Shared stride validation for TMA bulk load/store.
 bool CopyNode::CheckGlobalStrides(const Buffer &buffer,
-                                  arith::Analyzer *analyzer) {
+                                  arith::Analyzer *analyzer,
+                                  Optional<Target> target) {
   Array<PrimExpr> strides = buffer->strides;
   if (strides.empty()) {
     PrimExpr stride = 1;
@@ -652,7 +675,7 @@ bool CopyNode::CheckGlobalStrides(const Buffer &buffer,
         PrimExpr addr_bytes =
             cast(DataType::Int(64), buffer->elem_offset) *
             IntImm(DataType::Int(64), elem_bytes);
-        if (!Z3ProveStrideAligned16(analyzer, addr_bytes, stride_bytes)) {
+        if (!Z3ProveStrideAligned16(analyzer, addr_bytes, stride_bytes, target)) {
           LOG(WARNING)
               << "TMA bulk copy alignment unprovable (Z3): addr="
               << addr_bytes << " stride=" << stride_bytes
@@ -710,7 +733,7 @@ bool CopyNode::CheckBulkLoad(Target target, arith::Analyzer *analyzer,
                  << " vs. " << dst->dtype << " will be fallback to normal copy";
     return false;
   }
-  if (!CheckGlobalStrides(src, analyzer))
+  if (!CheckGlobalStrides(src, analyzer, target))
     return false;
   return true;
 }
@@ -824,7 +847,7 @@ bool CopyNode::CheckBulkStore(Target target, arith::Analyzer *analyzer,
                  << " vs. " << dst->dtype << " will be fallback to normal copy";
     return false;
   }
-  if (!CheckGlobalStrides(dst, analyzer))
+  if (!CheckGlobalStrides(dst, analyzer, target))
     return false;
   return true;
 }

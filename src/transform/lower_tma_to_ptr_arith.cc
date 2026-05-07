@@ -80,6 +80,7 @@
 #include "../op/builtin.h"
 #include "../target/utils.h"
 #include "lower_tma_to_ptr_arith.h"
+#include "vendored/let_stmt.h"
 
 namespace tvm {
 namespace tl {
@@ -433,8 +434,8 @@ Stmt BuildPointerArithCopy(const DecodedDesc &desc,
   // pattern-matcher.
   if (!kEmitOpaque && nonopaque_g_data.defined() &&
       nonopaque_s_data.defined()) {
-    body = LetStmt(nonopaque_g_data.value(), desc.global_addr, body);
-    body = LetStmt(nonopaque_s_data.value(), smem_handle, body);
+    body = tilelang::tl_tir::LetStmt(nonopaque_g_data.value(), desc.global_addr, body);
+    body = tilelang::tl_tir::LetStmt(nonopaque_s_data.value(), smem_handle, body);
   }
 
   // Preserve the swizzle hint so downstream Metal/HIP layout passes

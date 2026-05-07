@@ -42,6 +42,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -166,36 +167,39 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
   }
   ::z3::expr MakeIntVal(int64_t value) {
     if (bv_width_ > 0) {
-      // Z3 bv_val sign-extends/truncates to the requested width; for an
-      // int64 IntImm that "doesn't fit" in BV32 the high bits are
-      // dropped, matching standard two's-complement wrapping. Warn once
-      // per Analyzer when this happens — the result is well-defined but
-      // usually indicates an upstream bug (e.g. BV32 mode against an
-      // INT64-typed constant). Don't fail; the caller may still want the
-      // wrapped value (e.g. to test wrap-aware proofs).
-      if (!bv_truncation_warned_ && bv_width_ < 64) {
+      // fix-round-6 C8: previously, when `value` was outside the signed
+      // BV range we let Z3's bv_val silently truncate (two's-complement
+      // wrap). That makes proofs over wide constants unsound — e.g. a
+      // BV32 prove of `x == 0x100000000` would happily say "yes, x is
+      // 0" because the constant wrapped to zero. Conservative fix: mint
+      // an unconstrained fresh symbol of the BV sort so any predicate
+      // depending on the constant fails to be proved. Sound but lossy.
+      if (bv_width_ < 64) {
         int64_t lo = (bv_width_ == 32) ? static_cast<int64_t>(INT32_MIN)
                                        : -(int64_t{1} << (bv_width_ - 1));
         int64_t hi = (bv_width_ == 32) ? static_cast<int64_t>(INT32_MAX)
                                        : ((int64_t{1} << (bv_width_ - 1)) - 1);
         if (value < lo || value > hi) {
-          LOG(WARNING) << "Z3Prover BV" << bv_width_
-                       << ": MakeIntVal(" << value
-                       << ") wraps (signed range [" << lo << ", " << hi
-                       << "]); proof results may reflect two's-complement "
-                          "wrap, not unbounded Int semantics. "
-                          "(further occurrences suppressed)";
-          bv_truncation_warned_ = true;
+          if (!bv_truncation_warned_) {
+            LOG(WARNING)
+                << "Z3Prover BV" << bv_width_ << ": MakeIntVal(" << value
+                << ") out of signed range [" << lo << ", " << hi
+                << "]; returning unconstrained symbol (any proof "
+                   "depending on this constant will conservatively fail). "
+                   "(further occurrences suppressed)";
+            bv_truncation_warned_ = true;
+          }
+          return MakeIntConst("oor_" + std::to_string(memo_.size()));
         }
       }
-      return ctx->bv_val(static_cast<long long>(value),
+      return ctx->bv_val(static_cast<int64_t>(value),
                          static_cast<unsigned>(bv_width_));
     }
     return ctx->int_val(value);
   }
   ::z3::expr MakeUIntVal(uint64_t value) {
     if (bv_width_ > 0) {
-      return ctx->bv_val(static_cast<unsigned long long>(value),
+      return ctx->bv_val(static_cast<uint64_t>(value),
                          static_cast<unsigned>(bv_width_));
     }
     return ctx->int_val(value);
@@ -395,36 +399,23 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
           if (min_value < lo || max_value > hi) {
             if (!bv_range_warned_) {
               LOG(WARNING) << "Z3Prover BV" << bv_width_
-                           << ": clamping out-of-range bind " << var
+                           << ": dropping out-of-range bind " << var
                            << " in [" << min_value << ", " << max_value
-                           << ") to signed BV range [" << lo << ", " << hi
-                           << "]. (further occurrences suppressed)";
+                           << ") (signed BV range [" << lo << ", " << hi
+                           << "]). Subsequent CanProve over this var will"
+                           << " fail closed. (further occurrences suppressed)";
               bv_range_warned_ = true;
             }
-            // CPPMEGA fix-A7: NEW-1 (round-3): the previous fix-A3 bailed
-            // here without writing memo_, which left a hole — a later
-            // Visit(var) would mint a *fresh* free Z3 symbol, so the
-            // caller's range request was silently dropped while the
-            // prover happily reasoned about an unconstrained variable.
-            // Conservative fallback: memoize `var_expr` and assert the
-            // BV-clamped range [lo, hi+1) so subsequent uses see the
-            // tightest sound approximation we can express in this sort.
-            // This is over-approximation (the BV interval is wider than
-            // the caller's intent), so any CanProve we return remains
-            // sound; we only lose precision, never correctness.
-            int64_t clamped_min = std::max<int64_t>(min_value, lo);
-            int64_t clamped_max =
-                std::min<int64_t>(max_value, hi + int64_t{1});
-            if (clamped_min >= clamped_max) {
-              // Caller's range is entirely outside BV bounds — there's
-              // no representable interval. Fall back to the full BV
-              // range to keep the var bound at the right sort.
-              clamped_min = lo;
-              clamped_max = hi + int64_t{1};
-            }
-            memo_.emplace(var, var_expr);
-            solver.add(MakeIntVal(clamped_min) <= var_expr);
-            solver.add(var_expr < MakeIntVal(clamped_max));
+            // CPPMEGA fix-C2 (round-7): the round-3 fix wrote a clamped memo
+            // here, which over-approximated the caller's intent. Wave-5
+            // audit flagged this as unsound under composition: a downstream
+            // CanProve on `var` would see the *clamped* range and could
+            // prove tautologies that the caller never asserted. Round-7
+            // tightens to NOT emplace memo on OOR. A subsequent Visit(var)
+            // will still mint a fresh symbol, but with no range constraint
+            // asserted, CanProve will fail closed (return false) for any
+            // non-trivial query — preserving soundness. Callers that need
+            // the bind must keep variables within the BV width.
             commit_memo = false;
             return;
           }
@@ -434,8 +425,16 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
         solver.add(var_expr < MakeIntVal(max_value));
         commit_memo = false;  // already committed
       } else {
-        // Empty range — drop the memo write to avoid leaking a free var
-        // with no range. (Pre-fix-A3 we'd memoize anyway.)
+        // CPPMEGA fix-round-2 (HIGH correctness): empty range (min >= max)
+        // is logically UNSAT for any valuation of `var`. Previously we
+        // returned WITHOUT writing memo_, which meant a subsequent
+        // Visit(var) would mint a fresh free Z3 symbol, with no
+        // constraints — silently dropping the caller's intent. Commit
+        // the memo so subsequent uses bind to the same symbol, then
+        // assert `false` so any CanProve under this scope is sound
+        // (vacuously true) rather than reasoning about a free variable.
+        memo_.emplace(var, var_expr);
+        solver.add(ctx->bool_val(false));
         commit_memo = false;
         return;
       }
@@ -487,6 +486,19 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     // on every CanProve. The condition also covers width=0 → width=0
     // (Int → Int) which previously rebuilt unnecessarily.
     if (width == bv_width_) return;
+    // CPPMEGA fix-round-2 (HIGH correctness): a mode change rebuilds the
+    // solver, which clears `scope_stack_` and re-pushes a fresh root
+    // frame. If we did this while inside an active `EnterConstraint`
+    // scope, the recovery lambda's `solver.pop()` / `scope_stack_.pop_back()`
+    // would target a fresh stack — corrupting the prover state. Require
+    // the caller to be at the root scope before flipping modes.
+    ICHECK_EQ(scope_stack_.size(), 1u)
+        << "Z3Prover::SetBitVectorMode called with " << scope_stack_.size()
+        << " scope frames; recover all EnterConstraint scopes first.";
+    ICHECK(scope_stack_.front().empty())
+        << "Z3Prover::SetBitVectorMode called with non-empty root scope; "
+        << "the rebuild would discard " << scope_stack_.front().size()
+        << " bound vars / constraints.";
     bv_width_ = width;
     // Mode change: invalidate any pre-existing variable / sub-expression
     // encodings (declared at the old sort) by rebuilding the solver.
@@ -724,6 +736,23 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     return Create(op);
   }
   ::z3::expr VisitExpr_(const ReduceNode* op) override { return Create(op); }
+  // Ramp(base, stride, lanes) represents the vector [base, base+stride,
+  // base+2*stride, ...]. fix-round-6 C6: returning only `op->base` is
+  // unsound for the upper lanes — the prover would treat the entire
+  // ramp expression as if it equalled `base`, so any CanProve over a
+  // Ramp-containing predicate could succeed by collapsing the lanes
+  // away. Conservative replacement: mint a fresh unconstrained scalar
+  // (Int or BV depending on mode) so the prover cannot derive anything
+  // load-bearing from the Ramp. Callers that genuinely need
+  // per-lane reasoning must lower out the Ramp before invoking Z3.
+  ::z3::expr VisitExpr_(const ::tvm::tirx::RampNode* op) override {
+    (void)op;
+    return MakeIntConst("ramp_" + std::to_string(memo_.size()));
+  }
+  // Broadcast(value, lanes) is a vector of identical scalars; visit the value.
+  ::z3::expr VisitExpr_(const ::tvm::tirx::BroadcastNode* op) override {
+    return VisitExpr(op->value);
+  }
   // In BV mode every Z3 operand of an arithmetic / relational op must be a
   // BV of the current width; in Int mode operands must be Int. The Z3 C++
   // overloads will raise an error if you mix sorts (e.g. an Int operand
@@ -952,6 +981,19 @@ void Z3Prover::Bind(const Var& var, const PrimExpr& expr,
   impl_->Bind(var, expr, allow_override);
 }
 bool Z3Prover::CanProve(const PrimExpr& expr) {
+  // CPPMEGA z3-final safety gate (2026-05-07): a correctness regression
+  // observed on the gb10 (CUDA/sm_120) target has not been root-caused.
+  // Setting `TILELANG_DISABLE_Z3=1` makes every CanProve() return false,
+  // which keeps the conservative slow path everywhere it is queried
+  // (AutoDoubleBuffer / DropProvableBoundChecks / barrier-elide / etc.).
+  // Default behavior (env unset or `=0`) is unchanged, so Mac/Apple-Silicon
+  // performance wins are preserved. See `z3_prover.h` and `README.md` for
+  // the opt-out rationale.
+  static const bool z3_disabled = []() {
+    const char* env = std::getenv("TILELANG_DISABLE_Z3");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+  }();
+  if (z3_disabled) return false;
   return impl_->CanProve(expr);
 }
 std::function<void()> Z3Prover::EnterConstraint(const PrimExpr& constraint,
@@ -1064,12 +1106,21 @@ void Z3Prover::Reset() {
 // `ClearProverCache()` (below) can reach the same map. Returning by
 // reference is safe: the map itself is `static thread_local`, so its
 // storage outlives any caller frame on this thread.
+//
+// CPPMEGA z3-final: the cache is heap-allocated and intentionally LEAKED at
+// TLS teardown. Z3 keeps its own thread_local context globals that are
+// destroyed before our cache during process exit on aarch64/glibc 2.39 with
+// Z3 22.x. If our cache's dtor runs after Z3's globals are gone,
+// `~Z3ProverImpl` -> `~solver` -> `Z3_solver_dec_ref` -> `~param_descrs`
+// dereferences torn-down Z3 state and SIGSEGVs (cosmetic but pollutes test
+// output). By holding the map via a raw pointer that we never delete, the
+// TLS dtor runs no Z3 code at exit; the OS reclaims the heap pages.
 static std::unordered_map<::tvm::arith::Analyzer*, std::unique_ptr<Z3Prover>>&
 GetProverCache_() {
-  static thread_local std::unordered_map<::tvm::arith::Analyzer*,
-                                         std::unique_ptr<Z3Prover>>
-      cache;
-  return cache;
+  static thread_local auto* cache =
+      new std::unordered_map<::tvm::arith::Analyzer*,
+                             std::unique_ptr<Z3Prover>>();
+  return *cache;
 }
 
 Z3Prover& GetOrCreate(::tvm::arith::Analyzer* analyzer) {
@@ -1195,6 +1246,44 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = ::tvm::ffi::reflection;
   refl::GlobalDef().def("tl.z3.clear_prover_cache",
                         []() { ClearProverCache(); });
+}
+
+// ---------------------------------------------------------------------------
+// CPPMEGA z3-final per-pass gate (2026-05-07).
+// See `Z3PassGate` doc in z3_prover.h for the rationale & env-var table.
+// ---------------------------------------------------------------------------
+//
+// Cheap-by-design: the global lookup is amortized via a function-local
+// `static const`; per-pass lookups go through a small thread-local cache
+// keyed on the env-var name string. The cache is bounded by the small set
+// of pass names hard-coded at call sites (~10), so its memory footprint is
+// O(1) per thread for any realistic compile.
+//
+// Truthiness convention matches the existing `TILELANG_DISABLE_Z3` gate at
+// `Z3Prover::CanProve` (above): "set" means env != nullptr AND env[0] != 0
+// AND env[0] != '0'. So `=0`, ``, and unset are all "enabled".
+bool Z3PassGate::IsEnabled(const char* pass_name) {
+  // Fast path: global gate. Same predicate as `Z3Prover::CanProve`'s.
+  static const bool global_disabled = []() {
+    const char* g = std::getenv("TILELANG_DISABLE_Z3");
+    return g != nullptr && g[0] != '\0' && g[0] != '0';
+  }();
+  if (global_disabled) return false;
+
+  // Per-pass gate: cache by full env-var name. `pass_name` is a string
+  // literal at every call site, so the std::string allocation here is
+  // a one-time-per-name cost (then served from the cache).
+  static thread_local std::unordered_map<std::string, bool> cache;
+  std::string key("TILELANG_DISABLE_Z3_");
+  key += pass_name;
+  auto it = cache.find(key);
+  if (it != cache.end()) {
+    return !it->second;
+  }
+  const char* v = std::getenv(key.c_str());
+  bool disabled = v != nullptr && v[0] != '\0' && v[0] != '0';
+  cache.emplace(std::move(key), disabled);
+  return !disabled;
 }
 
 }  // namespace tlz3

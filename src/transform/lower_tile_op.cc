@@ -321,6 +321,20 @@ private:
                           makeBufferWithLayout(buffer, layout, var_remap_));
         layout_map_.Set(buffer, layout);
       }
+      // CPPMEGA z3-final fix (gemm dual-buffer site #2): the layout_map on
+      // an SBlock annotation may key on a POST-remap Buffer (e.g. one that
+      // LayoutInference materialized at the parent scope using a fresh data
+      // Var) while this inner block's alloc_buffers still hold the PRE-remap
+      // Buffer (the user's original `T.alloc_fragment`, with its own data
+      // Var). Without aliasing the two together BEFORE the body is visited,
+      // `T.ptx_mma(..., C_l.data, ...)` resolves through `buffer_data_to_buffer_`
+      // to the PRE-remap buffer (no `buffer_remap_` entry) and is left as
+      // the (32, 32) `local.fragment`, while the final copy reads the
+      // post-remap (8,) `local` alias — producing CUDA `T.gemm` zero-output.
+      // Match each alloc_buffer to a layout_map key by name (the canonical
+      // identity preserved across `makeBufferWithLayout`), and propagate
+      // var_remap_ / buffer_remap_ / layout_map_ entries for the alias so
+      // downstream VarNode and Buffer{Load,Store} visits resolve correctly.
     }
     // Extract cluster_size from cluster_dims annotation
     if (op->annotations.count("cluster_dims")) {
@@ -401,9 +415,28 @@ private:
 
       Buffer original_buffer = it->second;
 
-      // Check if this buffer has a layout
+      // Check if this buffer has a layout. If the buffer found in
+      // buffer_map_ has no layout entry, the same data var may be aliased
+      // by another buffer (e.g. layout-rewritten outer alloc vs. unrewritten
+      // inner alias produced by pipeline/multi-version rewrites). In that
+      // case we walk layout_map_ / buffer_remap_ for any buffer sharing the
+      // same data Var. Without this, the access_ptr offset is left in the
+      // *original* shape's coordinate system while the buffer it now aliases
+      // (via MergeSharedMemoryAllocations) lives at a different offset,
+      // producing zero-output gemm reads on CUDA (sm_120).
       if (!layout_map_.count(original_buffer)) {
-        return result; // No layout, no transformation needed
+        Buffer aliased;
+        for (const auto &kv : layout_map_) {
+          if (kv.first->data.same_as(buffer_var) &&
+              buffer_remap_.count(kv.first)) {
+            aliased = kv.first;
+            break;
+          }
+        }
+        if (!aliased.defined()) {
+          return result; // No layout, no transformation needed
+        }
+        original_buffer = aliased;
       }
 
       Layout layout = layout_map_[original_buffer];
@@ -969,6 +1002,63 @@ private:
       return BufferStore(new_buffer, store->value, store->indices);
     }
     return store;
+  }
+
+  // CPPMEGA z3-final fix (gemm dual-buffer site #2): rewrite in-body
+  // `AllocBuffer(buffer)` Stmts that allocate a `local.fragment` buffer to
+  // their layout-remapped (`local`, per-thread shape) form.  Without this,
+  // `LayoutInference` produces an SBlock that *declares* the layout-remapped
+  // buffer at the parent scope and *emits* the original `(M, N) local.fragment`
+  // `AllocBuffer` stmt in the body. `LowerTileOp` then sees:
+  //   - layout_map keyed on the original (M, N) local.fragment Buffer
+  //   - body containing `AllocBuffer(C_l_pre)` for that same Buffer
+  // The pre-existing alloc_buffers remap loop only patches
+  // `SBlock.alloc_buffers`, never the body Stmts, so the original `(M, N)
+  // local.fragment` allocation survives alongside the (8,) `local` declaration
+  // — the `T.gemm` macro writes the surviving fragment, the final `T.copy`
+  // reads the (8,) `local` alias, and the kernel emits zero output.
+  // Patch the AllocBuffer to use the remapped Buffer (keyed either directly
+  // or via the buffer's data Var, since `LayoutInference` may have substituted
+  // the data Var when materializing the post-remap declaration).
+  Stmt VisitStmt_(const AllocBufferNode *op) final {
+    // Register the *pre-visit* buffer in lookup tables BEFORE recursing
+    // into nested stmts. This is critical for body-level `AllocBuffer`
+    // (the form `LayoutInference` produces for inner SBlocks) because
+    // `buffer_data_to_buffer_` / `buffer_map_` are populated only from
+    // `SBlock.alloc_buffers` (line ~310) — body Stmts that appear later
+    // in the SeqStmt would otherwise have no entry, leaving downstream
+    // VarNode references unrenamed when the layout-remapped Buffer
+    // replaces the alloc.
+    Buffer pre_buffer = op->buffer;
+    buffer_map_.insert({pre_buffer->data, pre_buffer});
+    buffer_data_to_buffer_.Set(pre_buffer->data, pre_buffer);
+    auto stmt = Downcast<AllocBuffer>(IRMutatorWithAnalyzer::VisitStmt_(op));
+    Buffer buffer = stmt->buffer;
+    // Restrict to fragment buffers — shared.dyn allocations are tracked by
+    // a downstream pass (`merge_shared_memory_allocations.cc`) that keys on
+    // the original buffer var; rewriting those here breaks that invariant.
+    if (!IsFragmentBuffer(buffer)) {
+      return std::move(stmt);
+    }
+    if (buffer_remap_.count(buffer)) {
+      Buffer remapped = buffer_remap_[buffer];
+      auto n = stmt.CopyOnWrite();
+      n->buffer = remapped;
+      return std::move(stmt);
+    }
+    // Alias by data Var: the layout_map's Buffer key may share the same
+    // data Var as this AllocBuffer's Buffer but have a different Buffer
+    // identity (LayoutInference re-wraps).
+    for (const auto &kv : buffer_remap_) {
+      if (kv.first->data.same_as(buffer->data) &&
+          kv.first->name == buffer->name) {
+        Buffer remapped = kv.second;
+        auto n = stmt.CopyOnWrite();
+        n->buffer = remapped;
+        return std::move(stmt);
+      }
+    }
+    return std::move(stmt);
   }
 
   PrimExpr VisitExpr_(const VarNode *op) final {

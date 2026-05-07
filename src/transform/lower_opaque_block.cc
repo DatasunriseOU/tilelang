@@ -82,19 +82,22 @@ private:
     HandleAnnotations(new_block->annotations, &pragma_attrs, /*is_block=*/true,
                       new_block->alloc_buffers);
 
-    // CPPMEGA: emit apache `AllocBuffer + SeqStmt` directly instead of the
-    // vendored `tl_tir::Allocate`. apache `StmtFunctor` has no dispatch entry
-    // for `tilelang.Allocate`, and several passes after this one
-    // (`tir.transform.NarrowDataType`, `tir.transform.Simplify`, ...) crash
-    // with "NodeFunctor calls un-registered function on type tilelang.Allocate".
-    // Mirrors the rewrite that `tl.transform.LowerTileLangAllocate` would
-    // perform — see `lower_allocate.cc::LowerTileLangAllocateMutator`.
+    // CPPMEGA z3-final fix: emit a SINGLE `AllocBuffer(buffer, ...)` per
+    // alloc_buffer using the ORIGINAL Buffer object. The previous version
+    // emitted a separate `DeclBuffer(buffer)` PLUS a synthesized
+    // `AllocBuffer(alloc_buf_obj, ...)` whose Buffer carried a layout-
+    // transformed shape but the SAME data var. Downstream passes that
+    // build a buffer_var -> Buffer map (e.g. lower_tile_op alias resolution,
+    // codegen) ended up with two distinct Buffer aliases for the same data
+    // var, which caused CUDA T.gemm to operate on stale shape metadata and
+    // emit zero-output. Apache's `flatten_buffer.cc` emits a single
+    // `AllocBuffer(buffer)` for each `alloc_buffer`; layout/stride info is
+    // already carried on `buffer` itself, so no second buffer object is
+    // needed. (Reference impl in cppmega-mlx-tilelang-stack-c uses the
+    // legacy `Allocate(buffer->data, dtype, allocation_shape, ...)` which
+    // is also a single-node form keyed on `buffer->data`.)
     for (size_t i = new_block->alloc_buffers.size(); i > 0; --i) {
       const Buffer &buffer = new_block->alloc_buffers[i - 1];
-      Array<PrimExpr> allocation_shape = GetBufferAllocationShape(buffer);
-      // DeclBuffer no longer has a body in apache/tvm; emit it as a
-      // standalone stmt followed by `body` via SeqStmt.
-      body = SeqStmt::Flatten(Array<Stmt>{DeclBuffer(buffer), body});
       Map<String, ffi::Any> allocate_annotations;
       auto it = storage_align_.find(buffer->data);
       if (it != storage_align_.end()) {
@@ -110,19 +113,7 @@ private:
         const PrimExpr &init = (*init_it).second;
         allocate_annotations.Set(tl::attr::kLocalVarInit, init);
       }
-      // Build a Buffer using the (possibly stride-corrected) allocation shape;
-      // matches the legacy `Allocate(buffer_var, dtype, allocation_shape, ...)`
-      // semantics. condition is `const_true()` (trivial) so no IfThenElse wrap.
-      Buffer alloc_buf_obj(/*data=*/buffer->data,
-                           /*dtype=*/buffer->dtype,
-                           /*shape=*/allocation_shape,
-                           /*strides=*/{},
-                           /*elem_offset=*/PrimExpr(),
-                           /*name=*/buffer->data->name_hint,
-                           /*data_alignment=*/0,
-                           /*offset_factor=*/0,
-                           /*buffer_type=*/BufferType::kDefault);
-      body = SeqStmt({AllocBuffer(alloc_buf_obj, allocate_annotations), body});
+      body = SeqStmt({AllocBuffer(buffer, allocate_annotations), body});
     }
     // Step 5. Materialize a lexical scope boundary only for blocks that were
     // explicitly marked by an earlier semantic lowering pass (for example
