@@ -36,7 +36,9 @@ from poc.triton_frontend.op_mapping import (  # noqa: E402
     _atomic_rmw_kind,
     _attrs_with_properties_shared,
     _is_ptr_type,
+    _is_tensor_type,
     _normalize_mlir_dtype,
+    _parse_tensor_type,
     map_tt_make_range,
     map_tt_trans,
 )
@@ -281,6 +283,71 @@ def test_normalize_mlir_dtype_still_raises_on_unknown() -> None:
     """Hard constraint: unknown dtypes raise -- no silent float32 default."""
     with pytest.raises(ValueError, match="unsupported MLIR dtype"):
         _normalize_mlir_dtype("totally_made_up")
+
+
+# ---------------------------------------------------------------------------
+# Wave C-followup: tensor-typed block arguments. Kernels like ``layer_norm``
+# thread tile-typed values (``tensor<128xf32>``) across function boundaries
+# in TTIR. Before this fix, ``_normalize_mlir_dtype`` raised
+# ``unsupported MLIR dtype: 'tensor<128xf32>'`` and ``map_tt_func``
+# couldn't seed the buffer. ``_parse_tensor_type`` is the new helper that
+# preserves the rank info for callers that need to ``decl_buffer`` with
+# the actual extents.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_tensor_type_1d() -> None:
+    """``tensor<128xf32>`` -> ``([128], "float32")``.
+
+    The 1-D shape is the layer_norm path: each row of the input tile is
+    threaded through ``tt.func`` as a ``tensor<128xf32>``.
+    """
+    shape, dtype = _parse_tensor_type("tensor<128xf32>")
+    assert shape == [128]
+    assert dtype == "float32"
+
+
+def test_parse_tensor_type_2d() -> None:
+    """``tensor<16x32xf32>`` -> ``([16, 32], "float32")``.
+
+    Higher-rank tiles surface in matmul-style kernels; we preserve the
+    extents row-major so ``tir.decl_buffer`` can plug them in directly.
+    """
+    shape, dtype = _parse_tensor_type("tensor<16x32xf32>")
+    assert shape == [16, 32]
+    assert dtype == "float32"
+
+
+def test_parse_tensor_type_unknown_inner_raises() -> None:
+    """Hard constraint: unknown element dtype raises -- no silent default.
+
+    ``tensor<128xbogus>`` must fail because the regression we're guarding
+    against is silently lowering an unknown element type as ``float32``.
+    """
+    with pytest.raises(ValueError, match="unsupported MLIR dtype"):
+        _parse_tensor_type("tensor<128xbogus>")
+
+
+def test_normalize_mlir_dtype_unwraps_tensor() -> None:
+    """``tensor<NxT>`` collapses to the storage dtype ``T``.
+
+    Mirrors the pointer-unwrap behaviour: every caller of
+    :func:`_normalize_mlir_dtype` wants the storage dtype; rank info is
+    available via :func:`_parse_tensor_type` for the few callers (e.g.
+    ``map_tt_func``) that actually need it.
+    """
+    assert _normalize_mlir_dtype("tensor<128xf32>") == "float32"
+    assert _normalize_mlir_dtype("tensor<16x32xf32>") == "float32"
+    assert _normalize_mlir_dtype("tensor<8xi32>") == "int32"
+
+
+def test_is_tensor_type_detects_tensor() -> None:
+    """``tensor<NxT>`` is a tensor; pointer / scalar spellings are not."""
+    assert _is_tensor_type("tensor<128xf32>") is True
+    assert _is_tensor_type("tensor<16x32xf32>") is True
+    assert _is_tensor_type("!tt.ptr<f32>") is False
+    assert _is_tensor_type("f32") is False
+    assert _is_tensor_type("") is False
 
 
 # ---------------------------------------------------------------------------

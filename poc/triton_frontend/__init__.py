@@ -179,6 +179,8 @@ def _emit_tile_load_from_input_buffer(
     for axis, _extent in enumerate(out_shape or [1]):
         loop_vars.append(tir.Var(ctx.fresh(f"i{axis}"), "int32"))
 
+    from .op_emitters.memory import _read_vector_lane, _vector_lanes
+
     src_indices: List[Any] = []
     for axis, lv in enumerate(loop_vars):
         if axis < len(offset_indices):
@@ -188,6 +190,14 @@ def _emit_tile_load_from_input_buffer(
         if isinstance(base, tvm_mod.tir.Buffer):
             # Tile-buffer offset: index per-lane.
             src_indices.append(tir.BufferLoad(base, [lv]))
+        elif _vector_lanes(base) > 1:
+            # Vector PrimExpr (e.g. ``Broadcast(pid*N, N) + Ramp(0,1,N)`` from
+            # ``addptr(splat(ptr), col_offsets)``). ``base + lv`` would yield a
+            # vector dtype and trip BufferStore's
+            # ``index_lanes * buffer_lanes == value_dtype_lanes`` check. Read
+            # the per-lane scalar element instead so the index is rank-1
+            # scalar, matching the surrounding tile's serial For nest.
+            src_indices.append(_read_vector_lane(ctx, base, lv))
         else:
             src_indices.append(base + lv)
 
@@ -287,7 +297,7 @@ def _emit_tile_store_to_input_buffer(
     """
     tir = ctx.tir()
     tvm_mod = ctx.tvm()
-    from .op_emitters.memory import _resolve_lane_operand
+    from .op_emitters.memory import _resolve_lane_operand, _read_vector_lane, _vector_lanes
 
     loop_vars: List[Any] = []
     for axis, _extent in enumerate(val_shape or [1]):
@@ -301,6 +311,14 @@ def _emit_tile_store_to_input_buffer(
             base = tir.const(0, "int32")
         if isinstance(base, tvm_mod.tir.Buffer):
             dst_indices.append(tir.BufferLoad(base, [lv]))
+        elif _vector_lanes(base) > 1:
+            # Vector PrimExpr offset (e.g. ``Broadcast(pid*N, N) + Ramp(0,1,N)``
+            # from ``addptr(splat(ptr), col_offsets)``). ``base + lv`` would
+            # yield a vector index and trip BufferStore's
+            # ``index_lanes * buffer_lanes == value_dtype_lanes`` check. Read
+            # the per-lane scalar so the surrounding serial For nest stores
+            # element-by-element.
+            dst_indices.append(_read_vector_lane(ctx, base, lv))
         else:
             dst_indices.append(base + lv)
 

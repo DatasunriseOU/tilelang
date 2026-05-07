@@ -747,13 +747,48 @@ def map_tt_func(op: Any, ctx: _om.WalkerCtx) -> Any:
             else:
                 bound = {"_placeholder": True, "name": clean, "dtype": elt}
                 ctx.buffers[clean] = bound
+        elif _om._is_tensor_type(type_str):
+            # Tile-typed block arg (``tensor<NxT>`` / ``tensor<NxMxT>``).
+            # Triton's TTIR threads tile-typed values across function
+            # boundaries in kernels like ``layer_norm``; before this branch
+            # ``map_tt_func`` raised ``unsupported MLIR dtype:
+            # 'tensor<128xf32>'`` because it only knew pointer / scalar
+            # spellings. We allocate a fixed-shape ``tir.decl_buffer`` so
+            # downstream load/store ops can index into the tile directly,
+            # rather than wedging a placeholder ``[1]`` shape that mismatches
+            # the actual extents (the regression that motivated this fix).
+            try:
+                shape, elt = _om._parse_tensor_type(type_str)
+            except ValueError as exc:
+                # Re-raise as EmitError so the frontend's error hierarchy
+                # (TritonFrontendError -> EmitError) is honoured. The
+                # underlying ``ValueError`` carries the malformed spelling
+                # already; we surface the block-arg context here.
+                raise EmitError(
+                    f"tt.func block arg {ssa!r}: cannot parse tensor type "
+                    f"{type_str!r}: {exc}"
+                ) from exc
+            if tir_mod is not None:
+                if clean not in ctx.buffers:
+                    ctx.buffers[clean] = tir_mod.decl_buffer(
+                        shape=list(shape), dtype=elt, name=clean,
+                    )
+                bound = ctx.buffers[clean]
+            else:
+                bound = {
+                    "_placeholder": True,
+                    "name": clean,
+                    "dtype": elt,
+                    "shape": list(shape),
+                }
+                ctx.buffers[clean] = bound
         else:
-            # Scalar (or tensor) block arg: emit a tir.Var of the right dtype.
-            # We don't materialise tensor-shaped block args specially because
-            # Triton TTIR doesn't actually pass tensor SSAs across function
-            # boundaries -- only scalars and pointers. Normalise short MLIR
-            # spellings (``i32`` -> ``int32``) to TVM's canonical names so
-            # ``tir.Var`` doesn't reject ``i32`` as unknown.
+            # Scalar block arg: emit a tir.Var of the right dtype.
+            # Pointer args are handled by the ``_is_ptr_type`` branch
+            # above and tensor (tile) args by the ``_is_tensor_type``
+            # branch; everything else falls through here. Normalise short
+            # MLIR spellings (``i32`` -> ``int32``) to TVM's canonical
+            # names so ``tir.Var`` doesn't reject ``i32`` as unknown.
             dt = _normalize_dtype(type_str) if type_str else "int32"
             if tir_mod is not None:
                 bound = tir_mod.Var(clean, dt)

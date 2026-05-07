@@ -326,6 +326,45 @@ def _emit_tile_binop(
     return _bind_result(op, ctx, out_buf)
 
 
+def _emit_tile_unary(
+    op: Any,
+    ctx: EmitContext,
+    x: Any,
+    scalar_apply: Callable[[Any], Any],
+    op_label: str,
+    out_dtype: str,
+) -> Any:
+    """Emit a per-lane ``tir.For`` for a unary op on a tile operand.
+
+    Mirrors :func:`_emit_tile_binop` but for arity-1 ops (math intrinsics
+    plus arith.* casts). Returns the freshly allocated result ``tir.Buffer``;
+    ``scalar_apply`` receives the per-lane PrimExpr and returns the per-lane
+    result PrimExpr. Used by ``math.exp`` / ``math.sqrt`` / ``math.log`` and
+    cast emitters when the input resolves to a tile.
+    """
+    tir = ctx.tir()
+    out_shape = _tile_shape(ctx, x) if _is_tile_operand(ctx, x) else ()
+    if not out_shape:
+        raise EmitError(
+            f"{op_label}: _emit_tile_unary called without tile operand"
+        )
+    out_buf = _alloc_tile_buffer(ctx, list(out_shape), out_dtype, ctx.fresh("tile"))
+
+    loop_vars = [tir.Var(ctx.fresh(f"j{axis}"), "int32") for axis in range(len(out_shape))]
+    lane = _read_lane(ctx, x, tuple(loop_vars))
+    body: Any = tir.BufferStore(out_buf, scalar_apply(lane), list(loop_vars))
+    for axis in range(len(loop_vars) - 1, -1, -1):
+        body = tir.For(
+            loop_vars[axis],
+            tir.const(0, "int32"),
+            tir.const(int(out_shape[axis]), "int32"),
+            tir.ForKind.SERIAL,
+            body,
+        )
+    ctx.emit(body)
+    return _bind_result(op, ctx, out_buf)
+
+
 def _maybe_tile_binop(
     op: Any,
     ctx: EmitContext,
@@ -565,11 +604,19 @@ def _emit_maxsi(op: Any, ctx: EmitContext) -> Any:
 
 
 def _math_unary(name: str, tir_fn_name: str):
-    """Build an emitter that maps math.<name> to ``tvm.tir.<tir_fn_name>``."""
+    """Build an emitter that maps math.<name> to ``tvm.tir.<tir_fn_name>``.
+
+    Tile-shape contract: when ``x`` is a tile operand (``tir.Buffer`` /
+    ``Broadcast`` / ``Ramp`` / vector PrimExpr), the scalar ``tir.<fn>``
+    constructor would raise ``tirx.convert: Expected PrimExpr but got
+    tirx.Buffer``. We instead allocate a fresh tile buffer and emit a
+    serial ``tir.For`` nest that applies the scalar intrinsic per-lane,
+    matching the pattern used by ``_emit_tile_binop`` for binary arith.
+    """
 
     def _emit(op: Any, ctx: EmitContext) -> Any:
         x = _resolve_one(op, ctx)
-        dt = _dtype_of(x)
+        dt = _tile_dtype(ctx, x)  # per-lane scalar dtype (handles Buffer/vector)
         if not _is_float_dtype(dt):
             raise EmitError(
                 f"math.{name} on non-float type {dt!r}; "
@@ -577,12 +624,16 @@ def _math_unary(name: str, tir_fn_name: str):
             )
         tir = ctx.tir()
         fn = getattr(tir, tir_fn_name, None)
-        if fn is None:
-            # Fall back to a call_intrin so we still get a typed Call PrimExpr.
-            result = tir.call_intrin(dt, f"tir.{tir_fn_name}", x)
-        else:
-            result = fn(x)
-        return _bind_result(op, ctx, result)
+
+        def _scalar_apply(scalar: Any) -> Any:
+            if fn is None:
+                return tir.call_intrin(dt, f"tir.{tir_fn_name}", scalar)
+            return fn(scalar)
+
+        if _is_tile_operand(ctx, x):
+            return _emit_tile_unary(op, ctx, x, _scalar_apply, f"math.{name}", dt)
+
+        return _bind_result(op, ctx, _scalar_apply(x))
 
     _emit.__name__ = f"_emit_math_{name}"
     return _emit
@@ -598,16 +649,20 @@ _emit_math_tanh = _math_unary("tanh", "tanh")
 
 def _emit_math_absf(op: Any, ctx: EmitContext) -> Any:
     x = _resolve_one(op, ctx)
-    dt = _dtype_of(x)
+    dt = _tile_dtype(ctx, x)
     if not _is_float_dtype(dt):
         raise EmitError(f"math.absf on non-float type {dt!r}; use math.absi")
     tir = ctx.tir()
     abs_fn = getattr(tir, "abs", None)
-    if abs_fn is None:
-        result = tir.call_intrin(dt, "tir.fabs", x)
-    else:
-        result = abs_fn(x)
-    return _bind_result(op, ctx, result)
+
+    def _apply(scalar: Any) -> Any:
+        if abs_fn is None:
+            return tir.call_intrin(dt, "tir.fabs", scalar)
+        return abs_fn(scalar)
+
+    if _is_tile_operand(ctx, x):
+        return _emit_tile_unary(op, ctx, x, _apply, "math.absf", dt)
+    return _bind_result(op, ctx, _apply(x))
 
 
 # ---------------------------------------------------------------------------

@@ -583,15 +583,94 @@ _MLIR_DTYPE_ALIASES: Dict[str, str] = {
 # technically representable -- are handled by the recursion.
 _PTR_RE = re.compile(r"^!?tt\.ptr<(.+)>$")
 
+# Tensor types print as ``tensor<NxT>`` for 1-D tiles or
+# ``tensor<NxMx...xT>`` for higher-rank tiles. The element dtype is the
+# trailing token after the final ``x``; preceding tokens are integer
+# extents. Used by :func:`_parse_tensor_type` (which also surfaces the
+# rank info) and by :func:`_normalize_mlir_dtype` (which projects to the
+# element dtype because most callers want the storage dtype).
+#
+# Tile-typed block arguments surface in kernels like ``layer_norm`` where
+# Triton's TTIR threads a ``tensor<128xf32>`` across function boundaries.
+# Without this branch ``map_tt_func`` raised
+# ``unsupported MLIR dtype: 'tensor<128xf32>'``.
+_TENSOR_RE = re.compile(r"^tensor<([^>]+)>$")
+
+
+def _parse_tensor_type(s: str) -> Tuple[List[int], str]:
+    """Parse ``tensor<NxMxT>`` into ``([N, M], normalized_T)``.
+
+    The MLIR generic form prints tensor extents and element dtype joined
+    by ``x``, e.g. ``tensor<128xf32>`` or ``tensor<16x32xf32>``. We split
+    on the trailing ``x`` to recover the element dtype, then peel off the
+    leading ``NxM...`` extents (each must be a base-10 integer; symbolic
+    shapes aren't a thing in TTIR after constant-folding so we don't try
+    to handle ``?`` here -- the emitter has no shape info to plug in).
+
+    Returns
+    -------
+    shape : list[int]
+        The integer extents in row-major order.
+    elt_dtype : str
+        Canonical TVM element dtype (``"float32"`` etc.), normalised via
+        :func:`_normalize_mlir_dtype` so callers can plumb it directly
+        into ``tir.decl_buffer``.
+
+    Raises
+    ------
+    ValueError
+        If ``s`` doesn't match ``tensor<...>`` or any extent fails to
+        parse as a positive int. This is deliberate: silently defaulting
+        to ``[1]`` or ``float32`` is exactly the regression that this
+        helper exists to surface. Caller emitters re-raise as
+        :class:`EmitError` to fold into the frontend's error hierarchy.
+    """
+    m = _TENSOR_RE.match((s or "").strip())
+    if m is None:
+        raise ValueError(f"not a tensor type: {s!r}")
+    inner = m.group(1)
+    # rsplit on the last ``x`` -- everything before it is the shape, the
+    # tail is the element dtype. ``tensor<128xf32>`` -> ``("128", "f32")``;
+    # ``tensor<16x32xf32>`` -> ``("16x32", "f32")``.
+    parts = inner.rsplit("x", 1)
+    if len(parts) != 2 or not parts[0]:
+        raise ValueError(f"malformed tensor type (missing element dtype): {s!r}")
+    shape_str, elt_str = parts
+    shape: List[int] = []
+    for dim in shape_str.split("x"):
+        d = dim.strip()
+        if not d.isdigit():
+            raise ValueError(
+                f"non-integer extent {d!r} in tensor type: {s!r}"
+            )
+        shape.append(int(d))
+    if not shape:
+        raise ValueError(f"empty shape in tensor type: {s!r}")
+    elt_dtype = _normalize_mlir_dtype(elt_str)
+    return shape, elt_dtype
+
+
+def _is_tensor_type(dtype: str) -> bool:
+    """Return True iff ``dtype`` is an MLIR tensor spelling (``tensor<...>``).
+
+    Sibling to :func:`_is_ptr_type`; callers branch on this when they need
+    to allocate a fixed-shape buffer rather than a pointer-backed one.
+    """
+    return _TENSOR_RE.match((dtype or "").strip()) is not None
+
 
 def _normalize_mlir_dtype(dtype: str) -> str:
     """Canonicalise an MLIR-printed dtype string to TVM's spelling.
 
     Pointer types (``!tt.ptr<T>``) are recursively unwrapped to their
     element dtype since every caller of this helper operates on the
-    storage dtype, not the pointer itself. See module-level note on
-    ``_PTR_RE`` for the rationale; use :func:`_is_ptr_type` if a caller
-    actually needs to know whether the original spelling was a pointer.
+    storage dtype, not the pointer itself. Tensor types
+    (``tensor<NxT>``) are likewise projected to the element dtype --
+    callers that need the rank/shape go through
+    :func:`_parse_tensor_type` instead. See module-level note on
+    ``_PTR_RE`` / ``_TENSOR_RE`` for the rationale; use
+    :func:`_is_ptr_type` / :func:`_is_tensor_type` if a caller actually
+    needs to know whether the original spelling was a pointer or tensor.
 
     Raises ``ValueError`` when the input is genuinely unknown so that a
     coverage gap surfaces immediately rather than silently lowering as
@@ -609,6 +688,13 @@ def _normalize_mlir_dtype(dtype: str) -> str:
         # collapses to ``float32`` because the storage dtype is what the
         # caller ultimately operates on.
         return _normalize_mlir_dtype(m.group(1))
+    tm = _TENSOR_RE.match(s)
+    if tm is not None:
+        # Project to the element dtype. Rank is preserved on the parsed
+        # form via :func:`_parse_tensor_type`; this branch keeps the
+        # storage-dtype contract that all other callers rely on.
+        _shape, elt = _parse_tensor_type(s)
+        return elt
     if s in _MLIR_DTYPE_ALIASES:
         return _MLIR_DTYPE_ALIASES[s]
     # Already-canonical TVM spellings pass through (the alias map already

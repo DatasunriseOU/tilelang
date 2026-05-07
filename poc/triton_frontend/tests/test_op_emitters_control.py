@@ -802,6 +802,54 @@ def test_tt_func_zero_args_is_noop() -> None:
     assert ctx.buffers == {}
 
 
+def test_tt_func_tensor_block_arg_seeds_buffer() -> None:
+    """A ``tensor<128xf32>`` block arg lands in ``ctx.buffers`` rank-1.
+
+    Triton's TTIR threads tile-typed values across function boundaries
+    in kernels like ``layer_norm``. Before this fix, ``map_tt_func``
+    raised ``unsupported MLIR dtype: 'tensor<128xf32>'`` and the lowering
+    aborted at function-prologue time. We assert the buffer dtype and
+    shape are preserved (no ``[1]`` placeholder) so downstream load /
+    store ops can index into the actual extents.
+    """
+    ctx = WalkerCtx()
+    # ``_FakeSSA`` with shape=(128,) and dtype="f32" causes ``_type_string``
+    # in op_emitters/control.py to synthesize ``tensor<128xf32>`` -- the
+    # same spelling that surfaces in real TTIR for layer_norm-style kernels.
+    arg = _FakeSSA({"name": "%arg0", "dtype": "f32", "shape": (128,)})
+
+    op = {
+        "name": "tt.func",
+        "operands": [],
+        "results": [],
+        "attrs": {"sym_name": "kernel"},
+        "block_args": [arg],
+        "regions": [{"ops": []}],
+    }
+
+    map_tt_func(op, ctx)
+
+    # The tile lands in ``ctx.buffers`` keyed by stripped SSA name.
+    assert "arg0" in ctx.buffers, \
+        f"tensor block arg %arg0 should seed ctx.buffers; keys={list(ctx.buffers)}"
+    buf = ctx.buffers["arg0"]
+
+    # Rank-1 with the actual extent (128) and the canonical TVM dtype.
+    shape_ints = [int(s) for s in buf.shape]
+    assert shape_ints == [128], \
+        f"expected rank-1 shape [128], got {shape_ints!r}"
+    assert str(buf.dtype) == "float32", \
+        f"expected float32 dtype, got {buf.dtype!r}"
+
+    # SSA-name-keyed entry in value_map points at the same buffer object.
+    assert ctx.value_map["%arg0"] is buf
+
+    # Tile-typed args are NOT runtime scalar args; they shouldn't pollute
+    # ``ctx.runtime_args`` (that list feeds ``PrimFunc.params`` for scalars).
+    assert buf not in getattr(ctx, "runtime_args", []), \
+        "tile buffer should not appear in runtime_args (scalar-only list)"
+
+
 # ---------------------------------------------------------------------------
 # arith.constant  -> seed value_map with IntImm / FloatImm
 # ---------------------------------------------------------------------------

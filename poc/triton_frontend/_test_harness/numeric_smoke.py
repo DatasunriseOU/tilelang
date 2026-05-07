@@ -476,12 +476,52 @@ def _run_mlx(
     # in ``kernel_args`` is the output, everything else is an input.
     *inputs_np, output_np = kernel_args
 
+    # Build the args-struct inline mapping. TileLang's Metal emitter packs
+    # scalar runtime args into a ``<kernel>_args_t`` struct keyed by
+    # PrimFunc param name (``arg<N>`` for the Nth original PrimFunc param,
+    # plus auto-injected ``gridDim_<i>`` entries). ``mx.fast.metal_kernel``
+    # rebuilds the kernel signature itself and does NOT carry that struct
+    # parameter through, so each ``arg.<field>[0]`` access in the body
+    # must be substituted with a literal int. Values are derived from the
+    # kernel module's runtime metadata:
+    #
+    # * ``gridDim_<i>`` <- ``kernel_mod.LAUNCH_GRID[i]`` (default 1).
+    # * ``arg<N>`` for N >= (input_count + output_count) <- the matching
+    #   Triton scalar arg from the kernel module. By convention, scalar
+    #   args follow the buffer args in PrimFunc declaration order; the
+    #   only such scalar in vector_add is ``n_elements`` whose value is
+    #   the length of the first input array.
+    args_struct_inline: Dict[str, int] = {}
+    launch_grid = tuple(int(g) for g in getattr(kernel_mod, "LAUNCH_GRID", (1,)))
+    for i in range(3):
+        args_struct_inline[f"gridDim_{i}"] = (
+            launch_grid[i] if i < len(launch_grid) else 1
+        )
+    # Best-effort scalar-arg inference. The harness only knows the inputs
+    # and the kernel module; for the conformance ladder this is enough
+    # because the only scalar arg is ``n_elements`` (= input length). A
+    # kernel module may override this by exposing ``KERNEL_SCALAR_ARGS``
+    # as ``Dict[str, int]`` with explicit (PrimFunc-name -> value) pairs.
+    explicit_scalars = getattr(kernel_mod, "KERNEL_SCALAR_ARGS", None)
+    if isinstance(explicit_scalars, dict):
+        for k, v in explicit_scalars.items():
+            args_struct_inline[str(k)] = int(v)
+    else:
+        # Fallback: assume PrimFunc names buffer params arg0..arg{B-1}
+        # and the next scalar param ``arg<B>`` is ``n_elements`` (the
+        # length of the first input). This holds for vector_add and any
+        # 1D elementwise kernel; richer kernels need KERNEL_SCALAR_ARGS.
+        buffer_count = len(inputs_np) + 1  # +1 for the single output
+        if inputs_np:
+            args_struct_inline[f"arg{buffer_count}"] = int(inputs_np[0].size)
+
     try:
         adapter = wrap_tilelang_metal_kernel(
             artifact,
             input_count=len(inputs_np),
             output_count=1,
             name="triton_e2e_kernel",
+            args_struct_inline=args_struct_inline,
         )
     except MLXRuntimeError as exc:
         return None, f"wrap_tilelang_metal_kernel: {exc}"

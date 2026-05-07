@@ -126,6 +126,82 @@ def test_negf_lowers_to_zero_minus_x():
     assert tvm.ir.structural_equal(expr, expected)
 
 
+def test_arith_addf_handles_buffer_descriptor_operand():
+    """Regression: ``arith.addf(buf_c, prod)`` where ``buf_c`` is a Buffer.
+
+    After Wave I3 the matmul accumulator surfaces at the arith layer as a
+    plain ``tir.Buffer`` (an scf.for / while iter_arg bound directly to
+    the descriptor). Before this fix, ``_emit_addf`` called
+    ``ctx.tir().Add(buf_c, prod_expr)`` and TVM raised ``_OpAdd: Expected
+    PrimExpr but got tirx.Buffer``. The tile path in
+    :func:`poc.triton_frontend.op_emitters.arith._emit_tile_binop` must
+    detect the Buffer operand, allocate a fresh result Buffer, and emit a
+    per-lane ``tir.For`` nest with ``BufferLoad`` -> ``Add`` ->
+    ``BufferStore``.
+
+    We assert:
+      * the emitter binds a fresh ``tir.Buffer`` (not a PrimExpr) as the
+        SSA result;
+      * the ``ctx.stmts`` queue gained exactly one ``tir.For`` whose body
+        is a ``BufferStore`` of the correct dtype/shape;
+      * the stored value is ``Add(BufferLoad(buf_c, [j]),
+        BufferLoad(buf_prod, [j]))`` -- i.e. both Buffer operands are
+        materialised per-lane rather than passed as descriptors.
+    """
+    ctx = WalkerCtx()
+    # 1D Buffer accumulator (the per-lane case; 2D shapes go through the
+    # same ``_read_lane`` machinery so the rank-1 test pins the contract).
+    buf_c = tvm.tir.decl_buffer((128,), "float32", name="buf_c", scope="local")
+    buf_prod = tvm.tir.decl_buffer((128,), "float32", name="buf_prod", scope="local")
+    c_ssa = _ssa("c", "float32")
+    prod_ssa = _ssa("prod", "float32")
+    ctx.bind(c_ssa, buf_c)
+    ctx.bind(prod_ssa, buf_prod)
+    out_ssa = _ssa("o", "float32")
+    op = _op("arith.addf", [c_ssa, prod_ssa], [out_ssa])
+
+    result = ARITH_EMITTERS["arith.addf"](op, ctx)
+
+    # Result must be a freshly-allocated Buffer (not a PrimExpr).
+    assert isinstance(result, tvm.tir.Buffer), (
+        f"expected tir.Buffer, got {type(result).__name__}: {result!r}"
+    )
+    assert tuple(int(s) for s in result.shape) == (128,)
+    assert str(result.dtype) == "float32"
+    # Same Buffer is bound to the SSA result.
+    assert ctx.value_map[out_ssa] is result
+
+    # The tile-path emits exactly one For wrapping a BufferStore body.
+    fors = [s for s in ctx.stmts if isinstance(s, tvm.tir.For)]
+    assert len(fors) == 1, f"expected one For, got stmts={ctx.stmts!r}"
+    loop = fors[0]
+    assert int(loop.extent) == 128, f"loop extent {loop.extent!r} != 128"
+    body = loop.body
+    assert isinstance(body, tvm.tir.BufferStore), (
+        f"loop body should be BufferStore, got {type(body).__name__}"
+    )
+    assert body.buffer.same_as(result), "BufferStore target must be result buffer"
+
+    # Stored value must be Add(BufferLoad(buf_c, [j]), BufferLoad(buf_prod, [j])).
+    val = body.value
+    assert isinstance(val, tvm.tir.Add), (
+        f"per-lane combine must be tir.Add, got {type(val).__name__}: {val!r}"
+    )
+    lhs, rhs = val.a, val.b
+    assert isinstance(lhs, tvm.tir.BufferLoad), (
+        f"lhs must be BufferLoad of buf_c, got {type(lhs).__name__}"
+    )
+    assert isinstance(rhs, tvm.tir.BufferLoad), (
+        f"rhs must be BufferLoad of buf_prod, got {type(rhs).__name__}"
+    )
+    assert lhs.buffer.same_as(buf_c), "lhs BufferLoad must read buf_c"
+    assert rhs.buffer.same_as(buf_prod), "rhs BufferLoad must read buf_prod"
+    # Both loads index with the same loop var (single-axis tile).
+    assert len(lhs.indices) == 1 and len(rhs.indices) == 1
+    assert tvm.ir.structural_equal(lhs.indices[0], rhs.indices[0])
+    assert tvm.ir.structural_equal(lhs.indices[0], loop.loop_var)
+
+
 # ---------------------------------------------------------------------------
 # Integer arithmetic
 # ---------------------------------------------------------------------------
@@ -256,6 +332,66 @@ def test_math_absf_lowers_to_tir_abs():
     expr = ARITH_EMITTERS["math.absf"](op, ctx)
     expected = tvm.tir.abs(x_var)
     assert tvm.ir.structural_equal(expr, expected)
+
+
+def test_math_exp_handles_buffer_descriptor_operand():
+    """Regression: ``math.exp(buf)`` where ``buf`` is a tile ``tir.Buffer``.
+
+    Surfaced by the softmax e2e harness: ``math.exp`` on the centred logits
+    tile (``buf`` materialised by a prior ``arith.subf``) tripped
+    ``tirx.convert: Expected PrimExpr but got tirx.Buffer`` because the
+    scalar ``tir.exp`` constructor cannot accept a Buffer descriptor. The
+    emitter must detect the tile operand, allocate a fresh result Buffer,
+    and emit a per-lane ``tir.For`` whose body is
+    ``BufferStore(out, exp(BufferLoad(buf, [j])), [j])``.
+    """
+    ctx = WalkerCtx()
+    buf_x = tvm.tir.decl_buffer((128,), "float32", name="buf_x", scope="local")
+    x_ssa = _ssa("x", "float32")
+    ctx.bind(x_ssa, buf_x)
+    out_ssa = _ssa("o", "float32")
+    op = _op("math.exp", [x_ssa], [out_ssa])
+
+    result = ARITH_EMITTERS["math.exp"](op, ctx)
+
+    assert isinstance(result, tvm.tir.Buffer), (
+        f"expected tir.Buffer, got {type(result).__name__}: {result!r}"
+    )
+    assert tuple(int(s) for s in result.shape) == (128,)
+    assert str(result.dtype) == "float32"
+    assert ctx.value_map[out_ssa] is result
+
+    fors = [s for s in ctx.stmts if isinstance(s, tvm.tir.For)]
+    assert len(fors) == 1, f"expected one For, got stmts={ctx.stmts!r}"
+    loop = fors[0]
+    assert int(loop.extent) == 128
+    body = loop.body
+    assert isinstance(body, tvm.tir.BufferStore)
+    assert body.buffer.same_as(result)
+    val = body.value
+    # The stored value should be exp(BufferLoad(buf_x, [j])).
+    assert isinstance(val, tvm.tir.Call), (
+        f"per-lane apply must be tir.Call (exp intrinsic), got "
+        f"{type(val).__name__}: {val!r}"
+    )
+    inner = val.args[0]
+    assert isinstance(inner, tvm.tir.BufferLoad), (
+        f"exp argument must be BufferLoad, got {type(inner).__name__}"
+    )
+    assert inner.buffer.same_as(buf_x)
+    assert len(inner.indices) == 1
+    assert tvm.ir.structural_equal(inner.indices[0], loop.loop_var)
+
+
+def test_math_exp_scalar_path_unchanged():
+    """Scalar ``math.exp`` still produces a bare PrimExpr (no tile lowering)."""
+    ctx, x_ssa, x_var = _make_unary_ctx("float32")
+    out = _ssa("o", "float32")
+    op = _op("math.exp", [x_ssa], [out])
+    expr = ARITH_EMITTERS["math.exp"](op, ctx)
+    # Scalar path: no For nest queued, returned expr is the bare exp Call.
+    assert not [s for s in ctx.stmts if isinstance(s, tvm.tir.For)]
+    assert tvm.ir.structural_equal(expr, tvm.tir.exp(x_var))
 
 
 # ---------------------------------------------------------------------------
