@@ -882,6 +882,73 @@ def test_store_2d_tile_emits_2d_for_nest() -> None:
     )
 
 
+def test_emit_tile_load_from_input_buffer_2d_offset_tile() -> None:
+    """Rank-tracking regression: ``_emit_tile_load_from_input_buffer`` must
+    not index a rank-N offset tile buffer with a single 1-D index.
+
+    matmul resolves ``a_ptrs`` (a ``tensor<64x64xi32>`` flat-address tile)
+    via PtrAnalysis to ``(src_buf, [tile_2d_offsets])`` -- a single
+    rank-2 offset buffer, not one buffer per axis. Before this fix the
+    helper took the per-axis fallback branch and emitted
+    ``BufferLoad(tile_2d_offsets, [lv0])`` -- a 1-D index list against a
+    2-D buffer -- which TVM rejects with
+    ``buffer->shape.size() == indices.size() (2 vs. 1) : Buffer ... is
+    2-dimensional, cannot be indexed with the 1-dimensional indices``.
+
+    Contract: when ``offset_indices`` is ``[buf]`` and ``buf.shape``
+    matches the surrounding loop-var rank, the emitter indexes the
+    offset buffer with the FULL loop-var nest and produces a single
+    flat-address load against a 1D-redecl'd source buffer.
+    """
+    from poc.triton_frontend import (
+        _emit_tile_load_from_input_buffer,
+        _redecl_input_buffer,  # noqa: F401  -- ensure side-effect path imports
+    )
+
+    ctx = WalkerCtx()
+    # Pre-populate ctx.buffers so _redecl_input_buffer can rebind the
+    # source buffer in-place (mirrors how _materialize_func_args sets up
+    # PrimFunc parameter slots).
+    src_buf = tvm.tir.decl_buffer([64, 64], "float32", name="src")
+    ctx.buffers["src_key"] = src_buf
+    # The 2D offset tile that addptr produced (flat-address layout).
+    offset_buf = tvm.tir.decl_buffer([64, 64], "int32", name="tile_offsets_2d")
+
+    out_ssa = _ssa("tile_load", shape=[64, 64], dtype="float32")
+    op = {
+        "name": "tt.load",
+        "operands": [_ssa("ptr", shape=[64, 64], dtype="float32")],
+        "results": [out_ssa],
+        "attrs": {},
+    }
+
+    # Must not raise the rank-mismatch InternalError.
+    result = _emit_tile_load_from_input_buffer(
+        op, ctx, src_buf, [offset_buf], (64, 64), "float32",
+        mask_ssa=None, other_ssa=None,
+    )
+    assert isinstance(result, tvm.tir.Buffer), (
+        f"expected rank-N tile Buffer; got {type(result).__name__}"
+    )
+    assert len(result.shape) == 2, (
+        f"expected rank-2 result tile; got shape={list(result.shape)}"
+    )
+
+    text = _stringify(ctx.stmts)
+    # Both loop variables must drive the offset buffer's index list (not
+    # just a single ``[i0]`` against a 2D buffer).
+    assert "i0" in text and "i1" in text, (
+        "expected both loop variables (i0, i1) to index the rank-2 offset "
+        f"tile; got:\n{text}"
+    )
+    # The original bug printed ``tile_offsets_2d[i0]`` (1-D index on a 2-D
+    # buffer). With the fix the emitter indexes with the FULL loop nest.
+    assert "tile_offsets_2d[i0]" not in text or "tile_offsets_2d[i0, i1]" in text, (
+        "offset tile must be indexed with the full rank-N loop-var list, "
+        f"not a single 1-D index; got:\n{text}"
+    )
+
+
 def test_splat_pointer_buffer_passthrough() -> None:
     """``tt.splat`` of a pointer-backed Buffer must propagate the buffer unchanged.
 

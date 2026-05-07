@@ -62,7 +62,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from ..op_mapping import EmitError
+from ..op_mapping import EmitError, _alloc_tile_buffer
 
 # WalkerCtx alias only -- imported lazily so this module stays cheap to load.
 EmitContext = Any  # poc.triton_frontend.op_mapping.WalkerCtx
@@ -388,8 +388,18 @@ def map_tt_reduce(op: Any, ctx: EmitContext) -> Any:
     # Accumulator buffer (per-output-element). For rank > 1 we store one
     # accumulator per non-reduced position; we model this as a single
     # buffer indexed by the outer iteration variables.
+    #
+    # Use ``_alloc_tile_buffer`` (not bare ``tir.decl_buffer``) so the
+    # buffer is registered in ``ctx.local_buffers`` and gets a wrapping
+    # ``tir.AllocBuffer`` Stmt at the head of the PrimFunc body. Without
+    # that scoping, MakePackedAPI's free-Var enumerator flags the
+    # accumulator's data Var as undefined and aborts with
+    # "variables (reduce_accum_*) are used, but are not passed in as API
+    # arguments" (the bug fixed by this emitter).
     accum_shape = src_shape[:ax] + src_shape[ax + 1:] or [1]
-    accum = tir.decl_buffer(accum_shape, out_dtype, name=ctx.fresh("reduce_accum"))
+    accum = _alloc_tile_buffer(
+        ctx, accum_shape, out_dtype, ctx.fresh("reduce_accum")
+    )
 
     # Build the outer iteration variables for the non-reduced axes.
     outer_vars: List[Any] = []
@@ -518,8 +528,12 @@ def map_tt_scan(op: Any, ctx: EmitContext) -> Any:
     identity = identity_fn(tir, out_dtype)
 
     # Output buffer: same shape/dtype as the source.
-    dst = tir.decl_buffer(src_shape, out_dtype, name=ctx.fresh("scan_dst"))
-    accum = tir.decl_buffer([1], out_dtype, name=ctx.fresh("scan_accum"))
+    # Use ``_alloc_tile_buffer`` so the buffer's data Var is scoped via a
+    # head-of-body ``tir.AllocBuffer`` Stmt; otherwise MakePackedAPI flags
+    # the accumulator/dst as an undefined free Var (mirrors the
+    # ``reduce_accum`` fix in ``map_tt_reduce``).
+    dst = _alloc_tile_buffer(ctx, src_shape, out_dtype, ctx.fresh("scan_dst"))
+    accum = _alloc_tile_buffer(ctx, [1], out_dtype, ctx.fresh("scan_accum"))
 
     init = tir.BufferStore(accum, identity, [tir.const(0, "int32")])
 

@@ -181,25 +181,71 @@ def _emit_tile_load_from_input_buffer(
 
     from .op_emitters.memory import _read_vector_lane, _vector_lanes
 
+    # Detect "single rank-N offset buffer" case. When tt.addptr collapses
+    # to a single 2D (or higher-rank) offset tile buffer matching the load
+    # tile shape (matmul's ``a_ptrs`` / ``b_ptrs`` are tensor<64x64xi32>),
+    # ptr_analysis surfaces ``offset_indices`` as a single buffer covering
+    # all axes -- not one buffer per axis. The offsets stored in that
+    # buffer are FLAT linear addresses (e.g. ``i*stride_am + j*stride_ak``).
+    # We index the offset buffer with the FULL loop-var nest to retrieve a
+    # scalar flat address, then index the source buffer with that single
+    # linear address. Producing one BufferLoad per axis (as the per-axis
+    # fallback below does) would index a 2D buffer with a 1D index list
+    # and trip ``buffer->shape.size() == indices.size()`` in
+    # tirx::BufferLoad.
+    single_offset_buf: Any = None
+    if (
+        len(offset_indices) == 1
+        and isinstance(offset_indices[0], tvm_mod.tir.Buffer)
+        and len(offset_indices[0].shape) == len(loop_vars)
+        and len(loop_vars) >= 2
+    ):
+        single_offset_buf = offset_indices[0]
+
     src_indices: List[Any] = []
-    for axis, lv in enumerate(loop_vars):
-        if axis < len(offset_indices):
-            base = offset_indices[axis]
-        else:
-            base = tir.const(0, "int32")
-        if isinstance(base, tvm_mod.tir.Buffer):
-            # Tile-buffer offset: index per-lane.
-            src_indices.append(tir.BufferLoad(base, [lv]))
-        elif _vector_lanes(base) > 1:
-            # Vector PrimExpr (e.g. ``Broadcast(pid*N, N) + Ramp(0,1,N)`` from
-            # ``addptr(splat(ptr), col_offsets)``). ``base + lv`` would yield a
-            # vector dtype and trip BufferStore's
-            # ``index_lanes * buffer_lanes == value_dtype_lanes`` check. Read
-            # the per-lane scalar element instead so the index is rank-1
-            # scalar, matching the surrounding tile's serial For nest.
-            src_indices.append(_read_vector_lane(ctx, base, lv))
-        else:
-            src_indices.append(base + lv)
+    if single_offset_buf is not None:
+        # Flat-address scheme: redecl src_buf as 1D so a single linear
+        # address from offset_buf is a valid index. Without this the
+        # surrounding BufferLoad on a rank-N src_buf would itself trip the
+        # rank-mismatch check below. ``_redecl_input_buffer`` updates
+        # ctx.buffers / value_map in place, so subsequent emitters see the
+        # 1D shape consistently.
+        flat_extent = 1
+        for _e in out_shape:
+            flat_extent *= int(_e)
+        src_buf = _redecl_input_buffer(ctx, src_buf, [flat_extent], out_dtype)
+        src_indices.append(tir.BufferLoad(single_offset_buf, list(loop_vars)))
+    else:
+        for axis, lv in enumerate(loop_vars):
+            if axis < len(offset_indices):
+                base = offset_indices[axis]
+            else:
+                base = tir.const(0, "int32")
+            if isinstance(base, tvm_mod.tir.Buffer):
+                # Tile-buffer offset. Index it with as many of the surrounding
+                # loop_vars as the buffer's rank requires (matmul's a_ptrs
+                # tile is rank-N when broadcast across all axes; vector_add's
+                # offsets buffer is rank-1).
+                buf_rank = len(base.shape)
+                if buf_rank <= 0:
+                    src_indices.append(tir.BufferLoad(base, [tir.const(0, "int32")]))
+                elif buf_rank >= len(loop_vars):
+                    src_indices.append(tir.BufferLoad(base, list(loop_vars[:buf_rank])))
+                else:
+                    # Buffer is lower-rank than the surrounding nest: take
+                    # the trailing `buf_rank` loop vars (matches numpy-style
+                    # right-aligned broadcasting).
+                    src_indices.append(tir.BufferLoad(base, list(loop_vars[-buf_rank:])))
+            elif _vector_lanes(base) > 1:
+                # Vector PrimExpr (e.g. ``Broadcast(pid*N, N) + Ramp(0,1,N)`` from
+                # ``addptr(splat(ptr), col_offsets)``). ``base + lv`` would yield a
+                # vector dtype and trip BufferStore's
+                # ``index_lanes * buffer_lanes == value_dtype_lanes`` check. Read
+                # the per-lane scalar element instead so the index is rank-1
+                # scalar, matching the surrounding tile's serial For nest.
+                src_indices.append(_read_vector_lane(ctx, base, lv))
+            else:
+                src_indices.append(base + lv)
 
     load_expr: Any = tir.BufferLoad(src_buf, src_indices)
     if mask_ssa is not None:
@@ -303,24 +349,52 @@ def _emit_tile_store_to_input_buffer(
     for axis, _extent in enumerate(val_shape or [1]):
         loop_vars.append(tir.Var(ctx.fresh(f"i{axis}"), "int32"))
 
+    # Mirror of the load-side "single rank-N offset buffer" case: when
+    # tt.addptr collapses to one rank-N flat-address tile (matmul stores
+    # with ``c_ptrs`` shaped tensor<64x64xi32>), index that buffer with
+    # the FULL loop-var nest and use the resulting scalar as a 1D linear
+    # address into ``dst_buf``.
+    single_offset_buf: Any = None
+    if (
+        len(offset_indices) == 1
+        and isinstance(offset_indices[0], tvm_mod.tir.Buffer)
+        and len(offset_indices[0].shape) == len(loop_vars)
+        and len(loop_vars) >= 2
+    ):
+        single_offset_buf = offset_indices[0]
+
     dst_indices: List[Any] = []
-    for axis, lv in enumerate(loop_vars):
-        if axis < len(offset_indices):
-            base = offset_indices[axis]
-        else:
-            base = tir.const(0, "int32")
-        if isinstance(base, tvm_mod.tir.Buffer):
-            dst_indices.append(tir.BufferLoad(base, [lv]))
-        elif _vector_lanes(base) > 1:
-            # Vector PrimExpr offset (e.g. ``Broadcast(pid*N, N) + Ramp(0,1,N)``
-            # from ``addptr(splat(ptr), col_offsets)``). ``base + lv`` would
-            # yield a vector index and trip BufferStore's
-            # ``index_lanes * buffer_lanes == value_dtype_lanes`` check. Read
-            # the per-lane scalar so the surrounding serial For nest stores
-            # element-by-element.
-            dst_indices.append(_read_vector_lane(ctx, base, lv))
-        else:
-            dst_indices.append(base + lv)
+    if single_offset_buf is not None:
+        flat_extent = 1
+        for _e in val_shape:
+            flat_extent *= int(_e)
+        dst_dtype = str(getattr(dst_buf, "dtype", "float32"))
+        dst_buf = _redecl_input_buffer(ctx, dst_buf, [flat_extent], dst_dtype)
+        dst_indices.append(tir.BufferLoad(single_offset_buf, list(loop_vars)))
+    else:
+        for axis, lv in enumerate(loop_vars):
+            if axis < len(offset_indices):
+                base = offset_indices[axis]
+            else:
+                base = tir.const(0, "int32")
+            if isinstance(base, tvm_mod.tir.Buffer):
+                buf_rank = len(base.shape)
+                if buf_rank <= 0:
+                    dst_indices.append(tir.BufferLoad(base, [tir.const(0, "int32")]))
+                elif buf_rank >= len(loop_vars):
+                    dst_indices.append(tir.BufferLoad(base, list(loop_vars[:buf_rank])))
+                else:
+                    dst_indices.append(tir.BufferLoad(base, list(loop_vars[-buf_rank:])))
+            elif _vector_lanes(base) > 1:
+                # Vector PrimExpr offset (e.g. ``Broadcast(pid*N, N) + Ramp(0,1,N)``
+                # from ``addptr(splat(ptr), col_offsets)``). ``base + lv`` would
+                # yield a vector index and trip BufferStore's
+                # ``index_lanes * buffer_lanes == value_dtype_lanes`` check. Read
+                # the per-lane scalar so the surrounding serial For nest stores
+                # element-by-element.
+                dst_indices.append(_read_vector_lane(ctx, base, lv))
+            else:
+                dst_indices.append(base + lv)
 
     # Pull the per-lane value from val_expr. val_expr is typically a tile
     # Buffer (alloced as the result of a prior tt.load / arith op).

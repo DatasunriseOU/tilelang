@@ -238,6 +238,42 @@ def test_tt_reduce_unsupported_combiner_raises():
         REDUCTION_EMITTERS["tt.reduce"](op, ctx)
 
 
+def test_tt_reduce_accum_buffer_registered_in_local_buffers():
+    """Regression: ``map_tt_reduce`` must register its accumulator buffer
+    in ``ctx.local_buffers`` so ``_make_prim_func`` emits a wrapping
+    ``tir.AllocBuffer`` Stmt and the buffer's data Var is properly
+    scoped. Without this, MakePackedAPI's free-Var enumerator flags
+    ``reduce_accum_*`` as undefined and aborts softmax/layer_norm
+    compilation with::
+
+        In PrimFunc <name> variables (reduce_accum_N, ...) are used,
+        but are not passed in as API arguments.
+    """
+    ctx = WalkerCtx()
+    src_ssa = _ssa("buf", shape=[8], dtype="float32")
+    out_ssa = _ssa("acc", shape=[], dtype="float32")
+    src_buf = tvm.tir.decl_buffer([8], "float32", name="buf")
+    ctx.bind(src_ssa, src_buf)
+
+    pre_count = len(ctx.local_buffers)
+    op = _op("tt.reduce", [src_ssa], [out_ssa], combiner="addf", axis=0)
+    REDUCTION_EMITTERS["tt.reduce"](op, ctx)
+
+    assert len(ctx.local_buffers) > pre_count, (
+        "tt.reduce must register the accumulator buffer in "
+        "ctx.local_buffers (use _alloc_tile_buffer, not bare "
+        "tir.decl_buffer); otherwise MakePackedAPI flags reduce_accum_* "
+        "as an undefined free Var."
+    )
+    # Confirm the registered buffer is named "reduce_accum_*".
+    accum_names = [
+        str(getattr(b, "name", "")) for b in ctx.local_buffers[pre_count:]
+    ]
+    assert any(n.startswith("reduce_accum") for n in accum_names), (
+        f"expected a 'reduce_accum_*' buffer registered; got {accum_names!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # tt.scan
 # ---------------------------------------------------------------------------
@@ -263,6 +299,34 @@ def test_tt_scan_addf_emits_for_loop_with_running_accumulator():
     # First store should be the identity (0).
     zero = tvm.tir.const(0, "float32")
     assert tvm.ir.structural_equal(stores[0].value, zero)
+
+
+def test_tt_scan_buffers_registered_in_local_buffers():
+    """Regression: ``map_tt_scan`` must register both the destination and
+    the running accumulator in ``ctx.local_buffers`` so MakePackedAPI
+    sees scoped data Vars (mirrors the reduce_accum fix)."""
+    ctx = WalkerCtx()
+    src_ssa = _ssa("buf", shape=[8], dtype="float32")
+    out_ssa = _ssa("scan", shape=[8], dtype="float32")
+    src_buf = tvm.tir.decl_buffer([8], "float32", name="buf")
+    ctx.bind(src_ssa, src_buf)
+
+    pre_count = len(ctx.local_buffers)
+    op = _op("tt.scan", [src_ssa], [out_ssa], combiner="addf", axis=0)
+    REDUCTION_EMITTERS["tt.scan"](op, ctx)
+
+    new_buffers = ctx.local_buffers[pre_count:]
+    assert len(new_buffers) >= 2, (
+        f"tt.scan must register dst + accum in ctx.local_buffers; "
+        f"got {len(new_buffers)} new buffer(s)"
+    )
+    new_names = [str(getattr(b, "name", "")) for b in new_buffers]
+    assert any(n.startswith("scan_accum") for n in new_names), (
+        f"expected a 'scan_accum_*' buffer; got {new_names!r}"
+    )
+    assert any(n.startswith("scan_dst") for n in new_names), (
+        f"expected a 'scan_dst_*' buffer; got {new_names!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
