@@ -160,10 +160,20 @@ class PassConfigKey(str, Enum):
     within a single simdgroup (<= 32 lanes) into ``simd_shuffle_xor``-based
     reductions, bypassing threadgroup memory.
 
-    Currently implemented in *detection-only* mode: the pass walks reduction
-    loops, runs a Z3 query asserting ``tile_extent <= 32 /\\ reduce_op ∈
-    {add, max, min, or, and, xor}``, and logs the candidate sites. The IR
-    is left unchanged.
+    Behaviour:
+
+    * Detection (always): the pass walks reduction loops, runs a Z3 query
+      asserting ``tile_extent <= 32 /\\ reduce_op ∈ {add, max, min, or, and,
+      xor}``, and stashes proved candidates on
+      ``tl.simd_lift_candidates`` for downstream tooling.
+    * Rewrite (gated by this PassConfig + a per-loop ``tl.simd_butterfly_lane``
+      annotation): when both the PassConfig is True *and* the loop is
+      explicitly annotated as a lane-mapped reduction (i.e. ``loop_var``
+      maps to ``lane_id`` within a single simdgroup), the threadgroup-mem
+      reduction is replaced by a butterfly sequence of
+      ``tl.shfl_xor_sync`` calls. The annotation is required because a
+      bare serial reduction loop does not carry lane-mapping information,
+      and rewriting blindly would change semantics.
 
     Default: False.
     """

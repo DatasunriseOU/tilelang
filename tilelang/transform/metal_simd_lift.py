@@ -1,27 +1,33 @@
 """Idea #9 (Z3 roadmap): simdgroup vs threadgroup memory choice on Metal.
 
 When a tile-wide reduction fits within a single simdgroup (32 lanes on
-Apple Silicon), Metal can perform the reduction with `simd_shuffle_xor`
-intrinsics and skip the threadgroup-memory round-trip. This pass walks
-``for``-loop reductions, builds a Z3 query asserting the candidate
-constraints, and -- when proven -- *logs* the candidate site.
+Apple Silicon), Metal can perform the reduction with ``simd_shuffle_xor``
+intrinsics and skip the threadgroup-memory round-trip. This pass
 
-Z3 query shape:
+1. Walks ``for``-loop reductions, builds a Z3 query asserting the
+   candidate constraints, and stashes proved candidates on
+   ``tl.simd_lift_candidates`` for downstream tooling.
+
+2. **Rewrites** loops that are *both* proved <= 32 by Z3 *and* explicitly
+   marked with the ``tl.simd_butterfly_lane`` annotation into a
+   ``tl.shfl_xor_sync``-based butterfly reduction. The annotation is
+   load-bearing: a bare serial reduction loop ``for i: acc = f(acc,
+   buf[i])`` does not carry the lane-mapping semantics required for a
+   safe rewrite — without the annotation we keep the IR untouched.
+
+Z3 query shape::
 
     tile_extent <= 32
     /\\  reduce_op ∈ {add, max, min, or, and, xor}
-    /\\  no cross-simdgroup write happens before reduce
 
-Status: detection-only with logging. The pass is *gated* behind the
-PassConfig key ``tl.simd_lift_reductions`` (default OFF). The IR is left
-unchanged regardless of the Z3 result; the wiring (PassConfig slot,
-phase.py slot, tests) is ready for a follow-up to actually emit
-``simd_shuffle_xor`` reductions.
+The pass is gated behind PassConfig key ``tl.simd_lift_reductions``
+(default OFF). When OFF, both detection and rewrite are no-ops.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 
@@ -39,6 +45,11 @@ _SIMD_REDUCE_OPS = {"add", "max", "min", "or", "and", "xor"}
 
 PASS_CONFIG_KEY = "tl.simd_lift_reductions"
 
+#: Per-loop annotation key the rewrite looks for. Set this on a ``T.serial``
+#: loop whose induction variable maps 1:1 to the simdgroup lane id to opt
+#: into the butterfly rewrite.
+LOOP_ANNOTATION_KEY = "tl.simd_butterfly_lane"
+
 
 @dataclass(frozen=True)
 class _ReductionCandidate:
@@ -47,6 +58,7 @@ class _ReductionCandidate:
     op: str
     proved: bool
     query: str
+    annotated: bool = False
 
 
 def _is_supported_reduce(op_name: str) -> bool:
@@ -55,9 +67,6 @@ def _is_supported_reduce(op_name: str) -> bool:
 
 def _classify_reduce_op(value: tir.PrimExpr, acc_var) -> str | None:
     """Classify the reduce op from ``acc = f(acc, ...)``. Returns op name or None."""
-    # Common shapes:
-    #   acc[0] = acc[0] + buf[i]  →  "add"
-    #   acc[0] = T.max(acc[0], buf[i]) → "max"
     if isinstance(value, tir.Add):
         return "add"
     if isinstance(value, tir.Sub):
@@ -84,7 +93,6 @@ def _z3_extent_le_32(extent_expr) -> tuple[bool, str]:
 
     Returns ``(proved, query_str)``. Conservative: UNKNOWN/timeout → False.
     """
-    # Concrete fast-path.
     if isinstance(extent_expr, (int,)):
         proved = extent_expr <= _SIMD_LANES
         return proved, f"static: extent={extent_expr} <= {_SIMD_LANES}? {proved}"
@@ -101,10 +109,6 @@ def _z3_extent_le_32(extent_expr) -> tuple[bool, str]:
     solver.set("timeout", 500)
     z_ext = z3.Int("extent")
     solver.add(z_ext > 0)
-    # We have no upstream symbolic-bound channel here; without an inbound
-    # `<= 32` constraint Z3 will not be able to prove the conjecture, which
-    # is exactly the conservative behavior we want. The query is still
-    # logged so a follow-up can plumb constraints in.
     solver.push()
     solver.add(z3.Not(z_ext <= _SIMD_LANES))
     res = solver.check()
@@ -116,6 +120,31 @@ def _z3_extent_le_32(extent_expr) -> tuple[bool, str]:
     return proved, query
 
 
+def _is_butterfly_annotated(node: tir.For) -> bool:
+    """Return True if the loop carries ``tl.simd_butterfly_lane = True``."""
+    ann = getattr(node, "annotations", None)
+    if ann is None:
+        return False
+    try:
+        v = ann.get(LOOP_ANNOTATION_KEY, None)
+    except Exception:
+        # Older TVM Map; fall through to dict-style.
+        try:
+            v = dict(ann).get(LOOP_ANNOTATION_KEY, None)
+        except Exception:
+            return False
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, tir.IntImm):
+        return int(v.value) != 0
+    try:
+        return bool(int(v))
+    except Exception:
+        return bool(v)
+
+
 def _walk_reductions(body: tir.Stmt) -> list[_ReductionCandidate]:
     """Walk ``for`` loops looking for ``acc = f(acc, ...)`` patterns."""
     candidates: list[_ReductionCandidate] = []
@@ -123,11 +152,7 @@ def _walk_reductions(body: tir.Stmt) -> list[_ReductionCandidate]:
     def _visit(node):
         if not isinstance(node, tir.For):
             return
-        # Recognise simple in-loop reductions:
-        #     for i in range(EXT):
-        #         acc[...] = f(acc[...], <stuff involving i>)
         body = node.body
-        # Peel any wrapper SeqStmt of length 1.
         if isinstance(body, tir.SeqStmt) and len(body.seq) == 1:
             body = body.seq[0]
         if not isinstance(body, tir.BufferStore):
@@ -143,6 +168,7 @@ def _walk_reductions(body: tir.Stmt) -> list[_ReductionCandidate]:
                 op=op_name,
                 proved=proved,
                 query=query,
+                annotated=_is_butterfly_annotated(node),
             )
         )
 
@@ -156,17 +182,227 @@ def _log_candidates(func_name: str, candidates: list[_ReductionCandidate]):
     if os.environ.get("TL_LOG_SIMD_LIFT") or any(c.proved for c in candidates):
         for c in candidates:
             logger.warning(
-                "simd-lift-detect: func=%s loop=%s extent=%s op=%s proved=%s query=%s",
-                func_name, c.loop_var, c.extent_repr, c.op, c.proved, c.query,
+                "simd-lift-detect: func=%s loop=%s extent=%s op=%s proved=%s "
+                "annotated=%s query=%s",
+                func_name, c.loop_var, c.extent_repr, c.op, c.proved,
+                c.annotated, c.query,
             )
 
 
+# ---------------------------------------------------------------------------
+# Butterfly construction
+# ---------------------------------------------------------------------------
+
+def _butterfly_stages(extent: int) -> list[int]:
+    """Return the lane-shift sequence for a butterfly over ``extent`` lanes.
+
+    For extent=32 → [16, 8, 4, 2, 1] (5 stages).
+    For extent=16 → [8, 4, 2, 1]      (4 stages).
+    For extent=8  → [4, 2, 1]         (3 stages).
+    """
+    if extent <= 1:
+        return []
+    n_stages = int(math.ceil(math.log2(extent)))
+    # Largest power of two <= extent gives the top shift.
+    top = 1 << (n_stages - 1)
+    out = []
+    s = top
+    while s >= 1:
+        out.append(s)
+        s //= 2
+    return out
+
+
+def _apply_op(op: str, a: tir.PrimExpr, b: tir.PrimExpr) -> tir.PrimExpr:
+    """Combine two values using the simd reduce op."""
+    if op == "add":
+        return a + b
+    if op == "max":
+        return tir.max(a, b)
+    if op == "min":
+        return tir.min(a, b)
+    if op == "or":
+        return tir.bitwise_or(a, b)
+    if op == "and":
+        return tir.bitwise_and(a, b)
+    if op == "xor":
+        return tir.bitwise_xor(a, b)
+    raise ValueError(f"unsupported simd reduce op: {op}")
+
+
+def _build_butterfly(
+    acc_load: tir.PrimExpr,
+    op: str,
+    extent: int,
+    dtype: str,
+) -> tir.PrimExpr:
+    """Build a chain of ``op(acc, shfl_xor_sync(mask, acc, shift, 32))`` Calls.
+
+    Returns a PrimExpr representing the final reduced value. The caller is
+    responsible for storing it back into the original accumulator buffer.
+    """
+    shfl_op = tir.op.Op.get("tl.shfl_xor_sync")
+    full_mask = tir.const(-1, "uint32")
+    width = tir.const(_SIMD_LANES, "int32")
+    value: tir.PrimExpr = acc_load
+    for shift in _butterfly_stages(extent):
+        shifted = tir.Call(
+            dtype,
+            shfl_op,
+            [full_mask, value, tir.const(shift, "int32"), width],
+        )
+        value = _apply_op(op, value, shifted)
+    return value
+
+
+class _ButterflyRewriter:
+    """Replace annotated reduction ``for`` loops with a butterfly Calls."""
+
+    def __init__(self):
+        self.replaced = 0
+        self.stages_emitted = 0
+
+    def __call__(self, body: tir.Stmt) -> tir.Stmt:
+        return self._mutate(body)
+
+    def _mutate(self, node):
+        if isinstance(node, tir.For):
+            return self._visit_for(node)
+        if isinstance(node, tir.SeqStmt):
+            new_seq = [self._mutate(s) for s in node.seq]
+            return tir.SeqStmt(new_seq, node.span)
+        if isinstance(node, tir.IfThenElse):
+            new_then = self._mutate(node.then_case) if node.then_case is not None else None
+            new_else = self._mutate(node.else_case) if node.else_case is not None else None
+            return tir.IfThenElse(node.condition, new_then, new_else, node.span)
+        if isinstance(node, tir.LetStmt):
+            return tir.LetStmt(node.var, node.value, self._mutate(node.body), node.span)
+        if isinstance(node, tir.AttrStmt):
+            return tir.AttrStmt(
+                node.node, node.attr_key, node.value, self._mutate(node.body), node.span
+            )
+        if isinstance(node, tir.AllocateConst):
+            return tir.AllocateConst(
+                node.buffer_var, node.dtype, node.extents, node.data,
+                self._mutate(node.body), node.annotations, node.span,
+            )
+        if isinstance(node, tir.Allocate):
+            return tir.Allocate(
+                node.buffer_var, node.dtype, node.extents, node.condition,
+                self._mutate(node.body), node.annotations, node.span,
+            )
+        if isinstance(node, tir.DeclBuffer):
+            return tir.DeclBuffer(node.buffer, self._mutate(node.body), node.span)
+        if isinstance(node, tir.Block):
+            return tir.Block(
+                node.iter_vars, node.reads, node.writes, node.name_hint,
+                self._mutate(node.body),
+                getattr(node, "init", None),
+                getattr(node, "alloc_buffers", []),
+                getattr(node, "match_buffers", []),
+                getattr(node, "annotations", {}),
+                node.span,
+            )
+        if isinstance(node, tir.BlockRealize):
+            return tir.BlockRealize(
+                node.iter_values, node.predicate,
+                self._mutate(node.block), node.span,
+            )
+        return node
+
+    def _visit_for(self, node: tir.For) -> tir.Stmt:
+        # Recurse into nested scopes first so inner annotated loops can fire too.
+        recursed_body = self._mutate(node.body)
+        # Match the same shape `_walk_reductions` used.
+        body_stmt = recursed_body
+        if isinstance(body_stmt, tir.SeqStmt) and len(body_stmt.seq) == 1:
+            body_stmt = body_stmt.seq[0]
+        if not isinstance(body_stmt, tir.BufferStore):
+            return tir.For(
+                node.loop_var, node.min, node.extent, node.kind, recursed_body,
+                node.thread_binding, node.annotations, node.span,
+            )
+        op_name = _classify_reduce_op(body_stmt.value, body_stmt.buffer)
+        if op_name is None or not _is_supported_reduce(op_name):
+            return tir.For(
+                node.loop_var, node.min, node.extent, node.kind, recursed_body,
+                node.thread_binding, node.annotations, node.span,
+            )
+        if not _is_butterfly_annotated(node):
+            return tir.For(
+                node.loop_var, node.min, node.extent, node.kind, recursed_body,
+                node.thread_binding, node.annotations, node.span,
+            )
+        proved, _ = _z3_extent_le_32(node.extent)
+        if not proved:
+            return tir.For(
+                node.loop_var, node.min, node.extent, node.kind, recursed_body,
+                node.thread_binding, node.annotations, node.span,
+            )
+
+        # Resolve concrete extent for stage sequence.
+        if isinstance(node.extent, tir.IntImm):
+            extent_val = int(node.extent.value)
+        elif isinstance(node.extent, int):
+            extent_val = int(node.extent)
+        else:
+            # Symbolic-but-proved is rare here; without a numeric we cannot
+            # emit the static stage list. Conservative: skip.
+            return tir.For(
+                node.loop_var, node.min, node.extent, node.kind, recursed_body,
+                node.thread_binding, node.annotations, node.span,
+            )
+
+        # Build acc_load (BufferLoad mirroring the BufferStore).
+        store: tir.BufferStore = body_stmt
+        acc_load = tir.BufferLoad(store.buffer, list(store.indices))
+        dtype = str(store.value.dtype) if hasattr(store.value, "dtype") else str(
+            store.buffer.dtype
+        )
+        reduced = _build_butterfly(acc_load, op_name, extent_val, dtype)
+        new_store = tir.BufferStore(store.buffer, reduced, list(store.indices), store.span)
+        self.replaced += 1
+        self.stages_emitted += len(_butterfly_stages(extent_val))
+        return new_store
+
+
+def rewrite_reductions(func: tir.PrimFunc) -> tuple[tir.PrimFunc, int, int]:
+    """Public helper: run the butterfly rewrite on a PrimFunc.
+
+    Returns ``(new_func, n_replaced, n_stages_total)``. Used by tests.
+    """
+    rw = _ButterflyRewriter()
+    new_body = rw(func.body)
+    if rw.replaced == 0:
+        return func, 0, 0
+    new_func = tir.PrimFunc(
+        func.params, new_body, func.ret_type, func.buffer_map, func.attrs, func.span,
+    )
+    return new_func, rw.replaced, rw.stages_emitted
+
+
+def count_shfl_xor_calls(func: tir.PrimFunc) -> int:
+    """Test helper: count ``tl.shfl_xor_sync`` Calls in a PrimFunc."""
+    n = 0
+
+    def _visit(node):
+        nonlocal n
+        if isinstance(node, tir.Call):
+            op_name = getattr(getattr(node, "op", None), "name", "")
+            if op_name == "tl.shfl_xor_sync":
+                n += 1
+
+    tir.stmt_functor.post_order_visit(func.body, _visit)
+    return n
+
+
+# ---------------------------------------------------------------------------
+# Pass entry
+# ---------------------------------------------------------------------------
+
 def _metal_simd_lift(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.PrimFunc:
-    # Default OFF: only run when the PassConfig flag is set True.
-    pass_ctx = ctx
     enabled = False
     try:
-        # tvm.transform.PassContext has a `config` attribute (Map<str, ...>).
         from tvm.transform import PassContext
         cfg = PassContext.current().config
         val = cfg.get(PASS_CONFIG_KEY, None) if cfg is not None else None
@@ -195,23 +431,36 @@ def _metal_simd_lift(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.PrimFunc:
         pass
     _log_candidates(func_name, candidates)
 
-    # Detection-only: do not modify IR. Stash the candidate list on the
-    # PrimFunc attrs so downstream tooling / tests can inspect what would
-    # have been transformed.
+    # Stash candidate metadata.
     if candidates:
-        from tvm.ir import make_node  # noqa: F401  (compatibility import)
         new_attrs = dict(func.attrs) if func.attrs is not None else {}
         new_attrs["tl.simd_lift_candidates"] = tir.StringImm(
             ";".join(
-                f"{c.loop_var}:{c.extent_repr}:{c.op}:proved={c.proved}"
+                f"{c.loop_var}:{c.extent_repr}:{c.op}:proved={c.proved}:"
+                f"annotated={c.annotated}"
                 for c in candidates
             )
         )
         try:
             func = func.with_attrs(new_attrs)
         except Exception:
-            # PrimFunc.with_attrs may not exist on older builds; ignore.
             pass
+
+    # Conservative IR rewrite: only fires on annotated, proved candidates.
+    if any(c.annotated and c.proved for c in candidates):
+        rewritten, n_replaced, n_stages = rewrite_reductions(func)
+        if n_replaced:
+            logger.warning(
+                "simd-lift-rewrite: func=%s replaced=%d butterfly_stages=%d",
+                func_name, n_replaced, n_stages,
+            )
+            # Preserve previously stashed attrs through the rewrite.
+            try:
+                if func.attrs is not None:
+                    rewritten = rewritten.with_attrs(dict(func.attrs))
+            except Exception:
+                pass
+            return rewritten
 
     return func
 

@@ -1092,6 +1092,24 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
     os << ">(";
     this->PrintExpr(op->args[0], os);
     os << "))";
+  } else if (op->op.same_as(tl::shfl_xor_sync())) {
+    // Idea #9 (Z3 roadmap): butterfly reduction across a single Apple
+    // simdgroup (32 lanes). The TL builtin signature is
+    //   shfl_xor_sync(mask, value, lane_mask, width)
+    // On Metal the simdgroup is implicit and full (32 lanes), so the
+    // `mask` and `width` args are ignored. We only emit
+    //   simd_shuffle_xor(value, lane_mask)
+    ICHECK_EQ(op->args.size(), 4U)
+        << "tl.shfl_xor_sync expects <mask, value, lane_mask, width>.";
+    os << "simd_shuffle_xor(" << PrintExpr(op->args[1]) << ", "
+       << PrintExpr(op->args[2]) << ")";
+  } else if (op->op.same_as(tl::shfl_sync())) {
+    // Same convention as shfl_xor_sync: ignore `mask`/`width` on Metal
+    // and lower to simd_shuffle(value, src_lane).
+    ICHECK_EQ(op->args.size(), 4U)
+        << "tl.shfl_sync expects <mask, value, src_lane, width>.";
+    os << "simd_shuffle(" << PrintExpr(op->args[1]) << ", "
+       << PrintExpr(op->args[2]) << ")";
   } else {
     CodeGenC::VisitExpr_(op, os);
   }
