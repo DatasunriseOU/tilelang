@@ -151,9 +151,8 @@ def flashattn(batch, heads, groups, seqlen_kv, dim, block_N, block_H, num_split,
             for i in T.Parallel(block_H):
                 logsum[i] = T.log2(logsum[i]) + scores_max[i] * scale
 
-            for i in T.Parallel(block_H):
-                if i < valid_block_H:
-                    glse[bid, hid * valid_block_H + i, sid] = logsum[i]
+            for i in T.Parallel(valid_block_H):
+                glse[bid, hid * valid_block_H + i, sid] = logsum[i]
             T.copy(acc_o[:valid_block_H, :], O_shared)
             T.copy(O_shared, Output_partial[bid, hid * valid_block_H : (hid + 1) * valid_block_H, sid, :])
 

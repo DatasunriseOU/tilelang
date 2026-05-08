@@ -257,6 +257,11 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
   if (loop_layout_inferred_)
     return {};
 
+  // Bind LetStmt variables to their expressions in our local analyzer
+  for (const auto& kv : T.let_var_to_expr) {
+    const_cast<arith::Analyzer*>(&analyzer_)->Bind(kv.first, kv.second);
+  }
+
   // Expand let bindings to find fragment buffer accesses
   if (!T.let_var_to_expr.empty()) {
     const_cast<ParallelOpNode *>(this)->ExpandLetBindings(T.let_var_to_expr);
@@ -576,22 +581,26 @@ bool ParallelOpNode::ValidateCandidateAgainstFragments(
     if (access.is_read &&
         !ProveFragmentContains(candidate, fragment, vars, access.indices,
                                analyzer_, check_forward_index)) {
+      oss << "Layout infer conflict between " << buffer << " and "
+          << source_buffer << " in T.Parallel loop:" << '\n'
+          << "    loop " << candidate->DebugOutput() << '\n'
+          << "    fragment " << fragment->DebugOutput() << '\n';
+      LOG(WARNING) << oss.str();
       if (throw_on_error) {
-        oss << "Layout infer conflict between " << buffer << " and "
-            << source_buffer << " in T.Parallel loop:" << '\n'
-            << "    loop " << candidate->DebugOutput() << '\n'
-            << "    fragment " << fragment->DebugOutput() << '\n';
+        throw LayoutConflictException(oss.str());
       }
       success = false;
     }
     if (access.is_write &&
         !ProveFragmentContains(fragment, candidate, access.indices, vars,
                                analyzer_, check_forward_index)) {
+      oss << "Layout infer conflict between " << buffer << " and "
+          << source_buffer << " in T.Parallel loop:" << '\n'
+          << "    loop " << candidate->DebugOutput() << '\n'
+          << "    fragment " << fragment->DebugOutput() << '\n';
+      LOG(WARNING) << oss.str();
       if (throw_on_error) {
-        oss << "Layout infer conflict between " << buffer << " and "
-            << source_buffer << " in T.Parallel loop:" << '\n'
-            << "    loop " << candidate->DebugOutput() << '\n'
-            << "    fragment " << fragment->DebugOutput() << '\n';
+        throw LayoutConflictException(oss.str());
       }
       success = false;
     }
@@ -668,15 +677,24 @@ Fragment ParallelOpNode::ComputePlanCandidate(const LayoutInferArgs &T) const {
   auto maybe_remapped_root_ =
       IfBufferRemapLoopGenerator::run(root_, T.buffer_remap, T.layout_map);
   int vector_size =
-      GetVectorizeSize(maybe_remapped_root_, T.analyzer, T.layout_map);
+      GetVectorizeSize(maybe_remapped_root_, const_cast<arith::Analyzer*>(&analyzer_), T.layout_map);
   DLOG(INFO) << "[PlanLoopPartition] vector_size = " << vector_size << '\n';
 
   PrimExpr loop_total_size = 1;
   for (Stmt l = root_; l.as<For>().has_value(); l = l.as<For>().value()->body)
     loop_total_size = loop_total_size * l.as<For>().value()->extent;
+
+  PrimExpr max_loop_total_size = loop_total_size;
+  if (!is_const_int(loop_total_size)) {
+    int64_t max_val = analyzer_.const_int_bound(loop_total_size)->max_value;
+    if (max_val < arith::ConstIntBound::kPosInf) {
+      max_loop_total_size = make_const(loop_total_size->dtype, max_val);
+    }
+  }
+
   DLOG(INFO) << "[PlanLoopPartition] loop_total_size = " << loop_total_size
-             << '\n';
-  while (!analyzer_.CanProve(floormod(loop_total_size, T.thread_bounds->extent *
+             << " (max: " << max_loop_total_size << ")" << '\n';
+  while (!analyzer_.CanProve(floormod(max_loop_total_size, T.thread_bounds->extent *
                                                            vector_size) == 0) &&
          vector_size > 1)
     vector_size /= 2;
@@ -700,7 +718,7 @@ Fragment ParallelOpNode::ComputePlanCandidate(const LayoutInferArgs &T) const {
   DLOG(INFO) << "[PlanLoopPartition] root_ = " << root_
              << " ############# vector_size = " << vector_size
              << ", thread_bounds = " << T.thread_bounds << '\n';
-  auto plan = PlanLoopPartition(root_, vector_size, T.thread_bounds);
+  auto plan = PlanLoopPartition(root_, vector_size, T.thread_bounds, const_cast<arith::Analyzer*>(&analyzer_));
   DLOG(INFO) << "[PlanLoopPartition] candidate = " << plan->DebugOutput()
              << '\n';
   return plan;

@@ -950,6 +950,8 @@ private:
     // Record Let variable to its bound expression.
     // This enables tracking fragment buffer accesses through let bindings.
     let_var_to_expr_.Set(op->var, op->value);
+    analyzer_.Bind(op->var, op->value);
+    DLOG(INFO) << "[LayoutInference] Bind " << op->var << " = " << op->value;
     IRVisitorWithAnalyzer::VisitStmt_(op);
   }
 
@@ -1244,8 +1246,7 @@ private:
 
       // Try each member as the root of inference for this component
       for (int attempt_infer_root : members) {
-        DLOG(INFO) << "----------------------- try root " << attempt_infer_root
-                   << " members " << members.size() << '\n';
+        std::cout << "----------------------- try root " << attempt_infer_root << " members " << members.size() << std::endl;
         // Backup the current infer_list_ state
         auto back_infer_list = BackupInferList();
         // Copy the current layout_map for temporary use
@@ -1270,16 +1271,13 @@ private:
           }
         } catch (const LayoutConflictException &e) {
           do_update = false;
-          DLOG(INFO) << "attempt failed due to LayoutConflictException "
-                     << e.what() << '\n';
+          std::cout << "attempt failed due to LayoutConflictException " << e.what() << std::endl;
         } catch (const NormalizeIterException &e) {
           do_update = false;
-          DLOG(INFO) << "attempt failed due to NormalizeIterException "
-                     << e.what() << '\n';
+          std::cout << "attempt failed due to NormalizeIterException " << e.what() << std::endl;
         } catch (const LoopLayoutInjectiveException &e) {
           do_update = false;
-          DLOG(INFO) << "attempt failed due to LoopLayoutInjectiveException "
-                     << e.what() << '\n';
+          std::cout << "attempt failed due to LoopLayoutInjectiveException " << e.what() << std::endl;
         }
 
         if (do_update) {
@@ -1290,14 +1288,14 @@ private:
               int64_t frag_reg_num = 1;
               for (auto i : frag.value()->OutputShape()) {
                 auto pci = as_const_int(i);
-                ICHECK(pci != nullptr)
-                    << "Can not use non-constant range to "
-                       "iterate over a fragment/local "
-                       "buffer. Non-constant shape expr is: "
-                    << i
-                    << ". This is possibly because you use symbolic shape when "
-                       "accessing a fragment/local buffer.";
-                frag_reg_num *= *pci;
+                if (pci) {
+                  frag_reg_num *= *pci;
+                } else {
+                  auto cib = analyzer_.const_int_bound(i);
+                  ICHECK(cib->max_value < arith::ConstIntBound::kPosInf && cib->max_value >= 0)
+                      << "Can not deduce constant bound for fragment shape expr: " << i;
+                  frag_reg_num *= cib->max_value;
+                }
               }
               reg_num += frag_reg_num;
             }
