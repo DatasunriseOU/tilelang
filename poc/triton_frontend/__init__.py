@@ -320,7 +320,12 @@ def _emit_tile_load_from_input_buffer(
 
     result_value = _results(op)[0] if _results(op) else None
     out_buf_name = ctx.fresh("tile_load")
-    tile_buf = _alloc_tile_buffer(ctx, list(out_shape) or [1], out_dtype, out_buf_name)
+    # Use ``scope="shared"`` so the tile buffer satisfies the scope contract
+    # of downstream GEMM consumers: Metal GEMM's ``is_gemm_ss()`` check
+    # requires both A and B operand tiles in shared scope; the default
+    # ``scope="local"`` produces ``"Unsupported gemm combination, A: local,
+    # B: local"`` at ``LowerTileOp`` time.
+    tile_buf = _alloc_tile_buffer(ctx, list(out_shape) or [1], out_dtype, out_buf_name, scope="shared")
 
     loop_vars: List[Any] = []
     for axis, _extent in enumerate(out_shape or [1]):

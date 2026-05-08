@@ -20,10 +20,10 @@ Runs each kernel in :mod:`numeric_kernels` through the full pipeline:
     np.allclose(output, expected, ...)      -> NUMERIC_PASS / NUMERIC_DIVERGE
 
 Each step has a precise failure label (see :data:`Verdict`). On missing
-deps (``triton`` / ``tilelang`` / ``mlx`` / ``tvm`` not importable) the
-kernel is reported as ``SKIP: <component> unavailable`` rather than
-errored out -- this keeps the harness usable on hosts without the full
-toolchain (e.g. CI runners that only have numpy).
+deps (``triton`` / ``tilelang`` / ``mlx`` / ``cppmega_mlx`` / ``tvm`` not
+importable) the kernel is reported as ``SKIP: <component> unavailable``
+rather than errored out -- this keeps the harness usable on hosts without
+the full toolchain (e.g. CI runners that only have numpy).
 
 We never substitute the numpy reference for the kernel output. If the
 GPU path fails for any reason, the verdict reflects that.
@@ -132,10 +132,14 @@ def _probe_deps() -> Dict[str, Optional[str]]:
         "tvm": None,
         "tilelang": None,
         "mlx": None,
+        "cppmega_mlx": None,
     }
     for name in deps:
         try:
-            importlib.import_module(name if name != "mlx" else "mlx.core")
+            module_name = "mlx.core" if name == "mlx" else name
+            if name == "cppmega_mlx":
+                module_name = "cppmega_mlx.nn._tilelang._mlx_runtime"
+            importlib.import_module(module_name)
         except Exception as exc:  # noqa: BLE001 -- broad-by-design, recorded
             deps[name] = f"{type(exc).__name__}: {exc}"
     return deps
@@ -232,7 +236,7 @@ def _capture_ttir(
                 return None, (
                     f"no triton backend registered for {gpu_target.backend!r} "
                     f"(registry keys: {list(_backends.keys())})"
-                )
+                ), _default_options
             be = backend_entry.compiler(gpu_target)
             options = be.parse_options({})
             ctx = _ir.context()
@@ -657,7 +661,7 @@ def run_one(kernel_module_name: str, deps: Dict[str, Optional[str]]) -> KernelRe
 
     # If any pipeline component is unavailable we SKIP -- this is the
     # honest verdict (we can't even attempt the pipeline).
-    for comp in ("triton", "tvm", "tilelang", "mlx"):
+    for comp in ("triton", "tvm", "tilelang", "mlx", "cppmega_mlx"):
         if deps.get(comp):
             return KernelResult(
                 name=kernel_module_name,

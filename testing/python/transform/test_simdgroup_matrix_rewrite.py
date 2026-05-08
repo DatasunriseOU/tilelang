@@ -105,7 +105,8 @@ def test_pass_config_key_default_off():
 
 def test_pass_config_key_can_enable():
     """When PassContext sets the flag True, gating fires."""
-    from tvm.transform import PassContext
+    from tvm import transform as tvm_transform
+    PassContext = tvm_transform.PassContext
     with PassContext(config={PASS_CONFIG_KEY: True}):
         assert _M._is_rewrite_enabled() is True
     # And it returns to False outside the context.
@@ -185,6 +186,25 @@ def test_collect_fragment_gemm_accum_buffers_helper_exists():
         "rewrite path needs the per-buffer collector"
 
 
+def test_remap_buffer_does_not_introduce_auto_elem_offset_var():
+    """Promoting an internal fragment buffer must not create an ABI offset Var."""
+    buf = tir.decl_buffer(
+        [8, 8],
+        "float32",
+        name="C_local",
+        scope="local.fragment",
+    )
+    remapped = _M._remap_buffer(
+        buf,
+        _M._build_var_map([buf.data]),
+        {"C_local"},
+        {},
+    )
+
+    assert isinstance(remapped.elem_offset, tir.IntImm)
+    assert int(remapped.elem_offset.value) == 0
+
+
 # ---------------------------------------------------------------------------
 # `apply_simdgroup_matrix_rewrite` returns the func unchanged for non-Metal
 # targets (conservative-by-default).
@@ -197,9 +217,7 @@ def test_apply_rewrite_skips_non_metal_target():
     @T.prim_func
     def _f(A: T.Buffer((8, 8), "float16")):
         for i, j in T.grid(8, 8):
-            with T.block("compute"):
-                vi, vj = T.axis.remap("SS", [i, j])
-                A[vi, vj] = T.float16(0)
+            A[i, j] = T.float16(0)
 
     out = _M.apply_simdgroup_matrix_rewrite(_f)
     # Non-Metal target → no rewrite → no emitted attr added.

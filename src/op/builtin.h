@@ -124,6 +124,11 @@ static constexpr const char *kLoopUnswitchingAllowNonTrivialElse =
 // out-of-bounds buffer access, no side effects). Default: false (off — the
 // pass is a pure throughput optimization and must remain conservative).
 static constexpr const char *kPredicateFusion = "tl.predicate_fusion";
+// Python-side Metal optimization gates. Register them here so
+// tvm.transform.PassContext accepts the keys before Python passes read them.
+static constexpr const char *kSimdLiftReductions = "tl.simd_lift_reductions";
+static constexpr const char *kSimdgroupMatrixRewrite =
+    "tl.simdgroup_matrix_rewrite";
 // CPPMEGA: Z3 idea #12 — vectorize alignment proof companion. When enabled,
 // after `loop_vectorize` rewrites a loop body to a `kVectorized` For, try
 // to prove the buffer base address is aligned to `vec_width * dtype_bytes`

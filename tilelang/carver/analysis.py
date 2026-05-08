@@ -116,7 +116,7 @@ class BlockInfo:
         return str(self)
 
 
-_normalize_prim_func = get_global_func("tir.schedule.NormalizePrimFunc")
+_normalize_prim_func = get_global_func("s_tir.schedule.NormalizePrimFunc")
 
 
 def normalize_prim_func(sch: tir.Schedule) -> list[BlockInfo] | None:
@@ -200,7 +200,7 @@ def get_root_block(sch: Schedule, func_name: str = "main") -> BlockRV:
         block = sch.mod[func_name].body.block
     except Exception:
         raise ValueError(f"The function body is expected to be the root block, but got:\n{sch.mod[func_name].body}") from None
-    return sch.get_block(block.name_hint)
+    return sch.get_sblock(block.name_hint)
 
 
 def collect_block_iter_vars_used_in_access_region(block: tir.Block, region: list[ir.Range]) -> set[tir.Var]:

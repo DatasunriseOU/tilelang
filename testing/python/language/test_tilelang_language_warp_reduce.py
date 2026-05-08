@@ -31,6 +31,7 @@ def get_kernel(reduce_op: str, dtype: str):
     return main
 
 
+@tilelang.testing.requires_cuda_target
 def test_warp_reduce_sum():
     a = torch.randn((32,), dtype=torch.float32, device="cuda")
     kernel = get_kernel("sum", T.float32)
@@ -39,6 +40,7 @@ def test_warp_reduce_sum():
     torch.testing.assert_close(a, ref)
 
 
+@tilelang.testing.requires_cuda_target
 def test_warp_reduce_max():
     a = torch.randn((32,), dtype=torch.float32, device="cuda")
     kernel = get_kernel("max", T.float32)
@@ -48,6 +50,7 @@ def test_warp_reduce_max():
     torch.testing.assert_close(a, ref)
 
 
+@tilelang.testing.requires_cuda_target
 def test_warp_reduce_min():
     a = torch.randn((32,), dtype=torch.float32, device="cuda")
     kernel = get_kernel("min", T.float32)
@@ -56,6 +59,7 @@ def test_warp_reduce_min():
     torch.testing.assert_close(a, ref)
 
 
+@tilelang.testing.requires_cuda_target
 def test_warp_reduce_bitand():
     a = torch.randint(0, 100, size=(32,), dtype=torch.int32, device="cuda")
     kernel = get_kernel("bitand", T.int32)
@@ -67,6 +71,7 @@ def test_warp_reduce_bitand():
     torch.testing.assert_close(a, ref)
 
 
+@tilelang.testing.requires_cuda_target
 def test_warp_reduce_bitor():
     a = torch.randint(0, 100, size=(32,), dtype=torch.int32, device="cuda")
     kernel = get_kernel("bitor", T.int32)

@@ -178,6 +178,11 @@ class PassConfigKey(str, Enum):
     Default: False.
     """
 
+    TL_SIMDGROUP_MATRIX_REWRITE = "tl.simdgroup_matrix_rewrite"
+    """Gate the Metal fragment-to-simdgroup matrix rewrite behind explicit
+    per-buffer eligibility checks. Default: False, preserving legacy
+    unconditional rewrite behaviour."""
+
     TL_DISABLE_LOOP_UNSWITCHING = "tl.disable_loop_unswitching"
     """Disable loop unswitching optimization. Default: False"""
 

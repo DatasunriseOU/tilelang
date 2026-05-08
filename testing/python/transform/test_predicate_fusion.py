@@ -19,8 +19,8 @@ from __future__ import annotations
 import tilelang
 import tilelang.testing
 from tilelang import tvm as tvm
-from tilelang.tvm import tir
-from tilelang.tvm.script import tir as T
+from tvm import tir
+from tvm.script import tir as T
 from tilelang.transform import PassConfigKey
 
 

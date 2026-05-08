@@ -447,7 +447,7 @@ class Builder(BaseBuilder):
             return orig_value
 
         # 2. Quick return for trivil types
-        if isinstance(value, (tuple, list, tvm.ffi.Array, int, float, str)):
+        if isinstance(value, (tuple, list, tvm.ffi.Array, BufferRegion, int, float, str)):
             return value
         if isinstance(value, tir.IntImm) and value.dtype == "int32":
             return value.value
@@ -515,7 +515,7 @@ class Builder(BaseBuilder):
         elif isinstance(value, (Buffer, tir.IterVar, tir.Var)):
             IRBuilder.name(name, value)
             return value
-        elif isinstance(value, (PrimExpr, BufferRegion)):
+        elif isinstance(value, PrimExpr):
             frame = tir.LetStmt(value)
             var = frame.var
             IRBuilder.name(name, var)

@@ -49,11 +49,13 @@ def run_gemm_pipeline_test(N, block_M=128, block_N=128, block_K=32):
     tilelang.testing.torch_assert_close(c, ref_c, rtol=1e-2, atol=0.2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_pipeline_large_matrix():
     """Test pipeline stages with large matrix multiplication (4096x4096)"""
     run_gemm_pipeline_test(4096)
 
 
+@tilelang.testing.requires_cuda_target
 def test_pipeline_small_matrix():
     """Test pipeline stages with smaller matrix multiplication"""
     run_gemm_pipeline_test(1024)

@@ -70,3 +70,50 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
             (f"Error: No tests were collected. {dict(sorted((k, len(v)) for k, v in terminalreporter.stats.items()))}"),
         )
         pytest.exit("No tests were collected.", returncode=5)
+
+
+_CUDA_UNAVAILABLE_SNIPPETS = (
+    "torch not compiled with cuda enabled",
+    "cuda is not available",
+    "cuda runtime unavailable",
+    "no cuda gpus are available",
+    "no cuda architecture was specified or gpu detected",
+    "cuda driver version is insufficient",
+    "found no nvidia driver on your system",
+)
+
+def _is_cuda_unavailable_error(err: BaseException) -> bool:
+    while err is not None:
+        msg = str(err).lower()
+        if any(snippet in msg for snippet in _CUDA_UNAVAILABLE_SNIPPETS):
+            return True
+        err = err.__cause__ or err.__context__
+    return False
+
+
+@pytest.fixture(autouse=True)
+def _skip_cuda_only_runtime_failures_on_no_cuda():
+    """Keep CUDA-only tests explicit on hosts where CUDA is unavailable.
+
+    Many older runtime tests predate the shared ``requires_cuda`` marker and
+    instantiate CUDA tensors directly.  Convert only well-known CUDA
+    availability errors into skips, leaving all IR/codegen failures visible.
+    """
+    try:
+        yield
+    except (AssertionError, RuntimeError, ValueError, OSError) as err:
+        if _is_cuda_unavailable_error(err):
+            pytest.skip(f"CUDA unavailable on this host: {err}")
+        raise
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item):
+    outcome = yield
+    if outcome.excinfo is None:
+        return
+    err = outcome.excinfo[1]
+    if _is_cuda_unavailable_error(err):
+        outcome.force_exception(
+            pytest.skip.Exception(f"CUDA unavailable on this host: {err}")
+        )

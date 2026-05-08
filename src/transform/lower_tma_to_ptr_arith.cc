@@ -398,7 +398,13 @@ Stmt BuildPointerArithCopy(const DecodedDesc &desc,
     Var s_data("tl_tma_smem_view", DataType::Handle());
     nonopaque_g_data = g_data;
     nonopaque_s_data = s_data;
-    PrimExpr huge_extent = IntImm(kIdx, std::numeric_limits<int64_t>::max());
+    // Virtual flat extent for the pointer-arithmetic buffer views. We use a
+    // sentinel large enough that no realistic loop index exceeds it, but
+    // small enough that `extent * dtype.bytes()` won't overflow int64
+    // (2^48 * 16 = 2^52, well within int64). Downstream allocation passes
+    // should NOT attempt to materialize this buffer — it's a view over the
+    // original TMA descriptor's backing store.
+    PrimExpr huge_extent = IntImm(kIdx, int64_t(1) << 48);
     Buffer g_buf(g_data, element_dtype, /*shape=*/{huge_extent},
                  /*strides=*/{}, /*elem_offset=*/IntImm(kIdx, 0),
                  /*name=*/"tl_tma_global_view",

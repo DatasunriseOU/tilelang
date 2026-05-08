@@ -88,9 +88,19 @@ using ::tilelang::tl_tir::LetStmtNode;
 
 namespace {
 
-// Collect all free `Var`s referenced in an expression. Used to push
-// per-var bit-bound constraints into the Z3 context before issuing the
+// Collect all `Var`s referenced in an expression. Used to push per-var
+// bit-bound constraints into the Z3 context before issuing the
 // well-definedness query.
+//
+// Note: this collects ALL vars, including loop-bound and let-bound vars
+// that may already have tighter ranges from the analyzer. The BV bounds
+// pushed by `Z3ProvesIndexInRange` are layered ON TOP of the analyzer's
+// existing constraints, so Z3 intersects them — a redundant wider bound
+// on a var that already has [0, N) from a For-loop is harmless. The
+// alternative (filtering out bound vars) would require walking the
+// enclosing scope chain, which adds complexity for no correctness gain.
+// The cost is purely solver effort: BV-bounding a var the analyzer
+// already constrained is a redundant assertion that Z3 handles trivially.
 class FreeVarCollector : public ExprVisitor {
 public:
   std::unordered_set<const VarNode *> vars;
@@ -166,11 +176,16 @@ static bool Z3ProvesIndexInRange(const Buffer &buf, size_t dim,
       too_many_vars = true; // unsupported dtype — bail
       break;
     }
-    // CPPMEGA fix-B4 (idea712): dtype-aware BV bounds. Signed int32
-    // takes [-2^31, 2^31); unsigned [0, 1<<bits); 64-bit clamped to
-    // INT64 range. The previous flat [0, 2^31) was unsound for signed
-    // vars that could legitimately be negative.
-    auto [lo64, hi64] = ::tilelang::tlz3::BVBoundsForDtype(dt);
+    // CPPMEGA fix-B4 (idea712): dtype-aware BV bounds. The previous flat
+    // [0, 2^31) was unsound for signed vars that could legitimately be
+    // negative. If the dtype range cannot be represented exactly as an
+    // int64 half-open interval, refuse to fuse.
+    auto bounds = ::tilelang::tlz3::BVBoundsForDtype(dt);
+    if (!bounds.has_value()) {
+      too_many_vars = true;
+      break;
+    }
+    auto [lo64, hi64] = *bounds;
     PrimExpr lo = make_const(dt, lo64);
     PrimExpr hi = make_const(dt, hi64);
     PrimExpr bound = (var >= lo) && (var < hi);

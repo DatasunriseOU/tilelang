@@ -2,6 +2,13 @@ import tilelang
 import tilelang.testing
 import tilelang.language as T
 import pytest
+from tilelang import tvm
+from tilelang.engine.phase import PreLowerSemanticCheck
+
+
+def _run_fragment_loop_checker(jit_func):
+    func = jit_func.get_tir()
+    PreLowerSemanticCheck(tvm.IRModule({func.attrs["global_symbol"]: func}))
 
 
 @tilelang.jit
@@ -134,17 +141,17 @@ def valid_loop_serial(dtype: T.dtype = T.bfloat16, accum_dtype: T.dtype = T.floa
 
 def test_invalid_loop():
     with pytest.raises(ValueError):
-        simple_invalid_loop()
+        _run_fragment_loop_checker(simple_invalid_loop)
     with pytest.raises(ValueError):
-        nested_invalid_loop()
+        _run_fragment_loop_checker(nested_invalid_loop)
     with pytest.raises(ValueError):
-        invalid_loop_with_complex_dataflow()
+        _run_fragment_loop_checker(invalid_loop_with_complex_dataflow)
 
 
 def test_valid_loop():
-    valid_loop_not_use_loop_var()
-    valid_loop_not_frag()
-    valid_loop_serial()
+    _run_fragment_loop_checker(valid_loop_not_use_loop_var)
+    _run_fragment_loop_checker(valid_loop_not_frag)
+    _run_fragment_loop_checker(valid_loop_serial)
 
 
 if __name__ == "__main__":

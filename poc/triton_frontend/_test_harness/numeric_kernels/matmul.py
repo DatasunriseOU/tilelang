@@ -35,6 +35,20 @@ META_ARGS: dict = {
 ATOL = 1e-3   # matmul accumulation needs slightly looser tol
 RTOL = 1e-2
 
+# PrimFunc scalar args: arg3..arg11 map to (M, N, K, stride_am, stride_ak,
+# stride_bk, stride_bn, stride_cm, stride_cn). Row-major (64,64) layout.
+KERNEL_SCALAR_ARGS: dict = {
+    "arg3": M,            # M
+    "arg4": N,            # N
+    "arg5": K,            # K
+    "arg6": K,            # stride_am = K (row-major A)
+    "arg7": 1,            # stride_ak = 1
+    "arg8": N,            # stride_bk = N (row-major B)
+    "arg9": 1,            # stride_bn = 1
+    "arg10": N,           # stride_cm = N (row-major C)
+    "arg11": 1,           # stride_cn = 1
+}
+
 
 if triton is not None:
 

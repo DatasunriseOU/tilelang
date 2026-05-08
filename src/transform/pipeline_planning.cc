@@ -63,8 +63,9 @@ public:
 private:
   void VisitExpr_(const BufferLoadNode *op) {
     Buffer buf = op->buffer;
-    if (buf->data->type_annotation.as<PointerTypeNode>()->storage_scope ==
-        "shared") {
+    const auto *ptr_type =
+        buf->data->type_annotation.as<PointerTypeNode>();
+    if (ptr_type && ptr_type->storage_scope == "shared") {
       // We only care about shared.tmem buffers
       ICHECK(!result.defined())
           << "TmemLoadCollector: More than one shared buffer visited";
@@ -124,7 +125,9 @@ private:
   void VisitExpr_(const CallNode *op) final {
     auto args = op->args;
     if (op->op.same_as(builtin::call_extern())) {
-      std::string func_name_with_template = args[0].as<StringImmNode>()->value;
+      const auto *name_imm = args[0].as<StringImmNode>();
+      ICHECK(name_imm) << "call_extern expects first arg to be StringImm";
+      std::string func_name_with_template = name_imm->value;
       std::size_t le_pos = func_name_with_template.find_first_of('<');
       std::string func_name = le_pos == std::string::npos
                                   ? func_name_with_template

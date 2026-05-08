@@ -5,6 +5,7 @@ import random
 import torch
 import numpy as np
 from tilelang.contrib import nvcc
+from tilelang.env import env
 from tilelang.utils.target import determine_target, target_is_gfx950
 from tvm.testing.utils import requires_cuda, requires_package, requires_llvm, requires_metal, requires_rocm, _compose
 
@@ -17,6 +18,8 @@ __all__ = [
     "requires_metal",
     "requires_rocm",
     "requires_llvm",
+    "get_default_target_kind",
+    "requires_cuda_target",
     "requires_gfx950",
     "main",
     "requires_cuda_compute_version",
@@ -42,6 +45,32 @@ def requires_gfx950(func):
             reason="Requires gfx950 (CDNA4/MI350)",
         ),
         *requires_rocm.marks(),
+    ]
+    return _compose([func], marks)
+
+
+def _default_target_kind() -> str | None:
+    try:
+        target = determine_target(env.get_default_target(), return_object=True)
+        return target.kind.name
+    except (AssertionError, ValueError, RuntimeError):
+        return None
+
+
+def get_default_target_kind() -> str | None:
+    return _default_target_kind()
+
+
+def requires_cuda_target(func):
+    """Skip unless the selected default target is CUDA and CUDA runtime is available."""
+    target_kind = _default_target_kind()
+    target_desc = target_kind if target_kind is not None else "unavailable"
+    marks = [
+        pytest.mark.skipif(
+            target_kind != "cuda",
+            reason=f"Requires default target to resolve to CUDA, but got {target_desc}",
+        ),
+        *requires_cuda.marks(),
     ]
     return _compose([func], marks)
 

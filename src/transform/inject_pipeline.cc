@@ -3555,7 +3555,9 @@ private:
       allocated_buffers_.erase(buffer);
     }
     // Integration #9 follow-up: extern_intrinsic pipeline_stage hint.
-    MaybeWrapExternPipelineStage(op, &block);
+    if (MaybeWrapExternPipelineStage(op, &block)) {
+      subtree_modified_ = true;
+    }
     return block;
   }
 
@@ -3565,20 +3567,27 @@ private:
   // ``pipeline_stage == -1`` (default) is a passthrough; ``0`` means "no
   // pipelining hint"; ``stage >= 1`` becomes ``num_stages = stage + 1``,
   // matching the convention in :func:`GetPipelineNumStages`.
-  void MaybeWrapExternPipelineStage(const SBlockNode *op,
+  bool MaybeWrapExternPipelineStage(const SBlockNode *op,
                                     SBlock *block) const {
     auto meta_opt = GetExternBlockMeta(op);
-    if (!meta_opt.has_value()) return;
+    if (!meta_opt.has_value()) return false;
     auto stage_any = meta_opt.value().Get("pipeline_stage");
-    if (!stage_any.has_value()) return;
-    const auto *imm = stage_any.value().as<IntImmNode>();
-    if (imm == nullptr) return;
-    int stage = static_cast<int>(imm->value);
-    if (stage < 1) return;
+    if (!stage_any.has_value()) return false;
+    int64_t raw_stage = -1;
+    if (auto integer = stage_any.value().try_cast<Integer>()) {
+      raw_stage = (*integer)->value;
+    } else if (auto i64 = stage_any.value().try_cast<int64_t>()) {
+      raw_stage = *i64;
+    } else {
+      return false;
+    }
+    int stage = static_cast<int>(raw_stage);
+    if (stage < 1) return false;
     PrimExpr ns = IntImm(DataType::Int(32), stage + 1);
     SBlockNode *bn = block->CopyOnWrite();
     bn->body =
         AttrStmt(Integer(0), kPipelineContextNumStages, ns, bn->body);
+    return true;
   }
 
   bool HasPipelineAnnotation(const ForNode *op) const {

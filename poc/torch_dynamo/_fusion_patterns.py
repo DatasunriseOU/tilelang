@@ -172,6 +172,10 @@ _QK_REDUCE_OPS = {
 # PrimFunc IR, which keeps the smoke-test independent of the (still
 # evolving) emitter shapes. Reset is callers' responsibility — the
 # canonical idiom is ``_FUSION_HITS.clear()`` at the top of a test.
+#
+# NOTE: not thread-safe. This is a POC diagnostic counter used in
+# single-threaded test contexts. If torch.compile ever calls try_match
+# from multiple threads, replace with threading.Lock or atomics.
 _FUSION_HITS: "dict[str, int]" = {
     "fused_linear": 0,
     "layernorm_linear": 0,
@@ -323,9 +327,8 @@ def _warn_pending_extension_patterns() -> None:
     """Emit one ``PendingFusionWarning`` per extension pattern that has
     no dedicated emitter wired into ``dispatch_lower`` yet.
 
-    Called once at module import time. We intentionally use
-    ``warnings.warn`` (not ``logging``) so callers can promote the
-    warning to an error in CI via ``-W error::PendingFusionWarning``.
+    Called lazily on first ``try_match`` invocation so import-time warnings
+    don't spam CI when the module is loaded but fusion is not used.
     """
     pending = ("gemm_softmax", "qk_reduce_sm_scale")
     for name in pending:
@@ -338,11 +341,11 @@ def _warn_pending_extension_patterns() -> None:
                 f"fallback. Numerics are correct; perf is not."
             ),
             PendingFusionWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
 
 
-_warn_pending_extension_patterns()
+_pending_warned = False
 
 
 def try_match(nodes: List[OpTrace], start: int) -> Optional[Tuple[str, List[OpTrace], int]]:
@@ -351,6 +354,10 @@ def try_match(nodes: List[OpTrace], start: int) -> Optional[Tuple[str, List[OpTr
     Returns ``(pattern_name, captured_nodes, end_index)`` on a match, or
     ``None`` if nothing fires (orchestrator drops back to sequential).
     """
+    global _pending_warned
+    if not _pending_warned:
+        _pending_warned = True
+        _warn_pending_extension_patterns()
     for name, matcher, _emitter in FUSION_PATTERNS:
         matched, captured, end = matcher(nodes, start)
         if matched:

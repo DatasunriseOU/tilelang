@@ -253,15 +253,15 @@ def _validate_body(target: str, intrinsic_name: str, body: str, frags: Sequence[
                 f"extern_intrinsic[{target}] body for '{intrinsic_name}' contains "
                 f"no recognisable function definition; expected '{intrinsic_name}(...)'."
             )
-        return
-    args = _split_args(found[0].group(2))
-    if len(args) != len(frags):
-        raise ValueError(
-            f"extern_intrinsic[{target}] '{intrinsic_name}' declares "
-            f"{len(args)} body parameter(s), but the signature declares "
-            f"{len(frags)} Frag(s). Body args: {args!r}; "
-            f"Frags: {[f.name for f in frags]!r}."
-        )
+    else:
+        args = _split_args(found[0].group(2))
+        if len(args) != len(frags):
+            raise ValueError(
+                f"extern_intrinsic[{target}] '{intrinsic_name}' declares "
+                f"{len(args)} body parameter(s), but the signature declares "
+                f"{len(frags)} Frag(s). Body args: {args!r}; "
+                f"Frags: {[f.name for f in frags]!r}."
+            )
 
     scrubbed = _scrub_body_for_name_scan(body)
     missing: list[str] = []
@@ -476,12 +476,23 @@ def _looks_like_buffer(obj: Any) -> bool:
     Used to separate shape-parameter args (ints, sym vars) from buffer args
     in the signature/emit split. We cannot ``isinstance(obj, tir.Buffer)``
     here without forcing a TVM import at module load — keep duck-typing.
+
+    The check requires TIR-specific attributes (``access_ptr`` or ``scope``)
+    beyond the generic ``(data, dtype, shape)`` triple to avoid false
+    positives on numpy arrays, torch tensors, and pandas DataFrames — all
+    of which also carry ``data``, ``dtype``, and ``shape``.
     """
-    return (
-        hasattr(obj, "data")
-        and hasattr(obj, "dtype")
-        and hasattr(obj, "shape")
-    )
+    if not (hasattr(obj, "data") and hasattr(obj, "dtype") and hasattr(obj, "shape")):
+        return False
+    # TIR-specific discriminators: tir.Buffer exposes access_ptr() and scope().
+    if hasattr(obj, "access_ptr") or hasattr(obj, "scope"):
+        return True
+    # Fallback: if .data carries .type_annotation it's a TVM Var, not a
+    # numpy/torch data attribute.
+    data = getattr(obj, "data", None)
+    if data is not None and hasattr(data, "type_annotation"):
+        return True
+    return False
 
 
 def _split_shape_and_buffer_args(
@@ -619,7 +630,7 @@ def _simdgroup_factory(
     ) -> Frag:
         if len(shape) != 2:
             raise ValueError(
-                f"simdgroup_{layout[-1]} expects a 2-D tile shape; got {shape!r}"
+                f"{layout} expects a 2-D tile shape; got {shape!r}"
             )
         return Frag(
             name=name,
@@ -631,8 +642,8 @@ def _simdgroup_factory(
             pipeline_stage=pipeline_stage,
             is_output=is_output,
         )
-    _make.__name__ = f"simdgroup_{layout[-1]}"
-    _make.__qualname__ = _make.__name__
+    _make.__name__ = layout
+    _make.__qualname__ = layout
     return _make
 
 

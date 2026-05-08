@@ -254,10 +254,17 @@ _dot4_intrinsics_registered_cache: Optional[bool] = None
 
 
 def _dot4_intrinsics_registered() -> bool:
-    """Return True iff every dot4 intrinsic op is registered (cached)."""
+    """Return True iff every dot4 intrinsic op is registered (cached).
+
+    BUG-FP8-3 fix: the cache is invalidated when any lookup fails, so
+    lazy op registration (e.g. deferred FFI loading) will be picked up
+    on the next call. A successful probe is cached permanently since ops
+    cannot be unregistered.
+    """
     global _dot4_intrinsics_registered_cache
-    if _dot4_intrinsics_registered_cache is not None:
-        return _dot4_intrinsics_registered_cache
+    if _dot4_intrinsics_registered_cache is True:
+        return True
+    # Re-probe on every call when not yet proven True (either None or False).
     try:
         from tvm.ir import Op  # type: ignore
     except Exception:
@@ -267,7 +274,8 @@ def _dot4_intrinsics_registered() -> bool:
         try:
             Op.get(name)
         except Exception:
-            _dot4_intrinsics_registered_cache = False
+            # Don't cache False permanently — ops may be registered lazily.
+            _dot4_intrinsics_registered_cache = None
             return False
     _dot4_intrinsics_registered_cache = True
     return True
@@ -723,7 +731,7 @@ def _validate_buffers(
         raise TypeError(
             f"T.fp8_scaled_matmul: B_scale must be a {'uint8 E8M0 block-scale' if block_scale_layout is not None else 'floating-point scalar'} buffer, got dtype={sb_dtype!r}"
         )
-    if C_dtype and not (C_dtype.startswith("float32") or C_dtype.startswith("float16") or C_dtype.startswith("bfloat")):
+    if C_dtype and not (C_dtype.startswith("float32") or C_dtype.startswith("float16") or C_dtype == "bfloat16"):
         raise TypeError(
             f"T.fp8_scaled_matmul: C output must be float32 / float16 / bfloat16 (got {C_dtype!r})"
         )
@@ -1114,7 +1122,10 @@ def _fp8_scaled_matmul_m1_vecmat_metal_macro_legacy(
 
         reduced = T.call_intrin("float32", "tir.metal.simd_sum", dot)
         with T.If(tx == 0), T.Then():
-            sa = A_scale[0] if sa_size == 1 else A_scale[0]
+            # BUG-FP8-1 fix: M_dim == 1 in this macro (dispatcher guarantees
+            # it), so A_scale[0] is correct for both per-tensor AND per-row.
+            # The per-row index would be A_scale[i] but i is always 0 here.
+            sa = A_scale[0]
             sb = B_scale[0] if sb_size == 1 else B_scale[j]
             C_local[0, j] = base + reduced * sa * sb
 

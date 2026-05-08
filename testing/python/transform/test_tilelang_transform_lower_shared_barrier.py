@@ -18,10 +18,14 @@ def _apply(func):
 
 
 def _collect_calls(stmt, op_name: str):
+    return _collect_calls_any(stmt, {op_name})
+
+
+def _collect_calls_any(stmt, op_names: set[str]):
     calls = []
 
     def visitor(node):
-        if isinstance(node, tvm.tir.Call) and hasattr(node, "op") and hasattr(node.op, "name") and node.op.name == op_name:
+        if isinstance(node, tvm.tir.Call) and hasattr(node, "op") and hasattr(node.op, "name") and node.op.name in op_names:
             calls.append(node)
 
     tvm.tir.stmt_functor.post_order_visit(stmt, visitor)
@@ -29,11 +33,18 @@ def _collect_calls(stmt, op_name: str):
 
 
 def _collect_storage_syncs(stmt):
-    return _collect_calls(stmt, "tir.tvm_storage_sync")
+    return _collect_calls_any(stmt, {"tir.tvm_storage_sync", "tirx.tvm_storage_sync"})
 
 
 def _collect_init_barrier_calls(stmt):
-    return _collect_calls(stmt, "tir.ptx_init_barrier_thread_count")
+    return _collect_calls_any(
+        stmt,
+        {
+            "tl.ptx_init_barrier_thread_count",
+            "tir.ptx_init_barrier_thread_count",
+            "tirx.ptx_init_barrier_thread_count",
+        },
+    )
 
 
 def _collect_fence_barrier_init(stmt):
@@ -50,7 +61,7 @@ def _collect_barrier_blocks(stmt):
     def visitor(node):
         if isinstance(node, tvm.tir.Block):
             barrier_bufs = [buf for buf in node.alloc_buffers if buf.scope() in ("shared.barrier", "shared.cluster_barrier")]
-            if barrier_bufs:
+            if barrier_bufs or "barrier_init" in node.annotations:
                 blocks.append(node)
 
     tvm.tir.stmt_functor.post_order_visit(stmt, visitor)
@@ -154,7 +165,7 @@ def test_plan_update_keeps_barrier_init_with_tcgen05_no_tma():
             T.copy(C_local, Y_shared)
             T.copy(Y_shared, Y[by * 128, bx * 128])
 
-    target = tvm.target.Target("cuda -arch=sm_100")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100"})
     with tvm.transform.PassContext(config=pass_configs), target:
         mod = tvm.IRModule.from_expr(func.with_attr("global_symbol", "main"))
         mod = LowerAndLegalize(mod, target)

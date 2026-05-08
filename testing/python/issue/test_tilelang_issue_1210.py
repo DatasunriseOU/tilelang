@@ -1,6 +1,10 @@
 import tilelang
 import tilelang.language as T
 import tilelang.testing
+from tilelang import tvm
+from tilelang.engine.lower import LowerAndLegalize, OptimizeForTarget, PreLowerSemanticCheck, canon_target_host
+from tilelang.env import env
+from tilelang.utils.target import determine_target
 
 
 def _make_kernel(M, N):
@@ -42,12 +46,23 @@ def _make_kernel_if_cond(M, N):
     return fwd_main
 
 
+def _run_make_packed_api_pipeline(func, pass_configs):
+    target = determine_target(env.get_default_target())
+    target_host = tvm.target.Target.canon_target(canon_target_host(target, None))
+    target = tvm.target.Target(target, target_host)
+    mod = tvm.IRModule({func.attrs["global_symbol"]: func})
+    PreLowerSemanticCheck(mod)
+    with tvm.transform.PassContext(opt_level=3, config=pass_configs), target:
+        mod = LowerAndLegalize(mod, target)
+        OptimizeForTarget(mod, target)
+
+
 def test_make_packed_api_no_free_loop_var():
     func, func_if_cond = _make_kernel(4, 4), _make_kernel_if_cond(4, 4)
     # Keep warp-specialization/TMA disabled to match the original repro
     cfg = {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
-    tilelang.compile(func, pass_configs=cfg)
-    tilelang.compile(func_if_cond, pass_configs=cfg)
+    _run_make_packed_api_pipeline(func, cfg)
+    _run_make_packed_api_pipeline(func_if_cond, cfg)
 
 
 if __name__ == "__main__":

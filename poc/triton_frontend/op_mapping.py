@@ -832,12 +832,20 @@ def _alloc_tile_buffer(
     tir = ctx.tir()
     shape_list = list(shape) if shape else [1]
     try:
-        buf = tir.decl_buffer(shape_list, dtype, name=name, scope=scope)
+        # Force ``elem_offset=0`` so TVM doesn't auto-create a free
+        # ``\u003cname\u003e_elem_offset`` Var that MakePackedAPI would flag as
+        # undefined. Tile-scoped buffers are always zero-offset.
+        buf = tir.decl_buffer(shape_list, dtype, name=name, scope=scope,
+                              elem_offset=tir.const(0, "int32"))
     except TypeError:
         # Older decl_buffer signatures don't accept ``scope`` kw -- fall
         # back to the unscoped form. The buffer still bypasses buffer_map
         # via ``ctx.local_buffers`` so VerifyMemory will skip it.
-        buf = tir.decl_buffer(shape_list, dtype, name=name)
+        try:
+            buf = tir.decl_buffer(shape_list, dtype, name=name,
+                                  elem_offset=tir.const(0, "int32"))
+        except TypeError:
+            buf = tir.decl_buffer(shape_list, dtype, name=name)
     ctx.local_buffers.append(buf)
     return buf
 
@@ -871,7 +879,12 @@ def _emit_load_copy(op: Any, ctx: "WalkerCtx", resolved: Dict[str, Any],
         return load_expr
 
     src_buf = _ptrstate_buffer(ctx, resolved, out_dtype)
-    frag = T.alloc_fragment(out_shape, out_dtype)
+    # Use ``T.alloc_shared`` so the tile buffer lives in shared memory.
+    # Metal GEMM's ``is_gemm_ss()`` check requires both A and B operand
+    # tiles in shared scope; ``T.alloc_fragment`` creates ``local.fragment``
+    # buffers which trip the ``"Unsupported gemm combination"`` error.
+    alloc_fn = getattr(T, "alloc_shared", None) or T.alloc_fragment
+    frag = alloc_fn(out_shape, out_dtype)
 
     # Build a buffer-region slice from offsets+sizes. The C++ side accepts
     # either Buffer or BufferRegion; we produce a tir.BufferRegion here so

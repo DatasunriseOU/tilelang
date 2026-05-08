@@ -31,6 +31,10 @@ def _count_calls_in_stmt(stmt: tvm.tir.Stmt):
     return counts
 
 
+def _count_sync(calls, base_name: str) -> int:
+    return calls.get(f"tir.{base_name}", 0) + calls.get(f"tirx.{base_name}", 0)
+
+
 def test_lower_ptx_async_copy_rewrites_plain_parallel_copy():
     """LowerPTXAsyncCopy should rewrite plain global->shared stores to cp.async."""
 
@@ -44,7 +48,7 @@ def test_lower_ptx_async_copy_rewrites_plain_parallel_copy():
             S[i] = A[i]
         B[0] = S[0]
 
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
     func = before.with_attr("global_symbol", "main").with_attr("target", target)
     mod = tvm.IRModule.from_expr(func)
 
@@ -52,8 +56,8 @@ def test_lower_ptx_async_copy_rewrites_plain_parallel_copy():
     calls = _count_calls(mod["main"])
 
     assert calls.get("tl.ptx_cp_async", 0) > 0
-    assert calls.get("tir.ptx_commit_group", 0) > 0
-    assert calls.get("tir.ptx_wait_group", 0) > 0
+    assert _count_sync(calls, "ptx_commit_group") > 0
+    assert _count_sync(calls, "ptx_wait_group") > 0
 
 
 def test_lower_ptx_async_copy_respects_explicit_async_scope():
@@ -70,7 +74,7 @@ def test_lower_ptx_async_copy_respects_explicit_async_scope():
                 S[i] = A[i]
         B[0] = S[0]
 
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
     func = before.with_attr("global_symbol", "main").with_attr("target", target)
     mod = tvm.IRModule.from_expr(func)
 
@@ -78,8 +82,8 @@ def test_lower_ptx_async_copy_respects_explicit_async_scope():
     calls = _count_calls(mod["main"])
 
     assert calls.get("tl.ptx_cp_async", 0) > 0
-    assert calls.get("tir.ptx_commit_group", 0) == 0
-    assert calls.get("tir.ptx_wait_group", 0) == 0
+    assert _count_sync(calls, "ptx_commit_group") == 0
+    assert _count_sync(calls, "ptx_wait_group") == 0
 
 
 def test_lower_ptx_async_copy_supports_multi_dim_indices():
@@ -95,7 +99,7 @@ def test_lower_ptx_async_copy_supports_multi_dim_indices():
             S[i, j] = A[i, j]
         B[0, 0] = S[0, 0]
 
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
     func = before.with_attr("global_symbol", "main").with_attr("target", target)
     mod = tvm.IRModule.from_expr(func)
 
@@ -103,8 +107,8 @@ def test_lower_ptx_async_copy_supports_multi_dim_indices():
     calls = _count_calls(mod["main"])
 
     assert calls.get("tl.ptx_cp_async", 0) > 0
-    assert calls.get("tir.ptx_commit_group", 0) > 0
-    assert calls.get("tir.ptx_wait_group", 0) > 0
+    assert _count_sync(calls, "ptx_commit_group") > 0
+    assert _count_sync(calls, "ptx_wait_group") > 0
 
 
 def test_lower_ptx_async_copy_rewrites_vectorized_float16_loop():
@@ -121,7 +125,7 @@ def test_lower_ptx_async_copy_rewrites_vectorized_float16_loop():
                 S[i * 8 + v] = A[i * 8 + v]
         B[0] = S[0]
 
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
     func = before.with_attr("global_symbol", "main").with_attr("target", target)
     mod = tvm.IRModule.from_expr(func)
 
@@ -129,8 +133,8 @@ def test_lower_ptx_async_copy_rewrites_vectorized_float16_loop():
     calls = _count_calls(mod["main"])
 
     assert calls.get("tl.ptx_cp_async", 0) > 0
-    assert calls.get("tir.ptx_commit_group", 0) > 0
-    assert calls.get("tir.ptx_wait_group", 0) > 0
+    assert _count_sync(calls, "ptx_commit_group") > 0
+    assert _count_sync(calls, "ptx_wait_group") > 0
 
 
 def test_lower_ptx_async_copy_hoists_sync_out_of_predicated_block():
@@ -149,15 +153,15 @@ def test_lower_ptx_async_copy_hoists_sync_out_of_predicated_block():
                 S[vi] = A[vi]
         B[0] = S[0]
 
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
     func = before.with_attr("global_symbol", "main").with_attr("target", target)
     mod = tvm.IRModule.from_expr(func)
 
     mod = tl.transform.LowerPTXAsyncCopy()(mod)
     calls = _count_calls(mod["main"])
     assert calls.get("tl.ptx_cp_async", 0) > 0
-    assert calls.get("tir.ptx_commit_group", 0) > 0
-    assert calls.get("tir.ptx_wait_group", 0) > 0
+    assert _count_sync(calls, "ptx_commit_group") > 0
+    assert _count_sync(calls, "ptx_wait_group") > 0
 
     # Ensure we didn't introduce commit/wait *inside* the serial loop body.
     loop = None
@@ -170,8 +174,8 @@ def test_lower_ptx_async_copy_hoists_sync_out_of_predicated_block():
     post_order_visit(mod["main"].body, _find_for)
     assert loop is not None
     inner_calls = _count_calls_in_stmt(loop.body)
-    assert inner_calls.get("tir.ptx_commit_group", 0) == 0
-    assert inner_calls.get("tir.ptx_wait_group", 0) == 0
+    assert _count_sync(inner_calls, "ptx_commit_group") == 0
+    assert _count_sync(inner_calls, "ptx_wait_group") == 0
 
 
 def test_lower_ptx_async_copy_respects_enable_async_copy_config():
@@ -187,7 +191,7 @@ def test_lower_ptx_async_copy_respects_enable_async_copy_config():
             S[i] = A[i]
         B[0] = S[0]
 
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
     func = before.with_attr("global_symbol", "main").with_attr("target", target)
     mod = tvm.IRModule.from_expr(func)
 
@@ -196,8 +200,8 @@ def test_lower_ptx_async_copy_respects_enable_async_copy_config():
     calls = _count_calls(mod["main"])
 
     assert calls.get("tl.ptx_cp_async", 0) == 0
-    assert calls.get("tir.ptx_commit_group", 0) == 0
-    assert calls.get("tir.ptx_wait_group", 0) == 0
+    assert _count_sync(calls, "ptx_commit_group") == 0
+    assert _count_sync(calls, "ptx_wait_group") == 0
 
 
 def test_lower_ptx_async_copy_does_not_duplicate_existing_sync():
@@ -215,7 +219,7 @@ def test_lower_ptx_async_copy_does_not_duplicate_existing_sync():
         T.ptx_wait_group(0)
         B[0] = S[0]
 
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
     func = before.with_attr("global_symbol", "main").with_attr("target", target)
     mod = tvm.IRModule.from_expr(func)
 
@@ -223,8 +227,8 @@ def test_lower_ptx_async_copy_does_not_duplicate_existing_sync():
     calls = _count_calls(mod["main"])
 
     assert calls.get("tl.ptx_cp_async", 0) > 0
-    assert calls.get("tir.ptx_commit_group", 0) == 1
-    assert calls.get("tir.ptx_wait_group", 0) == 1
+    assert _count_sync(calls, "ptx_commit_group") == 1
+    assert _count_sync(calls, "ptx_wait_group") == 1
 
 
 def test_lower_ptx_async_copy_inserts_commit_before_existing_wait():
@@ -241,7 +245,7 @@ def test_lower_ptx_async_copy_inserts_commit_before_existing_wait():
         T.ptx_wait_group(0)
         B[0] = S[0]
 
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
     func = before.with_attr("global_symbol", "main").with_attr("target", target)
     mod = tvm.IRModule.from_expr(func)
 
@@ -249,8 +253,8 @@ def test_lower_ptx_async_copy_inserts_commit_before_existing_wait():
     calls = _count_calls(mod["main"])
 
     assert calls.get("tl.ptx_cp_async", 0) > 0
-    assert calls.get("tir.ptx_commit_group", 0) == 1
-    assert calls.get("tir.ptx_wait_group", 0) == 1
+    assert _count_sync(calls, "ptx_commit_group") == 1
+    assert _count_sync(calls, "ptx_wait_group") == 1
 
 
 def test_lower_ptx_async_copy_keeps_sync_out_of_inner_unrolled_loops_in_pipelined_loop():
@@ -267,15 +271,15 @@ def test_lower_ptx_async_copy_keeps_sync_out_of_inner_unrolled_loops_in_pipeline
                 S[ko * 4 + i] = A[ko * 4 + i]
             B[ko] = S[ko]
 
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
     func = before.with_attr("global_symbol", "main").with_attr("target", target)
     mod = tvm.IRModule.from_expr(func)
 
     mod = tl.transform.LowerPTXAsyncCopy()(mod)
     calls = _count_calls(mod["main"])
     assert calls.get("tl.ptx_cp_async", 0) > 0
-    assert calls.get("tir.ptx_commit_group", 0) > 0
-    assert calls.get("tir.ptx_wait_group", 0) > 0
+    assert _count_sync(calls, "ptx_commit_group") > 0
+    assert _count_sync(calls, "ptx_wait_group") > 0
 
     pipelined_loop = None
 
@@ -298,8 +302,8 @@ def test_lower_ptx_async_copy_keeps_sync_out_of_inner_unrolled_loops_in_pipeline
     post_order_visit(pipelined_loop.body, _find_unrolled)
     assert inner_unrolled is not None
     inner_calls = _count_calls_in_stmt(inner_unrolled.body)
-    assert inner_calls.get("tir.ptx_commit_group", 0) == 0
-    assert inner_calls.get("tir.ptx_wait_group", 0) == 0
+    assert _count_sync(inner_calls, "ptx_commit_group") == 0
+    assert _count_sync(inner_calls, "ptx_wait_group") == 0
 
 
 def test_lower_ptx_async_copy_from_vectorized_loop():
@@ -315,7 +319,7 @@ def test_lower_ptx_async_copy_from_vectorized_loop():
             S[i] = A[i]
         B[0] = S[0]
 
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
     func = before.with_attr("global_symbol", "main").with_attr("target", target)
     mod = tvm.IRModule.from_expr(func)
 
@@ -338,15 +342,15 @@ def test_lower_ptx_async_copy_skips_vectorized_broadcast_source():
                 S[i * 4 + v] = A[i * 4]
         B[0] = S[0]
 
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
     func = before.with_attr("global_symbol", "main").with_attr("target", target)
     mod = tvm.IRModule.from_expr(func)
 
     mod = tl.transform.LowerPTXAsyncCopy()(mod)
     calls = _count_calls(mod["main"])
     assert calls.get("tl.ptx_cp_async", 0) == 0
-    assert calls.get("tir.ptx_commit_group", 0) == 0
-    assert calls.get("tir.ptx_wait_group", 0) == 0
+    assert _count_sync(calls, "ptx_commit_group") == 0
+    assert _count_sync(calls, "ptx_wait_group") == 0
 
 
 def test_lower_ptx_async_copy_from_ramp():
@@ -361,7 +365,7 @@ def test_lower_ptx_async_copy_from_ramp():
         S[0:4] = A[0:4]
         B[0:4] = S[0:4]
 
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
     func = before.with_attr("global_symbol", "main").with_attr("target", target)
     mod = tvm.IRModule.from_expr(func)
 

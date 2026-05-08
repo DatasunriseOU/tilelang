@@ -41,6 +41,7 @@ def run_tmp_var_test(N=1024, block_N=128):
     tilelang.testing.torch_assert_close(b, b_ref, rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_issue_814():
     """Test that temporary variables are correctly handled and not over-inlined"""
     run_tmp_var_test(N=1024, block_N=128)

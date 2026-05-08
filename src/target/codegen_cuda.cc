@@ -526,9 +526,13 @@ private:
     if (f->GetAttr<Array<PrimExpr>>("cluster_dims").has_value()) {
       launch_with_cluster = true;
       auto cluster_dims = f->GetAttr<Array<PrimExpr>>("cluster_dims").value();
-      cluster_grid_x_ext = cluster_dims[0].as<IntImmNode>()->value;
-      cluster_grid_y_ext = cluster_dims[1].as<IntImmNode>()->value;
-      cluster_grid_z_ext = cluster_dims[2].as<IntImmNode>()->value;
+      const auto *cx = cluster_dims[0].as<IntImmNode>();
+      const auto *cy = cluster_dims[1].as<IntImmNode>();
+      const auto *cz = cluster_dims[2].as<IntImmNode>();
+      ICHECK(cx && cy && cz) << "cluster_dims must be constant integers";
+      cluster_grid_x_ext = cx->value;
+      cluster_grid_y_ext = cy->value;
+      cluster_grid_z_ext = cz->value;
       ICHECK(cluster_grid_x_ext > 0 && cluster_grid_y_ext > 0 &&
              cluster_grid_z_ext > 0);
     }
@@ -1385,7 +1389,9 @@ void CodeGenTileLangCUDA::PrintVecElemStore(const std::string &vec, DataType t,
 
 void CodeGenTileLangCUDA::PrintStorageSync(const CallNode *op) {
   auto args = op->args;
-  const std::string &sync = args[0].as<StringImmNode>()->value;
+  const auto *sync_imm = args[0].as<StringImmNode>();
+  ICHECK(sync_imm) << "PrintStorageSync expects StringImm argument";
+  const std::string &sync = sync_imm->value;
   if (sync == "warp") {
     // DO nothing.
   } else if (sync == "shared" || sync == "shared.dyn") {
@@ -1393,11 +1399,16 @@ void CodeGenTileLangCUDA::PrintStorageSync(const CallNode *op) {
     if (args.size() == 1) {
       this->stream << "__syncthreads();\n";
     } else if (args.size() == 2) {
-      auto barrier_id = args[1].as<IntImmNode>()->value;
+      const auto *bid = args[1].as<IntImmNode>();
+      ICHECK(bid) << "barrier_id must be IntImm";
+      auto barrier_id = bid->value;
       this->stream << "tl::__sync_thread_partial<" << barrier_id << ">();\n";
     } else if (args.size() == 3) {
-      auto barrier_id = args[1].as<IntImmNode>()->value;
-      auto thread_count = args[2].as<IntImmNode>()->value;
+      const auto *bid2 = args[1].as<IntImmNode>();
+      const auto *tc = args[2].as<IntImmNode>();
+      ICHECK(bid2 && tc) << "barrier_id and thread_count must be IntImm";
+      auto barrier_id = bid2->value;
+      auto thread_count = tc->value;
       this->stream << "tl::__sync_thread_partial<" << barrier_id << ", "
                    << thread_count << ">();\n";
     } else {
@@ -2208,7 +2219,7 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     ICHECK_GE(op->args.size(), 2);
     auto eviction_policy =
         this->eviction_policy_names_
-            [op->args[op->args.size() - 1].as<IntImmNode>()->value];
+            [Downcast<IntImm>(op->args[op->args.size() - 1])->value];
     // Simplify the code by using the default eviction policy
     if (op->annotations.find("use_2cta") != op->annotations.end() &&
         Downcast<Bool>(op->annotations["use_2cta"])->value) {
@@ -2238,7 +2249,7 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::stringstream ss;
     auto eviction_policy =
         this->eviction_policy_names_
-            [op->args[op->args.size() - 1].as<IntImmNode>()->value];
+            [Downcast<IntImm>(op->args[op->args.size() - 1])->value];
     if (eviction_policy != "EVICT_NORMAL") {
       ss << "tl::tma_load_im2col<tl::CacheHintSm90::" << eviction_policy << ">";
     } else {
@@ -2247,14 +2258,14 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     print_extern_call_stmt(ss.str(), 0, 1);
   } else if (op->op.same_as(tl::tma_store())) {
     std::stringstream ss;
-    auto need_reduce = op->args[op->args.size() - 2].as<IntImmNode>()->value;
+    auto need_reduce = Downcast<IntImm>(op->args[op->args.size() - 2])->value;
     if (need_reduce) {
       print_extern_call_stmt("tl::tma_store_add", 0, 2);
       return;
     }
     auto eviction_policy =
         this->eviction_policy_names_
-            [op->args[op->args.size() - 1].as<IntImmNode>()->value];
+            [Downcast<IntImm>(op->args[op->args.size() - 1])->value];
     if (eviction_policy != "EVICT_NORMAL") {
       ss << "tl::tma_store<tl::CacheHintSm90::" << eviction_policy << ">";
     } else {
@@ -3825,10 +3836,11 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->need_curand_kernel_h_ = true;
     this->curand_random_generator_state =
         name_supply_->FreshName("__random_generator_state");
-    this->curand_random_generator_state_type =
-        op->args[3].as<StringImmNode>()->value;
+    const auto *rng_type_imm = op->args[3].as<StringImmNode>();
+    ICHECK(rng_type_imm) << "rng_init expects StringImm for generator type";
+    this->curand_random_generator_state_type = rng_type_imm->value;
     this->PrintIndent();
-    this->stream << op->args[3].as<StringImmNode>()->value << " "
+    this->stream << rng_type_imm->value << " "
                  << this->curand_random_generator_state << ";\n";
     this->PrintIndent();
     this->stream << "curand_init(" << PrintExpr(op->args[0]) << ", "
@@ -3840,7 +3852,9 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << "curand(&" << this->curand_random_generator_state << ")";
   } else if (op->op.same_as(tl::rng_rand_float())) {
     this->need_curand_kernel_h_ = true;
-    os << "curand_" << op->args[0].as<StringImmNode>()->value;
+    const auto *dist_imm = op->args[0].as<StringImmNode>();
+    ICHECK(dist_imm) << "rng_rand_float expects StringImm distribution name";
+    os << "curand_" << dist_imm->value;
     if (op->dtype.bits() == 64) {
       os << "_double";
     }
@@ -4609,7 +4623,9 @@ void CodeGenTileLangCUDA::VisitExpr_(const BroadcastNode *op,
       }
       if (call->op.same_as(tl::rng_rand_float())) {
         int bits = call->dtype.bits();
-        std::string dist = call->args[0].as<StringImmNode>()->value;
+        const auto *dist_imm4 = call->args[0].as<StringImmNode>();
+        ICHECK(dist_imm4) << "rng_rand_float expects StringImm";
+        std::string dist = dist_imm4->value;
         if (bits == 32) {
           if (lanes == 4) {
             os << "curand_" << dist << "4(&"
@@ -4635,7 +4651,9 @@ void CodeGenTileLangCUDA::VisitExpr_(const BroadcastNode *op,
                    "curandStateXORWOW_t") {
       if (call->op.same_as(tl::rng_rand_float())) {
         int bits = call->dtype.bits();
-        std::string dist = call->args[0].as<StringImmNode>()->value;
+        const auto *dist_imm5 = call->args[0].as<StringImmNode>();
+        ICHECK(dist_imm5) << "rng_rand_float expects StringImm";
+        std::string dist = dist_imm5->value;
         if (bits == 32) {
           if (lanes == 2 && dist == "normal") {
             os << "curand_normal2(&" << this->curand_random_generator_state

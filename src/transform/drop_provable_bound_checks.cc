@@ -39,6 +39,7 @@
 
 #include "../op/builtin.h"
 #include "arith/ir_mutator_with_analyzer.h"
+#include "vendored/z3_constraint_scope.h"
 #include "vendored/z3_prover.h"
 
 namespace tvm {
@@ -123,6 +124,38 @@ class IsBufferBoundCheck : public ExprVisitor {
   }
 };
 
+class HasOverflowSensitiveArithmetic : public ExprVisitor {
+ public:
+  bool found = false;
+
+  static bool Check(const PrimExpr &expr) {
+    HasOverflowSensitiveArithmetic v;
+    v(expr);
+    return v.found;
+  }
+
+  void VisitExpr_(const FloorDivNode *op) final {
+    found = true;
+    ExprVisitor::VisitExpr_(op);
+  }
+  void VisitExpr_(const FloorModNode *op) final {
+    found = true;
+    ExprVisitor::VisitExpr_(op);
+  }
+  void VisitExpr_(const DivNode *op) final {
+    found = true;
+    ExprVisitor::VisitExpr_(op);
+  }
+  void VisitExpr_(const ModNode *op) final {
+    found = true;
+    ExprVisitor::VisitExpr_(op);
+  }
+  void VisitExpr_(const MulNode *op) final {
+    found = true;
+    ExprVisitor::VisitExpr_(op);
+  }
+};
+
 }  // namespace
 
 class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
@@ -141,6 +174,17 @@ class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
   explicit DropProvableBoundChecks(arith::Analyzer *analyzer)
       : IRMutatorWithAnalyzer(analyzer) {}
 
+  Stmt VisitStmt_(const ForNode *op) final {
+    bool old = inside_overflow_sensitive_loop_;
+    inside_overflow_sensitive_loop_ =
+        inside_overflow_sensitive_loop_ ||
+        HasOverflowSensitiveArithmetic::Check(op->min) ||
+        HasOverflowSensitiveArithmetic::Check(op->extent);
+    Stmt stmt = IRMutatorWithAnalyzer::VisitStmt_(op);
+    inside_overflow_sensitive_loop_ = old;
+    return stmt;
+  }
+
   Stmt VisitStmt_(const IfThenElseNode *op) final {
     // Only attempt rewrites when the IfThenElse has no user-written else
     // branch. (If the user wrote one, we'd be silently changing its
@@ -154,10 +198,20 @@ class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
       return IRMutatorWithAnalyzer::VisitStmt_(op);
     }
 
-    // 1) Default analyzer first (with kSymbolicBound).
-    if (analyzer_->CanProve(cond, arith::ProofStrength::kSymbolicBound)) {
+    bool overflow_sensitive =
+        inside_overflow_sensitive_loop_ ||
+        HasOverflowSensitiveArithmetic::Check(cond);
+
+    // 1) Default analyzer first (with kSymbolicBound), except for
+    // expressions whose truth depends on machine-width overflow semantics.
+    if (!overflow_sensitive &&
+        analyzer_->CanProve(cond, arith::ProofStrength::kSymbolicBound)) {
       ++dropped_count_;
       return this->VisitStmt(op->then_case);
+    }
+
+    if (overflow_sensitive) {
+      return IRMutatorWithAnalyzer::VisitStmt_(op);
     }
 
     // 2) Z3 fallback under BV32-emulated free-var constraints.
@@ -171,52 +225,39 @@ class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
       auto &z3 = arith::Z3Prover(analyzer_);
       z3.SetTimeoutMs(50);
 
-      // Push 0 <= v < 2^31 for every free Var in `cond`. This is the BV32
-      // "bit-bound emulation" the roadmap calls for; it stops Z3 from
-      // proving identities that only hold under unbounded ints (e.g.
-      // overflow situations near INT_MAX).
+      // Push dtype-aware BV bounds for every free Var in `cond`. This
+      // stops Z3 from proving identities that only hold under unbounded
+      // ints (e.g. overflow situations near INT_MAX). Uses RAII
+      // ConstraintScope so solver state is always rebalanced, even if
+      // EnterConstraint or CanProve throws.
       VarCollector vc;
       vc(cond);
-      const int64_t kBitBound = (int64_t(1) << 31);
-      std::vector<std::function<void()>> recover_stack;
-      recover_stack.reserve(vc.vars.size() * 2);
+      std::vector<::tilelang::tlz3::ConstraintScope> scopes;
+      bool bail = false;
       for (const VarNode *vn : vc.vars) {
         Var v = tvm::ffi::GetRef<Var>(vn);
-        // Only int-typed vars get the BV32 box.
         if (!v.dtype().is_int()) {
           continue;
         }
-        // fix-round-6 C2: IntImm(int32, 1<<31) overflows int32. Build the
-        // upper-bound constant in Int64 to avoid the silent wrap. Z3's
-        // sort-coercion will then promote `v` (int32) on the LT to a
-        // common int sort.
-        // fix-round-6 C3: pair EnterConstraint calls so the lower-bound
-        // recoverer is invoked on stack-unwind if the upper-bound call
-        // throws. Without the explicit try/catch the first recoverer
-        // (a `std::function`) would be destroyed without firing, leaking
-        // a solver scope frame. Push to recover_stack only after BOTH
-        // succeed (LIFO so upper-bound pops first).
-        auto r_lo = z3.EnterConstraint(v >= IntImm(tvm::DataType::Int(64), 0));
-        try {
-          auto r_hi =
-              z3.EnterConstraint(v < IntImm(tvm::DataType::Int(64), kBitBound));
-          recover_stack.push_back(std::move(r_hi));
-          recover_stack.push_back(std::move(r_lo));
-        } catch (...) {
-          // Roll back the lower-bound push and rethrow into the outer
-          // catch (which will mark `proved=false` and keep the guard).
-          if (r_lo) r_lo();
-          throw;
+        auto bounds = ::tilelang::tlz3::BVBoundsForDtype(v.dtype());
+        if (!bounds.has_value()) {
+          bail = true;
+          break;
+        }
+        auto [lo64, hi64] = *bounds;
+        PrimExpr lo = make_const(v.dtype(), lo64);
+        PrimExpr hi = make_const(v.dtype(), hi64);
+        scopes.emplace_back(z3, (v >= lo) && (v < hi));
+        if (scopes.size() > 8) {
+          bail = true;  // don't blow up the solver
+          break;
         }
       }
 
-      proved = z3.CanProve(cond);
-
-      // Pop in reverse to restore solver state.
-      for (auto it = recover_stack.rbegin(); it != recover_stack.rend();
-           ++it) {
-        (*it)();
+      if (!bail) {
+        proved = z3.CanProve(cond);
       }
+      // scopes destruct in reverse order here — solver state rebalanced.
     } catch (...) {
       proved = false;  // conservative: keep guard
     }
@@ -230,6 +271,7 @@ class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
   }
 
   int dropped_count_ = 0;
+  bool inside_overflow_sensitive_loop_ = false;
 };
 
 PrimFunc DropProvableBoundChecksFn(PrimFunc func) {

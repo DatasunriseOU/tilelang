@@ -35,8 +35,9 @@ BufferRegion NormalizeToBufferRegion(const PrimExpr &arg) {
     Array<Range> ranges;
     for (const PrimExpr &index : load->indices) {
       if (const auto *ramp = index.as<RampNode>()) {
-        ICHECK(ramp->stride.as<IntImmNode>()) << "Ramp stride must be IntImm";
-        ICHECK_EQ(ramp->stride.as<IntImmNode>()->value, 1)
+        const auto *stride_imm = ramp->stride.as<IntImmNode>();
+        ICHECK(stride_imm) << "Ramp stride must be IntImm";
+        ICHECK_EQ(stride_imm->value, 1)
             << "Only stride-1 Ramp is supported in region conversion";
         ICHECK(ramp->lanes.as<IntImmNode>())
             << "Scalable vector lanes not supported in region conversion";

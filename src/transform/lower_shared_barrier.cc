@@ -36,22 +36,45 @@ private:
   SharedBarrierRewriter(bool disable_shuffle_elect)
       : disable_shuffle_elect_(disable_shuffle_elect) {}
 
+  void CollectBodyBarrierBuffers(const Stmt &stmt, Array<Buffer> *buffers) {
+    if (const auto *alloc = stmt.as<AllocBufferNode>()) {
+      const auto *ptr_type =
+          alloc->buffer->data->type_annotation.as<PointerTypeNode>();
+      if (ptr_type) {
+        auto storage_scope = ptr_type->storage_scope;
+        if (storage_scope == "shared.barrier" ||
+            storage_scope == "shared.cluster_barrier") {
+          buffers->push_back(alloc->buffer);
+          if (storage_scope == "shared.cluster_barrier") {
+            has_cluster_barrier_ = true;
+          }
+        }
+      }
+      return;
+    }
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      for (const Stmt &child : seq->seq) {
+        CollectBodyBarrierBuffers(child, buffers);
+      }
+    }
+  }
+
   Stmt VisitStmt_(const SBlockNode *op) final {
     SBlock block = tvm::ffi::GetRef<SBlock>(op);
     Array<Buffer> alloc_buffers = op->alloc_buffers;
 
     // Record the mapping from buffer data var to buffer for later lookup
-    for (auto buffer : alloc_buffers) {
+    for (const auto& buffer : alloc_buffers) {
       buffer_map_.insert({buffer->data, buffer});
     }
-    for (auto match_buffer : op->match_buffers) {
+    for (const auto& match_buffer : op->match_buffers) {
       buffer_map_.insert({match_buffer->buffer->data, match_buffer->buffer});
     }
 
     // Only check buffers allocated in THIS block, not accumulated from parent
     // blocks
     Array<Buffer> barrier_buffers;
-    for (auto buffer : alloc_buffers) {
+    for (const auto& buffer : alloc_buffers) {
       const auto *ptr_type =
           buffer->data->type_annotation.as<PointerTypeNode>();
       if (!ptr_type)
@@ -65,6 +88,7 @@ private:
         }
       }
     }
+    CollectBodyBarrierBuffers(op->body, &barrier_buffers);
 
     if (barrier_buffers.empty()) {
       return StmtExprMutator::VisitStmt_(op);
@@ -72,7 +96,7 @@ private:
 
     ICHECK(thread_var_.defined()) << "thread_var_ is not defined";
 
-    for (auto buffer : barrier_buffers) {
+    for (const auto& buffer : barrier_buffers) {
       buffer_data_to_buffer_.Set(buffer->data, buffer);
     }
 
@@ -104,14 +128,18 @@ private:
     // Create init calls for each barrier buffer
     // Initialize each barrier element with its respective arrive count
     Array<Stmt> init_mbarrier_calls_;
-    for (auto buffer : barrier_buffers) {
+    for (const auto& buffer : barrier_buffers) {
       auto data = buffer->data;
       ICHECK(barrier_init_map.count(data))
           << "Barrier buffer " << buffer->name
           << " not found in barrier_init annotation";
       auto arrive_counts = barrier_init_map.at(data);
+      const auto *shape_imm = buffer->shape[0].as<IntImmNode>();
+      ICHECK(shape_imm)
+          << "Barrier buffer shape[0] must be a constant integer for buffer "
+          << buffer->name;
       ICHECK(arrive_counts.size() ==
-             static_cast<size_t>(buffer->shape[0].as<IntImmNode>()->value))
+             static_cast<size_t>(shape_imm->value))
           << "The number of arrive counts (" << arrive_counts.size()
           << ") must match the barrier buffer size (" << buffer->shape[0]
           << ") for buffer " << buffer->name;

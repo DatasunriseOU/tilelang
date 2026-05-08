@@ -5,7 +5,9 @@
 
 #include "reduce.h"
 
+#include <cstdint>
 #include <cmath>
+#include <limits>
 
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
@@ -28,6 +30,83 @@ namespace tvm {
 namespace tl {
 
 using namespace tirx;
+
+namespace {
+
+struct ReductionPlan {
+  int reducing_threads{0};
+  int scale{0};
+  PrimExpr thread_offset;
+  bool same_simdgroup_metal_fast_path_safe{false};
+};
+
+bool IsPositivePowerOfTwo(int64_t value) {
+  return value > 0 && (value & (value - 1)) == 0;
+}
+
+int64_t ConstIntAfterSimplify(const PrimExpr &expr, arith::Analyzer *analyzer,
+                              const char *name) {
+  PrimExpr simplified = analyzer != nullptr ? analyzer->Simplify(expr) : expr;
+  const int64_t *value = as_const_int(simplified);
+  ICHECK(value != nullptr)
+      << "ReduceOp: " << name
+      << " must be a compile-time constant after arith::Analyzer simplification; got "
+      << simplified;
+  return *value;
+}
+
+ReductionPlan MakeReductionPlan(const PrimExpr &extent_expr,
+                                 const PrimExpr &scale_expr,
+                                 const PrimExpr &thread_offset_expr,
+                                 const Target &target,
+                                 arith::Analyzer *analyzer,
+                                 const char *context,
+                                 int reduce_type) {
+  int64_t extent = ConstIntAfterSimplify(extent_expr, analyzer, "extent");
+  int64_t scale = ConstIntAfterSimplify(scale_expr, analyzer, "scale");
+  ICHECK_GT(extent, 0) << "ReduceOp" << context
+                      << ": extent must be positive; got " << extent;
+  ICHECK_GT(scale, 0) << "ReduceOp" << context
+                     << ": scale must be positive; got " << scale;
+  ICHECK_LE(extent, std::numeric_limits<int>::max() / scale)
+      << "ReduceOp" << context << ": reducing_threads overflows int: extent="
+      << extent << ", scale=" << scale;
+
+  int64_t reducing_threads = extent * scale;
+
+  PrimExpr thread_offset =
+      analyzer != nullptr ? analyzer->Simplify(thread_offset_expr)
+                          : thread_offset_expr;
+  const int64_t *thread_offset_value = as_const_int(thread_offset);
+  ICHECK(thread_offset_value != nullptr)
+      << "ReduceOp" << context
+      << ": thread_offset must be a compile-time constant after "
+      << "arith::Analyzer simplification; got " << thread_offset;
+
+  if (extent != 1) {
+    ICHECK(IsPositivePowerOfTwo(reducing_threads))
+        << "ReduceOp" << context
+        << ": reducing_threads must be a power of two for the AllReduce "
+        << "XOR-butterfly to be correct; got " << reducing_threads
+        << " for type=" << reduce_type
+        << ". Adjust the fragment layout / thread split or insert an "
+        << "identity-pad before the reduce.";
+  }
+
+  // Same-simdgroup Metal lowering is only safe when the whole butterfly
+  // stays inside one Apple simdgroup and the reduce lanes map 1:1 from the
+  // reduction axis. This helper only records the proof; emission remains in
+  // the existing AllReduce path until a Metal-specific helper is wired in.
+  bool same_simdgroup_metal_fast_path_safe =
+      extent != 1 && TargetIsMetal(target) && reducing_threads <= 32 &&
+      scale == 1 && (*thread_offset_value % 32) == 0;
+
+  return ReductionPlan{static_cast<int>(reducing_threads),
+                       static_cast<int>(scale), thread_offset,
+                       same_simdgroup_metal_fast_path_safe};
+}
+
+}  // namespace
 
 // NormalizeToBufferRegion moved to src/op/utils.{h,cc}
 
@@ -99,7 +178,7 @@ PrimExpr ReduceOpNode::MakeInitValue() const {
     return make_zero(dst->dtype);
   } else if (type->isMax()) {
     if (is_int) {
-      return make_const(dst->dtype, -(1 << (bits - 1)));
+      return make_const(dst->dtype, -(int64_t(1) << (bits - 1)));
     } else if (is_uint) {
       return make_const(dst->dtype, 0);
     } else {
@@ -107,9 +186,9 @@ PrimExpr ReduceOpNode::MakeInitValue() const {
     }
   } else if (type->isMin()) {
     if (is_int) {
-      return make_const(dst->dtype, (1 << (bits - 1)) - 1);
+      return make_const(dst->dtype, (int64_t(1) << (bits - 1)) - 1);
     } else if (is_uint) {
-      return make_const(dst->dtype, (1 << bits) - 1);
+      return make_const(dst->dtype, (int64_t(1) << bits) - 1);
     } else {
       return make_const(dst->dtype, INFINITY);
     }
@@ -119,7 +198,7 @@ PrimExpr ReduceOpNode::MakeInitValue() const {
     if (is_int) {
       return make_const(dst->dtype, -1);
     } else if (is_uint) {
-      return make_const(dst->dtype, (1 << bits) - 1);
+      return make_const(dst->dtype, (int64_t(1) << bits) - 1);
     } else {
       // Should not arrive here
       return make_const(dst->dtype, -INFINITY);
@@ -521,51 +600,49 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
           continue;
         if (!mark.value().same_as(src_vars[this->dim]->var))
           continue;
-        auto scale = as_const_int(iter_split->scale);
-        auto extent = as_const_int(iter_split->extent);
-        ICHECK(scale != nullptr && extent != nullptr);
-        if (*extent == 1)
+        auto plan = MakeReductionPlan(iter_split->extent, iter_split->scale,
+                                      T.thread_bounds->min, T.target, analyzer,
+                                      "(batched)", this->type->type);
+        if (plan.reducing_threads == plan.scale)
           continue;
 
-        int reducing_threads = (*extent) * (*scale);
-        // Wave-11 #1: same power-of-two enforcement as the scalar path
-        // above. The batched AllReduce recursion has identical structural
-        // requirements (offset = threads/2 at every step).
-        ICHECK(reducing_threads > 0 &&
-               (reducing_threads & (reducing_threads - 1)) == 0)
-            << "ReduceOp(batched): reducing_threads must be a power of two "
-            << "for the AllReduce XOR-butterfly to be correct; got "
-            << reducing_threads << " for type=" << this->type->type
-            << ". Adjust the fragment layout / thread split or insert an "
-            << "identity-pad before the reduce.";
-        auto thread_offset = T.thread_bounds->min;
+        int reducing_threads = plan.reducing_threads;
+        int scale = plan.scale;
+        auto thread_offset = plan.thread_offset;
         std::stringstream ss;
+        int workspace_stride = reducing_threads;
 
         // Use run_batch (not run) to avoid overload-resolution ambiguity when
         // a pointer is passed as first argument.
         if (TargetHasSMVersionGE(T.target, 90)) {
           auto all_threads = T.thread_bounds->extent;
           ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
-             << reducing_threads << ", " << (*scale) << ", " << thread_offset
+             << reducing_threads << ", " << scale << ", " << thread_offset
              << ", tl::NamedBarrier<" << all_threads << ">, " << batch << ", "
              << reducing_threads << ">::run_batch";
         } else if (TargetIsRocm(T.target)) {
           ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
-             << reducing_threads << ", " << (*scale) << ", " << thread_offset
-             << ", " << batch << ", " << reducing_threads << ">::run_batch";
+             << reducing_threads << ", " << scale << ", " << thread_offset
+             << ", " << batch << ", " << workspace_stride << ">::run_batch";
+        } else if (TargetIsMetal(T.target)) {
+          ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
+             << reducing_threads << ", " << scale << ", " << thread_offset
+             << ", tl::SyncThreadsBarrier, " << batch << ", "
+             << workspace_stride << ">::run_batch";
         } else {
           ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
-             << reducing_threads << ", " << (*scale) << ", " << thread_offset
+             << reducing_threads << ", " << scale << ", " << thread_offset
              << ", tl::SyncThreadsBarrier, " << batch << ", "
-             << reducing_threads << ">::run_batch";
+             << workspace_stride << ">::run_batch";
         }
 
         // Workspace is only needed for cross-warp reduce (> 32 threads).
-        // Allocate once; all chunks share the same workspace buffer.
+        // Metal helpers take an explicit workspace argument and may use it as a
+        // conservative fallback even inside one SIMD group.
         PrimExpr workspace;
-        bool need_workspace = reducing_threads > 32;
+        bool need_workspace = TargetIsMetal(T.target) || reducing_threads > 32;
         if (need_workspace) {
-          int ws_size = reducing_threads * batch;
+          int ws_size = workspace_stride * batch;
           workspace = T.AddWorkspace(ws_size, clear_buffer->dtype);
         }
 
@@ -597,8 +674,12 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
                               {BufferLoad(clear_buffer, chunk_indices)});
 
           Array<PrimExpr> args = {StringImm(ss.str()), ptr};
-          if (need_workspace)
+          if (TargetIsMetal(T.target)) {
+            args.push_back(T.thread_var);
             args.push_back(workspace);
+          } else if (need_workspace) {
+            args.push_back(workspace);
+          }
           phases.push_back(
               Evaluate(Call(DataType::Handle(), builtin::call_extern(), args)));
         }
@@ -670,13 +751,12 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         if (!mark)
           continue;
         if (mark.value().same_as(src_vars[this->dim]->var)) {
-          auto scale = as_const_int(iter_split->scale);
-          auto extent = as_const_int(iter_split->extent);
-          ICHECK(scale != nullptr && extent != nullptr);
-          if (*extent == 1)
+          auto plan = MakeReductionPlan(iter_split->extent, iter_split->scale,
+                                        T.thread_bounds->min, T.target,
+                                        analyzer, "", this->type->type);
+          if (plan.reducing_threads == plan.scale)
             continue;
 
-          int reducing_threads = (*extent) * (*scale);
           // Wave-11 #1: lowering-time enforcement of the AllReduce contract.
           // The XOR-butterfly recursion in
           // src/tl_templates/{cuda,hip}/reduce.h halves `threads` at every
@@ -690,29 +770,35 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
           // wave-10 HIGH on "silent wrong product on non-warp-divisible N"
           // by refusing to lower to AllReduce when the structural
           // power-of-two invariant cannot hold.
-          ICHECK(reducing_threads > 0 &&
-                 (reducing_threads & (reducing_threads - 1)) == 0)
-              << "ReduceOp: reducing_threads must be a power of two for the "
-              << "AllReduce XOR-butterfly to be correct; got "
-              << reducing_threads << " for type=" << this->type->type
-              << ". Adjust the fragment layout / thread split or insert an "
-              << "identity-pad before the reduce.";
+          int reducing_threads = plan.reducing_threads;
+          int scale = plan.scale;
           std::stringstream ss;
 
-          auto thread_offset = T.thread_bounds->min;
+          auto thread_offset = plan.thread_offset;
+          int workspace_stride = reducing_threads;
           if (TargetHasSMVersionGE(T.target, 90)) {
             auto all_threads = T.thread_bounds->extent;
             ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
-               << reducing_threads << ", " << (*scale) << ", " << thread_offset
+               << reducing_threads << ", " << scale << ", " << thread_offset
                << ", tl::NamedBarrier<" << all_threads << ">>::run";
+          } else if (TargetIsMetal(T.target)) {
+            ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
+               << reducing_threads << ", " << scale << ", "
+               << thread_offset << ", tl::SyncThreadsBarrier, 1, "
+               << workspace_stride << ">::run";
           } else {
             ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
-               << reducing_threads << ", " << (*scale) << ", " << thread_offset
+               << reducing_threads << ", " << scale << ", " << thread_offset
                << ">::run";
           }
           Array<PrimExpr> thread_reduce_args = {
               StringImm(ss.str()), BufferLoad(clear_buffer, red_indices)};
-          if (reducing_threads > 32) {
+          if (TargetIsMetal(T.target)) {
+            PrimExpr workspace =
+                T.AddWorkspace(workspace_stride, clear_buffer->dtype);
+            thread_reduce_args.push_back(T.thread_var);
+            thread_reduce_args.push_back(workspace);
+          } else if (reducing_threads > 32) {
             int workspace_size =
                 static_cast<int>(*as_const_int(T.thread_bounds->extent));
             PrimExpr workspace =

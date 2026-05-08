@@ -101,7 +101,7 @@ class BlockScaledLayout:
     def scale_index(self, k: Any):
         """Return the contracted-K scale block index for element ``k``."""
 
-        return k // 32
+        return k // self.block_size
 
     def decode(self, byte: Any):
         return e8m0_to_float(byte)

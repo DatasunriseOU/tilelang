@@ -28,6 +28,7 @@
 #include "tirx/transform/ir_utils.h"
 #include "vendored/let_stmt.h"
 #include "vendored/tl_runtime_symbols.h"
+#include "vendored/z3_constraint_scope.h"
 #include "vendored/z3_prover_stub.h"
 #include <algorithm>
 #include <string>
@@ -1316,7 +1317,9 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
       ConstrVisitor::VisitExpr_(op);
     } else if (op->op.same_as(builtin::tvm_storage_sync())) {
       ICHECK(allow_append_);
-      const std::string &s = op->args[0].as<StringImmNode>()->value;
+      const auto *sync_imm = op->args[0].as<StringImmNode>();
+      ICHECK(sync_imm) << "tvm_storage_sync expects StringImm argument";
+      const std::string &s = sync_imm->value;
       if (s != "warp" && s != "cluster") {
         StorageScope scope = StorageScope::Create(s);
         AccessEntry e{.cset = {constr_stack_}};
@@ -1610,6 +1613,11 @@ private:
     PrimExpr rhs_min = analyzer.Simplify(rhs.touched[0].min());
     PrimExpr rhs_max = analyzer.Simplify(rhs.touched[0].max());
     for (unsigned idx = 0; idx != 3; ++idx) {
+      // Guard: skip axes that don't exist in either side's thread list.
+      // On Metal 2D launches, threads may have only 2 elements.
+      if (idx + lhs.threads.size() < 3 || idx + rhs.threads.size() < 3) {
+        continue;
+      }
       auto &info = thread_vars[idx];
       Var old_prev_var = lhs.threads[lhs.threads.size() + idx - 3]->var;
       Var old_curr_var = rhs.threads[rhs.threads.size() + idx - 3]->var;
@@ -1897,7 +1905,7 @@ private:
     // early return). Both reviewers (gpt-5-5-pro, grok) flagged that an
     // unhandled Z3 exception here would crash the entire ThreadSync pass;
     // `catch (...)` ensures we degrade to "barrier kept" no matter what.
-    auto recover = prover.EnterConstraint(range_constraint);
+    ::tilelang::tlz3::ConstraintScope scope(prover, range_constraint);
     try {
       proven = prover.CanProve(goal);
     } catch (const std::exception &e) {
@@ -1914,7 +1922,7 @@ private:
                    << goal << "`; keeping barrier (conservative).";
       proven = false;
     }
-    recover();
+    // scope destructs here — solver state rebalanced.
     return proven;
   }
 
@@ -2180,6 +2188,11 @@ private:
 
       const char *thread_names[] = {"tx", "ty", "tz"};
       for (unsigned idx = 0; idx != 3; ++idx) {
+        // Guard: skip axes that don't exist in either side's thread list.
+        // On Metal 2D launches, threads may have only 2 elements.
+        if (idx + prev.threads.size() < 3 || idx + curr.threads.size() < 3) {
+          continue;
+        }
         Var old_prev_var = prev.threads[prev.threads.size() + idx - 3]->var;
         Var old_curr_var = curr.threads[curr.threads.size() + idx - 3]->var;
 

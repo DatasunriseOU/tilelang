@@ -63,5 +63,5 @@ def test_map_tt_sync_threads_partial_rejects_short_operands():
     om = _om()
     ctx = om.WalkerCtx()
     op = {"operands": ["%mask"], "results": [], "attrs": {}}
-    with pytest.raises(ValueError, match="expected"):
+    with pytest.raises(om.EmitError, match="expected"):
         om.map_tt_sync_threads_partial(op, ctx)

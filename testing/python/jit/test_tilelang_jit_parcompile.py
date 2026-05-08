@@ -56,6 +56,7 @@ def matmul_kernel_jit(
     return main
 
 
+@tilelang.testing.requires_cuda_target
 def test_par_compile():
     configs = [
         (1024, 1024, 1024, 128, 128, 64),

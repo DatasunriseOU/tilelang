@@ -48,7 +48,7 @@ def run_general_matmul_emit_configs(M, N, K, topk: int = 20):
     assert len(hints) > 0, "Hints length is zero"
 
 
-@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_target
 @tilelang.testing.requires_cuda_compute_version_le(9, 0)
 def test_general_matmul_emit_configs():
     run_general_matmul_emit_configs(128, 128, 128)
@@ -94,7 +94,7 @@ def run_general_matmul_matmul_emit_configs(M, N, K, topk: int = 20):
     assert len(hints) > 0, "Hints length is zero"
 
 
-@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_target
 @tilelang.testing.requires_cuda_compute_version_le(9, 0)
 def test_general_matmul_matmul_emit_configs():
     run_general_matmul_matmul_emit_configs(128, 128, 128)

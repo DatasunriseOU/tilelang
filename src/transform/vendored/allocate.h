@@ -104,17 +104,10 @@ class Allocate : public Stmt {
                    Span span = Span());
 
   /*! \brief Returns the constant total allocation size if all extents are
-   *  IntImm, otherwise -1. Mirrors the legacy apache `Allocate::ConstantAllocationSize`. */
+   *  IntImm, otherwise -1. Delegates to the node method to avoid
+   *  code duplication (BUG-VIR-2 fix). */
   int64_t ConstantAllocationSize() const {
-    int64_t result = 1;
-    for (const PrimExpr &dim : (*this)->extents) {
-      if (const auto *imm = dim.as<tvm::tirx::IntImmNode>()) {
-        result *= imm->value;
-      } else {
-        return -1;
-      }
-    }
-    return result;
+    return (*this)->ConstantAllocationSize();
   }
 
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(Allocate, Stmt, AllocateNode);

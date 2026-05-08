@@ -157,6 +157,7 @@ def run_gemm_jit_kernel(
     tilelang.testing.torch_assert_close(C, ref_C, atol=1e-2, rtol=1e-2, max_mismatched_ratio=0.05)
 
 
+@tilelang.testing.requires_cuda_target
 def test_gemm_jit_kernel():
     run_gemm_jit_kernel(
         256,
@@ -208,6 +209,7 @@ def run_cython_kernel_do_bench(
 
 
 @pytest.mark.perf
+@tilelang.testing.requires_cuda_target
 def test_cython_kernel_do_bench():
     run_cython_kernel_do_bench(512, 1024, 768, False, False, T.float16, T.float16, T.float32, 128, 256, 32, 2)
 
@@ -252,6 +254,7 @@ def run_cython_kernel_multi_stream(
             matmul_kernel(tensor_a, tensor_b, tensor_c)
 
 
+@tilelang.testing.requires_cuda_target
 def test_cython_kernel_multi_stream():
     run_cython_kernel_multi_stream(512, 1024, 768, False, False, T.float16, T.float16, T.float32, 128, 256, 32, 2)
 
@@ -301,6 +304,7 @@ def run_cython_dynamic_shape(
     tilelang.testing.torch_assert_close(tensor_c, tensor_ref_c, atol=1e-2, rtol=1e-2, max_mismatched_ratio=0.05)
 
 
+@tilelang.testing.requires_cuda_target
 def test_cython_dynamic_shape():
     run_cython_dynamic_shape(T.dynamic("m"), 256, 192, False, False, T.float16, T.float16, T.float32, 128, 128, 32, 2)
     run_cython_dynamic_shape(T.dynamic("m"), T.dynamic("n"), T.dynamic("k"), False, False, T.float16, T.float16, T.float32, 128, 128, 32, 2)
@@ -351,6 +355,7 @@ def run_cython_dynamic_shape_with_out_idx(
     tilelang.testing.torch_assert_close(tensor_c, tensor_ref_c, atol=1e-2, rtol=1e-2, max_mismatched_ratio=0.05)
 
 
+@tilelang.testing.requires_cuda_target
 def test_cython_dynamic_shape_with_out_idx():
     run_cython_dynamic_shape_with_out_idx(T.dynamic("m"), 256, 192, False, False, T.float16, T.float16, T.float32, 128, 128, 32, 2)
 
@@ -422,6 +427,7 @@ def run_matmul_int_variable(M, N, K, block_M, block_N, block_K, trans_A, trans_B
     tilelang.testing.torch_assert_close(tensor_c, tensor_ref_c, rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_matmul_int_variable():
     run_matmul_int_variable(256, 256, 256, 128, 128, 32, False, False, T.float16, T.float16, T.float32, 0, 128)
 
@@ -493,6 +499,7 @@ def run_matmul_float_variable(M, N, K, block_M, block_N, block_K, trans_A, trans
     tilelang.testing.torch_assert_close(tensor_c, tensor_ref_c, rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_matmul_float_variable():
     run_matmul_float_variable(256, 256, 256, 128, 128, 32, False, False, T.float16, T.float16, T.float32, 0, 128)
 

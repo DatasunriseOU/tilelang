@@ -251,7 +251,7 @@ public:
 
       Array<PrimExpr> counts;
       counts.reserve(substituter.mbarrier_count_);
-      for (auto c : substituter.mbarrier_arrive_counts_)
+      for (const auto& c : substituter.mbarrier_arrive_counts_)
         counts.push_back(IntImm(DataType::Int(32), c));
 
       // Walk the body to find the inner "tilelang_root" BlockRealize
@@ -302,13 +302,13 @@ private:
 
   Stmt VisitStmt_(const SBlockNode *op) final {
     // Record the mapping from buffer data var to buffer for later lookup
-    for (auto buffer : op->alloc_buffers) {
+    for (const auto& buffer : op->alloc_buffers) {
       buffer_map_.insert({buffer->data, buffer});
     }
-    for (auto match_buffer : op->match_buffers) {
+    for (const auto& match_buffer : op->match_buffers) {
       buffer_map_.insert({match_buffer->buffer->data, match_buffer->buffer});
     }
-    for (auto buffer : op->alloc_buffers) {
+    for (const auto& buffer : op->alloc_buffers) {
       buffer_data_to_buffer_.Set(buffer->data, buffer);
     }
     Map<Var, Layout> vmap;
@@ -373,7 +373,10 @@ private:
         << buffer->shape << " should be at least 2";
 
     auto dim = buffer->shape.size();
-    auto buffer_row_size = buffer->shape[dim - 1].as<IntImmNode>()->value;
+    const auto *row_imm = buffer->shape[dim - 1].as<IntImmNode>();
+    ICHECK(row_imm) << "Buffer \"" << buffer->name
+                    << "\" last dimension must be a constant integer";
+    auto buffer_row_size = row_imm->value;
     return buffer_row_size;
   }
 
@@ -1191,7 +1194,8 @@ private:
       if (iv->thread_tag == "threadIdx.x") {
         thread_var_ = iv;
         ICHECK(iv->dom->extent.as<IntImmNode>());
-        thread_block_size_ = iv->dom->extent.as<IntImmNode>()->value;
+        const auto *ext_imm = iv->dom->extent.as<IntImmNode>();
+        thread_block_size_ = ext_imm->value;
       }
     }
     return arith::IRMutatorWithAnalyzer::VisitStmt_(op);

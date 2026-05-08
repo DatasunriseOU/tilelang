@@ -7,7 +7,7 @@ import torch
 from tvm.tir.stmt_functor import post_order_visit
 
 auto_target = tvm.target.Target(determine_target("auto"))
-sm80_target = tvm.target.Target("cuda -arch=sm_80")
+sm80_target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
 
 
 def _check(original, transformed):
@@ -210,7 +210,7 @@ def test_pipeline_planning_does_not_mark_fill_as_async_producer_for_predicated_c
 
 
 def test_pipeline_planning_keeps_plain_hopper_pipeline_copies_sync():
-    hopper_target = tvm.target.Target("cuda -arch=sm_90a")
+    hopper_target = tvm.target.Target({"kind": "cuda", "arch": "sm_90a"})
 
     @T.prim_func
     def before(

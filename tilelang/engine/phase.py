@@ -1,4 +1,5 @@
 from __future__ import annotations
+import collections
 import tvm
 from tvm import tir, IRModule
 from tvm.target import Target
@@ -10,22 +11,28 @@ from tilelang.contrib.nvcc import have_tma, have_pdl
 # CPPMEGA fix-round-2 (MED perf): per-compile sentinel so the Z3 prover
 # cache clear runs once per (LowerAndLegalize + OptimizeForTarget) pair
 # instead of twice. Keyed by id(IRModule) — short-lived, uniquely
-# identifies the in-flight compile. The set is bounded by consume-on-read
+# identifies the in-flight compile. The deque is bounded by consume-on-read
 # in OptimizeForTarget so a stale id (after GC) never spuriously skips.
-_Z3_CLEARED_COMPILE_IDS: set[int] = set()
+#
+# BUG-PIPE-1 fix: use a bounded deque (max 64 entries) instead of an
+# unbounded set. If LowerAndLegalize is called without a matching
+# OptimizeForTarget (abnormal termination, exception), old entries are
+# evicted FIFO instead of leaking forever.
+_Z3_CLEARED_COMPILE_IDS: collections.deque = collections.deque(maxlen=64)
 
 
 def _mark_z3_cleared_for_compile(mod: IRModule) -> None:
-    _Z3_CLEARED_COMPILE_IDS.add(id(mod))
+    _Z3_CLEARED_COMPILE_IDS.append(id(mod))
 
 
 def _consume_z3_cleared_for_compile(mod: IRModule) -> bool:
     """Return True if this mod was already cleared, and drop the marker."""
     key = id(mod)
-    if key in _Z3_CLEARED_COMPILE_IDS:
-        _Z3_CLEARED_COMPILE_IDS.discard(key)
+    try:
+        _Z3_CLEARED_COMPILE_IDS.remove(key)
         return True
-    return False
+    except ValueError:
+        return False
 
 
 def allow_warp_specialized(pass_ctx: PassContext | None = None, target: Target | None = None) -> bool:
@@ -420,6 +427,10 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # NOTE: LowerPTXAsyncCopy is applied earlier (before PipelinePlanning).
     if allow_warp_specialized(pass_ctx=pass_ctx, target=target):
         mod = tilelang.transform.AnnotateWarpGroupRegAlloc()(mod)
+    # Some late target-specific passes can introduce new internal buffers after
+    # the normal flattening point.  Re-flatten before wrapping the host API so
+    # local buffer elem_offset symbols do not become phantom API arguments.
+    mod = tilelang.transform.FlattenBuffer()(mod)
     mod = tilelang.transform.MakePackedAPI()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.LowerDeviceKernelLaunch()(mod)

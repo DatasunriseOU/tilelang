@@ -495,13 +495,11 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     ICHECK_EQ(scope_stack_.size(), 1u)
         << "Z3Prover::SetBitVectorMode called with " << scope_stack_.size()
         << " scope frames; recover all EnterConstraint scopes first.";
-    ICHECK(scope_stack_.front().empty())
-        << "Z3Prover::SetBitVectorMode called with non-empty root scope; "
-        << "the rebuild would discard " << scope_stack_.front().size()
-        << " bound vars / constraints.";
     bv_width_ = width;
     // Mode change: invalidate any pre-existing variable / sub-expression
     // encodings (declared at the old sort) by rebuilding the solver.
+    // Root binds are intentionally discarded; callers that need persistent
+    // assumptions must re-enter them after changing modes.
     RebuildSolver_();
   }
 
@@ -590,53 +588,78 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
       return -1;
     }
 
-    solver.set("model", true);
-    solver.push();
-
-    ::z3::expr z3_var = VisitInt(var);
-
-    int64_t count = 0;
-    std::vector<int64_t> found_values;
-
-    while (count < max_count) {
-      auto result = solver.check();
-      if (result != ::z3::sat) break;
-      ::z3::model m = solver.get_model();
-      ::z3::expr val_expr = m.eval(z3_var, true);
-      int64_t val;
-      if (val_expr.is_numeral()) {
-        val = val_expr.get_numeral_int64();
-      } else {
-        break;
+    auto cleanup_side_effects = [this]() {
+      for (const auto& expr : side_effect_exprs_) {
+        memo_.erase(expr);
       }
-      found_values.push_back(val);
-      count++;
-      solver.add(z3_var != MakeIntVal(val));
-    }
+      side_effect_exprs_.clear();
+    };
 
-    solver.pop();
-    solver.set("model", false);
+    bool pushed = false;
+    try {
+      solver.set("model", true);
+      solver.push();
+      pushed = true;
 
-    for (const auto& expr : side_effect_exprs_) {
-      memo_.erase(expr);
-    }
-    side_effect_exprs_.clear();
+      ::z3::expr z3_var = VisitInt(var);
 
-    if (min_consecutive > 0 && count > 0) {
-      std::sort(found_values.begin(), found_values.end());
-      int64_t consecutive_count = 1;
-      for (size_t i = 1; i < found_values.size(); i++) {
-        if (found_values[i] == found_values[i - 1] + 1) {
-          consecutive_count++;
+      int64_t count = 0;
+      std::vector<int64_t> found_values;
+
+      while (count < max_count) {
+        auto result = solver.check();
+        if (result != ::z3::sat) break;
+        ::z3::model m = solver.get_model();
+        ::z3::expr val_expr = m.eval(z3_var, true);
+        int64_t val;
+        if (val_expr.is_numeral()) {
+          val = val_expr.get_numeral_int64();
         } else {
-          if (consecutive_count < min_consecutive) return -2;
-          consecutive_count = 1;
+          break;
         }
+        found_values.push_back(val);
+        count++;
+        solver.add(z3_var != MakeIntVal(val));
       }
-      if (consecutive_count < min_consecutive) return -2;
+
+      solver.pop();
+      pushed = false;
+      solver.set("model", false);
+      cleanup_side_effects();
+
+      if (min_consecutive > 0 && count > 0) {
+        std::sort(found_values.begin(), found_values.end());
+        int64_t consecutive_count = 1;
+        for (size_t i = 1; i < found_values.size(); i++) {
+          if (found_values[i] == found_values[i - 1] + 1) {
+            consecutive_count++;
+          } else {
+            if (consecutive_count < min_consecutive) return -2;
+            consecutive_count = 1;
+          }
+        }
+        if (consecutive_count < min_consecutive) return -2;
+      }
+
+      return count;
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "Z3 CountSatisfyingValues exception: " << e.what();
+    } catch (...) {
+      LOG(WARNING) << "Z3 CountSatisfyingValues unknown exception";
     }
 
-    return count;
+    if (pushed) {
+      try {
+        solver.pop();
+      } catch (...) {
+      }
+    }
+    try {
+      solver.set("model", false);
+    } catch (...) {
+    }
+    cleanup_side_effects();
+    return -1;
   }
 
  private:
@@ -724,7 +747,7 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     return VisitExpr(op->body);
   }
   ::z3::expr VisitExpr_(const CastNode* op) override {
-    if (IsValidDType(op->value->dtype) && IsValidDType(op->dtype)) {
+    if (op->value->dtype == op->dtype && IsValidDType(op->value->dtype)) {
       return VisitInt(op->value);
     } else {
       return Create(op);
@@ -1115,21 +1138,48 @@ void Z3Prover::Reset() {
 // dereferences torn-down Z3 state and SIGSEGVs (cosmetic but pollutes test
 // output). By holding the map via a raw pointer that we never delete, the
 // TLS dtor runs no Z3 code at exit; the OS reclaims the heap pages.
-static std::unordered_map<::tvm::arith::Analyzer*, std::unique_ptr<Z3Prover>>&
+
+// BUG-Z3-1 fix: generation-tagged cache entry. Each cache entry stores a
+// monotonic generation counter that is bumped on every ClearProverCache().
+// GetOrCreate records the generation at creation time; if a subsequent
+// lookup finds a stale generation (meaning the Analyzer* was freed and
+// the address was reused), the entry is replaced with a fresh prover.
+// This prevents dangling-pointer cache hits without requiring a dtor hook
+// on Analyzer (which apache/tvm does not expose).
+struct CacheEntry {
+  std::unique_ptr<Z3Prover> prover;
+  std::vector<std::unique_ptr<Z3Prover>> retired;
+  uint64_t generation;
+};
+
+static uint64_t& GetCacheGeneration_() {
+  static thread_local uint64_t gen = 0;
+  return gen;
+}
+
+static std::unordered_map<::tvm::arith::Analyzer*, CacheEntry>&
 GetProverCache_() {
   static thread_local auto* cache =
-      new std::unordered_map<::tvm::arith::Analyzer*,
-                             std::unique_ptr<Z3Prover>>();
+      new std::unordered_map<::tvm::arith::Analyzer*, CacheEntry>();
   return *cache;
 }
 
 Z3Prover& GetOrCreate(::tvm::arith::Analyzer* analyzer) {
   auto& cache = GetProverCache_();
-  auto& slot = cache[analyzer];
-  if (!slot) {
-    slot = std::make_unique<Z3Prover>(analyzer);
+  uint64_t current_gen = GetCacheGeneration_();
+  auto it = cache.find(analyzer);
+  if (it != cache.end() && it->second.prover &&
+      it->second.generation == current_gen) {
+    return *it->second.prover;
   }
-  return *slot;
+  // Stale entry (generation mismatch) or missing entry — create fresh.
+  auto& entry = cache[analyzer];
+  if (entry.prover) {
+    entry.retired.emplace_back(std::move(entry.prover));
+  }
+  entry.prover = std::make_unique<Z3Prover>(analyzer);
+  entry.generation = current_gen;
+  return *entry.prover;
 }
 
 // CPPMEGA z3-stack fix-A8 (NEW-2): clear the entire per-thread prover
@@ -1137,9 +1187,38 @@ Z3Prover& GetOrCreate(::tvm::arith::Analyzer* analyzer) {
 // consecutive passes that happen to receive the same `Analyzer*`
 // (either by deliberate reuse or by heap-address coincidence after a
 // previous Analyzer was freed) cannot inherit memo / scope / bv-mode
-// state from the prior pass. Cheap (drops unique_ptrs) and safe to call
-// any number of times.
-void ClearProverCache() { GetProverCache_().clear(); }
+// state from the prior pass. Cheap and safe to call any number of times.
+//
+// BUG-Z3-1 fix: bump the generation counter instead of clearing the map.
+// This makes all existing entries stale; the next GetOrCreate for any
+// Analyzer* will create a fresh prover. This is safe even if recovery
+// lambdas from EnterConstraint still hold a reference to the old prover —
+// the lambda's `this` pointer remains valid because the CacheEntry's
+// unique_ptr is not destroyed until the entry is replaced or the cache
+// is torn down at thread exit.
+//
+// BUG-Z3-3 fix: we no longer call cache.clear() which would destroy
+// provers that may have outstanding EnterConstraint recovery lambdas.
+// Instead, stale entries are lazily replaced on the next GetOrCreate; the
+// previous prover is retained in CacheEntry::retired for the lifetime of the
+// thread-local cache so any late recovery lambda still targets live storage.
+void ClearProverCache() {
+  GetCacheGeneration_()++;
+  // Eagerly drop entries that have no outstanding scopes (safe to destroy).
+  // Keep entries with outstanding scopes alive so recovery lambdas don't
+  // dangle; they'll be replaced on next GetOrCreate.
+  auto& cache = GetProverCache_();
+  for (auto it = cache.begin(); it != cache.end(); ) {
+    if (it->second.prover) {
+      // Accessing impl_->scope_stack_ directly is not possible from here
+      // (it's private). Instead, just mark as stale via generation; the
+      // entry stays alive until the next GetOrCreate replaces it.
+      ++it;
+    } else {
+      it = cache.erase(it);
+    }
+  }
+}
 
 // CPPMEGA z3-stack fix-A8 (NEW-2): targeted reset for a specific
 // Analyzer's cached prover. Use when the caller knows the precise
@@ -1148,8 +1227,8 @@ void ClearProverCache() { GetProverCache_().clear(); }
 void ResetProverFor(::tvm::arith::Analyzer* analyzer) {
   auto& cache = GetProverCache_();
   auto it = cache.find(analyzer);
-  if (it != cache.end() && it->second) {
-    it->second->Reset();
+  if (it != cache.end() && it->second.prover) {
+    it->second.prover->Reset();
   }
 }
 
@@ -1273,16 +1352,23 @@ bool Z3PassGate::IsEnabled(const char* pass_name) {
   // Per-pass gate: cache by full env-var name. `pass_name` is a string
   // literal at every call site, so the std::string allocation here is
   // a one-time-per-name cost (then served from the cache).
-  static thread_local std::unordered_map<std::string, bool> cache;
+  //
+  // BUG-Z3-TLS fix: use heap-leak pattern matching the prover cache to
+  // avoid TLS-destruction-order SIGSEGVs. The std::unordered_map dtor
+  // would run at thread exit; if it runs after Z3's own TLS globals are
+  // gone, the interleaved allocator calls can crash. Leaking the small
+  // (~10 entry) map is harmless.
+  static thread_local auto* cache =
+      new std::unordered_map<std::string, bool>();
   std::string key("TILELANG_DISABLE_Z3_");
   key += pass_name;
-  auto it = cache.find(key);
-  if (it != cache.end()) {
+  auto it = cache->find(key);
+  if (it != cache->end()) {
     return !it->second;
   }
   const char* v = std::getenv(key.c_str());
   bool disabled = v != nullptr && v[0] != '\0' && v[0] != '0';
-  cache.emplace(std::move(key), disabled);
+  cache->emplace(std::move(key), disabled);
   return !disabled;
 }
 

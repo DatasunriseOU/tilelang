@@ -1224,6 +1224,21 @@ def _emit_region(
     # Bubble counter back so fresh names stay unique across siblings.
     ctx._tmp_counter = child._tmp_counter
 
+    # Propagate tile-scoped buffers allocated inside the region back to the
+    # parent context. ``_alloc_tile_buffer`` registers each buffer in
+    # ``ctx.local_buffers``; when ``ctx`` is the child, those buffers are
+    # lost when the child is discarded. ``_make_prim_func`` only wraps
+    # ``ctx.local_buffers`` entries with ``tir.AllocBuffer`` stmts -- any
+    # buffer that's missing from the top-level list surfaces as an
+    # "undefined free Var" error in ``MakePackedAPI``.
+    parent_locals = getattr(ctx, "local_buffers", None)
+    child_locals = getattr(child, "local_buffers", None)
+    if parent_locals is not None and child_locals:
+        parent_set = set(id(b) for b in parent_locals)
+        for buf in child_locals:
+            if id(buf) not in parent_set:
+                parent_locals.append(buf)
+
     tir = ctx.tir()
     if not child.stmts:
         body = tir.Evaluate(tir.const(0, "int32"))
@@ -1369,38 +1384,41 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
             # see the buffer. This is the matmul T.gemm path.
             iter_arg_pairs.append((blk_ssa, init_val))
 
-    body, yielded = _emit_region(
-        region,
-        ctx,
-        induction_var=loop_var,
-        induction_ssa=induction_ssa,
-        iter_arg_pairs=iter_arg_pairs,
-    )
+    def _emit_body(induction_value: Any) -> Tuple[Any, List[Any]]:
+        body, yielded = _emit_region(
+            region,
+            ctx,
+            induction_var=induction_value,
+            induction_ssa=induction_ssa,
+            iter_arg_pairs=iter_arg_pairs,
+        )
 
-    # Wrap the body so each *scalar* iter_arg is visible via LetStmt. The
-    # yielded values become the next-iteration values; full SSA-style
-    # rotation requires a more involved transform pass, so for now we mark
-    # the loop kind as "serial" and record yielded values in ctx for the
-    # parent walker to consume (via ctx.value_map). This matches scf.for's
-    # forwarding semantics for the common pattern where iter_args carry an
-    # accumulator buffer that the body has *already* mutated in place.
-    for var, init_val in init_pairs:
-        if not _is_scalar_primexpr(init_val):
-            # Defence in depth: ctx.get(init_ssa) may have returned a
-            # non-scalar even after our triage above (e.g. an emitter
-            # rebound the SSA between collection time and now). Surface a
-            # clear EmitError instead of a cryptic tirx.Bind type error.
-            raise EmitError(
-                f"map_scf_for: iter_arg init value for {var!r} is not a "
-                f"scalar PrimExpr (got type={type(init_val).__name__}); "
-                f"buffer-typed carries should be routed through the "
-                f"non-LetStmt branch above."
-            )
-        body = tir.LetStmt(var, init_val, body)
+        # Wrap the body so each *scalar* iter_arg is visible via LetStmt. The
+        # yielded values become the next-iteration values; full SSA-style
+        # rotation requires a more involved transform pass, so for now we mark
+        # the loop kind as "serial" and record yielded values in ctx for the
+        # parent walker to consume (via ctx.value_map). This matches scf.for's
+        # forwarding semantics for the common pattern where iter_args carry an
+        # accumulator buffer that the body has *already* mutated in place.
+        for var, init_val in init_pairs:
+            if not _is_scalar_primexpr(init_val):
+                # Defence in depth: ctx.get(init_ssa) may have returned a
+                # non-scalar even after our triage above (e.g. an emitter
+                # rebound the SSA between collection time and now). Surface a
+                # clear EmitError instead of a cryptic tirx.Bind type error.
+                raise EmitError(
+                    f"map_scf_for: iter_arg init value for {var!r} is not a "
+                    f"scalar PrimExpr (got type={type(init_val).__name__}); "
+                    f"buffer-typed carries should be routed through the "
+                    f"non-LetStmt branch above."
+                )
+            body = tir.LetStmt(var, init_val, body)
+        return body, yielded
 
     # Compute extent = ub - lb. step == 1 is the common case; for non-unit
     # step we either unroll or scale the induction var.
     UNROLL_LIMIT = 8
+    yielded: List[Any] = []
     if (lb_i is not None and ub_i is not None and step_i is not None
             and step_i not in (0, 1) and (ub_i - lb_i) // step_i <= UNROLL_LIMIT
             and (ub_i - lb_i) > 0):
@@ -1411,6 +1429,7 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
         stmts = []
         for idx, v in enumerate(range(lb_i, ub_i, step_i)):
             iter_var = tir.Var(ctx.fresh(f"iu{idx}"), "int32")
+            body, yielded = _emit_body(iter_var)
             stmts.append(tir.For(iter_var, tir.const(v, "int32"), tir.const(1, "int32"),
                                  tir.ForKind.SERIAL, body))
         for_stmt = tir.SeqStmt(stmts) if len(stmts) > 1 else stmts[0]
@@ -1426,17 +1445,8 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
                 tir.Add(tir.Sub(ub, lb), tir.Sub(step, tir.const(1, "int32"))),
                 step,
             )
-        # The body sees ``loop_var`` as the iteration index; uses of the
-        # induction SSA were already bound to ``loop_var`` by
-        # _emit_region. We keep the simpler form (loop_var counts
-        # iterations 0..N-1) and trust the body emitter to do its own
-        # scaling when it needs the un-strided value. A future cleanup
-        # may inject a Let binding ``i_real = lb + loop_var * step`` here
-        # once we can prove the body only uses the induction SSA for
-        # arithmetic (no address-of).
-        # TODO: scale induction var when body uses it as an offset. See
-        # feedback_no_silent_delete -- we keep this branch in place rather
-        # than dropping the non-unit-step support.
+        body_induction = lb + loop_var * step
+        body, yielded = _emit_body(body_induction)
         for_stmt = tir.For(loop_var, tir.const(0, "int32"), extent_expr,
                            tir.ForKind.SERIAL, body)
     else:
@@ -1449,6 +1459,7 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
             extent_expr = tir.Sub(ub, lb)
             # If lb is already a PrimExpr we forward it; otherwise wrap.
             min_expr = lb if hasattr(lb, "dtype") else tir.const(lb_i or 0, "int32")
+        body, yielded = _emit_body(loop_var)
         for_stmt = tir.For(loop_var, min_expr, extent_expr,
                            tir.ForKind.SERIAL, body)
 

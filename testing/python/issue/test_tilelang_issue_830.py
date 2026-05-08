@@ -4,6 +4,21 @@ import torch
 import tilelang
 import tilelang.testing
 import tilelang.language as T
+from tilelang import tvm
+from tilelang.engine.lower import LowerAndLegalize, OptimizeForTarget, PreLowerSemanticCheck, canon_target_host
+from tilelang.env import env
+from tilelang.utils.target import determine_target
+
+
+def _run_optimize_pipeline(func):
+    target = determine_target(env.get_default_target())
+    target_host = tvm.target.Target.canon_target(canon_target_host(target, None))
+    target = tvm.target.Target(target, target_host)
+    mod = tvm.IRModule({func.attrs["global_symbol"]: func})
+    PreLowerSemanticCheck(mod)
+    with tvm.transform.PassContext(opt_level=3), target:
+        mod = LowerAndLegalize(mod, target)
+        OptimizeForTarget(mod, target)
 
 
 @tilelang.jit
@@ -42,9 +57,7 @@ def _empty_with_dead_code_kernel():
 
 
 def test_empty_with_dead_code_kernel():
-    kernel = _empty_with_dead_code_kernel()
-    x = torch.randn((128,), dtype=torch.float32, device="cuda")
-    kernel(x)
+    _run_optimize_pipeline(_empty_with_dead_code_kernel.get_tir())
 
 
 @tilelang.jit

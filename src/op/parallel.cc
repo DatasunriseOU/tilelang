@@ -214,7 +214,8 @@ bool ParallelOpNode::IsBufferCompletelyReplicated(
   for (const auto &index : GetAccessInfo(buffer).indices) {
     if (!index.as<IntImmNode>()) {
       return false;
-    } else if (index.as<IntImmNode>()->value != 0) {
+    } else if (const auto *idx_imm = index.as<IntImmNode>();
+               idx_imm && idx_imm->value != 0) {
       LOG(FATAL) << "buffer " << buffer << " is not completed replicated";
     }
   }

@@ -3,6 +3,7 @@ import tilelang.testing
 import tilelang.language as T
 
 
+@tilelang.testing.requires_cuda_target
 def test_issue_1690():
     @tilelang.jit()
     def test(A):

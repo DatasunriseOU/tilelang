@@ -120,8 +120,12 @@ private:
   void VisitStmt_(const EvaluateNode *op) final {
     if (const CallNode *call = op->value.as<CallNode>()) {
       if (call->op.same_as(set_max_nreg())) {
-        auto reg_hint = call->args[0].as<IntImmNode>()->value;
-        auto is_inc = call->args[1].as<IntImmNode>()->value;
+        const auto *reg_imm = call->args[0].as<IntImmNode>();
+        const auto *inc_imm = call->args[1].as<IntImmNode>();
+        ICHECK(reg_imm) << "set_max_nreg expects IntImm for reg_hint";
+        ICHECK(inc_imm) << "set_max_nreg expects IntImm for is_inc";
+        auto reg_hint = reg_imm->value;
+        auto is_inc = inc_imm->value;
         ICHECK(reg_hint <= 240 && reg_hint >= 24)
             << "Invalid reg hint: " << reg_hint;
         ICHECK(is_inc == 0 || is_inc == 1) << "Invalid is_inc: " << is_inc;
@@ -226,8 +230,12 @@ private:
         // the consumer body may be absent. Handle gracefully by only
         // annotating the producer side when consumer is missing.
 
-        auto dec_reg = nreg_[0].as<IntImmNode>()->value;
-        auto inc_reg = nreg_[1].as<IntImmNode>()->value;
+        const auto *dec_imm = nreg_[0].as<IntImmNode>();
+        const auto *inc_imm = nreg_[1].as<IntImmNode>();
+        ICHECK(dec_imm) << "nreg_[0] must be IntImm";
+        ICHECK(inc_imm) << "nreg_[1] must be IntImm";
+        auto dec_reg = dec_imm->value;
+        auto inc_reg = inc_imm->value;
 
         auto inc_reg_stmt = Evaluate(0);
         auto dec_reg_stmt = Evaluate(0);

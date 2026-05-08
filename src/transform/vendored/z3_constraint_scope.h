@@ -66,6 +66,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <utility>
 
 #include "z3_prover.h"
@@ -135,34 +136,34 @@ class ConstraintScope {
 //
 // `BVBoundsForDtype` returns `(lo, hi)` such that the expression
 // `(var >= lo) && (var < hi)` is the tightest sound BV bound for the
-// given dtype.
+// given dtype, or `std::nullopt` when that half-open range cannot be
+// represented exactly as int64 PrimExpr constants.
 //
 //   * unsigned uintN, N < 63   →  [0, 1<<N)
-//   * unsigned uint63/uint64   →  [0, INT64_MAX]   (clamped to int64)
 //   * signed   intN, N <= 63   →  [-(1<<(N-1)), 1<<(N-1))
-//   * signed   int64           →  [INT64_MIN, INT64_MAX]
+//   * unsigned uint63/uint64   →  unsupported (upper bound overflows int64)
+//   * signed   int64           →  unsupported (exclusive upper overflows int64)
 //
 // Returned as `int64_t` because the entire constraint stack works in
-// int64 PrimExpr constants. Float/handle/bool dtypes return {0, 0} —
-// callers must check `dt.is_int() || dt.is_uint()` separately.
-inline std::pair<int64_t, int64_t> BVBoundsForDtype(
+// int64 PrimExpr constants.
+inline std::optional<std::pair<int64_t, int64_t>> BVBoundsForDtype(
     const ::tvm::runtime::DataType& dt) {
   if (!dt.is_int() && !dt.is_uint()) {
-    return {0, 0};
+    return std::nullopt;
   }
   int bits = dt.bits();
   if (dt.is_uint()) {
     if (bits >= 63) {
-      return {0, std::numeric_limits<int64_t>::max()};
+      return std::nullopt;
     }
-    return {0, int64_t(1) << bits};
+    return std::make_pair(int64_t(0), int64_t(1) << bits);
   }
   // signed
   if (bits >= 64) {
-    return {std::numeric_limits<int64_t>::min(),
-            std::numeric_limits<int64_t>::max()};
+    return std::nullopt;
   }
-  return {-(int64_t(1) << (bits - 1)), int64_t(1) << (bits - 1)};
+  return std::make_pair(-(int64_t(1) << (bits - 1)),
+                        int64_t(1) << (bits - 1));
 }
 
 }  // namespace tlz3

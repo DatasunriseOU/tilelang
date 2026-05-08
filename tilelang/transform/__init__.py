@@ -5,6 +5,7 @@ from . import _ffi_api
 from .simplify import Simplify, simplify_prim_func, LetInline  # noqa: F401
 from .pass_config import PassConfigKey  # noqa: F401
 from tilelang import tvm as tvm  # noqa: F401
+from tvm import tir  # noqa: F401
 from tvm.ir.transform import PassContext  # noqa: F401
 from .add_bufstore_wrapper import AddWrapperForSingleBufStore  # noqa: F401
 from .hoist_broadcast_values import HoistBroadcastValues  # noqa: F401
@@ -129,7 +130,12 @@ def LowerHopperIntrin():
     fpass : tvm.transform.Pass
         The result pass
     """
-    return _ffi_api.LowerHopperIntrin() if hasattr(_ffi_api, "LowerHopperIntrin") else lambda f: f  # type: ignore
+    if hasattr(_ffi_api, "LowerHopperIntrin"):
+        return _ffi_api.LowerHopperIntrin()  # type: ignore
+    # BUG-PIPE-2 fix: return a proper no-op pass instead of a bare lambda.
+    # A bare `lambda f: f` lacks pass metadata and breaks in pipelines that
+    # call `.run()` or inspect pass properties.
+    return tir.transform.Apply(lambda f: f)  # type: ignore
 
 
 def LowerTMAToPtrArith():
@@ -151,7 +157,8 @@ def LowerTMAToPtrArith():
     """
     if hasattr(_ffi_api, "LowerTMAToPtrArith"):
         return _ffi_api.LowerTMAToPtrArith()  # type: ignore
-    return lambda f: f
+    # BUG-PIPE-2 fix: proper no-op pass (see LowerHopperIntrin above).
+    return tir.transform.Apply(lambda f: f)  # type: ignore
 
 
 def ThreadSync(storage_scope: str):

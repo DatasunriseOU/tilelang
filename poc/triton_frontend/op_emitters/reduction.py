@@ -911,13 +911,8 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
                     ctx.emit(tir_mod.Evaluate(copy_handle))
                 else:
                     ctx.emit(copy_handle)
-            except Exception:
-                # Fall back to hand-built loop nest. Some buffer/region
-                # mismatches make T.copy raise; skipping the seed is safe
-                # for the common case where ``c_orig`` is a zero tile
-                # produced by an ``arith.constant`` and the gemm path
-                # zero-initialises the fragment internally.
-                pass
+            except Exception as e:
+                raise EmitError(f"T.copy(c_orig, c) failed: {e}") from e
 
         handle = gemm(a, b, c, transpose_A=transpose_A, transpose_B=transpose_B)
         # ``tilelang.language.gemm`` returns a ``tir.Call`` (a PrimExpr).

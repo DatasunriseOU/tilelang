@@ -24,6 +24,7 @@ def qwq():
     return main
 
 
+@tilelang.testing.requires_cuda_target
 def test_issue_1604():
     kernel = qwq()
     print(kernel.get_kernel_source())

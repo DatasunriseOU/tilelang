@@ -1,5 +1,10 @@
+import tilelang
 import tilelang.testing
 import tilelang.language as T
+from tilelang import tvm
+from tilelang.engine.lower import LowerAndLegalize, OptimizeForTarget, PreLowerSemanticCheck, canon_target_host
+from tilelang.env import env
+from tilelang.utils.target import determine_target
 
 
 def _test_kernel(M, N):
@@ -47,14 +52,25 @@ def _test_kernel_if_cond(M, N):
     return fwd_main
 
 
+def _run_optimize_pipeline(func, pass_configs=None):
+    target = determine_target(env.get_default_target())
+    target_host = tvm.target.Target.canon_target(canon_target_host(target, None))
+    target = tvm.target.Target(target, target_host)
+    mod = tvm.IRModule({func.attrs["global_symbol"]: func})
+    PreLowerSemanticCheck(mod)
+    with tvm.transform.PassContext(opt_level=3, config=pass_configs or {}), target:
+        mod = LowerAndLegalize(mod, target)
+        OptimizeForTarget(mod, target)
+
+
 def test_issue_1263_pipeline_no_consumer():
-    tilelang.compile(_test_kernel(1024, 1024))
-    tilelang.compile(
+    _run_optimize_pipeline(_test_kernel(1024, 1024))
+    _run_optimize_pipeline(
         _test_kernel(1024, 1024),
         pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True},
     )
-    tilelang.compile(_test_kernel_if_cond(1024, 1024))
-    tilelang.compile(
+    _run_optimize_pipeline(_test_kernel_if_cond(1024, 1024))
+    _run_optimize_pipeline(
         _test_kernel_if_cond(1024, 1024),
         pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True},
     )

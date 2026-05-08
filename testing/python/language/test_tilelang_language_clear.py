@@ -1,4 +1,5 @@
 import tilelang
+import tilelang.testing
 import tilelang.language as T
 
 
@@ -50,6 +51,7 @@ def run_matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=
     assert torch.allclose(c, torch.zeros_like(c))
 
 
+@tilelang.testing.requires_cuda_target
 def test_matmul():
     run_matmul(1024, 1024, 1024, 128, 128, 32)
 

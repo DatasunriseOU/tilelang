@@ -126,6 +126,7 @@ def run_autotune(M, N, K, M_value=None, N_value=None, K_value=None):
     torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_autotune_matmul():
     """
     Run the autotuning validation for the matmul kernel on a 1024x1024x1024 problem.
@@ -136,6 +137,7 @@ def test_autotune_matmul():
     run_autotune(1024, 1024, 1024)
 
 
+@tilelang.testing.requires_cuda_target
 def test_autotune_matmul_symbolic_m():
     run_autotune(T.symbolic("m"), 1024, 1024, M_value=1024)
 

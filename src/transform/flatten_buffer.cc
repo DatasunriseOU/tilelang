@@ -268,6 +268,14 @@ private:
     auto int_bound = analyzer_->const_int_bound(index);
     int64_t max_value = int_bound->max_value;
     int64_t min_value = int_bound->min_value;
+    // If the analyzer returns the full [kNegInf, kPosInf) range, the bound
+    // is uninformative (typically a symbolic expression). Don't promote in
+    // that case — false int64 promotion inflates the IR with unnecessary
+    // casts and prevents downstream int32-vectorization.
+    if (max_value == arith::ConstIntBound::kPosInf &&
+        min_value == arith::ConstIntBound::kNegInf) {
+      return false;
+    }
     const int64_t type_max = (1LL << (dtype.bits() - 1));
     const int64_t type_min = -(1LL << (dtype.bits() - 1));
     return max_value >= (type_max - 1) || min_value < type_min;

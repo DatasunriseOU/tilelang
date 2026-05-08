@@ -16,6 +16,7 @@
 #include "../transform/loop_partition.h"
 #include "../transform/loop_vectorize.h"
 #include "../transform/ptx_async_copy_injector.h"
+#include "../transform/vendored/z3_constraint_scope.h"
 #include "../transform/vendored/z3_prover.h"
 #include "utils.h"
 
@@ -599,15 +600,14 @@ static bool Z3ProveStrideAligned16(arith::Analyzer *analyzer,
     PrimExpr stride_constraint =
         (stride_bytes > IntImm(DataType::Int(64), 0)) &&
         (stride_bytes < IntImm(DataType::Int(64), addr_envelope));
-    auto recover = z3.EnterConstraint(addr_constraint && stride_constraint);
+    ::tilelang::tlz3::ConstraintScope scope(z3, addr_constraint && stride_constraint);
     PrimExpr goal =
         (FloorMod(addr_bytes, IntImm(DataType::Int(64), 16)) ==
          IntImm(DataType::Int(64), 0)) &&
         (FloorMod(stride_bytes, IntImm(DataType::Int(64), 16)) ==
          IntImm(DataType::Int(64), 0));
-    bool proven = z3.CanProve(goal);
-    recover();
-    return proven;
+    return z3.CanProve(goal);
+    // scope destructs here — solver state rebalanced.
   } catch (...) {
     // Conservative: any Z3 error/timeout/unknown -> keep slow cp.async path.
     return false;

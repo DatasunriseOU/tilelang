@@ -10,6 +10,13 @@ from __future__ import annotations
 from tvm.script.parser.tir import *
 from . import overrides as _overrides  # noqa: F401
 
+# Upstream TVMScript renamed block frames to sblock; keep the TileLang-facing
+# spelling working for older tests and call sites.
+if "block" not in globals() and "sblock" in globals():
+    block = sblock  # noqa: F405
+if "block_attr" not in globals() and "sblock_attr" in globals():
+    block_attr = sblock_attr  # noqa: F405
+
 # from .tir import prim_func, macro,  # noqa: F401
 from .eager import *  # noqa: F401
 from .tir.ir import *  # noqa: F401

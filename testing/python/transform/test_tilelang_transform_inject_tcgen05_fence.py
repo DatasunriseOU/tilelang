@@ -6,8 +6,8 @@ from tilelang.engine.phase import LowerAndLegalize
 from tvm import tir
 
 
-sm100_target = tvm.target.Target("cuda -arch=sm_100")
-sm90_target = tvm.target.Target("cuda -arch=sm_90a")
+sm100_target = tvm.target.Target({"kind": "cuda", "arch": "sm_100"})
+sm90_target = tvm.target.Target({"kind": "cuda", "arch": "sm_90a"})
 
 
 def _apply(func, target=sm100_target):

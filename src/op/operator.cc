@@ -52,9 +52,10 @@ TileOperator ParseOperator(Call call) {
  * TileOperator if `stmt` is not an Evaluate(Call).
  */
 TileOperator ParseOperator(Stmt stmt) {
-  if (stmt.as<Evaluate>() && stmt.as<EvaluateNode>()->value.as<CallNode>()) {
-    auto call = stmt.as<EvaluateNode>()->value.as<CallNode>();
-    return ParseOperator(tvm::ffi::GetRef<Call>(call));
+  if (const auto *eval = stmt.as<EvaluateNode>()) {
+    if (const auto *call = eval->value.as<CallNode>()) {
+      return ParseOperator(tvm::ffi::GetRef<Call>(call));
+    }
   }
   return TileOperator();
 }

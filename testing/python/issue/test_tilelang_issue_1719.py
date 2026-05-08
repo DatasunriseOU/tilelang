@@ -4,7 +4,7 @@ import tilelang.testing
 import tilelang.language as T
 
 
-@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_target
 def test_issue_1719_layout_1():
     @tilelang.jit
     def _buggy_kernel():
@@ -22,6 +22,7 @@ def test_issue_1719_layout_1():
     print(kernel.get_kernel_source())
 
 
+@tilelang.testing.requires_cuda_target
 def test_issue_1719_layout_2():
     @tilelang.jit
     def _buggy_kernel(M: int, N: int):
@@ -40,7 +41,7 @@ def test_issue_1719_layout_2():
     assert "tmp2[(((int)threadIdx.x) & 3)]" not in kernel.get_kernel_source()
 
 
-@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_target
 def test_issue_1719_layout_3():
     @tilelang.jit
     def _buggy_kernel(A, dtype=T.float32):
@@ -64,6 +65,7 @@ def test_issue_1719_layout_3():
     torch.testing.assert_close(b, a.sum(dim=1), atol=1e-2, rtol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_issue_1719_layout_4():
     @tilelang.jit
     def _buggy_kernel():
@@ -78,6 +80,7 @@ def test_issue_1719_layout_4():
     _buggy_kernel.compile()
 
 
+@tilelang.testing.requires_cuda_target
 def test_issue_1719_layout_5():
     @tilelang.jit
     def buggy_kernel(A, dtype=T.float32):
@@ -93,6 +96,7 @@ def test_issue_1719_layout_5():
     buggy_kernel.compile(N=128)
 
 
+@tilelang.testing.requires_cuda_target
 def test_issue_1719_layout_6():
     @tilelang.jit
     def buggy_kernel():
@@ -106,6 +110,7 @@ def test_issue_1719_layout_6():
     buggy_kernel.compile()
 
 
+@tilelang.testing.requires_cuda_target
 def test_issue_1719_layout_7():
     @tilelang.jit
     def buggy_kernel():

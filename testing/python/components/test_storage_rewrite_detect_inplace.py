@@ -1,6 +1,8 @@
 import tilelang
 import tilelang.testing
+from tilelang import tvm
 from tilelang import language as T
+from tilelang.engine.lower import LowerAndLegalize, OptimizeForTarget, get_device_call
 
 
 @tilelang.jit
@@ -42,23 +44,32 @@ def _compile_kernel_with_inplace():
 
 
 def _get_device_kernel_script(detect_inplace: bool) -> str:
-    if detect_inplace:
-        kernel = _compile_kernel_with_inplace()
-    else:
-        kernel = _compile_kernel_without_inplace()
-    source = kernel.get_kernel_source()
-    return source
+    jit_func = _compile_kernel_with_inplace if detect_inplace else _compile_kernel_without_inplace
+    prim_func = jit_func.get_tir()
+    target = tvm.target.Target("cuda", host="c")
+    mod = tvm.IRModule({prim_func.attrs["global_symbol"]: prim_func})
+    with tvm.transform.PassContext(opt_level=3, config=jit_func.pass_configs or {}):
+        with target:
+            mod = LowerAndLegalize(mod, target)
+            mod = OptimizeForTarget(mod, target)
+        device_mod = tvm.tir.transform.Filter(get_device_call())(mod)
+    return device_mod.script()
+
+
+def _has_scaled_assignment(script: str, lhs_prefix: str, rhs_prefix: str) -> bool:
+    return any(
+        line.strip().startswith(lhs_prefix) and f"= {rhs_prefix}" in line and "* 2" in line
+        for line in script.splitlines()
+    )
 
 
 def test_storage_rewrite_detect_inplace_toggle():
     script_off = _get_device_kernel_script(detect_inplace=False)
     script_on = _get_device_kernel_script(detect_inplace=True)
 
-    pattern_on = "read = (read * 2);"
-    pattern_off = "write = (read * 2);"
-    assert script_off.count(pattern_on) == 0, f"inplace pattern found when disabled:\n{script_off}"
-    assert script_on.count(pattern_on) > 0, f"inplace pattern not found when enabled:\n{script_on}"
-    assert script_off.count(pattern_off) > 0, f"separate-write pattern not found when disabled:\n{script_off}"
+    assert not _has_scaled_assignment(script_off, "read_", "read_"), f"inplace pattern found when disabled:\n{script_off}"
+    assert _has_scaled_assignment(script_on, "read_", "read_"), f"inplace pattern not found when enabled:\n{script_on}"
+    assert _has_scaled_assignment(script_off, "write_", "read_"), f"separate-write pattern not found when disabled:\n{script_off}"
 
 
 if __name__ == "__main__":

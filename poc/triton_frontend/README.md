@@ -242,6 +242,26 @@ End-to-end numeric harness (requires Triton + MLX):
 python -m poc.triton_frontend._test_harness.numeric_smoke
 ```
 
+Local Apple Silicon run with `cppmega_mlx` enabled uses the sibling
+checkout at `/Users/dave/sources/cppmega.mlx` (same real path as
+`/Volumes/external/sources/cppmega.mlx`) plus this repo's `.venv313`
+Python:
+
+```bash
+export CPPMEGA_MLX=/Users/dave/sources/cppmega.mlx
+export TL_ROOT=/private/tmp/tl_apache_tvm_swap
+export TL_PY="$TL_ROOT/.venv313/bin/python"
+export DYLD_FALLBACK_LIBRARY_PATH="$TL_ROOT/.venv313/lib/python3.13/site-packages/mlx/lib:/opt/homebrew/lib"
+export PYTHONPATH="$TL_ROOT:$TL_ROOT/3rdparty/tvm/python:$CPPMEGA_MLX"
+
+"$TL_PY" -m pytest poc/triton_frontend/tests/test_e2e_numeric_smoke.py -q
+"$TL_PY" -m poc.triton_frontend._test_harness.numeric_smoke
+```
+
+This keeps `tvm_ffi` and TileLang on the current checkout while loading the
+`cppmega_mlx` package from the sibling tree. A healthy dependency probe
+reports `None` for `triton`, `tvm`, `tilelang`, `mlx`, and `cppmega_mlx`.
+
 Reducer corpus (17 kernels):
 
 ```bash

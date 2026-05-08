@@ -75,6 +75,7 @@ def nested_noncontinuous_parallels(length=256, block=16, dtype=T.float32):
     return main
 
 
+@tilelang.testing.requires_cuda_target
 def test_nested_parallels():
     kernel1 = nested_continuous_parallels(length=256, block=16)
     kernel2 = nested_triple_continuous_parallels(length=256, block1=8, block2=2)
@@ -193,6 +194,7 @@ def run_gemm_nested_pipelines(
     profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_nested_pipelines():
     run_gemm_nested_pipelines(extra_pipeline_repeats=3)
 
@@ -238,6 +240,7 @@ def nested_noncontinuous_serials(length=256, block=16, dtype=T.float32):
     return main
 
 
+@tilelang.testing.requires_cuda_target
 def test_nested_serials():
     kernel1 = nested_continuous_serials(length=256, block=16)
     data = _require_cuda_tensor((256,), torch.float32)
@@ -326,6 +329,7 @@ def nested_continuous_sps(length=256, block1=8, block2=2, dtype=T.float32):
     return main
 
 
+@tilelang.testing.requires_cuda_target
 def test_mixed_sp():
     kernel1 = nested_continuous_sp(length=256, block=16)
     kernel2 = nested_continuous_ps(length=256, block=16)
@@ -514,6 +518,7 @@ def run_gemm_mixed_pp():
         )
 
 
+@tilelang.testing.requires_cuda_target
 def test_mixed_pp():
     run_gemm_mixed_pp()
 
@@ -664,6 +669,7 @@ def customize_op_with_parallel(length=256, block=16, dtype=T.float32):
     return main
 
 
+@tilelang.testing.requires_cuda_target
 def test_tiled_op_with_parallel():
     run_gemm_tiled_op_with_parallel()
 

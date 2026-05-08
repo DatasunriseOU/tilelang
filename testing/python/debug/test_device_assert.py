@@ -4,6 +4,7 @@ import tilelang.testing
 import tilelang.language as T
 
 
+@tilelang.testing.requires_cuda_target
 def test_device_assert_no_trigger():
     @T.prim_func
     def program():

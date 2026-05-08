@@ -35,22 +35,32 @@ class HoistBroadcastValuesMutator(PyStmtExprMutator):
         super().__init__()
         # Temporary queue: used to store variables that need to be defined within the current statement.
         self.pending_defs = []
+        # CSE map: (value, dtype) -> Var. Reuse the same variable when the
+        # same constant appears in multiple Broadcast nodes within the same
+        # statement scope.
+        self._seen_values = {}
         # Flag to indicate if hoist should be enabled.
         self.hoist_enabled = False
 
     def visit_broadcast_(self, op):
         if self.hoist_enabled and isinstance(op.value, (tir.IntImm, tir.FloatImm)):
             # 1. Intercept Broadcast nodes.
-            # Extract the value to be hoisted into a variable.
             val = self.visit_expr(op.value)
-            # 2. Create a new variable.
+            # 2. CSE: reuse an existing variable if this exact (value, dtype)
+            # was already hoisted within the current statement scope.
+            cse_key = (val.value, str(val.dtype))
+            existing_var = self._seen_values.get(cse_key)
+            if existing_var is not None:
+                return Broadcast(existing_var, op.lanes)
+            # 3. Create a new variable for the first occurrence.
             new_var = Var("broadcast_var", dtype=val.dtype)
+            self._seen_values[cse_key] = new_var
 
-            # 3. Add the (variable, value) pair to the pending queue.
+            # 4. Add the (variable, value) pair to the pending queue.
             # Note: Do not create the LetStmt here; it must wrap the statement.
             self.pending_defs.append((new_var, val))
 
-            # 4. Return a new Broadcast node, using the new variable to replace the original value.
+            # 5. Return a new Broadcast node, using the new variable to replace the original value.
             return Broadcast(new_var, op.lanes)
         return Broadcast(self.visit_expr(op.value), self.visit_expr(op.lanes))
 
@@ -60,10 +70,12 @@ class HoistBroadcastValuesMutator(PyStmtExprMutator):
         # 1. Save the current state to handle nested statements correctly.
         saved_hoist_enabled = self.hoist_enabled
         saved_pending_defs = self.pending_defs
+        saved_seen_values = self._seen_values
 
-        # 2. Enable hoist flag and clear the pending queue for the current statement context.
+        # 2. Enable hoist flag and clear the pending queue / CSE map for the current statement context.
         self.hoist_enabled = True
         self.pending_defs = []
+        self._seen_values = {}
 
         # 3. Visit child nodes normally (this will trigger visit_broadcast_).
         new_indices = [self.visit_expr(idx) for idx in op.indices]
@@ -82,6 +94,29 @@ class HoistBroadcastValuesMutator(PyStmtExprMutator):
         # 6. Restore the saved state.
         self.hoist_enabled = saved_hoist_enabled
         self.pending_defs = saved_pending_defs
+        self._seen_values = saved_seen_values
+
+        return new_stmt
+
+    def visit_bind_(self, op):
+        saved_hoist_enabled = self.hoist_enabled
+        saved_pending_defs = self.pending_defs
+        saved_seen_values = self._seen_values
+
+        self.hoist_enabled = True
+        self.pending_defs = []
+        self._seen_values = {}
+
+        new_value = self.visit_expr(op.value)
+        new_stmt = _CppmegaBind(op.var, new_value)
+        if self.pending_defs:
+            stmts = [_CppmegaBind(var, val) for var, val in self.pending_defs]
+            stmts.append(new_stmt)
+            new_stmt = _CppmegaSeqStmt(stmts)
+
+        self.hoist_enabled = saved_hoist_enabled
+        self.pending_defs = saved_pending_defs
+        self._seen_values = saved_seen_values
 
         return new_stmt
 
@@ -89,10 +124,12 @@ class HoistBroadcastValuesMutator(PyStmtExprMutator):
         # 1. Save the current state to handle nested statements correctly.
         saved_hoist_enabled = self.hoist_enabled
         saved_pending_defs = self.pending_defs
+        saved_seen_values = self._seen_values
 
-        # 2. Enable hoist flag and clear the pending queue for the current statement context.
+        # 2. Enable hoist flag and clear the pending queue / CSE map for the current statement context.
         self.hoist_enabled = True
         self.pending_defs = []
+        self._seen_values = {}
 
         # 3. Visit the value expression (this will trigger visit_broadcast_).
         new_value = self.visit_expr(op.value)
@@ -121,6 +158,7 @@ class HoistBroadcastValuesMutator(PyStmtExprMutator):
         # 10. Restore the saved state.
         self.hoist_enabled = saved_hoist_enabled
         self.pending_defs = saved_pending_defs
+        self._seen_values = saved_seen_values
 
         return new_stmt
 

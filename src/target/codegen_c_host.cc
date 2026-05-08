@@ -263,8 +263,8 @@ void CodeGenCHost::PrintCallPacked(const tvm::tirx::CallNode *op) {
   const StringImmNode *func_name = op->args[0].as<StringImmNode>();
   ICHECK(func_name != nullptr)
       << "tvm_call_[c]packed_lowered expects first argument as function name";
-  int64_t begin = op->args[2].as<IntImmNode>()->value;
-  int64_t end = op->args[3].as<IntImmNode>()->value;
+  int64_t begin = Downcast<IntImm>(op->args[2])->value;
+  int64_t end = Downcast<IntImm>(op->args[3])->value;
   int64_t num_args = end - begin;
   ICHECK_GE(num_args, 0);
 
@@ -359,7 +359,9 @@ void CodeGenCHost::VisitExpr_(const tvm::tirx::CallNode *op,
   using namespace tvm::tirx;
   if (op->op.same_as(builtin::tvm_stack_alloca())) {
     std::string stack_name = name_supply_->FreshName("stack");
-    const std::string &type = op->args[0].as<StringImmNode>()->value;
+    const auto *type_imm = op->args[0].as<StringImmNode>();
+    ICHECK(type_imm) << "tvm_stack_alloca expects StringImm type argument";
+    const std::string &type = type_imm->value;
     const IntImmNode *num = op->args[1].as<IntImmNode>();
     ICHECK(num != nullptr);
     static_assert(alignof(TVMFFIAny) % alignof(DLTensor) == 0, "invariant");

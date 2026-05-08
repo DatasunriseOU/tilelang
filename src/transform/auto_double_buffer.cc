@@ -161,23 +161,19 @@ public:
  * returns false (either disproved or unknown), the pass MUST NOT
  * transform.
  */
-PrimExpr BuildSoundnessObligation(const CandidateInfo &info,
-                                  const Var &k_var) {
-  // Construct k_next = k + 1.
-  Var k_next("k_next", k_var.dtype());
-  // fix-round-6 C4: stub: no real obligation; return False to never claim
-  // Z3 proved soundness. Previously this returned Bool(true), which made
-  // CanProve(...) trivially succeed and gave the audit trail false
-  // confidence — `BuildSoundnessObligation` looked like a real prover
-  // gate but was a tautology. Since this pass is detector-gated and the
-  // Z3 result is *discarded* in stub mode anyway, returning False is
-  // strictly safer: any future code that begins to act on the proof
-  // result will see "unproved" and refuse to transform until the real
-  // obligation is wired.
-  (void)k_next;
-  (void)info;
-  return Bool(false);
-}
+// TODO(auto-double-buffer): implement the real soundness obligation.
+//
+// The obligation has two parts:
+//   1. The next-iteration load address must be computable independently of
+//      the previous iteration's USE.
+//   2. The candidate buffer slot for read at iter k must differ from the
+//      write target slot at iter k+1.
+//
+// Until the real ping-pong rewrite is implemented (see file header), there
+// is no consumer for the obligation. The stub pass never transforms IR.
+// Do NOT add a vacuous PrimExpr here; any future code that acts on the
+// proof result must implement the real obligation first.
+
 
 /*!
  * \brief Top-level mutator. In stub mode this does NOT modify the IR; it
@@ -246,12 +242,12 @@ tvm::transform::Pass AutoDoubleBuffer() {
   auto pass_func = [](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     bool enabled =
         ctx->GetConfig<Bool>(kAutoDoubleBuffer, Bool(false)).value();
-    AutoDoubleBufferRewriter rewriter(enabled);
-    Stmt new_body = rewriter(f->body);
     if (!enabled) {
-      // Default OFF: never modify IR.
+      // Default OFF: skip the IR traversal entirely.
       return f;
     }
+    AutoDoubleBufferRewriter rewriter(enabled);
+    Stmt new_body = rewriter(f->body);
     // Even when enabled, the safe-stub does not modify the IR; this returns
     // `f` whose body is structurally equal to the input.
     if (!new_body.same_as(f->body)) {

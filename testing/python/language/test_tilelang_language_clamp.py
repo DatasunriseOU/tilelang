@@ -109,6 +109,10 @@ def test_clamp():
     # clamp tests for float16 and float32
     run_clamp(1024, 128, T.float16, -0.05, 0.05)
     run_clamp(1024, 128, T.float32, -0.06, 0.05)
+
+
+@tilelang.testing.requires_cuda_target
+def test_clamp_value_range():
     run_clamp_value_range(1024, 128, T.float16)
     run_clamp_value_range(1024, 128, T.float32)
 

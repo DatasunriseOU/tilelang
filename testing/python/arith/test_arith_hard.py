@@ -1,9 +1,15 @@
 import tilelang.testing
 import tilelang.language as T
+import pytest
 from tvm.arith import Analyzer
 from tvm.ir.expr import Range
 from tvm.tir.expr import Not, Or
 from tvm.tir import all as tir_all
+
+pytestmark = pytest.mark.skipif(
+    not all(hasattr(Analyzer(), name) for name in ("get_smtlib2", "set_z3_timeout_ms")),
+    reason="requires TileLang hard-Z3 Analyzer debug APIs",
+)
 
 
 def implies(x, y):

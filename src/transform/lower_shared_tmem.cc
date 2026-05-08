@@ -135,10 +135,10 @@ private:
     }
 
     // Record the mapping from buffer data var to buffer for later lookup
-    for (auto buffer : alloc_buffers) {
+    for (const auto& buffer : alloc_buffers) {
       buffer_map_.insert({buffer->data, buffer});
     }
-    for (auto match_buffer : op->match_buffers) {
+    for (const auto& match_buffer : op->match_buffers) {
       buffer_map_.insert({match_buffer->buffer->data, match_buffer->buffer});
     }
 
@@ -147,8 +147,8 @@ private:
     for (const auto &[data, buffer] : buffer_map_) {
       const auto *ptr_type =
           buffer->data->type_annotation.as<PointerTypeNode>();
-      auto storage_scope = ptr_type->storage_scope;
       ICHECK(ptr_type) << "Buffer Var's type annotation must be of PointerType";
+      auto storage_scope = ptr_type->storage_scope;
       if (storage_scope == "shared.tmem") {
         tmem_buffers.push_back(buffer);
       }
@@ -162,7 +162,7 @@ private:
 
     auto [fallthrough_deallocs, _] = CollectFallthroughDeallocs(op->body);
 
-    for (auto buffer : tmem_buffers) {
+    for (const auto& buffer : tmem_buffers) {
       buffer_data_to_buffer_.Set(buffer->data, buffer);
     }
 
@@ -184,7 +184,7 @@ private:
     */
     // 1. create new data vars
     Array<Var> new_data_vars;
-    for (auto buffer : tmem_buffers) {
+    for (const auto& buffer : tmem_buffers) {
       auto data = buffer->data;
       if (var_remap_.count(data))
         continue;
@@ -196,7 +196,7 @@ private:
 
     // 2. create new buffers
     Array<Buffer> new_buffers;
-    for (auto buffer : tmem_buffers) {
+    for (const auto& buffer : tmem_buffers) {
       auto data = buffer->data;
       ICHECK(var_remap_.find(data) != var_remap_.end())
           << "data not found in var_remap_";
@@ -239,7 +239,7 @@ private:
     // 3. create init & dealloc calls for new buffers
     std::vector<Stmt> init_mtmem_calls_;
     std::vector<Stmt> dealloc_tmem_calls_;
-    for (auto buffer : tmem_buffers) {
+    for (const auto& buffer : tmem_buffers) {
       auto data = buffer->data;
       auto old_buffer = buffer_data_to_buffer_.at(data);
       auto new_buffer = buffer_remap_.at(old_buffer);
@@ -274,11 +274,19 @@ private:
       }
     }
     auto compare_by_buffer_name = [&](const Stmt &a, const Stmt &b) {
-      auto call_a = a.as<EvaluateNode>()->value.as<CallNode>();
-      auto call_b = b.as<EvaluateNode>()->value.as<CallNode>();
-      auto num_cols_a = call_a->args[1].as<IntImmNode>()->value;
-      auto num_cols_b = call_b->args[1].as<IntImmNode>()->value;
-      return num_cols_a > num_cols_b;
+      const auto *eval_a = a.as<EvaluateNode>();
+      const auto *eval_b = b.as<EvaluateNode>();
+      ICHECK(eval_a) << "Expected EvaluateNode in tmem init calls";
+      ICHECK(eval_b) << "Expected EvaluateNode in tmem init calls";
+      const auto *call_a = eval_a->value.as<CallNode>();
+      const auto *call_b = eval_b->value.as<CallNode>();
+      ICHECK(call_a) << "Expected CallNode in tmem init calls";
+      ICHECK(call_b) << "Expected CallNode in tmem init calls";
+      const auto *imm_a = call_a->args[1].as<IntImmNode>();
+      const auto *imm_b = call_b->args[1].as<IntImmNode>();
+      ICHECK(imm_a) << "Expected IntImmNode for num_cols in tmem init calls";
+      ICHECK(imm_b) << "Expected IntImmNode for num_cols in tmem init calls";
+      return imm_a->value > imm_b->value;
     };
     std::sort(init_mtmem_calls_.begin(), init_mtmem_calls_.end(),
               compare_by_buffer_name);

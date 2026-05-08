@@ -6,7 +6,15 @@ import tilelang.language as T
 from tilelang.utils import determine_fp8_type
 
 
+def _require_debug_print_target():
+    target_kind = tilelang.testing.get_default_target_kind()
+    if target_kind not in {"cuda", "hip"}:
+        pytest.skip(f"Debug print runtime helpers require CUDA/HIP target, but got {target_kind or 'unavailable'}")
+
+
 def debug_print_buffer(M=16, N=16, dtype=T.float16):
+    _require_debug_print_target()
+
     @T.prim_func
     def program(Q: T.Tensor((M, N), dtype)):
         with T.Kernel(4, 4, 2, threads=128 * 2) as (bx, by, bz):
@@ -25,7 +33,7 @@ def test_debug_print_buffer(dtype):
     debug_print_buffer(dtype=dtype)
 
 
-@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_target
 def test_debug_print_buffer_cuda_fp8():
     debug_print_buffer(dtype=T.float8_e4m3fn)
     debug_print_buffer(dtype=T.float8_e5m2)
@@ -38,6 +46,7 @@ def test_debug_print_buffer_rocm_fp8():
 
 
 def debug_print_buffer_conditional(M=16, N=16):
+    _require_debug_print_target()
     dtype = T.float16
 
     @T.prim_func
@@ -58,6 +67,7 @@ def test_debug_print_buffer_conditional():
 
 
 def debug_print_value_conditional(M=16, N=16):
+    _require_debug_print_target()
     dtype = T.float16
 
     @T.prim_func
@@ -77,6 +87,7 @@ def test_debug_print_value_conditional():
 
 
 def debug_print_register_files(M=16, N=16):
+    _require_debug_print_target()
     dtype = T.float16
 
     @T.prim_func
@@ -96,6 +107,7 @@ def test_debug_print_register_files():
 
 
 def debug_print_msg(M=16, N=16, msg_only=False):
+    _require_debug_print_target()
     dtype = T.float16
 
     @T.prim_func

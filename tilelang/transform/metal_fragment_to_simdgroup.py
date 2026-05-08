@@ -280,6 +280,26 @@ def _buffer_was_remapped(old_buf, new_buf):
     return old_buf.scope() != new_buf.scope() or not old_buf.data.same_as(new_buf.data)
 
 
+def _remapped_elem_offset(buf):
+    elem_offset = getattr(buf, "elem_offset", None)
+    if elem_offset is None:
+        return tir.const(0, "int32")
+    try:
+        if not elem_offset.defined():
+            return tir.const(0, "int32")
+    except AttributeError:
+        pass
+    if isinstance(elem_offset, tir.Var):
+        name = getattr(elem_offset, "name", None) or getattr(elem_offset, "name_hint", "")
+        data_name = getattr(getattr(buf, "data", None), "name", None)
+        if name in {
+            f"{getattr(buf, 'name', '')}_elem_offset",
+            f"{data_name}_elem_offset",
+        }:
+            return tir.const(0, elem_offset.dtype)
+    return elem_offset
+
+
 def _remap_buffer(buf, var_map, accum_names, semantic_var_map):
     old_data = buf.data
     new_data = var_map.get(old_data, None)
@@ -303,6 +323,7 @@ def _remap_buffer(buf, var_map, accum_names, semantic_var_map):
         scope="metal.simdgroup",
         data_alignment=buf.data_alignment,
         offset_factor=buf.offset_factor,
+        elem_offset=_remapped_elem_offset(buf),
     )
 
 
@@ -424,8 +445,8 @@ def _is_rewrite_enabled() -> bool:
     per-buffer by :func:`is_simdgroup_eligible`.
     """
     try:
-        from tvm.transform import PassContext
-        cfg = PassContext.current().config
+        from tvm import transform as tvm_transform
+        cfg = tvm_transform.PassContext.current().config
         if cfg is None:
             return False
         val = cfg.get(PASS_CONFIG_KEY, None)

@@ -130,7 +130,7 @@ public:
                         InferLevel level) const override;
   AccessRegions GetAccessRegions() const override;
   static const Op &Get();
-  TileOperator Clone() const;
+  TileOperator Clone() const override;
 
 private:
   /// Generate initial value for reduction
@@ -178,7 +178,7 @@ public:
   LayoutMap InferLayout(const LayoutInferArgs &T,
                         InferLevel level) const override;
   static const Op &Get();
-  TileOperator Clone() const;
+  TileOperator Clone() const override;
 };
 
 /// Wrapper class for cumulative sum operations

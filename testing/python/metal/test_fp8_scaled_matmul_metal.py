@@ -271,7 +271,7 @@ def test_m1_transposed_b_vecmat_lowers_to_simd_sum():
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
     body = src[src.find("kernel void"):]
 
-    assert "__tvm_fp8_e4m3_to_half" in body
+    assert "__tvm_fp8_e4m3_dot4_packed" in body
     assert "simd_sum(" in body
     assert "#pragma unroll 4" in body
     simd_pos = body.find("simd_sum(")

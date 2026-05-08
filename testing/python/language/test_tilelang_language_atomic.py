@@ -214,7 +214,7 @@ def tma_atomic_add_program(out, explicit_swizzle=False):
             T.atomic_add(out, out_shared, use_tma=True)
 
 
-@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_target
 def test_tma_atomic_add():
     out = torch.zeros((16, 16), dtype=torch.float32, device="cuda")
     tma_atomic_add_program(out)
@@ -274,47 +274,51 @@ def run_atomic_add_complicated_parallel(K, M, N, block_M, block_N, dtype=T.float
     assert "AtomicAddx4" in kernel.get_kernel_source()
 
 
-@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_target
 def test_atomic_memory_order():
     run_atomic_memory_order(4, 64, 64, 16, 16)
 
 
-@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_target
 def test_atomic_addx2_half():
     run_atomic_addx2(32, 64, 8, 16, dtype=T.float16)
 
 
+@tilelang.testing.requires_cuda_target
 def test_atomic_addx2_float():
     run_atomic_addx2(32, 64, 8, 16, dtype=T.float32)
 
 
-@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_target
 def test_atomic_different_memory_orders():
     run_atomic_different_memory_orders(32, 32, 8, 8, dtype=T.float32)
     run_atomic_different_memory_orders(32, 32, 8, 8, dtype=T.float16)
     run_atomic_different_memory_orders(32, 32, 8, 8, dtype=T.bfloat16)
 
 
+@tilelang.testing.requires_cuda_target
 # TODO: atomic_addx4 currently not support half
 def test_atomic_addx4():
     run_atomic_addx4(16, 64, 4, 4)
 
 
+@tilelang.testing.requires_cuda_target
 def test_atomic_return_prev():
     run_atomic_return_prev(32, 32, 8, 8)
 
 
+@tilelang.testing.requires_cuda_target
 def test_atomic_add():
     run_atomic_add(8, 128, 128, 32, 32)
 
 
-@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_target
 @tilelang.testing.requires_cuda_compute_version_ge(9, 0)
 def test_atomic_add_auto_vectorized():
     run_atomic_add_auto_vectorized(8, 128, 128, 32, 32, dtype=T.float32)
 
 
-@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_target
 @tilelang.testing.requires_cuda_compute_version_ge(9, 0)
 def test_atomic_add_auto_vectorized_unit_test():
     run_atomic_add_auto_vectorized_unit_test(2, dtype=T.float32)
@@ -323,6 +327,7 @@ def test_atomic_add_auto_vectorized_unit_test():
     run_atomic_add_auto_vectorized_unit_test(2, dtype=T.bfloat16)
 
 
+@tilelang.testing.requires_cuda_target
 @tilelang.testing.requires_cuda_compute_version_ge(9, 0)
 def test_atomic_add_complicated_parallel():
     run_atomic_add_complicated_parallel(8, 128, 128, 32, 32, dtype=T.float32)
@@ -420,14 +425,17 @@ def run_tile_atomic_add_scalar(dtype=T.float32):
     torch.testing.assert_close(B, ref_B, atol=1e-3, rtol=1e-3)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tile_atomic_add():
     run_tile_atomic_add(8, 128, 128, 32, 32)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tile_atomic_add_expr():
     run_tile_atomic_add_expr(128, 128, 32, 32)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tile_atomic_add_scalar():
     run_tile_atomic_add_scalar()
 
@@ -526,15 +534,17 @@ def run_atomic_load_store(M, N, block_M, block_N, dtype=T.float32):
     torch.testing.assert_close(B, A, atol=1e-3, rtol=1e-3)
 
 
+@tilelang.testing.requires_cuda_target
 def test_atomic_max():
     run_atomic_max(4, 64, 64, 16, 16)
 
 
+@tilelang.testing.requires_cuda_target
 def test_atomic_min():
     run_atomic_min(4, 64, 64, 16, 16)
 
 
-@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_target
 def test_atomic_load_store():
     run_atomic_load_store(64, 64, 16, 16)
 
@@ -630,14 +640,17 @@ def run_tile_atomic_max_expr(M, N, block_M, block_N, dtype=T.float32):
     torch.testing.assert_close(A, ref_A, atol=1e-3, rtol=1e-3)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tile_atomic_max():
     run_tile_atomic_max(8, 128, 128, 32, 32)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tile_atomic_min():
     run_tile_atomic_min(8, 128, 128, 32, 32)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tile_atomic_max_expr():
     run_tile_atomic_max_expr(128, 128, 32, 32)
 
@@ -645,7 +658,7 @@ def test_tile_atomic_max_expr():
 # ======================= xchg / and / or / xor IR-level tests =======================
 #
 # These tests construct a tiny prim_func that calls each new T.atomic_*
-# wrapper and assert the corresponding ``tl.atomic_<op>_elem_op`` intrinsic
+# wrapper and assert the corresponding ``atomic_<op>_elem_op`` intrinsic
 # name shows up in the printed IR. They exercise the wrappers + the C++
 # Op registration without requiring a CUDA / Metal device.
 
@@ -668,19 +681,19 @@ def _atomic_intrin_in_ir(builder_fn, expected_substr: str) -> None:
 
 
 def test_atomic_xchg_emits_tl_atomic_xchg_intrin():
-    _atomic_intrin_in_ir(lambda A: T.atomic_xchg(A, 1), "tl.atomic_xchg_elem_op")
+    _atomic_intrin_in_ir(lambda A: T.atomic_xchg(A, 1), "atomic_xchg_elem_op")
 
 
 def test_atomic_and_emits_tl_atomic_and_intrin():
-    _atomic_intrin_in_ir(lambda A: T.atomic_and(A, 0xFF), "tl.atomic_and_elem_op")
+    _atomic_intrin_in_ir(lambda A: T.atomic_and(A, 0xFF), "atomic_and_elem_op")
 
 
 def test_atomic_or_emits_tl_atomic_or_intrin():
-    _atomic_intrin_in_ir(lambda A: T.atomic_or(A, 0x1), "tl.atomic_or_elem_op")
+    _atomic_intrin_in_ir(lambda A: T.atomic_or(A, 0x1), "atomic_or_elem_op")
 
 
 def test_atomic_xor_emits_tl_atomic_xor_intrin():
-    _atomic_intrin_in_ir(lambda A: T.atomic_xor(A, 0xF), "tl.atomic_xor_elem_op")
+    _atomic_intrin_in_ir(lambda A: T.atomic_xor(A, 0xF), "atomic_xor_elem_op")
 
 
 if __name__ == "__main__":

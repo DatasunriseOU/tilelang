@@ -237,6 +237,7 @@ def run_reduce_after_reshape(N, M, dtype):
     profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_reduce_after_reshape():
     run_reduce_after_reshape(1024, 32, T.float32)
     run_reduce_after_reshape(2048, 64, T.float16)
@@ -260,6 +261,7 @@ def test_reshape_shape_mismatch():
         reshape_shape_mismatch_test(1024, 32, T.float32)
 
 
+@tilelang.testing.requires_cuda_target
 def test_reduce_absmax_after_reshape_3d():
     M, N, num_groups, num_per_channels = 2, 384, 3, 128
     threads = 128

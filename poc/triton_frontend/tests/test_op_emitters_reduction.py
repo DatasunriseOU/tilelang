@@ -26,7 +26,9 @@ from typing import Any, Dict, List
 
 import pytest
 
+pytest.importorskip("tilelang")
 tvm = pytest.importorskip("tvm")
+from tvm import tir
 
 from poc.triton_frontend.op_emitters.reduction import (  # noqa: E402
     EmitError,

@@ -132,6 +132,12 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
   // ROCm wavefronts are 64-wide; only batch when reducing across warps.
   const int warp_size = TargetIsRocm(T.target) ? 64 : 32;
   bool use_batch = effective_batch > 1 && reducing_threads > warp_size;
+  ICHECK(reducing_threads > 0 &&
+         (reducing_threads & (reducing_threads - 1)) == 0)
+      << "finalize_reducer: reducing_threads must be a power of two for the "
+      << "AllReduce XOR-butterfly to be correct; got " << reducing_threads
+      << "; op=" << static_cast<int>(op) << "; dtype=" << buffer->dtype
+      << "; batch=" << effective_batch << "; target=" << T.target->str();
 
   if (use_batch) {
     // Batched AllReduce: single butterfly pass for all output elements.
@@ -149,6 +155,10 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
       ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
          << ", " << thread_offset << ", " << effective_batch << ", "
          << workspace_stride << ">::run_batch";
+    } else if (TargetIsMetal(T.target)) {
+      ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
+         << ", " << thread_offset << ", tl::SyncThreadsBarrier, "
+         << effective_batch << ", " << workspace_stride << ">::run_batch";
     } else {
       ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
          << ", " << thread_offset << ", tl::SyncThreadsBarrier, "
@@ -156,7 +166,11 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
     }
     int ws_size = workspace_stride * static_cast<int>(effective_batch);
     PrimExpr workspace = T.AddWorkspace(ws_size, buffer->dtype);
-    Array<PrimExpr> args = {StringImm(ss.str()), buffer->data, workspace};
+    Array<PrimExpr> args = {StringImm(ss.str()), buffer->data};
+    if (TargetIsMetal(T.target)) {
+      args.push_back(T.thread_var);
+    }
+    args.push_back(workspace);
     return Evaluate(Call(DataType::Handle(), builtin::call_extern(), args));
   }
 
@@ -167,13 +181,21 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
     ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
        << ", " << thread_offset << ", tl::NamedBarrier<" << all_threads
        << ">>::run";
+  } else if (TargetIsMetal(T.target)) {
+    ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
+       << ", " << thread_offset << ", tl::SyncThreadsBarrier, 1, "
+       << reducing_threads << ">::run";
   } else {
     ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
        << ", " << thread_offset << ">::run";
   }
   Array<PrimExpr> thread_reduce_args = {StringImm(ss.str()),
                                         BufferLoad(buffer, indices_0)};
-  if (reducing_threads >= 32) {
+  if (TargetIsMetal(T.target)) {
+    PrimExpr workspace = T.AddWorkspace(reducing_threads, buffer->dtype);
+    thread_reduce_args.push_back(T.thread_var);
+    thread_reduce_args.push_back(workspace);
+  } else if (reducing_threads >= 32) {
     PrimExpr workspace =
         T.AddWorkspace(*as_const_int(T.thread_bounds->extent), buffer->dtype);
     thread_reduce_args.push_back(workspace);

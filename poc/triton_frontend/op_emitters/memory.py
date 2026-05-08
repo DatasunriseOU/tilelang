@@ -325,7 +325,10 @@ def _emit_degraded_tile_load(
     # Tile-scoped allocation -- see ``_alloc_tile_buffer`` for why this
     # bypasses ``ctx.buffers`` (otherwise ``VerifyMemory`` flags the
     # per-lane BufferStore as host-memory access).
-    tile_buf = _alloc_tile_buffer(ctx, list(out_shape) or [1], out_dtype, out_buf_name)
+    # Use ``scope="shared"`` so the buffer satisfies the scope contract
+    # of downstream GEMM consumers (Metal requires A/B in shared scope;
+    # CUDA MMA paths accept shared or local.fragment for operand tiles).
+    tile_buf = _alloc_tile_buffer(ctx, list(out_shape) or [1], out_dtype, out_buf_name, scope="shared")
 
     # Build a nested ``For`` over the tile shape. We collapse to a single
     # 1-D loop when the tile is rank-1 to keep the output legible; higher
@@ -495,7 +498,8 @@ def _emit_tile_copy_tir(
     result_value = _results(op)[0] if _results(op) else None
     out_buf_name = ctx.fresh("tile_load")
     # Tile-scoped allocation; see ``_alloc_tile_buffer`` docstring.
-    tile_buf = _alloc_tile_buffer(ctx, list(out_shape) or [1], out_dtype, out_buf_name)
+    # ``shared`` scope satisfies Metal GEMM's is_gemm_ss() contract.
+    tile_buf = _alloc_tile_buffer(ctx, list(out_shape) or [1], out_dtype, out_buf_name, scope="shared")
 
     loop_vars: List[Any] = []
     body_indices: List[Any] = list(base_indices) if base_indices else []
@@ -763,8 +767,9 @@ def emit_tt_load(op: Any, ctx: WalkerCtx) -> Any:
         # ``op_mapping._alloc_tile_buffer`` for why this bypasses
         # ``ctx.buffers`` (Memory verification would otherwise flag
         # every per-lane BufferLoad below).
+        # ``shared`` scope satisfies Metal GEMM's is_gemm_ss() contract.
         if buf_name not in ctx.buffers:
-            src_buf = _alloc_tile_buffer(ctx, list(out_shape), out_dtype, buf_name)
+            src_buf = _alloc_tile_buffer(ctx, list(out_shape), out_dtype, buf_name, scope="shared")
         else:
             src_buf = ctx.buffers[buf_name]
         # Rank-N safety: ``src_buf`` was declared with the result tile

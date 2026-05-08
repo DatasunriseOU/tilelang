@@ -17,6 +17,7 @@ def get_shared_kernel():
     return shared_kernel
 
 
+@tilelang.testing.requires_cuda_target
 def test_issue_1026():
     kernel = get_shared_kernel()
     assert "__syncthreads" not in kernel.get_kernel_source()

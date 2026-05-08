@@ -155,6 +155,7 @@ def run_gemm_jit_kernel(
     tilelang.testing.torch_assert_close(C, ref_C, atol=1e-2, rtol=1e-2, max_mismatched_ratio=0.05)
 
 
+@tilelang.testing.requires_cuda_target
 def test_gemm_jit_kernel():
     run_gemm_jit_kernel(
         512,
@@ -207,6 +208,7 @@ def run_tvm_ffi_kernel_do_bench(
 
 
 @pytest.mark.perf
+@tilelang.testing.requires_cuda_target
 def test_tvm_ffi_kernel_do_bench():
     run_tvm_ffi_kernel_do_bench(512, 1024, 768, False, False, T.float16, T.float16, T.float32, 128, 256, 32, 2)
 
@@ -249,6 +251,7 @@ def run_tvm_ffi_kernel_multi_stream(
             matmul_kernel(tensor_a, tensor_b, tensor_c)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tvm_ffi_kernel_multi_stream():
     run_tvm_ffi_kernel_multi_stream(512, 1024, 768, False, False, T.float16, T.float16, T.float32, 128, 256, 32, 2)
 
@@ -298,6 +301,7 @@ def run_tvm_ffi_dynamic_shape(
     tilelang.testing.torch_assert_close(tensor_c, tensor_ref_c, atol=1e-2, rtol=1e-2, max_mismatched_ratio=0.05)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tvm_ffi_dynamic_shape():
     run_tvm_ffi_dynamic_shape(T.dynamic("m"), 1024, 768, False, False, T.float16, T.float16, T.float32, 128, 256, 32, 2)
 
@@ -371,6 +375,7 @@ def run_tvm_ffi_im2col_tma_desc(N, C, H, W, F, K, S, D, P, block_M, block_N, blo
     tilelang.testing.torch_assert_close(out_c, ref_c, atol=1e-2, rtol=1e-2, max_mismatched_ratio=0.05)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tvm_ffi_im2col_tma_desc():
     """Test im2col TMA descriptor with tvm_ffi backend."""
     if not check_hopper():
@@ -384,7 +389,7 @@ def test_tvm_ffi_im2col_tma_desc():
     )
 
 
-@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_target
 def test_tvm_ffi_l2_persistent_map():
     """Test L2 persistent cache annotation with elementwise add."""
     from tilelang.language import annotate_l2_hit_ratio
@@ -444,7 +449,7 @@ def test_tvm_ffi_l2_persistent_map():
     print("L2 persistent map test passed!")
 
 
-@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_target
 @tilelang.testing.requires_cuda_compute_version(9, 0)
 def test_tvm_ffi_pdl():
     """Test pdl."""

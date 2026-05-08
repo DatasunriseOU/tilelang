@@ -132,14 +132,15 @@ private:
     }
 
     // If one of the loop has extent which is not 2^n, we do not fuse
-    for (auto l : loop_chain) {
+    for (const auto *l : loop_chain) {
       PrimExpr extent = l->extent;
       // If extent is not a constant integer, we cannot determine if it's power
       // of 2
-      if (!extent.as<IntImmNode>()) {
+      const auto *ext_imm = extent.as<IntImmNode>();
+      if (!ext_imm) {
         return IRMutatorWithAnalyzer::VisitStmt_(op);
       }
-      int64_t value = extent.as<IntImmNode>()->value;
+      int64_t value = ext_imm->value;
       // Check if value is power of 2: value > 0 and only has one bit set
       if (value <= 0 || (value & (value - 1)) != 0) {
         return IRMutatorWithAnalyzer::VisitStmt_(op);

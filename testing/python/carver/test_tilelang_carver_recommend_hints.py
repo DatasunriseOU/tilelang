@@ -20,6 +20,7 @@ def run_general_reduction_recommend_hints(structure: str = "SSR", shape: List[in
     assert len(hints) > 0, "Hints length is zero"
 
 
+@tilelang.testing.requires_cuda_target
 def test_general_reduction_recommend_hints():
     run_general_reduction_recommend_hints("SSR", [1024, 1024, 1024], T.float16)
     run_general_reduction_recommend_hints("SS", [1024, 1024], T.float16)
@@ -40,6 +41,7 @@ def run_elementwise_recommend_hints(shape: List[int] = None, dtype: T.dtype = T.
     assert len(hints) > 0, "Hints length is not topk"
 
 
+@tilelang.testing.requires_cuda_target
 def test_elementwise_recommend_hints():
     run_elementwise_recommend_hints([1024, 1024], T.float16)
     run_elementwise_recommend_hints([1024], T.float16)
@@ -71,6 +73,7 @@ def run_matmul_recommend_hints(
     assert len(hints) > 0, "Hints length is not 20"
 
 
+@tilelang.testing.requires_cuda_target
 def test_matmul_recommend_hints():
     run_matmul_recommend_hints(1024, 1024, 1024, T.float16, T.float16, T.float16)
     run_matmul_recommend_hints(1024, 1024, 1024, T.int8, T.int32, T.int32)
@@ -96,6 +99,7 @@ def run_gemv_recommend_hints(
     assert len(hints) > 0, "Hints length is not 20"
 
 
+@tilelang.testing.requires_cuda_target
 def test_gemv_recommend_hints():
     run_gemv_recommend_hints(1024, 1024, T.float16, T.float16, T.float16)
     run_gemv_recommend_hints(1024, 1024, T.int8, T.int32, T.int32)
@@ -133,7 +137,7 @@ def run_fmha_recommend_hints(
     assert len(hints) > 0, "Hints length should be greater than 0"
 
 
-@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_target
 @tilelang.testing.requires_cuda_compute_version_eq(8, 0)
 def test_fmha_recommend_hints():
     run_fmha_recommend_hints(4, 32, 512, 512, 128, T.float16, T.float16, T.float16)

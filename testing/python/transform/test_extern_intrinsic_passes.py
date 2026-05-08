@@ -27,6 +27,8 @@ from tilelang.language.extern import (  # noqa: E402
     EXTERN_CALL_PREFIX,
 )
 
+_CUDA_TARGET = tvm.target.Target("cuda")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -62,6 +64,10 @@ def _has_layout_for_buffer(stmt, buffer_name: str) -> bool:
     return found[0]
 
 
+def _bind_layout_target(mod: tvm.IRModule) -> tvm.IRModule:
+    return tvm.tir.transform.BindTarget(_CUDA_TARGET)(mod)
+
+
 # ---------------------------------------------------------------------------
 # Layout-inference pickup
 # ---------------------------------------------------------------------------
@@ -86,20 +92,20 @@ def test_layout_inference_picks_up_extern_meta():
     def kernel(A: T.Buffer((8, 8), "float16"),  # noqa: N803
                B: T.Buffer((8, 8), "float16"),
                C: T.Buffer((8, 8), "float32")) -> None:
-        with T.block("root"):
-            T.block_attr({EXTERN_BLOCK_ATTR: {"layouts": ["simdgroup_a",
-                                                          "simdgroup_b",
-                                                          "simdgroup_c"]}})
+        with T.sblock("root"):
+            T.sblock_attr({EXTERN_BLOCK_ATTR: {"layouts": ["simdgroup_a",
+                                                           "simdgroup_b",
+                                                           "simdgroup_c"]}})
             T.evaluate(T.call_extern("handle",
                                      EXTERN_CALL_PREFIX + "simdgroup_mma_8x8",
                                      A.access_ptr("r"),
                                      B.access_ptr("r"),
                                      C.access_ptr("rw")))
 
-    mod = tvm.IRModule({"main": kernel})
+    mod = _bind_layout_target(tvm.IRModule({"main": kernel}))
     LayoutInference = tvm.get_global_func("tl.transform.LayoutInference")
     out = LayoutInference()(mod)
-    assert "main" in out.functions
+    assert out["main"] is not None
 
 
 # ---------------------------------------------------------------------------
@@ -122,15 +128,15 @@ def test_inject_pipeline_picks_up_extern_meta():
     def kernel(A: T.Buffer((8, 8), "float16"),  # noqa: N803
                B: T.Buffer((8, 8), "float16"),
                C: T.Buffer((8, 8), "float32")) -> None:
-        with T.block("root"):
-            T.block_attr({EXTERN_BLOCK_ATTR: {"pipeline_stage": 2}})
+        with T.sblock("root"):
+            T.sblock_attr({EXTERN_BLOCK_ATTR: {"pipeline_stage": 2}})
             T.evaluate(T.call_extern("handle",
                                      EXTERN_CALL_PREFIX + "simdgroup_mma_8x8",
                                      A.access_ptr("r"),
                                      B.access_ptr("r"),
                                      C.access_ptr("rw")))
 
-    mod = tvm.IRModule({"main": kernel})
+    mod = _bind_layout_target(tvm.IRModule({"main": kernel}))
     InjectPipeline = tvm.get_global_func("tl.transform.InjectSoftwarePipeline")
     out = InjectPipeline()(mod)
     body = out["main"].body
@@ -154,13 +160,13 @@ def test_inject_pipeline_picks_up_extern_meta():
 def test_inject_pipeline_passthrough_for_unset_stage():
     @T.prim_func
     def kernel(A: T.Buffer((8, 8), "float16")) -> None:  # noqa: N803
-        with T.block("root"):
-            T.block_attr({EXTERN_BLOCK_ATTR: {"pipeline_stage": -1}})
+        with T.sblock("root"):
+            T.sblock_attr({EXTERN_BLOCK_ATTR: {"pipeline_stage": -1}})
             T.evaluate(T.call_extern("handle",
                                      EXTERN_CALL_PREFIX + "noop",
                                      A.access_ptr("r")))
 
-    mod = tvm.IRModule({"main": kernel})
+    mod = _bind_layout_target(tvm.IRModule({"main": kernel}))
     InjectPipeline = tvm.get_global_func("tl.transform.InjectSoftwarePipeline")
     out = InjectPipeline()(mod)
     body = out["main"].body
@@ -206,17 +212,17 @@ def test_layout_inference_dispatches_mma_tile_size():
 
     @T.prim_func
     def kernel(C: T.Buffer((16, 16), "float32")) -> None:  # noqa: N803
-        with T.block("root"):
-            T.block_attr({EXTERN_BLOCK_ATTR: {"layouts": ["mma_C"],
-                                              "tile_size": [16, 16, 16]}})
+        with T.sblock("root"):
+            T.sblock_attr({EXTERN_BLOCK_ATTR: {"layouts": ["mma_C"],
+                                               "tile_size": [16, 16, 16]}})
             T.evaluate(T.call_extern("handle",
                                      EXTERN_CALL_PREFIX + "fake_mma_16x16",
                                      C.access_ptr("rw")))
 
-    mod = tvm.IRModule({"main": kernel})
+    mod = _bind_layout_target(tvm.IRModule({"main": kernel}))
     LayoutInference = tvm.get_global_func("tl.transform.LayoutInference")
     out = LayoutInference()(mod)
-    assert "main" in out.functions
+    assert out["main"] is not None
 
 
 @pytest.mark.skipif(
@@ -230,16 +236,16 @@ def test_layout_inference_unknown_layout_falls_through():
 
     @T.prim_func
     def kernel(A: T.Buffer((8, 8), "float16")) -> None:  # noqa: N803
-        with T.block("root"):
-            T.block_attr({EXTERN_BLOCK_ATTR: {"layouts": ["totally_made_up"]}})
+        with T.sblock("root"):
+            T.sblock_attr({EXTERN_BLOCK_ATTR: {"layouts": ["totally_made_up"]}})
             T.evaluate(T.call_extern("handle",
                                      EXTERN_CALL_PREFIX + "noop",
                                      A.access_ptr("r")))
 
-    mod = tvm.IRModule({"main": kernel})
+    mod = _bind_layout_target(tvm.IRModule({"main": kernel}))
     LayoutInference = tvm.get_global_func("tl.transform.LayoutInference")
     out = LayoutInference()(mod)
-    assert "main" in out.functions
+    assert out["main"] is not None
 
 
 if __name__ == "__main__":

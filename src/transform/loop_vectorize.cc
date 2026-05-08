@@ -1093,9 +1093,13 @@ static bool Z3CanProveAlignedAccess(const Buffer &buffer,
       // CPPMEGA fix-B4 (idea712): dtype-aware BV bounds. The flat
       // [0, 2^31) bound was unsound for any signed-int var that may
       // hold a negative offset (e.g. sub-buffer biases or
-      // `LegalizeNegativeIndex`-rewritten loads). Use the dtype's
-      // proper signed/unsigned range instead.
-      auto [lo64, hi64] = ::tilelang::tlz3::BVBoundsForDtype(dt);
+      // `LegalizeNegativeIndex`-rewritten loads). Refuse to prove when
+      // the dtype's range cannot be encoded exactly as int64 constants.
+      auto bounds = ::tilelang::tlz3::BVBoundsForDtype(dt);
+      if (!bounds.has_value()) {
+        return false;
+      }
+      auto [lo64, hi64] = *bounds;
       PrimExpr lo = make_const(dt, lo64);
       PrimExpr hi = make_const(dt, hi64);
       PrimExpr bound = (var >= lo) && (var < hi);
@@ -1492,7 +1496,7 @@ static bool Z3CanProveUnitStride(const PrimExpr &expr, const Var &var,
       PrimExpr bv_hi = make_const(vt, int64_t(0x7fffffff));
       range_constraint = range_constraint && (iter_var_size <= bv_hi);
     }
-    auto recover = z3.EnterConstraint(range_constraint);
+    ::tilelang::tlz3::ConstraintScope scope(z3, range_constraint);
 
     // Audit fix (HIGH): negative strides. The TileLang For loop is
     // normalised (min == 0, extent > 0, increment +1), so the loop
@@ -1534,7 +1538,7 @@ static bool Z3CanProveUnitStride(const PrimExpr &expr, const Var &var,
     //   recover_neg();
     // }
 
-    recover();
+    // scope destructs here — solver state rebalanced.
     if (!proved) {
       // Audit fix (LOW): log silent UNKNOWN/timeout/false paths so missed
       // vectorizations can be diagnosed later. We can't distinguish

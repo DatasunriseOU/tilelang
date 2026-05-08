@@ -93,6 +93,7 @@ REDUCE_CASES = [
         for op, dtype, M, N, src_scope, dst_scope, threads, batch in REDUCE_CASES
     ],
 )
+@tilelang.testing.requires_cuda_target
 def test_reduce(op, dtype, M, N, src_scope, dst_scope, threads, batch):
     import re
 
@@ -150,6 +151,7 @@ REDUCE_CLEAR_CASES = [
     REDUCE_CLEAR_CASES,
     ids=[f"{op}-{dtype}-{M}x{N}-{src_scope[0]}2{dst_scope[0]}" for op, dtype, M, N, src_scope, dst_scope in REDUCE_CLEAR_CASES],
 )
+@tilelang.testing.requires_cuda_target
 def test_reduce_clear(op, dtype, M, N, src_scope, dst_scope):
     @tilelang.jit(out_idx=-1)
     def kernel(M, N, dtype, op, src_scope, dst_scope):
@@ -233,6 +235,7 @@ def _make_finalize_reducer_kernel(block_M, block_N, dtype, op, batch):
     FINALIZE_REDUCER_CASES,
     ids=[f"{op}-{dtype}-{bM}x{bN}-b{batch}" for op, dtype, bM, bN, batch in FINALIZE_REDUCER_CASES],
 )
+@tilelang.testing.requires_cuda_target
 def test_finalize_reducer_codegen(op, dtype, block_M, block_N, batch):
     """batch=1 → scalar run; batch>1 → run_batch with correct template arg."""
     import re
@@ -256,6 +259,7 @@ def test_finalize_reducer_codegen(op, dtype, block_M, block_N, batch):
     [c for c in FINALIZE_REDUCER_CASES if c[4] == 1],
     ids=[f"{op}-{dtype}-{bM}x{bN}" for op, dtype, bM, bN, batch in FINALIZE_REDUCER_CASES if batch == 1],
 )
+@tilelang.testing.requires_cuda_target
 def test_finalize_reducer_correctness(op, dtype, block_M, block_N, batch):
     """Numerical correctness (batch=1 scalar path; batch>1 blocked by fragment layout bug)."""
     A = torch.randn(block_M, block_N, dtype=getattr(torch, dtype)).cuda()
@@ -283,6 +287,8 @@ FINALIZE_REDUCER_INVALID_CASES = [
 )
 def test_finalize_reducer_invalid_batch(batch, exc_type, match):
     block_M = 64
+    if batch >= 1 and tilelang.testing.get_default_target_kind() != "cuda":
+        pytest.skip("Compile-time finalize_reducer batch validation lowers through CUDA AllReduce")
 
     def make_kernel():
         @T.prim_func

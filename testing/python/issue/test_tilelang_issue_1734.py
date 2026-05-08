@@ -3,6 +3,14 @@ import tilelang.testing
 from tilelang import language as T
 
 
+def _device_kernel_source(source):
+    for marker in ("kernel void", "__global__ void"):
+        pos = source.find(marker)
+        if pos >= 0:
+            return source[pos:]
+    return source
+
+
 def test_issue_1734():
     """Test that loop-invariant if statements are hoisted out of loops."""
 
@@ -30,12 +38,14 @@ def test_issue_1734():
 
         return main
 
-    mod = kernel.compile()
-    source = mod.get_kernel_source()
+    mod = tilelang.lower(kernel.get_tir())
+    source = mod.kernel_source
     # Verify that the if statement is hoisted outside the for loop
     # After hoisting, we should see "if" before "for" pattern
-    if_pos = source.find("if (")
-    for_pos = source.find("for (")
+    kernel_source = _device_kernel_source(source)
+    if_pos = kernel_source.find("if (")
+    for_pos = kernel_source.find("for (")
+    assert if_pos >= 0 and for_pos >= 0, f"Expected hoisted if and loop in generated source.\n{kernel_source}"
     assert if_pos < for_pos, "Loop-invariant if should be hoisted outside the loop"
 
 

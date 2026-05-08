@@ -1,6 +1,7 @@
 """Reduce operations exposed on the TileLang language surface."""
 
 from __future__ import annotations
+import warnings
 from typing import Literal
 from tilelang._typing import BufferLikeType
 from tvm import tir
@@ -19,6 +20,7 @@ def _legalize_dim(buffer: tir.Buffer, dim: int):
 _REDUCE_OP_KEY = "tl.tileop.reduce"
 
 ReduceKind = Literal["sum", "abssum", "max", "absmax", "min", "mul", "bitand", "bitor", "bitxor"]
+_REDUCE_PROD_WARNED = False
 
 
 # NOTE(chaofan): T.reduce is implemented as a macro, so no return
@@ -62,6 +64,9 @@ def reduce(
     if not annotations:
         annotations = None
 
+    def _tile_region(buf: tir.Buffer, access_type: str):
+        return to_buffer_region(buf, access_type=access_type, extents=list(buf.shape))
+
     @macro
     def reduce_macro(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, dim: int, clear: bool) -> None:
         if is_shared(buffer) and is_shared(out):
@@ -79,8 +84,8 @@ def reduce(
             tir.call_intrin(
                 "handle",
                 tir.op.Op.get(_REDUCE_OP_KEY),
-                to_buffer_region(red_frag_in, access_type="r"),
-                to_buffer_region(red_frag_out, access_type="w"),
+                _tile_region(red_frag_in, "r"),
+                _tile_region(red_frag_out, "w"),
                 reduce_type,
                 dim,
                 clear,
@@ -95,8 +100,8 @@ def reduce(
             tir.call_intrin(
                 "handle",
                 tir.op.Op.get(_REDUCE_OP_KEY),
-                to_buffer_region(red_frag_in, access_type="r"),
-                to_buffer_region(out, access_type="w"),
+                _tile_region(red_frag_in, "r"),
+                _tile_region(out, "w"),
                 reduce_type,
                 dim,
                 clear,
@@ -112,8 +117,8 @@ def reduce(
             tir.call_intrin(
                 "handle",
                 tir.op.Op.get(_REDUCE_OP_KEY),
-                to_buffer_region(buffer, access_type="r"),
-                to_buffer_region(red_frag_out, access_type="w"),
+                _tile_region(buffer, "r"),
+                _tile_region(red_frag_out, "w"),
                 reduce_type,
                 dim,
                 clear,
@@ -124,8 +129,8 @@ def reduce(
             tir.call_intrin(
                 "handle",
                 tir.op.Op.get(_REDUCE_OP_KEY),
-                to_buffer_region(buffer, access_type="r"),
-                to_buffer_region(out, access_type="w"),
+                _tile_region(buffer, "r"),
+                _tile_region(out, "w"),
                 reduce_type,
                 dim,
                 clear,
@@ -249,24 +254,15 @@ def reduce_prod(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool 
     """
     global _REDUCE_PROD_WARNED
     if not _REDUCE_PROD_WARNED:
-        import warnings
         warnings.warn(
-            "tilelang.language.reduce_prod: the 'mul' AllReduce lowering "
-            "currently violates the last-index-vector-only invariant in "
-            "vectorize_loop.cc / storage_rewrite.cc. Constructing this "
-            "prim_func body will compile, but lowering will fail. Prefer "
-            "the log/exp synthesis fallback "
-            "(poc.triton_frontend.op_mapping._USE_LOGEXP_PROD = True) "
-            "until wave-8 fixes the C++ pass.",
+            "reduce_prod lowers through the 'mul' reduction kind; verify backend "
+            "mul support or use a log/exp fallback on unsupported targets.",
             RuntimeWarning,
             stacklevel=2,
         )
         _REDUCE_PROD_WARNED = True
     dim = _legalize_dim(buffer, dim)
     reduce(buffer, out, "mul", dim, clear, batch=batch)
-
-
-_REDUCE_PROD_WARNED = False
 
 
 def reduce_abssum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, batch: int = 1) -> None:

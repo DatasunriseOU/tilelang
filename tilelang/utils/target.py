@@ -96,6 +96,26 @@ def determine_torch_fp8_type(fp8_format: Literal["e4m3", "e5m2"] = "e4m3") -> to
     return torch_dtype
 
 
+def _legacy_target_dict(target: str) -> dict[str, str] | None:
+    parts = target.strip().split()
+    if len(parts) <= 1:
+        return None
+    target_dict = {"kind": parts[0]}
+    for option in parts[1:]:
+        if not option.startswith("-") or "=" not in option:
+            return None
+        key, value = option[1:].split("=", 1)
+        if not key or not value:
+            return None
+        target_dict[key] = value
+    return target_dict
+
+
+def _target_from_string(target: str) -> Target:
+    target_dict = _legacy_target_dict(target)
+    return Target(target_dict) if target_dict is not None else Target(target)
+
+
 def normalize_cutedsl_target(target: str | Target) -> Target | None:
     if isinstance(target, Target):
         if target.kind.name == "cuda" and "cutedsl" in target.keys:
@@ -106,7 +126,7 @@ def normalize_cutedsl_target(target: str | Target) -> Target | None:
         cuda_target_str = target.replace("cutedsl", "cuda", 1)
 
         try:
-            temp_target = Target(cuda_target_str)
+            temp_target = _target_from_string(cuda_target_str)
 
             target_dict = dict(temp_target.export())
             target_dict["keys"] = list(set(target_dict["keys"]) | {"cutedsl"})
@@ -178,14 +198,14 @@ def determine_target(target: str | Target | Literal["auto"] = "auto", return_obj
                 if not normalized_target:
                     raise AssertionError(f"Target {target} is not supported")
                 try:
-                    Target(normalized_target)
+                    parsed_target = _target_from_string(normalized_target)
                 except Exception as err:
                     examples = ", ".join(f"`{name}`" for name in SUPPORTED_TARGETS)
                     raise AssertionError(
                         f"Target {target} is not supported. Supported targets include: {examples}. "
                         "Pass additional options after the base name, e.g. `cuda -arch=sm_80`."
                     ) from err
-                return_var = normalized_target
+                return_var = parsed_target if _legacy_target_dict(normalized_target) is not None else normalized_target
             else:
                 raise AssertionError(f"Target {target} is not supported")
 

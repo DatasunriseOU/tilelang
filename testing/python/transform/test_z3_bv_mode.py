@@ -21,8 +21,15 @@ import tvm
 from tvm import tir
 
 
-_BV_CAN_PROVE = tvm.ffi.get_global_func("tl.z3.bv_can_prove")
-_BV_SCOPED_ROUND_TRIP = tvm.ffi.get_global_func("tl.z3.bv_scoped_round_trip")
+_BV_CAN_PROVE = tvm.ffi.get_global_func("tl.z3.bv_can_prove", allow_missing=True)
+_BV_SCOPED_ROUND_TRIP = tvm.ffi.get_global_func(
+    "tl.z3.bv_scoped_round_trip", allow_missing=True
+)
+
+pytestmark = pytest.mark.skipif(
+    _BV_CAN_PROVE is None or _BV_SCOPED_ROUND_TRIP is None,
+    reason="Z3 BV test helpers require configuring with -DTILELANG_BUILD_TESTS=ON",
+)
 
 
 def _can_prove(var, lo, hi, expr, bv_width):

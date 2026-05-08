@@ -73,6 +73,10 @@ def _classify_reduce_op(value: tir.PrimExpr, acc_var) -> str | None:
         return "add"  # sub-into-acc still uses simd_sum-style lowering
     if isinstance(value, tir.Mul):
         return None  # not a supported simd reduce
+    if hasattr(tir, "Max") and isinstance(value, tir.Max):
+        return "max"
+    if hasattr(tir, "Min") and isinstance(value, tir.Min):
+        return "min"
     if isinstance(value, tir.Call):
         op_name = getattr(getattr(value, "op", None), "name", "")
         if op_name.endswith("max"):
@@ -250,7 +254,7 @@ def _build_butterfly(
     responsible for storing it back into the original accumulator buffer.
     """
     shfl_op = tir.op.Op.get("tl.shfl_xor_sync")
-    full_mask = tir.const(-1, "uint32")
+    full_mask = tir.const((1 << 32) - 1, "uint32")
     width = tir.const(_SIMD_LANES, "int32")
     value: tir.PrimExpr = acc_load
     for shift in _butterfly_stages(extent):
@@ -273,34 +277,47 @@ class _ButterflyRewriter:
     def __call__(self, body: tir.Stmt) -> tir.Stmt:
         return self._mutate(body)
 
+    @staticmethod
+    def _span(node):
+        return getattr(node, "span", None)
+
+    def _for_with_body(self, node: tir.For, body: tir.Stmt) -> tir.For:
+        return tir.For(
+            node.loop_var, node.min, node.extent, node.kind, body,
+            getattr(node, "thread_binding", None),
+            getattr(node, "annotations", {}),
+            self._span(node),
+        )
+
     def _mutate(self, node):
         if isinstance(node, tir.For):
             return self._visit_for(node)
         if isinstance(node, tir.SeqStmt):
             new_seq = [self._mutate(s) for s in node.seq]
-            return tir.SeqStmt(new_seq, node.span)
+            return tir.SeqStmt(new_seq, self._span(node))
         if isinstance(node, tir.IfThenElse):
             new_then = self._mutate(node.then_case) if node.then_case is not None else None
             new_else = self._mutate(node.else_case) if node.else_case is not None else None
-            return tir.IfThenElse(node.condition, new_then, new_else, node.span)
+            return tir.IfThenElse(node.condition, new_then, new_else, self._span(node))
         if isinstance(node, tir.LetStmt):
-            return tir.LetStmt(node.var, node.value, self._mutate(node.body), node.span)
+            return tir.LetStmt(node.var, node.value, self._mutate(node.body), self._span(node))
         if isinstance(node, tir.AttrStmt):
             return tir.AttrStmt(
-                node.node, node.attr_key, node.value, self._mutate(node.body), node.span
+                node.node, node.attr_key, node.value, self._mutate(node.body), self._span(node)
             )
-        if isinstance(node, tir.AllocateConst):
-            return tir.AllocateConst(
+        allocate_const = getattr(tir, "AllocateConst", None)
+        if allocate_const is not None and isinstance(node, allocate_const):
+            return allocate_const(
                 node.buffer_var, node.dtype, node.extents, node.data,
-                self._mutate(node.body), node.annotations, node.span,
+                self._mutate(node.body), node.annotations, self._span(node),
             )
         if isinstance(node, tir.Allocate):
             return tir.Allocate(
                 node.buffer_var, node.dtype, node.extents, node.condition,
-                self._mutate(node.body), node.annotations, node.span,
+                self._mutate(node.body), node.annotations, self._span(node),
             )
         if isinstance(node, tir.DeclBuffer):
-            return tir.DeclBuffer(node.buffer, self._mutate(node.body), node.span)
+            return tir.DeclBuffer(node.buffer, self._mutate(node.body), self._span(node))
         if isinstance(node, tir.Block):
             return tir.Block(
                 node.iter_vars, node.reads, node.writes, node.name_hint,
@@ -309,13 +326,24 @@ class _ButterflyRewriter:
                 getattr(node, "alloc_buffers", []),
                 getattr(node, "match_buffers", []),
                 getattr(node, "annotations", {}),
-                node.span,
+                self._span(node),
             )
         if isinstance(node, tir.BlockRealize):
             return tir.BlockRealize(
                 node.iter_values, node.predicate,
-                self._mutate(node.block), node.span,
+                self._mutate(node.block), self._span(node),
             )
+        # Catch-all: recurse into any body-bearing node we don't explicitly
+        # handle (e.g. AssertStmt, ProducerRealize). Without this, annotated
+        # reduction loops nested inside unknown statement types are silently
+        # skipped. We reconstruct the node if the body changed.
+        if hasattr(node, "body") and node.body is not None:
+            new_body = self._mutate(node.body)
+            if not new_body.same_as(node.body):
+                # Best-effort reconstruction via with_body if available,
+                # otherwise fall through to return the original node.
+                if hasattr(node, "with_body"):
+                    return node.with_body(new_body)
         return node
 
     def _visit_for(self, node: tir.For) -> tir.Stmt:
@@ -326,21 +354,12 @@ class _ButterflyRewriter:
         if isinstance(body_stmt, tir.SeqStmt) and len(body_stmt.seq) == 1:
             body_stmt = body_stmt.seq[0]
         if not isinstance(body_stmt, tir.BufferStore):
-            return tir.For(
-                node.loop_var, node.min, node.extent, node.kind, recursed_body,
-                node.thread_binding, node.annotations, node.span,
-            )
+            return self._for_with_body(node, recursed_body)
         op_name = _classify_reduce_op(body_stmt.value, body_stmt.buffer)
         if op_name is None or not _is_supported_reduce(op_name):
-            return tir.For(
-                node.loop_var, node.min, node.extent, node.kind, recursed_body,
-                node.thread_binding, node.annotations, node.span,
-            )
+            return self._for_with_body(node, recursed_body)
         if not _is_butterfly_annotated(node):
-            return tir.For(
-                node.loop_var, node.min, node.extent, node.kind, recursed_body,
-                node.thread_binding, node.annotations, node.span,
-            )
+            return self._for_with_body(node, recursed_body)
         proved, query = _z3_extent_le_32(node.extent)
         if not proved:
             # Annotated loop but Z3 cannot prove extent <= 32 — log so CI can
@@ -350,10 +369,7 @@ class _ButterflyRewriter:
                 "reason=z3_extent_unproved query=%s",
                 str(node.loop_var.name), str(node.extent), query,
             )
-            return tir.For(
-                node.loop_var, node.min, node.extent, node.kind, recursed_body,
-                node.thread_binding, node.annotations, node.span,
-            )
+            return self._for_with_body(node, recursed_body)
 
         # Resolve concrete extent for stage sequence.
         if isinstance(node.extent, tir.IntImm):
@@ -369,10 +385,7 @@ class _ButterflyRewriter:
                 "reason=symbolic_extent_no_static_value",
                 str(node.loop_var.name), str(node.extent),
             )
-            return tir.For(
-                node.loop_var, node.min, node.extent, node.kind, recursed_body,
-                node.thread_binding, node.annotations, node.span,
-            )
+            return self._for_with_body(node, recursed_body)
 
         # #9 butterfly guard: only rewrite when extent is a power-of-2 in
         # [2, 32]. Non-power-of-2 extents would yield bad shuffle indices,
@@ -385,10 +398,7 @@ class _ButterflyRewriter:
                 "reason=extent_not_pow2_in_[2,32]",
                 str(node.loop_var.name), extent_val,
             )
-            return tir.For(
-                node.loop_var, node.min, node.extent, node.kind, recursed_body,
-                node.thread_binding, node.annotations, node.span,
-            )
+            return self._for_with_body(node, recursed_body)
 
         # Build acc_load (BufferLoad mirroring the BufferStore).
         store: tir.BufferStore = body_stmt
@@ -397,7 +407,7 @@ class _ButterflyRewriter:
             store.buffer.dtype
         )
         reduced = _build_butterfly(acc_load, op_name, extent_val, dtype)
-        new_store = tir.BufferStore(store.buffer, reduced, list(store.indices), store.span)
+        new_store = tir.BufferStore(store.buffer, reduced, list(store.indices), self._span(store))
         self.replaced += 1
         self.stages_emitted += len(_butterfly_stages(extent_val))
         return new_store
@@ -413,7 +423,8 @@ def rewrite_reductions(func: tir.PrimFunc) -> tuple[tir.PrimFunc, int, int]:
     if rw.replaced == 0:
         return func, 0, 0
     new_func = tir.PrimFunc(
-        func.params, new_body, func.ret_type, func.buffer_map, func.attrs, func.span,
+        func.params, new_body, func.ret_type, func.buffer_map, func.attrs,
+        getattr(func, "span", None),
     )
     return new_func, rw.replaced, rw.stages_emitted
 
@@ -440,8 +451,8 @@ def count_shfl_xor_calls(func: tir.PrimFunc) -> int:
 def _metal_simd_lift(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.PrimFunc:
     enabled = False
     try:
-        from tvm.transform import PassContext
-        cfg = PassContext.current().config
+        from tvm import transform as tvm_transform
+        cfg = tvm_transform.PassContext.current().config
         val = cfg.get(PASS_CONFIG_KEY, None) if cfg is not None else None
         if val is not None:
             try:

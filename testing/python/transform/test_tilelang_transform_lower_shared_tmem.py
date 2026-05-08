@@ -5,7 +5,7 @@ import tilelang.language as T
 import tilelang.testing
 
 
-TARGET = tvm.target.Target("cuda -arch=sm_100")
+TARGET = tvm.target.Target({"kind": "cuda", "arch": "sm_100"})
 
 
 def _apply(func):

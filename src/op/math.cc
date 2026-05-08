@@ -22,8 +22,10 @@ PrimExpr pow_of_int_op(PrimExpr args) {
   ICHECK_EQ(arg.size(), 2);
   PrimExpr base = arg[0];
   PrimExpr exp = arg[1];
+  const auto *exp_imm = exp.as<IntImmNode>();
+  ICHECK(exp_imm) << "pow_of_int expects integer exponent";
   String pow_of_int_name =
-      "tl::pow_of_int<" + std::to_string(exp.as<IntImmNode>()->value) + ">";
+      "tl::pow_of_int<" + std::to_string(exp_imm->value) + ">";
   return tirx::Call(base.dtype(), tirx::builtin::call_extern(),
                    {StringImm(pow_of_int_name), base});
 }

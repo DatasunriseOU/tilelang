@@ -40,7 +40,10 @@ def _count_allocate_inside_attr(func, attr_key):
             inside[0] = True
             post_order_visit(node.body, _visit)
             inside[0] = old
-        elif isinstance(node, tvm.tir.Allocate) and inside[0]:
+        elif inside[0] and (
+            isinstance(node, (tvm.tir.Allocate, tvm.tir.AllocBuffer))
+            or type(node).__name__ in {"AllocBuffer", "DeclBuffer"}
+        ):
             count[0] += 1
 
     post_order_visit(func.body, _visit)
@@ -67,7 +70,7 @@ def _apply_lower_opaque_pipeline(func, target, pass_configs=None):
 # ---------------------------------------------------------------------------
 def test_lower_opaque_block_inserts_lexical_alloc_scope_for_explicit_block():
     """An explicitly annotated block should produce a lexical_alloc_scope."""
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
 
     @T.prim_func
     def func(
@@ -101,7 +104,7 @@ def test_lower_opaque_block_inserts_lexical_alloc_scope_for_explicit_block():
 # ---------------------------------------------------------------------------
 def test_lower_opaque_block_skips_unmarked_local_alloc():
     """An unmarked local-alloc block should not produce a lexical_alloc_scope."""
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
 
     @T.prim_func
     def func(
@@ -130,7 +133,7 @@ def test_lower_opaque_block_skips_unmarked_local_alloc():
 # ---------------------------------------------------------------------------
 def test_lower_opaque_block_skips_empty_alloc():
     """A block without alloc_buffers should not produce a lexical_alloc_scope."""
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
 
     @T.prim_func
     def func(
@@ -157,7 +160,7 @@ def test_lower_opaque_block_skips_empty_alloc():
 # ---------------------------------------------------------------------------
 def test_lower_opaque_block_inserts_scope_for_gemm_descriptor_alloc():
     """Lowered WGMMA descriptor buffers inside a loop should trigger lexical_alloc_scope."""
-    target = tvm.target.Target("cuda -arch=sm_90a")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_90a"})
 
     @T.prim_func
     def func(
@@ -188,7 +191,7 @@ def test_lower_opaque_block_inserts_scope_for_gemm_descriptor_alloc():
 # ---------------------------------------------------------------------------
 def test_lower_opaque_block_skips_local_var_only_alloc():
     """A block that allocates only local.var should not get lexical_alloc_scope."""
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
 
     @T.prim_func
     def func(
@@ -217,7 +220,7 @@ def test_lower_opaque_block_skips_local_var_only_alloc():
 # ---------------------------------------------------------------------------
 def test_lower_opaque_block_marks_explicit_top_level_local_alloc():
     """A top-level explicitly annotated local alloc should get lexical_alloc_scope."""
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
 
     @T.prim_func
     def func(
@@ -246,7 +249,7 @@ def test_lower_opaque_block_marks_explicit_top_level_local_alloc():
 # ---------------------------------------------------------------------------
 def test_lower_opaque_block_skips_fragment_alloc():
     """A fragment alloc should not force lexical_alloc_scope by itself."""
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
 
     @T.prim_func
     def func(
@@ -274,7 +277,7 @@ def test_lower_opaque_block_skips_fragment_alloc():
 # ---------------------------------------------------------------------------
 def test_lower_opaque_block_skips_fragment_root_in_disable_ws_pipeline():
     """A fragment root block should not force lexical_alloc_scope in disable-ws pipeline."""
-    target = tvm.target.Target("cuda -arch=sm_90a")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_90a"})
     pass_configs = {tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED.value: True}
 
     @T.prim_func
@@ -311,7 +314,7 @@ def test_lower_opaque_block_skips_fragment_root_in_disable_ws_pipeline():
 # ---------------------------------------------------------------------------
 def test_storage_rewrite_preserves_scope():
     """lexical_alloc_scope should survive StorageRewrite without crashing."""
-    target = tvm.target.Target("cuda -arch=sm_80")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
 
     @T.prim_func
     def func(

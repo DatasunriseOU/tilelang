@@ -374,10 +374,9 @@ class TTIRWalker:
         self.visited.append(op_name)
         emitter = OP_TABLE.get(op_name)
         if emitter is None:
-            # Unknown op: leave it for the caller to decide; we don't
-            # raise here because the MLIR walker is also used for
-            # generic-form parsing where unknown ops are expected.
-            return
+            raise NotImplementedError(
+                f"Unsupported TTIR op {op_name!r}: no emitter registered"
+            )
         try:
             result = emitter(op, self.ctx)
         except NotImplementedError:
