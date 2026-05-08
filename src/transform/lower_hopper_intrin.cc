@@ -1,5 +1,5 @@
 /*!
- * \file lower hopper intrin.cc
+ * \file tl/transform/lower_hopper_intrin.cc
  * \brief Lower Hopper intrinsics cuda GPU(sm90+)
  */
 
@@ -16,8 +16,8 @@
 #include <unordered_map>
 #include <vector>
 
-#include "../op/builtin.h"
-#include "../runtime/runtime.h"
+#include "backend/cuda/runtime.h"
+#include "op/builtin.h"
 #include "vendored/let_stmt.h"
 
 namespace tvm {

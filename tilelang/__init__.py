@@ -271,7 +271,30 @@ if not env.is_light_import():
         # Triton frontend is optional; tolerate environments without
         # the (large) implementation tree.
         pass
+    for _backend_name in ("cpu", "cuda", "rocm"):
+        try:
+            globals()[_backend_name] = __import__(
+                f"{__name__}.{_backend_name}",
+                fromlist=[_backend_name],
+            )
+        except Exception:
+            # Backend packages are optional in partially merged local
+            # checkouts; importing tilelang.engine must keep working for
+            # non-backend-specific lowering.
+            pass
+    # Fork-specific: ``tilelang.backend`` hosts the reduction-lowerer dispatch
+    # and the standalone Metal backend (gemm + reduction). Importing it here
+    # registers those implementations (upstream #2165 moved only the
+    # CUDA/CPU/ROCm GEMM packages out to ``tilelang.{cpu,cuda,rocm}``).
+    try:
+        from . import backend as _backend  # noqa: F401
+    except Exception:
+        pass
 
 
 del _lazy_extension_imports
 del _import_optional_torch
+try:
+    del _backend_name
+except NameError:
+    pass
