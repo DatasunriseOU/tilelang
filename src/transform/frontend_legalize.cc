@@ -90,6 +90,34 @@ private:
     return arith::IRMutatorWithAnalyzer::VisitStmt(stmt);
   }
 
+  Stmt VisitStmt_(const SeqStmtNode *node) final {
+    ffi::Array<Stmt> seq;
+    bool changed = false;
+    for (const Stmt &stmt : node->seq) {
+      if (const auto *bind = stmt.as<BindNode>()) {
+        let_bindings_[bind->var.get()] = this->VisitExpr(bind->value);
+        changed = true;
+        continue;
+      }
+      Stmt visited = VisitStmt(stmt);
+      changed = changed || !visited.same_as(stmt);
+      if (const auto *nested = visited.as<SeqStmtNode>()) {
+        for (const Stmt &nested_stmt : nested->seq) {
+          seq.push_back(nested_stmt);
+        }
+      } else {
+        seq.push_back(visited);
+      }
+    }
+    if (!changed) {
+      return tvm::ffi::GetRef<Stmt>(node);
+    }
+    if (seq.empty()) {
+      return Evaluate(0);
+    }
+    return seq.size() == 1 ? seq[0] : SeqStmt(std::move(seq));
+  }
+
   PrimExpr VisitExpr_(const LetNode *node) final {
     let_bindings_[node->var.get()] = node->value;
     return arith::IRMutatorWithAnalyzer::VisitExpr(node->body);
@@ -108,9 +136,69 @@ Pass LetInline() {
   return CreatePrimFuncPass(pass_func, 0, "tl.LetInline", {});
 }
 
+class ParallelLoopLegalizer : public StmtExprMutator {
+public:
+  static PrimFunc Substitute(PrimFunc f) {
+    ParallelLoopLegalizer mutator;
+    PrimFuncNode *fptr = f.CopyOnWrite();
+    fptr->body = mutator.VisitStmt(f->body);
+    return f;
+  }
+
+private:
+  Stmt VisitStmt_(const ForNode *node) final {
+    auto n = StmtExprMutator::VisitStmt_(node);
+    if (const auto *new_for = n.as<ForNode>()) {
+      if (new_for->kind == ForKind::kParallel) {
+        if (const auto *min_node = new_for->extent.as<MinNode>()) {
+          PrimExpr a = min_node->a;
+          PrimExpr b = min_node->b;
+          PrimExpr static_extent = PrimExpr();
+          if (a->IsInstance<IntImmNode>()) {
+            static_extent = a;
+          } else if (b->IsInstance<IntImmNode>()) {
+            static_extent = b;
+          }
+          if (static_extent.defined()) {
+            Stmt body = IfThenElse(new_for->loop_var < new_for->extent, new_for->body);
+            return For(new_for->loop_var, new_for->min, static_extent, new_for->kind, body,
+                       new_for->thread_binding, new_for->annotations, new_for->step, new_for->span);
+          }
+        } else if (const auto *call = new_for->extent.as<CallNode>()) {
+          const auto* op_node = call->op.as<OpNode>();
+          if (op_node && op_node->name == "tir.min") {
+            PrimExpr a = call->args[0];
+            PrimExpr b = call->args[1];
+            PrimExpr static_extent = PrimExpr();
+            if (a->IsInstance<IntImmNode>()) {
+              static_extent = a;
+            } else if (b->IsInstance<IntImmNode>()) {
+              static_extent = b;
+            }
+            if (static_extent.defined()) {
+              Stmt body = IfThenElse(new_for->loop_var < new_for->extent, new_for->body);
+              return For(new_for->loop_var, new_for->min, static_extent, new_for->kind, body,
+                         new_for->thread_binding, new_for->annotations, new_for->step, new_for->span);
+            }
+          }
+        }
+      }
+    }
+    return n;
+  }
+};
+
+Pass LegalizeParallelLoop() {
+  auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
+    return ParallelLoopLegalizer::Substitute(std::move(f));
+  };
+  return CreatePrimFuncPass(pass_func, 0, "tl.LegalizeParallelLoop", {});
+}
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("tl.transform.LetInline", LetInline);
+  refl::GlobalDef().def("tl.transform.LegalizeParallelLoop", LegalizeParallelLoop);
 }
 
 } // namespace tl

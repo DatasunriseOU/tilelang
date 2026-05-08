@@ -32,7 +32,7 @@ def flashattn(batch, heads, heads_kv, dim, dim_v, block_N, block_H, num_stages, 
     shape_indices = [batch, heads_kv, max_selected_blocks]
     shape_o = [batch, heads, dim_v]
     part_shape = [batch, heads, num_split, dim_v]
-    valid_block_H = min(block_H, kv_group_num)
+    valid_block_H = T.min(block_H, kv_group_num)
 
     @T.prim_func
     def main(
@@ -110,13 +110,10 @@ def flashattn(batch, heads, heads_kv, dim, dim_v, block_N, block_H, num_stages, 
                 for i in T.Parallel(block_H):
                     logsum[i] = T.log2(logsum[i]) + scores_max[i] * scale
 
-            # TODO(lei): Support T.Parallel(valid_block_H)
-            for i in T.Parallel(block_H):
-                if i < valid_block_H:
-                    glse[bid, hid * valid_block_H + i, sid] = logsum[i]
-            for i, j in T.Parallel(block_H, dim_v):
-                if i < valid_block_H:
-                    Output_partial[bid, hid * valid_block_H + i, sid, j] = acc_o[i, j]
+            for i in T.Parallel(valid_block_H):
+                glse[bid, hid * valid_block_H + i, sid] = logsum[i]
+            for i, j in T.Parallel(valid_block_H, dim_v):
+                Output_partial[bid, hid * valid_block_H + i, sid, j] = acc_o[i, j]
 
         # combine
         with T.Kernel(heads, batch, threads=128) as (by, bz):
