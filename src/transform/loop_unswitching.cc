@@ -322,6 +322,10 @@ bool IsSideEffectFreeStmt(const Stmt &stmt) {
     return IsSideEffectFreeStmt(op->body);
   }
 
+  if (const auto *op = stmt.as<BindNode>()) {
+    return SideEffect(op->value) <= CallEffectKind::kReadState;
+  }
+
   if (const auto *op = stmt.as<IfThenElseNode>()) {
     if (SideEffect(op->condition) > CallEffectKind::kReadState) {
       return false;
@@ -427,6 +431,44 @@ public:
     return StmtExprMutator::VisitStmt_(op);
   }
 
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
+    Array<Stmt> new_seq;
+    bool changed = false;
+    for (const Stmt &stmt : op->seq) {
+      if (const auto *bind = stmt.as<BindNode>()) {
+        if (hoisted_vars.count(bind->var.get())) {
+          changed = true;
+          continue;
+        }
+        PrimExpr value = VisitExpr(bind->value);
+        if (value.same_as(bind->value)) {
+          new_seq.push_back(stmt);
+        } else {
+          new_seq.push_back(Bind(bind->var, value, bind->span));
+          changed = true;
+        }
+        continue;
+      }
+      Stmt visited = VisitStmt(stmt);
+      changed = changed || !visited.same_as(stmt);
+      if (const auto *nested = visited.as<SeqStmtNode>()) {
+        for (const Stmt &nested_stmt : nested->seq) {
+          new_seq.push_back(nested_stmt);
+        }
+        changed = true;
+      } else {
+        new_seq.push_back(visited);
+      }
+    }
+    if (!changed) {
+      return ffi::GetRef<Stmt>(op);
+    }
+    if (new_seq.empty()) {
+      return Evaluate(0);
+    }
+    return new_seq.size() == 1 ? new_seq[0] : SeqStmt(std::move(new_seq));
+  }
+
   Stmt VisitStmt(const Stmt &stmt) final {
     if (const auto *op = stmt.as<LetStmtNode>()) {
       // Remove LetStmts for hoisted variables (they are now bound outside the
@@ -497,6 +539,11 @@ public:
         disallowed_vars(disallowed_vars) {}
 
   void VisitStmt(const Stmt &stmt) final {
+    if (const auto *op = stmt.as<BindNode>()) {
+      let_bindings_[op->var.get()] = op->value;
+      this->VisitExpr(op->value);
+      return;
+    }
     if (const auto *op = stmt.as<LetStmtNode>()) {
       // Track ALL Let bindings to detect when a condition uses a variable
       // that is defined inside the loop with a loop-variant value.
@@ -639,7 +686,7 @@ public:
     // outermost)
     for (auto it = finder.hoisted_let_bindings.rbegin();
          it != finder.hoisted_let_bindings.rend(); ++it) {
-      result = LetStmt(it->first, it->second, result);
+      result = SeqStmt::Flatten(Bind(it->first, it->second), result);
     }
 
     if (pushed_thread_idx) {

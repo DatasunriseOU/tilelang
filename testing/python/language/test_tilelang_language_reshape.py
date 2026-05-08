@@ -197,6 +197,7 @@ def run_reshape_layout_transform_shared(N, M, dtype):
     profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_reshape_layout_transform_shared():
     run_reshape_layout_transform_shared(1024, 32, T.float32)
     run_reshape_layout_transform_shared(2048, 64, T.float16)

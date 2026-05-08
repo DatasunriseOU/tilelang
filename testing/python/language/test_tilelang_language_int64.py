@@ -1,5 +1,6 @@
 import tilelang
 import tilelang.language as T
+import tilelang.testing
 
 
 @tilelang.jit
@@ -27,6 +28,7 @@ def run_fill_symbolic(n: int):
     assert x.min() == 1.0 and x.max() == 1.0
 
 
+@tilelang.testing.requires_cuda_target
 def test_fill_symbolic():
     # Requires 8GB VRAM
     run_fill_symbolic(2**32)
@@ -56,6 +58,7 @@ def run_fill_static(n: int):
     assert x.min() == 1.0 and x.max() == 1.0
 
 
+@tilelang.testing.requires_cuda_target
 def test_fill_static():
     # Requires 8GB VRAM
     run_fill_static(2**32)

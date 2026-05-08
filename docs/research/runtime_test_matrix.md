@@ -23,6 +23,9 @@ shipped four families of runtime bugs that no `pytest --collect-only` would catc
 - python: `3.13.12` from `/Volumes/external/sources/cppmega.mlx/.venv` (the only venv on host with
   `torch 2.13.0.dev`, `mlx 0.31.2`, `tilelang` (loaded from `/tmp/tl_apache_tvm_swap/build/lib`),
   `cppmega_mlx`, `cppmega`, `pytest 8.4.2`)
+- `cppmega_mlx` source: `/Users/dave/sources/cppmega.mlx` (resolves to
+  `/Volumes/external/sources/cppmega.mlx`); include this directory in
+  `PYTHONPATH` for local tests that import `cppmega_mlx`.
 - `mlx.metal.is_available()` → True
 - `torch.backends.mps.is_available()` → True, `torch.cuda.is_available()` → False
 - `triton` → **NOT installed** (skips the `tt.*` runtime conformance kernels)

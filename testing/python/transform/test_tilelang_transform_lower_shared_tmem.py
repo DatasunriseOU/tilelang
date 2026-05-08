@@ -26,6 +26,7 @@ def _collect_calls(stmt, op_name: str):
     return calls
 
 
+@tilelang.testing.requires_cuda_target
 def test_explicit_deallocate_tmem_suppresses_auto_dealloc():
     """Explicit T.deallocate_tmem on fallthrough suppresses auto-dealloc."""
 
@@ -45,6 +46,7 @@ def test_explicit_deallocate_tmem_suppresses_auto_dealloc():
     assert dealloc_call.args[1].value == 128
 
 
+@tilelang.testing.requires_cuda_target
 def test_explicit_deallocate_only_suppresses_matching_buffer():
     """Only the explicitly-deallocated buffer skips auto-dealloc; others keep it."""
 
@@ -66,6 +68,7 @@ def test_explicit_deallocate_only_suppresses_matching_buffer():
     assert dealloc_num_cols == [64, 128]
 
 
+@tilelang.testing.requires_cuda_target
 def test_dealloc_before_thread_return_keeps_auto_dealloc():
     """Dealloc on non-fallthrough path (before thread_return) does NOT suppress auto-dealloc."""
 

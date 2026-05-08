@@ -4,6 +4,7 @@ import tilelang.testing
 import torch
 
 
+@tilelang.testing.requires_cuda_target
 def test_tensor_annot_mul():
     # There is a known issue where the cython execution backend fails to build with T.symbolic.
     # Forcing the TVM FFI execution backend to avoid the issue on HIP.
@@ -28,6 +29,7 @@ def test_tensor_annot_mul():
     assert torch.equal(A, expected)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tensor_annot_add():
     # There is a known issue where the cython execution backend fails to build with T.symbolic.
     # Forcing the TVM FFI execution backend to avoid the issue on HIP.
@@ -52,6 +54,7 @@ def test_tensor_annot_add():
     assert torch.equal(A, expected)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tensor_annot_mul_add():
     # There is a known issue where the cython execution backend fails to build with T.symbolic.
     # Forcing the TVM FFI execution backend to avoid the issue on HIP.

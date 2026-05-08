@@ -202,6 +202,7 @@ def test_dtype_str_repr():
 #         assert T.dtype(b) == a, "dtype conversion error"
 
 
+@tilelang.testing.requires_cuda_target
 def test_var_assign():
     @tilelang.jit
     def test_var_assign():
@@ -254,6 +255,7 @@ def test_marco_return():
             check(d, (int, float, T.PrimExpr))
 
 
+@tilelang.testing.requires_cuda_target
 def test_serial_for_with_step():
     @tilelang.jit
     def stepped_serial():
@@ -290,6 +292,7 @@ def test_serial_for_with_step():
     assert not isinstance(T.serial(10, -1, -1), IRBuilderFrame)
 
 
+@tilelang.testing.requires_cuda_target
 def test_swap_logic():
     @tilelang.jit
     def swap_var(A):
@@ -403,6 +406,7 @@ def test_var_macro():
         pass
 
 
+@tilelang.testing.requires_cuda_target
 def test_frame_inside_macro():
     @tilelang.jit
     def get_sample_kernel():
@@ -436,7 +440,7 @@ def test_buffer_slice_step():
                 B[0:5:2] = A[0:10:2]
 
         raise AssertionError("Expect to report an error, buffer slice with step is not supported")
-    except RuntimeError:
+    except (RuntimeError, TypeError):
         pass
 
 
@@ -452,6 +456,7 @@ def test_boolop():
     cond()
 
 
+@tilelang.testing.requires_cuda_target
 def test_constexpr_if():
     @tilelang.jit
     def probe(A, tmp: bool):

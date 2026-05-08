@@ -225,6 +225,8 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
     # Normalize negative indices to canonical non-negative form
     mod = tilelang.transform.LegalizeNegativeIndex()(mod)
+    # Legalize parallel loops with dynamic bounds
+    mod = tilelang.transform.LegalizeParallelLoop()(mod)
     # Verify parallel loop correctness
     if should_enable_race_check():
         mod = tilelang.transform.VerifyParallelLoop()(mod)

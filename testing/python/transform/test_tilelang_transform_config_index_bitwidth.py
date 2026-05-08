@@ -2,6 +2,7 @@ import math
 
 import tilelang
 import tilelang.language as T
+import tilelang.testing
 
 
 def blocksparse_flashattn(batch, heads, seq_len, dim, downsample_len, is_causal):
@@ -146,6 +147,7 @@ def blocksparse_flashattn(batch, heads, seq_len, dim, downsample_len, is_causal)
     return kernel_func(block_M, block_N, num_stages, threads)
 
 
+@tilelang.testing.requires_cuda_target
 def test_sta_attention():
     # Config
     BATCH, N_HEADS, SEQ_LEN, D_HEAD = 1, 24, 82944, 128

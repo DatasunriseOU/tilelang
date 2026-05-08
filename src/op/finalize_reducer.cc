@@ -19,6 +19,24 @@ namespace tl {
 
 using namespace tirx;
 
+namespace {
+
+bool SameSimdgroupMetalFastPathSafe(const Target &target, int reducing_threads,
+                                    int scale,
+                                    const PrimExpr &thread_offset_expr,
+                                    arith::Analyzer *analyzer) {
+  if (!TargetIsMetal(target) || reducing_threads > 32 || scale != 1) {
+    return false;
+  }
+  PrimExpr thread_offset =
+      analyzer != nullptr ? analyzer->Simplify(thread_offset_expr)
+                          : thread_offset_expr;
+  const int64_t *thread_offset_value = as_const_int(thread_offset);
+  return thread_offset_value != nullptr && (*thread_offset_value % 32) == 0;
+}
+
+}  // namespace
+
 /**
  * @brief Construct a FinalizeReducerOp from TL operator arguments and a buffer
  * map.
@@ -105,6 +123,8 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
   // adopted from ReduceOp
   int reducing_threads = extent;
   auto thread_offset = T.thread_bounds->min;
+  bool same_simdgroup_metal_fast_path_safe = SameSimdgroupMetalFastPathSafe(
+      T.target, reducing_threads, scale, thread_offset, analyzer);
 
   // Validate batch against the layout's total output element count.
   int64_t layout_batch_size = 1;
@@ -142,7 +162,9 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
   if (use_batch) {
     // Batched AllReduce: single butterfly pass for all output elements.
     int workspace_stride =
-        static_cast<int>(*as_const_int(T.thread_bounds->extent));
+        same_simdgroup_metal_fast_path_safe
+            ? 0
+            : static_cast<int>(*as_const_int(T.thread_bounds->extent));
     std::stringstream ss;
     if (TargetHasSMVersionGE(T.target, 90)) {
       auto all_threads = T.thread_bounds->extent;
@@ -164,13 +186,20 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
          << ", " << thread_offset << ", tl::SyncThreadsBarrier, "
          << effective_batch << ", " << workspace_stride << ">::run_batch";
     }
-    int ws_size = workspace_stride * static_cast<int>(effective_batch);
-    PrimExpr workspace = T.AddWorkspace(ws_size, buffer->dtype);
+    bool need_workspace =
+        !TargetIsMetal(T.target) || !same_simdgroup_metal_fast_path_safe;
+    PrimExpr workspace;
+    if (need_workspace) {
+      int ws_size = workspace_stride * static_cast<int>(effective_batch);
+      workspace = T.AddWorkspace(ws_size, buffer->dtype);
+    }
     Array<PrimExpr> args = {StringImm(ss.str()), buffer->data};
     if (TargetIsMetal(T.target)) {
       args.push_back(T.thread_var);
     }
-    args.push_back(workspace);
+    if (need_workspace) {
+      args.push_back(workspace);
+    }
     return Evaluate(Call(DataType::Handle(), builtin::call_extern(), args));
   }
 
@@ -184,7 +213,8 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
   } else if (TargetIsMetal(T.target)) {
     ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
        << ", " << thread_offset << ", tl::SyncThreadsBarrier, 1, "
-       << reducing_threads << ">::run";
+       << (same_simdgroup_metal_fast_path_safe ? 0 : reducing_threads)
+       << ">::run";
   } else {
     ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
        << ", " << thread_offset << ">::run";
@@ -192,9 +222,11 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
   Array<PrimExpr> thread_reduce_args = {StringImm(ss.str()),
                                         BufferLoad(buffer, indices_0)};
   if (TargetIsMetal(T.target)) {
-    PrimExpr workspace = T.AddWorkspace(reducing_threads, buffer->dtype);
     thread_reduce_args.push_back(T.thread_var);
-    thread_reduce_args.push_back(workspace);
+    if (!same_simdgroup_metal_fast_path_safe) {
+      PrimExpr workspace = T.AddWorkspace(reducing_threads, buffer->dtype);
+      thread_reduce_args.push_back(workspace);
+    }
   } else if (reducing_threads >= 32) {
     PrimExpr workspace =
         T.AddWorkspace(*as_const_int(T.thread_bounds->extent), buffer->dtype);

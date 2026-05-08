@@ -1,5 +1,6 @@
 import tilelang
 import tilelang.language as T
+import tilelang.testing
 import torch
 
 
@@ -34,6 +35,7 @@ def run_tilelang_copy_mask_parallel(M=1024, N=1024, block_M=128, block_N=128, dt
     torch.testing.assert_close(b, a, rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tilelang_copy_mask_parallel():
     run_tilelang_copy_mask_parallel(M=1024, N=1024, block_M=128, block_N=128)
 
@@ -68,6 +70,7 @@ def run_tilelang_copy_mask_copy(M=1024, N=1024, block_M=128, block_N=128, dtype=
     torch.testing.assert_close(b, a, rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tilelang_copy_mask_copy():
     run_tilelang_copy_mask_copy(M=1024, N=1024, block_M=128, block_N=128)
 
@@ -103,6 +106,7 @@ def run_tilelang_copy_mask_parallel_range(M=1024, N=1024, block_M=128, block_N=1
     torch.testing.assert_close(b, a, rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tilelang_copy_mask_parallel_range():
     run_tilelang_copy_mask_parallel_range(M=1024, N=1024, block_M=128, block_N=128)
 
@@ -137,6 +141,7 @@ def run_tilelang_copy_mask_copy_range(M=1024, N=1024, block_M=128, block_N=128, 
     torch.testing.assert_close(b, a, rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tilelang_copy_mask_copy_range():
     run_tilelang_copy_mask_copy_range(M=1024, N=1024, block_M=128, block_N=128)
 

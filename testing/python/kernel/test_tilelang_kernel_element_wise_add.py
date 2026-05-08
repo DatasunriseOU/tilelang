@@ -61,6 +61,7 @@ def run_elementwise_add(
     profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_elementwise_add_f32():
     run_elementwise_add(
         512,
@@ -72,6 +73,7 @@ def test_elementwise_add_f32():
     )
 
 
+@tilelang.testing.requires_cuda_target
 def test_elementwise_add_f16():
     run_elementwise_add(
         512,
@@ -83,6 +85,7 @@ def test_elementwise_add_f16():
     )
 
 
+@tilelang.testing.requires_cuda_target
 def test_elementwise_add_i32():
     run_elementwise_add(
         512,
@@ -94,6 +97,7 @@ def test_elementwise_add_i32():
     )
 
 
+@tilelang.testing.requires_cuda_target
 def test_elementwise_add_f32f16():
     run_elementwise_add(
         512,

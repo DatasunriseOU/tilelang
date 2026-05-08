@@ -207,6 +207,7 @@ def run_pointer_table_grouped_matmul(batch_sizes_list, N, K, block_M, block_N, b
         torch.testing.assert_close(out[:size].to(torch_accum_dtype), expected, atol=1e-2, rtol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_matmul():
     run_matmul(256, 256, 256, 64, 64, 32)
 
@@ -219,15 +220,17 @@ def test_pointer_table_annotation_lowers_to_int64_buffer():
     assert [int(dim) for dim in src_ptrs.shape] == [4]
 
 
+@tilelang.testing.requires_cuda_target
 def test_pointer_table_copy():
     run_pointer_table_copy(64)
 
 
+@tilelang.testing.requires_cuda_target
 def test_pointer_table_multi_copy():
     run_pointer_table_multi_copy(2, 64)
 
 
-@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_target
 def test_pointer_table_grouped_matmul():
     run_pointer_table_grouped_matmul([8, 12, 17], 32, 32, 16, 16, 16)
 

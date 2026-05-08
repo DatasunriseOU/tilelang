@@ -492,8 +492,22 @@ def _run_native_dtype_probe(tmp_path: Path, dtype_name: str) -> subprocess.Compl
         )
     )
     env = os.environ.copy()
-    repo_root = str(Path.cwd())
-    env["PYTHONPATH"] = repo_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    repo_root_path = Path(__file__).resolve().parents[3]
+    repo_root = str(repo_root_path)
+    build_root = repo_root_path / "build"
+    build_lib_paths = [
+        str(path) for path in (build_root / "lib", build_root / "tvm") if path.exists()
+    ]
+    env["PYTHONPATH"] = repo_root + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+    )
+    env["TILELANG_DEV_BUILD_ROOT"] = str(build_root)
+    if build_lib_paths:
+        env["TVM_LIBRARY_PATH"] = os.pathsep.join(build_lib_paths)
+        for loader_var in ("DYLD_LIBRARY_PATH", "LD_LIBRARY_PATH"):
+            env[loader_var] = os.pathsep.join(
+                build_lib_paths + ([env[loader_var]] if env.get(loader_var) else [])
+            )
     return subprocess.run(
         [sys.executable, str(script)],
         cwd=repo_root,

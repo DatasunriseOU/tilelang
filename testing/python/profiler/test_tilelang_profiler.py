@@ -1,5 +1,6 @@
 import tilelang
 import tilelang.language as T
+import tilelang.testing
 import pytest
 
 
@@ -28,6 +29,7 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
 
 
 @pytest.mark.perf
+@tilelang.testing.requires_cuda_target
 def test_profiler():
     kernel = matmul(1024, 1024, 1024, 128, 128, 32)
 

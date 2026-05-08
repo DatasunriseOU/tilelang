@@ -109,6 +109,7 @@ def run_gemm(
     profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_pipeline_order_stage():
     run_gemm(order=[0, 1, 2], stage=[0, 0, 1])
     run_gemm(order=[0, 1, 2], stage=[0, 0, 2])
@@ -197,6 +198,7 @@ def run_blocksparse_matmul(num_stages):
     torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_blocksparse_matmul():
     run_blocksparse_matmul(num_stages=1)
     run_blocksparse_matmul(num_stages=2)

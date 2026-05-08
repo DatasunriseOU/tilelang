@@ -12,13 +12,10 @@ emitted source string and is therefore safe to run on Linux/x86 with
 no GPU SDK installed.
 """
 
-import pytest
-
-pytest.importorskip("tvm")  # skip if TVM/TileLang stack is unavailable
-
 import tilelang  # noqa: E402
 from tilelang import tvm as tvm  # noqa: E402
 import tilelang.language as T  # noqa: E402
+import tilelang.testing  # noqa: E402
 
 
 def _trivial_kernel():
@@ -56,6 +53,7 @@ def test_metal_preamble_has_tl_ptr_copy_elem():
     assert "threadgroup void* dst" in src
 
 
+@tilelang.testing.requires_rocm
 def test_hip_preamble_has_tl_ptr_copy_elem():
     """HIP preamble (decl_stream in Finish()) must define the helper."""
     src = _lower_source("hip")
@@ -66,6 +64,7 @@ def test_hip_preamble_has_tl_ptr_copy_elem():
     assert "__device__ inline void __tl_ptr_copy_elem" in src
 
 
+@tilelang.testing.requires_cuda_target
 def test_cuda_preamble_has_tl_ptr_copy_elem():
     """Pre-Hopper CUDA also takes the pointer-arith fallback, so the
     helper must be present in the CUDA preamble too. (On sm_90+ it's

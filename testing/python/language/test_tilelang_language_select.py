@@ -1,6 +1,15 @@
 import torch
+import tilelang
 import tilelang.testing
 import tilelang.language as T
+
+
+def _device_kernel_source(source):
+    for marker in ("kernel void", "__global__ void"):
+        pos = source.find(marker)
+        if pos >= 0:
+            return source[pos:]
+    return source
 
 
 @tilelang.jit
@@ -28,6 +37,7 @@ def get_select_kernel_1():
     return main
 
 
+@tilelang.testing.requires_cuda_target
 def test_select_correctness():
     A = torch.randn((128, 8), dtype=torch.float32, device="cuda")
     B = torch.empty((128, 8), dtype=torch.float32, device="cuda")
@@ -66,8 +76,8 @@ def get_select_kernel_2():
 
 
 def test_select_codegen_no_if():
-    kernel = get_select_kernel_2()
-    source = kernel.get_kernel_source()
+    artifact = tilelang.lower(get_select_kernel_2.get_tir())
+    source = _device_kernel_source(artifact.kernel_source)
     assert "if (" not in source
 
 

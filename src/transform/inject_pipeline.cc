@@ -3051,12 +3051,29 @@ private:
     // pipelined loop will be converted into a block.
     PipelineInfo pipeline_info;
     Array<SBlock> original_order; // pipeline body blocks in the original order
+    Array<Stmt> pipeline_stage_stmts;
 
     auto f_add_child = [&](const Stmt &child) {
       original_order.push_back(MakeBlock(child, buffer_data_to_buffer_));
+      pipeline_stage_stmts.push_back(child);
+    };
+    auto add_block_local_alloc = [&](const Buffer &buffer) {
+      for (const Buffer &existing : block_local_allocs) {
+        if (existing.same_as(buffer)) {
+          return;
+        }
+      }
+      block_local_allocs.push_back(buffer);
     };
     for (size_t i = 0; i < pipeline_body_seq->seq.size(); i++) {
       const Stmt &child = pipeline_body_seq->seq[i];
+      if (const auto *alloc_buffer = child.as<AllocBufferNode>()) {
+        const Buffer &buffer = alloc_buffer->buffer;
+        buffer_data_to_buffer_.Set(buffer->data, buffer);
+        allocated_buffers_.insert(buffer);
+        add_block_local_alloc(buffer);
+        continue;
+      }
       const auto *nested_block_realize = child.as<SBlockRealizeNode>();
       if (nested_block_realize && is_one(nested_block_realize->predicate) &&
           nested_block_realize->block->body->IsInstance<SeqStmtNode>()) {
@@ -3075,7 +3092,7 @@ private:
     // This includes buffers allocated in outer blocks (like logits_smem) that
     // are used inside the pipeline loop.
     BufferUsageCollector collector(buffer_data_to_buffer_, allocated_buffers_);
-    pipeline_allocs = collector.Collect(SeqStmt(pipeline_body_seq->seq));
+    pipeline_allocs = collector.Collect(SeqStmt(pipeline_stage_stmts));
 
     auto pipeline_stages = Downcast<Array<Integer>>(
         op->annotations.at(tirx::attr::software_pipeline_stage));
@@ -3241,8 +3258,8 @@ private:
 
     Array<Buffer> local_allocs = block_local_allocs;
     // Add nested block allocs to local_allocs
-    for (size_t i = 0; i < pipeline_body_seq->seq.size(); i++) {
-      const Stmt &child = pipeline_body_seq->seq[i];
+    for (size_t i = 0; i < pipeline_stage_stmts.size(); i++) {
+      const Stmt &child = pipeline_stage_stmts[i];
       const auto *nested_block_realize = child.as<SBlockRealizeNode>();
       if (nested_block_realize && is_one(nested_block_realize->predicate) &&
           nested_block_realize->block->body->IsInstance<SeqStmtNode>()) {

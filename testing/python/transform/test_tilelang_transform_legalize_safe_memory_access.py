@@ -22,7 +22,7 @@ def _strip_block_reads_writes(stmt):
                 op.annotations,
             )
 
-    return ir_transform(stmt, None, _postorder, ["tir.Block"])
+    return ir_transform(stmt, None, _postorder, ["tirx.SBlock"])
 
 
 def _collect_call_nodes(stmt, op_names):

@@ -35,6 +35,7 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
 
 
 @pytest.mark.parametrize("m_val", SINGLE_SYMBOLIC_M_VALUES, ids=[f"m={m}" for m in SINGLE_SYMBOLIC_M_VALUES])
+@tilelang.testing.requires_cuda_target
 def test_profiler_dynamic_symbolic_single(m_val):
     """Test profiler with a single dynamic symbolic variable."""
     M = T.dynamic("m")
@@ -57,6 +58,7 @@ def test_profiler_dynamic_symbolic_single(m_val):
     MULTIPLE_SYMBOLIC_CONSTRAINTS,
     ids=[f"m={m}-n={n}" for m, n in MULTIPLE_SYMBOLIC_CONSTRAINTS],
 )
+@tilelang.testing.requires_cuda_target
 def test_profiler_dynamic_symbolic_multiple(m_val, n_val):
     """Test profiler with multiple dynamic symbolic variables."""
     M = T.dynamic("m")
@@ -75,6 +77,7 @@ def test_profiler_dynamic_symbolic_multiple(m_val, n_val):
 
 
 @pytest.mark.parametrize("m_val", SINGLE_SYMBOLIC_M_VALUES, ids=[f"m={m}" for m in SINGLE_SYMBOLIC_M_VALUES])
+@tilelang.testing.requires_cuda_target
 def test_profiler_dynamic_symbolic_correctness(m_val):
     """Test that kernel with dynamic symbolic produces correct results."""
     M = T.dynamic("m")
@@ -96,6 +99,7 @@ def test_profiler_dynamic_symbolic_correctness(m_val):
     print(f"Correctness test passed for m={m_val}")
 
 
+@tilelang.testing.requires_cuda_target
 def test_profiler_dynamic_symbolic_missing_constraint():
     """Test that missing constraint raises appropriate error."""
     M = T.dynamic("m")
@@ -117,6 +121,7 @@ def test_profiler_dynamic_symbolic_missing_constraint():
         print(f"Correctly raised error for missing constraint: {e}")
 
 
+@tilelang.testing.requires_cuda_target
 def test_profiler_dynamic_symbolic_with_input_tensors():
     """Test that input_tensors takes precedence over dynamic_symbolic_constraints."""
     M = T.dynamic("m")

@@ -36,6 +36,7 @@ def run_tilelang_ternary(M=128, N=128, block_M=32, block_N=32, dtype=T.float16):
     torch.testing.assert_close(b, ref_b, rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tilelang_ternary():
     run_tilelang_ternary(M=128, N=128, block_M=32, block_N=32)
 

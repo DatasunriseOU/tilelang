@@ -77,8 +77,19 @@ def _build_tma_kernel(data_type_code: int = _CU_TENSOR_MAP_DATA_TYPE_FLOAT16):
     return kernel
 
 
+def _make_target(target_str: str):
+    if target_str == "cuda -arch=sm_90":
+        return tvm.target.Target({"kind": "cuda", "arch": "sm_90"})
+    if target_str == "hip":
+        try:
+            return tvm.target.Target({"kind": "hip"})
+        except ValueError as exc:
+            pytest.skip(f"HIP target kind is unavailable in this TVM build: {exc}")
+    return tvm.target.Target(target_str)
+
+
 def _lower(func, target_str: str):
-    target = tvm.target.Target(target_str)
+    target = _make_target(target_str)
     func = func.with_attr("global_symbol", "main")
     func = func.with_attr("target", target)
     mod = tvm.IRModule.from_expr(func)
@@ -89,8 +100,11 @@ def _lower(func, target_str: str):
 
 def _has_tma_call(mod) -> bool:
     s = str(mod.script() if hasattr(mod, "script") else mod)
-    return ("tl.tma_load" in s) or ("tl.tma_store" in s) or \
-           ("tl.tma_load_im2col" in s)
+    return (
+        ("tma_load(" in s)
+        or ("tma_store(" in s)
+        or ("tma_load_im2col(" in s)
+    )
 
 
 def test_cuda_hopper_passes_through():
@@ -241,7 +255,7 @@ def test_im2col_call_is_left_in_place_with_warning():
 
     mod = _lower(kernel, "metal")
     s = str(mod.script() if hasattr(mod, "script") else mod)
-    assert "tl.tma_load_im2col" in s, \
+    assert "tma_load_im2col(" in s, \
         "im2col call must NOT be silently rewritten (TODO: gather loop)."
 
 

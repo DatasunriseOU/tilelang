@@ -7,8 +7,13 @@ import torch
 
 import tilelang
 from tilelang import tvm as tvm
+from tvm import tir
 import tilelang.language as T
+from tilelang.engine.lower import device_codegen_without_compile, get_device_call
+from tilelang.engine.phase import OptimizeForTarget
+from tilelang.layout import Fragment
 import tilelang.testing
+from tilelang.utils.language import to_buffer_region
 
 
 _FORBIDDEN_CUDA_REDUCE_TOKENS = (
@@ -28,6 +33,31 @@ def _lower_source(func) -> str:
     return artifact.kernel_source
 
 
+def _lower_preannotated_source(func) -> str:
+    target = tvm.target.Target("metal", host="llvm")
+    mod = tvm.IRModule({func.attrs["global_symbol"]: func})
+
+    with tvm.transform.PassContext(), target:
+        mod = tilelang.transform.LowerTileLangLetStmt()(mod)
+        mod = tilelang.transform.LowerTileLangAllocate()(mod)
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.Simplify()(mod)
+        mod = tilelang.transform.LayoutInference()(mod)
+        mod = tilelang.transform.LowerTileOp()(mod)
+        mod = tilelang.transform.LowerTileLangLetStmt()(mod)
+        mod = tilelang.transform.LowerTileLangAllocate()(mod)
+        mod = tilelang.transform.DecoupleTypeCast()(mod)
+        mod = tilelang.transform.LegalizeVectorizedLoop()(mod)
+        mod = tilelang.transform.LegalizeSafeMemoryAccess()(mod)
+        mod = tilelang.transform.LowerAccessPtr()(mod)
+        mod = tilelang.transform.Simplify()(mod)
+        mod = OptimizeForTarget(mod, target)
+
+    device_mod = tvm.tir.transform.Filter(get_device_call(False))(mod)
+    codegen_mod = device_codegen_without_compile(device_mod, target)
+    return codegen_mod.inspect_source()
+
+
 def _assert_no_cuda_reduce_leakage(src: str) -> None:
     for token in _FORBIDDEN_CUDA_REDUCE_TOKENS:
         assert token not in src, f"unexpected CUDA reduce token {token!r} in Metal source:\n{src}"
@@ -43,6 +73,18 @@ def _assert_metal_reduce_tokens(src: str, *, cross_simdgroup: bool = False) -> N
     assert "[[thread_position_in_threadgroup]]" in src
     if cross_simdgroup:
         assert "threadgroup_barrier" in src or "[[threadgroup" in src, src
+
+
+def _assert_body_workspace(src: str, *, expected: bool) -> None:
+    has_workspace = re.search(
+        r"^\s*threadgroup\s+\w+\s+workspace\[\d+\];", src, re.MULTILINE
+    )
+    if expected:
+        assert has_workspace is not None, src
+        assert "(&(workspace[0]))" in src, src
+    else:
+        assert has_workspace is None, src
+        assert "(&(workspace[0]))" not in src, src
 
 
 def _make_reduce_kernel(op, *, length=32, dtype=T.float32, threads=32):
@@ -71,12 +113,44 @@ def _make_reduce_kernel(op, *, length=32, dtype=T.float32, threads=32):
     return reduce_kernel
 
 
+def _make_finalize_reducer_kernel(*, rows=4, dtype=T.float32, threads=32):
+    layout = Fragment((rows,), forward_fn=lambda i, rep: (rep, i), replicate=threads)
+
+    @T.prim_func
+    def finalize_reducer_kernel(
+        B: T.Tensor((rows,), dtype),
+    ):
+        with T.Kernel(1, threads=threads):
+            reducer = T.alloc_fragment((rows,), dtype)
+            T.annotate_layout({reducer: layout})
+            for i in T.Parallel(rows):
+                reducer[i] = T.cast(i + 1, dtype)
+            tir.call_intrin(
+                "handle",
+                tir.op.Op.get("tl.tileop.finalize_reducer"),
+                to_buffer_region(reducer, access_type="w"),
+                0,
+            )
+            for i in T.Parallel(rows):
+                B[i] = reducer[i]
+
+    return finalize_reducer_kernel
+
+
 @pytest.mark.parametrize("op", ["sum", "max", "min"])
 def test_metal_reduce_codegen_uses_metal_simd_reduction(op):
     src = _lower_source(_make_reduce_kernel(op, length=32, threads=32))
 
     _assert_no_cuda_reduce_leakage(src)
     _assert_metal_reduce_tokens(src)
+
+
+def test_metal_reduce_same_simdgroup_codegen_elides_body_workspace():
+    src = _lower_source(_make_reduce_kernel("sum", length=32, threads=32))
+
+    _assert_no_cuda_reduce_leakage(src)
+    _assert_metal_reduce_tokens(src)
+    _assert_body_workspace(src, expected=False)
 
 
 @pytest.mark.parametrize("op", ["bitand", "bitor", "bitxor"])
@@ -92,6 +166,31 @@ def test_metal_reduce_cross_simdgroup_codegen_uses_metal_barrier_path():
 
     _assert_no_cuda_reduce_leakage(src)
     _assert_metal_reduce_tokens(src, cross_simdgroup=True)
+    _assert_body_workspace(src, expected=True)
+
+
+def test_metal_finalize_reducer_same_simdgroup_codegen_elides_body_workspace():
+    src = _lower_preannotated_source(_make_finalize_reducer_kernel(threads=32))
+
+    _assert_no_cuda_reduce_leakage(src)
+    _assert_metal_reduce_tokens(src)
+    assert re.search(
+        r"AllReduce<tl::SumOp,\s*32,\s*1,\s*0,\s*tl::SyncThreadsBarrier,\s*1,\s*0>::run",
+        src,
+    ), src
+    _assert_body_workspace(src, expected=False)
+
+
+def test_metal_finalize_reducer_cross_simdgroup_codegen_keeps_body_workspace():
+    src = _lower_preannotated_source(_make_finalize_reducer_kernel(threads=64))
+
+    _assert_no_cuda_reduce_leakage(src)
+    _assert_metal_reduce_tokens(src, cross_simdgroup=True)
+    assert re.search(
+        r"AllReduce<tl::SumOp,\s*64,\s*1,\s*0,\s*tl::SyncThreadsBarrier,\s*1,\s*64>::run",
+        src,
+    ), src
+    _assert_body_workspace(src, expected=True)
 
 
 def test_metal_reduce_nan_propagate_does_not_emit_cuda_nan_intrinsics():

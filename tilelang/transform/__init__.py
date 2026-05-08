@@ -17,6 +17,10 @@ def get_pass_context():
     return PassContext.current()
 
 
+def LegalizeParallelLoop():
+    return _ffi_api.LegalizeParallelLoop()  # type: ignore
+
+
 def ClusterPlanning():
     """ClusterPlanning
 

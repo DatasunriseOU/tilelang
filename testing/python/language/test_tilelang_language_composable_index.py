@@ -37,6 +37,7 @@ def run_tilelang_composable_copy(M=1024, N=1024, block_M=128, block_N=128, dtype
     torch.testing.assert_close(b.flatten(), a.flatten(), rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tilelang_copy():
     run_tilelang_composable_copy(M=1024, N=1024, block_M=128, block_N=128)
     run_tilelang_composable_copy(M=1024, N=576, block_M=32, block_N=576)

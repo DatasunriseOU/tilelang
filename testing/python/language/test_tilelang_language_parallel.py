@@ -51,6 +51,7 @@ def _require_cuda_tensor(shape, dtype=torch.float32):
 PARALLEL_DYNAMIC_VALID_LENGTHS = [0, 13, 200, 600]
 
 
+@tilelang.testing.requires_cuda_target
 def test_parallel_static_extent():
     kernel = parallel_elementwise_static(length=256)
     data = _require_cuda_tensor((256,), torch.float32)
@@ -63,6 +64,7 @@ def test_parallel_static_extent():
     PARALLEL_DYNAMIC_VALID_LENGTHS,
     ids=[f"valid_len={value}" for value in PARALLEL_DYNAMIC_VALID_LENGTHS],
 )
+@tilelang.testing.requires_cuda_target
 def test_parallel_dynamic_extent(valid_len):
     kernel = parallel_elementwise_dynamic(max_len=512, threads=256)
     data = _require_cuda_tensor((512,), torch.float32)

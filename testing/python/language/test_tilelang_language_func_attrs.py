@@ -3,10 +3,12 @@
 import pytest
 import torch
 import tilelang
+import tilelang.testing
 from tilelang import language as T
 from tilelang.transform import PassConfigKey
 
 
+@tilelang.testing.requires_cuda_target
 def test_out_idx_via_attr_lazy():
     """out_idx should be stored as PrimFunc attr when using T.empty + return."""
 
@@ -29,6 +31,7 @@ def test_out_idx_via_attr_lazy():
     torch.testing.assert_close(b, a + 1.0)
 
 
+@tilelang.testing.requires_cuda_target
 def test_all_attrs_together_lazy():
     """annotate_pass_configs, annotate_compile_flags, and out_idx should all work together."""
 
@@ -55,6 +58,7 @@ def test_all_attrs_together_lazy():
     torch.testing.assert_close(b, a * 2.0)
 
 
+@tilelang.testing.requires_cuda_target
 def test_eager_mode_attrs():
     """Eager mode should support annotate_pass_configs and out_idx via T.empty."""
 
@@ -92,6 +96,7 @@ def test_out_idx_conflict_detection():
         tilelang.compile(kernel, out_idx=[-1])
 
 
+@tilelang.testing.requires_cuda_target
 def test_no_out_idx_when_not_using_empty():
     """When T.empty is not used, tilelang_out_idx attr should not be present."""
 
@@ -112,6 +117,7 @@ def test_no_out_idx_when_not_using_empty():
     torch.testing.assert_close(b, a)
 
 
+@tilelang.testing.requires_cuda_target
 def test_pass_configs_only_lazy():
     """annotate_pass_configs should work without T.empty or annotate_compile_flags."""
 
@@ -134,6 +140,7 @@ def test_pass_configs_only_lazy():
     torch.testing.assert_close(b, a + 1.0)
 
 
+@tilelang.testing.requires_cuda_target
 def test_compile_flags_only_lazy():
     """annotate_compile_flags should work standalone."""
 
@@ -155,6 +162,7 @@ def test_compile_flags_only_lazy():
     torch.testing.assert_close(b, a + 1.0)
 
 
+@tilelang.testing.requires_cuda_target
 def test_annotations_before_tensor_type():
     """Annotations placed before tensor type annotations should work."""
 
@@ -178,6 +186,7 @@ def test_annotations_before_tensor_type():
     torch.testing.assert_close(b, a + 1.0)
 
 
+@tilelang.testing.requires_cuda_target
 def test_annotations_after_tensor_type():
     """Annotations placed after tensor type annotations should work."""
 

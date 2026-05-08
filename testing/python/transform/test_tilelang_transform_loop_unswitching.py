@@ -395,17 +395,16 @@ def test_no_hoist_let_bound_loop_variant():
 
 
 def test_no_hoist_multiple_let():
-    @tilelang.jit()
-    def get_fused_mapping_kernel(topk_idx: T.Tensor[(1,), T.int32]):
-        with T.Kernel():
-            _tmp1 = T.alloc_shared((1,), "int")
-            for i in T.serial(0, 4, 2):
-                _tmp2 = topk_idx[i]
-                T.assume(0 <= _tmp2 < 1)
-                if _tmp2 != -1:
-                    T.atomic_add(_tmp1[_tmp2], 1)
+    @T.prim_func
+    def before(topk_idx: T.Tensor((4,), T.int32)):
+        _tmp1 = T.alloc_buffer((1,), "int32", scope="shared")
+        for i in T.serial(0, 4, 2):
+            _tmp2 = topk_idx[i]
+            T.assume(0 <= _tmp2 < 1)
+            if _tmp2 != -1:
+                T.atomic_add(_tmp1[_tmp2], 1)
 
-    get_fused_mapping_kernel.compile()
+    _check(before, before)
 
 
 def test_no_hoist_thread_idx_predicate():

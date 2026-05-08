@@ -231,6 +231,7 @@ def run_alloc_global_eagerjit(
     torch.testing.assert_close(B, A, rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_alloc_global():
     run_alloc_global(1024, 128, T.float16)
     run_alloc_global_eagerjit(1024, 128, T.float16)

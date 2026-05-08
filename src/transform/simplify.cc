@@ -339,19 +339,73 @@ private:
     return Parent::VisitStmt_(op);
   }
 
-  bool CanInlineLetStmt(const LetStmtNode *op) {
+  bool CanInlineValue(const PrimExpr &value) {
     if (!config_->enable_simplify_let_inline)
       return false;
-    if (is_const_number(op->value))
+    if (is_const_number(value))
       return true;
-    if (op->value.as<VarNode>())
+    if (value.as<VarNode>())
       return true;
     // Won't face the deep expression explosion problem as in Let expression.
     // attempt to inline as much as possible if the value integer type(can be
     // index).
-    if (!op->value.dtype().is_int())
+    if (!value.dtype().is_int())
       return false;
-    return SideEffect(op->value) <= CallEffectKind::kPure;
+    return SideEffect(value) <= CallEffectKind::kPure;
+  }
+
+  bool CanInlineLetStmt(const LetStmtNode *op) {
+    return CanInlineValue(op->value);
+  }
+
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
+    Array<Stmt> new_seq;
+    bool changed = false;
+
+    for (const Stmt &stmt : op->seq) {
+      if (const auto *bind = stmt.as<BindNode>()) {
+        PrimExpr value = this->VisitExpr(bind->value);
+        bool can_inline = CanInlineValue(value);
+        if (can_inline) {
+          analyzer_->Bind(bind->var, value);
+        } else if (SideEffect(value) <= CallEffectKind::kPure) {
+          non_inlined_bindings_.Set(bind->var, value);
+        }
+
+        bool used_in_buffer_def = used_in_buffer_def_.count(bind->var.get());
+        if (can_inline && !used_in_buffer_def) {
+          changed = true;
+          continue;
+        }
+
+        if (value.same_as(bind->value)) {
+          new_seq.push_back(stmt);
+        } else {
+          new_seq.push_back(Bind(bind->var, value, bind->span));
+          changed = true;
+        }
+        continue;
+      }
+
+      Stmt visited = this->VisitStmt(stmt);
+      changed = changed || !visited.same_as(stmt);
+      if (const auto *nested = visited.as<SeqStmtNode>()) {
+        for (const Stmt &nested_stmt : nested->seq) {
+          new_seq.push_back(nested_stmt);
+        }
+        changed = true;
+      } else {
+        new_seq.push_back(visited);
+      }
+    }
+
+    if (!changed) {
+      return ffi::GetRef<Stmt>(op);
+    }
+    if (new_seq.empty()) {
+      return Evaluate(0);
+    }
+    return new_seq.size() == 1 ? new_seq[0] : SeqStmt(std::move(new_seq));
   }
 
   // CPPMEGA: vendored LetStmt is not in apache StmtFunctor dispatch, so this
@@ -407,7 +461,7 @@ private:
       return body;
     }
 
-    bool can_inline = CanInlineLetStmt(op);
+    bool can_inline = CanInlineValue(value);
     if (can_inline) {
       analyzer_->Bind(op->var, value);
     } else if (SideEffect(op->value) <= CallEffectKind::kPure) {

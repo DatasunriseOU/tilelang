@@ -43,6 +43,7 @@ def _require_cuda_tensor(shape, dtype):
         pytest.skip(f"CUDA runtime unavailable: {err}")
 
 
+@tilelang.testing.requires_cuda_target
 def test_layout_infer_compiles_and_runs():
     B, M, N = 1, 32, 64
     BLOCK_MN, BLOCK_K = 32, 64

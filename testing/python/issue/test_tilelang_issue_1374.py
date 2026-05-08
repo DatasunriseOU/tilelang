@@ -3,6 +3,7 @@ import tilelang.testing
 import tilelang.language as T
 
 
+@tilelang.testing.requires_cuda_target
 def test_issue_1374_non_var_itermark():
     @tl.jit
     def get_wrong_kernel(M: int = 4096):

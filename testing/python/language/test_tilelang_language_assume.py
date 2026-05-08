@@ -3,6 +3,7 @@ import tilelang.language as T
 import tilelang.testing
 
 
+@tilelang.testing.requires_cuda_target
 def test_assume_remove_boundary_check():
     @tilelang.jit
     def kernel_with_assume():
@@ -23,6 +24,7 @@ def test_assume_remove_boundary_check():
     assert "if (" not in source
 
 
+@tilelang.testing.requires_cuda_target
 def test_assume_enable_vectorization():
     @tilelang.jit
     def kernel_vectorize(M):
@@ -52,6 +54,7 @@ def test_assume_enable_vectorization():
     assert ("float4" in source) and ("if (" not in source)
 
 
+@tilelang.testing.requires_cuda_target
 def test_assume_complex_indexing():
     @tilelang.jit
     def kernel_complex():

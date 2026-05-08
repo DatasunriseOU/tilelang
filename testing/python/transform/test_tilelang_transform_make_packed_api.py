@@ -152,8 +152,8 @@ def test_subroutine_call_to_externally_visible_subroutine():
     assert subroutine_compute_scope is not None
 
     subroutine_call_op = main_compute_scope.body.value.op
-    assert isinstance(subroutine_call_op, tvm.ir.Op) and subroutine_call_op.name == "tir.tvm_call_cpacked", (
-        f"The main function's CallNode should be lowered to the builtin 'tir.tvm_call_cpacked', "
+    assert isinstance(subroutine_call_op, tvm.ir.Op) and subroutine_call_op.name in {"tir.tvm_call_cpacked", "tirx.tvm_call_cpacked"}, (
+        f"The main function's CallNode should be lowered to the builtin tvm_call_cpacked op, "
         f"but instead has an operation of type {subroutine_call_op}"
     )
 

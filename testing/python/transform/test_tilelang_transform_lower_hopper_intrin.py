@@ -23,6 +23,7 @@ def _check(original, transformed):
     # tvm.ir.assert_structural_equal(mod["main"], transformed["main"], True)
 
 
+@tilelang.testing.requires_cuda_target
 def test_lower_shared_barrier():
     """Test that LowerSharedBarrier converts shared.barrier buffers + barrier_init
     annotations into ptx_init_barrier_thread_count calls.

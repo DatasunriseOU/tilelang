@@ -25,8 +25,25 @@ def _conformance():
         pytest.skip(f"poc.triton_frontend.conformance unavailable: {exc!r}")
 
 
+def _cuda_runtime_or_skip():
+    try:
+        import torch
+        import tilelang.testing as tilelang_testing
+    except Exception as exc:
+        pytest.skip(f"CUDA conformance dependencies unavailable: {exc!r}")
+
+    target_kind = tilelang_testing.get_default_target_kind()
+    if target_kind != "cuda":
+        target_desc = target_kind if target_kind is not None else "unavailable"
+        pytest.skip(f"CUDA conformance requires default target cuda, got {target_desc}")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA conformance requires torch CUDA runtime")
+    return torch
+
+
 def test_vector_add_matches_numpy():
     np = _np()
+    torch = _cuda_runtime_or_skip()
     conf = _conformance()
     kernel = conf.kernel_vector_add(N=1024, BLOCK=128)
     if kernel is None:
@@ -37,12 +54,11 @@ def test_vector_add_matches_numpy():
     expect = a + b
 
     try:
-        import torch
-        a_t = torch.from_numpy(a)
-        b_t = torch.from_numpy(b)
+        a_t = torch.from_numpy(a).cuda()
+        b_t = torch.from_numpy(b).cuda()
         y_t = torch.empty_like(a_t)
         kernel(a_t, b_t, y_t)
-        got = y_t.numpy()
+        got = y_t.cpu().numpy()
     except Exception as exc:
         pytest.skip(f"backend execution failed: {exc!r}")
 
@@ -51,6 +67,7 @@ def test_vector_add_matches_numpy():
 
 def test_dot_reduce_atomic_matches_numpy():
     np = _np()
+    torch = _cuda_runtime_or_skip()
     conf = _conformance()
     kernel = conf.kernel_dot_reduce_atomic(M=64, N=64, K=64, BLOCK=32)
     if kernel is None:
@@ -62,12 +79,11 @@ def test_dot_reduce_atomic_matches_numpy():
     expect = (a.astype(np.float32) @ b.astype(np.float32)).sum(axis=0)
 
     try:
-        import torch
-        a_t = torch.from_numpy(a)
-        b_t = torch.from_numpy(b)
-        acc = torch.zeros(64, dtype=torch.float32)
+        a_t = torch.from_numpy(a).cuda()
+        b_t = torch.from_numpy(b).cuda()
+        acc = torch.zeros(64, dtype=torch.float32, device="cuda")
         kernel(a_t, b_t, acc)
-        got = acc.numpy()
+        got = acc.cpu().numpy()
     except Exception as exc:
         pytest.skip(f"backend execution failed: {exc!r}")
 
@@ -77,6 +93,7 @@ def test_dot_reduce_atomic_matches_numpy():
 def test_dot_reduce_atomic_trans_b_matches_numpy():
     """Phase-1 migration regression: trans_b path produces same numerics."""
     np = _np()
+    torch = _cuda_runtime_or_skip()
     conf = _conformance()
     kernel = conf.kernel_dot_reduce_atomic_trans_b(M=64, N=64, K=64, BLOCK=32)
     if kernel is None:
@@ -88,12 +105,11 @@ def test_dot_reduce_atomic_trans_b_matches_numpy():
     expect = (a.astype(np.float32) @ b_kn.astype(np.float32).T).sum(axis=0)
 
     try:
-        import torch
-        a_t = torch.from_numpy(a)
-        b_t = torch.from_numpy(b_kn)
-        acc = torch.zeros(64, dtype=torch.float32)
+        a_t = torch.from_numpy(a).cuda()
+        b_t = torch.from_numpy(b_kn).cuda()
+        acc = torch.zeros(64, dtype=torch.float32, device="cuda")
         kernel(a_t, b_t, acc)
-        got = acc.numpy()
+        got = acc.cpu().numpy()
     except Exception as exc:
         pytest.skip(f"backend execution failed: {exc!r}")
 
@@ -109,6 +125,7 @@ def test_kernels_dict_lists_wave2_additions():
 
 def test_softmax_matches_numpy():
     np = _np()
+    torch = _cuda_runtime_or_skip()
     conf = _conformance()
     kernel = conf.kernel_softmax(M=8, N=64, BLOCK_N=64)
     if kernel is None:
@@ -120,11 +137,10 @@ def test_softmax_matches_numpy():
     expect = expect / expect.sum(axis=-1, keepdims=True)
 
     try:
-        import torch
-        x_t = torch.from_numpy(x)
+        x_t = torch.from_numpy(x).cuda()
         y_t = torch.empty_like(x_t)
         kernel(x_t, y_t)
-        got = y_t.numpy()
+        got = y_t.cpu().numpy()
     except Exception as exc:
         pytest.skip(f"backend execution failed: {exc!r}")
 
@@ -133,6 +149,7 @@ def test_softmax_matches_numpy():
 
 def test_matmul_matches_numpy():
     np = _np()
+    torch = _cuda_runtime_or_skip()
     conf = _conformance()
     kernel = conf.kernel_matmul(M=64, N=64, K=64, BLOCK_M=32, BLOCK_N=32, BLOCK_K=16)
     if kernel is None:
@@ -143,12 +160,11 @@ def test_matmul_matches_numpy():
     expect = a.astype(np.float32) @ b.astype(np.float32)
 
     try:
-        import torch
-        a_t = torch.from_numpy(a)
-        b_t = torch.from_numpy(b)
-        c_t = torch.empty(64, 64, dtype=torch.float32)
+        a_t = torch.from_numpy(a).cuda()
+        b_t = torch.from_numpy(b).cuda()
+        c_t = torch.empty(64, 64, dtype=torch.float32, device="cuda")
         kernel(a_t, b_t, c_t)
-        got = c_t.numpy()
+        got = c_t.cpu().numpy()
     except Exception as exc:
         pytest.skip(f"backend execution failed: {exc!r}")
 
@@ -157,6 +173,7 @@ def test_matmul_matches_numpy():
 
 def test_layer_norm_matches_numpy():
     np = _np()
+    torch = _cuda_runtime_or_skip()
     conf = _conformance()
     kernel = conf.kernel_layer_norm(M=8, N=64, BLOCK_N=64, eps=1e-5)
     if kernel is None:
@@ -170,13 +187,12 @@ def test_layer_norm_matches_numpy():
     expect = (x - mean) / np.sqrt(var + 1e-5) * gamma + beta
 
     try:
-        import torch
-        x_t = torch.from_numpy(x)
-        g_t = torch.from_numpy(gamma)
-        b_t = torch.from_numpy(beta)
+        x_t = torch.from_numpy(x).cuda()
+        g_t = torch.from_numpy(gamma).cuda()
+        b_t = torch.from_numpy(beta).cuda()
         y_t = torch.empty_like(x_t)
         kernel(x_t, g_t, b_t, y_t)
-        got = y_t.numpy()
+        got = y_t.cpu().numpy()
     except Exception as exc:
         pytest.skip(f"backend execution failed: {exc!r}")
 

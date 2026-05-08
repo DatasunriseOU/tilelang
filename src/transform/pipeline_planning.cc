@@ -546,6 +546,7 @@ private:
     bool copy_stage = false;
     bool tma_copy = false; // true if this copy stage uses TMA (not cp.async)
     bool conditional_execution = false;
+    bool has_non_copy_tile_op = false;
     bool producer_for_copy = false;
     // Commit statements have no buffer writes, but they must be scheduled as a
     // part of their cp.async producer group (after the cp.async calls).
@@ -644,6 +645,9 @@ private:
       return false;
     }
     if (pinfo.has_cp_async_commit() && !pinfo.has_cp_async_call()) {
+      return false;
+    }
+    if (pinfo.has_cp_async_call() && pinfo.has_non_copy_tile_op) {
       return false;
     }
     return pinfo.is_copy_stage() || pinfo.has_cp_async_call();
@@ -759,7 +763,7 @@ private:
 
     // Explicit cp.async producer statements participate in the synthetic
     // stage-0 producer schedule just like ordinary global->shared copies.
-    if (pinfo->has_cp_async_call()) {
+    if (pinfo->has_cp_async_call() && !pinfo->has_non_copy_tile_op) {
       pinfo->copy_stage = true;
       return;
     }
@@ -969,6 +973,7 @@ private:
     pinfo.writes = std::move(collector.GetWrites());
     pinfo.original_stmt_index = idx;
     pinfo.conditional_execution = MayBeConditionallyExecuted(block->body);
+    pinfo.has_non_copy_tile_op = collector.HasNonCopyTileOp();
     bool pure_copy_stage =
         collector.GetGlobalCopyPattern() && IsPureCopyStmt(block->body);
     pinfo.copy_stage = pure_copy_stage;

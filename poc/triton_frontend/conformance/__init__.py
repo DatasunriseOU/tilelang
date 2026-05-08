@@ -12,8 +12,9 @@ in ascending difficulty:
     7. paged_attn         -- vLLM port (TODO)
     8. dot_reduce_atomic  -- dot + reduce + atomic_add (Wave-2 add)
 
-Each ``kernel_<name>`` returns a ``@T.prim_func`` (or ``None`` if TileLang
-isn't importable in the runtime environment, so callers can ``skipif``).
+Each implemented ``kernel_<name>`` returns a compiled TileLang kernel (or
+``None`` if TileLang isn't importable in the runtime environment, so callers
+can ``skipif``).
 """
 from __future__ import annotations
 
@@ -55,7 +56,6 @@ def kernel_vector_add(N: int = 1024, BLOCK: int = 128) -> Optional[Any]:
     import tilelang
     grid = (N + BLOCK - 1) // BLOCK
 
-    @tilelang.jit
     @T.prim_func
     def vector_add(
         A: T.Tensor((N,), "float32"),
@@ -79,7 +79,7 @@ def kernel_vector_add(N: int = 1024, BLOCK: int = 128) -> Optional[Any]:
                 if idx < N:
                     Y[idx] = Y_tile[i]
 
-    return vector_add
+    return tilelang.compile(vector_add)
 
 
 def kernel_softmax(M: int = 128, N: int = 256, BLOCK_N: int = 256) -> Optional[Any]:
@@ -94,7 +94,6 @@ def kernel_softmax(M: int = 128, N: int = 256, BLOCK_N: int = 256) -> Optional[A
         return None
     import tilelang
 
-    @tilelang.jit
     @T.prim_func
     def softmax(
         X: T.Tensor((M, N), "float32"),
@@ -114,7 +113,7 @@ def kernel_softmax(M: int = 128, N: int = 256, BLOCK_N: int = 256) -> Optional[A
                 if j < N:
                     Y[bx, j] = row[j] / row_sum[0]
 
-    return softmax
+    return tilelang.compile(softmax)
 
 
 def kernel_matmul(
@@ -132,7 +131,6 @@ def kernel_matmul(
         return None
     import tilelang
 
-    @tilelang.jit
     @T.prim_func
     def matmul(
         A: T.Tensor((M, K), "float16"),
@@ -150,7 +148,7 @@ def kernel_matmul(
                 T.gemm(A_s, B_s, C_f)
             T.copy(C_f, C[bx * BLOCK_M, by * BLOCK_N])
 
-    return matmul
+    return tilelang.compile(matmul)
 
 
 def kernel_layer_norm(
@@ -167,7 +165,6 @@ def kernel_layer_norm(
         return None
     import tilelang
 
-    @tilelang.jit
     @T.prim_func
     def layer_norm(
         X: T.Tensor((M, N), "float32"),
@@ -195,7 +192,7 @@ def kernel_layer_norm(
                 if j < N:
                     Y[bx, j] = (row[j] - mean[0]) * inv_std * Gamma[j] + Beta[j]
 
-    return layer_norm
+    return tilelang.compile(layer_norm)
 
 
 def kernel_fa_v2() -> None:
@@ -229,7 +226,6 @@ def kernel_dot_reduce_atomic(
         return None
     import tilelang
 
-    @tilelang.jit
     @T.prim_func
     def dot_reduce_atomic(
         A: T.Tensor((M, K), "float16"),
@@ -251,7 +247,7 @@ def kernel_dot_reduce_atomic(
             for j in T.Parallel(BLOCK):
                 T.atomic_add(Acc[by * BLOCK + j], col_sum[j])
 
-    return dot_reduce_atomic
+    return tilelang.compile(dot_reduce_atomic)
 
 
 def kernel_dot_reduce_atomic_trans_b(
@@ -269,7 +265,6 @@ def kernel_dot_reduce_atomic_trans_b(
         return None
     import tilelang
 
-    @tilelang.jit
     @T.prim_func
     def dot_reduce_atomic_trans_b(
         A: T.Tensor((M, K), "float16"),
@@ -291,7 +286,7 @@ def kernel_dot_reduce_atomic_trans_b(
             for j in T.Parallel(BLOCK):
                 T.atomic_add(Acc[by * BLOCK + j], col_sum[j])
 
-    return dot_reduce_atomic_trans_b
+    return tilelang.compile(dot_reduce_atomic_trans_b)
 
 
 KERNELS: Dict[str, Callable[..., Optional[Any]]] = {

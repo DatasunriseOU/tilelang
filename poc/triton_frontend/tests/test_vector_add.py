@@ -47,15 +47,6 @@ def test_vector_add_lowers_to_prim_func() -> None:
     assert func.attrs["global_symbol"] == "_vector_add_kernel"
 
 
-@pytest.mark.xfail(
-    reason="from_ttir() text path is now opt-in (requires _allow_text_ttir=True) "
-    "after the consolidation that made mlir.ir.Module the default. The "
-    "test was not updated. TODO: either pass _allow_text_ttir=True (and "
-    "audit whether the textual path is still maintained), OR rewrite "
-    "the fixture to construct an mlir.ir.Module directly.",
-    strict=False,
-    raises=TypeError,
-)
 def test_from_ttir_accepts_text() -> None:
     """``from_ttir`` accepts a textual TTIR string and produces a PrimFunc."""
     ttir_text = """\
@@ -65,5 +56,5 @@ def test_from_ttir_accepts_text() -> None:
       }
     }
     """
-    func = from_ttir(ttir_text, target="cuda", name="vector_add")
+    func = from_ttir(ttir_text, target="cuda", name="vector_add", _allow_text_ttir=True)
     assert isinstance(func, tvm.tir.PrimFunc)

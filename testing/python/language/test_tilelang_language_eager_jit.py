@@ -5,6 +5,7 @@ from itertools import product
 import torch
 
 
+@tilelang.testing.requires_cuda_target
 def test_jit2_gemm():
     @tilelang.jit(verbose=True)
     def gemm(
@@ -44,6 +45,7 @@ def test_jit2_gemm():
     torch.testing.assert_close(C, C_ref, atol=1e-2, rtol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_jit2_gemm_ptr():
     @tilelang.jit
     def gemm_ptr(
@@ -91,6 +93,7 @@ def test_jit2_gemm_ptr():
         torch.testing.assert_close(C, C_ref, atol=1e-2, rtol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_jit2_many_annot():
     @T.macro
     def copy_impl(A, B):
@@ -161,6 +164,7 @@ def test_jit2_many_annot():
         assert torch.equal(A[:, 0, :, 0], B[:, 0, :, 0])
 
 
+@tilelang.testing.requires_cuda_target
 def test_jit2_return():
     @T.macro
     def copy_impl(A):
@@ -218,6 +222,7 @@ def test_jit2_return():
         assert torch.equal(A[:, 0, :, 0], B)
 
 
+@tilelang.testing.requires_cuda_target
 def test_jit2_compile_with_consts():
     @tilelang.jit
     def transpose(X, Y, block_M, block_N):

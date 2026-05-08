@@ -38,6 +38,7 @@ def run_tilelang_copy(M=1024, N=1024, block_M=128, block_N=128, dtype=T.float16)
     torch.testing.assert_close(b, a, rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tilelang_copy():
     run_tilelang_copy(M=1024, N=1024, block_M=128, block_N=128)
     run_tilelang_copy(M=1024, N=576, block_M=32, block_N=576)
@@ -74,6 +75,7 @@ def run_tilelang_copy_with_stride(M=1024, N=1024, NN=2048, block_M=128, block_N=
     torch.testing.assert_close(b, a[:, :N], rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tilelang_copy_with_stride():
     run_tilelang_copy_with_stride(M=1024, N=1024, NN=2048, block_M=128, block_N=128)
     run_tilelang_copy_with_stride(M=1024, N=1024, NN=T.dynamic("NN"), block_M=128, block_N=128)
@@ -133,6 +135,7 @@ def run_tilelang_copy_buffer_load_with_parallel(M=1024, N=1024, block_M=128, blo
     torch.testing.assert_close(b, a, rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tilelang_copy_buffer_load_with_parallel():
     run_tilelang_copy_buffer_load_with_parallel(M=1024, N=1024, block_M=128, block_N=128)
 
@@ -162,6 +165,7 @@ def run_tilelang_copy_shape_mismatched(M=1024, N=1024, dtype=T.float16):
     torch.testing.assert_close(b[:, :1], a[:, :1], rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_tilelang_copy_shape_mismatched():
     run_tilelang_copy_shape_mismatched(M=128, N=128)
 

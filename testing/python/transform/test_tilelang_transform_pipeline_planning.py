@@ -175,6 +175,45 @@ def test_pipeline_planning_recognizes_explicit_cp_async_copy_stage():
     assert 0 in stages, "Expected explicit cp.async producer to be recognized as stage-0 copy stage"
 
 
+def test_pipeline_planning_does_not_mark_mixed_cp_async_reduce_stmt_async_producer():
+    @T.prim_func
+    def before(
+        A: T.Tensor((16,), T.uint8),
+        R: T.Tensor((4, 4), T.float32),
+        B: T.Tensor((4,), T.float32),
+        C: T.Tensor((16,), T.uint8),
+    ):
+        with T.Kernel(1, threads=32):
+            S = T.alloc_shared((16,), T.uint8)
+            RF = T.alloc_fragment((4, 4), T.float32)
+            BF = T.alloc_fragment((4,), T.float32)
+            T.copy(R, RF)
+            for i in T.Pipelined(4, num_stages=2):
+                with T.block():
+                    T.ptx_cp_async(
+                        T.access_ptr(S[i * 4], "w", 4),
+                        T.access_ptr(A[i * 4], "r", 4),
+                        4,
+                    )
+                    T.reduce_sum(RF, BF, dim=1)
+                with T.block():
+                    T.ptx_commit_group()
+                with T.block():
+                    T.ptx_wait_group(0)
+                with T.block():
+                    C[i * 4] = S[i * 4]
+            T.copy(BF, B)
+
+    mod = _run_pipeline_planning(before, sm80_target)
+    annos = _collect_pipeline_loop_annotations(mod["main"])
+    assert annos, "Expected at least one loop annotated by PipelinePlanning"
+    anno = annos[0]
+    async_producers = [int(v) for v in anno["software_pipeline_async_producers"]]
+    async_groups = [int(v) for v in anno["software_pipeline_async_producer_groups"]]
+    assert async_producers == [0, 0, 0, 0]
+    assert async_groups == [-1, -1, -1, -1]
+
+
 def test_pipeline_planning_does_not_mark_fill_as_async_producer_for_predicated_cp_async():
     @T.prim_func
     def before(A: T.Tensor((16,), T.uint8), B: T.Tensor((16,), T.uint8)):

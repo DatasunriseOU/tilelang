@@ -45,6 +45,7 @@ from tvm import tir
 from tvm.ir import Op
 from tvm.tir import (
     Allocate,
+    Bind,
     Buffer,
     BufferLoad,
     BufferStore,
@@ -223,8 +224,20 @@ def inline_let_stmts(stmt: Stmt) -> Stmt:
             return IfThenElse(stmt.condition, then_case, else_case)
         return stmt
     elif isinstance(stmt, SeqStmt):
-        new_seq = [inline_let_stmts(s) for s in stmt.seq]
-        return SeqStmt(new_seq)
+        bindings: dict[Var, tir.PrimExpr] = {}
+        new_seq = []
+        for child in stmt.seq:
+            if isinstance(child, Bind):
+                value = substitute(child.value, bindings) if bindings else child.value
+                bindings[child.var] = value
+                continue
+            inlined = inline_let_stmts(child)
+            if bindings:
+                inlined = substitute(inlined, bindings)
+            new_seq.append(inlined)
+        if not new_seq:
+            return tir.Evaluate(0)
+        return new_seq[0] if len(new_seq) == 1 else SeqStmt(new_seq)
     else:
         return stmt
 
@@ -328,12 +341,13 @@ class DecoupleTypeCastMutator(tir.PyStmtExprMutator):
         if not _has_cast(new_body):
             return self._make_for(op, new_body) if new_body is not op.body else op
 
-        # Skip SeqStmt (multiple statements) — not supported yet
-        if _contains_seq_stmt(new_body):
-            return self._make_for(op, new_body) if new_body is not op.body else op
-
         # Inline LetStmts for analysis so BufferLoads behind Vars are visible
         inlined_body = inline_let_stmts(new_body)
+
+        # Skip SeqStmt (multiple statements) — not supported yet.  A flat
+        # Bind+body sequence becomes a single inlined statement above.
+        if _contains_seq_stmt(inlined_body):
+            return self._make_for(op, new_body) if new_body is not op.body else op
 
         # Collect all shared/global stores and loads
         collector = MemoryAccessCollector(op.loop_var)

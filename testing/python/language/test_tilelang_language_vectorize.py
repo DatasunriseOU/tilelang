@@ -50,6 +50,7 @@ def run_vectorize(N, M, stride_A, stride_B):
         assert "float2" in code
 
 
+@tilelang.testing.requires_cuda_target
 def test_vectorize():
     N, M = 128, 128
 
@@ -104,6 +105,7 @@ def run_vectorize_invariant_index(N, M, K):
         assert "float2" in code
 
 
+@tilelang.testing.requires_cuda_target
 def test_vectorize_invariant_index():
     N, M = 128, 128
 
@@ -124,7 +126,7 @@ def vectorize_test_all_dtypes(dtype, vec_num):
     return main
 
 
-@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_target
 @pytest.mark.parametrize(
     "dtype",
     [
@@ -154,7 +156,7 @@ def vectorize_broadcast_int8(vec_num):
             a[i] = b
 
 
-@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_target
 @pytest.mark.parametrize("vec_num", [4, 32])
 def test_vectorize_broadcast_int8(vec_num):
     """Test broadcasting a non-constant int8 value to a vectorized store."""
@@ -170,6 +172,7 @@ def vectorize_test_call_infinity():
     return A
 
 
+@tilelang.testing.requires_cuda_target
 def test_vectorize_call_infinity():
     kernel = vectorize_test_call_infinity.compile()
     assert "float4" in kernel.get_kernel_source()

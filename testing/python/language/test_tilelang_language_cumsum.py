@@ -142,6 +142,7 @@ def run_cumsum_1d(N, block_N, reverse=False, dtype=T.float32, scope="smem"):
     torch.testing.assert_close(tilelang_res, ref_res, atol=1e-3, rtol=1e-3)
 
 
+@tilelang.testing.requires_cuda_target
 def test_cumsum_smem():
     # Test different sizes
     run_cumsum(256, 256, 64, 64)
@@ -152,6 +153,7 @@ def test_cumsum_smem():
     run_cumsum(128, 128, 64, 64, dtype=T.float32)
 
 
+@tilelang.testing.requires_cuda_target
 def test_cumsum_fragment():
     run_cumsum(256, 256, 64, 64, scope="fragment")
     run_cumsum(256, 256, 64, 64, dim=1, scope="fragment")
@@ -161,11 +163,13 @@ def test_cumsum_fragment():
     run_cumsum(128, 128, 64, 64, dtype=T.float32, scope="fragment")
 
 
+@tilelang.testing.requires_cuda_target
 def test_cumsum_smem_1d():
     run_cumsum_1d(512, 64)
     run_cumsum_1d(512, 64, reverse=True)
 
 
+@tilelang.testing.requires_cuda_target
 def test_cumsum_fragment_1d():
     run_cumsum_1d(512, 64, scope="fragment")
     run_cumsum_1d(512, 64, reverse=True, scope="fragment")
@@ -280,6 +284,7 @@ def run_cumsum_region_2d(M, N, block_M, block_N, dim=0, reverse=False, dtype=T.f
     torch.testing.assert_close(tilelang_res, ref_res, atol=1e-3, rtol=1e-3)
 
 
+@tilelang.testing.requires_cuda_target
 def test_cumsum_region_1d():
     """Test cumsum with 1D region input."""
     # Test normal cumsum with region input
@@ -292,6 +297,7 @@ def test_cumsum_region_1d():
     run_cumsum_region_1d(250, 64)
 
 
+@tilelang.testing.requires_cuda_target
 def test_cumsum_region_2d():
     """Test cumsum with 2D region input."""
     # Test 2D cumsum along dim 0

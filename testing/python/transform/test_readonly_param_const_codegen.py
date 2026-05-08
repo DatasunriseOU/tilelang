@@ -1,4 +1,5 @@
 import tilelang.language as T
+import tilelang.testing
 from tilelang.engine.lower import lower
 from tilelang.jit.adapter.utils import match_declare_kernel
 
@@ -16,6 +17,7 @@ def _simple_add_kernel():
     return main
 
 
+@tilelang.testing.requires_cuda_target
 def test_codegen_emits_const_for_readonly_params():
     # Lower without device compilation to retrieve CUDA source reliably
     func = _simple_add_kernel()

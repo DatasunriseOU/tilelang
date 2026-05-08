@@ -75,13 +75,13 @@
 
 #include <limits>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 #include "../op/builtin.h"
 #include "../target/utils.h"
 #include "lower_tma_to_ptr_arith.h"
 #include "vendored/allocate_visit_passthrough.h"
-#include "vendored/let_stmt.h"
 
 namespace tvm {
 namespace tl {
@@ -252,7 +252,7 @@ DecodedDesc DecodeTmaDescriptor(const PrimExpr &desc_arg) {
  *                    lose it).
  *
  * Default form (`kEmitOpaque == false`): emit `BufferStore(BufferLoad(...))`
- * against synthetic flat Buffers anchored on the handles via `LetStmt`-bound
+ * against synthetic flat Buffers anchored on the handles via `Bind`-bound
  * data Vars. This restores the structural pattern that
  * `LowerPTXAsyncCopy` / `InjectSoftwarePipeline` look for, so on
  * pre-Hopper Ampere the rewritten copy can be re-detected and re-issued
@@ -330,7 +330,7 @@ Stmt BuildPointerArithCopy(const DecodedDesc &desc,
     smem_elem_offset = smem_elem_offset + t;
 
   // Synthetic-buffer data Vars (used only on the non-opaque path). Declared
-  // at function scope so the LetStmt bindings emitted after the For nest
+  // at function scope so the Bind statements emitted after the For nest
   // can reference them.
   Optional<Var> nonopaque_g_data;
   Optional<Var> nonopaque_s_data;
@@ -360,7 +360,7 @@ Stmt BuildPointerArithCopy(const DecodedDesc &desc,
                          tirx::builtin::call_extern(), copy_args));
   } else {
     // Default path: emit `BufferStore(BufferLoad(...))` against synthetic
-    // flat Buffers anchored on the handles via LetStmt-bound data Vars.
+    // flat Buffers anchored on the handles via Bind-bound data Vars.
     //
     // The descriptor's `global_stride` is in BYTES (cuTensorMap
     // convention) — convert to element strides by dividing by
@@ -388,14 +388,15 @@ Stmt BuildPointerArithCopy(const DecodedDesc &desc,
     }
 
     // Synthetic flat Buffers anchored on fresh data Vars. We bind the
-    // data Vars to the handle expressions via `LetStmt` after wrapping
+    // data Vars to the handle expressions via `Bind` after wrapping
     // the For nest. Choosing `Int(64)` extents lets us declare an
     // effectively unbounded view (the actual bounds come from the loop
     // ranges and the descriptor coords). `data_alignment=16` and
     // `offset_factor=1` mirror what `decl_buffer` chooses by default for
     // typed copies.
-    Var g_data("tl_tma_global_view", DataType::Handle());
-    Var s_data("tl_tma_smem_view", DataType::Handle());
+    Var g_data("tl_tma_global_view", PointerType(PrimType(element_dtype)));
+    Var s_data("tl_tma_smem_view",
+               PointerType(PrimType(element_dtype), "shared"));
     nonopaque_g_data = g_data;
     nonopaque_s_data = s_data;
     // Virtual flat extent for the pointer-arithmetic buffer views. We use a
@@ -428,7 +429,7 @@ Stmt BuildPointerArithCopy(const DecodedDesc &desc,
     (void)g_buf;
     (void)s_buf;
     // The data-Var bindings are deferred to after the For-nest wrapping
-    // (see the trailing `LetStmt` bindings below) so they live above the
+    // (see the trailing `Bind` statements below) so they live above the
     // loop scope, not per iteration.
   }
 
@@ -444,14 +445,12 @@ Stmt BuildPointerArithCopy(const DecodedDesc &desc,
 
   // Bind the synthetic Buffer data Vars to the actual handle expressions
   // ABOVE the loop scope (so the bindings happen once per copy, not once
-  // per iteration). Standard TVM aliasing idiom — `LowerPTXAsyncCopy`
-  // walks through `LetStmt`s when matching `BufferStore(BufferLoad(...))`
-  // pairs, so the buffer-view abstraction is transparent to the
-  // pattern-matcher.
+  // per iteration). Native tirx::Bind keeps the result consumable by
+  // apache/tvm visitors and script printers.
   if (!kEmitOpaque && nonopaque_g_data.defined() &&
       nonopaque_s_data.defined()) {
-    body = tilelang::tl_tir::LetStmt(nonopaque_g_data.value(), desc.global_addr, body);
-    body = tilelang::tl_tir::LetStmt(nonopaque_s_data.value(), smem_handle, body);
+    body = SeqStmt({Bind(nonopaque_g_data.value(), desc.global_addr),
+                    Bind(nonopaque_s_data.value(), smem_handle), body});
   }
 
   // Preserve the swizzle hint so downstream Metal/HIP layout passes
@@ -514,6 +513,15 @@ public:
       return *out;
     }
     return StmtExprMutator::VisitStmt(stmt);
+  }
+
+  Stmt VisitStmt_(const BindNode *op) final {
+    PrimExpr value = VisitExpr(op->value);
+    let_bindings_[op->var] = value;
+    if (value.same_as(op->value)) {
+      return ffi::GetRef<Stmt>(op);
+    }
+    return Bind(op->var, value, op->span);
   }
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
@@ -596,9 +604,25 @@ public:
   }
 
 private:
+  PrimExpr ResolveLetBoundExpr(const PrimExpr &expr) const {
+    PrimExpr resolved = expr;
+    for (int depth = 0; depth < 16; ++depth) {
+      const auto *var = resolved.as<VarNode>();
+      if (var == nullptr) {
+        break;
+      }
+      auto it = let_bindings_.find(ffi::GetRef<Var>(var));
+      if (it == let_bindings_.end()) {
+        break;
+      }
+      resolved = it->second;
+    }
+    return resolved;
+  }
+
   Optional<Stmt> RewriteTmaCall(const CallNode *call, bool is_load) {
     if (call->args.size() < 3) return std::nullopt;
-    const PrimExpr &desc_arg = call->args[0];
+    PrimExpr desc_arg = ResolveLetBoundExpr(call->args[0]);
     DecodedDesc desc = DecodeTmaDescriptor(desc_arg);
     if (!desc.ok) {
       // Non-decodable descriptor (e.g. lifted to a Var by upstream pass)
@@ -655,6 +679,8 @@ private:
   }
 
   Target target_;
+  std::unordered_map<Var, PrimExpr, ObjectPtrHash, ObjectPtrEqual>
+      let_bindings_;
 };
 
 } // namespace

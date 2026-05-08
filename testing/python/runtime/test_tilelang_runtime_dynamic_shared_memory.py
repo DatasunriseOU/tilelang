@@ -37,6 +37,7 @@ def _run_and_check(kernel, n):
     torch.cuda.synchronize()
 
 
+@tilelang.testing.requires_cuda_target
 def test_dynamic_shared_memory_varies_across_calls():
     kernel = dynamic_smem_kernel()
 

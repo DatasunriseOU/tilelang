@@ -4,6 +4,7 @@ import tilelang.testing
 from tilelang import language as T
 
 
+@tilelang.testing.requires_cuda_target
 def test_nullable_shared_shape():
     """Test that buffers sharing a shape variable can be nullable."""
 
@@ -69,6 +70,7 @@ def test_nullable_shared_shape():
     return True
 
 
+@tilelang.testing.requires_cuda_target
 def test_nullable_single_source_shape():
     """Test that a single buffer with a symbolic shape var must be non-null.
 
@@ -100,6 +102,7 @@ def test_nullable_single_source_shape():
     kernel(None)
 
 
+@tilelang.testing.requires_cuda_target
 def test_nullable_shared_shape_with_no_source_buffers_but_other_tensor_present():
     """Test that unused buffers sharing a symbolic shape var can both be None.
 

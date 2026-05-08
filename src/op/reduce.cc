@@ -95,8 +95,7 @@ ReductionPlan MakeReductionPlan(const PrimExpr &extent_expr,
 
   // Same-simdgroup Metal lowering is only safe when the whole butterfly
   // stays inside one Apple simdgroup and the reduce lanes map 1:1 from the
-  // reduction axis. This helper only records the proof; emission remains in
-  // the existing AllReduce path until a Metal-specific helper is wired in.
+  // reduction axis. Emission uses this proof to elide threadgroup workspace.
   bool same_simdgroup_metal_fast_path_safe =
       extent != 1 && TargetIsMetal(target) && reducing_threads <= 32 &&
       scale == 1 && (*thread_offset_value % 32) == 0;
@@ -610,7 +609,8 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         int scale = plan.scale;
         auto thread_offset = plan.thread_offset;
         std::stringstream ss;
-        int workspace_stride = reducing_threads;
+        int workspace_stride =
+            plan.same_simdgroup_metal_fast_path_safe ? 0 : reducing_threads;
 
         // Use run_batch (not run) to avoid overload-resolution ambiguity when
         // a pointer is passed as first argument.
@@ -636,11 +636,13 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
              << workspace_stride << ">::run_batch";
         }
 
-        // Workspace is only needed for cross-warp reduce (> 32 threads).
-        // Metal helpers take an explicit workspace argument and may use it as a
-        // conservative fallback even inside one SIMD group.
+        // Workspace is only needed for cross-warp reduce (> 32 threads), or for
+        // Metal reductions that cannot be proven to stay inside one simdgroup.
         PrimExpr workspace;
-        bool need_workspace = TargetIsMetal(T.target) || reducing_threads > 32;
+        bool need_workspace =
+            (TargetIsMetal(T.target) &&
+             !plan.same_simdgroup_metal_fast_path_safe) ||
+            (!TargetIsMetal(T.target) && reducing_threads > 32);
         if (need_workspace) {
           int ws_size = workspace_stride * batch;
           workspace = T.AddWorkspace(ws_size, clear_buffer->dtype);
@@ -676,7 +678,9 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
           Array<PrimExpr> args = {StringImm(ss.str()), ptr};
           if (TargetIsMetal(T.target)) {
             args.push_back(T.thread_var);
-            args.push_back(workspace);
+            if (need_workspace) {
+              args.push_back(workspace);
+            }
           } else if (need_workspace) {
             args.push_back(workspace);
           }
@@ -775,7 +779,8 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
           std::stringstream ss;
 
           auto thread_offset = plan.thread_offset;
-          int workspace_stride = reducing_threads;
+          int workspace_stride =
+              plan.same_simdgroup_metal_fast_path_safe ? 0 : reducing_threads;
           if (TargetHasSMVersionGE(T.target, 90)) {
             auto all_threads = T.thread_bounds->extent;
             ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
@@ -794,10 +799,12 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
           Array<PrimExpr> thread_reduce_args = {
               StringImm(ss.str()), BufferLoad(clear_buffer, red_indices)};
           if (TargetIsMetal(T.target)) {
-            PrimExpr workspace =
-                T.AddWorkspace(workspace_stride, clear_buffer->dtype);
             thread_reduce_args.push_back(T.thread_var);
-            thread_reduce_args.push_back(workspace);
+            if (!plan.same_simdgroup_metal_fast_path_safe) {
+              PrimExpr workspace =
+                  T.AddWorkspace(workspace_stride, clear_buffer->dtype);
+              thread_reduce_args.push_back(workspace);
+            }
           } else if (reducing_threads > 32) {
             int workspace_size =
                 static_cast<int>(*as_const_int(T.thread_bounds->extent));

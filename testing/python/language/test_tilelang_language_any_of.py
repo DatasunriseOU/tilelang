@@ -293,14 +293,17 @@ def run_block_sparse_matmul_local(M=1024, N=1024, K=1024, sparsity=0.5, conditio
     torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_block_sparse_matmul_global():
     run_block_sparse_matmul_global(M=1024, N=1024, K=1024, sparsity=0.5, condition_dim=2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_block_sparse_matmul_shared():
     run_block_sparse_matmul_shared(M=1024, N=1024, K=1024, sparsity=0.5, condition_dim=2)
 
 
+@tilelang.testing.requires_cuda_target
 def test_block_sparse_matmul_local():
     run_block_sparse_matmul_local(M=1024, N=1024, K=1024, sparsity=0.5, condition_dim=2)
 

@@ -5,8 +5,6 @@ import tilelang.language as T
 import tilelang.testing
 from tilelang.transform import PassConfigKey
 
-from tvm import te
-
 
 def simplify_and_compare(before, expected, config=None):
     """Helper function to run simplify pass and compare results."""
@@ -25,54 +23,56 @@ def simplify_and_compare(before, expected, config=None):
     tvm.ir.assert_structural_equal(after_func.body, expected_func.body, map_free_vars=True)
 
 
-def test_stmt_simplify():
-    ib = tvm.tir.ir_builder.create()
-    A = ib.pointer("float32", name="A")
-    C = ib.pointer("float32", name="C")
-    n = te.size_var("n")
-    with ib.for_range(0, n, name="i") as i, ib.if_scope(i < 12):
-        A[i] = C[i]
+def _count_stmt_nodes(stmt, node_type):
+    count = 0
 
-    body = tvm.tir.LetStmt(n, 10, ib.get())
-    mod = tvm.IRModule.from_expr(tvm.tir.PrimFunc([A, C, n], body))
-    body = tl.transform.Simplify()(mod)["main"].body
-    assert isinstance(body.body, tvm.tir.BufferStore)
+    def _visit(node):
+        nonlocal count
+        if isinstance(node, node_type):
+            count += 1
+
+    tvm.tir.stmt_functor.post_order_visit(stmt, _visit)
+    return count
+
+
+def test_stmt_simplify():
+    @T.prim_func
+    def before(A: T.Buffer((10,), "float32"), C: T.Buffer((10,), "float32")):
+        n = T.int32(10)
+        for i in T.serial(n):
+            if i < 12:
+                A[i] = C[i]
+
+    body = tl.transform.Simplify()(tvm.IRModule({"main": before}))["main"].body
+    assert _count_stmt_nodes(body, tvm.tir.IfThenElse) == 0
+    assert _count_stmt_nodes(body, tvm.tir.BufferStore) == 1
 
 
 def test_thread_extent_simplify():
-    ib = tvm.tir.ir_builder.create()
-    A = ib.pointer("float32", name="A")
-    C = ib.pointer("float32", name="C")
-    n = te.size_var("n")
-    tx = te.thread_axis("threadIdx.x")
-    ty = te.thread_axis("threadIdx.y")
-    ib.scope_attr(tx, "thread_extent", n)
-    ib.scope_attr(tx, "thread_extent", n)
-    ib.scope_attr(ty, "thread_extent", 1)
-    with ib.if_scope(tx + ty < 12):
-        A[tx] = C[tx + ty]
-    body = tvm.tir.LetStmt(n, 10, ib.get())
-    mod = tvm.IRModule.from_expr(tvm.tir.PrimFunc([A, C, n], body))
-    body = tl.transform.Simplify()(mod)["main"].body
-    assert isinstance(body.body.body.body, tvm.tir.BufferStore)
+    @T.prim_func
+    def before(A: T.Buffer((10,), "float32"), C: T.Buffer((10,), "float32")):
+        n = T.int32(10)
+        tx = T.launch_thread("threadIdx.x", n)
+        ty = T.launch_thread("threadIdx.y", 1)
+        if tx + ty < 12:
+            A[tx] = C[tx + ty]
+
+    body = tl.transform.Simplify()(tvm.IRModule({"main": before}))["main"].body
+    assert _count_stmt_nodes(body, tvm.tir.IfThenElse) == 0
+    assert _count_stmt_nodes(body, tvm.tir.BufferStore) == 1
 
 
 def test_if_likely():
-    ib = tvm.tir.ir_builder.create()
-    A = ib.pointer("float32", name="A")
-    C = ib.pointer("float32", name="C")
-    n = te.size_var("n")
-    tx = te.thread_axis("threadIdx.x")
-    ty = te.thread_axis("threadIdx.y")
-    ib.scope_attr(tx, "thread_extent", 32)
-    ib.scope_attr(ty, "thread_extent", 32)
-    with ib.if_scope(ib.likely(tx * 32 + ty < n)), ib.if_scope(ib.likely(tx * 32 + ty < n)):
-        A[tx] = C[tx * 32 + ty]
-    body = ib.get()
-    mod = tvm.IRModule.from_expr(tvm.tir.PrimFunc([A, C, n], body))
-    body = tl.transform.Simplify()(mod)["main"].body
-    assert isinstance(body.body.body, tvm.tir.IfThenElse)
-    assert not isinstance(body.body.body.then_case, tvm.tir.IfThenElse)
+    @T.prim_func
+    def before(A: T.Buffer((32,), "float32"), C: T.Buffer((1024,), "float32"), n: T.int32):
+        tx = T.launch_thread("threadIdx.x", 32)
+        ty = T.launch_thread("threadIdx.y", 32)
+        if T.likely(tx * 32 + ty < n):
+            if T.likely(tx * 32 + ty < n):
+                A[tx] = C[tx * 32 + ty]
+
+    body = tl.transform.Simplify()(tvm.IRModule({"main": before}))["main"].body
+    assert _count_stmt_nodes(body, tvm.tir.IfThenElse) == 1
 
 
 def test_load_store_noop():

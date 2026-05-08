@@ -77,7 +77,7 @@ class _FakeRes:
         self.type = type("Ty", (), {"shape": shape, "element_type": dtype})()
 
 
-def test_dot_after_trans_b_emits_gemm_with_transpose_B_true():
+def test_dot_after_trans_b_emits_gemm_with_transpose_B_true(monkeypatch):
     """End-to-end fake-op walk: ``%bt = tt.trans %b ; tt.dot %a, %bt``."""
     om = _ctx()
     captured = {}
@@ -101,8 +101,12 @@ def test_dot_after_trans_b_emits_gemm_with_transpose_B_true():
 
     # Stub the ``tilelang.language as T`` lazy import inside map_tt_dot.
     import sys
-    sys.modules["tilelang"] = type(sys)("tilelang")
-    sys.modules["tilelang.language"] = _FakeT  # type: ignore[assignment]
+
+    import tilelang as real_tilelang
+
+    monkeypatch.setattr(real_tilelang, "language", _FakeT, raising=False)
+    monkeypatch.setitem(sys.modules, "tilelang", real_tilelang)
+    monkeypatch.setitem(sys.modules, "tilelang.language", _FakeT)  # type: ignore[arg-type]
 
     ctx = om.WalkerCtx()
     ctx.bind("%a", "TIR_A")
@@ -128,7 +132,7 @@ def test_dot_after_trans_b_emits_gemm_with_transpose_B_true():
     assert captured["gemm"]["transpose_A"] is False
 
 
-def test_dot_with_transpose_B_attr_xors_with_pre_trans_b():
+def test_dot_with_transpose_B_attr_xors_with_pre_trans_b(monkeypatch):
     """If trans_b is *both* on the dot attr and via tt.trans, they cancel."""
     om = _ctx()
     captured = {}
@@ -144,8 +148,12 @@ def test_dot_with_transpose_B_attr_xors_with_pre_trans_b():
             return None
 
     import sys
-    sys.modules["tilelang"] = type(sys)("tilelang")
-    sys.modules["tilelang.language"] = _FakeT  # type: ignore[assignment]
+
+    import tilelang as real_tilelang
+
+    monkeypatch.setattr(real_tilelang, "language", _FakeT, raising=False)
+    monkeypatch.setitem(sys.modules, "tilelang", real_tilelang)
+    monkeypatch.setitem(sys.modules, "tilelang.language", _FakeT)  # type: ignore[arg-type]
 
     ctx = om.WalkerCtx()
     ctx.bind("%a", "A")
