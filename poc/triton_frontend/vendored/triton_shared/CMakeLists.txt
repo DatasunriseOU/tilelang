@@ -96,7 +96,7 @@ file(MAKE_DIRECTORY "${_VENDOR_BUILD_INCLUDE}/triton-shared/Dialect/TritonStruct
 include_directories(SYSTEM
   ${LLVM_INCLUDE_DIRS}
   ${MLIR_INCLUDE_DIRS}
-  "${TRITON_INSTALL_DIR}/include"
+  "$<BUILD_INTERFACE:${TRITON_INSTALL_DIR}/include>"
 )
 include_directories(
   "${_VENDOR_INCLUDE}"
@@ -162,7 +162,7 @@ add_dependencies(TritonStructuredDialect TritonStructuredVendoredTableGen)
 target_include_directories(TritonStructuredDialect PUBLIC
   "${_VENDOR_INCLUDE}"
   "$<BUILD_INTERFACE:${_VENDOR_BUILD_INCLUDE}>"
-  "${TRITON_INSTALL_DIR}/include"
+  "$<BUILD_INTERFACE:${TRITON_INSTALL_DIR}/include>"
   ${MLIR_INCLUDE_DIRS}
   ${LLVM_INCLUDE_DIRS}
 )
@@ -181,7 +181,7 @@ target_link_libraries(TritonStructuredDialect PUBLIC
 # directory to the link search path; the actual symbol resolution happens
 # at link time of the final pybind shared object.
 target_link_directories(TritonStructuredDialect PUBLIC
-  "${TRITON_INSTALL_DIR}/lib"
+  "$<BUILD_INTERFACE:${TRITON_INSTALL_DIR}/lib>"
 )
 target_link_libraries(TritonStructuredDialect PUBLIC TritonIR)
 
@@ -195,7 +195,7 @@ add_dependencies(TritonSharedUseAnalysis TritonStructuredVendoredTableGen)
 target_include_directories(TritonSharedUseAnalysis PUBLIC
   "${_VENDOR_INCLUDE}"
   "$<BUILD_INTERFACE:${_VENDOR_BUILD_INCLUDE}>"
-  "${TRITON_INSTALL_DIR}/include"
+  "$<BUILD_INTERFACE:${TRITON_INSTALL_DIR}/include>"
   ${MLIR_INCLUDE_DIRS}
   ${LLVM_INCLUDE_DIRS}
 )
@@ -224,7 +224,7 @@ add_dependencies(TritonSharedAnalysisStructured TritonStructuredVendoredTableGen
 target_include_directories(TritonSharedAnalysisStructured PUBLIC
   "${_VENDOR_INCLUDE}"
   "$<BUILD_INTERFACE:${_VENDOR_BUILD_INCLUDE}>"
-  "${TRITON_INSTALL_DIR}/include"
+  "$<BUILD_INTERFACE:${TRITON_INSTALL_DIR}/include>"
   ${MLIR_INCLUDE_DIRS}
   ${LLVM_INCLUDE_DIRS}
 )
@@ -289,7 +289,7 @@ add_dependencies(TritonSharedConversionStructuredToMemref
 target_include_directories(TritonSharedConversionStructuredToMemref PUBLIC
   "${_VENDOR_INCLUDE}"
   "$<BUILD_INTERFACE:${_VENDOR_BUILD_INCLUDE}>"
-  "${TRITON_INSTALL_DIR}/include"
+  "$<BUILD_INTERFACE:${TRITON_INSTALL_DIR}/include>"
   ${MLIR_INCLUDE_DIRS}
   ${LLVM_INCLUDE_DIRS}
 )
@@ -326,7 +326,7 @@ target_include_directories(TritonSharedRegister PUBLIC
   "${_VENDOR_ROOT}"
   "${_VENDOR_INCLUDE}"
   "$<BUILD_INTERFACE:${_VENDOR_BUILD_INCLUDE}>"
-  "${TRITON_INSTALL_DIR}/include"
+  "$<BUILD_INTERFACE:${TRITON_INSTALL_DIR}/include>"
   ${MLIR_INCLUDE_DIRS}
   ${LLVM_INCLUDE_DIRS}
 )

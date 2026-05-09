@@ -676,45 +676,35 @@ Fragment ParallelOpNode::ComputePlanCandidate(const LayoutInferArgs &T) const {
   // As the pass will do post processing to the layout
   auto maybe_remapped_root_ =
       IfBufferRemapLoopGenerator::run(root_, T.buffer_remap, T.layout_map);
-  int vector_size =
-      GetVectorizeSize(maybe_remapped_root_, const_cast<arith::Analyzer*>(&analyzer_), T.layout_map);
-  DLOG(INFO) << "[PlanLoopPartition] vector_size = " << vector_size << '\n';
-
-  PrimExpr loop_total_size = 1;
-  for (Stmt l = root_; l.as<For>().has_value(); l = l.as<For>().value()->body)
-    loop_total_size = loop_total_size * l.as<For>().value()->extent;
-
-  PrimExpr max_loop_total_size = loop_total_size;
-  if (!is_const_int(loop_total_size)) {
-    int64_t max_val = analyzer_.const_int_bound(loop_total_size)->max_value;
-    if (max_val < arith::ConstIntBound::kPosInf) {
-      max_loop_total_size = make_const(loop_total_size->dtype, max_val);
-    }
-  }
-
-  DLOG(INFO) << "[PlanLoopPartition] loop_total_size = " << loop_total_size
-             << " (max: " << max_loop_total_size << ")" << '\n';
-  while (!analyzer_.CanProve(floormod(max_loop_total_size, T.thread_bounds->extent *
-                                                           vector_size) == 0) &&
-         vector_size > 1)
-    vector_size /= 2;
-  DLOG(INFO) << "[PlanLoopPartition] after adjust: vector_size = "
-             << vector_size << '\n';
-
+  int vector_size = 1;
   // Check if coalesced_width is defined
   if (auto coalesced_width = root_->annotations.Get(attr::kCoalescedWidth)) {
     if (const auto *imm = coalesced_width->as<IntImmNode>()) {
-      int expected = imm->value;
-      // Verify that vector_size is divisible by expected
-      if (vector_size % expected != 0) {
-        LOG(FATAL) << "Vector size " << vector_size
-                   << " is not divisible by coalesced width " << expected;
-      }
-      vector_size = expected;
+      vector_size = imm->value;
     } else {
       LOG(FATAL) << "coalesced_width should be an IntImmNode.";
     }
+  } else {
+    vector_size = GetVectorizeSize(maybe_remapped_root_, const_cast<arith::Analyzer*>(&analyzer_), T.layout_map);
+
+    PrimExpr loop_total_size = 1;
+    for (Stmt l = root_; l.as<For>().has_value(); l = l.as<For>().value()->body)
+      loop_total_size = loop_total_size * l.as<For>().value()->extent;
+
+    PrimExpr max_loop_total_size = loop_total_size;
+    if (!is_const_int(loop_total_size)) {
+      int64_t max_val = analyzer_.const_int_bound(loop_total_size)->max_value;
+      if (max_val < arith::ConstIntBound::kPosInf) {
+        max_loop_total_size = make_const(loop_total_size->dtype, max_val);
+      }
+    }
+
+    while (!analyzer_.CanProve(floormod(max_loop_total_size, T.thread_bounds->extent *
+                                                             vector_size) == 0) &&
+           vector_size > 1)
+      vector_size /= 2;
   }
+  DLOG(INFO) << "[PlanLoopPartition] vector_size = " << vector_size << '\n';
   DLOG(INFO) << "[PlanLoopPartition] root_ = " << root_
              << " ############# vector_size = " << vector_size
              << ", thread_bounds = " << T.thread_bounds << '\n';

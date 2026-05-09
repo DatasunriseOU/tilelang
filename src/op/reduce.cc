@@ -9,6 +9,7 @@
 #include <cmath>
 #include <limits>
 
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/op_attr_types.h>
@@ -93,12 +94,11 @@ ReductionPlan MakeReductionPlan(const PrimExpr &extent_expr,
         << "identity-pad before the reduce.";
   }
 
-  // Same-simdgroup Metal lowering is only safe when the whole butterfly
-  // stays inside one Apple simdgroup and the reduce lanes map 1:1 from the
-  // reduction axis. Emission uses this proof to elide threadgroup workspace.
   bool same_simdgroup_metal_fast_path_safe =
-      extent != 1 && TargetIsMetal(target) && reducing_threads <= 32 &&
-      scale == 1 && (*thread_offset_value % 32) == 0;
+      extent != 1 &&
+      IsSameSimdgroupMetalReductionSafe(
+          target, static_cast<int>(reducing_threads), static_cast<int>(scale),
+          thread_offset, analyzer);
 
   return ReductionPlan{static_cast<int>(reducing_threads),
                        static_cast<int>(scale), thread_offset,
@@ -106,6 +106,34 @@ ReductionPlan MakeReductionPlan(const PrimExpr &extent_expr,
 }
 
 }  // namespace
+
+bool IsSameSimdgroupMetalReductionSafe(const Target &target,
+                                       int reducing_threads, int scale,
+                                       const PrimExpr &thread_offset_expr,
+                                       arith::Analyzer *analyzer) {
+  if (!TargetIsMetal(target) || scale != 1 || reducing_threads <= 0 ||
+      reducing_threads > 32 || !IsPositivePowerOfTwo(reducing_threads)) {
+    return false;
+  }
+
+  // Z3 is not useful for this legality check. `thread_offset` is printed into
+  // the MSL `AllReduce<..., thread_offset, ...>` template argument, so codegen
+  // already requires the Analyzer to reduce it to an integer constant. Once it
+  // is constant, the exact condition is modular arithmetic over the 32-wide
+  // Metal simdgroup lane id: every xor partner used by the butterfly must stay
+  // inside the same contiguous reduce group.
+  PrimExpr thread_offset =
+      analyzer != nullptr ? analyzer->Simplify(thread_offset_expr)
+                          : thread_offset_expr;
+  const int64_t *thread_offset_value = as_const_int(thread_offset);
+  if (thread_offset_value == nullptr || *thread_offset_value < 0) {
+    return false;
+  }
+
+  const int64_t simd_lane = *thread_offset_value % 32;
+  return simd_lane + reducing_threads <= 32 &&
+         simd_lane % reducing_threads == 0;
+}
 
 // NormalizeToBufferRegion moved to src/op/utils.{h,cc}
 
@@ -1054,10 +1082,21 @@ TIR_REGISTER_TL_TILE_OP(CumSumOp, cumsum)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+bool MetalReductionSameSimdgroupFastPathSafeForTest(
+    Target target, int reducing_threads, int scale, int64_t thread_offset) {
+  arith::Analyzer analyzer;
+  return IsSameSimdgroupMetalReductionSafe(
+      target, reducing_threads, scale,
+      IntImm(DataType::Int(64), thread_offset), &analyzer);
+}
+
 TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
   ReduceOpNode::RegisterReflection();
   CumSumOpNode::RegisterReflection();
   ReduceTypeNode::RegisterReflection();
+  refl::GlobalDef().def("tl.metal.reduce_same_simdgroup_fast_path_safe",
+                        MetalReductionSameSimdgroupFastPathSafeForTest);
 }
 
 } // namespace tl

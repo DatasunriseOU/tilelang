@@ -28,6 +28,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -52,12 +53,110 @@ _FORBIDDEN_EXTERNAL_TOKENS = (
     "tl.cuda",
 )
 
+_BENCH_WARMUP_ENV = "TILELANG_METAL_BENCH_WARMUP"
+_BENCH_ITERS_ENV = "TILELANG_METAL_BENCH_ITERS"
+_COMPONENT_BENCH_ITERS_ENV = "TILELANG_METAL_COMPONENT_BENCH_ITERS"
+
+
+@dataclass(frozen=True)
+class _Timing:
+    mean_ms: float
+    std_ms: float
+
 
 def _lower_source(func) -> str:
     with tvm.transform.PassContext(), tvm.target.Target("metal"):
         artifact = tilelang.lower(func, target="metal")
     assert artifact.kernel_source is not None
     return artifact.kernel_source
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        pytest.fail(f"{name} must be an integer, got {value!r}")
+    if parsed <= 0:
+        pytest.fail(f"{name} must be positive, got {parsed}")
+    return parsed
+
+
+def _time_synced_ms(fn, sync, *, warmup: int, iterations: int) -> _Timing:
+    for _ in range(warmup):
+        fn()
+        sync()
+
+    samples = []
+    for _ in range(iterations):
+        sync()
+        start = time.perf_counter()
+        fn()
+        sync()
+        samples.append((time.perf_counter() - start) * 1000.0)
+
+    samples.sort()
+    kept = samples[: max(1, int(len(samples) * 0.9))]
+    mean = sum(kept) / len(kept)
+    variance = sum((x - mean) ** 2 for x in kept) / max(1, len(kept) - 1)
+    return _Timing(mean, variance ** 0.5)
+
+
+def _bench_metal_profiler_ms(
+    prefix: str,
+    name: str,
+    jit_kernel,
+    input_tensors,
+    *,
+    warmup: int,
+    iterations: int,
+    evidence: str = "",
+) -> _Timing:
+    profiler = jit_kernel.get_profiler()
+
+    def run():
+        profiler(*input_tensors)
+
+    timing = _time_synced_ms(
+        run,
+        torch.mps.synchronize,
+        warmup=warmup,
+        iterations=iterations,
+    )
+    suffix = f" {evidence}" if evidence else ""
+    print(
+        f"{prefix} case={name} timer=tilelang_profiler_sync "
+        f"tilelang={timing.mean_ms:.4f} ms/iter "
+        f"tilelang_std={timing.std_ms:.4f} "
+        f"warmup={warmup} iterations={iterations}{suffix}"
+    )
+    assert timing.mean_ms > 0.0
+    return timing
+
+
+def _quant_matmul_bottleneck_evidence(src: str, *, m: int, n: int, k: int) -> str:
+    scalar_k_iters = m * n * k
+    lowered = src.lower()
+    return (
+        f"shape={m}x{n}x{k} "
+        f"scalar_k_iters={scalar_k_iters} "
+        f"fp8_decode_ops={scalar_k_iters} "
+        f"fp4_decode_ops={scalar_k_iters} "
+        f"e8m0_scale_ops={scalar_k_iters * 2} "
+        f"source_simdgroup_mma={src.count('simdgroup_multiply_accumulate')} "
+        f"source_device_uchar={lowered.count('device uchar')}"
+    )
+
+
+def _gdn_simdgroup_evidence(src: str) -> str:
+    return (
+        f"source_simdgroup_mma={src.count('simdgroup_multiply_accumulate')} "
+        f"source_simdgroup_load={src.count('simdgroup_load')} "
+        f"source_simdgroup_store={src.count('simdgroup_store')} "
+        f"source_threadgroup_float={src.count('threadgroup float')}"
+    )
 
 
 def _assert_clean_metal_source(src: str) -> None:
@@ -782,6 +881,8 @@ def test_small_synthetic_runtime_benchmarks_opt_in():
     if os.environ.get("TILELANG_RUN_METAL_SMALL_BENCH") != "1":
         pytest.skip("set TILELANG_RUN_METAL_SMALL_BENCH=1 to run small Metal benchmark hooks")
 
+    warmup = _env_int(_BENCH_WARMUP_ENV, 3)
+    iterations = _env_int(_BENCH_ITERS_ENV, 20)
     deepseek_kernel = tilelang.compile(_make_deepseek_packed_quant_probe(), target="metal")
     gdn_kernel = tilelang.compile(_make_flashqla_gdn_kkt_probe(), target="metal")
     q8, q4, e8m0_scale = _deepseek_synthetic_inputs()
@@ -795,23 +896,24 @@ def test_small_synthetic_runtime_benchmarks_opt_in():
     scores = torch.empty((8, 8), dtype=torch.float32, device="mps")
     torch.mps.synchronize()
 
-    def bench(name, fn, iterations: int = 20):
-        # The current TVM/Metal runtime can trip Metal's single command-encoder
-        # assertion if tiny kernels are launched back-to-back without a flush.
-        # Keep this hook safe/rerunnable by timing synchronized iterations.
-        for _ in range(3):
-            fn()
-            torch.mps.synchronize()
-        start = time.perf_counter()
-        for _ in range(iterations):
-            fn()
-            torch.mps.synchronize()
-        elapsed_ms = (time.perf_counter() - start) * 1000.0 / iterations
-        print(f"metal_small_bench {name}: {elapsed_ms:.4f} ms/iter over {iterations} iterations")
-        assert elapsed_ms >= 0.0
-
-    bench("deepseek_packed_decode_16", lambda: deepseek_kernel(q8_mps, q4_mps, e8m0_mps, decode_out))
-    bench("flashqla_gdn_kkt_8x8", lambda: gdn_kernel(row_k, col_k, scores))
+    _bench_metal_profiler_ms(
+        "metal_small_bench",
+        "deepseek_packed_decode_16",
+        deepseek_kernel,
+        [q8_mps, q4_mps, e8m0_mps, decode_out],
+        warmup=warmup,
+        iterations=iterations,
+        evidence="elements=16 fp8_decode_ops=16 fp4_decode_ops=16 e8m0_scale_ops=16",
+    )
+    _bench_metal_profiler_ms(
+        "metal_small_bench",
+        "flashqla_gdn_kkt_8x8",
+        gdn_kernel,
+        [row_k, col_k, scores],
+        warmup=warmup,
+        iterations=iterations,
+        evidence=_gdn_simdgroup_evidence(gdn_kernel.get_kernel_source()),
+    )
 
 
 @tilelang.testing.requires_metal
@@ -819,6 +921,8 @@ def test_scaled_synthetic_runtime_benchmarks_opt_in():
     if os.environ.get("TILELANG_RUN_METAL_SCALED_BENCH") != "1":
         pytest.skip("set TILELANG_RUN_METAL_SCALED_BENCH=1 to run scaled Metal benchmark hooks")
 
+    warmup = _env_int(_BENCH_WARMUP_ENV, 3)
+    iterations = _env_int(_BENCH_ITERS_ENV, 20)
     deepseek_kernel = tilelang.compile(_make_deepseek_packed_quant_matmul_probe(), target="metal")
     gdn_kernel = tilelang.compile(_make_flashqla_gdn_wu_probe(), target="metal")
     q8_act, q4_weight, act_scale, weight_scale = _deepseek_matmul_synthetic_inputs()
@@ -834,23 +938,29 @@ def test_scaled_synthetic_runtime_benchmarks_opt_in():
     u = torch.empty((8, 8), dtype=torch.float32, device="mps")
     torch.mps.synchronize()
 
-    def bench(name, fn, iterations: int = 20):
-        for _ in range(3):
-            fn()
-            torch.mps.synchronize()
-        start = time.perf_counter()
-        for _ in range(iterations):
-            fn()
-            torch.mps.synchronize()
-        elapsed_ms = (time.perf_counter() - start) * 1000.0 / iterations
-        print(f"metal_scaled_bench {name}: {elapsed_ms:.4f} ms/iter over {iterations} iterations")
-        assert elapsed_ms >= 0.0
-
-    bench(
+    _bench_metal_profiler_ms(
+        "metal_scaled_bench",
         "deepseek_packed_quant_matmul_m8n8k16",
-        lambda: deepseek_kernel(q8_mps, q4_mps, act_scale_mps, weight_scale_mps, matmul_out),
+        deepseek_kernel,
+        [q8_mps, q4_mps, act_scale_mps, weight_scale_mps, matmul_out],
+        warmup=warmup,
+        iterations=iterations,
+        evidence=_quant_matmul_bottleneck_evidence(
+            deepseek_kernel.get_kernel_source(),
+            m=8,
+            n=8,
+            k=16,
+        ),
     )
-    bench("flashqla_gdn_wu_8x8", lambda: gdn_kernel(a_mps, k_mps, v_mps, beta_mps, g_cum_mps, w, u))
+    _bench_metal_profiler_ms(
+        "metal_scaled_bench",
+        "flashqla_gdn_wu_8x8",
+        gdn_kernel,
+        [a_mps, k_mps, v_mps, beta_mps, g_cum_mps, w, u],
+        warmup=warmup,
+        iterations=iterations,
+        evidence=_gdn_simdgroup_evidence(gdn_kernel.get_kernel_source()),
+    )
 
 
 @tilelang.testing.requires_metal
@@ -858,6 +968,8 @@ def test_component_synthetic_runtime_benchmarks_opt_in():
     if os.environ.get("TILELANG_RUN_METAL_COMPONENT_BENCH") != "1":
         pytest.skip("set TILELANG_RUN_METAL_COMPONENT_BENCH=1 to run component Metal benchmark hooks")
 
+    warmup = _env_int(_BENCH_WARMUP_ENV, 2)
+    iterations = _env_int(_COMPONENT_BENCH_ITERS_ENV, 10)
     deepseek_kernel = tilelang.compile(_make_deepseek_component_quant_matmul_probe(), target="metal")
     gdn_kernel = tilelang.compile(_make_flashqla_gdn_component_probe(), target="metal")
     q8_act, q4_weight, act_scale, weight_scale = _deepseek_component_matmul_synthetic_inputs()
@@ -874,20 +986,26 @@ def test_component_synthetic_runtime_benchmarks_opt_in():
     u = torch.empty((16, 16), dtype=torch.float32, device="mps")
     torch.mps.synchronize()
 
-    def bench(name, fn, iterations: int = 10):
-        for _ in range(2):
-            fn()
-            torch.mps.synchronize()
-        start = time.perf_counter()
-        for _ in range(iterations):
-            fn()
-            torch.mps.synchronize()
-        elapsed_ms = (time.perf_counter() - start) * 1000.0 / iterations
-        print(f"metal_component_bench {name}: {elapsed_ms:.4f} ms/iter over {iterations} iterations")
-        assert elapsed_ms >= 0.0
-
-    bench(
+    _bench_metal_profiler_ms(
+        "metal_component_bench",
         "deepseek_packed_quant_matmul_m16n32k64",
-        lambda: deepseek_kernel(q8_mps, q4_mps, act_scale_mps, weight_scale_mps, matmul_out),
+        deepseek_kernel,
+        [q8_mps, q4_mps, act_scale_mps, weight_scale_mps, matmul_out],
+        warmup=warmup,
+        iterations=iterations,
+        evidence=_quant_matmul_bottleneck_evidence(
+            deepseek_kernel.get_kernel_source(),
+            m=16,
+            n=32,
+            k=64,
+        ),
     )
-    bench("flashqla_gdn_component_chunk16_k16_v16", lambda: gdn_kernel(k_mps, v_mps, beta_mps, g_cum_mps, a_pre, w, u))
+    _bench_metal_profiler_ms(
+        "metal_component_bench",
+        "flashqla_gdn_component_chunk16_k16_v16",
+        gdn_kernel,
+        [k_mps, v_mps, beta_mps, g_cum_mps, a_pre, w, u],
+        warmup=warmup,
+        iterations=iterations,
+        evidence=_gdn_simdgroup_evidence(gdn_kernel.get_kernel_source()),
+    )

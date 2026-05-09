@@ -96,6 +96,7 @@ def _make_vecmat_m1_kernel(
     b_dtype: str = "float8_e4m3",
     a_scale_size: int = 1,
     b_scale_size: int = 1,
+    macro_target=None,
 ):
     """Build an M=1, transpose_B=True vecmat kernel using the Metal path."""
     g = globals()
@@ -103,6 +104,7 @@ def _make_vecmat_m1_kernel(
         _VM_N=N, _VM_K=K, _VM_BN=BN, _VM_BK=BK,
         _VM_SA=a_scale_size, _VM_SB=b_scale_size,
         _VM_A_DTYPE=a_dtype, _VM_B_DTYPE=b_dtype,
+        _VM_MACRO_TARGET=macro_target,
     )
 
     @T.prim_func
@@ -121,18 +123,78 @@ def _make_vecmat_m1_kernel(
             for ko in range(T.ceildiv(_VM_K, _VM_BK)):
                 T.copy(A_fp8[0, ko * _VM_BK], A_shared)
                 T.copy(B_fp8[bx * _VM_BN, ko * _VM_BK], B_shared)
-                T.fp8_scaled_matmul(
-                    A_shared,
-                    A_scale,
-                    B_shared,
-                    B_scale,
-                    C_local,
-                    transpose_B=True,
-                    target=Target("metal"),
-                )
+                if _VM_MACRO_TARGET is None:
+                    T.fp8_scaled_matmul(
+                        A_shared,
+                        A_scale,
+                        B_shared,
+                        B_scale,
+                        C_local,
+                        transpose_B=True,
+                    )
+                else:
+                    T.fp8_scaled_matmul(
+                        A_shared,
+                        A_scale,
+                        B_shared,
+                        B_scale,
+                        C_local,
+                        transpose_B=True,
+                        target=_VM_MACRO_TARGET,
+                    )
             T.copy(C_local, C[0, bx * _VM_BN])
 
     return fp8_scaled_vecmat_kernel
+
+
+def _make_direct_m1_kernel(
+    N: int,
+    K: int,
+    BN: int,
+    *,
+    macro_target=None,
+):
+    """Build a direct-global-store M=1 transposed-B kernel."""
+    g = globals()
+    g.update(
+        _DM_N=N, _DM_K=K, _DM_BN=BN,
+        _DM_MACRO_TARGET=macro_target,
+    )
+
+    @T.prim_func
+    def fp8_scaled_direct_kernel(
+        A_fp8: T.Tensor((1, _DM_K), "float8_e4m3"),
+        A_scale: T.Tensor((1,), "float32"),
+        B_fp8: T.Tensor((_DM_N, _DM_K), "float8_e4m3"),
+        B_scale: T.Tensor((1,), "float32"),
+        C: T.Tensor((1, _DM_N), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(_DM_N, _DM_BN), threads=_DM_BN) as bx:
+            if _DM_MACRO_TARGET is None:
+                T.fp8_scaled_matmul(
+                    A_fp8,
+                    A_scale,
+                    B_fp8,
+                    B_scale,
+                    C,
+                    transpose_B=True,
+                    c_col_offset=bx * _DM_BN,
+                    outputs_per_block=_DM_BN,
+                )
+            else:
+                T.fp8_scaled_matmul(
+                    A_fp8,
+                    A_scale,
+                    B_fp8,
+                    B_scale,
+                    C,
+                    transpose_B=True,
+                    target=_DM_MACRO_TARGET,
+                    c_col_offset=bx * _DM_BN,
+                    outputs_per_block=_DM_BN,
+                )
+
+    return fp8_scaled_direct_kernel
 
 
 def _xcrun_compile(msl_source: str) -> tuple[int, str]:
@@ -175,10 +237,9 @@ def test_per_tensor_scale_lowers_on_metal():
     # Matmul-body shape: should accumulate into C_local.
     body = src[src.find("kernel void"):]
     assert "C_local" in body
-    assert "a_val" in body and "b_val" in body
-    assert "sa" in body and "sb" in body, (
-        "expected per-tensor / per-row scale variables in the inner loop"
-    )
+    assert "__tvm_fp8_e4m3_to_half(A_shared" in body
+    assert "__tvm_fp8_e4m3_to_half(B_shared" in body
+    assert "A_scale[0]" in body and "B_scale[0]" in body
 
     # No simdgroup MMA for FP8 — Apple has no native FP8 ALU through M5.
     assert "simdgroup_multiply_accumulate" not in body, (
@@ -263,9 +324,15 @@ def test_mixed_e4m3_e5m2_lowers_on_metal():
     assert "__tvm_fp8_e5m2_to_half(B_shared" in body
 
 
-def test_m1_transposed_b_vecmat_lowers_to_simd_sum():
-    """Metal M=1 vecmat uses SIMD-group K reduction, not the scalar matmul path."""
-    fn = _make_vecmat_m1_kernel(N=64, K=96, BN=64, BK=96)
+def test_m1_transposed_b_vecmat_explicit_metal_target_lowers_to_dot4_simd_sum():
+    """Metal M=1 vecmat uses dot4 + SIMD reduction when the macro target is Metal."""
+    fn = _make_vecmat_m1_kernel(
+        N=64,
+        K=96,
+        BN=64,
+        BK=96,
+        macro_target=Target("metal"),
+    )
     target = Target("metal")
     artifact = tilelang.lower(fn, target=target)
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
@@ -280,6 +347,138 @@ def test_m1_transposed_b_vecmat_lowers_to_simd_sum():
         if pos >= 0
     )
     assert scale_pos > simd_pos, "scale must be applied after the SIMD dot reduction"
+
+
+def test_m1_transposed_b_vecmat_keeps_metal_intrinsics_until_codegen():
+    """The Metal fast path stays as TIR intrinsics before final MSL emission."""
+    fn = _make_vecmat_m1_kernel(
+        N=64,
+        K=96,
+        BN=64,
+        BK=96,
+        macro_target=Target("metal"),
+    )
+    tir_text = str(fn)
+
+    assert "T.metal_fp8_e4m3_dot4" in tir_text
+    assert "T.tirx.metal.simd_sum" in tir_text
+    assert "__tvm_fp8_e4m3_dot4_packed" not in tir_text
+
+    artifact = tilelang.lower(fn, target=Target("metal"))
+    src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
+    body = src[src.find("kernel void"):]
+
+    assert "T.metal_fp8_e4m3_dot4" not in body
+    assert "T.tirx.metal.simd_sum" not in body
+    assert "__tvm_fp8_e4m3_dot4_packed" in body
+    assert "simd_sum(" in body
+
+
+def test_m1_transposed_b_vecmat_without_macro_target_uses_late_scalar_lowering():
+    """Omitted macro target emits a marker, then lowers safely for fragment output."""
+    fn = _make_vecmat_m1_kernel(N=64, K=96, BN=64, BK=96)
+    assert "tl.fp8_scaled_matmul.marker" in str(fn)
+    artifact = tilelang.lower(fn, target=Target("metal"))
+    src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
+    body = src[src.find("kernel void"):]
+
+    assert "__tvm_fp8_e4m3_dot4_packed" not in body
+    assert "tl.fp8_scaled_matmul.marker" not in body
+    assert "__tvm_fp8_e4m3_to_half" in body
+
+
+def test_m1_transposed_b_vecmat_unsafe_dot4_marker_uses_scalar_fallback():
+    """A local.fragment marker with non-e4m3 inputs lowers without dot4."""
+    fn = _make_vecmat_m1_kernel(
+        N=64,
+        K=96,
+        BN=64,
+        BK=96,
+        a_dtype="float8_e5m2",
+        b_dtype="float8_e5m2",
+    )
+    assert "tl.fp8_scaled_matmul.marker" in str(fn)
+    artifact = tilelang.lower(fn, target=Target("metal"))
+    src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
+    body = src[src.find("kernel void"):]
+
+    assert "tl.fp8_scaled_matmul.marker" not in body
+    assert "__tvm_fp8_e4m3_dot4_packed" not in body
+    assert "__tvm_fp8_e5m2_to_half" in body
+
+
+def test_m1_transposed_b_vecmat_jit_metal_target_uses_marker_late_lowering():
+    """JIT target context also leaves the call as a marker until lowering."""
+
+    @tilelang.jit(target="metal")
+    def build_kernel():
+        return _make_vecmat_m1_kernel(N=64, K=96, BN=64, BK=96)
+
+    fn = build_kernel.get_tir()
+    assert "tl.fp8_scaled_matmul.marker" in str(fn)
+    artifact = tilelang.lower(fn, target=Target("metal"))
+    src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
+    body = src[src.find("kernel void"):]
+
+    assert "tl.fp8_scaled_matmul.marker" not in body
+    assert "__tvm_fp8_e4m3_to_half" in body
+
+
+def test_m1_transposed_b_vecmat_explicit_non_metal_target_uses_scalar_fallback():
+    """An explicit non-Metal macro target must not emit Metal dot4 intrinsics."""
+    fn = _make_vecmat_m1_kernel(
+        N=64,
+        K=96,
+        BN=64,
+        BK=96,
+        macro_target=Target("cuda"),
+    )
+    artifact = tilelang.lower(fn, target=Target("metal"))
+    src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
+    body = src[src.find("kernel void"):]
+
+    assert "__tvm_fp8_e4m3_dot4_packed" not in body
+    assert "simd_sum(" not in body
+    assert "a_val" in body and "b_val" in body
+
+
+def test_m1_transposed_b_direct_explicit_metal_target_lowers_to_dot4():
+    """Metal direct global-store path uses packed dot4 with explicit Metal target."""
+    fn = _make_direct_m1_kernel(N=64, K=96, BN=64, macro_target=Target("metal"))
+    artifact = tilelang.lower(fn, target=Target("metal"))
+    src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
+    body = src[src.find("kernel void"):]
+
+    assert "__tvm_fp8_e4m3_dot4_packed" in body
+    assert "simd_sum(" in body
+    assert "a_val" not in body and "b_val" not in body
+
+
+def test_m1_transposed_b_direct_without_macro_target_late_lowers_to_dot4():
+    """A prebuilt direct-global-store marker selects Metal dot4 at lowering."""
+    fn = _make_direct_m1_kernel(N=64, K=96, BN=64)
+    assert "tl.fp8_scaled_matmul.marker" in str(fn)
+    artifact = tilelang.lower(fn, target=Target("metal"))
+    src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
+    body = src[src.find("kernel void"):]
+
+    assert "tl.fp8_scaled_matmul.marker" not in body
+    assert "__tvm_fp8_e4m3_dot4_packed" in body
+    assert "simd_sum(" in body
+
+
+def test_m1_transposed_b_direct_marker_stores_global_column_index():
+    """Late dot4 lowering stores to the global output column across blocks."""
+    fn = _make_direct_m1_kernel(N=128, K=96, BN=64)
+    artifact = tilelang.lower(fn, target=Target("metal"))
+    src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
+    body = src[src.find("kernel void"):]
+    c_access_lines = [line.strip() for line in body.splitlines() if "C[" in line]
+
+    assert "__tvm_fp8_e4m3_dot4_packed" in body
+    assert "simd_sum(" in body
+    assert any("C[(gridThreadIdx >> 5)]" in line for line in c_access_lines)
+    assert not any("C[((gridThreadIdx >> 5) -" in line for line in c_access_lines)
 
 
 # --------------------------------------------------------------------------

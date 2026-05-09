@@ -126,6 +126,8 @@ from .blockscaled_layout import (
     E8M0_BLOCK_SIZE,
     e8m0_to_float,
 )
+from tilelang.language.utils import buffer_region_to_tile_region
+from tilelang.utils.language import to_buffer_region
 
 __all__ = [
     "fp8_scaled_matmul",
@@ -139,6 +141,7 @@ __all__ = [
 # is the block-scale-factor format and is intentionally excluded — it is
 # carried by the sf_a / sf_b operands of the block-scaled GEMM, not by A / B.
 FP8_DTYPES: tuple[str, ...] = ("float8_e4m3", "float8_e5m2", "float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2fnuz")
+FP8_SCALED_MATMUL_MARKER = "tl.fp8_scaled_matmul.marker"
 
 
 def metal_fp8_e4m3_dot4(a_ptr, b_ptr, a_word_idx, b_word_idx):
@@ -205,6 +208,18 @@ def _is_metal_target(target: Optional[Target]) -> bool:
     if kind_name is not None:
         return str(kind_name).lower() == "metal"
     return "metal" in str(target).lower()
+
+
+def _allows_metal_fast_path(target: Optional[Target]) -> bool:
+    """Return True only when macro expansion can see a Metal target.
+
+    ``T.fp8_scaled_matmul`` expands while ``@T.prim_func`` is built, before
+    the later ``tilelang.lower(fn, target=...)`` target is generally visible.
+    Emitting Metal intrinsics when ``target`` is omitted would therefore also
+    affect CUDA/CPU callers that use the same Python function shape. Keep the
+    fast path explicit unless a Metal ``Target.current()`` context is active.
+    """
+    return _is_metal_target(target)
 
 
 def _target_thread_warp_size(target: Optional[Target]) -> int:
@@ -836,6 +851,50 @@ def _validate_buffers(
         )
 
 
+def _as_tile_region_arg(buffer, access_type: str):
+    region = to_buffer_region(buffer)
+    shape = [r.extent for r in region.region]
+    return buffer_region_to_tile_region(region, access_type, shape)
+
+
+def _emit_fp8_scaled_matmul_marker(
+    A_fp8,
+    A_scale,
+    B_fp8,
+    B_scale,
+    C_out,
+    *,
+    transpose_B: bool,
+    a_scale_offset,
+    b_scale_offset,
+    c_row_offset,
+    c_col_offset,
+    simd_group_width,
+    outputs_per_block,
+):
+    """Emit a target-visible TIR marker for late target-specific lowering."""
+    if simd_group_width is None:
+        simd_group_width = 0
+    if outputs_per_block is None:
+        outputs_per_block = 0
+    return tir.call_extern(
+        "handle",
+        FP8_SCALED_MATMUL_MARKER,
+        _as_tile_region_arg(A_fp8, "r"),
+        _as_tile_region_arg(A_scale, "r"),
+        _as_tile_region_arg(B_fp8, "r"),
+        _as_tile_region_arg(B_scale, "r"),
+        _as_tile_region_arg(C_out, "rw"),
+        tir.IntImm("int32", int(bool(transpose_B))),
+        a_scale_offset,
+        b_scale_offset,
+        c_row_offset,
+        c_col_offset,
+        tir.IntImm("int32", int(simd_group_width)),
+        tir.IntImm("int32", int(outputs_per_block)),
+    )
+
+
 @T.macro
 def _fp8_scaled_matmul_macro(
     A_fp8,
@@ -1139,7 +1198,7 @@ def fp8_scaled_matmul(
     *,
     transpose_B: bool = False,
     accum_dtype: str = "float32",
-    target: Optional[Target] = None,  # accepted for API compat, currently unused
+    target: Optional[Target] = None,
     scale_format: str | None = None,
     scale_block_size: int | None = None,
     block_scale_layout: BlockScaledLayout | None = None,
@@ -1257,6 +1316,22 @@ def fp8_scaled_matmul(
     if c_col_offset is None:
         c_col_offset = 0
 
+    if target is None and layout is None:
+        return _emit_fp8_scaled_matmul_marker(
+            A_fp8,
+            A_scale,
+            B_fp8,
+            B_scale,
+            C_out,
+            transpose_B=transpose_B,
+            a_scale_offset=inferred_a_scale_offset,
+            b_scale_offset=inferred_b_scale_offset,
+            c_row_offset=c_row_offset,
+            c_col_offset=c_col_offset,
+            simd_group_width=simd_group_width,
+            outputs_per_block=outputs_per_block,
+        )
+
     # CPPMEGA Z3 idea #10: before falling back to the scalar legacy M=1 vecmat
     # macro, ask the dot4-legality prover whether the packed fast path is
     # provably legal for this call site. Auto-promote ONLY when:
@@ -1273,7 +1348,7 @@ def fp8_scaled_matmul(
         layout is None
         and transpose_B
         and not direct_global_store
-        and _is_metal_target(target)
+        and _allows_metal_fast_path(target)
         and _shape_extent(A_fp8, 0) == 1
         and not _fp8_dot4_auto_disabled()
         and _dot4_intrinsics_registered()
@@ -1320,7 +1395,7 @@ def fp8_scaled_matmul(
         layout is None
         and transpose_B
         and not direct_global_store
-        and _is_metal_target(target)
+        and _allows_metal_fast_path(target)
         and _shape_extent(A_fp8, 0) == 1
     ):
         return _fp8_scaled_matmul_m1_vecmat_metal_macro_legacy(
@@ -1331,7 +1406,7 @@ def fp8_scaled_matmul(
         layout is None
         and transpose_B
         and direct_global_store
-        and _is_metal_target(target)
+        and _allows_metal_fast_path(target)
         and _shape_extent(A_fp8, 0) == 1
         and _shape_extent(A_fp8, 1) > 0
         and _shape_extent(A_fp8, 1) % 4 == 0
@@ -1380,7 +1455,7 @@ def fp8_scaled_matmul(
         layout is None
         and transpose_B
         and direct_2d_global_store
-        and _is_metal_target(target)
+        and _allows_metal_fast_path(target)
         and _shape_extent(A_fp8, 0) > 0
         and _shape_extent(A_fp8, 1) > 0
         and _shape_extent(A_fp8, 1) % 4 == 0

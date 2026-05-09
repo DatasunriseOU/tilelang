@@ -401,7 +401,7 @@ def test_op_table_has_expected_size() -> None:
     """
     from poc.triton_frontend.op_mapping import OP_TABLE
 
-    EXPECTED = 84
+    EXPECTED = 86
     assert len(OP_TABLE) == EXPECTED, (
         f"OP_TABLE size changed from {EXPECTED} to {len(OP_TABLE)}; "
         f"if intentional, update this constant + the three README "

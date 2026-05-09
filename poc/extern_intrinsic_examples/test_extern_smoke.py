@@ -236,29 +236,25 @@ def test_simdgroup_fp8_factories_produce_canonical_frags():
 
 @pytest.mark.xfail(
     reason=(
-        "Apple has not shipped simdgroup_matrix<float8_e4m3> as of 2026-05. "
-        "When Apple FP8 silicon ships and codegen_metal lowers the FP8 MMA "
-        "intrinsic, flip this xfail off — the test currently locks the "
-        "factory contract but the runtime call is not yet executable."
+        "FP8 simdgroup factories only lock the metadata contract today; "
+        "there is no executable TileLang compile-and-launch runtime check "
+        "for float8_e4m3 simdgroup MMA yet."
     ),
     strict=False,
+    raises=NotImplementedError,
 )
 def test_simdgroup_fp8_factories_produce_canonical_frags_fp8_runtime():
     """Runtime tracking marker for Apple FP8 silicon.
 
-    Auto-flips to passing the moment Metal codegen materialises an FP8
-    simdgroup MMA call from a TileLang intrinsic. Until then we only
-    assert the factory contract; the runtime path is xfail (strict=False
-    so accidental flips are caught early).
+    Replace the explicit ``NotImplementedError`` with a real compile and
+    launch assertion when the runtime FP8 simdgroup MMA path exists.
     """
     # The factory must keep working regardless of hardware.
     a = simdgroup_a_fp8("a")
     b = simdgroup_b_fp8("b")
     assert (a.layout, b.layout) == ("simdgroup_a_fp8", "simdgroup_b_fp8")
-    # Forward-compat: when codegen ships FP8, this assertion will become a
-    # real runtime check (compile + launch a tiny FP8 simdgroup MMA kernel).
-    # For now we deliberately fail the xfail by asserting hardware is not
-    # there yet. Replace with a real launcher when Apple ships.
+    # Forward-compat: replace this explicit marker with a real runtime check
+    # (compile + launch a tiny FP8 simdgroup MMA kernel) when that path exists.
     raise NotImplementedError(
         "Apple float8_e4m3 simdgroup_matrix not shipped — see extern.py "
         "module docstring for the precise edits required to flip this on."

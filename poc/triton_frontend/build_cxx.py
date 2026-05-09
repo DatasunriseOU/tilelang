@@ -181,6 +181,7 @@ def _build(verbose: bool = True) -> Tuple[bool, str]:
         cmake, "-S", str(_CXX_DIR), "-B", str(_BUILD_DIR), "-GNinja",
         f"-DMLIR_DIR={mlir_dir}",
         f"-DLLVM_DIR={llvm_dir}",
+        f"-DPython3_EXECUTABLE={sys.executable}",
     ]
     triton_install = os.environ.get("TRITON_INSTALL_DIR")
     if triton_install:

@@ -78,16 +78,6 @@ def test_tinymm_relu_forward_matches_eager() -> None:
     torch.testing.assert_close(y, y_ref, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Backward emitters (threshold_backward / mm_backward / sum_dim) "
-        "are still shape-tracking stubs in the POC. Marked xfail (rather "
-        "than the previous silent skip) so the regression becomes visible "
-        "the moment the bwd emitters land — see grok review tests #4."
-    ),
-    strict=False,
-    raises=NotImplementedError,
-)
 def test_tinymm_relu_backward_matches_eager() -> None:
     """End-to-end backward smoke for the tilelang Dynamo backend.
 
@@ -144,9 +134,20 @@ def test_tinymm_relu_backward_matches_eager() -> None:
     x = x.detach().clone().requires_grad_(True)
     compiled = torch.compile(model, backend="tilelang", fullgraph=True)
     # NOTE: previously wrapped in ``except NotImplementedError: pytest.skip``
-    # which silently masked the regression we want to catch. The xfail
-    # decorator above now surfaces the gap — see grok review tests #4.
-    y = compiled(x)
+    # which silently masked the regression we want to catch. Keep the xfail
+    # tied to the actual unsupported ATen op so unrelated failures surface.
+    try:
+        y = compiled(x)
+    except Exception as exc:
+        detail = str(exc)
+        if "aten.detach" in detail and "ATEN_DISPATCH" in detail:
+            pytest.xfail(
+                "AOT autograd forward capture now emits aten.detach before "
+                "the backward graph is reached; add a detach lowering to "
+                "ATEN_DISPATCH before this test can verify the "
+                "threshold_backward/mm/sum_dim emitters."
+            )
+        raise
     loss = y.sum()
     loss.backward()
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from .base import BaseTemplate
+import tilelang.language as T
 from tvm import te
 from ..arch import TileDevice
 from ..roller import Hint
@@ -17,6 +18,82 @@ class GeneralReductionTemplate(BaseTemplate):
     def get_hardware_aware_configs(self, arch: TileDevice = None, topk: int = 10) -> list[Hint]:
         roller_hints = get_roller_hints_from_func(self._func, arch=arch, topk=topk, allow_gemv=False)
         return roller_hints
+
+    def make_metal_row_reduce_sum(
+        self,
+        *,
+        rows_per_threadgroup: int = 8,
+        simdgroup_size: int = 32,
+    ):
+        """Return a Metal-specialized contiguous innermost row-sum PrimFunc.
+
+        This is a narrow fast path for PyTorch-style ``A.sum(dim=-1)`` on a
+        2-D contiguous tensor.  Each 256-thread threadgroup covers 8 rows, and
+        each 32-lane simdgroup reduces one row with Metal ``simd_sum``.  The
+        generated kernel does not use threadgroup memory or a threadgroup
+        barrier on the reduction path.
+        """
+        if self.structure != "SR":
+            raise ValueError(
+                "Metal row-reduce sum fast path requires structure='SR' "
+                f"for contiguous innermost reduction, got {self.structure!r}."
+            )
+        if self.shape is None or len(self.shape) != 2:
+            raise ValueError(
+                "Metal row-reduce sum fast path requires a static 2-D shape."
+            )
+        if self.dtype not in {"float16", "float32"}:
+            raise ValueError(
+                "Metal row-reduce sum fast path currently supports float16 "
+                f"and float32, got {self.dtype!r}."
+            )
+        if rows_per_threadgroup <= 0:
+            raise ValueError(
+                "rows_per_threadgroup must be positive, got "
+                f"{rows_per_threadgroup}."
+            )
+        if simdgroup_size != 32:
+            raise ValueError(
+                "Metal row-reduce sum fast path assumes 32-lane simdgroups, "
+                f"got {simdgroup_size}."
+            )
+
+        rows, cols = self.shape
+        if not all(isinstance(s, int) and s > 0 for s in (rows, cols)):
+            raise ValueError(
+                "Metal row-reduce sum fast path requires positive static rows "
+                f"and cols, got {self.shape!r}."
+            )
+
+        metal_dtype = {"float16": "half", "float32": "float"}[self.dtype]
+        threads = rows_per_threadgroup * simdgroup_size
+        helper = (
+            "tl::RowReduceSumContiguousInnermost<"
+            f"{metal_dtype}, {rows_per_threadgroup}, {cols}>::run"
+        )
+
+        def metal_row_reduce_sum(
+            A,
+            C,
+        ):
+            with T.Kernel(T.ceildiv(rows, rows_per_threadgroup), threads=threads) as bx:
+                T.evaluate(
+                    T.call_extern(
+                        "handle",
+                        helper,
+                        T.access_ptr(A[0, 0], "r", rows * cols),
+                        T.access_ptr(C[0], "w", rows),
+                        bx,
+                        T.get_thread_binding(0),
+                        rows,
+                    )
+                )
+
+        metal_row_reduce_sum.__annotations__ = {
+            "A": T.Tensor((rows, cols), self.dtype),
+            "C": T.Tensor((rows,), self.dtype),
+        }
+        return T.prim_func(metal_row_reduce_sum)
 
     def initialize_function(self) -> None:
         """

@@ -91,15 +91,13 @@ def sparse_mla_fwd(
             Q_shared_l = T.alloc_shared([H_per_block, D // 2], dtype)
             Q_shared_r = T.alloc_shared([H_per_block, D // 2], dtype)
             Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
-            KV_shared_0_l = T.alloc_shared([BI, D // 2], dtype)
-            KV_shared_0_r = T.alloc_shared([BI, D // 2], dtype)
-            KV_shared_1_l = T.alloc_shared([BI, D // 2], dtype)
-            KV_shared_1_r = T.alloc_shared([BI, D // 2], dtype)
-            K_tail_shared_0 = T.alloc_shared([BI, D_tail], dtype)
-            K_tail_shared_1 = T.alloc_shared([BI, D_tail], dtype)
+            num_stages = num_stages if num_stages > 0 else 2
+            KV_shared_l = T.alloc_shared([num_stages, BI, D // 2], dtype)
+            KV_shared_r = T.alloc_shared([num_stages, BI, D // 2], dtype)
+            K_tail_shared = T.alloc_shared([num_stages, BI, D_tail], dtype)
             O_shared_l = Q_shared_l
             O_shared_r = Q_shared_r
-            is_kv_valid = T.alloc_shared([BI], "bool", scope="shared")
+            is_kv_valid = T.alloc_shared([num_stages, BI], "bool", scope="shared")
 
             acc_o_l = T.alloc_fragment([H_per_block, D // 2], accum_dtype)
             acc_o_r = T.alloc_fragment([H_per_block, D // 2], accum_dtype)
@@ -114,14 +112,11 @@ def sparse_mla_fwd(
             m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
             indices_local = T.alloc_var(indices_dtype)
 
-            # TODO: Multi buffer
-            bar_q = T.alloc_barrier(arrive_count=384)
-            bar_k_0_ready = T.alloc_barrier(arrive_count=128)
-            bar_k_1_ready = T.alloc_barrier(arrive_count=128)
-            bar_k_0_free = T.alloc_barrier(arrive_count=256)
-            bar_k_1_free = T.alloc_barrier(arrive_count=256)
-            bar_sScale_and_sS_ready = T.alloc_barrier(arrive_count=256)
-            bar_sScale_and_sS_free = T.alloc_barrier(arrive_count=256)
+            bar_q = T.alloc_barrier([384] * 1)
+            bar_k_ready = T.alloc_barrier([128] * num_stages)
+            bar_k_free = T.alloc_barrier([256] * num_stages)
+            bar_sScale_and_sS_ready = T.alloc_barrier([256] * num_stages)
+            bar_sScale_and_sS_free = T.alloc_barrier([256] * num_stages)
 
             b_i, g_i = by, bz
             s_i = (bx + (KV_stride - 1 if CP0 else 0)) if REPLICATE_H == 1 else (bx // REPLICATE_H + (KV_stride - 1 if CP0 else 0))
@@ -133,33 +128,35 @@ def sparse_mla_fwd(
 
             tx = T.get_thread_binding()
 
-            T.tma_copy(Q[b_i, s_i, H0:H1, 0 : D // 2], Q_shared_l, barrier=bar_q)
-            T.tma_copy(Q[b_i, s_i, H0:H1, D // 2 : D], Q_shared_r, barrier=bar_q)
-            T.tma_copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared, barrier=bar_q)
-            T.barrier_arrive(bar_q)
+            T.tma_copy(Q[b_i, s_i, H0:H1, 0 : D // 2], Q_shared_l, barrier=bar_q[0])
+            T.tma_copy(Q[b_i, s_i, H0:H1, D // 2 : D], Q_shared_r, barrier=bar_q[0])
+            T.tma_copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared, barrier=bar_q[0])
+            T.barrier_arrive(bar_q[0])
 
             if tx < 128:
                 T.set_max_nreg(240, 1)
                 T.fill(sumexp, 0)
                 T.fill(m_i, -(2**30))  # avoid -inf - inf to cause nan
                 T.fill(acc_o_l, 0)
-                T.barrier_wait(bar_q, 0)
+                T.barrier_wait(bar_q[0], 0)
 
-                for i_i in T.serial(T.ceildiv(NI, 2)):
-                    # Buffer 0
-                    T.barrier_wait(bar_k_0_ready[0], (i_i & 1))
+                for i_i in T.serial(NI):
+                    stage = i_i % num_stages
+                    phase = (i_i // num_stages) & 1
+
+                    T.barrier_wait(bar_k_ready[stage], phase)
 
                     for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.if_then_else(is_kv_valid[bi_i], 0, -T.infinity(acc_s.dtype))
-                    T.wgmma_gemm(Q_shared_l, KV_shared_0_l, acc_s, transpose_B=True)
-                    T.wgmma_gemm(Q_shared_r, KV_shared_0_r, acc_s, transpose_B=True)
-                    T.wgmma_gemm(Q_tail_shared, K_tail_shared_0, acc_s, transpose_B=True)
+                        acc_s[h_i, bi_i] = T.if_then_else(is_kv_valid[stage, bi_i], 0, -T.infinity(acc_s.dtype))
+                    T.wgmma_gemm(Q_shared_l, KV_shared_l[stage, :, :], acc_s, transpose_B=True)
+                    T.wgmma_gemm(Q_shared_r, KV_shared_r[stage, :, :], acc_s, transpose_B=True)
+                    T.wgmma_gemm(Q_tail_shared, K_tail_shared[stage, :, :], acc_s, transpose_B=True)
 
                     T.wait_wgmma(0)
 
                     if i_i != 0:
-                        T.barrier_arrive(bar_sScale_and_sS_free)
-                        T.barrier_wait(bar_sScale_and_sS_free, ((i_i * 2) & 1) ^ 1)
+                        T.barrier_arrive(bar_sScale_and_sS_free[stage])
+                        T.barrier_wait(bar_sScale_and_sS_free[stage], phase ^ 1)
 
                     T.copy(m_i, m_i_prev)
                     T.reduce_max(acc_s, m_i, dim=1, clear=False)
@@ -177,45 +174,10 @@ def sparse_mla_fwd(
                     T.copy(alpha_local, alpha_shared)
 
                     T.copy(acc_s, S_shared)
-                    T.gemm(S_shared, KV_shared_0_l, acc_o_l)
+                    T.gemm(S_shared, KV_shared_l[stage, :, :], acc_o_l)
 
-                    T.barrier_arrive(bar_sScale_and_sS_ready)
-                    T.barrier_arrive(bar_k_0_free[0])
-
-                    # Buffer 1
-                    T.barrier_wait(bar_k_1_ready[0], (i_i & 1))
-
-                    for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.if_then_else(is_kv_valid[bi_i], 0, -T.infinity(acc_s.dtype))
-                    T.wgmma_gemm(Q_shared_l, KV_shared_1_l, acc_s, transpose_B=True)
-                    T.wgmma_gemm(Q_shared_r, KV_shared_1_r, acc_s, transpose_B=True)
-                    T.wgmma_gemm(Q_tail_shared, K_tail_shared_1, acc_s, transpose_B=True)
-
-                    T.wait_wgmma(0)
-
-                    T.barrier_arrive(bar_sScale_and_sS_free)
-                    T.barrier_wait(bar_sScale_and_sS_free, ((i_i * 2 + 1) & 1) ^ 1)
-
-                    T.copy(m_i, m_i_prev)
-                    T.reduce_max(acc_s, m_i, dim=1, clear=False)
-                    for h_i in T.Parallel(H_per_block):
-                        m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
-                    for h_i in T.Parallel(H_per_block):
-                        alpha_local[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
-                    for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
-                    T.reduce_sum(acc_s, sumexp_i, dim=1)  # is this a accumulate operator?
-                    for h_i in T.Parallel(H_per_block):
-                        sumexp[h_i] = sumexp[h_i] * alpha_local[h_i] + sumexp_i[h_i]
-                    for h_i, d_i in T.Parallel(H_per_block, D // 2):
-                        acc_o_l[h_i, d_i] *= alpha_local[h_i]
-                    T.copy(alpha_local, alpha_shared)
-
-                    T.copy(acc_s, S_shared)
-                    T.gemm(S_shared, KV_shared_1_l, acc_o_l)
-
-                    T.barrier_arrive(bar_sScale_and_sS_ready)
-                    T.barrier_arrive(bar_k_1_free[0])
+                    T.barrier_arrive(bar_sScale_and_sS_ready[stage])
+                    T.barrier_arrive(bar_k_free[stage])
 
                 # Rescale
                 for h_i in T.Parallel(H_per_block):
@@ -230,25 +192,18 @@ def sparse_mla_fwd(
             elif tx >= 128 and tx < 256:
                 T.set_max_nreg(168, 1)
                 T.fill(acc_o_r, 0)
-                for i_i in T.serial(T.ceildiv(NI, 2)):
-                    # Buffer 0
-                    T.barrier_arrive(bar_sScale_and_sS_ready)
-                    T.barrier_wait(bar_sScale_and_sS_ready, ((i_i * 2) & 1))
-                    for h_i, d_i in T.Parallel(H_per_block, D // 2):
-                        acc_o_r[h_i, d_i] *= alpha_shared[h_i]
-                    T.gemm(S_shared, KV_shared_0_r, acc_o_r)
-                    T.barrier_arrive(bar_k_0_free[0])
-                    T.barrier_arrive(bar_sScale_and_sS_free)
+                for i_i in T.serial(NI):
+                    stage = i_i % num_stages
+                    phase = (i_i // num_stages) & 1
 
-                    # Buffer 1
-                    T.barrier_arrive(bar_sScale_and_sS_ready)
-                    T.barrier_wait(bar_sScale_and_sS_ready, ((i_i * 2 + 1) & 1))
+                    T.barrier_arrive(bar_sScale_and_sS_ready[stage])
+                    T.barrier_wait(bar_sScale_and_sS_ready[stage], phase)
                     for h_i, d_i in T.Parallel(H_per_block, D // 2):
                         acc_o_r[h_i, d_i] *= alpha_shared[h_i]
-                    T.gemm(S_shared, KV_shared_1_r, acc_o_r)
-                    T.barrier_arrive(bar_k_1_free[0])
-                    if i_i != T.ceildiv(NI, 2) - 1:
-                        T.barrier_arrive(bar_sScale_and_sS_free)
+                    T.gemm(S_shared, KV_shared_r[stage, :, :], acc_o_r)
+                    T.barrier_arrive(bar_k_free[stage])
+                    if i_i != NI - 1:
+                        T.barrier_arrive(bar_sScale_and_sS_free[stage])
 
                 # Rescale
                 for h_i, d_i in T.Parallel(H_per_block, D // 2):
@@ -259,56 +214,33 @@ def sparse_mla_fwd(
             elif tx >= 256:
                 # producer
                 T.set_max_nreg(80, 0)
-                for i_i in T.serial(T.ceildiv(NI, 2)):
-                    # Buffer 0
-                    T.barrier_wait(bar_k_0_free[0], ((i_i & 1) ^ 1))
-                    for r in T.serial(4):
-                        indices_local = Indices[b_i, s_i, g_i, (i_i * 2) * BI + r * 16 + (tx - 256) // 8]
-                        is_kv_valid[r * 16 + (tx - 256) // 8] = indices_local <= max_kv_i
-                        if is_kv_valid[r * 16 + (tx - 256) // 8]:
-                            # Manually issue cp.async copies for KV_left, KV_right, and K_tail.
-                            for u in T.serial(4):
-                                T.ptx_cp_async(
-                                    T.access_ptr(KV_shared_0_l[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8], "w", 8),
-                                    T.access_ptr(KV[b_i, indices_local, g_i, 64 * u + (tx - 256) % 8 * 8], "r", 8),
-                                    8,
-                                )
-                                T.ptx_cp_async(
-                                    T.access_ptr(KV_shared_0_r[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8], "w", 8),
-                                    T.access_ptr(KV[b_i, indices_local, g_i, D // 2 + 64 * u + (tx - 256) % 8 * 8], "r", 8),
-                                    8,
-                                )
-                            T.ptx_cp_async(
-                                T.access_ptr(K_tail_shared_0[r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8], "w", 8),
-                                T.access_ptr(KV[b_i, indices_local, g_i, D + (tx - 256) % 8 * 8], "r", 8),
-                                8,
-                            )
-                    T.cp_async_barrier_noinc(bar_k_0_ready[0])
+                for i_i in T.serial(NI):
+                    stage = i_i % num_stages
+                    phase = (i_i // num_stages) & 1
 
-                    # Buffer 1
-                    T.barrier_wait(bar_k_1_free[0], ((i_i & 1) ^ 1))
+                    T.barrier_wait(bar_k_free[stage], phase ^ 1)
                     for r in T.serial(4):
-                        indices_local = Indices[b_i, s_i, g_i, (i_i * 2 + 1) * BI + r * 16 + (tx - 256) // 8]
-                        is_kv_valid[r * 16 + (tx - 256) // 8] = indices_local <= max_kv_i
-                        if is_kv_valid[r * 16 + (tx - 256) // 8]:
+                        indices_local = Indices[b_i, s_i, g_i, i_i * BI + r * 16 + (tx - 256) // 8]
+                        is_kv_valid[stage, r * 16 + (tx - 256) // 8] = indices_local <= max_kv_i
+                        if is_kv_valid[stage, r * 16 + (tx - 256) // 8]:
                             # Manually issue cp.async copies for KV_left, KV_right, and K_tail.
                             for u in T.serial(4):
                                 T.ptx_cp_async(
-                                    T.access_ptr(KV_shared_1_l[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8], "w", 8),
+                                    T.access_ptr(KV_shared_l[stage, r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8], "w", 8),
                                     T.access_ptr(KV[b_i, indices_local, g_i, 64 * u + (tx - 256) % 8 * 8], "r", 8),
                                     8,
                                 )
                                 T.ptx_cp_async(
-                                    T.access_ptr(KV_shared_1_r[r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8], "w", 8),
+                                    T.access_ptr(KV_shared_r[stage, r * 16 + (tx - 256) // 8, 64 * u + (tx - 256) % 8 * 8], "w", 8),
                                     T.access_ptr(KV[b_i, indices_local, g_i, D // 2 + 64 * u + (tx - 256) % 8 * 8], "r", 8),
                                     8,
                                 )
                             T.ptx_cp_async(
-                                T.access_ptr(K_tail_shared_1[r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8], "w", 8),
+                                T.access_ptr(K_tail_shared[stage, r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8], "w", 8),
                                 T.access_ptr(KV[b_i, indices_local, g_i, D + (tx - 256) % 8 * 8], "r", 8),
                                 8,
                             )
-                    T.cp_async_barrier_noinc(bar_k_1_ready[0])
+                    T.cp_async_barrier_noinc(bar_k_ready[stage])
 
     return main
 

@@ -9,7 +9,7 @@ from collections.abc import Iterable
 import numpy as np
 import tvm
 
-from ...arch import TileDevice
+from ...arch import TileDevice, is_metal_arch
 from ..bestfit import BestFit
 from ..hint import Hint, Stride, TileDict
 from .common import coalesced_factor, coalesced_tensor_shape, factorize, get_all_factors
@@ -76,6 +76,11 @@ class DefaultPolicy:
 
         rstep_map = {node: self._assign_reduce_step(node) for node in self.ordered_nodes}
         smem_tile_condidates = self.dfs_smem_tile(base_tile, rstep_map)
+        if self._is_metal_1024_wide_row_reduce():
+            smem_tile_condidates = sorted(
+                smem_tile_condidates,
+                key=lambda td: 0 if td.output_tile == [1] else 1,
+            )
         results = []
         for td in smem_tile_condidates:
             if not self.check_tile_shape_isvalid(td):
@@ -92,6 +97,27 @@ class DefaultPolicy:
             if len(results) >= topk:
                 break
         return results
+
+    def _is_metal_1024_wide_row_reduce(self) -> bool:
+        if not is_metal_arch(self.arch) or len(self.ordered_nodes) != 1:
+            return False
+        node = self.ordered_nodes[0]
+        if (
+            node.reduction_block is None
+            or len(node.get_space_dim()) != 1
+            or len(node.raxis) != 1
+        ):
+            return False
+
+        axis = node.raxis[0]
+        if not isinstance(axis.dom.extent, tvm.tir.IntImm):
+            return False
+        if int(axis.dom.extent) != 1024:
+            return False
+
+        rstep = {axis.var.name: 1024}
+        input_shapes = node.propagate_inputs([1], rstep=rstep)
+        return any(len(shape) >= 2 and int(shape[-1]) == 1024 for shape in input_shapes)
 
     def dfs_smem_tile(self, init_tile, rstep_map) -> Iterable[TileDict]:
         _steps = [get_all_factors(n) for n in self.output_nodes[0].get_space_dim()]

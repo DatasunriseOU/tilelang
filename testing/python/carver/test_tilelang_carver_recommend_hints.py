@@ -1,7 +1,8 @@
 import tilelang.testing
 from tilelang import carver
+from tilelang import tvm
 from tilelang.language import dtypes as T
-from tilelang.carver.arch import auto_infer_current_arch
+from tilelang.carver.arch import CUDA, METAL, auto_infer_current_arch
 from typing import List
 
 
@@ -18,6 +19,56 @@ def run_general_reduction_recommend_hints(structure: str = "SSR", shape: List[in
 
     hints = carve_template.recommend_hints(topk=topk)
     assert len(hints) > 0, "Hints length is zero"
+
+
+def _arch_without_runtime(cls, target, platform, bandwidth):
+    arch = object.__new__(cls)
+    arch.target = tvm.target.Target(target)
+    arch.platform = platform
+    arch.warp_size = 32
+    arch.sm_partition = 4
+    arch.transaction_size = [32, 128]
+    arch.smem_cap = 32 * 1024
+    arch.max_smem_usage = 2 * arch.smem_cap
+    arch.reg_cap = 65536
+    arch.compute_max_core = 1
+    arch.bandwidth = bandwidth
+    arch.l2_cache_size_bytes = 0
+    arch.compute_capability = "metal" if platform == "METAL" else "80"
+    arch.sm_version = 80
+    return arch
+
+
+def _first_sr_1024_hint(arch):
+    return carver.GeneralReductionTemplate(
+        structure="SR",
+        shape=[1024, 1024],
+        dtype="float32",
+    ).with_arch(arch).recommend_hints(topk=1)[0]
+
+
+def test_metal_row_reduce_1024_prefers_128_reduce_threads():
+    hint = _first_sr_1024_hint(
+        _arch_without_runtime(METAL, "metal", "METAL", [750, 1200])
+    )
+
+    assert hint.block == [1]
+    assert hint.thread == [1]
+    assert hint.rstep == [1024]
+    assert hint.reduce_thread == [128]
+
+
+def test_cuda_row_reduce_1024_hint_order_is_unchanged():
+    hint = _first_sr_1024_hint(
+        _arch_without_runtime(
+            CUDA, {"kind": "cuda", "arch": "sm_80"}, "CUDA", [750, 12080]
+        )
+    )
+
+    assert hint.block == [128]
+    assert hint.thread == [128]
+    assert hint.rstep == [32]
+    assert hint.reduce_thread == [1]
 
 
 @tilelang.testing.requires_cuda_target

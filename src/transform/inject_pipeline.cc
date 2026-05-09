@@ -107,21 +107,33 @@ bool UpdateExpandedLayoutMapForRemappedAllocs(
     return false;
   }
 
-  Map<Var, Layout> updated_layout_map = layout_map.value();
+  Map<Var, Layout> updated_layout_map;
+  for (const auto &[var, layout] : layout_map.value()) {
+    bool remapped = false;
+    for (const auto &[old_buffer, _] : remapped_allocs) {
+      if (var.same_as(old_buffer->data)) {
+        remapped = true;
+        break;
+      }
+    }
+    if (!remapped) {
+      updated_layout_map.Set(var, layout);
+    }
+  }
   std::unordered_set<const VarNode *> visited;
   bool changed = false;
   for (const auto &[old_buffer, new_buffer] : remapped_allocs) {
     if (!visited.insert(old_buffer->data.get()).second ||
-        !updated_layout_map.count(old_buffer->data)) {
+        !layout_map.value().count(old_buffer->data)) {
       continue;
     }
-    Layout layout = updated_layout_map[old_buffer->data];
+    Layout layout = layout_map.value()[old_buffer->data];
     Layout expanded = ExpandAnnotatedLayoutForMultiVersionedBuffer(
         layout, old_buffer, new_buffer);
     if (!expanded.defined()) {
       continue;
     }
-    updated_layout_map.Set(old_buffer->data, expanded);
+    updated_layout_map.Set(new_buffer->data, expanded);
     changed = true;
   }
 
@@ -2842,6 +2854,56 @@ private:
                             Optional<Target> target)
       : global_symbol_(std::move(global_symbol)), target_(std::move(target)) {}
 
+  void RecordRemappedAlloc(const Buffer &old_buffer, const Buffer &new_buffer,
+                           std::vector<std::pair<Buffer, Buffer>> *remapped) {
+    remapped->emplace_back(old_buffer, new_buffer);
+    buffer_data_to_buffer_.Set(old_buffer->data, new_buffer);
+    allocated_buffers_.erase(old_buffer);
+    allocated_buffers_.insert(new_buffer);
+    for (Buffer &scoped_alloc : scoped_flat_allocs_) {
+      if (scoped_alloc.same_as(old_buffer)) {
+        scoped_alloc = new_buffer;
+      }
+    }
+  }
+
+  Stmt RewriteFlatAllocBuffers(
+      Stmt stmt, std::vector<std::pair<Buffer, Buffer>> *remapped) {
+    class Rewriter : public StmtExprMutator {
+    public:
+      Rewriter(PipelineInjector *injector,
+               std::vector<std::pair<Buffer, Buffer>> *remapped)
+          : injector_(injector), remapped_(remapped) {}
+
+      Stmt VisitStmt_(const AllocBufferNode *op) final {
+        AllocBuffer alloc =
+            Downcast<AllocBuffer>(StmtExprMutator::VisitStmt_(op));
+        if (auto new_buffer =
+                injector_->pending_buffer_remap_.Get(alloc->buffer)) {
+          injector_->RecordRemappedAlloc(alloc->buffer, new_buffer.value(),
+                                         remapped_);
+          injector_->pending_buffer_remap_.erase(alloc->buffer);
+          alloc.CopyOnWrite()->buffer = new_buffer.value();
+        }
+        return alloc;
+      }
+
+    private:
+      PipelineInjector *injector_;
+      std::vector<std::pair<Buffer, Buffer>> *remapped_;
+    };
+    return Rewriter(this, remapped)(std::move(stmt));
+  }
+
+  void EraseScopedFlatAllocs(size_t start) {
+    for (size_t i = start; i < scoped_flat_allocs_.size(); ++i) {
+      const Buffer &buffer = scoped_flat_allocs_[i];
+      buffer_data_to_buffer_.erase(buffer->data);
+      allocated_buffers_.erase(buffer);
+    }
+    scoped_flat_allocs_.resize(start);
+  }
+
   /*!
    * \brief Check the pipeline satisfies the following conditions:
    * 1. No conflicting order: The order of each statement should be unique.
@@ -2921,8 +2983,10 @@ private:
 
   Stmt VisitStmt_(const ForNode *op) final {
     // Step 1: Recursively rewrite the children first.
+    size_t flat_alloc_scope_start = scoped_flat_allocs_.size();
     For for_node = Downcast<For>(StmtExprMutator::VisitStmt_(op));
     if (!HasPipelineAnnotation(op)) {
+      EraseScopedFlatAllocs(flat_alloc_scope_start);
       return for_node;
     }
     // Step 2: Find the body and buffer allocations of the pipeline. The body
@@ -3179,6 +3243,7 @@ private:
           allocated_buffers_.erase(buffer);
         }
       }
+      EraseScopedFlatAllocs(flat_alloc_scope_start);
       return For(for_node->loop_var, for_node->min, for_node->extent,
                  for_node->kind, for_node->body, for_node->thread_binding,
                  StripPipelineAnnotations(for_node->annotations),
@@ -3395,7 +3460,16 @@ private:
         allocated_buffers_.erase(buffer);
       }
     }
+    EraseScopedFlatAllocs(flat_alloc_scope_start);
     return pipeline;
+  }
+
+  Stmt VisitStmt_(const AllocBufferNode *op) final {
+    const Buffer &buffer = op->buffer;
+    buffer_data_to_buffer_.Set(buffer->data, buffer);
+    allocated_buffers_.insert(buffer);
+    scoped_flat_allocs_.push_back(buffer);
+    return StmtExprMutator::VisitStmt_(op);
   }
 
   Stmt VisitStmt_(const SBlockNode *op) final {
@@ -3404,6 +3478,7 @@ private:
       allocated_buffers_.insert(buffer);
     }
 
+    size_t flat_alloc_scope_start = scoped_flat_allocs_.size();
     bool outer_flag = subtree_modified_;
     subtree_modified_ = false;
     SBlock block = Downcast<SBlock>(StmtExprMutator::VisitStmt_(op));
@@ -3421,12 +3496,19 @@ private:
     for (const auto &buffer : block->alloc_buffers) {
       if (auto remapped = pending_buffer_remap_.Get(buffer)) {
         new_alloc_buffers.push_back(remapped.value());
-        remapped_allocs.emplace_back(buffer, remapped.value());
+        RecordRemappedAlloc(buffer, remapped.value(), &remapped_allocs);
         pending_buffer_remap_.erase(buffer);
         allocs_changed = true;
       } else {
         new_alloc_buffers.push_back(buffer);
       }
+    }
+    Stmt remapped_body =
+        RewriteFlatAllocBuffers(block->body, &remapped_allocs);
+    bool flat_allocs_changed = !remapped_body.same_as(block->body);
+    if (flat_allocs_changed) {
+      block.CopyOnWrite()->body = remapped_body;
+      allocs_changed = true;
     }
 
     if (!remapped_allocs.empty()) {
@@ -3499,12 +3581,20 @@ private:
         local_bufs.insert(buf.get());
         local_data_vars.insert(buf->data.get());
       }
+      for (size_t i = flat_alloc_scope_start; i < scoped_flat_allocs_.size();
+           ++i) {
+        const Buffer &buf = scoped_flat_allocs_[i];
+        local_bufs.insert(buf.get());
+        local_data_vars.insert(buf->data.get());
+      }
       // Also collect data vars from all nested blocks.
       PostOrderVisit(block->body, [&](const ObjectRef &obj) {
         if (auto *inner = obj.as<SBlockNode>()) {
           for (const auto &buf : inner->alloc_buffers) {
             local_data_vars.insert(buf->data.get());
           }
+        } else if (auto *alloc = obj.as<AllocBufferNode>()) {
+          local_data_vars.insert(alloc->buffer->data.get());
         }
       });
       auto region_uses_local_var = [&](const BufferRegion &br) -> bool {
@@ -3571,6 +3661,7 @@ private:
       buffer_data_to_buffer_.erase(buffer->data);
       allocated_buffers_.erase(buffer);
     }
+    EraseScopedFlatAllocs(flat_alloc_scope_start);
     // Integration #9 follow-up: extern_intrinsic pipeline_stage hint.
     if (MaybeWrapExternPipelineStage(op, &block)) {
       subtree_modified_ = true;
@@ -3639,6 +3730,7 @@ private:
   // subtree.  Used to avoid unnecessary reads/writes recalculation
   // on blocks whose descendants were not modified.
   bool subtree_modified_ = false;
+  std::vector<Buffer> scoped_flat_allocs_;
 };
 } // namespace software_pipeline
 

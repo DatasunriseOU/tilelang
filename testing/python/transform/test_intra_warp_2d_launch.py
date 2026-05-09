@@ -136,6 +136,33 @@ def test_1d_launch_within_single_simdgroup_elides():
         f"found {n_sync} sync(s):\n{mod.script()}")
 
 
+@tilelang.testing.requires_metal
+def test_1d_launch_within_single_simdgroup_elides_when_z3_disabled(monkeypatch):
+    """The deterministic same-simdgroup proof should cover the simplest
+    one-row reduction shape even when the Z3 barrier-elision query is gated
+    off. This keeps the Metal row-reduce fast path independent of optional
+    solver availability.
+    """
+
+    monkeypatch.setenv("TILELANG_DISABLE_Z3_BARRIER_ELISION", "1")
+
+    @T.prim_func(private=True)
+    def func():
+        A_shared = T.alloc_buffer((16,), dtype="float32", scope="shared")
+        bx = T.launch_thread("blockIdx.x", 1)
+        tx = T.launch_thread("threadIdx.x", 16)
+        A_shared[tx] = T.float32(1)
+        if tx > 0:
+            _ = A_shared[tx - 1]
+
+    mod = _run_thread_sync_metal(func)
+    n_sync = _count_storage_sync(mod)
+    assert n_sync == 0, (
+        "Expected deterministic same-simdgroup proof to elide the barrier "
+        "with TILELANG_DISABLE_Z3_BARRIER_ELISION=1; "
+        f"found {n_sync} sync(s):\n{mod.script()}")
+
+
 # ----------------------------------------------------------------------
 # gpt-5-5-pro audit follow-ups: regression tests for unusual thread tags,
 # degenerate 3-D launches, and Z3 timeout fallback. Each test pins a

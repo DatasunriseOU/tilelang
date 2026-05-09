@@ -61,34 +61,10 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Transforms/DialectConversion.h"
 
-// Vendored triton-shared headers. The TritonStructured dialect (sibling
-// integration #5) is not yet vendored; the include is gated so this TU can
-// compile against both layouts. When integration #5 lands, drop the gate.
-//
-// Note on stub builds: `triton-shared/AnalysisStructured/PtrAnalysis.h`
-// transitively references `mlir::triton::AddPtrOp`, `MakeRangeOp`, etc., so
-// it cannot be parsed unless the upstream Triton dialect headers are on the
-// include path. We therefore gate it on the same condition we use for the
-// dialect symbols; when the gate is false the C ABI still compiles but
-// `tl_pa_run_rewrite` returns TL_PA_ERR_INTERNAL.
-#if __has_include("triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h") \
-    && __has_include("triton/Dialect/Triton/IR/Dialect.h")
-#  include "triton-shared/AnalysisStructured/PtrAnalysis.h"
-#  include "triton-shared/Conversion/StructuredToMemref/StructuredToMemref.h"
-#  include "triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h"
-#  define TL_PA_HAVE_TRITON_STRUCTURED 1
-#else
-#  define TL_PA_HAVE_TRITON_STRUCTURED 0
-#endif
-
-// Upstream Triton dialect. TODO(integration#5): once Triton sources are
-// vendored, drop the gate and require the include.
-#if __has_include("triton/Dialect/Triton/IR/Dialect.h")
-#  include "triton/Dialect/Triton/IR/Dialect.h"
-#  define TL_PA_HAVE_TRITON 1
-#else
-#  define TL_PA_HAVE_TRITON 0
-#endif
+#include "triton-shared/AnalysisStructured/PtrAnalysis.h"
+#include "triton-shared/Conversion/StructuredToMemref/StructuredToMemref.h"
+#include "triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 
 // Optional nlohmann::json encoder. Compiled in via
 // -DTRITON_FRONTEND_USE_NLOHMANN_JSON=ON in CMake (see CMakeLists.txt).
@@ -137,12 +113,8 @@ TLPtrAnalysisContext* tl_pa_context_create(void) {
              mlir::scf::SCFDialect,
              mlir::tensor::TensorDialect,
              mlir::memref::MemRefDialect>();
-#if TL_PA_HAVE_TRITON
   reg.insert<mlir::triton::TritonDialect>();
-#endif
-#if TL_PA_HAVE_TRITON_STRUCTURED
   reg.insert<mlir::tts::TritonStructuredDialect>();
-#endif
   impl->ctx.appendDialectRegistry(reg);
   impl->ctx.loadAllAvailableDialects();
   return reinterpret_cast<TLPtrAnalysisContext*>(impl);
@@ -227,12 +199,6 @@ TLPtrAnalysisStatus tl_pa_run_rewrite(TLPtrAnalysisModule* mod,
                                       int use_unsafe_mask) {
   if (!mod) return TL_PA_ERR_NULL_HANDLE;
   auto* m = reinterpret_cast<ModuleImpl*>(mod);
-#if !TL_PA_HAVE_TRITON_STRUCTURED || !TL_PA_HAVE_TRITON
-  setError(m->parent,
-           "TritonStructured/Triton dialect not yet vendored: rebuild after "
-           "integration #5 with -DTRITON_INSTALL_DIR set.");
-  return TL_PA_ERR_INTERNAL;
-#else
   mlir::ModuleOp moduleOp = m->module.get();
   mlir::tts::PtrAnalysis pa(
       static_cast<bool>(enable_make_gather_scatter_tensor_ptr));
@@ -246,18 +212,11 @@ TLPtrAnalysisStatus tl_pa_run_rewrite(TLPtrAnalysisModule* mod,
     (void)pa.rewriteGetStructuredStateOp(op);
   });
   return TL_PA_OK;
-#endif
 }
 
 TLPtrAnalysisStatus tl_pa_run_structured_to_memref(TLPtrAnalysisModule* mod) {
   if (!mod) return TL_PA_ERR_NULL_HANDLE;
   auto* m = reinterpret_cast<ModuleImpl*>(mod);
-#if !TL_PA_HAVE_TRITON_STRUCTURED || !TL_PA_HAVE_TRITON
-  setError(m->parent,
-           "TritonStructured/Triton dialect not yet vendored: rebuild after "
-           "integration #5 with -DTRITON_INSTALL_DIR set.");
-  return TL_PA_ERR_INTERNAL;
-#else
   // Mirror facebookincubator/triton-shared
   // lib/Conversion/StructuredToMemref/StructuredToMemrefPass.cpp::runOnOperation,
   // minus the dialect-registry entries for `tptr::TPtrDialect` /
@@ -308,7 +267,6 @@ TLPtrAnalysisStatus tl_pa_run_structured_to_memref(TLPtrAnalysisModule* mod) {
     return TL_PA_ERR_REWRITE;
   }
   return TL_PA_OK;
-#endif
 }
 
 const char* tl_pa_extract_states_json(TLPtrAnalysisModule* mod) {
@@ -323,7 +281,6 @@ const char* tl_pa_extract_states_json(TLPtrAnalysisModule* mod) {
   //
   // The default is a hand-rolled RFC-8259 escaper (no third-party deps);
   // -DTRITON_FRONTEND_USE_NLOHMANN_JSON=ON swaps it for nlohmann::json.
-#if TL_PA_HAVE_TRITON_STRUCTURED
 #  ifdef TL_PA_USE_NLOHMANN_JSON
   // ---- nlohmann::json encoder ---------------------------------------------
   nlohmann::json arr = nlohmann::json::array();
@@ -384,9 +341,6 @@ const char* tl_pa_extract_states_json(TLPtrAnalysisModule* mod) {
   os << "]";
   m->statesJson = os.str();
 #  endif  // TL_PA_USE_NLOHMANN_JSON
-#else
-  m->statesJson = "[]";
-#endif
   return m->statesJson.c_str();
 }
 

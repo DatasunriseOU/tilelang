@@ -365,10 +365,13 @@ class TTIRWalker:
         if not op_name:
             return
         if op_name == "tt.func" or op_name.endswith(".func"):
-            self._materialize_func_args(op)
+            # No longer manually materializing func args here, the emitter does it
             self.visited.append(op_name)
+            emitter = OP_TABLE.get(op_name)
+            if emitter is not None:
+                emitter(op, self.ctx)
             return
-        if op_name in self._STRUCTURAL_OPS:
+        if op_name == "builtin.module":
             self.visited.append(op_name)
             return
         self.visited.append(op_name)

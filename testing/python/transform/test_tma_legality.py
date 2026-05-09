@@ -42,12 +42,12 @@ import tilelang.testing
 # If the C++ extension was not rebuilt with Z3 idea #6, the
 # `tl.tma_legality_z3` config is unknown and `tilelang.compile(...,
 # pass_configs={...})` raises mid-compile. Detect this once up front and
-# xfail (rather than throw) so the test suite gives a clear signal in
-# stale builds.
+# skip CUDA-dependent cases in stale builds while the registration sanity
+# check below fails loudly.
 # ---------------------------------------------------------------------------
 def _tma_legality_z3_registered() -> bool:
     try:
-        from tvm.transform import PassContext
+        from tvm.ir.transform import PassContext
     except Exception:
         return False
     try:
@@ -227,16 +227,16 @@ def test_tma_legality_z3_query_shape():
 def test_tma_legality_z3_passconfig_registered():
     """Registration sanity check.
 
-    If this test xfails, the C++ extension was built without Z3 idea #6
+    If this test fails, the C++ extension was built without Z3 idea #6
     and every test gated on `_z3_skip` will be skipped. Surface that as a
     clear, single-line failure rather than a swarm of skips.
     """
     if not _Z3_LEGALITY_REGISTERED:
-        pytest.xfail(
+        pytest.fail(
             "PassConfig 'tl.tma_legality_z3' is not registered — "
             "rebuild the tilelang C++ extension."
         )
-    from tvm.transform import PassContext
+    from tvm.ir.transform import PassContext
     assert "tl.tma_legality_z3" in PassContext.list_configs()
 
 

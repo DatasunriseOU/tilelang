@@ -1844,6 +1844,42 @@ private:
       }
       return iv.value()->dom->extent;
     };
+    auto has_zero_min = [](const Optional<IterVar> &iv) -> bool {
+      if (!iv.has_value() || !iv.value()->dom.defined() ||
+          !iv.value()->dom->min.defined()) {
+        return false;
+      }
+      const int64_t *min = as_const_int(iv.value()->dom->min);
+      return min != nullptr && *min == 0;
+    };
+    auto const_extent_le = [&](const Optional<IterVar> &iv,
+                               int64_t limit) -> bool {
+      auto extent = extract_extent(iv);
+      if (!extent.has_value()) {
+        return false;
+      }
+      PrimExpr simplified = analyzer.Simplify(extent.value());
+      const int64_t *value = as_const_int(simplified);
+      return value != nullptr && *value > 0 && *value <= limit;
+    };
+    auto absent_or_singleton_axis = [&](const Optional<IterVar> &p_iv,
+                                        const Optional<IterVar> &c_iv) -> bool {
+      if (!p_iv.has_value() && !c_iv.has_value()) {
+        return true;
+      }
+      if (!p_iv.has_value() || !c_iv.has_value()) {
+        return false;
+      }
+      return has_zero_min(p_iv) && has_zero_min(c_iv) &&
+             const_extent_le(p_iv, 1) && const_extent_le(c_iv, 1);
+    };
+    auto deterministic_single_simdgroup = [&]() -> bool {
+      return has_zero_min(tx_p_iv) && has_zero_min(tx_c_iv) &&
+             const_extent_le(tx_p_iv, warp_size_) &&
+             const_extent_le(tx_c_iv, warp_size_) &&
+             absent_or_singleton_axis(ty_p_iv, ty_c_iv) &&
+             absent_or_singleton_axis(tz_p_iv, tz_c_iv);
+    };
     // CPPMEGA fix-C2 (round-7): if `threadIdx.x` (the only mandatory axis,
     // already required upstream) lacks an upper bound on either side, the
     // Z3 floor-div-by-32 query becomes unbounded and can prove anything —
@@ -1879,6 +1915,15 @@ private:
     add_axis_bounds(tx_w, tx_r, tx_p_iv, tx_c_iv, range_constraint);
     add_axis_bounds(ty_w, ty_r, ty_p_iv, ty_c_iv, range_constraint);
     add_axis_bounds(tz_w, tz_r, tz_p_iv, tz_c_iv, range_constraint);
+
+    // Fast deterministic proof for the common one-simdgroup-per-row shape:
+    // tx is statically in [0, warp_size) on both sides, and y/z cannot vary.
+    // This is independent of Z3 availability and covers the Metal row-reduce
+    // case where all cross-thread shared-memory communication is confined to
+    // one Apple simdgroup.
+    if (deterministic_single_simdgroup()) {
+      return true;
+    }
 
     // Use Z3 with a tight timeout to avoid pathological slowdowns. On
     // timeout/unknown/exception, `proven` stays false → we keep the

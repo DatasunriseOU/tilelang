@@ -12,30 +12,13 @@
 #include <tvm/tirx/op_attr_types.h>
 
 #include "../target/utils.h"
+#include "reduce.h"
 #include "utils.h"
 
 namespace tvm {
 namespace tl {
 
 using namespace tirx;
-
-namespace {
-
-bool SameSimdgroupMetalFastPathSafe(const Target &target, int reducing_threads,
-                                    int scale,
-                                    const PrimExpr &thread_offset_expr,
-                                    arith::Analyzer *analyzer) {
-  if (!TargetIsMetal(target) || reducing_threads > 32 || scale != 1) {
-    return false;
-  }
-  PrimExpr thread_offset =
-      analyzer != nullptr ? analyzer->Simplify(thread_offset_expr)
-                          : thread_offset_expr;
-  const int64_t *thread_offset_value = as_const_int(thread_offset);
-  return thread_offset_value != nullptr && (*thread_offset_value % 32) == 0;
-}
-
-}  // namespace
 
 /**
  * @brief Construct a FinalizeReducerOp from TL operator arguments and a buffer
@@ -123,7 +106,7 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
   // adopted from ReduceOp
   int reducing_threads = extent;
   auto thread_offset = T.thread_bounds->min;
-  bool same_simdgroup_metal_fast_path_safe = SameSimdgroupMetalFastPathSafe(
+  bool same_simdgroup_metal_fast_path_safe = IsSameSimdgroupMetalReductionSafe(
       T.target, reducing_threads, scale, thread_offset, analyzer);
 
   // Validate batch against the layout's total output element count.

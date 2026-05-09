@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import inspect
+from contextlib import nullcontext
 from typing import (
     Any,
     Callable,
@@ -32,6 +33,7 @@ from tilelang.cache import cached
 from os import path, makedirs
 from logging import getLogger
 from tilelang.jit.param import Kernel
+from tilelang.utils.target import determine_target
 import concurrent.futures
 
 from tqdm.auto import tqdm
@@ -304,17 +306,30 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         self._kernel_cache: dict[tuple, Kernel] = {}
         self._tuner_cache: dict[tuple, Kernel] = {}
 
+    def _target_elaboration_context(self):
+        target = self.target if self.target is not None else "auto"
+        if target == "auto":
+            current = Target.current(allow_none=True)
+            if current is not None:
+                return current
+            try:
+                return determine_target("auto", return_object=True)
+            except ValueError:
+                return nullcontext()
+        return determine_target(target, return_object=True)
+
     def get_tir(self, *args: _P.args, **kwargs: _P.kwargs) -> PrimFunc[_KP, _T]:
         """
         Retrieve a TIR (Tensor Intermediate Representation) PrimFunc from the stored callable or object.
         """
-        self.initialize_jit_mode(*args, **kwargs)
-        if isinstance(self.func, PrimFunc):
-            tir = self.func
-        elif callable(self.func):
-            tir = self.func(*args, **kwargs)
-        else:
-            raise ValueError(f"Invalid function type: {type(self.func)}")
+        with self._target_elaboration_context():
+            self.initialize_jit_mode(*args, **kwargs)
+            if isinstance(self.func, PrimFunc):
+                tir = self.func
+            elif callable(self.func):
+                tir = self.func(*args, **kwargs)
+            else:
+                raise ValueError(f"Invalid function type: {type(self.func)}")
         assert isinstance(tir, PrimFunc), f"target function must be a PrimFunc but got {type(tir)}"
         return tir
 
@@ -454,12 +469,13 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
 
         kwargs.update(kwargs.pop("__tune_params", {}))
 
-        # infer mode early, before parse_args needs it
-        if self.mode == "auto":
-            self.mode = self._infer_jit_mode(*args, **kwargs)
-            self.func.set_mode(self.mode)
+        with self._target_elaboration_context():
+            # infer mode early, before parse_args needs it
+            if self.mode == "auto":
+                self.mode = self._infer_jit_mode(*args, **kwargs)
+                self.func.set_mode(self.mode)
 
-        key, kernel_args = self.func.parse_args(*args, **kwargs)
+            key, kernel_args = self.func.parse_args(*args, **kwargs)
         kernel = self._kernel_cache.get(key, None)
         if kernel is None:
             kernel = self.compile(*args, **kwargs)

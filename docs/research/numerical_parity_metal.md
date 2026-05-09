@@ -11,7 +11,7 @@ honest companion to the static-review-only verdicts produced by waves 1–6.
 | OS | macOS **26.4.1** (build 25E253) |
 | Architecture | arm64 (`applegpu_g16s`) |
 | Unified memory | 137 GB (max recommended working set 115 GB) |
-| MLX | 0.31.1 (homebrew Cellar at `/opt/homebrew/Cellar/mlx/0.31.1/`) |
+| MLX | Python package rebuilt from `/Volumes/external/sources/mlx` branch `cppmega/latest-main-dlpack` (`0.32.0.dev20260509+85a0e7e4a`); Homebrew `mlx` remains `0.31.1` |
 | `mx.metal.is_available()` | `True` |
 | Python | 3.13.12 (cppmega.mlx venv) |
 | pytest | 9.0.3 |
@@ -20,8 +20,9 @@ honest companion to the static-review-only verdicts produced by waves 1–6.
 ## Environment overrides used
 
 ```bash
-DYLD_LIBRARY_PATH=/opt/homebrew/lib            # libz3.dylib
-DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib
+MLX_LIB=/Volumes/external/sources/nanochat/.venv/lib/python3.13/site-packages/mlx/lib
+DYLD_LIBRARY_PATH=$MLX_LIB:/opt/homebrew/lib  # venv libmlx first, Homebrew libz3 second
+DYLD_FALLBACK_LIBRARY_PATH=$MLX_LIB:/opt/homebrew/lib
 CPPMEGA_MLX_TILELANG_ENGINE=engine_with_msl_extraction  # then also tested =shim
 PYTHONPATH=/Volumes/external/sources/cppmega.mlx:/Volumes/external/sources/cppmega:/private/tmp/tl_poc_review
 ```
@@ -64,6 +65,13 @@ loudly.
 This is itself a real finding worth a `# NOTE` in the test infra: importorskip
 masks ABI mismatches as ordinary "module unavailable" skips.
 
+2026-05-09 update: MLX was rebuilt from upstream `main` plus the cppmega
+DLPack consumer patch. The rebuilt venv package imports cleanly as long as
+`$VENV/lib/python3.13/site-packages/mlx/lib` precedes `/opt/homebrew/lib` in
+`DYLD_LIBRARY_PATH`. If `/opt/homebrew/lib` comes first, macOS still resolves
+`@rpath/libmlx.dylib` to the stale Homebrew `0.31.1` library and reproduces the
+same ABI error.
+
 ## Per-file results (in scope)
 
 ### cppmega.mlx engine-path tests
@@ -100,7 +108,7 @@ masks ABI mismatches as ordinary "module unavailable" skips.
 | `poc/triton_frontend/tests/test_triton_structured_walk.py` | 0 | 0 | 4 | All skip — `dialects_available()` returns False (no MLIR build). |
 | `poc/triton_frontend/tests/test_vendor_drift.py` | **2** | 0 | 0 | Vendor manifest drift detector clean. |
 | `poc/extern_intrinsic_examples/test_extern_smoke.py` | — | — | — | **collect-error**: tilelang dev root build missing. |
-| `poc/torch_dynamo/examples/test_torch_compile_chain.py` | 8 | **4** | 0 (3 xfailed) | **REAL BUG** — see below. |
+| `poc/torch_dynamo/examples/test_torch_compile_chain.py` | 8 | **4** | 0 (historical: 3 xfailed; current cleanup removed the stale attention xfail) | **REAL BUG** — see below. |
 | `poc/torch_dynamo/examples/test_autograd_compose.py` | **12** | 0 | 1 | All wave-3+wave-4 fixes validated end-to-end. |
 
 ## Real bugs found (this run, post-wave-7-partial)
@@ -165,15 +173,18 @@ Out of 17 scope files, **only 2** ran any kernel-level numerical asserts
 - `test_engine_path_switch.py`: 1 of 4 passed (the one that doesn't import
   the engine module — pure shim-mode contract test).
 
-**The unified engine path is empirically untested on this host.** Static
-review claims of "Metal-runtime-validated" from waves 1–6 are unjustified
-until the cppmega.mlx venv MLX is reinstalled.
+2026-05-09 update: the reduced unified engine smoke now imports and runs after
+the source MLX rebuild when `DYLD_LIBRARY_PATH` starts with the venv MLX lib
+directory. The broader parity claim still needs the full cppmega suite, but the
+previous MLX ABI hard block is no longer the blocker under that environment.
 
 ## Recommendations
 
-1. **Fix the venv MLX ABI mismatch** before any further parity claims:
+1. **Keep venv MLX before Homebrew MLX** for parity runs:
    ```bash
-   /Volumes/external/sources/nanochat/.venv/bin/uv pip install --force-reinstall mlx==0.31.1
+   export MLX_LIB=/Volumes/external/sources/nanochat/.venv/lib/python3.13/site-packages/mlx/lib
+   export DYLD_LIBRARY_PATH=$MLX_LIB:/opt/homebrew/lib
+   export DYLD_FALLBACK_LIBRARY_PATH=$MLX_LIB:/opt/homebrew/lib
    ```
 2. **Wave-7 #4 needs a follow-up** — string annotation issue.
 3. **Wave-7 #6 retry agent didn't finish** — tt.func still missing.
@@ -182,6 +193,23 @@ until the cppmega.mlx venv MLX is reinstalled.
 5. Replace `pytest.importorskip` with explicit `try: import; except
    ImportError as e: pytest.skip(...)` so ABI mismatches surface as visible
    skip-with-reason instead of silently sliding under "module unavailable".
+
+## Wave-2 local rerun plan
+
+`~/sources/cppmega.mlx` exists locally and resolves to
+`/Volumes/external/sources/cppmega.mlx`; keep both `cppmega.mlx` and `cppmega`
+on `PYTHONPATH`.
+
+```bash
+export PYTHONPATH=~/sources/cppmega.mlx:~/sources/cppmega:/private/tmp/tl_apache_tvm_swap
+export MLX_LIB=~/sources/cppmega.mlx/.venv/lib/python3.13/site-packages/mlx/lib
+export DYLD_LIBRARY_PATH=$MLX_LIB:/opt/homebrew/lib
+export DYLD_FALLBACK_LIBRARY_PATH=$MLX_LIB:/opt/homebrew/lib
+
+python -m pytest -q testing/python/metal/test_fp8_scaled_matmul_metal.py testing/python/metal/test_metal_reduce.py
+CPPMEGA_MLX_TILELANG_ENGINE=engine_with_msl_extraction python -m pytest -q ~/sources/cppmega.mlx/tests/test_msl_extraction.py ~/sources/cppmega/tests/test_engine_path_switch.py ~/sources/cppmega/tests/test_fp8_amax_tilelang.py ~/sources/cppmega/tests/test_fp8_msl_kernels_engine.py
+TILELANG_RUN_METAL_REDUCE_BENCH=1 TILELANG_METAL_REDUCE_BENCH_WARMUP=1 TILELANG_METAL_REDUCE_BENCH_ITERS=2 python -m pytest -q -s testing/python/metal/test_metal_reduce_perf_smoke.py -k 'same_simdgroup_32 or cross_simdgroup_64 or row_reduce_256x32_no_barrier'
+```
 
 ## Source data
 

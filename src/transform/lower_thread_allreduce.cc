@@ -226,6 +226,11 @@ private:
     }
   };
 
+  struct SplitThreadReduceEntry {
+    ThreadEntry thread;
+    int reduce_extent{};
+  };
+
   // make allreduce.
   Stmt MakeAllreduce(const CallNode *call) {
     ICHECK(!reduce_combiner_.empty());
@@ -258,6 +263,7 @@ private:
     }
 
     std::unordered_set<const VarNode *> reduce_set;
+    std::unordered_map<const VarNode *, int> split_reduce_extents;
     for (size_t i = 2 + 2 * size; i < call->args.size(); ++i) {
       const VarNode *v = call->args[i].as<VarNode>();
       // The simply optimization replace a iteration variable with a constant
@@ -266,15 +272,28 @@ private:
       if (v) {
         reduce_set.insert(v);
       } else {
-        ICHECK(call->args[i].as<IntImmNode>() &&
-               call->args[i].as<IntImmNode>()->value == 0)
-            << "arg" << i << "should be a VarNode or IntImmNode "
-            << "while it is " << call->args[i];
+        const VarNode *split_var = nullptr;
+        int split_extent = 0;
+        if (target_->kind->name == "metal" &&
+            TryMatchMetalSplitReduceIndex(call->args[i], &split_var,
+                                          &split_extent)) {
+          auto inserted = split_reduce_extents.emplace(split_var, split_extent);
+          ICHECK(inserted.second || inserted.first->second == split_extent)
+              << "Conflicting Metal split allreduce extents for "
+              << split_var->name_hint << ": " << inserted.first->second
+              << " vs " << split_extent;
+        } else {
+          ICHECK(call->args[i].as<IntImmNode>() &&
+                 call->args[i].as<IntImmNode>()->value == 0)
+              << "arg" << i << "should be a VarNode or IntImmNode "
+              << "while it is " << call->args[i];
+        }
       }
     }
 
     size_t nmatch = 0;
     std::vector<ThreadEntry> vred, vpar;
+    std::vector<SplitThreadReduceEntry> split_vred;
     int reduce_dim_index = -1;
     for (const AttrStmtNode *attr : thread_extents_) {
       ThreadEntry e;
@@ -293,7 +312,22 @@ private:
           continue;
         }
 
-        if (reduce_set.count(iv->var.get())) {
+        if (auto split_it = split_reduce_extents.find(iv->var.get());
+            split_it != split_reduce_extents.end()) {
+          int split_extent = split_it->second;
+          ICHECK_GT(split_extent, 1)
+              << "Metal split allreduce extent must be greater than 1";
+          ICHECK_LE(split_extent, e.extent)
+              << "Metal split allreduce extent " << split_extent
+              << " exceeds thread extent " << e.extent;
+          ICHECK_EQ(e.extent % split_extent, 0)
+              << "Metal split allreduce requires the thread extent "
+              << e.extent << " to be divisible by the reduce extent "
+              << split_extent;
+          split_vred.push_back(SplitThreadReduceEntry{e, split_extent});
+          ++nmatch;
+          reduce_dim_index = e.scope.dim_index;
+        } else if (reduce_set.count(iv->var.get())) {
           bool already_exists = false;
           for (const auto &entry : vred) {
             if (entry.scope.dim_index == e.scope.dim_index) {
@@ -322,7 +356,7 @@ private:
     }
 
     // remove reduce thread from parallel thread
-    if (reduce_dim_index != -1) {
+    if (reduce_dim_index != -1 && split_vred.empty()) {
       for (size_t i = 0; i < vpar.size(); ++i) {
         if (vpar[i].scope.dim_index == reduce_dim_index) {
           vpar.erase(vpar.begin() + i);
@@ -331,38 +365,64 @@ private:
       }
     }
 
-    ICHECK_EQ(nmatch, reduce_set.size())
+    ICHECK_EQ(nmatch, reduce_set.size() + split_reduce_extents.size())
         << "Not all reduce index are presented in the context";
+    ICHECK_LE(split_vred.size(), 1U)
+        << "Metal split allreduce supports one split thread axis for now";
+    ICHECK(split_vred.empty() || vred.empty())
+        << "Metal split allreduce cannot be mixed with full-axis reduction";
+    ICHECK(split_vred.empty() || vpar.empty())
+        << "Metal split allreduce with extra parallel thread axes is not "
+           "supported yet";
     std::sort(vred.begin(), vred.end());
     std::sort(vpar.begin(), vpar.end());
     // the size of each index.
     int reduce_extent, group_extent;
-    PrimExpr reduce_index = FlattenThread(vred, &reduce_extent);
-    PrimExpr group_index = FlattenThread(vpar, &group_extent);
+    PrimExpr reduce_index;
+    PrimExpr group_index;
+    bool metal_split_reduce = !split_vred.empty();
+    if (metal_split_reduce) {
+      const SplitThreadReduceEntry &split = split_vred.front();
+      reduce_extent = split.reduce_extent;
+      group_extent = split.thread.extent / split.reduce_extent;
+      PrimExpr split_extent =
+          make_const(split.thread.iv->var.dtype(), split.reduce_extent);
+      reduce_index =
+          analyzer_.Simplify(floormod(split.thread.iv->var, split_extent));
+      group_index =
+          analyzer_.Simplify(floordiv(split.thread.iv->var, split_extent));
+    } else {
+      reduce_index = FlattenThread(vred, &reduce_extent);
+      group_index = FlattenThread(vpar, &group_extent);
+    }
 
     // the longest contiguous reduce extent after flattening
     int contiguous_reduce_extent = 1;
-    std::vector<std::tuple<int, int, bool>>
-        block_threads; // tuple(dim_index, extent, is_reduce)
-    for (const ThreadEntry &thr : vred) {
-      if (thr.scope.rank == 1) { // threadIdx
-        block_threads.emplace_back(thr.scope.dim_index, thr.extent, true);
+    if (metal_split_reduce) {
+      contiguous_reduce_extent = reduce_extent;
+    } else {
+      std::vector<std::tuple<int, int, bool>>
+          block_threads; // tuple(dim_index, extent, is_reduce)
+      for (const ThreadEntry &thr : vred) {
+        if (thr.scope.rank == 1) { // threadIdx
+          block_threads.emplace_back(thr.scope.dim_index, thr.extent, true);
+        }
       }
-    }
-    for (const ThreadEntry &thr : vpar) {
-      if (thr.scope.rank == 1) { // threadIdx
-        block_threads.emplace_back(thr.scope.dim_index, thr.extent, false);
+      for (const ThreadEntry &thr : vpar) {
+        if (thr.scope.rank == 1) { // threadIdx
+          block_threads.emplace_back(thr.scope.dim_index, thr.extent, false);
+        }
       }
-    }
-    // sort according to dim_index
-    std::sort(block_threads.begin(), block_threads.end());
-    for (auto &&thr_attr : block_threads) {
-      auto [dim_index, extent, is_reduce] = thr_attr;
-      (void)dim_index; // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=81767
-      if (is_reduce) {
-        contiguous_reduce_extent *= extent;
-      } else {
-        break;
+      // sort according to dim_index
+      std::sort(block_threads.begin(), block_threads.end());
+      for (auto &&thr_attr : block_threads) {
+        auto [dim_index, extent, is_reduce] = thr_attr;
+        (void)dim_index; // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=81767
+        if (is_reduce) {
+          contiguous_reduce_extent *= extent;
+        } else {
+          break;
+        }
       }
     }
 
@@ -415,11 +475,16 @@ private:
         // uniformly writing the same result.
         for (size_t i = 0; i < size; ++i) {
           Buffer buf = Downcast<BufferLoad>(reduce_results[i])->buffer;
+          new_alloc_bufs.push_back(buf);
           PrimExpr val = BufferLoad(buf, {zero_index});
           ICHECK_EQ(val->dtype, types[i]);
+          PrimExpr broadcast_lane =
+              (metal_split_reduce && reduce_extent == warp_size_)
+                  ? zero_index
+                  : reduce_extent * group_index;
           PrimExpr splat =
               WarpShuffle(builtin::tvm_warp_shuffle(), new_alloc_bufs.back(),
-                          val, reduce_extent * group_index);
+                          val, broadcast_lane);
           seq.push_back(BufferStore(buf, splat, {zero_index}));
         }
       } else {
@@ -843,6 +908,28 @@ private:
       return reduce_index;
     }
   }
+
+  bool TryMatchMetalSplitReduceIndex(const PrimExpr &expr,
+                                     const VarNode **out_var,
+                                     int *out_extent) {
+    PrimExpr simplified = analyzer_.Simplify(expr);
+    const FloorModNode *mod = simplified.as<FloorModNode>();
+    if (mod == nullptr) {
+      mod = expr.as<FloorModNode>();
+    }
+    if (mod == nullptr) {
+      return false;
+    }
+    const VarNode *var = mod->a.as<VarNode>();
+    const IntImmNode *extent = mod->b.as<IntImmNode>();
+    if (var == nullptr || extent == nullptr || extent->value <= 0) {
+      return false;
+    }
+    *out_var = var;
+    *out_extent = static_cast<int>(extent->value);
+    return true;
+  }
+
   // sync thread op.
   static Stmt SyncThread(const std::string &sync) {
     return Evaluate(Call(DataType::Int(32), builtin::tvm_storage_sync(),

@@ -84,6 +84,18 @@ public:
   }
 };
 
+/*!
+ * \brief Return whether Metal AllReduce may use only simd_shuffle_xor without
+ * threadgroup workspace.
+ *
+ * The helper intentionally requires a compile-time thread_offset.  The offset
+ * is emitted as an MSL template parameter, so symbolic Z3 proofs cannot make a
+ * non-constant offset codegen-legal.
+ */
+TVM_DLL bool IsSameSimdgroupMetalReductionSafe(
+    const Target &target, int reducing_threads, int scale,
+    const PrimExpr &thread_offset_expr, arith::Analyzer *analyzer);
+
 /// Node class for reduction operations
 class ReduceOpNode : public TileOperatorNode {
 public:

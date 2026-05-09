@@ -227,7 +227,9 @@ class WalkerCtx:
 
     def tir(self) -> Any:
         """Shortcut to ``tvm.tir``."""
-        return self.tvm().tir
+        import tvm
+        from tvm import tir
+        return tir
 
     def get(self, ssa_value: Any) -> Any:
         """Resolve an MLIR SSA value to its TIR equivalent.

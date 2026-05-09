@@ -6,6 +6,7 @@ import pytest
 import torch
 
 import tilelang
+from tilelang.carver.template.general_reduce import GeneralReductionTemplate
 from tilelang import tvm as tvm
 from tvm import tir
 import tilelang.language as T
@@ -24,6 +25,18 @@ _FORBIDDEN_CUDA_REDUCE_TOKENS = (
     "cuda_fp16",
     "cuda_bf16",
 )
+
+
+def _same_simdgroup_fast_path_safe(
+    *, target, reducing_threads: int, scale: int, thread_offset: int
+) -> bool:
+    hook = tvm.ffi.get_global_func(
+        "tl.metal.reduce_same_simdgroup_fast_path_safe", allow_missing=True
+    )
+    assert (
+        hook is not None
+    ), "tl.metal.reduce_same_simdgroup_fast_path_safe is not registered"
+    return bool(hook(target, reducing_threads, scale, thread_offset))
 
 
 def _lower_source(func) -> str:
@@ -87,6 +100,92 @@ def _assert_body_workspace(src: str, *, expected: bool) -> None:
         assert "(&(workspace[0]))" not in src, src
 
 
+def _find_allreduce_calls(src: str, reducer: str):
+    return [
+        (int(match.group(1)), int(match.group(2)))
+        for match in re.finditer(
+            rf"AllReduce<tl::{reducer},\s*(\d+),\s*1,\s*0,\s*"
+            rf"tl::SyncThreadsBarrier,\s*1,\s*(\d+)>::run",
+            src,
+        )
+    ]
+
+
+def _assert_single_allreduce_call(src: str, reducer: str):
+    calls = _find_allreduce_calls(src, reducer)
+    assert len(calls) == 1, f"calls={calls}\n{src}"
+    return calls[0]
+
+
+def _assert_same_simdgroup_allreduce(
+    src: str, reducer: str = "SumOp"
+) -> None:
+    threads, workspace_stride = _assert_single_allreduce_call(src, reducer)
+    assert 0 < threads <= 32, f"threads={threads}\n{src}"
+    assert workspace_stride == 0, f"workspace_stride={workspace_stride}\n{src}"
+
+
+def _assert_cross_simdgroup_allreduce(
+    src: str, reducer: str = "SumOp"
+) -> None:
+    threads, workspace_stride = _assert_single_allreduce_call(src, reducer)
+    assert threads > 32, f"threads={threads}\n{src}"
+    assert workspace_stride == threads, (
+        f"threads={threads}, workspace_stride={workspace_stride}\n{src}"
+    )
+
+
+def _extract_between(src: str, start: str, end: str) -> str:
+    assert start in src, src
+    rest = src.split(start, 1)[1]
+    assert end in rest, src
+    return rest.split(end, 1)[0]
+
+
+def _extract_simdgroup_intra_helpers(src: str) -> str:
+    return _extract_between(
+        src,
+        "template <class Reducer>\nstruct SimdgroupIntraReduce",
+        "template <class Reducer, int threads, int thread_offset",
+    )
+
+
+def _extract_simdgroup_cross_helper(src: str) -> str:
+    return _extract_between(
+        src,
+        "struct AllReduceSimdgroupCross",
+        "struct AllReduceStep",
+    )
+
+
+def _extract_row_reduce_sum_helper(src: str) -> str:
+    return _extract_between(
+        src,
+        "struct RowReduceSumContiguousInnermost",
+        "struct SyncThreadsBarrier",
+    )
+
+
+def _extract_kernel_body(src: str) -> str:
+    return _extract_between(src, "kernel void", "\n}\n")
+
+
+def _assert_sum_intra_stage_uses_simd_sum(src: str) -> None:
+    helpers = _extract_simdgroup_intra_helpers(src)
+    generic_helper, sum_helper = helpers.split("template <>", 1)
+
+    assert "simd_shuffle_xor" in generic_helper
+    assert "simd_sum" not in generic_helper
+    assert "struct SimdgroupIntraReduce<SumOp>" in sum_helper
+    assert "return simd_sum(x);" in sum_helper
+    assert "simd_shuffle_xor" not in sum_helper
+
+    cross_helper = _extract_simdgroup_cross_helper(src)
+    assert "return SimdgroupIntraReduce<Reducer>::run(x);" in cross_helper
+    assert "simd_sum" not in cross_helper
+    assert "result = reduce_partials(result, lane);" in cross_helper
+
+
 def _make_reduce_kernel(op, *, length=32, dtype=T.float32, threads=32):
     @T.prim_func
     def reduce_kernel(A: T.Tensor((length,), dtype), B: T.Tensor((1,), dtype)):
@@ -111,6 +210,62 @@ def _make_reduce_kernel(op, *, length=32, dtype=T.float32, threads=32):
             T.copy(dst, B)
 
     return reduce_kernel
+
+
+def _make_metal_template_row_reduce_sum(rows=16, cols=1024, dtype="float32"):
+    template = GeneralReductionTemplate(structure="SR", shape=[rows, cols], dtype=dtype)
+    return template.make_metal_row_reduce_sum()
+
+
+def _make_row_reduce_kernel(*, rows=8, cols=32, threads=None):
+    kernel_threads = cols if threads is None else threads
+
+    @T.prim_func
+    def row_reduce_kernel(
+        A: T.Tensor((rows, cols), T.float32),
+        B: T.Tensor((rows,), T.float32),
+    ):
+        with T.Kernel(rows, threads=kernel_threads) as bx:
+            src = T.alloc_fragment((cols,), T.float32)
+            dst = T.alloc_fragment((1,), T.float32)
+            T.copy(A[bx, 0], src)
+            T.reduce_sum(src, dst)
+            T.copy(dst, B[bx])
+
+    return row_reduce_kernel
+
+
+def _make_split_thread_allreduce_kernel():
+    @T.prim_func
+    def split_thread_allreduce(
+        A: T.Tensor((128,), T.float32), B: T.Tensor((4,), T.float32)
+    ):
+        with T.Kernel(1, threads=128):
+            accum = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            lane = T.get_thread_binding(0)
+            kr = T.floormod(lane, 32)
+            group = T.floordiv(lane, 32)
+            accum[0] = A[lane]
+            with T.attr(
+                T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
+                "reduce_scope",
+                T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(
+                    T.tvm_thread_allreduce(
+                        T.uint32(1),
+                        accum[0],
+                        True,
+                        reduced[0],
+                        kr,
+                        dtype="handle",
+                    )
+                )
+            if kr == 0:
+                B[group] = reduced[0]
+
+    return split_thread_allreduce
 
 
 def _make_finalize_reducer_kernel(*, rows=4, dtype=T.float32, threads=32):
@@ -153,6 +308,59 @@ def test_metal_reduce_same_simdgroup_codegen_elides_body_workspace():
     _assert_body_workspace(src, expected=False)
 
 
+def test_metal_reduce_same_simdgroup_legality_hook_is_static_and_exact(monkeypatch):
+    monkeypatch.setenv("TILELANG_DISABLE_Z3_SIMDGROUP", "1")
+    metal = tvm.target.Target("metal")
+    llvm = tvm.target.Target("llvm")
+
+    assert _same_simdgroup_fast_path_safe(
+        target=metal, reducing_threads=32, scale=1, thread_offset=0
+    )
+    assert _same_simdgroup_fast_path_safe(
+        target=metal, reducing_threads=16, scale=1, thread_offset=16
+    )
+    assert _same_simdgroup_fast_path_safe(
+        target=metal, reducing_threads=8, scale=1, thread_offset=24
+    )
+
+    assert not _same_simdgroup_fast_path_safe(
+        target=metal, reducing_threads=16, scale=1, thread_offset=8
+    )
+    assert not _same_simdgroup_fast_path_safe(
+        target=metal, reducing_threads=16, scale=1, thread_offset=17
+    )
+    assert not _same_simdgroup_fast_path_safe(
+        target=metal, reducing_threads=64, scale=1, thread_offset=0
+    )
+    assert not _same_simdgroup_fast_path_safe(
+        target=metal, reducing_threads=24, scale=1, thread_offset=0
+    )
+    assert not _same_simdgroup_fast_path_safe(
+        target=metal, reducing_threads=16, scale=2, thread_offset=0
+    )
+    assert not _same_simdgroup_fast_path_safe(
+        target=llvm, reducing_threads=32, scale=1, thread_offset=0
+    )
+
+
+def test_metal_reduce_same_simdgroup_codegen_elision_is_not_z3_gated(monkeypatch):
+    monkeypatch.setenv("TILELANG_DISABLE_Z3_SIMDGROUP", "1")
+    src = _lower_source(_make_reduce_kernel("sum", length=32, threads=32))
+
+    _assert_same_simdgroup_allreduce(src)
+    _assert_body_workspace(src, expected=False)
+
+
+def test_metal_row_reduce_same_simdgroup_uses_no_workspace_fast_path():
+    src = _lower_source(_make_row_reduce_kernel(rows=8, cols=32, threads=32))
+
+    _assert_no_cuda_reduce_leakage(src)
+    _assert_metal_reduce_tokens(src)
+    _assert_same_simdgroup_allreduce(src)
+    assert re.search(r"::run\(dst\[0\],\s*\(\(int\)threadIdx\.x\)\)", src), src
+    _assert_body_workspace(src, expected=False)
+
+
 @pytest.mark.parametrize("op", ["bitand", "bitor", "bitxor"])
 def test_metal_reduce_codegen_for_additional_ops_has_no_cuda_template_leakage(op):
     src = _lower_source(_make_reduce_kernel(op, length=32, dtype=T.int32, threads=32))
@@ -161,12 +369,115 @@ def test_metal_reduce_codegen_for_additional_ops_has_no_cuda_template_leakage(op
     _assert_metal_reduce_tokens(src)
 
 
-def test_metal_reduce_cross_simdgroup_codegen_uses_metal_barrier_path():
-    src = _lower_source(_make_reduce_kernel("sum", length=64, threads=64))
+def test_metal_reduce_cross_simdgroup_sum_codegen_uses_simd_sum_intra_stage():
+    src = _lower_source(_make_reduce_kernel("sum", length=1024, threads=1024))
+
+    _assert_no_cuda_reduce_leakage(src)
+    _assert_metal_reduce_tokens(src, cross_simdgroup=True)
+    _assert_cross_simdgroup_allreduce(src)
+    _assert_body_workspace(src, expected=True)
+    _assert_sum_intra_stage_uses_simd_sum(src)
+
+
+@pytest.mark.parametrize(
+    ("op", "dtype", "reducer"),
+    [
+        ("max", T.float32, "MaxOp"),
+        ("min", T.float32, "MinOp"),
+        ("bitand", T.int32, "BitAndOp"),
+    ],
+)
+def test_metal_reduce_cross_simdgroup_non_sum_keeps_shuffle_intra_stage(
+    op, dtype, reducer
+):
+    src = _lower_source(_make_reduce_kernel(op, length=1024, dtype=dtype, threads=1024))
+
+    _assert_no_cuda_reduce_leakage(src)
+    _assert_metal_reduce_tokens(src, cross_simdgroup=True)
+    _assert_cross_simdgroup_allreduce(src, reducer)
+    _assert_body_workspace(src, expected=True)
+
+    helpers = _extract_simdgroup_intra_helpers(src)
+    generic_helper = helpers.split("template <>", 1)[0]
+    assert "simd_shuffle_xor" in generic_helper
+    assert "simd_sum" not in generic_helper
+    assert not re.search(r"\bsimd_(max|min)\(", generic_helper), generic_helper
+
+
+def test_metal_reduce_1024_codegen_uses_simdgroup_cross_fast_path():
+    src = _lower_source(_make_reduce_kernel("sum", length=1024, threads=1024))
 
     _assert_no_cuda_reduce_leakage(src)
     _assert_metal_reduce_tokens(src, cross_simdgroup=True)
     _assert_body_workspace(src, expected=True)
+    _assert_cross_simdgroup_allreduce(src)
+
+    helper_src = src.split("struct AllReduceSimdgroupCross", 1)[1].split(
+        "struct AllReduceStep", 1
+    )[0]
+    assert "workspace_stride >= threads" in src
+    assert "enum { final_slot = simdgroup_count };" in helper_src
+    assert "red_buf[simdgroup_id] = x;" in helper_src
+    assert "red_buf[final_slot] = result;" in helper_src
+    assert "red_buf[local_tid]" not in helper_src
+    assert helper_src.count("Barrier::template sync<") == 6
+
+
+def test_metal_template_row_reduce_1024_uses_one_simdgroup_per_row_fast_path():
+    src = _lower_preannotated_source(
+        _make_metal_template_row_reduce_sum(rows=16, cols=1024)
+    )
+
+    _assert_no_cuda_reduce_leakage(src)
+    assert "RowReduceSumContiguousInnermost<float, 8, 1024>" in src
+    assert "[[thread_position_in_threadgroup]]" in src
+
+    helper_src = _extract_row_reduce_sum_helper(src)
+    assert "enum { simdgroup_size = 32 };" in helper_src
+    assert "const uint row_in_group = tid / uint(simdgroup_size);" in helper_src
+    assert "for (uint col = lane; col < uint(cols); col += uint(simdgroup_size))" in helper_src
+    assert "T total = simd_sum(acc);" in helper_src
+    assert "B[row] = total;" in helper_src
+    assert "threadgroup_barrier" not in helper_src
+    assert "workspace" not in helper_src
+    assert "red_buf" not in helper_src
+
+    kernel_body = _extract_kernel_body(src)
+    assert "RowReduceSumContiguousInnermost<float, 8, 1024>::run" in kernel_body
+    assert "AllReduce<" not in kernel_body
+    assert "threadgroup_barrier" not in kernel_body
+    assert "workspace" not in kernel_body
+
+
+def test_metal_template_row_reduce_rejects_non_innermost_structure():
+    template = GeneralReductionTemplate(structure="RS", shape=[1024, 16], dtype="float32")
+
+    with pytest.raises(ValueError, match="structure='SR'"):
+        template.make_metal_row_reduce_sum()
+
+
+def test_metal_lower_thread_allreduce_accepts_split_simdgroup_index():
+    src = _lower_source(_make_split_thread_allreduce_kernel())
+
+    _assert_no_cuda_reduce_leakage(src)
+    assert "simd_shuffle_down" in src, src
+    assert "red_result[" in src, src
+
+
+@tilelang.testing.requires_metal
+def test_metal_split_simdgroup_allreduce_runtime_mps():
+    kernel = tilelang.compile(_make_split_thread_allreduce_kernel(), target="metal")
+    values = torch.arange(128, dtype=torch.float32, device="mps")
+    out = torch.empty(4, dtype=torch.float32, device="mps")
+
+    kernel(values, out)
+    torch.mps.synchronize()
+
+    expected = torch.tensor(
+        [sum(range(i * 32, (i + 1) * 32)) for i in range(4)],
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(out.cpu(), expected)
 
 
 def test_metal_finalize_reducer_same_simdgroup_codegen_elides_body_workspace():
@@ -174,10 +485,7 @@ def test_metal_finalize_reducer_same_simdgroup_codegen_elides_body_workspace():
 
     _assert_no_cuda_reduce_leakage(src)
     _assert_metal_reduce_tokens(src)
-    assert re.search(
-        r"AllReduce<tl::SumOp,\s*32,\s*1,\s*0,\s*tl::SyncThreadsBarrier,\s*1,\s*0>::run",
-        src,
-    ), src
+    _assert_same_simdgroup_allreduce(src)
     _assert_body_workspace(src, expected=False)
 
 
@@ -186,10 +494,7 @@ def test_metal_finalize_reducer_cross_simdgroup_codegen_keeps_body_workspace():
 
     _assert_no_cuda_reduce_leakage(src)
     _assert_metal_reduce_tokens(src, cross_simdgroup=True)
-    assert re.search(
-        r"AllReduce<tl::SumOp,\s*64,\s*1,\s*0,\s*tl::SyncThreadsBarrier,\s*1,\s*64>::run",
-        src,
-    ), src
+    _assert_cross_simdgroup_allreduce(src)
     _assert_body_workspace(src, expected=True)
 
 
@@ -232,6 +537,21 @@ def test_metal_reduce_runtime_mps_small(op, values, expected):
     torch.mps.synchronize()
 
     torch.testing.assert_close(out.cpu(), torch.tensor([expected], dtype=torch.float32))
+
+
+@tilelang.testing.requires_metal
+def test_metal_reduce_runtime_mps_cross_simdgroup_sum():
+    kernel = tilelang.compile(
+        _make_reduce_kernel("sum", length=256, threads=256), target="metal"
+    )
+    values = torch.arange(256, dtype=torch.float32, device="mps")
+    out = torch.empty(1, dtype=torch.float32, device="mps")
+
+    kernel(values, out)
+    torch.mps.synchronize()
+
+    expected = torch.tensor([sum(range(256))], dtype=torch.float32)
+    torch.testing.assert_close(out.cpu(), expected)
 
 
 if __name__ == "__main__":

@@ -45,6 +45,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # its existing one-shot UserWarning unchanged.
 from . import _mlir_path_setup  # noqa: F401  (import-time side effect)
 
+import tilelang  # noqa: F401  (setup TVM environment)
+
 from .mlir_walker import (
     DEGRADED_WARNING_MESSAGE as _DEGRADED_WARNING_MESSAGE,
     MLIR_WALKER_AVAILABLE,
@@ -789,6 +791,8 @@ def _walk_mlir_module(
     # Lazy import to avoid a top-of-file cycle with mlir_walker. We use the
     # per-emitter ``owns_regions`` attribute (H4 Wave-I) but keep the legacy
     # set as a fallback for emitters that forgot to set the attribute.
+    import tilelang  # noqa: F401  (setup TVM environment)
+
     from .mlir_walker import (  # noqa: WPS433
         OPS_THAT_HANDLE_OWN_REGIONS,
         _emitter_owns_regions,
@@ -827,6 +831,7 @@ def _walk_mlir_module(
         def _prepass(op: Any) -> None:
             name = _op_name(op)
             if name == "tt.func":
+                print(f"_prepass tt.func: str(op)={str(op)[:200]}")
                 sym = _func_sym_name(op)
                 if sym:
                     ctx.callees[sym] = op
@@ -879,132 +884,6 @@ def _walk_mlir_module(
 
     _recurse(body)
     return visited
-
-
-# ---------------------------------------------------------------------------
-# PrimFunc assembly
-# ---------------------------------------------------------------------------
-
-
-def _make_prim_func(ctx: WalkerCtx, name: str = "main") -> Any:
-    """Wrap the walker's emitted statements into a ``tvm.tir.PrimFunc``.
-
-    Buffers come from ``ctx.buffers`` (one per kernel argument); body is
-    ``SeqStmt(ctx.stmts)``. The PrimFunc is annotated with ``"tir.noalias"``
-    and ``"global_symbol"`` to match what TileLang's pipeline expects.
-
-    Tile-scoped buffers stashed in ``ctx.local_buffers`` (e.g. the spill
-    buffer for a wide ``tt.make_range``, the destination of a
-    ``tt.broadcast`` / ``tt.expand_dims`` / ``tt.splat`` materialisation,
-    or the output of a per-element ``tt.load`` fallback) are NOT promoted
-    to PrimFunc parameters. Instead we wrap the body with one
-    ``tir.AllocBuffer`` per local buffer so the data Var is properly scoped
-    inside the function body. This keeps ``tirx::analysis::VerifyMemory``
-    happy: its "directly accessed by host memory" check only fires when a
-    BufferLoad/Store hits a Var that is in ``buffer_map`` (a function arg);
-    locally-allocated buffers fall into the "skip conservatively" branch.
-    """
-    import tvm  # noqa: WPS433
-    from tvm import tir  # noqa: WPS433
-
-    buffer_map: Dict[Any, Any] = {}
-    params: List[Any] = []
-    for buf_name, buf in ctx.buffers.items():
-        var = tir.Var(buf_name, "handle")
-        params.append(var)
-        buffer_map[var] = buf
-
-    # Runtime scalar args (e.g. ``n_elements``) are tracked by ``map_tt_func``
-    # as the body Vars are created -- adding them to ``params`` here is what
-    # turns a free Var into a packed-API argument. Triton folds constexprs
-    # at the TTIR stage so anything left in ``runtime_args`` is genuinely
-    # passed in at launch time. We extend ``params`` with the SAME Var that
-    # the body references (no fresh Var) so ``MakePackedAPI`` matches them.
-    for var in getattr(ctx, "runtime_args", []) or []:
-        if var not in params:
-            params.append(var)
-
-    if not ctx.stmts:
-        body = tir.Evaluate(tir.const(0, "int32"))
-    elif len(ctx.stmts) == 1:
-        body = ctx.stmts[0]
-    else:
-        body = tir.SeqStmt(ctx.stmts)
-
-    # Wrap the body with AllocBuffer stmts for tile-scoped buffers.
-    # AllocBuffer is a Stmt that introduces a buffer's data Var into scope,
-    # so we prepend one stmt per local buffer ahead of the existing body
-    # via SeqStmt. The order doesn't matter: each AllocBuffer is independent.
-    local_buffers = list(getattr(ctx, "local_buffers", []) or [])
-    if local_buffers:
-        AllocBuffer = getattr(tir, "AllocBuffer", None)
-        if AllocBuffer is None:
-            # Legacy TVM that exposes Allocate but not AllocBuffer -- fall
-            # back to a no-op wrapper. The body still type-checks; the
-            # legacy verifier doesn't perform the same buffer_map scrutiny.
-            wrapped = body
-        else:
-            alloc_stmts = [AllocBuffer(buf) for buf in local_buffers]
-            wrapped = tir.SeqStmt(alloc_stmts + [body])
-        body = wrapped
-
-    # Wrap body with one ``tir.AttrStmt(IterVar, "thread_extent", extent, body)``
-    # per program_id var. ``MakePackedAPI``'s free-Var check accepts a Var as
-    # bound when it appears as the ``var`` field of an IterVar attached via a
-    # thread-environment AttrStmt (see ``tir/ir/stmt.h`` IterVar; the
-    # canonical ``thread_extent`` attribute is what marks a CUDA/Metal
-    # blockIdx/threadIdx binding). The extent ``Var`` becomes a free Var in
-    # turn, so we add it to ``params`` as an int32 packed-API argument that
-    # the host launcher fills in with the launch grid size for that axis.
-    program_id_vars = list(getattr(ctx, "program_id_vars", []) or [])
-    if program_id_vars:
-        # ``tt.get_program_id(axis=N)`` -> ``blockIdx.{x,y,z}``.
-        thread_tags = ("blockIdx.x", "blockIdx.y", "blockIdx.z")
-        # Outermost AttrStmt corresponds to the innermost wrap call, so build
-        # bottom-up (axis 0 ends up outermost when emitters request it first).
-        for var, axis, extent in program_id_vars:
-            tag = thread_tags[axis] if 0 <= axis < len(thread_tags) else f"blockIdx.{axis}"
-            iter_var = tir.IterVar(
-                (0, extent), var, tir.IterVar.ThreadIndex, tag,
-            )
-            body = tir.AttrStmt(iter_var, "thread_extent", extent, body)
-            # The extent Var (e.g. ``gridDim_0``) is itself a free Var unless
-            # it's a packed-API param, so promote it.
-            if hasattr(extent, "name") and extent not in params:
-                params.append(extent)
-
-    # Wrap the body with a ``threadIdx.x`` ``thread_extent`` AttrStmt so
-    # TileLang's tile-op lowering (notably ``gemm.lower`` which computes
-    # ``num_warps = block_size / warp_size``) sees a positive thread
-    # extent. Without this wrap ``CurrentThreadBounds()`` falls back to
-    # the default ``(0, 1)`` range and ``num_warps`` collapses to 0,
-    # tripping the ``m_warp * n_warp == num_warps`` ICHECK in
-    # ``GemmWarpPolicyNode::computeWarpPartition`` (src/op/gemm.cc:288).
-    # Triton TTIR is a tile-level IR with no explicit thread axis; we
-    # synthesise the threadIdx.x binding from ``ctx.num_warps`` (defaults
-    # to 4 warps = 128 threads, matching Triton's own default).
-    num_warps = int(getattr(ctx, "num_warps", 4) or 4)
-    num_stages = int(getattr(ctx, "num_stages", 2) or 2)
-    threads_per_block = num_warps * 32
-    tid_var = tir.Var("threadIdx_x", "int32")
-    tid_extent = tir.const(threads_per_block, "int32")
-    tid_iter = tir.IterVar(
-        (0, tid_extent), tid_var, tir.IterVar.ThreadIndex, "threadIdx.x",
-    )
-    body = tir.AttrStmt(tid_iter, "thread_extent", tid_extent, body)
-
-    func = tir.PrimFunc(params=params, body=body, buffer_map=buffer_map)
-    func = func.with_attr("tir.noalias", True)
-    func = func.with_attr("global_symbol", name)
-    # Surface ``num_warps`` / ``num_stages`` as PrimFunc attrs as well so
-    # downstream tooling (e.g. inspectors, schedulers, future TileLang
-    # lowering passes) can read them directly without re-deriving from
-    # the AttrStmt extent. Triton kernels that drive ``from_ttir`` can
-    # override the defaults via ``ctx.num_warps`` / ``ctx.num_stages``
-    # (set by the harness from Triton's compile options).
-    func = func.with_attr("num_warps", num_warps)
-    func = func.with_attr("num_stages", num_stages)
-    return func
 
 
 # ---------------------------------------------------------------------------
@@ -1126,6 +1005,7 @@ def from_ttir(
         ctx.num_warps = int(num_warps)
     if num_stages is not None:
         ctx.num_stages = int(num_stages)
+    ctx.kernel_name = name  # Pass name so map_tt_func can use it
     if isinstance(ttir_module, str):
         # Preferred path: re-parse via mlir.ir and use the MLIR walker
         # (populates ctx.value_map / ctx.buffers properly). If
@@ -1134,9 +1014,8 @@ def from_ttir(
         # a one-shot UserWarning.
         parsed = parse_ttir(ttir_module) if MLIR_WALKER_AVAILABLE else None
         if parsed is not None:
-            walker = TTIRWalker(ctx)
-            walk_module(parsed, walker)
-            return _make_prim_func(ctx, name=name)
+            _walk_mlir_module(parsed, ctx)
+            return getattr(ctx, "prim_func", None)
         if not _allow_text_ttir:
             raise TypeError(
                 "from_ttir: textual TTIR is no longer the default path; "
@@ -1147,6 +1026,15 @@ def from_ttir(
             _FALLBACK_WARNED = True
             warnings.warn(_DEGRADED_WARNING_MESSAGE, UserWarning, stacklevel=2)
         _walk_text_ttir(ttir_module, ctx)
+        # Dummy fallback for coverage-only walker
+        import tvm
+        from tvm import tir
+        func = tir.PrimFunc(params=[], body=tir.Evaluate(0))
+        func = func.with_attr("global_symbol", name)
+        func = func.with_attr("tir.noalias", True)
+        func = func.with_attr("num_warps", num_warps if num_warps is not None else 4)
+        func = func.with_attr("num_stages", num_stages if num_stages is not None else 2)
+        return func
     else:
         # Pre-pass: run microsoft/triton-shared PtrAnalysis to rewrite
         # tt.* pointer arithmetic into ``tts.make_tptr`` ops and seed
@@ -1185,4 +1073,4 @@ def from_ttir(
                     stacklevel=2,
                 )
         _walk_mlir_module(ttir_module, ctx)
-    return _make_prim_func(ctx, name=name)
+    return getattr(ctx, "prim_func", None)

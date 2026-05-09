@@ -368,11 +368,11 @@ def _rewrite_scope(body, var_map):
         if isinstance(node, tir.BufferLoad):
             new_buffer = _remap_buffer_ref(node.buffer)
             if _buffer_was_remapped(node.buffer, new_buffer):
-                return tir.BufferLoad(new_buffer, node.indices, node.predicate, node.span)
+                return tir.BufferLoad(new_buffer, node.indices, getattr(node, "span", None))
         if isinstance(node, tir.BufferStore):
             new_buffer = _remap_buffer_ref(node.buffer)
             if _buffer_was_remapped(node.buffer, new_buffer):
-                return tir.BufferStore(new_buffer, node.value, node.indices, node.predicate, node.span)
+                return tir.BufferStore(new_buffer, node.value, node.indices, getattr(node, "span", None))
         return None
 
     def _post_order(node):

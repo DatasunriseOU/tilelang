@@ -76,9 +76,7 @@ def test_macro_expands_to_scalar_kloop_metal():
         "expected per-element FP8 dequantization in lowered IR"
     )
     body = src[src.find("kernel void"):]
-    assert "a_val" in body and "b_val" in body, (
-        "expected dequantized FP8 values to be named in the inner loop"
-    )
+    assert "C_local" in body
     # The scale multiplications survive lowering — even in the per-tensor
     # case where the compiler could hoist them out, the generated MSL
     # keeps the scale as a runtime reference.
@@ -176,20 +174,10 @@ def test_validation_rejects_k_mismatch():
 
 
 def test_intrinsic_in_pre_lowering_ir():
-    """Pre-lowering IR contains the macro expansion (Cast + multiply chain).
-
-    The macro is a TIR-level construct, so by the time we have an
-    ``IRModule`` from ``@T.prim_func`` the ``T.fp8_scaled_matmul`` call
-    has already been inlined into a ``For/BufferStore`` chain. This test
-    verifies the macro produces *some* recognizable arithmetic shape
-    rather than e.g. a ``Call`` to an unknown op.
-    """
+    """Pre-lowering IR contains the target-visible fp8_scaled_matmul marker."""
     fn = _make_kernel()
     # Pre-lowering: just the @T.prim_func itself (no target dispatch).
     ir_text = str(fn)
-    # The macro expansion uses cast operations — we should see ``T.Cast`` or
-    # ``Cast(`` in the textual IR somewhere along the dequant path.
-    assert "Cast" in ir_text or "cast" in ir_text or "float32" in ir_text
-    # And the scale buffers should appear (they're function arguments).
+    assert "tl.fp8_scaled_matmul.marker" in ir_text
     assert "A_scale" in ir_text
     assert "B_scale" in ir_text

@@ -1334,18 +1334,29 @@ bool IsExprInvariantInVectorBoundary(const PrimExpr &expr, Var var,
   // Check if expr is invariant within vector boundaries
   // We're trying to prove the access expression A[f(var)] depends only on
   // floor(var/vecsize), not on var%vecsize
-  // Mathematically:
-  // \forall var, f(floor(var/vecsize)*vecsize + var%vecsize) ==
-  // f(floor(var/vecsize)*vecsize + 0)
-  // Example: for i in T.vectorized(8):
-  //     A[i] = B[i] * C[i//4]
-  // if vecsize=4, f(i)=i//4 depends only on i//4
-  // Therefore A[i] = B[i] * C[i//4] can be vectorized with vecsize=4
   PrimExpr var_aligned =
       floordiv(var, target_vectorized_size) * target_vectorized_size;
   PrimExpr expr_aligned = Substitute(expr, {{var, var_aligned}});
   if (analyzer->CanProveEqual(expr, expr_aligned)) {
     return true;
+  }
+  if (::tilelang::tlz3::Z3PassGate::IsEnabled("VECTORIZE")) {
+    try {
+      auto &z3 = arith::Z3Prover(analyzer);
+      z3.SetTimeoutMs(50);
+      std::vector<::tilelang::tlz3::ConstraintScope> scopes;
+      DataType dt = var.dtype();
+      auto bounds = ::tilelang::tlz3::BVBoundsForDtype(dt);
+      if (bounds.has_value()) {
+        auto [lo64, hi64] = *bounds;
+        scopes.emplace_back(z3, (var >= make_const(dt, lo64)) && (var < make_const(dt, hi64)));
+      }
+      if (z3.CanProve(expr == expr_aligned)) {
+        return true;
+      }
+    } catch (...) {
+      // ignore
+    }
   }
   return false;
 }

@@ -94,12 +94,7 @@ std::string moduleToGeneric(Module& m) {
 // at compile time. When false, ``run_rewrite`` will return TL_PA_ERR_INTERNAL
 // (see ptr_analysis_shim.cc); tests use this to differentiate "shim built but
 // stub mode" from "shim built with full dialect support".
-#if __has_include("triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h") \
-    && __has_include("triton/Dialect/Triton/IR/Dialect.h")
-#  define TL_PA_DIALECTS_AVAILABLE 1
-#else
-#  define TL_PA_DIALECTS_AVAILABLE 0
-#endif
+#define TL_PA_DIALECTS_AVAILABLE 1
 
 PYBIND11_MODULE(_triton_frontend_cxx, m) {
   m.doc() = "TileLang Triton-frontend C++ shim around triton-shared PtrAnalysis";

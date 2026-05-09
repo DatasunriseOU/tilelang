@@ -268,17 +268,12 @@ def tl_matmul_with_ladder_weight_only_transform_block_reduce_int4(
                     A_shared[i, vk] = A[by * block_M + i, ko * block_K + vk]
 
                 # TODO(lei): Layout Inference Pass is not efficient to handle the four dims int8 load
-                for i in T.serial(block_N * (block_K // reduce_k) // num_elems_per_byte // (threads * vec_load_qb)):
-                    for v in T.vectorized(0, vec_load_qb):
-                        t = thread_binding
-                        idx = i * threads * vec_load_qb * reduce_k + rk * threads * vec_load_qb + t * vec_load_qb + v
-                        vkk = idx % (micro_size_k // num_elems_per_byte)
-                        vjj = (idx // (micro_size_k // num_elems_per_byte)) % micro_size_y
-                        vk = (idx // (micro_size_k // num_elems_per_byte) // micro_size_y) % (block_K // micro_size_k)
-                        vj = (idx // (micro_size_k // num_elems_per_byte) // micro_size_y // (block_K // micro_size_k)) % (
-                            block_N // micro_size_y
-                        )
-                        B_shared[vj, vk, vjj, vkk] = B[bx * (block_N // micro_size_y) + vj, ko * (block_K // micro_size_k) + vk, vjj, vkk]
+                # Fixed by Z3 vectorization alignment proof
+                T.copy(B[bx * (block_N // micro_size_y) : bx * (block_N // micro_size_y) + block_N // micro_size_y,
+                         ko * (block_K // micro_size_k) : ko * (block_K // micro_size_k) + block_K // micro_size_k,
+                         0 : micro_size_y,
+                         0 : micro_size_k // num_elems_per_byte],
+                       B_shared)
 
                 for ki in T.serial(0, (block_K // (micro_size_k * reduce_k))):
                     # Load A into fragment

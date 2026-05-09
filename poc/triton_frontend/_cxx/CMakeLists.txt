@@ -78,40 +78,26 @@ find_package(pybind11 CONFIG REQUIRED)
 # returns TL_PA_ERR_INTERNAL because the `__has_include` gates in
 # ptr_analysis_shim.cc disable the rewrite path.
 set(TL_PA_LINK_LIBS "")
-if(DEFINED ENV{TRITON_INSTALL_DIR} OR DEFINED TRITON_INSTALL_DIR)
-  if(NOT DEFINED TRITON_INSTALL_DIR)
-    set(TRITON_INSTALL_DIR "$ENV{TRITON_INSTALL_DIR}")
-  endif()
-  message(STATUS "Using TRITON_INSTALL_DIR = ${TRITON_INSTALL_DIR}")
-  include_directories(${TRITON_INSTALL_DIR}/include)
-  link_directories(${TRITON_INSTALL_DIR}/lib)
-  # The Triton dialect splits across a handful of static libs; PtrAnalysis.cpp
-  # references symbols from at least TritonIR + TritonAnalysis. Use REQUIRED
-  # for the core library and treat the rest as best-effort so older Triton
-  # checkouts still link.
-  find_library(TRITON_IR_LIB
-    NAMES TritonIR
+set(TRITON_INSTALL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../vendored/triton")
+message(STATUS "Using TRITON_INSTALL_DIR = ${TRITON_INSTALL_DIR}")
+include_directories(${TRITON_INSTALL_DIR}/include)
+link_directories(${TRITON_INSTALL_DIR}/lib)
+
+find_library(TRITON_IR_LIB
+  NAMES TritonIR
+  PATHS ${TRITON_INSTALL_DIR}/lib
+  NO_DEFAULT_PATH
+  REQUIRED)
+list(APPEND TL_PA_LINK_LIBS ${TRITON_IR_LIB})
+foreach(_optlib TritonAnalysis TritonTransforms TritonGPUIR)
+  find_library(TRITON_${_optlib}_LIB
+    NAMES ${_optlib}
     PATHS ${TRITON_INSTALL_DIR}/lib
-    NO_DEFAULT_PATH
-    REQUIRED)
-  list(APPEND TL_PA_LINK_LIBS ${TRITON_IR_LIB})
-  foreach(_optlib TritonAnalysis TritonTransforms TritonGPUIR)
-    find_library(TRITON_${_optlib}_LIB
-      NAMES ${_optlib}
-      PATHS ${TRITON_INSTALL_DIR}/lib
-      NO_DEFAULT_PATH)
-    if(TRITON_${_optlib}_LIB)
-      list(APPEND TL_PA_LINK_LIBS ${TRITON_${_optlib}_LIB})
-    endif()
-  endforeach()
-else()
-  message(WARNING
-    "TRITON_INSTALL_DIR not set: building C-ABI surface only; "
-    "tl_pa_run_rewrite will return TL_PA_ERR_INTERNAL until integration #5.")
-  # Auto-promote to a stub build so we don't try to compile vendored
-  # PtrAnalysis.cpp against missing `triton/Dialect/Triton/IR/Dialect.h`.
-  set(TRITON_FRONTEND_STUB_BUILD ON)
-endif()
+    NO_DEFAULT_PATH)
+  if(TRITON_${_optlib}_LIB)
+    list(APPEND TL_PA_LINK_LIBS ${TRITON_${_optlib}_LIB})
+  endif()
+endforeach()
 
 # ---- Vendored triton-shared sources ----------------------------------
 

@@ -689,135 +689,151 @@ def _func_block_args(op: Any) -> List[Any]:
 
 
 def map_tt_func(op: Any, ctx: _om.WalkerCtx) -> Any:
-    """Seed ``tt.func`` block arguments into ``ctx.value_map`` / ``ctx.buffers``.
+    """Build a ``tvm.tir.PrimFunc`` from a ``tt.func`` op.
 
     Mapping summary
     ---------------
-    * Pointer block args (``!tt.ptr<T>``): allocated as ``tir.decl_buffer``
-      shape=(?,), dtype=T, name=<ssa stripped of '%'>; bound under both
-      the SSA Value (so MLIR-walker operand lookups resolve) AND the
-      printed SSA name string (so test fixtures can introspect by name).
-    * Scalar block args (``i32`` etc.): bound as a fresh ``tir.Var`` of the
-      MLIR dtype, again under both the Value and the SSA-name string.
-
-    We deliberately do NOT recurse into the body region: the parent walker
-    (``_walk_mlir_module`` in ``triton_frontend.__init__``) handles
-    recursion already. Doing so here would double-walk the body.
-
-    Returning ``None`` keeps the walker's auto-bind logic (which only fires
-    on single-result ops with non-None return) inert -- ``tt.func`` has no
-    result SSA to bind anyway.
+    * Pointer block args (``!tt.ptr<T>``) -> ``tir.decl_buffer`` in ``ctx.buffers``.
+    * Scalar block args (``i32``) -> ``tir.Var`` in ``ctx.value_map``.
+    * Body region is walked via ``_emit_region`` to collect statements.
+    * Output is a ``PrimFunc`` attached to ``ctx.prim_func``.
     """
-    block_args = _func_block_args(op)
-    if not block_args:
-        # Nothing to seed. This is unusual but legal (e.g. zero-arg kernel)
-        # and we honour it silently rather than raising -- the walker will
-        # still recurse into the body and downstream ops with no operand
-        # references will succeed.
+    # Helper tt.func: a tt.func whose sym_name is referenced by some
+    # tt.call is inlined at the call site. We must NOT build a PrimFunc
+    # for it here.
+    sym = _func_sym_name(op)
+    if sym and hasattr(ctx, "callee_used") and sym in ctx.callee_used:
         return None
+
+    block_args = _func_block_args(op)
 
     tir_mod = None
     try:
+        import tvm
+        from tvm import tir  # ensure tir is loaded
         tir_mod = ctx.tir()
     except Exception:
-        # TVM unavailable: we still want to seed string-keyed entries so
-        # text-walker-style fakes can introspect the value_map. We use a
-        # sentinel dict in that case.
-        tir_mod = None
+        pass
 
-    for idx, arg in enumerate(block_args):
-        ssa = _ssa_name(arg) or f"%arg{idx}"
-        clean = ssa.lstrip("%") or f"arg{idx}"
-        type_str = _type_string(arg)
+    if block_args:
+        for idx, arg in enumerate(block_args):
+            ssa = _ssa_name(arg) or f"%arg{idx}"
+            clean = ssa.lstrip("%") or f"arg{idx}"
+            type_str = _type_string(arg)
 
-        if _is_ptr_type(type_str):
-            elt = _normalize_dtype(_ptr_element_dtype(type_str))
-            if tir_mod is not None:
-                # Pointer block arg: allocate a placeholder buffer. Shape
-                # is symbolic (no kernel-level info available here); we
-                # use 1 -- the actual extents come from later tt.load /
-                # tt.store ops that re-decl with the right shape via the
-                # PtrAnalysis path. This matches what
-                # mlir_walker.TTIRWalker._materialize_func_args does.
-                if clean not in ctx.buffers:
-                    ctx.buffers[clean] = tir_mod.decl_buffer(
-                        shape=[1], dtype=elt, name=clean,
-                    )
-                bound = ctx.buffers[clean]
+            if _is_ptr_type(type_str):
+                elt = _normalize_dtype(_ptr_element_dtype(type_str))
+                if tir_mod is not None:
+                    if clean not in ctx.buffers:
+                        ctx.buffers[clean] = tir_mod.decl_buffer(
+                            shape=[1], dtype=elt, name=clean,
+                        )
+                    bound = ctx.buffers[clean]
+                else:
+                    bound = {"_placeholder": True, "name": clean, "dtype": elt}
+                    ctx.buffers[clean] = bound
+            elif _om._is_tensor_type(type_str):
+                try:
+                    shape, elt = _om._parse_tensor_type(type_str)
+                except ValueError as exc:
+                    raise EmitError(
+                        f"tt.func block arg {ssa!r}: cannot parse tensor type "
+                        f"{type_str!r}: {exc}"
+                    ) from exc
+                if tir_mod is not None:
+                    if clean not in ctx.buffers:
+                        ctx.buffers[clean] = tir_mod.decl_buffer(
+                            shape=list(shape), dtype=elt, name=clean,
+                        )
+                    bound = ctx.buffers[clean]
+                else:
+                    bound = {
+                        "_placeholder": True,
+                        "name": clean,
+                        "dtype": elt,
+                        "shape": list(shape),
+                    }
+                    ctx.buffers[clean] = bound
             else:
-                bound = {"_placeholder": True, "name": clean, "dtype": elt}
-                ctx.buffers[clean] = bound
-        elif _om._is_tensor_type(type_str):
-            # Tile-typed block arg (``tensor<NxT>`` / ``tensor<NxMxT>``).
-            # Triton's TTIR threads tile-typed values across function
-            # boundaries in kernels like ``layer_norm``; before this branch
-            # ``map_tt_func`` raised ``unsupported MLIR dtype:
-            # 'tensor<128xf32>'`` because it only knew pointer / scalar
-            # spellings. We allocate a fixed-shape ``tir.decl_buffer`` so
-            # downstream load/store ops can index into the tile directly,
-            # rather than wedging a placeholder ``[1]`` shape that mismatches
-            # the actual extents (the regression that motivated this fix).
+                dt = _normalize_dtype(type_str) if type_str else "int32"
+                if tir_mod is not None:
+                    bound = tir_mod.Var(clean, dt)
+                    runtime_args = getattr(ctx, "runtime_args", None)
+                    if runtime_args is not None and bound not in runtime_args:
+                        runtime_args.append(bound)
+                else:
+                    bound = {"_var_placeholder": True, "name": clean, "dtype": dt}
+
             try:
-                shape, elt = _om._parse_tensor_type(type_str)
-            except ValueError as exc:
-                # Re-raise as EmitError so the frontend's error hierarchy
-                # (TritonFrontendError -> EmitError) is honoured. The
-                # underlying ``ValueError`` carries the malformed spelling
-                # already; we surface the block-arg context here.
-                raise EmitError(
-                    f"tt.func block arg {ssa!r}: cannot parse tensor type "
-                    f"{type_str!r}: {exc}"
-                ) from exc
-            if tir_mod is not None:
-                if clean not in ctx.buffers:
-                    ctx.buffers[clean] = tir_mod.decl_buffer(
-                        shape=list(shape), dtype=elt, name=clean,
-                    )
-                bound = ctx.buffers[clean]
-            else:
-                bound = {
-                    "_placeholder": True,
-                    "name": clean,
-                    "dtype": elt,
-                    "shape": list(shape),
-                }
-                ctx.buffers[clean] = bound
-        else:
-            # Scalar block arg: emit a tir.Var of the right dtype.
-            # Pointer args are handled by the ``_is_ptr_type`` branch
-            # above and tensor (tile) args by the ``_is_tensor_type``
-            # branch; everything else falls through here. Normalise short
-            # MLIR spellings (``i32`` -> ``int32``) to TVM's canonical
-            # names so ``tir.Var`` doesn't reject ``i32`` as unknown.
-            dt = _normalize_dtype(type_str) if type_str else "int32"
-            if tir_mod is not None:
-                bound = tir_mod.Var(clean, dt)
-                # Track the runtime scalar arg so ``_make_prim_func`` can
-                # append it to ``PrimFunc.params``. Triton 3.x folds
-                # ``tl.constexpr`` parameters at the TTIR stage, so anything
-                # that survives as a non-pointer block arg is an actual
-                # runtime arg (e.g. ``n_elements``). Without this MakePackedAPI
-                # rejects the Var as a free variable in the body.
-                runtime_args = getattr(ctx, "runtime_args", None)
-                if runtime_args is not None and bound not in runtime_args:
-                    runtime_args.append(bound)
-            else:
-                bound = {"_var_placeholder": True, "name": clean, "dtype": dt}
+                ctx.bind(arg, bound)
+            except Exception:
+                pass
+            ctx.value_map[ssa] = bound
 
-        # Bind under BOTH keys so:
-        #   - downstream ops looking up the Value object (real MLIR walker
-        #     case) resolve;
-        #   - tests / introspection looking up by printed SSA name string
-        #     resolve too.
-        try:
-            ctx.bind(arg, bound)
-        except Exception:
-            # Some Value objects aren't hashable across binding shapes;
-            # the string key below still gives downstream code a way in.
-            pass
-        ctx.value_map[ssa] = bound
+    # Walk body region
+    regions = _scf_regions(op)
+    if not regions:
+        return None
+    
+    # We walk the region directly.
+    body_stmt, _ = _emit_region(regions[0], ctx)
 
-    return None
+    if tir_mod is None:
+        return None
+
+    # Assemble PrimFunc
+    buffer_map: Dict[Any, Any] = {}
+    params: List[Any] = []
+    for buf_name, buf in ctx.buffers.items():
+        var = tir_mod.Var(buf_name, "handle")
+        params.append(var)
+        buffer_map[var] = buf
+
+    for var in getattr(ctx, "runtime_args", []) or []:
+        if var not in params:
+            params.append(var)
+
+    local_buffers = list(getattr(ctx, "local_buffers", []) or [])
+    if local_buffers:
+        AllocBuffer = getattr(tir_mod, "AllocBuffer", None)
+        if AllocBuffer is not None:
+            alloc_stmts = [AllocBuffer(buf) for buf in local_buffers]
+            body_stmt = tir_mod.SeqStmt(alloc_stmts + [body_stmt])
+
+    program_id_vars = list(getattr(ctx, "program_id_vars", []) or [])
+    print(f"map_tt_func: program_id_vars={program_id_vars}, type={type(program_id_vars)}")
+    if program_id_vars:
+        thread_tags = ("blockIdx.x", "blockIdx.y", "blockIdx.z")
+        for var, axis, extent in program_id_vars:
+            tag = thread_tags[axis] if 0 <= axis < len(thread_tags) else f"blockIdx.{axis}"
+            iter_var = tir_mod.IterVar(
+                (0, extent), var, tir_mod.IterVar.ThreadIndex, tag,
+            )
+            body_stmt = tir_mod.AttrStmt(iter_var, "thread_extent", extent, body_stmt)
+            if hasattr(extent, "name") and extent not in params:
+                params.append(extent)
+
+    num_warps = int(getattr(ctx, "num_warps", 4) or 4)
+    num_stages = int(getattr(ctx, "num_stages", 2) or 2)
+    threads_per_block = num_warps * 32
+    tid_var = tir_mod.Var("threadIdx_x", "int32")
+    tid_extent = tir_mod.const(threads_per_block, "int32")
+    tid_iter = tir_mod.IterVar(
+        (0, tid_extent), tid_var, tir_mod.IterVar.ThreadIndex, "threadIdx.x",
+    )
+    body_stmt = tir_mod.AttrStmt(tid_iter, "thread_extent", tid_extent, body_stmt)
+
+    sym_name = _func_sym_name(op)
+    func_name = sym_name or getattr(ctx, "kernel_name", "main")
+
+    func = tir_mod.PrimFunc(params=params, body=body_stmt, buffer_map=buffer_map)
+    func = func.with_attr("tir.noalias", True)
+    func = func.with_attr("global_symbol", func_name)
+    func = func.with_attr("num_warps", num_warps)
+    func = func.with_attr("num_stages", num_stages)
+
+    ctx.prim_func = func
+    return func
 
 
 def _parse_value_attr(value_attr: Any) -> Tuple[str, Any]:
@@ -1185,6 +1201,19 @@ def _emit_region(
     child._tmp_counter = ctx._tmp_counter
     child._tvm = ctx._tvm
     child._T = ctx._T
+
+    # Share mutable lists so inner ops surface to parent
+    if not hasattr(ctx, "program_id_vars"):
+        ctx.program_id_vars = []
+    child.program_id_vars = ctx.program_id_vars
+    if not hasattr(ctx, "local_buffers"):
+        ctx.local_buffers = []
+    child.local_buffers = ctx.local_buffers
+    if not hasattr(ctx, "runtime_args"):
+        ctx.runtime_args = []
+    child.runtime_args = ctx.runtime_args
+    child.callees = ctx.callees
+    child.callee_used = ctx.callee_used
 
     # Materialise iter_args first: each block-arg SSA value gets bound to
     # a fresh tir.Var so the body emits BufferLoad / arithmetic against it.
@@ -2028,8 +2057,8 @@ def _parse_callee_attr(op: Any) -> Optional[str]:
     if isinstance(op, dict):
         attrs = op.get("attrs") or {}
         if "callee" in attrs:
-            sym = str(attrs["callee"]).strip()
-            return sym.lstrip("@") or None
+            sym = str(attrs["callee"]).strip().strip('@"')
+            return sym.replace(".", "_") if sym else None
 
     # Path 2: real MLIR attributes.
     attrs_obj = getattr(op, "attributes", None)
@@ -2037,8 +2066,8 @@ def _parse_callee_attr(op: Any) -> Optional[str]:
         try:
             for a in attrs_obj:
                 if getattr(a, "name", None) == "callee":
-                    val = str(a.attr).strip()
-                    return val.lstrip("@") or None
+                    val = str(a.attr).strip().strip('@"')
+                    return val.replace(".", "_") if val else None
         except Exception:
             pass
 
@@ -2049,7 +2078,7 @@ def _parse_callee_attr(op: Any) -> Optional[str]:
         return None
     m = _CALLEE_RE.search(text)
     if m:
-        return m.group("sym")
+        return m.group("sym").strip('@"').replace(".", "_")
     return None
 
 
@@ -2071,10 +2100,24 @@ def _func_sym_name(func_op: Any) -> Optional[str]:
                     return raw or None
         except Exception:
             pass
-    # Fall back to the printed properties block.
-    props = _om._parse_generic_properties_shared(func_op)
-    sym = props.get("sym_name")
-    return str(sym) if sym else None
+    # Fall back to the printed property string.
+    try:
+        s = str(func_op)
+        if s.startswith("tt.func public @"):
+            idx = len("tt.func public @")
+            end = s.find("(", idx)
+            if end != -1:
+                return s[idx:end].strip()
+        import re
+        m = re.search(r'tt\.func.*?@([a-zA-Z0-9_.-]+)', s)
+        if m:
+            return m.group(1).replace(".", "_")
+        m2 = re.search(r'sym_name\s*=\s*"([^"]+)"', s)
+        if m2:
+            return m2.group(1).replace(".", "_")
+    except Exception:
+        pass
+    return None
 
 
 def _func_entry_block_ops(func_op: Any) -> List[Any]:
@@ -2253,6 +2296,7 @@ map_scf_for.owns_regions = True
 map_scf_if.owns_regions = True
 map_scf_while.owns_regions = True
 emit_tt_call.owns_regions = True
+map_tt_func.owns_regions = True
 
 
 CONTROL_EMITTERS: Dict[str, Callable[..., Any]] = {
@@ -2285,6 +2329,8 @@ CONTROL_EMITTERS: Dict[str, Callable[..., Any]] = {
     # downstream emitters can look up ``%arg0`` via ctx.get(). The walker
     # owns recursion into the body region itself.
     "tt.func": map_tt_func,
+    "tt.return": lambda op, ctx: None,
+    "ub.poison": lambda op, ctx: ctx.tir().const(0, "int32"),
     # tt.call -- inline-expand a helper tt.func at the call site.
     "tt.call": emit_tt_call,
     # scf

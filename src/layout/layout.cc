@@ -390,7 +390,7 @@ Array<PrimExpr> LayoutNode::OutputShape() const {
         }
       }
     } else {
-      ret.Set(i, ist.max());
+      ret.Set(i, analyzer.Simplify(ist.max()));
     }
   }
   return ret;

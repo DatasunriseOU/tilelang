@@ -173,7 +173,8 @@ def PreLowerSemanticCheck(mod: IRModule) -> None:
 def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     # Bind the target device information to the module
     """
-    Bind target information and progressively legalize and lower frontend Tile IR into a form suitable for downstream optimization and codegen.
+    Bind target information and progressively legalize and lower frontend Tile
+    IR into a form suitable for downstream optimization and codegen.
 
     This pass pipeline:
     - Binds the provided target to the module.
@@ -217,6 +218,9 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.LowerTileLangLetStmt()(mod)
     mod = tilelang.transform.LowerTileLangAllocate()(mod)
     mod = tir.transform.BindTarget(target)(mod)
+    from tilelang.transform.fp8_late_lower import Fp8ScaledMatmulLateLower
+
+    mod = Fp8ScaledMatmulLateLower(target)(mod)
 
     if should_force_let_inline():
         # Force-let inline whenever the pass config requests it.

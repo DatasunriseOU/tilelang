@@ -616,6 +616,12 @@ static bool IsSyncGlobalToSharedCopyLikeStmt(const Stmt &stmt, Target target) {
       copy->GetIsTmaCopy() || copy->GetIsAsyncCopy()) {
     return false;
   }
+  
+  // Producer statements must write to shared memory to be visible across warps.
+  // If the destination is not shared memory, it must be executed by the consumer.
+  if (copy->dst.scope() != "shared" && copy->dst.scope() != "shared.dyn") {
+    return false;
+  }
 
   arith::Analyzer analyzer;
   return !copy->CheckBulkLoad(target, &analyzer, /*check_last_dim=*/true);
@@ -633,16 +639,6 @@ static bool IsProducerMovableLoopPrefixStmt(const Stmt &stmt, Target target) {
       return;
     }
     if (const auto *call = node.as<CallNode>()) {
-      if (call->op.same_as(builtin::tvm_storage_sync())) {
-        const auto *scope = call->args[0].as<StringImmNode>();
-        if (!scope ||
-            (scope->value != "shared" && scope->value != "shared.dyn")) {
-          has_disallowed = true;
-          return;
-        }
-        has_allowed_work = true;
-        return;
-      }
       if (IsBarrierOrTmaControlCall(call)) {
         has_disallowed = true;
         return;

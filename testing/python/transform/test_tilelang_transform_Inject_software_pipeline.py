@@ -3,8 +3,8 @@ import tilelang as tl
 import tilelang.language as T
 from tilelang.layout import Layout
 import tilelang.testing
-import pytest
 from tvm.tir.stmt_functor import post_order_visit
+from tvm.tirx.stmt import AllocBuffer as TIRXAllocBuffer
 
 _MVB_ATTR_KEYS = frozenset(
     [
@@ -142,6 +142,23 @@ def _find_block_with_layout_map(func):
     post_order_visit(func.body, _visit)
     assert blocks, "Expected at least one block with layout_map"
     return blocks[0]
+
+
+def _find_flat_alloc_buffer_with_layout(block):
+    flat_allocs = []
+
+    def _visit(node):
+        if isinstance(node, TIRXAllocBuffer):
+            flat_allocs.append(node.buffer)
+
+    post_order_visit(block, _visit)
+    layout_map = block.annotations["layout_map"]
+    for buffer in flat_allocs:
+        if buffer.scope() == "shared.dyn" and buffer.data in layout_map:
+            return buffer
+    raise AssertionError(
+        "Expected a flat shared.dyn AllocBuffer with layout_map entry"
+    )
 
 
 def test_trival_pipeline():
@@ -478,10 +495,6 @@ def test_degenerate_pipeline_with_single_stage_is_not_expanded():
     assert "frag[2, i]" not in func.script()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="TIRX flat AllocBuffer layout_map annotations are not remapped by InjectSoftwarePipeline yet.",
-)
 def test_inject_software_pipeline_expands_annotated_layout():
     layout = Layout([8, 16], lambda i, j: i * 16 + j)
 
@@ -511,7 +524,7 @@ def test_inject_software_pipeline_expands_annotated_layout():
     mod = tl.transform.InjectSoftwarePipeline()(mod)
 
     block = _find_block_with_layout_map(mod["main"])
-    shared = next(buf for buf in block.alloc_buffers if buf.scope() == "shared.dyn")
+    shared = _find_flat_alloc_buffer_with_layout(block)
     layout_map = block.annotations["layout_map"]
 
     assert [int(dim) for dim in shared.shape] == [2, 8, 16]
