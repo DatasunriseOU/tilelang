@@ -8,9 +8,9 @@
 
 ## Group 2: Triton Frontend (Python & C++)
 - [x] Task 5: Структурный парсинг сигнатур (map_tt_func). Генератор TIR-сигнатур из аргументов функции TTIR вместо неявных эпилогов.
-- [ ] Task 6: Интеграция C++ MLIR (Integration #5). Полноценный вендоринг апстрим-диалектов Triton, удаление #ifdef в CMakeLists.txt и ptr_analysis_shim.cc.
-- [ ] Task 7: PtrAnalysis в эмиттерах памяти. Перевод map_tt_load/store в op_mapping.py на результаты PtrAnalysis.
-- [ ] Task 8: Реализация tt.split и tt.join в маппере Triton -> TileLang.
+- [x] Task 6: Интеграция C++ MLIR (Integration #5). Полноценный вендоринг апстрим-диалектов Triton, удаление #ifdef в CMakeLists.txt и ptr_analysis_shim.cc.
+- [x] Task 7: PtrAnalysis в эмиттерах памяти. Перевод map_tt_load/store в op_mapping.py на результаты PtrAnalysis.
+- [x] Task 8: Реализация tt.split и tt.join в маппере Triton -> TileLang.
 - [ ] Task 9: Реализация tt.histogram в маппере Triton -> TileLang.
 - [ ] Task 10: Реализация tt.print с %n-санитизацией в маппере Triton -> TileLang.
 - [ ] Task 11: Поддержка async-copy (cp.async) / barrier в маппере Triton.
