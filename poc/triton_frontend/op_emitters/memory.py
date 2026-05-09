@@ -1787,6 +1787,142 @@ def emit_tts_make_tptr(op: Any, ctx: WalkerCtx) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# tt.split / tt.join
+# ---------------------------------------------------------------------------
+
+
+def emit_tt_split(op: Any, ctx: WalkerCtx) -> Any:
+    """Lower tt.split to two separate buffer slices along the last dimension."""
+    tir = ctx.tir()
+    operands = _operands(op)
+    if not operands:
+        raise ValueError("tt.split: missing source operand")
+    src_ssa = operands[0]
+    src = ctx.get(src_ssa)
+    results = _results(op)
+    if not results or len(results) != 2:
+        raise ValueError("tt.split: expected 2 results")
+    
+    out_shape_0 = list(_shape_of(results[0]))
+    out_dtype_0 = _dtype_of(results[0]) or getattr(src, "dtype", "float32")
+    out_shape_1 = list(_shape_of(results[1]))
+    out_dtype_1 = _dtype_of(results[1]) or getattr(src, "dtype", "float32")
+    
+    buf0_name = ctx.fresh("split0")
+    buf1_name = ctx.fresh("split1")
+    buf0 = _alloc_tile_buffer(ctx, out_shape_0 or [1], out_dtype_0, buf0_name)
+    buf1 = _alloc_tile_buffer(ctx, out_shape_1 or [1], out_dtype_1, buf1_name)
+    
+    loop_vars = [tir.Var(ctx.fresh(f"s{i}"), "int32") for i in range(len(out_shape_0))]
+    
+    src_indices_0 = list(loop_vars) + [tir.const(0, "int32")]
+    src_indices_1 = list(loop_vars) + [tir.const(1, "int32")]
+    
+    if hasattr(src, "shape"):
+        rhs0 = tir.BufferLoad(src, src_indices_0)
+        rhs1 = tir.BufferLoad(src, src_indices_1)
+    else:
+        rhs0 = src
+        rhs1 = src
+        
+    store0 = tir.BufferStore(buf0, rhs0, list(loop_vars) or [tir.const(0, "int32")])
+    body0: Any = store0
+    for axis in range(len(loop_vars) - 1, -1, -1):
+        extent = out_shape_0[axis] if axis < len(out_shape_0) else 1
+        body0 = tir.For(
+            loop_vars[axis],
+            tir.const(0, "int32"),
+            tir.const(int(extent), "int32"),
+            tir.ForKind.SERIAL,
+            body0,
+        )
+    ctx.emit(body0)
+    
+    store1 = tir.BufferStore(buf1, rhs1, list(loop_vars) or [tir.const(0, "int32")])
+    body1: Any = store1
+    for axis in range(len(loop_vars) - 1, -1, -1):
+        extent = out_shape_1[axis] if axis < len(out_shape_1) else 1
+        body1 = tir.For(
+            loop_vars[axis],
+            tir.const(0, "int32"),
+            tir.const(int(extent), "int32"),
+            tir.ForKind.SERIAL,
+            body1,
+        )
+    ctx.emit(body1)
+    
+    ctx.bind(results[0], buf0)
+    ctx.bind(results[1], buf1)
+    
+    # Return None so Walker doesn't bind a single result
+    return None
+
+
+def emit_tt_join(op: Any, ctx: WalkerCtx) -> Any:
+    """Lower tt.join to a single buffer by combining along a new last dimension."""
+    tir = ctx.tir()
+    operands = _operands(op)
+    if len(operands) != 2:
+        raise ValueError("tt.join: expected 2 source operands")
+    src0 = ctx.get(operands[0])
+    src1 = ctx.get(operands[1])
+    
+    result_value = _results(op)[0] if _results(op) else None
+    out_shape = list(_shape_of(result_value)) if result_value is not None else []
+    out_dtype = _dtype_of(result_value) if result_value is not None else getattr(src0, "dtype", "float32")
+    
+    buf_name = ctx.fresh("join")
+    out_buf = _alloc_tile_buffer(ctx, out_shape or [2], out_dtype, buf_name)
+    
+    src_shape = out_shape[:-1] if out_shape else []
+    
+    loop_vars = [tir.Var(ctx.fresh(f"j{i}"), "int32") for i in range(len(src_shape))]
+    
+    if hasattr(src0, "shape"):
+        rhs0 = tir.BufferLoad(src0, list(loop_vars) or [tir.const(0, "int32")])
+    else:
+        rhs0 = src0
+        
+    if hasattr(src1, "shape"):
+        rhs1 = tir.BufferLoad(src1, list(loop_vars) or [tir.const(0, "int32")])
+    else:
+        rhs1 = src1
+        
+    dst_indices_0 = list(loop_vars) + [tir.const(0, "int32")]
+    dst_indices_1 = list(loop_vars) + [tir.const(1, "int32")]
+    
+    store0 = tir.BufferStore(out_buf, rhs0, dst_indices_0)
+    body0: Any = store0
+    for axis in range(len(loop_vars) - 1, -1, -1):
+        extent = src_shape[axis] if axis < len(src_shape) else 1
+        body0 = tir.For(
+            loop_vars[axis],
+            tir.const(0, "int32"),
+            tir.const(int(extent), "int32"),
+            tir.ForKind.SERIAL,
+            body0,
+        )
+    ctx.emit(body0)
+
+    store1 = tir.BufferStore(out_buf, rhs1, dst_indices_1)
+    body1: Any = store1
+    for axis in range(len(loop_vars) - 1, -1, -1):
+        extent = src_shape[axis] if axis < len(src_shape) else 1
+        body1 = tir.For(
+            loop_vars[axis],
+            tir.const(0, "int32"),
+            tir.const(int(extent), "int32"),
+            tir.ForKind.SERIAL,
+            body1,
+        )
+    ctx.emit(body1)
+    
+    if result_value is not None:
+        ctx.bind(result_value, out_buf)
+    return out_buf
+
+
+# ---------------------------------------------------------------------------
 # Dispatch table -- imported by the walker; overlays op_mapping.OP_TABLE.
 # ---------------------------------------------------------------------------
 
@@ -1800,5 +1936,7 @@ MEMORY_EMITTERS: Dict[str, Callable[..., Any]] = {
     "tt.view": emit_tt_reshape,
     "tt.reshape": emit_tt_reshape,
     "tt.addptr": emit_tt_addptr,
+    "tt.split": emit_tt_split,
+    "tt.join": emit_tt_join,
     "tts.make_tptr": emit_tts_make_tptr,
 }

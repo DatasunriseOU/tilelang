@@ -1086,6 +1086,79 @@ def test_splat_pointer_buffer_passthrough() -> None:
 
 
 # ---------------------------------------------------------------------------
+# tt.split / tt.join
+# ---------------------------------------------------------------------------
+
+
+def test_emit_tt_split() -> None:
+    """``tt.split`` on a tensor with last dimension size 2 returns two tensors."""
+    ctx = WalkerCtx()
+    src_ssa = _ssa("src", shape=[16, 2], dtype="float32")
+    src_buf = tvm.tir.decl_buffer([16, 2], "float32", name="SRC")
+    ctx.bind(src_ssa, src_buf)
+    
+    out0_ssa = _ssa("out0", shape=[16], dtype="float32")
+    out1_ssa = _ssa("out1", shape=[16], dtype="float32")
+    
+    op = {
+        "name": "tt.split",
+        "operands": [src_ssa],
+        "results": [out0_ssa, out1_ssa],
+        "attrs": {},
+    }
+    
+    # Import the function locally or access it through MEMORY_EMITTERS
+    from poc.triton_frontend.op_emitters.memory import emit_tt_split
+    result = emit_tt_split(op, ctx)
+    assert result is None, "tt.split must return None to avoid double binding"
+    
+    # Verify outputs are bound
+    out0_buf = ctx.get(out0_ssa)
+    out1_buf = ctx.get(out1_ssa)
+    assert isinstance(out0_buf, tvm.tir.Buffer)
+    assert isinstance(out1_buf, tvm.tir.Buffer)
+    assert list(out0_buf.shape) == [16]
+    assert list(out1_buf.shape) == [16]
+    
+    text = _stringify(ctx.stmts)
+    assert "for" in text.lower()
+    assert "SRC[s0, 0]" in text or "SRC" in text
+    assert "SRC[s0, 1]" in text or "SRC" in text
+
+
+def test_emit_tt_join() -> None:
+    """``tt.join`` takes two tensors and joins them along a new last dimension."""
+    ctx = WalkerCtx()
+    src0_ssa = _ssa("src0", shape=[16], dtype="float32")
+    src1_ssa = _ssa("src1", shape=[16], dtype="float32")
+    
+    src0_buf = tvm.tir.decl_buffer([16], "float32", name="A")
+    src1_buf = tvm.tir.decl_buffer([16], "float32", name="B")
+    ctx.bind(src0_ssa, src0_buf)
+    ctx.bind(src1_ssa, src1_buf)
+    
+    out_ssa = _ssa("joined", shape=[16, 2], dtype="float32")
+    
+    op = {
+        "name": "tt.join",
+        "operands": [src0_ssa, src1_ssa],
+        "results": [out_ssa],
+        "attrs": {},
+    }
+    
+    from poc.triton_frontend.op_emitters.memory import emit_tt_join
+    result = emit_tt_join(op, ctx)
+    
+    assert isinstance(result, tvm.tir.Buffer)
+    assert list(result.shape) == [16, 2]
+    
+    text = _stringify(ctx.stmts)
+    assert "for" in text.lower()
+    assert "[j0, 0]" in text or "0" in text
+    assert "[j0, 1]" in text or "1" in text
+
+
+# ---------------------------------------------------------------------------
 # Regression: matmul LOWER_FAIL (Cannot store value with 4096, expected 1)
 # ---------------------------------------------------------------------------
 
