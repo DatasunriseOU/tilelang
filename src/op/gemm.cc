@@ -206,7 +206,7 @@ std::pair<int, int> GemmWarpPolicyNode::computeWarpPartition(
     kMPerWarp = 8;
   }
   int kNPerWarp = 8; // Columns processed by a single warp
-  if (TargetIsVolta(target)) {
+  if (TargetIsVolta(target) || TargetIsTuring(target)) {
     kNPerWarp = 16;
   } else if (TargetIsCDNA(target)) {
     kNPerWarp = 16;

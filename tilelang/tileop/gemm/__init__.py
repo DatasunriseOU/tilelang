@@ -15,7 +15,7 @@ from .gemm_wmma import GemmWMMA
 from .gemm_scalar import GemmScalar
 from .gemm_metal import GemmMetal
 from tilelang import _ffi_api
-from tilelang.utils.target import target_is_volta, target_is_metal
+from tilelang.utils.target import target_is_volta, target_is_turing, target_is_metal
 
 
 @tvm_ffi.register_global_func("tl.gemm.infer_layout")
@@ -189,7 +189,7 @@ class Gemm(Node, Scriptable):
             ValueError: If the instruction type is unknown
         """
         if gemm_inst.is_mma():
-            if target_is_volta(target):
+            if target_is_volta(target) or target_is_turing(target):
                 return GemmMMASm70
             return GemmMMA
         elif gemm_inst.is_wgmma():
