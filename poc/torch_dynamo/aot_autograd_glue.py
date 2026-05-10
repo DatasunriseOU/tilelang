@@ -500,21 +500,19 @@ def register_double_backward(
 def _import_make_boxed_func() -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Lazily import ``make_boxed_func`` across PyTorch 2.10/2.11/2.12.
 
-    The canonical 2.11 path is ``functorch.compile.make_boxed_func``. PyTorch
-    2.12 also exposes it as ``torch._functorch.aot_autograd.make_boxed_func``.
-    We try both, in priority order. TODO: verify on the exact PyTorch shipped
-    with this checkout — both work as of 2026-05.
+    The canonical 2.11+ path is ``functorch.compile.make_boxed_func``. PyTorch
+    2.12+ also exposes it as ``torch._functorch.aot_autograd.make_boxed_func``.
+    We try both, in priority order. Verified on PyTorch 2.13 (both work).
     """
     try:
-        # TODO: verify — canonical 2.11+ path.
         from functorch.compile import make_boxed_func  # type: ignore[import-not-found]
         return make_boxed_func
-    except Exception:  # pragma: no cover - defensive
+    except ImportError:  # pragma: no cover - defensive
         pass
     try:
         from torch._functorch.aot_autograd import make_boxed_func  # type: ignore[import-not-found]
         return make_boxed_func
-    except Exception as exc:  # pragma: no cover - defensive
+    except ImportError as exc:  # pragma: no cover - defensive
         raise ImportError(
             "Could not import make_boxed_func from either functorch.compile "
             "or torch._functorch.aot_autograd; integration #10 requires "
@@ -764,7 +762,20 @@ def make_aot_backend(
         same FX walker — only ``ATEN_DISPATCH`` differs by op kind).
     """
     # Lazy import: module must be importable without torch.
-    from torch._dynamo.backends.common import aot_autograd  # type: ignore[import-not-found]
+    try:
+        from torch._dynamo.backends.common import aot_autograd  # type: ignore[import-not-found]
+    except ImportError:
+        try:
+            from torch._functorch.aot_autograd import aot_autograd  # type: ignore[import-not-found]
+        except ImportError:
+            try:
+                from functorch.compile import aot_autograd  # type: ignore[import-not-found]
+            except ImportError as exc:
+                raise ImportError(
+                    "Could not import aot_autograd from torch._dynamo.backends.common, "
+                    "torch._functorch.aot_autograd, or functorch.compile. "
+                    "Please verify your PyTorch version."
+                ) from exc
 
     fw = fw_compiler if fw_compiler is not None else tilelang_fw_compiler
     bw = bw_compiler if bw_compiler is not None else fw
