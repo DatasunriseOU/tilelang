@@ -178,10 +178,16 @@ def test_wave4_compile_symbolic_fallback_does_not_recurse():
         # GraphModule that breaks fx_to_tilelang import → exception in
         # compile_symbolic → fallback.
         class _BadGM:
-            class graph:
-                nodes: list = []
+            @property
+            def graph(self):
+                raise RuntimeError("forced failure")
             meta: dict = {}
 
+            # mock getattr(gm, "meta", {})
+            def __getattr__(self, name):
+                if name == "meta":
+                    return self.meta
+                raise AttributeError(name)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             out = glue.compile_symbolic(_BadGM(), [], is_backward=False)
@@ -288,6 +294,8 @@ def test_wave4_autotune_cache_is_thread_safe():
     chosen = _AUTOTUNE_CACHE[keys[0]]
     # _slow_bench keys: smaller first dim wins → (64, 64, 4) for "fa" shortlist.
     assert chosen == (64, 64, 4)
+    # The benchmark function should only be called once per candidate (3 candidates for 'fa')
+    assert len(bench_calls) == 3
 
 
 def test_wave4_artifact_carries_atomic_flag():

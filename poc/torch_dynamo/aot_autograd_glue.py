@@ -209,29 +209,27 @@ def autotune_select(
     if key in _AUTOTUNE_CACHE:
         return _AUTOTUNE_CACHE[key]
 
-    candidates = _AUTOTUNE_SHORTLIST.get(kind, _AUTOTUNE_SHORTLIST["default"])
-    if bench_fn is None:
-        chosen = candidates[0]
-    else:
-        timings = []
-        for cfg in candidates:
-            try:
-                t = bench_fn(cfg)
-            except Exception:  # pragma: no cover - tuning path is best-effort
-                t = float("inf")
-            timings.append((t, cfg))
-        timings.sort()
-        chosen = timings[0][1]
-
     with _AUTOTUNE_LOCK:
-        # Race guard: a parallel compile may have inserted ``key`` while we
-        # were benching. Honour the first writer's choice instead of
-        # overwriting; this trades a wasted bench pass for stable results.
-        existing = _AUTOTUNE_CACHE.get(key)
-        if existing is not None:
-            return existing
+        # Double check after acquiring lock
+        if key in _AUTOTUNE_CACHE:
+            return _AUTOTUNE_CACHE[key]
+
+        candidates = _AUTOTUNE_SHORTLIST.get(kind, _AUTOTUNE_SHORTLIST["default"])
+        if bench_fn is None:
+            chosen = candidates[0]
+        else:
+            timings = []
+            for cfg in candidates:
+                try:
+                    t = bench_fn(cfg)
+                except Exception:  # pragma: no cover - tuning path is best-effort
+                    t = float("inf")
+                timings.append((t, cfg))
+            timings.sort()
+            chosen = timings[0][1]
+
         _AUTOTUNE_CACHE[key] = chosen
-    return chosen
+        return chosen
 
 
 # Wave-3 #09 item 2 — autotune codegen specialisation hookup.
