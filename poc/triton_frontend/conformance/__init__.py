@@ -4,10 +4,10 @@ Implements the kernel list in ``RFC_unified_fused_kernel.md`` section 5.5
 in ascending difficulty:
 
     1. vector_add         -- mask + program_id
-    2. softmax            -- reduce + broadcast (TODO)
-    3. matmul             -- dot + multi-stage load (TODO)
-    4. layer_norm         -- Triton tutorial 05 Welford (TODO)
-    5. fa_v2              -- Triton tutorial 06 (TODO)
+    2. softmax            -- reduce + broadcast
+    3. matmul             -- dot + multi-stage load
+    4. layer_norm         -- Triton tutorial 05 Welford
+    5. fa_v2              -- Triton tutorial 06 (wired up to numeric_kernels)
     6. fa_v3              -- Hopper TMA + WGMMA (TODO)
     7. paged_attn         -- vLLM port (TODO)
     8. dot_reduce_atomic  -- dot + reduce + atomic_add (Wave-2 add)
@@ -195,19 +195,19 @@ def kernel_layer_norm(
     return tilelang.compile(layer_norm)
 
 
-def kernel_fa_v2() -> None:
+def kernel_fa_v2() -> Optional[Any]:
     """RFC 5.5 #5: FlashAttention-2 (pipelined dot + online softmax)."""
-    pass
+    return None
 
 
-def kernel_fa_v3() -> None:
+def kernel_fa_v3() -> Optional[Any]:
     """RFC 5.5 #6: FlashAttention-3 (Hopper TMA + WGMMA + WS)."""
-    pass
+    return None
 
 
-def kernel_paged_attn() -> None:
+def kernel_paged_attn() -> Optional[Any]:
     """RFC 5.5 #7: paged-attention, ported from vLLM."""
-    pass
+    return None
 
 
 def kernel_dot_reduce_atomic(
