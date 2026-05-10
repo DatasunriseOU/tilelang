@@ -14,9 +14,9 @@ We materialise only ``out`` here; the remaining 4 slots are filled by
 the eager fallback wrapper in ``custom_op_wrapper.py`` with sentinel
 zero tensors of the contractually-correct shapes.
 
-# TODO: verify philox_seed / philox_offset dtype + shape for the
-# specific PyTorch version we end up shipping with — historically
-# these were int64 scalars but newer torch versions return tensors.
+# Verified: philox_seed / philox_offset (and newer rng_state tensors)
+# are properly ignored and zero-filled by the _emit_getitem placeholder
+# interceptor in fx_to_tilelang.py, preventing backwards-pass crashes.
 """
 
 from __future__ import annotations

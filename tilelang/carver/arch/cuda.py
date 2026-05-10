@@ -70,22 +70,32 @@ ada_tensorcore_supported = [
     ("int8", "int32"),
     ("float8_e5m2", "float32"),
     ("float8_e4m3", "float32"),
+    ("float8_e4m3", "float8_e5m2", "float32"),
 ]
 hopper_tensorcore_supported = ada_tensorcore_supported
 
 
-# TODO(lei): we should consider the dtype of the input a and b
-# instead of assuming both a and b share the same dtype.
-# As the tensorcore may supports float8_e4m3 * float8_e5m2
-def is_tensorcore_supported_precision(in_dtype: str, accum_dtype: str, arch: TileDevice) -> bool:
+def check_supported_precision(supported_list: list, in_dtype_a: str, in_dtype_b: str, accum_dtype: str) -> bool:
+    for item in supported_list:
+        if len(item) == 2:
+            if item[0] == in_dtype_a and item[0] == in_dtype_b and item[1] == accum_dtype:
+                return True
+        elif len(item) == 3:
+            if item[0] == in_dtype_a and item[1] == in_dtype_b and item[2] == accum_dtype:
+                return True
+            if item[1] == in_dtype_a and item[0] == in_dtype_b and item[2] == accum_dtype:
+                return True
+    return False
+
+def is_tensorcore_supported_precision(in_dtype_a: str, in_dtype_b: str, accum_dtype: str, arch: TileDevice) -> bool:
     if is_volta_arch(arch):
-        return (in_dtype, accum_dtype) in volta_tensorcore_supported
+        return check_supported_precision(volta_tensorcore_supported, in_dtype_a, in_dtype_b, accum_dtype)
     elif is_ampere_arch(arch):
-        return (in_dtype, accum_dtype) in ampere_tensorcore_supported
+        return check_supported_precision(ampere_tensorcore_supported, in_dtype_a, in_dtype_b, accum_dtype)
     elif is_ada_arch(arch):
-        return (in_dtype, accum_dtype) in ada_tensorcore_supported
+        return check_supported_precision(ada_tensorcore_supported, in_dtype_a, in_dtype_b, accum_dtype)
     elif is_hopper_arch(arch):
-        return (in_dtype, accum_dtype) in hopper_tensorcore_supported
+        return check_supported_precision(hopper_tensorcore_supported, in_dtype_a, in_dtype_b, accum_dtype)
     else:
         raise ValueError(f"Unsupported architecture: {arch}")
 
@@ -113,7 +123,8 @@ class CUDA(TileDevice):
         self.name = cuda_driver.get_device_name()
         self.device: tvm.runtime.Device = device
         self.platform: str = "CUDA"
-        # TODO(lei): maybe static shared memory, can be improved in future
+        # cuda_driver.get_shared_memory_per_block() returns the dynamic shared memory capacity.
+        # Static shared memory limit is typically 48KB (49152 bytes) without opt-in.
         self.smem_cap = cuda_driver.get_shared_memory_per_block()
         self.compute_max_core = device.multi_processor_count
         self.warp_size = device.warp_size
@@ -125,13 +136,36 @@ class CUDA(TileDevice):
         # the number of transaction size in bytes
         self.transaction_size: list[int] = [32, 128]  # in bytes
         # bandwidth in MB/s, will be used for recommend basic tile size
-        # TODO(lei): find some way to get the real bandwidth
-        # However, the ratio of bandwidth between different devices can
-        # be similar. The bandwidth can work for another devices as well.
-        self.bandwidth: list[int] = [750, 12080]
+        # Heuristic bandwidth mapping for common architectures
+        bandwidth_map = {
+            70: [750, 900000],   # Volta V100: ~900 GB/s
+            80: [750, 1555000],  # Ampere A100: ~1555 GB/s
+            86: [750, 760000],   # Ampere RTX 3090: ~760 GB/s
+            89: [750, 1008000],  # Ada RTX 4090: ~1008 GB/s
+            90: [750, 3350000],  # Hopper H100: ~3350 GB/s
+        }
+        self.bandwidth: list[int] = bandwidth_map.get(self.sm_version, [750, 12080])
         # get the available tensor instructions during runtime to avoid
         # the dependency of the tensor intrinsics registration
         self.available_tensor_instructions: list[TensorInstruction] = None
+
+    def get_max_math_throughput(self, dtype: str = "float16") -> float:
+        """
+        Returns a heuristic for the maximum math throughput based on the architecture and dtype.
+        For example, INT8 is typically 2x faster than FP16 on Tensor Cores.
+        """
+        base_cores = self.compute_max_core
+        if dtype in ["int8", "uint8"]:
+            return base_cores * 2.0
+        elif dtype in ["int4", "uint4"]:
+            return base_cores * 4.0
+        elif dtype in ["float8_e4m3", "float8_e5m2"]:
+            # On Hopper/Ada, FP8 is 2x faster than FP16
+            if self.sm_version >= 89:
+                return base_cores * 2.0
+            return base_cores * 1.0
+        else:
+            return base_cores * 1.0
 
     def get_avaliable_tensorintrin_shapes(self):
         self.available_tensor_instructions = (

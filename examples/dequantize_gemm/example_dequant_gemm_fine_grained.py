@@ -267,8 +267,6 @@ def tl_matmul_with_ladder_weight_only_transform_block_reduce_int4(
                     vk = rk * (block_K // reduce_k) + k
                     A_shared[i, vk] = A[by * block_M + i, ko * block_K + vk]
 
-                # TODO(lei): Layout Inference Pass is not efficient to handle the four dims int8 load
-                # Fixed by Z3 vectorization alignment proof
                 T.copy(B[bx * (block_N // micro_size_y) : bx * (block_N // micro_size_y) + block_N // micro_size_y,
                          ko * (block_K // micro_size_k) : ko * (block_K // micro_size_k) + block_K // micro_size_k,
                          0 : micro_size_y,

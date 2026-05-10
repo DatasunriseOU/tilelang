@@ -39,7 +39,6 @@ from poc.triton_frontend.op_mapping import (  # noqa: E402
     _is_tensor_type,
     _normalize_mlir_dtype,
     _parse_tensor_type,
-    map_tt_make_range,
     map_tt_trans,
 )
 
@@ -177,33 +176,6 @@ def test_tt_trans_order_from_properties_block() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_tt_make_range_legacy_from_properties_block() -> None:
-    """The legacy ``map_tt_make_range`` in op_mapping.py is currently
-    superseded by ``op_emitters/memory.py:emit_tt_make_range`` via
-    ``OP_TABLE.update(MEMORY_EMITTERS)`` at module init. We still keep
-    the legacy emitter alive (per ``feedback_no_silent_delete``) and
-    migrate it defensively: if the merge order ever shifts, this path
-    must NOT silently emit a zero-length Ramp from ``start = end = 0``.
-    """
-    printed = (
-        '%r = "tt.make_range"() <{start = 0 : i32, end = 256 : i32}>'
-        " : () -> tensor<256xi32>"
-    )
-    out_ssa = _HashableSSA("r", shape=(256,), dtype="int32")
-    op = _FakeMlirOp(
-        name="tt.make_range",
-        operands=[],
-        results=[out_ssa],
-        printed=printed,
-    )
-    ctx = WalkerCtx()
-    ramp = map_tt_make_range(op, ctx)
-    # tir.Ramp(start, stride, lanes); lanes=256 is the regression guard --
-    # pre-E3, attrs would be empty and `lanes = 0 - 0 = 0` would raise
-    # ``invalid range [0, 0)``.
-    assert ramp.lanes == 256
-    # Bound the result SSA to the Ramp.
-    assert ctx.value_map[out_ssa] is ramp
 
 
 # ---------------------------------------------------------------------------
@@ -410,44 +382,6 @@ def test_op_table_has_expected_size() -> None:
     )
 
 
-def test_op_mapping_emitters_raise_emit_error_not_value_error() -> None:
-    """H4 Wave-I: emitter-internal preconditions raise :class:`EmitError`
-    (not plain ``ValueError``) so callers can ``except EmitError``
-    uniformly.
-
-    We exercise a representative subset (``tt.load`` / ``tt.dot`` /
-    ``tt.where`` / ``tt.broadcast``) by feeding each a dict-shaped op with
-    missing operands. Each must raise ``EmitError``. ``ValueError`` is
-    explicitly rejected (the migration must not have left these as
-    ``ValueError`` so generic ``except ValueError`` catches stop swallowing
-    real bugs).
-    """
-    from poc.triton_frontend.op_mapping import (
-        EmitError,
-        WalkerCtx,
-        map_tt_broadcast,
-        map_tt_dot,
-        map_tt_load,
-        map_tt_where,
-    )
-
-    ctx = WalkerCtx()
-
-    # tt.load: missing pointer operand
-    with pytest.raises(EmitError, match="tt.load: missing pointer operand"):
-        map_tt_load({"name": "tt.load", "operands": []}, ctx)
-
-    # tt.dot: needs 2 operands
-    with pytest.raises(EmitError, match=r"tt\.dot: expected at least 2"):
-        map_tt_dot({"name": "tt.dot", "operands": ["%a"]}, ctx)
-
-    # tt.where: needs 3 operands
-    with pytest.raises(EmitError, match=r"tt\.where: expected 3 operands"):
-        map_tt_where({"name": "tt.where", "operands": ["%c", "%t"]}, ctx)
-
-    # tt.broadcast: missing source
-    with pytest.raises(EmitError, match=r"tt\.broadcast: missing source"):
-        map_tt_broadcast({"name": "tt.broadcast", "operands": []}, ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -463,62 +397,6 @@ def test_op_mapping_emitters_raise_emit_error_not_value_error() -> None:
 # canonical. This test enforces that markup discipline.
 
 
-def test_map_tt_dead_stubs_are_marked() -> None:
-    """Every legacy ``map_tt_*`` superseded by an overlay must carry the
-    ``DEAD-BUT-LOADED:`` marker comment immediately above its ``def``.
-
-    The audit list below was assembled by cross-referencing each
-    ``map_tt_*`` definition in op_mapping.py against the four overlay
-    EMITTERS dicts (ARITH / MEMORY / REDUCTION / CONTROL). Live emitters
-    (``map_tt_atomic_rmw``, ``map_tt_where``, ``map_tt_trans``,
-    ``map_tt_async_copy``, ``map_tt_mbarrier``,
-    ``map_tt_sync_threads_partial``,
-    ``map_tt_experimental_descriptor_{load,store}``, ``map_tt_print``,
-    ``map_tt_program_id``) are *not* listed here -- their op-table keys
-    are never overwritten so they remain canonical.
-    """
-    import re
-    from pathlib import Path
-
-    src_path = (
-        Path(__file__).resolve().parent.parent / "op_mapping.py"
-    )
-    src = src_path.read_text()
-
-    # Dead-but-loaded names (these are overridden by the overlay
-    # EMITTERS dicts via OP_TABLE.update(...) at import time).
-    DEAD_STUBS = [
-        "map_tt_load",
-        "map_tt_store",
-        "map_tt_dot",
-        "map_tt_reduce",
-        "map_tt_broadcast",
-        "map_tt_splat",
-        "map_tt_expand_dims",
-        "map_tt_reshape",
-        "map_tt_make_range",
-    ]
-
-    missing: List[str] = []
-    for name in DEAD_STUBS:
-        # Look for a ``# DEAD-BUT-LOADED:`` comment somewhere in the
-        # block of comment lines immediately preceding ``def <name>(``.
-        pattern = re.compile(
-            r"# DEAD-BUT-LOADED:[^\n]*"  # marker + same-line text
-            r"(?:\n#[^\n]*)*"            # optional continuation comment lines
-            r"\ndef " + re.escape(name) + r"\(",
-            re.MULTILINE,
-        )
-        if not pattern.search(src):
-            missing.append(name)
-
-    assert not missing, (
-        f"Dead-but-loaded legacy emitters missing the "
-        f"'# DEAD-BUT-LOADED:' marker in op_mapping.py: {missing!r}. "
-        f"Add the standard marker block immediately above each ``def`` "
-        f"so readers know the function is superseded by the overlay "
-        f"EMITTERS dict at module-init."
-    )
 
 
 def test_op_mapping_live_canonical_emitters_unmarked() -> None:

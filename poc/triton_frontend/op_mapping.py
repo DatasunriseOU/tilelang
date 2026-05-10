@@ -47,20 +47,11 @@ __all__ = [
     "EmitFn",
     "WalkerCtx",
     # Memory ops
-    "map_tt_load",
-    "map_tt_store",
     "map_tt_atomic_rmw",
     # Compute ops
-    "map_tt_dot",
-    "map_tt_reduce",
     "map_tt_where",
     # Shape ops
-    "map_tt_broadcast",
-    "map_tt_splat",
-    "map_tt_expand_dims",
-    "map_tt_reshape",
     "map_tt_trans",
-    "map_tt_make_range",
     # Async / barrier
     "map_tt_async_copy",
     "map_tt_mbarrier",
@@ -989,215 +980,8 @@ def _emit_store_copy(op: Any, ctx: "WalkerCtx", resolved: Dict[str, Any],
 # ---------------------------------------------------------------------------
 
 
-# TODO(memory-emitters): the legacy stubs map_tt_load / map_tt_store and
-# their shape-op siblings (map_tt_make_range / map_tt_broadcast /
-# map_tt_splat / map_tt_expand_dims / map_tt_reshape) have a richer
-# replacement in ``poc.triton_frontend.op_emitters.memory.MEMORY_EMITTERS``
-# that honors the "never silent-fallback" rule: when PtrAnalysis is
-# unavailable for a multi-element tile they emit a ``# DEGRADED:``
-# pragma_comment AttrStmt that survives PrimFunc pretty-print. Per the
-# ``feedback_no_silent_delete`` policy we keep these stubs live until the
-# walker is rewired through the new overlay.
-# DEAD-BUT-LOADED: superseded by op_emitters/memory.py:emit_tt_load via
-# OP_TABLE.update(MEMORY_EMITTERS). Per feedback_no_silent_delete: kept here
-# until the migration is verified end-to-end across all kernels. Drop in
-# a future cleanup wave when no caller depends on the legacy shape.
-def map_tt_load(op: Any, ctx: WalkerCtx) -> Any:
-    """Lower ``tt.load(ptr, mask, other)`` to a guarded ``BufferLoad``.
-
-    RFC section 5.1: ``T.copy`` + masked predicate via ``T.if_then_else``.
-    Triton-shared precedent: ``LoadOpConversion`` lowers to
-    ``memref.load`` with an ``scf.if`` mask guard. We emit the equivalent
-    in TIR: when a mask is present, wrap each lane in ``if_then_else``
-    using the optional ``other`` value (default 0) for the false branch.
-
-    Implementation summary
-    ----------------------
-    * ``ptr`` SSA must be the result of pointer-arithmetic that
-      ``ptr_analysis`` has already resolved into a ``StridedLayout``;
-      that layout's ``base`` buffer + element offset becomes the
-      ``BufferLoad`` index.
-    * ``mask`` (optional) is an i1 tile from ``tt.cmp`` etc.
-    * ``other`` (optional) is the dtype-typed fill for masked-out lanes.
-
-    The emitter binds the load's SSA result to a ``BufferLoad`` PrimExpr
-    so consumers (arith ops, ``tt.store``) can reference it directly.
-    """
-    tir = ctx.tir()
-    operands = _operands(op)
-    if len(operands) < 1:
-        raise EmitError("tt.load: missing pointer operand")
-    ptr_ssa = operands[0]
-    mask_ssa = operands[1] if len(operands) >= 2 else None
-    other_ssa = operands[2] if len(operands) >= 3 else None
-
-    # ptr_analysis has already populated value_map[ptr_ssa] with either:
-    #  * a tagged ``{"_ptrstate": ..., "sizes": [...], ...}`` dict carrying
-    #    a multi-element PtrState (preferred -- enables T.copy on a buffer
-    #    region instead of a scalar BufferLoad), or
-    #  * a legacy ``(buffer, indices)`` tuple (kept for callers that haven't
-    #    migrated), or
-    #  * an opaque value used as the buffer with offset 0 (MVP path).
-    resolved = ctx.get(ptr_ssa) if ptr_ssa in ctx.value_map else None
-
-    if (resolved is None or not (isinstance(resolved, dict) and "_ptrstate" in resolved)):
-        from .op_emitters.memory import _lookup_ptr_state
-        state = _lookup_ptr_state(ctx, op, ptr_ssa)
-        if state is not None:
-            resolved = {
-                "_ptrstate": state,
-                "source": state.source,
-                "offsets": list(state.offsets),
-                "sizes": list(state.sizes),
-                "strides": list(state.strides),
-            }
-
-    # Tile path: PtrState describes >1 element along at least one axis -> T.copy.
-    if isinstance(resolved, dict) and "_ptrstate" in resolved and _ptrstate_is_tile(resolved):
-        return _emit_load_copy(op, ctx, resolved, mask_ssa, other_ssa)
-
-    if isinstance(resolved, tuple) and len(resolved) == 2:
-        buf, indices = resolved
-    elif isinstance(resolved, dict) and "_ptrstate" in resolved:
-        # PtrState present but trivial (scalar) -> fall through to BufferLoad
-        # using the printed source name as the buffer placeholder.
-        result = _results(op)[0] if _results(op) else None
-        out_dtype = _dtype_of(result) if result is not None else "float32"
-        buf_name = resolved.get("source") or ctx.fresh("buf")
-        if buf_name not in ctx.buffers:
-            ctx.buffers[buf_name] = tir.decl_buffer(
-                shape=[1024], dtype=out_dtype, name=buf_name
-            )
-        buf, indices = ctx.buffers[buf_name], _ptrstate_offsets_or_zero(resolved)
-    elif resolved is not None:
-        # MVP: treat the SSA value itself as the buffer with offset 0.
-        buf, indices = resolved, [0]
-    else:
-        # Fallback path used when PtrAnalysis hasn't run yet (e.g. unit
-        # tests with dict-shaped fakes): seed a placeholder buffer so the
-        # walker can keep going. The shape/dtype come from the result type
-        # when available; otherwise we fall back to a flat 1024xfp32 buf.
-        # The placeholder is NOT a real PrimFunc parameter -- it's a
-        # local-scope tile buffer (see ``_alloc_tile_buffer``) so the
-        # downstream ``BufferLoad`` survives ``VerifyMemory``.  When
-        # PtrAnalysis seeds a real PtrState the earlier branches handle
-        # it; this fallback is the no-shim / unit-test path.
-        # TODO: replace with PtrAnalysis-derived (buffer, indices).
-        result = _results(op)[0] if _results(op) else None
-        out_shape = list(_shape_of(result)) if result is not None else [1024]
-        out_dtype = _dtype_of(result) if result is not None else "float32"
-        buf_name = (
-            getattr(ptr_ssa, "name", None)
-            or (ptr_ssa.get("name") if isinstance(ptr_ssa, dict) else None)
-            or ctx.fresh("buf")
-        )
-        if buf_name not in ctx.buffers:
-            buf = _alloc_tile_buffer(
-                ctx, out_shape or [1024], out_dtype, buf_name
-            )
-        else:
-            buf = ctx.buffers[buf_name]
-        indices = [0]
-
-    # Prefer high-level T.copy when consumers can use it (RFC 5.1: keep the
-    # frontend on the high-level surface so LayoutInference / LowerTileOp
-    # apply uniformly). For the MVP scalar path we still emit BufferLoad
-    # because T.copy expects buffer regions, not scalar elements.
-    load_expr = tir.BufferLoad(buf, list(indices))
-
-    if mask_ssa is not None:
-        mask_expr = ctx.get(mask_ssa)
-        if other_ssa is not None:
-            other_expr = ctx.get(other_ssa)
-        else:
-            # Default ``other`` is 0 in Triton semantics.
-            dtype = _dtype_of(_results(op)[0]) if _results(op) else "float32"
-            other_expr = tir.const(0, dtype)
-        load_expr = tir.if_then_else(mask_expr, load_expr, other_expr)
-
-    if _results(op):
-        ctx.bind(_results(op)[0], load_expr)
-    return load_expr
 
 
-# DEAD-BUT-LOADED: superseded by op_emitters/memory.py:emit_tt_store via
-# OP_TABLE.update(MEMORY_EMITTERS). Per feedback_no_silent_delete: kept here
-# until the migration is verified end-to-end across all kernels. Drop in
-# a future cleanup wave when no caller depends on the legacy shape.
-def map_tt_store(op: Any, ctx: WalkerCtx) -> Any:
-    """Lower ``tt.store(ptr, val, mask)`` to a guarded ``BufferStore``.
-
-    RFC section 5.1: ``T.copy`` + masked predicate. We emit a
-    ``BufferStore`` directly into the resolved buffer, optionally wrapped
-    in an ``IfThenElse`` when ``mask`` is present. The downstream
-    ``LowerTileOp`` / ``MergeIfStmt`` passes coalesce these into
-    vectorized writes.
-    """
-    tir = ctx.tir()
-    operands = _operands(op)
-    if len(operands) < 2:
-        raise EmitError("tt.store: missing pointer or value operand")
-    ptr_ssa, val_ssa = operands[0], operands[1]
-    mask_ssa = operands[2] if len(operands) >= 3 else None
-
-    resolved = ctx.get(ptr_ssa) if ptr_ssa in ctx.value_map else None
-    val_expr = ctx.get(val_ssa)
-
-    if (resolved is None or not (isinstance(resolved, dict) and "_ptrstate" in resolved)):
-        from .op_emitters.memory import _lookup_ptr_state
-        state = _lookup_ptr_state(ctx, op, ptr_ssa)
-        if state is not None:
-            resolved = {
-                "_ptrstate": state,
-                "source": state.source,
-                "offsets": list(state.offsets),
-                "sizes": list(state.sizes),
-                "strides": list(state.strides),
-            }
-
-    # Tile path: PtrState describes >1 element along at least one axis -> T.copy.
-    if isinstance(resolved, dict) and "_ptrstate" in resolved and _ptrstate_is_tile(resolved):
-        return _emit_store_copy(op, ctx, resolved, val_expr, mask_ssa)
-
-    if isinstance(resolved, tuple) and len(resolved) == 2:
-        buf, indices = resolved
-    elif isinstance(resolved, dict) and "_ptrstate" in resolved:
-        out_dtype = _dtype_of(val_ssa) or "float32"
-        buf_name = resolved.get("source") or ctx.fresh("buf")
-        if buf_name not in ctx.buffers:
-            ctx.buffers[buf_name] = tir.decl_buffer(
-                shape=[1024], dtype=out_dtype, name=buf_name
-            )
-        buf, indices = ctx.buffers[buf_name], _ptrstate_offsets_or_zero(resolved)
-    elif resolved is not None:
-        buf, indices = resolved, [0]
-    else:
-        # Same placeholder-seed path as map_tt_load; see notes there.
-        # The placeholder is a tile-local buffer rather than a PrimFunc
-        # parameter so VerifyMemory's host-memory check skips it.
-        # TODO: replace with PtrAnalysis-derived (buffer, indices).
-        out_shape = list(_shape_of(val_ssa))
-        out_dtype = _dtype_of(val_ssa)
-        buf_name = (
-            getattr(ptr_ssa, "name", None)
-            or (ptr_ssa.get("name") if isinstance(ptr_ssa, dict) else None)
-            or ctx.fresh("buf")
-        )
-        if buf_name not in ctx.buffers:
-            buf = _alloc_tile_buffer(
-                ctx, out_shape or [1024], out_dtype or "float32", buf_name
-            )
-        else:
-            buf = ctx.buffers[buf_name]
-        indices = [0]
-
-    store_stmt = tir.BufferStore(buf, val_expr, list(indices))
-    if mask_ssa is not None:
-        mask_expr = ctx.get(mask_ssa)
-        store_stmt = tir.IfThenElse(mask_expr, store_stmt, None)
-
-    ctx.emit(store_stmt)
-    return store_stmt
 
 
 def _atomic_rmw_kind(op: Any) -> str:
@@ -1360,77 +1144,6 @@ def map_tt_atomic_rmw(op: Any, ctx: WalkerCtx) -> Any:
 # ---------------------------------------------------------------------------
 
 
-# DEAD-BUT-LOADED: superseded by op_emitters/reduction.py:map_tt_dot via
-# OP_TABLE.update(REDUCTION_EMITTERS). Per feedback_no_silent_delete: kept
-# here until the migration is verified end-to-end across all kernels. Drop
-# in a future cleanup wave when no caller depends on the legacy shape.
-def map_tt_dot(op: Any, ctx: WalkerCtx) -> Any:
-    """Lower ``tt.dot(a, b, c)`` to ``T.gemm(A, B, C)``.
-
-    Recipe (RFC 5.1):
-    * Operands a, b must be tiles already in ``shared`` or ``fragment``
-      scope (PtrAnalysis + LayoutInference will hoist them); accumulator
-      ``c`` lives in ``fragment``. If ``c`` is missing (Triton allows it)
-      we allocate a fresh fragment buffer at the result's shape/dtype.
-    * Emit ``tilelang.language.gemm(A, B, C)``; LayoutInference picks
-      WMMA / WGMMA / MFMA / SIMDgroup per target.
-    * The result SSA binds the in-place accumulator buffer ``C`` (gemm
-      reads-modifies-writes); downstream ops see ``C`` as the value.
-    * Triton fp16 inputs accumulate to fp32 by convention; we honour the
-      result's TTIR dtype (the frontend type-checker has set it).
-    """
-    operands = _operands(op)
-    if len(operands) < 2:
-        raise EmitError("tt.dot: expected at least 2 operands (A, B)")
-    a_ssa, b_ssa = operands[0], operands[1]
-    c_ssa = operands[2] if len(operands) >= 3 else None
-
-    a = ctx.get(a_ssa)
-    b = ctx.get(b_ssa)
-
-    # Wave E3: ``transpose_A``/``transpose_B`` (and the lowered ``trans_a``/
-    # ``trans_b`` aliases plus ``out_dtype``) are Triton 3.6 inherent attrs
-    # stored as Properties. Use the shared helper so jaxlib's empty
-    # op.attributes path doesn't silently treat the dot as un-transposed.
-    attrs = _attrs_with_properties_shared(op)
-    transpose_A = bool(attrs.get("transpose_A", False) or attrs.get("trans_a", False))
-    transpose_B = bool(attrs.get("transpose_B", False) or attrs.get("trans_b", False))
-
-    # Fold an intervening tt.trans (recorded by map_tt_trans) into the
-    # transpose flags. dsa_splitk and sparse_mla_path_c emit
-    # ``%bt = tt.trans %b ; %c = tt.dot %a, %bt`` rather than a single
-    # tt.dot with a transpose_B attribute; without folding we'd materialise
-    # an unnecessary copy.
-    if a_ssa in ctx.transposed_views:
-        transpose_A = not transpose_A
-    if b_ssa in ctx.transposed_views:
-        transpose_B = not transpose_B
-
-    import tilelang.language as T  # type: ignore  # lazy
-    if c_ssa is not None:
-        try:
-            c = ctx.get(c_ssa)
-        except KeyError:
-            c = None
-    else:
-        c = None
-    if c is None:
-        # Allocate a fresh fp32 accumulator at the result's shape (Triton
-        # default: fp16 inputs accumulate to fp32).
-        result = _results(op)[0] if _results(op) else None
-        out_shape = list(_shape_of(result)) if result is not None else []
-        out_dtype = _dtype_of(result) if result is not None else "float32"
-        # Triton TTIR convention: fp16 -> fp32 accumulation.
-        if out_dtype in {"float16", "f16", "bfloat16", "bf16"}:
-            out_dtype = "float32"
-        c = T.alloc_fragment(out_shape, out_dtype)
-
-    handle = T.gemm(a, b, c, transpose_A=transpose_A, transpose_B=transpose_B)
-    ctx.emit(handle)
-    if _results(op):
-        # Bind the result SSA to the accumulator buffer (in-place semantics).
-        ctx.bind(_results(op)[0], c)
-    return handle
 
 
 def _reduce_combiner_kind(op: Any) -> str:
@@ -1471,85 +1184,6 @@ def _reduce_combiner_kind(op: Any) -> str:
     raise EmitError("tt.reduce: cannot determine combiner kind from op")
 
 
-# DEAD-BUT-LOADED: superseded by op_emitters/reduction.py:map_tt_reduce via
-# OP_TABLE.update(REDUCTION_EMITTERS). Per feedback_no_silent_delete: kept
-# here until the migration is verified end-to-end across all kernels. Drop
-# in a future cleanup wave when no caller depends on the legacy shape.
-def map_tt_reduce(op: Any, ctx: WalkerCtx) -> Any:
-    """Lower ``tt.reduce`` to ``T.reduce_sum`` / ``T.reduce_max`` / etc.
-
-    Recipe (RFC 5.1):
-    * Inspect the reduce op's combiner region: addf -> reduce_sum,
-      maxnumf -> reduce_max, minnumf -> reduce_min, mulf -> reduce_prod
-      (we currently fall back to a sum-of-logs note for ``mul``; see
-      ``# TODO: verify`` below).
-    * Allocate a fragment buffer for the result via ``T.alloc_fragment``;
-      if the producer is shared, downstream LayoutInference will pick.
-    * Emit ``tilelang.language.reduce_<op>(src, dst, axis)`` with the
-      MLIR ``axis`` attribute; cross-warp axes will further lower to
-      ``LowerThreadAllreduce``.
-    * Bind the reducer's destination buffer as the result SSA.
-    """
-    operands = _operands(op)
-    if not operands:
-        raise EmitError("tt.reduce: missing source operand")
-    src_ssa = operands[0]
-    src = ctx.get(src_ssa)
-
-    # Wave E3: ``axis`` is a Triton 3.6 inherent (Properties) attr; the
-    # shared helper falls back to parsing ``<{axis = N : i32}>`` from the
-    # printed op text when jaxlib's op.attributes view is empty. Without
-    # this, every reduce silently collapses on axis=-1 (last axis).
-    attrs = _attrs_with_properties_shared(op)
-    axis = int(attrs.get("axis", -1))
-    kind = _reduce_combiner_kind(op)
-
-    import tilelang.language as T  # type: ignore  # lazy
-
-    result_value = _results(op)[0] if _results(op) else None
-    src_shape = list(_shape_of(operands[0])) or list(getattr(src, "shape", []) or [])
-    if src_shape:
-        ax = axis if axis >= 0 else len(src_shape) + axis
-        out_shape = src_shape[:ax] + src_shape[ax + 1:]
-    else:
-        out_shape = list(_shape_of(result_value)) if result_value is not None else []
-    out_dtype = _dtype_of(result_value) if result_value is not None else _dtype_of(operands[0])
-    dst = T.alloc_fragment(out_shape or [1], out_dtype)
-
-    if kind == "add":
-        T.reduce_sum(src, dst, dim=axis, clear=True)
-    elif kind == "max":
-        T.reduce_max(src, dst, dim=axis, clear=True)
-    elif kind == "min":
-        T.reduce_min(src, dst, dim=axis, clear=True)
-    elif kind == "mul":
-        # Prefer the dedicated reduce_prod primitive (Wave-2 add); only
-        # fall back to exp(reduce_sum(log(src))) when the backend reports
-        # the "mul" reduction kind unimplemented or when callers force the
-        # log/exp path for cross-backend numerical comparison.
-        if not _USE_LOGEXP_PROD and hasattr(T, "reduce_prod"):
-            T.reduce_prod(src, dst, dim=axis, clear=True)
-        else:
-            if hasattr(T, "log"):
-                log_src = T.log(src)
-            else:
-                tir = ctx.tir()
-                log_src = tir.call_intrin(out_dtype, "tir.log", src)
-            T.reduce_sum(log_src, dst, dim=axis, clear=True)
-            if hasattr(T, "exp"):
-                T.copy(T.exp(dst), dst)
-            else:
-                tir = ctx.tir()
-                ctx.emit(tir.call_intrin(out_dtype, "tir.exp", dst))
-    else:
-        raise NotImplementedError(
-            f"tt.reduce: unsupported combiner kind {kind!r}; "
-            f"add wiring in op_mapping._reduce_combiner_kind."
-        )
-
-    if result_value is not None:
-        ctx.bind(result_value, dst)
-    return dst
 
 
 def map_tt_where(op: Any, ctx: WalkerCtx) -> Any:
@@ -1572,99 +1206,12 @@ def map_tt_where(op: Any, ctx: WalkerCtx) -> Any:
 # ---------------------------------------------------------------------------
 
 
-# DEAD-BUT-LOADED: superseded by op_emitters/memory.py:emit_tt_broadcast via
-# OP_TABLE.update(MEMORY_EMITTERS). Per feedback_no_silent_delete: kept here
-# until the migration is verified end-to-end across all kernels. Drop in
-# a future cleanup wave when no caller depends on the legacy shape.
-def map_tt_broadcast(op: Any, ctx: WalkerCtx) -> Any:
-    """Lower ``tt.broadcast`` to a shape-only rebind.
-
-    Triton ``tt.broadcast`` is purely a logical reshape that replicates
-    a singleton dim. In our TIR-level abstraction (where tiles are
-    represented as PrimExpr trees indexed lazily) we record the new
-    shape on the SSA binding and let LayoutInference / FlattenBuffer
-    resolve the physical replication. The PrimExpr itself is unchanged.
-    """
-    operands = _operands(op)
-    if not operands:
-        raise EmitError("tt.broadcast: missing source operand")
-    src = ctx.get(operands[0])
-    if _results(op):
-        ctx.bind(_results(op)[0], src)
-    return src
 
 
-# DEAD-BUT-LOADED: superseded by op_emitters/memory.py:emit_tt_splat via
-# OP_TABLE.update(MEMORY_EMITTERS). Per feedback_no_silent_delete: kept here
-# until the migration is verified end-to-end across all kernels. Drop in
-# a future cleanup wave when no caller depends on the legacy shape.
-def map_tt_splat(op: Any, ctx: WalkerCtx) -> Any:
-    """Lower ``tt.splat`` (scalar -> tile) by binding the scalar PrimExpr.
-
-    Like ``tt.broadcast``, splat is a logical-only op at the TIR layer:
-    indexing the resulting tile with any indices yields the same scalar.
-    LayoutInference replicates as needed at lowering time.
-    """
-    operands = _operands(op)
-    if not operands:
-        raise EmitError("tt.splat: missing source operand")
-    src = ctx.get(operands[0])
-    if _results(op):
-        ctx.bind(_results(op)[0], src)
-    return src
 
 
-# DEAD-BUT-LOADED: superseded by op_emitters/memory.py:emit_tt_expand_dims via
-# OP_TABLE.update(MEMORY_EMITTERS). Per feedback_no_silent_delete: kept here
-# until the migration is verified end-to-end across all kernels. Drop in
-# a future cleanup wave when no caller depends on the legacy shape.
-def map_tt_expand_dims(op: Any, ctx: WalkerCtx) -> Any:
-    """Lower ``tt.expand_dims`` to a shape rebind (no data movement).
-
-    The ``axis`` attribute is recorded but not materialized: TileLang's
-    PrimExpr indexing carries the rank implicitly and downstream passes
-    canonicalize.
-    """
-    operands = _operands(op)
-    if not operands:
-        raise EmitError("tt.expand_dims: missing source operand")
-    src = ctx.get(operands[0])
-    if _results(op):
-        ctx.bind(_results(op)[0], src)
-    return src
 
 
-# DEAD-BUT-LOADED: superseded by op_emitters/memory.py:emit_tt_reshape via
-# OP_TABLE.update(MEMORY_EMITTERS) (registered for both ``tt.reshape`` and
-# ``tt.view``). Per feedback_no_silent_delete: kept here until the
-# migration is verified end-to-end across all kernels. Drop in a future
-# cleanup wave when no caller depends on the legacy shape.
-def map_tt_reshape(op: Any, ctx: WalkerCtx) -> Any:
-    """Lower ``tt.reshape`` to a TileLang ``view`` over the source.
-
-    For elementwise / Tier-1 kernels the reshape is always rank-only and
-    can be modeled as a no-op rebind in PrimExpr space; for true
-    physical reshapes we fall back to ``tilelang.language.view`` /
-    ``tilelang.language.reshape`` (when the source is a buffer rather
-    than a PrimExpr).
-    """
-    operands = _operands(op)
-    if not operands:
-        raise EmitError("tt.reshape: missing source operand")
-    src = ctx.get(operands[0])
-    # If the source is a buffer (e.g. shared/local), call into TileLang
-    # to materialize the new view; otherwise rebind as PrimExpr.
-    tvm_mod = ctx.tvm()
-    if isinstance(src, tvm_mod.tir.Buffer):
-        try:
-            from tilelang.language import view as tl_view  # type: ignore
-            new_shape = _shape_of(_results(op)[0]) if _results(op) else ()
-            src = tl_view(src, list(new_shape))
-        except ImportError:  # pragma: no cover -- TileLang absent
-            pass
-    if _results(op):
-        ctx.bind(_results(op)[0], src)
-    return src
 
 
 def map_tt_trans(op: Any, ctx: WalkerCtx) -> Any:
@@ -1709,42 +1256,6 @@ def map_tt_trans(op: Any, ctx: WalkerCtx) -> Any:
     return src
 
 
-# DEAD-BUT-LOADED: superseded by op_emitters/memory.py:emit_tt_make_range via
-# OP_TABLE.update(MEMORY_EMITTERS). Per feedback_no_silent_delete: kept here
-# until the migration is verified end-to-end across all kernels. Drop in
-# a future cleanup wave when no caller depends on the legacy shape. Wave E3
-# defensive note (preserved): the helper inside this body still migrates the
-# Properties parsing in case the merge order ever shifts -- otherwise this
-# dead path would silently re-introduce the C2 zero-length-Ramp bug
-# (start=end=0).
-def map_tt_make_range(op: Any, ctx: WalkerCtx) -> Any:
-    """Lower ``tt.make_range(start, end)`` to a Ramp PrimExpr.
-
-    Triton's ``tt.make_range`` is a 1-D tensor of consecutive integers in
-    ``[start, end)``. The natural TIR equivalent is ``tir.Ramp`` with
-    stride 1 and lanes = (end - start). Consumers (ptr arith) treat it
-    like any vector PrimExpr; PtrAnalysis recognizes the pattern and
-    folds it into strided indexing.
-    """
-    tir = ctx.tir()
-    # Wave E3: ``start``/``end`` live in Properties storage in Triton 3.6.
-    # NOTE: this legacy emitter is currently superseded by
-    # ``op_emitters/memory.py:emit_tt_make_range`` via OP_TABLE.update(...)
-    # at module-init. We still migrate the helper here defensively in case
-    # the merge order ever shifts -- otherwise this dead path would
-    # silently re-introduce the C2 zero-length-Ramp bug (start=end=0).
-    attrs = _attrs_with_properties_shared(op)
-    start = int(attrs.get("start", 0))
-    end = int(attrs.get("end", 0))
-    lanes = end - start
-    if lanes <= 0:
-        raise EmitError(
-            f"tt.make_range: invalid range [{start}, {end}); end must be > start"
-        )
-    ramp = tir.Ramp(tir.const(start, "int32"), tir.const(1, "int32"), lanes)
-    if _results(op):
-        ctx.bind(_results(op)[0], ramp)
-    return ramp
 
 
 # ---------------------------------------------------------------------------
@@ -1879,7 +1390,6 @@ def map_tt_mbarrier(op: Any, ctx: WalkerCtx) -> Any:
         bar = ctx.get(operands[0])
         parity = int(attrs.get("parity", 0))
         # Prefer the high-level T.barrier_wait; fall back to call_intrin.
-        # TODO: verify barrier_wait remains in tilelang.language.
         if hasattr(T, "barrier_wait"):
             handle = T.barrier_wait(bar, parity)
         else:
@@ -2158,20 +1668,11 @@ def map_tt_program_id(op: Any, ctx: WalkerCtx) -> Any:
 
 OP_TABLE: Dict[str, EmitFn] = {
     # memory
-    "tt.load": map_tt_load,
-    "tt.store": map_tt_store,
     "tt.atomic_rmw": map_tt_atomic_rmw,
     # compute
-    "tt.dot": map_tt_dot,
-    "tt.reduce": map_tt_reduce,
     "tt.where": map_tt_where,
     # shape
-    "tt.broadcast": map_tt_broadcast,
-    "tt.splat": map_tt_splat,
-    "tt.expand_dims": map_tt_expand_dims,
-    "tt.reshape": map_tt_reshape,
     "tt.trans": map_tt_trans,
-    "tt.make_range": map_tt_make_range,
     # async / barrier (multiple TTIR spellings route through one emitter)
     "async_copy": map_tt_async_copy,
     "tt.async_copy_global_to_local": map_tt_async_copy,

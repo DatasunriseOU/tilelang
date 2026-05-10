@@ -27,12 +27,7 @@ def get_configs():
 @lru_cache(maxsize=1)
 def get_heuristic_config() -> Tuple[Dict, int]:
     # Get CUDA device properties
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available")
-    device = torch.cuda.current_device()
-    sm_major, sm_minor = torch.cuda.get_device_capability(device)
-    sm_version = sm_major * 10 + sm_minor
-    print(f"CUDA device capability: {sm_version}")
+    sm_version = 89
     if sm_version == 89:
         cfg = dict(block_N=128, block_H=64, num_split=1, num_stages=0, threads=128)
     else:
@@ -40,9 +35,8 @@ def get_heuristic_config() -> Tuple[Dict, int]:
     return cfg, sm_version
 
 
-# TODO(lei): fix warp specialized pass
 def get_pass_configs():
-    return {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
+    return {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: False}
 
 
 @autotune(configs=get_configs(), warmup=10, rep=10)

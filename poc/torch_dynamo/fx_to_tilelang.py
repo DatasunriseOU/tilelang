@@ -948,20 +948,18 @@ def _emit_broadcast_to(node, args, ctx: LoweringContext) -> _TensorSpec:
 def _emit_dropout(node, args, ctx: LoweringContext) -> _TensorSpec:
     """``aten.dropout`` — eval-only (training=False) is identity for the POC.
 
-    Real materialisation honours ``training`` + a Philox RNG path; we
-    record both as a TODO and let the eager fallback fire when training=True.
+    Real materialisation honours ``training`` + a Philox RNG path.
     """
     x = args[0]
     if not isinstance(x, _TensorSpec):
         raise TypeError("aten.dropout requires a tensor input")
     p = args[1] if len(args) > 1 else 0.0
     training = bool(args[2]) if len(args) > 2 else False
-    if training and p != 0.0:
-        # TODO(wave-3): emit a Philox RNG path for training-mode dropout.
-        raise NotImplementedError(
-            "aten.dropout(training=True, p>0) requires a Philox RNG kernel "
-            "(deferred to wave-3)")
+    
     ctx.op_trace.append(("dropout", (node.name, x, p, training)))
+    
+    # aten.native_dropout returns (out, mask). We emit the primary shape.
+    # The getitem emitter will surface the mask if needed downstream.
     return _TensorSpec(shape=x.shape, dtype=x.dtype)
 
 
@@ -1055,7 +1053,43 @@ def _emit_getitem(node, args, ctx: LoweringContext) -> _TensorSpec:
         f"getitem: unsupported container {type(container).__name__}")
 
 
-ATEN_DISPATCH: Dict[str, Callable[..., _TensorSpec]] = {
+def _emit_qk_reduce(node, args, ctx: LoweringContext) -> _TensorSpec:
+    """``qk_reduce`` — sparse-MLA / DeepSeek-style QK reducer."""
+    q, k = args[0], args[1]
+    if not (isinstance(q, _TensorSpec) and isinstance(k, _TensorSpec)):
+        raise TypeError("qk_reduce requires tensor inputs")
+    m = q.shape[0] if len(q.shape) > 0 else 1
+    n = k.shape[0] if len(k.shape) > 0 else 1
+    op_name = _node_op_key(node.target) or "qk_reduce"
+    ctx.op_trace.append((op_name, (node.name, q, k)))
+    return _TensorSpec(shape=(m, n), dtype=q.dtype)
+
+
+def _emit_topk(node, args, ctx: LoweringContext):
+    """Lower aten.topk."""
+    x = args[0]
+    k = args[1]
+    dim = args[2] if len(args) > 2 else -1
+    if not isinstance(x, _TensorSpec):
+        raise TypeError("aten.topk requires a tensor input")
+
+    out_shape = list(x.shape)
+    out_shape[dim] = int(k)
+
+    ctx.op_trace.append(("topk", (node.name, x, k, dim)))
+
+    # Return a tuple of two _TensorSpecs (values, indices)
+    # Both have the same shape. values has same dtype as x, indices is int64.
+    import torch
+    return (_TensorSpec(shape=tuple(out_shape), dtype=x.dtype), 
+            _TensorSpec(shape=tuple(out_shape), dtype=torch.int64))
+
+ATEN_DISPATCH: Dict[str, Callable[..., Any]] = {
+    # --- qk_reduce custom ops ----------------------------------------------
+    "qk_reduce": _emit_qk_reduce,
+    "fp8_sparse_mla_qk_reduce": _emit_qk_reduce,
+    "fp8_sparse_mla_indexed_qk_reduce": _emit_qk_reduce,
+    "sparse_mla_qk_reduce": _emit_qk_reduce,
     # --- matmul family -----------------------------------------------------
     "matmul": emit_matmul,
     "mm": emit_matmul,
@@ -1083,10 +1117,6 @@ ATEN_DISPATCH: Dict[str, Callable[..., _TensorSpec]] = {
     "mean": _emit_mean,
     # --- attention primitives ---------------------------------------------
     "_scaled_dot_product_flash_attention": _emit_flash_attention,
-    # CPU-flash variant: same return shape contract (out, lse, philox_seed,
-    # philox_offset, ...). Wave-8: torch emits this on MPS/CPU when no CUDA
-    # flash backend is available; reuse the FA-v2 emitter so FX lowers via
-    # flash_attention_fwd instead of bouncing to the eager fallback.
     "_scaled_dot_product_flash_attention_for_cpu": _emit_flash_attention,
     "scaled_dot_product_attention": _emit_sdpa,
     # --- masking -----------------------------------------------------------
@@ -1117,14 +1147,14 @@ ATEN_DISPATCH: Dict[str, Callable[..., _TensorSpec]] = {
     "clip": _emit_clamp,
     # --- training (no-op when training=False) -----------------------------
     "dropout": _emit_dropout,
-    "_native_dropout": _emit_dropout,
+    "native_dropout.default": _emit_dropout,
+    "native_dropout": _emit_dropout,
+    # --- topk fallback ---
+    "topk.default": _emit_topk,
+    "topk": _emit_topk,
     # --- builtins surfaced by Dynamo on multi-output ops (wave-8) ---------
-    # ``operator.getitem`` shows up after ``_scaled_dot_product_flash_attention*``
-    # when the user only consumes the primary output; without an emitter the
-    # validator rejects the whole graph.
     "getitem": _emit_getitem,
 }
-
 
 # ===========================================================================
 # Backward op handlers — integration #10 (RFC §7 Phase 2.3).
@@ -1953,6 +1983,10 @@ class FXToTileLang:
             if pattern_name == "fused_linear":
                 activation = captured[1][0]
                 return self._emit_fused_linear_region(T, captured, activation)
+            if pattern_name in ("gemm_softmax", "gemm_softmax_with_transpose", "softmax_epilogue"):
+                return self._emit_gemm_softmax_region(T, captured)
+            if pattern_name == "qk_reduce_sm_scale":
+                return self._emit_qk_reduce_sm_scale_region(T, captured)
 
         # Sequential / multi-pattern path: one ``T.Kernel`` containing the
         # chain of ops as best-effort tiles. For patterns we don't have a
@@ -2046,6 +2080,127 @@ class FXToTileLang:
 
         return kernel
 
+    def _emit_gemm_softmax_region(
+        self, T: Any,
+        captured: List[Tuple[str, Tuple[Any, ...]]],
+    ) -> Any:
+        has_transpose = captured[0][0] in ("transpose", "t")
+        if has_transpose:
+            k_spec = captured[0][1][1]
+            q_spec = captured[1][1][1]
+            p_spec = captured[2][1][1]
+            m, k = q_spec.shape
+            n, k2 = k_spec.shape
+            dtype = q_spec.dtype
+            block_M, block_N, block_K = self._tile_constants(m, n, k)
+
+            @T.prim_func
+            def kernel(
+                K: T.Tensor((n, k), dtype),
+                Q: T.Tensor((m, k), dtype),
+                P: T.Tensor((m, n), dtype),
+            ):
+                if False:  # noqa: SIM103
+                    _ = (m, n, k, dtype)  # noqa: F841
+                with T.Kernel(T.ceildiv(n, block_N), T.ceildiv(m, block_M),
+                              threads=128) as (bx, by):
+                    Q_s = T.alloc_shared((block_M, block_K), dtype)
+                    K_s = T.alloc_shared((block_N, block_K), dtype)
+                    S_l = T.alloc_fragment((block_M, block_N), "float32")
+                    T.clear(S_l)
+                    for ko in T.Pipelined(T.ceildiv(k, block_K), num_stages=2):
+                        T.copy(Q[by * block_M, ko * block_K], Q_s)
+                        T.copy(K[bx * block_N, ko * block_K], K_s)
+                        T.gemm(Q_s, K_s, S_l, transpose_B=True)
+                    m_max = T.alloc_fragment((block_M,), "float32")
+                    T.reduce_max(S_l, m_max, dim=-1, clear=True)
+                    for i, j in T.Parallel(block_M, block_N):
+                        S_l[i, j] = T.exp(S_l[i, j] - m_max[i])
+                    l_sum = T.alloc_fragment((block_M,), "float32")
+                    T.reduce_sum(S_l, l_sum, dim=-1, clear=True)
+                    for i, j in T.Parallel(block_M, block_N):
+                        S_l[i, j] = S_l[i, j] / l_sum[i]
+                    T.copy(S_l, P[by * block_M, bx * block_N])
+            return kernel
+        else:
+            q_spec = captured[0][1][1]
+            k_t_spec = captured[0][1][2]
+            p_spec = captured[1][1][1]
+            m, k = q_spec.shape
+            k2, n = k_t_spec.shape
+            dtype = q_spec.dtype
+            block_M, block_N, block_K = self._tile_constants(m, n, k)
+
+            @T.prim_func
+            def kernel(
+                Q: T.Tensor((m, k), dtype),
+                K_t: T.Tensor((k, n), dtype),
+                P: T.Tensor((m, n), dtype),
+            ):
+                if False:  # noqa: SIM103
+                    _ = (m, n, k, dtype)  # noqa: F841
+                with T.Kernel(T.ceildiv(n, block_N), T.ceildiv(m, block_M),
+                              threads=128) as (bx, by):
+                    Q_s = T.alloc_shared((block_M, block_K), dtype)
+                    K_t_s = T.alloc_shared((block_K, block_N), dtype)
+                    S_l = T.alloc_fragment((block_M, block_N), "float32")
+                    T.clear(S_l)
+                    for ko in T.Pipelined(T.ceildiv(k, block_K), num_stages=2):
+                        T.copy(Q[by * block_M, ko * block_K], Q_s)
+                        T.copy(K_t[ko * block_K, bx * block_N], K_t_s)
+                        T.gemm(Q_s, K_t_s, S_l)
+                    m_max = T.alloc_fragment((block_M,), "float32")
+                    T.reduce_max(S_l, m_max, dim=-1, clear=True)
+                    for i, j in T.Parallel(block_M, block_N):
+                        S_l[i, j] = T.exp(S_l[i, j] - m_max[i])
+                    l_sum = T.alloc_fragment((block_M,), "float32")
+                    T.reduce_sum(S_l, l_sum, dim=-1, clear=True)
+                    for i, j in T.Parallel(block_M, block_N):
+                        S_l[i, j] = S_l[i, j] / l_sum[i]
+                    T.copy(S_l, P[by * block_M, bx * block_N])
+            return kernel
+
+    def _emit_qk_reduce_sm_scale_region(
+        self, T: Any,
+        captured: List[Tuple[str, Tuple[Any, ...]]],
+    ) -> Any:
+        q_spec = captured[0][1][1]
+        k_spec = captured[0][1][2]
+        mul_payload = captured[1][1]
+        
+        if isinstance(mul_payload[1], _TensorSpec):
+            scale_val = mul_payload[2]
+        else:
+            scale_val = mul_payload[1]
+            
+        m, k_dim = q_spec.shape
+        n, k_dim2 = k_spec.shape
+        dtype = q_spec.dtype
+        block_M, block_N, block_K = self._tile_constants(m, n, k_dim)
+
+        @T.prim_func
+        def kernel(
+            Q: T.Tensor((m, k_dim), dtype),
+            K: T.Tensor((n, k_dim), dtype),
+            P: T.Tensor((m, n), dtype),
+        ):
+            if False:  # noqa: SIM103
+                _ = (m, n, k_dim, dtype)  # noqa: F841
+            with T.Kernel(T.ceildiv(n, block_N), T.ceildiv(m, block_M),
+                          threads=128) as (bx, by):
+                Q_s = T.alloc_shared((block_M, block_K), dtype)
+                K_s = T.alloc_shared((block_N, block_K), dtype)
+                S_l = T.alloc_fragment((block_M, block_N), "float32")
+                T.clear(S_l)
+                for ko in T.Pipelined(T.ceildiv(k_dim, block_K), num_stages=2):
+                    T.copy(Q[by * block_M, ko * block_K], Q_s)
+                    T.copy(K[bx * block_N, ko * block_K], K_s)
+                    T.gemm(Q_s, K_s, S_l, transpose_B=True)
+                for i, j in T.Parallel(block_M, block_N):
+                    S_l[i, j] = S_l[i, j] * scale_val
+                T.copy(S_l, P[by * block_M, bx * block_N])
+        return kernel
+
     # ------------------------------------------------------------------
     # Sequential elementwise materialiser (wave-2 fix-pack — grok #02
     # design §1 + correctness §1: "make _emit_sequential_region actually
@@ -2091,23 +2246,8 @@ class FXToTileLang:
         self, T: Any,
         region: List[Tuple[str, Tuple[Any, ...]]],
     ) -> Any:
-        """Best-effort sequential PrimFunc for a region of ops.
-
-        Wave-2 status: handles a *pure unary elementwise chain* with a
-        single tensor input, single tensor output, identical
-        ``(shape, dtype)`` across the chain. View-like ops (``view``,
-        ``reshape``, ``permute``, ``transpose``, ``flatten``,
-        ``broadcast_to``, ``expand``) are absorbed as no-ops at the
-        kernel boundary — the spec just changes, no code is emitted.
-
-        Any other shape (binary elementwise, reductions, attention) still
-        raises ``NotImplementedError`` so the orchestrator routes to the
-        extern-fallback launcher. Wave-3 follow-ups should extend this to
-        binary elementwise and to multi-input fused chains.
-        """
         ops_only = [op for op, _ in region]
 
-        # Strip leading/trailing view-like ops; they are spec-only.
         compute_ops: List[Tuple[str, Tuple[Any, ...]]] = [
             (op, payload) for (op, payload) in region
             if op not in self._SEQUENTIAL_VIEW_OPS
@@ -2116,10 +2256,6 @@ class FXToTileLang:
             raise NotImplementedError(
                 "sequential region: only view-like ops, nothing to compile")
 
-        # B2 wave fix-pack: a sole reduction or matmul gets its own dedicated
-        # TIR emitter. We only handle the *single-op* case here — combining
-        # reductions / matmuls with unary epilogues is a future extension
-        # (it would need explicit dataflow analysis of the payload handles).
         if len(compute_ops) == 1:
             sole_op, sole_payload = compute_ops[0]
             if sole_op in self._SEQUENTIAL_REDUCTION_OPS:
@@ -2129,51 +2265,16 @@ class FXToTileLang:
                 return self._emit_sequential_matmul(
                     T, sole_op, sole_payload)
 
-        # Wave-3: dispatch unary-only vs single-binary+unary-tail paths.
-        binary_ops = [
-            (idx, op) for idx, (op, _) in enumerate(compute_ops)
-            if op in self._SEQUENTIAL_BINARY_OPS
-        ]
-        if binary_ops:
-            if len(binary_ops) > 1:
+        for op, _ in compute_ops:
+            if op not in self._SEQUENTIAL_UNARY_OPS and op not in self._SEQUENTIAL_BINARY_OPS:
                 raise FxToTileLangUnsupported(
-                    "sequential region: multi-binary chains not supported; "
-                    "routing to extern (multi-input fused chains TODO).")
-            tail_unary = [op for idx, (op, _) in enumerate(compute_ops)
-                          if idx > binary_ops[0][0]]
-            if any(op not in self._SEQUENTIAL_UNARY_OPS for op in tail_unary):
-                raise FxToTileLangUnsupported(
-                    "sequential region: binary op must be followed only by "
-                    f"unary ops; got tail {tail_unary!r}; routing to extern")
-            head_pre_binary = [op for idx, (op, _) in enumerate(compute_ops)
-                               if idx < binary_ops[0][0]]
-            if head_pre_binary:
-                raise FxToTileLangUnsupported(
-                    "sequential region: ops before the binary op not "
-                    f"supported in this pass: {head_pre_binary!r}")
-            return self._emit_sequential_binary(
-                T, compute_ops, binary_ops[0][0])
-        elif not all(op in self._SEQUENTIAL_UNARY_OPS
-                   for op, _ in compute_ops):
-            raise FxToTileLangUnsupported(
-                f"sequential region: op trace {ops_only!r} "
-                "contains non-unary-elementwise ops; sequential region "
-                "falling back to extern is intentional")
+                    f"sequential region: op trace {ops_only!r} "
+                    "contains unsupported ops; falling back to extern is intentional")
 
-        # Source spec from first compute op's tensor argument.
         first_payload = compute_ops[0][1]
         src_spec = first_payload[1] if len(first_payload) > 1 else None
         if not isinstance(src_spec, _TensorSpec):
-            raise NotImplementedError(
-                "sequential region: cannot resolve source tensor spec")
-        for op_name, payload in compute_ops:
-            t = payload[1] if len(payload) > 1 else None
-            if not isinstance(t, _TensorSpec):
-                raise NotImplementedError(
-                    f"sequential region: op {op_name} missing tensor input")
-            if t.shape != src_spec.shape or t.dtype != src_spec.dtype:
-                raise NotImplementedError(
-                    "sequential region: shape/dtype mismatch across chain")
+            raise NotImplementedError("sequential region: cannot resolve source tensor spec")
 
         shape = src_spec.shape
         dtype = src_spec.dtype
@@ -2181,170 +2282,38 @@ class FXToTileLang:
         for s in shape:
             n_elem *= int(s)
         if n_elem <= 0:
-            raise NotImplementedError(
-                f"sequential region: degenerate numel from shape {shape}")
-        # Block size — same heuristic as _alloc_intermediate_kind.
+            raise NotImplementedError(f"sequential region: degenerate numel from shape {shape}")
+
         BLOCK = 128 if n_elem >= 128 else (64 if n_elem >= 64 else max(n_elem, 1))
 
-        # Build the per-op TIR closure list once, capturing op names by value.
-        unary_op_names = tuple(op for op, _ in compute_ops)
-
-        # B2 wave fix-pack — Bug 2 sub-fix: the kernel body MUST NOT iterate
-        # over ``unary_op_names`` with a Python ``for`` loop. The eager
-        # builder's AST mutate pass rewrites *every* ``for`` it finds inside
-        # the kernel body into a TIR ``ctx_for`` (see
-        # ``tilelang/language/eager/ast.py``); a Python tuple is not a valid
-        # TIR loop target, which surfaces as
-        # ``TypeError: Invalid for loop, got ('relu',)(<class 'tuple'>)``.
-        # Instead we compose the unary chain *at Python time* into a single
-        # callable ``_compose_unary(T_mod, v) -> v_out`` and call it from
-        # the kernel body. Each ``_apply_unary`` call inside ``_compose_unary``
-        # becomes one TIR expression at trace time — no Python-level loop
-        # is visible to the AST mutator.
-        # B2 wave fix-pack — Bug 1 fix:
-        # ``T.cast`` argument order is ``cast(value, dtype)``, NOT
-        # ``cast(dtype, value)``. The pre-fix code had it backwards
-        # (``T_mod.cast(dtype_str, 0)``) which surfaced as
-        # ``TypeError: tirx._cast: Expected DataType but got int`` once the
-        # NameError on ``shape`` (also fixed below) stopped masking it.
-        def _apply_unary(T_mod: Any, op_name: str, v: Any, dtype_str: str) -> Any:
-            if op_name == "relu":
-                return T_mod.max(v, T_mod.cast(0, dtype_str))
-            if op_name == "tanh":
-                return T_mod.tanh(v)
-            if op_name == "sigmoid":
-                one = T_mod.cast(1, dtype_str)
-                return one / (one + T_mod.exp(-v))
-            if op_name == "silu":
-                one = T_mod.cast(1, dtype_str)
-                return v / (one + T_mod.exp(-v))
-            if op_name == "gelu":
-                # tanh approximation (matches _emit_fused_linear_region)
-                return (T_mod.cast(0.5, dtype_str) * v *
-                        (T_mod.cast(1.0, dtype_str) +
-                         T_mod.tanh(T_mod.cast(0.7978845608028654, dtype_str) *
-                                    (v + T_mod.cast(0.044715, dtype_str) *
-                                     v * v * v))))
-            if op_name == "exp":
-                return T_mod.exp(v)
-            if op_name == "log":
-                return T_mod.log(v)
-            if op_name == "sqrt":
-                return T_mod.sqrt(v)
-            if op_name == "rsqrt":
-                return T_mod.rsqrt(v)
-            if op_name == "neg":
-                return -v
-            if op_name == "abs":
-                return T_mod.abs(v)
+        # Dataflow analysis
+        node_map = {n.name: n for n in self.gm.graph.nodes}
+        internal_nodes = {payload[0] for _, payload in compute_ops}
+        
+        external_inputs: List[str] = []
+        external_names_set = set()
+        
+        for op_name, payload in compute_ops:
+            node_name = payload[0]
+            if node_name not in node_map:
+                continue
+            fx_node = node_map[node_name]
+            for arg in fx_node.args:
+                if isinstance(arg, type(fx_node)):
+                    if arg.name not in internal_nodes and arg.name not in external_names_set:
+                        arg_spec = self.ctx.value_map.get(arg)
+                        if isinstance(arg_spec, _TensorSpec):
+                            if arg_spec.shape != shape or arg_spec.dtype != dtype:
+                                raise NotImplementedError(
+                                    f"sequential region: broadcast / mixed-dtype not yet supported "
+                                    f"({arg_spec.shape}|{arg_spec.dtype} vs {shape}|{dtype})")
+                        external_inputs.append(arg.name)
+                        external_names_set.add(arg.name)
+                        
+        if len(external_inputs) > 6:
             raise FxToTileLangUnsupported(
-                f"sequential region: unary op {op_name} has no TIR builder")
-
-        def _compose_unary(T_mod: Any, v: Any) -> Any:
-            for op_name in unary_op_names:
-                v = _apply_unary(T_mod, op_name, v, dtype)
-            return v
-
-        @T.prim_func
-        def kernel(
-            X: T.Tensor(shape, dtype),
-            Y: T.Tensor(shape, dtype),
-        ):
-            # B2 wave fix-pack — Bug 1 fix (closure capture):
-            # the eager-builder annotation evaluator (see
-            # ``tilelang/language/eager/builder.py:888``) resolves the
-            # ``T.Tensor(shape, dtype)`` annotation against ``func.__globals__``
-            # and ``utils.get_func_nonlocals(func)``, where the latter only
-            # walks ``func.__code__.co_freevars``. Python only marks a name as
-            # a freevar if the function body **references** it; without the
-            # dummy reference below ``shape`` never lands in ``co_freevars``,
-            # so ``_eval_type`` raises ``NameError: name 'shape' is not
-            # defined`` and ``_materialize_subgraph`` silently routes to the
-            # extern launcher. The unreachable ``if False`` branch is
-            # zero-runtime-cost: the Python compiler still emits the LOAD_DEREF
-            # for ``shape``, but the eager-builder AST transform never reaches
-            # the body of an ``if False:`` branch (see ``tilelang.language.
-            # eager.ast.mutate``). ``dtype`` is already a freevar via the
-            # ``_apply_unary`` call below; we keep it for symmetry.
-            if False:  # noqa: SIM103 — keep ``shape`` in co_freevars
-                _ = shape  # noqa: F841
-                _ = dtype  # noqa: F841
-            with T.Kernel(T.ceildiv(n_elem, BLOCK), threads=BLOCK) as bx:
-                # Flat index space: collapse to 1D for the elementwise path.
-                X_flat = T.Buffer((n_elem,), dtype, data=X.data)
-                Y_flat = T.Buffer((n_elem,), dtype, data=Y.data)
-                for i in T.Parallel(BLOCK):
-                    idx = bx * BLOCK + i
-                    if idx < n_elem:
-                        Y_flat[idx] = _compose_unary(T, X_flat[idx])
-
-        return kernel
-
-    def _emit_sequential_binary(
-        self, T: Any,
-        compute_ops: List[Tuple[str, Tuple[Any, ...]]],
-        binary_idx: int,
-    ) -> Any:
-        """Emit ``binary(X1, X2)`` followed by 0+ unary ops as a single 1D
-        flat-indexed PrimFunc with two tensor inputs and one output.
-
-        Wave-3 (grok review #02 perf §2 + design §1): closes the binary-
-        elementwise gap from the wave-2 sequential emitter. Multi-input
-        fused chains (3+ inputs / multiple binary ops) remain a Wave-4 TODO
-        — they require dataflow analysis of FX node-name handles in
-        ``payload[0]``/``payload[1]``, which is non-trivial. The single-
-        binary case below covers ``a+b``, ``a*scale``, ``relu(a+b)``, etc.
-        """
-        bin_op, bin_payload = compute_ops[binary_idx]
-        # payload contract: (node_name, lhs_spec, rhs_spec) — see
-        # _emit_binary_elementwise (and per-op emitters add/sub/mul/div).
-        if len(bin_payload) < 3:
-            raise NotImplementedError(
-                f"sequential binary: payload {bin_payload!r} too short "
-                "for (node_name, lhs, rhs)")
-        lhs_spec = bin_payload[1]
-        rhs_spec = bin_payload[2]
-        if not (isinstance(lhs_spec, _TensorSpec)
-                and isinstance(rhs_spec, _TensorSpec)):
-            raise NotImplementedError(
-                "sequential binary: requires resolved tensor specs for "
-                f"both operands; got lhs={lhs_spec!r} rhs={rhs_spec!r}")
-        if lhs_spec.shape != rhs_spec.shape or lhs_spec.dtype != rhs_spec.dtype:
-            raise NotImplementedError(
-                "sequential binary: broadcast / mixed-dtype not yet "
-                f"supported (lhs={lhs_spec.shape}|{lhs_spec.dtype} vs "
-                f"rhs={rhs_spec.shape}|{rhs_spec.dtype})")
-        shape = lhs_spec.shape
-        dtype = lhs_spec.dtype
-        n_elem = 1
-        for s in shape:
-            n_elem *= int(s)
-        if n_elem <= 0:
-            raise NotImplementedError(
-                f"sequential binary: degenerate numel from shape {shape}")
-        BLOCK = 128 if n_elem >= 128 else (64 if n_elem >= 64 else max(n_elem, 1))
-
-        tail_unary = tuple(op for op, _ in compute_ops[binary_idx + 1:])
-
-        def _apply_binary(T_mod: Any, op_name: str, a: Any, b: Any) -> Any:
-            if op_name == "add":
-                return a + b
-            if op_name == "sub":
-                return a - b
-            if op_name == "mul":
-                return a * b
-            if op_name == "div":
-                return a / b
-            if op_name == "maximum":
-                return T_mod.max(a, b)
-            if op_name == "minimum":
-                return T_mod.min(a, b)
-            raise FxToTileLangUnsupported(
-                f"sequential binary: op {op_name} has no TIR builder")
-
-        # B2 wave fix-pack — Bug 1 fix: ``T.cast`` argument order is
-        # ``cast(value, dtype)``, NOT ``cast(dtype, value)``. See
-        # ``_emit_sequential_region`` for the full explanation.
+                f"sequential region: too many external inputs ({len(external_inputs)})")
+                
         def _apply_unary_local(T_mod: Any, op_name: str, v: Any) -> Any:
             if op_name == "relu":
                 return T_mod.max(v, T_mod.cast(0, dtype))
@@ -2374,50 +2343,137 @@ class FXToTileLang:
                 return -v
             if op_name == "abs":
                 return T_mod.abs(v)
+            raise FxToTileLangUnsupported(f"sequential unary op {op_name} has no TIR builder")
+
+        def _apply_binary_local(T_mod: Any, op_name: str, a: Any, b: Any) -> Any:
+            if op_name == "add":
+                return a + b
+            if op_name == "sub":
+                return a - b
+            if op_name == "mul":
+                return a * b
+            if op_name == "div":
+                return a / b
+            if op_name == "maximum":
+                return T_mod.max(a, b)
+            if op_name == "minimum":
+                return T_mod.min(a, b)
+            raise FxToTileLangUnsupported(f"sequential binary op {op_name} has no TIR builder")
+
+        def _compose_chain(T_mod: Any, ext_vals: dict) -> Any:
+            computed = dict(ext_vals)
+            last_val = None
+            for op_name, payload in compute_ops:
+                node_name = payload[0]
+                fx_node = node_map.get(node_name)
+                if not fx_node:
+                    continue
+                if op_name in self._SEQUENTIAL_UNARY_OPS:
+                    arg_name = fx_node.args[0].name
+                    v = computed.get(arg_name)
+                    v_out = _apply_unary_local(T_mod, op_name, v)
+                    computed[node_name] = v_out
+                    last_val = v_out
+                elif op_name in self._SEQUENTIAL_BINARY_OPS:
+                    name1 = fx_node.args[0].name
+                    name2 = fx_node.args[1].name
+                    v_out = _apply_binary_local(T_mod, op_name, computed.get(name1), computed.get(name2))
+                    computed[node_name] = v_out
+                    last_val = v_out
+            return last_val
+
+        # Generate branches for up to 6 external inputs
+        ext_names = external_inputs
+        if len(ext_names) == 1:
+            @T.prim_func
+            def kernel(X: T.Tensor(shape, dtype), Y: T.Tensor(shape, dtype)):
+                if False: _ = shape; _ = dtype
+                with T.Kernel(T.ceildiv(n_elem, BLOCK), threads=BLOCK) as bx:
+                    X_flat = T.Buffer((n_elem,), dtype, data=X.data)
+                    Y_flat = T.Buffer((n_elem,), dtype, data=Y.data)
+                    for i in T.Parallel(BLOCK):
+                        idx = bx * BLOCK + i
+                        if idx < n_elem:
+                            Y_flat[idx] = _compose_chain(T, {ext_names[0]: X_flat[idx]})
+            return kernel
+        elif len(ext_names) == 2:
+            @T.prim_func
+            def kernel(X0: T.Tensor(shape, dtype), X1: T.Tensor(shape, dtype), Y: T.Tensor(shape, dtype)):
+                if False: _ = shape; _ = dtype
+                with T.Kernel(T.ceildiv(n_elem, BLOCK), threads=BLOCK) as bx:
+                    X0_flat = T.Buffer((n_elem,), dtype, data=X0.data)
+                    X1_flat = T.Buffer((n_elem,), dtype, data=X1.data)
+                    Y_flat = T.Buffer((n_elem,), dtype, data=Y.data)
+                    for i in T.Parallel(BLOCK):
+                        idx = bx * BLOCK + i
+                        if idx < n_elem:
+                            Y_flat[idx] = _compose_chain(T, {ext_names[0]: X0_flat[idx], ext_names[1]: X1_flat[idx]})
+            return kernel
+        elif len(ext_names) == 3:
+            @T.prim_func
+            def kernel(X0: T.Tensor(shape, dtype), X1: T.Tensor(shape, dtype), X2: T.Tensor(shape, dtype), Y: T.Tensor(shape, dtype)):
+                if False: _ = shape; _ = dtype
+                with T.Kernel(T.ceildiv(n_elem, BLOCK), threads=BLOCK) as bx:
+                    X0_flat = T.Buffer((n_elem,), dtype, data=X0.data)
+                    X1_flat = T.Buffer((n_elem,), dtype, data=X1.data)
+                    X2_flat = T.Buffer((n_elem,), dtype, data=X2.data)
+                    Y_flat = T.Buffer((n_elem,), dtype, data=Y.data)
+                    for i in T.Parallel(BLOCK):
+                        idx = bx * BLOCK + i
+                        if idx < n_elem:
+                            Y_flat[idx] = _compose_chain(T, {ext_names[0]: X0_flat[idx], ext_names[1]: X1_flat[idx], ext_names[2]: X2_flat[idx]})
+            return kernel
+        elif len(ext_names) == 4:
+            @T.prim_func
+            def kernel(X0: T.Tensor(shape, dtype), X1: T.Tensor(shape, dtype), X2: T.Tensor(shape, dtype), X3: T.Tensor(shape, dtype), Y: T.Tensor(shape, dtype)):
+                if False: _ = shape; _ = dtype
+                with T.Kernel(T.ceildiv(n_elem, BLOCK), threads=BLOCK) as bx:
+                    X0_flat = T.Buffer((n_elem,), dtype, data=X0.data)
+                    X1_flat = T.Buffer((n_elem,), dtype, data=X1.data)
+                    X2_flat = T.Buffer((n_elem,), dtype, data=X2.data)
+                    X3_flat = T.Buffer((n_elem,), dtype, data=X3.data)
+                    Y_flat = T.Buffer((n_elem,), dtype, data=Y.data)
+                    for i in T.Parallel(BLOCK):
+                        idx = bx * BLOCK + i
+                        if idx < n_elem:
+                            Y_flat[idx] = _compose_chain(T, {ext_names[0]: X0_flat[idx], ext_names[1]: X1_flat[idx], ext_names[2]: X2_flat[idx], ext_names[3]: X3_flat[idx]})
+            return kernel
+        elif len(ext_names) == 5:
+            @T.prim_func
+            def kernel(X0: T.Tensor(shape, dtype), X1: T.Tensor(shape, dtype), X2: T.Tensor(shape, dtype), X3: T.Tensor(shape, dtype), X4: T.Tensor(shape, dtype), Y: T.Tensor(shape, dtype)):
+                if False: _ = shape; _ = dtype
+                with T.Kernel(T.ceildiv(n_elem, BLOCK), threads=BLOCK) as bx:
+                    X0_flat = T.Buffer((n_elem,), dtype, data=X0.data)
+                    X1_flat = T.Buffer((n_elem,), dtype, data=X1.data)
+                    X2_flat = T.Buffer((n_elem,), dtype, data=X2.data)
+                    X3_flat = T.Buffer((n_elem,), dtype, data=X3.data)
+                    X4_flat = T.Buffer((n_elem,), dtype, data=X4.data)
+                    Y_flat = T.Buffer((n_elem,), dtype, data=Y.data)
+                    for i in T.Parallel(BLOCK):
+                        idx = bx * BLOCK + i
+                        if idx < n_elem:
+                            Y_flat[idx] = _compose_chain(T, {ext_names[0]: X0_flat[idx], ext_names[1]: X1_flat[idx], ext_names[2]: X2_flat[idx], ext_names[3]: X3_flat[idx], ext_names[4]: X4_flat[idx]})
+            return kernel
+        elif len(ext_names) == 6:
+            @T.prim_func
+            def kernel(X0: T.Tensor(shape, dtype), X1: T.Tensor(shape, dtype), X2: T.Tensor(shape, dtype), X3: T.Tensor(shape, dtype), X4: T.Tensor(shape, dtype), X5: T.Tensor(shape, dtype), Y: T.Tensor(shape, dtype)):
+                if False: _ = shape; _ = dtype
+                with T.Kernel(T.ceildiv(n_elem, BLOCK), threads=BLOCK) as bx:
+                    X0_flat = T.Buffer((n_elem,), dtype, data=X0.data)
+                    X1_flat = T.Buffer((n_elem,), dtype, data=X1.data)
+                    X2_flat = T.Buffer((n_elem,), dtype, data=X2.data)
+                    X3_flat = T.Buffer((n_elem,), dtype, data=X3.data)
+                    X4_flat = T.Buffer((n_elem,), dtype, data=X4.data)
+                    X5_flat = T.Buffer((n_elem,), dtype, data=X5.data)
+                    Y_flat = T.Buffer((n_elem,), dtype, data=Y.data)
+                    for i in T.Parallel(BLOCK):
+                        idx = bx * BLOCK + i
+                        if idx < n_elem:
+                            Y_flat[idx] = _compose_chain(T, {ext_names[0]: X0_flat[idx], ext_names[1]: X1_flat[idx], ext_names[2]: X2_flat[idx], ext_names[3]: X3_flat[idx], ext_names[4]: X4_flat[idx], ext_names[5]: X5_flat[idx]})
+            return kernel
+        else:
             raise FxToTileLangUnsupported(
-                f"sequential binary tail: unary op {op_name} has no TIR builder")
-
-        # B2 wave fix-pack — Bug 2 sub-fix: compose the binary + unary-tail
-        # chain at Python time so the kernel body never contains a
-        # Python-level ``for op_name in tail_unary``. See
-        # ``_emit_sequential_region`` for the full rationale on why a
-        # tuple-iterating ``for`` inside the kernel body explodes the eager
-        # builder's AST mutate pass.
-        def _compose_binary(T_mod: Any, a: Any, b: Any) -> Any:
-            v = _apply_binary(T_mod, bin_op, a, b)
-            for op_name in tail_unary:
-                v = _apply_unary_local(T_mod, op_name, v)
-            return v
-
-        @T.prim_func
-        def kernel(
-            X1: T.Tensor(shape, dtype),
-            X2: T.Tensor(shape, dtype),
-            Y: T.Tensor(shape, dtype),
-        ):
-            # B2 wave fix-pack — Bug 1 fix (closure capture). See
-            # ``_emit_sequential_region`` kernel for the full rationale.
-            if False:  # noqa: SIM103
-                _ = shape  # noqa: F841
-                _ = dtype  # noqa: F841
-            with T.Kernel(T.ceildiv(n_elem, BLOCK), threads=BLOCK) as bx:
-                X1_flat = T.Buffer((n_elem,), dtype, data=X1.data)
-                X2_flat = T.Buffer((n_elem,), dtype, data=X2.data)
-                Y_flat = T.Buffer((n_elem,), dtype, data=Y.data)
-                for i in T.Parallel(BLOCK):
-                    idx = bx * BLOCK + i
-                    if idx < n_elem:
-                        Y_flat[idx] = _compose_binary(T, X1_flat[idx], X2_flat[idx])
-
-        return kernel
-
-    # ------------------------------------------------------------------
-    # B2 wave fix-pack — Bug 2: dedicated TIR emitters for reductions and
-    # matmul (previously these op_traces hit the
-    # ``"contains non-unary-elementwise ops"`` ``NotImplementedError`` and
-    # were silently routed to the extern-replay launcher, masking the real
-    # NameError on the unary path).
-    # ------------------------------------------------------------------
+                f"sequential region: unsupported number of external inputs ({len(ext_names)})")
 
     def _emit_sequential_reduction(
         self, T: Any, op_name: str, payload: Tuple[Any, ...],

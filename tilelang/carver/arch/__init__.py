@@ -26,13 +26,15 @@ def get_arch(target: str | Target = "cuda") -> TileDevice:
 
 
 def auto_infer_current_arch() -> TileDevice:
-    # TODO(lei): This is a temporary solution to infer the current architecture
-    # Can be replaced by a more sophisticated method in the future
+    target = Target.current()
+    if target is not None:
+        return get_arch(target)
+
     if torch.version.hip is not None:
         return get_arch("hip")
     if torch.cuda.is_available():
         return get_arch("cuda")
-    elif torch.mps.is_available():
+    elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
         return get_arch("metal")
     else:
         return get_arch("llvm")

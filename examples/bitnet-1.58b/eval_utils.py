@@ -76,7 +76,7 @@ class LMEvalAdaptor(BaseLM):
         elif "bloom" in self.model_name:
             return 2048
         elif "llama" in self.model_name:
-            return 2048  # TODO: did not check this
+            return 2048
         elif "mpt" in self.model_name:
             return 2048
         elif "falcon" in self.model_name:

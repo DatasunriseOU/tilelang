@@ -403,14 +403,15 @@ def get_index_map(block: tir.Block, layout: list[str] | None = None) -> tuple[ti
     )
 
 
-def get_in_out_dtypes(block: tir.Block) -> tuple[str]:
+def get_in_out_dtypes(block: tir.Block) -> tuple[str, str, str]:
     """
     Detect In/Out data types for the given block based on the analysis if read/write buffers.
     """
     assert len(block.reads) > 0 and len(block.writes) > 0
-    in_dtype = block.reads[0].buffer.dtype
+    in_dtype_a = block.reads[0].buffer.dtype
+    in_dtype_b = block.reads[1].buffer.dtype if len(block.reads) > 1 else in_dtype_a
     out_dtype = block.writes[0].buffer.dtype
-    return (in_dtype, out_dtype)
+    return (in_dtype_a, in_dtype_b, out_dtype)
 
 
 def get_dequantize_block(sch, blocks) -> BlockRV | None:
@@ -589,8 +590,10 @@ def get_tensorized_func_and_tags(
             return has_common_reduce(axes[-1])
 
         intrin_info: dict = {}
-        in_dtype, out_dtype = get_in_out_dtypes(block_stmt)
-        intrin_info["in_dtype"] = in_dtype
+        in_dtype_a, in_dtype_b, out_dtype = get_in_out_dtypes(block_stmt)
+        intrin_info["in_dtype"] = in_dtype_a
+        intrin_info["in_dtype_a"] = in_dtype_a
+        intrin_info["in_dtype_b"] = in_dtype_b
         intrin_info["out_dtype"] = out_dtype
 
         if 70 <= check_sm_version(target.arch) < 80 and out_dtype == "int32":
@@ -626,9 +629,9 @@ def get_tensorized_func_and_tags(
 
     block_stmt = sch.get(main_block)
     if target.kind.name == "cuda" and check_sm_version(target.arch) >= 70:
-        in_dtype, out_dtype = get_in_out_dtypes(block_stmt)
-        if not is_tensorcore_supported_precision(in_dtype, out_dtype, arch=get_arch(target)):
-            logger.debug(f"The input and output dtype ({in_dtype}, {out_dtype})is not supported by tensorcore")
+        in_dtype_a, in_dtype_b, out_dtype = get_in_out_dtypes(block_stmt)
+        if not is_tensorcore_supported_precision(in_dtype_a, in_dtype_b, out_dtype, arch=get_arch(target)):
+            logger.debug(f"The input and output dtype ({in_dtype_a}, {in_dtype_b}, {out_dtype}) is not supported by tensorcore")
             return func, None
 
         # reindex and transform functions

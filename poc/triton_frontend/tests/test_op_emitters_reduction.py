@@ -336,13 +336,6 @@ def test_tt_scan_buffers_registered_in_local_buffers():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason="tt.dot emitter calls T.alloc_fragment / tilelang.compile gemm "
-    "which require an enclosing T.prim_func builder scope; this unit "
-    "test invokes the emitter directly. TODO: re-enable as an "
-    "integration test inside a tilelang.builder context, OR add a "
-    "direct-TIR helper analogous to _emit_tile_copy_tir for use here."
-)
 def test_tt_dot_emits_gemm_or_3loop_with_mul_add():
     """tt.dot(M=32, K=32, N=32, fp32) -> T.gemm OR explicit 3-loop nest.
 
@@ -350,6 +343,8 @@ def test_tt_dot_emits_gemm_or_3loop_with_mul_add():
     require the gemm path; otherwise we accept the manual fallback as
     long as the inner BufferStore on C is a multiply-accumulate.
     """
+    import tilelang.language as T
+
     ctx = WalkerCtx()
     a_ssa = _ssa("A", shape=[32, 32], dtype="float32")
     b_ssa = _ssa("B", shape=[32, 32], dtype="float32")
@@ -360,7 +355,14 @@ def test_tt_dot_emits_gemm_or_3loop_with_mul_add():
     ctx.bind(b_ssa, b_buf)
     op = _op("tt.dot", [a_ssa, b_ssa], [c_ssa])
 
-    handle = REDUCTION_EMITTERS["tt.dot"](op, ctx)
+    handles = []
+
+    @T.prim_func
+    def _test_func():
+        with T.Kernel(1, threads=128):
+            handles.append(REDUCTION_EMITTERS["tt.dot"](op, ctx))
+
+    handle = handles[0]
 
     # Path 1: tilelang.gemm path -- the handle string mentions gemm.
     try:

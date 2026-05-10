@@ -239,9 +239,6 @@ def tilelang_chunk_o_bwd_dqkwg(
 
                 if use_g:
                     T.clear(dg_last_fragment_scalar)
-                    # FIXME: The reduce operation of a whole buffer to a scalar is not supported and will cause incorrect result
-                    # for i_kv in T.Parallel(block_DK * block_DV):
-                    #     dg_last_fragment[i_kv] = h_shared[i_kv // block_DV, i_kv % block_DV] * dh_shared[i_kv // block_DV, i_kv % block_DV]
                     for i_kv in T.Parallel(block_DK * block_DV):
                         dg_last_fragment[i_kv] = h_shared[i_kv // block_DV, i_kv % block_DV] * dh_shared[i_kv // block_DV, i_kv % block_DV]
                     T.reduce_sum(dg_last_fragment, dg_last_fragment_scalar, dim=-1, clear=False)
@@ -279,7 +276,6 @@ def tilelang_chunk_o_bwd_dqkwg(
                 T.clear(dg_fragment_reduce_tmp)
                 for i_s, i_k in T.Parallel(block_S, block_DK):
                     dg_fragment_reduce_tmp[i_s, i_k] = dq_fragment[i_s, i_k] * q_shared[i_s, i_k]
-                # FIXME: The reduce_sum statement with clear=True will cause an error of warp specialized pass
                 T.reduce_sum(dg_fragment_reduce_tmp, dg_fragment, dim=-1, clear=False)
 
                 for i_s, i_k in T.Parallel(block_S, block_DK):
@@ -291,10 +287,8 @@ def tilelang_chunk_o_bwd_dqkwg(
                 T.clear(dg_fragment_reduce_tmp)
                 for i_s, i_k in T.Parallel(block_S, block_DK):
                     dg_fragment_reduce_tmp[i_s, i_k] = dk_fragment[i_s, i_k] * (-k_shared[i_s, i_k])
-                # FIXME: The reduce_sum statement with clear=True will cause an error of warp specialized pass
                 T.reduce_sum(dg_fragment_reduce_tmp, dg_fragment, dim=-1, clear=False)
 
-                # FIXME: The reduce operation of a whole buffer to a scalar is not supported and will cause incorrect result
                 T.copy(dk_fragment, dk_shared)
                 T.clear(dg_last_fragment_scalar_2)
                 for i_sk in T.Parallel(block_S * block_DK):
@@ -316,7 +310,6 @@ def tilelang_chunk_o_bwd_dqkwg(
                 for i_s1, i_s2 in T.Parallel(block_S, block_S):
                     ds_fragment_positive[i_s1, i_s2] = ds_fragment[i_s1, i_s2] * ds_fragment_positive[i_s1, i_s2]
 
-                # FIXME: The reduce_sum statement with clear=True will cause an error of warp specialized pass
                 T.reduce_sum(ds_fragment_positive, dg_fragment, dim=1, clear=False)
                 T.copy(dg_fragment, dg_shared_1)
 
@@ -324,7 +317,6 @@ def tilelang_chunk_o_bwd_dqkwg(
                 for i_s1, i_s2 in T.Parallel(block_S, block_S):
                     ds_fragment_positive_transpose[i_s2, i_s1] = ds_fragment_positive[i_s1, i_s2]
 
-                # FIXME: The reduce_sum statement with clear=True will cause an error of warp specialized pass
                 T.reduce_sum(ds_fragment_positive_transpose, dg_fragment_2, dim=1, clear=False)
                 T.copy(dg_fragment_2, dg_shared_2)
 

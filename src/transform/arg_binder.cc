@@ -971,6 +971,9 @@ void ArgBinder::BindDLTensors(
           // Also tolerate any stride when dim size is 1 (torch 2.1 DLPack bug).
           RelaxedStrideCheck(k, buffer->strides[k], stride_val,
                              buffer->shape[k], is_null, stride_element_name(k));
+          stride_from_shape =
+              analyzer_.Simplify(stride_from_shape *
+                                 cast(stride_dtype, buffer->shape[k]));
         }
       } else {
         PrimExpr stride_from_shape = 1;
@@ -981,9 +984,6 @@ void ArgBinder::BindDLTensors(
           PrimExpr explicit_stride =
               cast(stride_dtype,
                    BufferLoad(buf_strides, {IntImm(DataType::Int(32), k)}));
-          PrimExpr shape_stride =
-              cast(stride_dtype,
-                   BufferLoad(buf_shape, {IntImm(DataType::Int(32), k)}));
 
           PrimExpr stride_val = tvm::if_then_else(
               v_strides_is_null, stride_from_shape, explicit_stride);
@@ -993,6 +993,9 @@ void ArgBinder::BindDLTensors(
           // Also tolerate any stride when dim size is 1 (torch 2.1 DLPack bug).
           RelaxedStrideCheck(k, buffer->strides[k], stride_val,
                              buffer->shape[k], is_null, stride_element_name(k));
+          stride_from_shape =
+              analyzer_.Simplify(stride_from_shape *
+                                 cast(stride_dtype, buffer->shape[k]));
         }
       }
     }

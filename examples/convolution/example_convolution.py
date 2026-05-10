@@ -31,7 +31,7 @@ def convolution(N, C, H, W, F, K, S, D, P, block_M, block_N, block_K, num_stages
     OW = (W + 2 * P - D * (K - 1) - 1) // S + 1
     dtype = T.float16
     accum_dtype = T.float32
-    is_hopper = check_hopper()
+    is_hopper = False # check_hopper()  # TODO(@cy): TMA with convolution must be fixed in future.
 
     @T.prim_func
     def main(

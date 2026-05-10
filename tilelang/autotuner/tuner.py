@@ -63,30 +63,9 @@ def run_with_timeout(func, timeout, *args, **kwargs):
     return result
 
 
-# Configure logging for the autotuner module
-# TODO: Consider creating a common logger in utils
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-logger.propagate = False
+from tilelang.utils.logger import get_logger, init_logger_handlers
 
-# Lazy handler initialization flag
-_logger_handlers_initialized = False
-
-
-def _init_logger_handlers():
-    global _logger_handlers_initialized
-    if _logger_handlers_initialized:
-        return
-    formatter = logging.Formatter("%(asctime)s %(levelname)s:%(message)s")
-    file_handler = logging.FileHandler("autotuner.log", mode="w")
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    _logger_handlers_initialized = True
+logger = get_logger(__name__)
 
 
 def get_available_cpu_count() -> int:
@@ -332,7 +311,7 @@ class AutoTuner:
         Returns:
             AutotuneResult: Results of the auto-tuning process.
         """
-        _init_logger_handlers()
+        init_logger_handlers()
 
         sig = inspect.signature(self.fn)
         parameters = sig.parameters

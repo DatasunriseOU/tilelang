@@ -53,9 +53,8 @@ def flashattn(batch, heads, seqlen_q, seqlen_kv, dim, is_causal, block_M, block_
             T.fill(logsum, 0)
             T.fill(scores_max, -T.infinity(accum_dtype))
 
-            # TODO: Handle causal split case
             loop_range = (
-                T.min(T.ceildiv(seqlen_kv, block_N), T.ceildiv((mid + 1) * block_M, block_N))
+                T.max(0, T.min(T.ceildiv((seqlen_kv // num_split), block_N), T.ceildiv((mid + 1) * block_M - (seqlen_kv // num_split) * sid, block_N)))
                 if is_causal
                 else T.ceildiv((seqlen_kv // num_split), block_N)
             )
@@ -65,10 +64,9 @@ def flashattn(batch, heads, seqlen_q, seqlen_kv, dim, is_causal, block_M, block_
                     K[bid, (seqlen_kv // num_split) * sid + k * block_N : (seqlen_kv // num_split) * sid + (k + 1) * block_N, hid, :],
                     K_shared,
                 )
-                # TODO: Handle causal split case
                 if is_causal:
                     for i, j in T.Parallel(block_M, block_N):
-                        acc_s[i, j] = T.if_then_else(mid * block_M + i >= k * block_N + j, 0, -T.infinity(acc_s.dtype))
+                        acc_s[i, j] = T.if_then_else(mid * block_M + i >= (seqlen_kv // num_split) * sid + k * block_N + j, 0, -T.infinity(acc_s.dtype))
                 else:
                     T.clear(acc_s)
                 T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)

@@ -727,10 +727,7 @@ _OP_LINE = re.compile(
 # OP_TABLE-membership check; the text walker mirrors that behaviour with
 # an explicit allow-list so we can keep raising NotImplementedError on
 # truly-unknown ops (helps catch coverage regressions).
-# TODO: implement a real ``map_tt_func`` that builds the PrimFunc shell
-# from the TTIR function signature instead of relying on the implicit
-# ``_make_prim_func(ctx)`` epilogue.
-_TTIR_STRUCTURAL_OPS = frozenset({"tt.func", "tt.return"})
+_TTIR_STRUCTURAL_OPS = frozenset({"tt.return"})
 
 
 def _walk_text_ttir(
@@ -868,14 +865,6 @@ def _walk_mlir_module(
         # set for emitters that haven't been migrated yet.
         if _emitter_owns_regions(op_name_str) or op_name_str in OPS_THAT_HANDLE_OWN_REGIONS:
             return
-        # Helper tt.func: a tt.func whose sym_name is referenced by some
-        # tt.call is inlined at the call site. We must NOT re-walk its
-        # body here -- doing so would double-emit and (worse) the helper's
-        # block-args are not bound at module-level so dispatch would fail.
-        if op_name_str == "tt.func" and ctx is not None:
-            sym = _func_sym_name(op)
-            if sym and sym in ctx.callee_used:
-                return
         # Recurse into regions/blocks.
         for region in getattr(op, "regions", ()) or ():
             for block in getattr(region, "blocks", ()) or ():
@@ -999,7 +988,7 @@ def from_ttir(
     ctx = WalkerCtx()
     # Plumb optional ``num_warps`` / ``num_stages`` overrides supplied by
     # the harness (which captures them from Triton's compile options) so
-    # ``_make_prim_func`` can stamp the right ``threadIdx.x`` extent and
+    # ``map_tt_func`` can stamp the right ``threadIdx.x`` extent and
     # PrimFunc attrs. Falsy values keep the WalkerCtx defaults intact.
     if num_warps is not None:
         ctx.num_warps = int(num_warps)

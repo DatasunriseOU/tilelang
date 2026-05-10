@@ -24,9 +24,8 @@ pytest.importorskip("tilelang")
 from poc.triton_frontend.op_mapping import (  # noqa: E402
     WalkerCtx,
     map_tt_atomic_rmw,
-    map_tt_dot,
-    map_tt_reduce,
 )
+from poc.triton_frontend.op_emitters.reduction import map_tt_dot, map_tt_reduce
 
 
 # ---------------------------------------------------------------------------
@@ -58,15 +57,10 @@ def _stringify(stmt: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason="map_tt_dot calls T.alloc_fragment which requires an enclosing "
-    "T.prim_func builder scope; this unit test invokes the emitter "
-    "directly. TODO: re-enable by wrapping in tilelang.builder context "
-    "(see _emit_tile_copy_tir pattern in op_emitters/memory.py for the "
-    "direct-TIR helper that bypasses the builder)."
-)
 def test_tt_dot_lowering_emits_gemm() -> None:
     """``tt.dot(A, B)`` (no accumulator) lowers to a ``tl.tileop.gemm`` call."""
+    import tilelang.language as T
+
     ctx = WalkerCtx()
     a_ssa = _fake_value("a_ssa", shape=[16, 32], dtype="float16")
     b_ssa = _fake_value("b_ssa", shape=[32, 16], dtype="float16")
@@ -84,7 +78,14 @@ def test_tt_dot_lowering_emits_gemm() -> None:
         "attrs": {},
     }
 
-    handle = map_tt_dot(op, ctx)
+    handles = []
+
+    @T.prim_func
+    def _test_func():
+        with T.Kernel(1, threads=128):
+            handles.append(map_tt_dot(op, ctx))
+
+    handle = handles[0]
     text = _stringify(handle) + " " + _stringify(ctx.stmts)
     assert "gemm" in text.lower(), f"expected gemm in emitted TIR: {text!r}"
 
@@ -162,11 +163,6 @@ def test_tt_atomic_rmw_dispatch(kind: str, expected_substr: str, dtype: str) -> 
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason="map_tt_reduce calls T.alloc_fragment which requires an enclosing "
-    "T.prim_func builder scope; this unit test invokes the emitter directly. "
-    "TODO: re-enable by wrapping in tilelang.builder context."
-)
 @pytest.mark.parametrize(
     "combiner, expected_substr",
     [
@@ -176,6 +172,8 @@ def test_tt_atomic_rmw_dispatch(kind: str, expected_substr: str, dtype: str) -> 
 )
 def test_tt_reduce_combiner_dispatch(combiner: str, expected_substr: str) -> None:
     """``tt.reduce`` picks the right ``T.reduce_*`` based on its combiner."""
+    import tilelang.language as T
+
     ctx = WalkerCtx()
     src_ssa = _fake_value("src", shape=[16, 32], dtype="float32")
     res_ssa = _fake_value("dst", shape=[16], dtype="float32")
@@ -191,7 +189,14 @@ def test_tt_reduce_combiner_dispatch(combiner: str, expected_substr: str) -> Non
         "combiner": combiner,
     }
 
-    out_buf = map_tt_reduce(op, ctx)
+    out_bufs = []
+
+    @T.prim_func
+    def _test_func():
+        with T.Kernel(1, threads=128):
+            out_bufs.append(map_tt_reduce(op, ctx))
+
+    out_buf = out_bufs[0]
     # Walk emitted statements + the bound result for the combiner-specific
     # call_intrin name. Reduce internally lowers via macros that may not
     # leave a literal ``reduce_sum`` substring in __str__; the safest

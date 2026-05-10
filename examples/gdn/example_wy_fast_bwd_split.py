@@ -310,6 +310,7 @@ def tilelang_wy_fast_bwd_split(
             dA_shared = T.alloc_shared((block_S, block_S), dtype=input_dtype)
             dA_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
             dA_A_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
+            dA_A_fragment_transpose = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
             dA_A_fragment_1 = T.alloc_fragment((block_S,), dtype=accum_dtype)
             dA_A_fragment_2 = T.alloc_fragment((block_S,), dtype=accum_dtype)
             dk_shared = T.alloc_shared((block_S, block_DK), dtype=input_dtype)
@@ -395,10 +396,10 @@ def tilelang_wy_fast_bwd_split(
             T.copy(A_fragment, A_shared)
             for i_s1, i_s2 in T.Parallel(block_S, block_S):
                 dA_A_fragment[i_s1, i_s2] = dA_fragment[i_s1, i_s2] * A_fragment[i_s1, i_s2]
-            # Note: Reduce operation now not supported in shared memory
-            # FIXME: reduce will cause incorrect result when dim != -1
+                dA_A_fragment_transpose[i_s2, i_s1] = dA_A_fragment[i_s1, i_s2]
+            
             T.reduce_sum(dA_A_fragment, dA_A_fragment_1, dim=1)
-            T.reduce_sum(dA_A_fragment, dA_A_fragment_2, dim=0)
+            T.reduce_sum(dA_A_fragment_transpose, dA_A_fragment_2, dim=1)
 
             for i_s1, i_s2 in T.Parallel(block_S, block_S):
                 dg_A_positive[bb, bs * block_S + i_s1, bh, i_s2] = dA_A_fragment[i_s1, i_s2]

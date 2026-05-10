@@ -295,6 +295,7 @@ void CodeGenCHost::PrintCallPacked(const tvm::tirx::CallNode *op) {
   this->stream << result << ".v_int64 = 0;\n";
 
   int metal_scope;
+  int stream_hook_scope;
   std::string metal_result;
   if (is_in_metal_context) {
     metal_result = name_supply_->FreshName("metal_ret");
@@ -306,8 +307,17 @@ void CodeGenCHost::PrintCallPacked(const tvm::tirx::CallNode *op) {
     this->PrintLine("const id<MTLCommandBuffer> commandBuffer = "
                     "torch::mps::get_command_buffer();");
     this->PrintLine(
-        "const auto f = tvm::ffi::Function::GetGlobal(\"metal.SetStream\");");
-    this->PrintLine("(*f)(static_cast<TVMStreamHandle>(commandBuffer));");
+        "const auto set_stream = tvm::ffi::Function::GetGlobal(\"metal.SetStream\");");
+    this->PrintLine("if (!set_stream.has_value()) {");
+    int missing_stream_hook_scope = this->BeginScope();
+    this->PrintLine(
+        "TVMFFIErrorSetRaisedFromCStr(\"RuntimeError\", "
+        "\"metal.SetStream runtime hook is not registered\");");
+    this->PrintLine(metal_result, " = -1;");
+    this->EndScope(missing_stream_hook_scope);
+    this->PrintLine("} else {");
+    stream_hook_scope = this->BeginScope();
+    this->PrintLine("(*set_stream)(static_cast<TVMStreamHandle>(commandBuffer));");
   }
 
   this->PrintIndent();
@@ -329,6 +339,9 @@ void CodeGenCHost::PrintCallPacked(const tvm::tirx::CallNode *op) {
   this->PrintLine("}");
 
   if (is_in_metal_context) {
+    this->PrintLine("(*set_stream)(static_cast<TVMStreamHandle>(nullptr));");
+    this->EndScope(stream_hook_scope);
+    this->PrintLine("}");
     this->EndScope(metal_scope);
     this->PrintLine("});");
     this->PrintLine("if (", metal_result, " != 0) return ", metal_result, ";");
