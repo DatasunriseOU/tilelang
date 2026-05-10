@@ -31,10 +31,9 @@ def _load_register_dialects():
     # Fallback: combined frontend pybind module (when the project chooses
     # to fold the shim into a single .so).
     try:
-        from poc.triton_frontend._triton_frontend_cxx import (  # type: ignore
-            register_dialects,
-        )
-        return register_dialects
+        from poc.triton_frontend.ptr_analysis import shim_available, _load_shim
+        if shim_available():
+            return _load_shim().register_dialects
     except ImportError:
         return None
 
@@ -48,6 +47,7 @@ def _main() -> int:
 
     try:
         from mlir import ir  # type: ignore
+        from mlir.dialects import func, arith, scf, tensor, math  # type: ignore
     except ImportError as exc:
         print(f"SKIP: mlir python bindings not available ({exc})")
         return 0

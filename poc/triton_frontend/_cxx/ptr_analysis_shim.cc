@@ -41,7 +41,9 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -200,6 +202,22 @@ TLPtrAnalysisStatus tl_pa_run_rewrite(TLPtrAnalysisModule* mod,
   if (!mod) return TL_PA_ERR_NULL_HANDLE;
   auto* m = reinterpret_cast<ModuleImpl*>(mod);
   mlir::ModuleOp moduleOp = m->module.get();
+
+  std::unordered_set<std::string> seenDiagnostics;
+  mlir::ScopedDiagnosticHandler diagHandler(moduleOp.getContext(),
+      [&](mlir::Diagnostic& diag) {
+        std::string diagStr;
+        llvm::raw_string_ostream os(diagStr);
+        diag.print(os);
+        os.flush();
+        if (seenDiagnostics.insert(diagStr).second) {
+          // New diagnostic. Allow next handler to process it (e.g. print it).
+          return mlir::failure();
+        }
+        // Duplicate diagnostic. Return success to consume/suppress it.
+        return mlir::success();
+      });
+
   mlir::tts::PtrAnalysis pa(
       static_cast<bool>(enable_make_gather_scatter_tensor_ptr));
   pa.initializeMaybeStructuredArgs(moduleOp);

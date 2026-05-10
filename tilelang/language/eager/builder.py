@@ -837,7 +837,9 @@ def get_type_hints(func):
     # Build eval namespaces from function globals plus captured closure variables
     # This lets annotations reference symbols like `n`, `h`, or dtype vars
     # defined in the outer scope of a nested function.
-    globalns = func.__globals__
+    import sys
+    globalns = dict(getattr(sys.modules.get(func.__module__, None), "__dict__", {}))
+    globalns.update(func.__globals__)
     # Here we add nonlocals into localns, to capture the parameters declared in the parent function
     # ```py
     # def foo():

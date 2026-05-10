@@ -22,6 +22,8 @@
 #include <string>
 
 #include "ptr_analysis_shim.h"
+#include "RegisterTritonStructured.h"
+#include "mlir/IR/MLIRContext.h"
 
 namespace py = pybind11;
 
@@ -192,13 +194,18 @@ PYBIND11_MODULE(_triton_frontend_cxx, m) {
         py::arg("enable_make_gather_scatter_tensor_ptr") = false,
         py::arg("use_unsafe_mask") = false);
 
-  // Dialect registration is handled inside Context's constructor; this is a
-  // no-op kept for API symmetry with mlir-python-bindings users.
+  // Dialect registration via C++ shim
   m.def("register_dialects",
-        [](py::object /*ctx*/) {
-          // No-op: the C++ context owns dialect registration. When MLIR
-          // upstream Python bindings are wired in, this hook will register
-          // TritonStructured into the user-supplied mlir.ir.Context.
+        [](py::object ctx_obj) {
+          py::object capi = ctx_obj.attr("_CAPIPtr");
+          auto* mlir_ctx = static_cast<mlir::MLIRContext*>(
+              PyCapsule_GetPointer(capi.ptr(), "mlir.ir.Context._CAPIPtr"));
+          if (!mlir_ctx) {
+            throw py::value_error(
+                "register_dialects: ctx._CAPIPtr did not yield a valid "
+                "MLIRContext pointer");
+          }
+          mlir::triton_shared_vendored::registerTritonStructured(*mlir_ctx);
         },
         py::arg("ctx"));
 }

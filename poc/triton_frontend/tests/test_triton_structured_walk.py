@@ -23,8 +23,9 @@ def _try_load_register_dialects():
     except ImportError:
         pass
     try:
-        from poc.triton_frontend._triton_frontend_cxx import register_dialects  # type: ignore
-        return register_dialects
+        from poc.triton_frontend.ptr_analysis import shim_available, _load_shim
+        if shim_available():
+            return _load_shim().register_dialects
     except ImportError:
         return None
 
@@ -32,6 +33,7 @@ def _try_load_register_dialects():
 def _try_import_mlir_ir():
     try:
         from mlir import ir  # type: ignore
+        from mlir.dialects import func, arith, scf, tensor, math  # type: ignore
         return ir
     except ImportError:
         return None

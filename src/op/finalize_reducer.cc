@@ -100,7 +100,7 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
   if (extent == 1)
     return Evaluate(0);
 
-  std::array op_names{"tl::SumOp", "tl::MaxOp", "tl::MinOp"};
+  std::array op_names{"tl::SumOp", "tl::MaxOp", "tl::MinOp", "tl::MulOp"};
   auto op_str = op_names[(int)op];
 
   // adopted from ReduceOp

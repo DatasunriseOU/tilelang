@@ -39,8 +39,7 @@ void registerTritonStructured(::mlir::MLIRContext &context) {
   ::mlir::DialectRegistry registry;
   registerTritonStructured(registry);
   context.appendDialectRegistry(registry);
-  context.loadDialect<::mlir::tts::TritonStructuredDialect>();
-  context.loadDialect<::mlir::triton::TritonDialect>();
+  context.loadAllAvailableDialects();
 }
 
 }  // namespace triton_shared_vendored

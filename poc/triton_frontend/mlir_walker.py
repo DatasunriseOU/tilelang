@@ -182,6 +182,7 @@ def try_import_mlir() -> Optional[ModuleType]:
     _augment_sys_path_from_env()
     try:
         from mlir import ir  # type: ignore  # noqa: WPS433
+        from mlir.dialects import func, arith, scf, tensor, math  # type: ignore # noqa: F401
         return ir
     except Exception:  # ImportError or platform-specific dynload failure
         if not _WARNED_ONCE:
@@ -207,8 +208,19 @@ def parse_ttir(text: str) -> Optional[Any]:
     ir = try_import_mlir()
     if ir is None:
         return None
+
+    register_dialects = None
+    try:
+        from poc.triton_frontend.ptr_analysis import shim_available, _load_shim
+        if shim_available():
+            register_dialects = _load_shim().register_dialects
+    except ImportError:
+        pass
+
     try:
         ctx = ir.Context()
+        if register_dialects is not None:
+            register_dialects(ctx)
         # Triton TTIR mixes ``tt.*`` (Triton dialect) with ``arith.*`` /
         # ``scf.*`` / ``builtin``. The latter three are typically
         # registered by default; ``tt.*`` won't be on a vanilla LLVM

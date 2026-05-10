@@ -446,6 +446,15 @@ def extern_intrinsic(
         raise ``TypeError`` or silently produce wrong frags (perf review
         finding #1).
         """
+        # If invoked by Python's `@` syntax as `@extern_intrinsic(...)`, this
+        # function receives the decorated function as its sole argument. We
+        # return ourselves to replace the user's stub with this emitter.
+        if len(runtime_args) == 1 and not runtime_kwargs and callable(runtime_args[0]) and not _looks_like_buffer(runtime_args[0]):
+            func = runtime_args[0]
+            _emit.__name__ = func.__name__
+            _emit.__doc__ = func.__doc__ or _emit.__doc__
+            return _emit
+
         shape_args, buffer_args = _split_shape_and_buffer_args(runtime_args)
         shape_kwargs, buffer_kwargs = _split_shape_and_buffer_kwargs(runtime_kwargs)
         frags = tuple(intrinsic.signature(*shape_args, **shape_kwargs))

@@ -1217,6 +1217,104 @@ def map_tt_atomic_cas(op: Any, ctx: EmitContext) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# tt.histogram -- histogram count into a 1D tensor
+# ---------------------------------------------------------------------------
+
+def map_tt_histogram(op: Any, ctx: EmitContext) -> Any:
+    """Lower ``tt.histogram`` to a ``tir.For`` loop updating a bin buffer.
+
+    Triton semantics:
+      out = tt.histogram(src, mask?)
+      where `out` is a 1D tensor of shape [num_bins].
+    """
+    tir = ctx.tir()
+    operands = _operands(op)
+    if not operands:
+        raise EmitError("tt.histogram: missing source operand")
+
+    src_ssa = operands[0]
+    src = ctx.get(src_ssa)
+    mask = ctx.get(operands[1]) if len(operands) > 1 else None
+
+    src_shape = _shape_of(src_ssa)
+    if not src_shape:
+        raise EmitError("tt.histogram: source operand has unknown shape")
+
+    results = _results(op)
+    if not results:
+        raise EmitError("tt.histogram: missing result")
+
+    result_ssa = results[0]
+    out_shape = _shape_of(result_ssa)
+    if not out_shape or len(out_shape) != 1:
+        raise EmitError("tt.histogram: result must be a 1D tensor")
+
+    num_bins = int(out_shape[0])
+    out_dtype = _dtype_of(result_ssa)
+
+    # Allocate the histogram buffer.
+    hist_buf = _alloc_tile_buffer(ctx, [num_bins], out_dtype, ctx.fresh("histogram"))
+
+    # Init loop: hist_buf[i] = 0
+    init_var = tir.Var(ctx.fresh("i"), "int32")
+    init_store = tir.BufferStore(hist_buf, tir.const(0, out_dtype), [init_var])
+    init_for = tir.For(
+        init_var,
+        tir.const(0, "int32"),
+        tir.const(num_bins, "int32"),
+        tir.ForKind.SERIAL,
+        init_store,
+    )
+
+    # Accumulation loop: iterate over src_shape
+    vars = []
+    extents = []
+    for i, ext in enumerate(src_shape):
+        v = tir.Var(ctx.fresh(f"i{i}"), "int32")
+        vars.append(v)
+        extents.append(int(ext))
+
+    # Read src
+    if hasattr(src, "shape") and hasattr(src, "dtype"):
+        src_val = tir.BufferLoad(src, list(vars))
+    else:
+        src_val = src
+
+    bin_idx = tir.Cast("int32", src_val)
+    bin_load = tir.BufferLoad(hist_buf, [bin_idx])
+    bin_store = tir.BufferStore(hist_buf, tir.Add(bin_load, tir.const(1, out_dtype)), [bin_idx])
+
+    in_bounds = tir.And(tir.GE(bin_idx, tir.const(0, "int32")), tir.LT(bin_idx, tir.const(num_bins, "int32")))
+
+    if mask is not None:
+        if hasattr(mask, "shape") and hasattr(mask, "dtype"):
+            mask_val = tir.BufferLoad(mask, list(vars))
+        else:
+            mask_val = mask
+        if getattr(mask_val, "dtype", None) != "bool":
+            mask_val = tir.Cast("bool", mask_val)
+        condition = tir.And(mask_val, in_bounds)
+        update = tir.IfThenElse(condition, bin_store, None)
+    else:
+        update = tir.IfThenElse(in_bounds, bin_store, None)
+
+    accum_for = update
+    for v, ext in zip(reversed(vars), reversed(extents)):
+        accum_for = tir.For(
+            v,
+            tir.const(0, "int32"),
+            tir.const(ext, "int32"),
+            tir.ForKind.SERIAL,
+            accum_for,
+        )
+
+    body = tir.SeqStmt([init_for, accum_for])
+    ctx.emit(body)
+    ctx.bind(result_ssa, hist_buf)
+    return body
+
+
+# ---------------------------------------------------------------------------
 # Dispatch table -- merged into op_mapping.OP_TABLE.
 # ---------------------------------------------------------------------------
 
@@ -1233,6 +1331,8 @@ REDUCTION_EMITTERS: Dict[str, Callable[[Any, EmitContext], Any]] = {
     # Reductions / scans
     "tt.reduce": map_tt_reduce,
     "tt.scan": map_tt_scan,
+    # Histogram
+    "tt.histogram": map_tt_histogram,
     # Matmul
     "tt.dot": map_tt_dot,
     # Atomics (Triton names: tt.atomic_<op>; the legacy tt.atomic_rmw with

@@ -401,7 +401,7 @@ def test_op_table_has_expected_size() -> None:
     """
     from poc.triton_frontend.op_mapping import OP_TABLE
 
-    EXPECTED = 86
+    EXPECTED = 89
     assert len(OP_TABLE) == EXPECTED, (
         f"OP_TABLE size changed from {EXPECTED} to {len(OP_TABLE)}; "
         f"if intentional, update this constant + the three README "
@@ -566,3 +566,52 @@ def test_op_mapping_live_canonical_emitters_unmarked() -> None:
         f"'# DEAD-BUT-LOADED:' marker: {falsely_marked!r}. Remove the "
         f"marker -- a false-positive label hides real dead code."
     )
+
+
+def test_sanitize_printf_format():
+    from poc.triton_frontend.op_mapping import _sanitize_printf_format
+
+    assert _sanitize_printf_format("%n") == "%%n"
+    assert _sanitize_printf_format("hello %n world") == "hello %%n world"
+    assert _sanitize_printf_format("%%n") == "%%n"
+    assert _sanitize_printf_format("%%%n") == "%%%%n"
+    assert _sanitize_printf_format("%10n") == "%%10n"
+    assert _sanitize_printf_format("%-10.5lln") == "%%-10.5lln"
+    assert _sanitize_printf_format("Valid %d and %s") == "Valid %d and %s"
+    assert _sanitize_printf_format("%n%n") == "%%n%%n"
+    assert _sanitize_printf_format("%%n%n") == "%%n%%n"
+    assert _sanitize_printf_format("") == ""
+
+
+def test_tt_async_commit_and_wait() -> None:
+    """Test that tt.async_commit_group and tt.async_wait emit the proper
+    ptx_commit_group and ptx_wait_group instructions.
+    """
+    from poc.triton_frontend.op_mapping import map_tt_async_copy
+
+    ctx = WalkerCtx()
+    # Test async_commit_group
+    op_commit = _FakeMlirOp(
+        name="tt.async_commit_group",
+        operands=[],
+        results=[],
+        printed='"tt.async_commit_group"() : () -> ()',
+    )
+    handle_commit = map_tt_async_copy(op_commit, ctx)
+    assert handle_commit is not None
+    # Depending on TileLang lazy import, it might be a Stmt or Expr.
+    # It should have "ptx_commit_group" inside it.
+    assert "ptx_commit_group" in str(handle_commit)
+
+    # Test async_wait
+    op_wait = _FakeMlirOp(
+        name="tt.async_wait",
+        operands=[],
+        results=[],
+        printed='"tt.async_wait"() <{num = 2 : i32}> : () -> ()',
+    )
+    handle_wait = map_tt_async_copy(op_wait, ctx)
+    assert handle_wait is not None
+    # Should have "ptx_wait_group" and the argument '2'
+    assert "ptx_wait_group" in str(handle_wait)
+    assert "2" in str(handle_wait)

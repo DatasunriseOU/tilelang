@@ -1103,6 +1103,36 @@ LogicalResult PtrAnalysis::visitOperandMakeTPtr(tts::MakeTensorPtrOp makeTPtrOp,
   return success();
 }
 
+LogicalResult PtrAnalysis::visitOperandMakeGatherScatterTPtr(
+    tts::MakeGatherScatterTensorPtrOp makeTPtrOp, PtrState &state,
+    const Location loc, OpBuilder &builder) {
+  assert(state.isEmpty());
+  state.source = makeTPtrOp.getBase();
+  state.offsets = makeTPtrOp.getMixedOffsets();
+  
+  // Convert sizes (vector of int64_t) to vector of OpFoldResult
+  for (int64_t size : makeTPtrOp.getSizes()) {
+    state.sizes.push_back(builder.getIndexAttr(size));
+  }
+  
+  state.strides = makeTPtrOp.getMixedStrides();
+  
+  // Note: MakeGatherScatterTensorPtrOp does not have getMixedShape() or getOrder()
+  // We can leave state.shape and state.order empty or populated with defaults if needed.
+  // Actually, for gather/scatter, the unstructured dim is set.
+  // Let's populate shape with sizes for now, and order with 0..rank-1
+  for (size_t i = 0; i < state.sizes.size(); ++i) {
+    state.shape.push_back(state.sizes[i]);
+    state.order.push_back(i);
+  }
+
+  // Restore the non-continuous dimension offset to state.offsets
+  int nonContinuousDim = makeTPtrOp.getGatherScatterDim();
+  state.offsets[nonContinuousDim] = makeTPtrOp.getGatherScatterOffset();
+
+  return success();
+}
+
 LogicalResult PtrAnalysis::visitOperandForOp(scf::ForOp forOp, Value operand,
                                              PtrState &state,
                                              const Location loc,
@@ -1219,6 +1249,10 @@ LogicalResult PtrAnalysis::visitOperand(Value operand, PtrState &state,
     return visitOperandRem(op, state, loc, builder);
   } else if (auto op = operand.getDefiningOp<arith::ExtSIOp>()) {
     return visitOperandExtSI(op, state, loc, builder);
+  } else if (auto op = operand.getDefiningOp<tts::MakeTensorPtrOp>()) {
+    return visitOperandMakeTPtr(op, state, loc, builder);
+  } else if (auto op = operand.getDefiningOp<tts::MakeGatherScatterTensorPtrOp>()) {
+    return visitOperandMakeGatherScatterTPtr(op, state, loc, builder);
   } else if (auto op = operand.getDefiningOp<scf::ForOp>()) {
     return visitOperandForOp(op, operand, state, loc, builder);
   } else if (!operand.getDefiningOp()) {

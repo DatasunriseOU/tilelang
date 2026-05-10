@@ -34,6 +34,7 @@ import re
 import sys
 import warnings
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -530,6 +531,7 @@ def extract_ptr_states(ttir_text: str) -> List[PtrState]:
     return _parse_states_json(raw)
 
 
+@lru_cache(maxsize=128)
 def run_ptr_analysis_with_states(
     ttir_text: str,
 ) -> Tuple[str, List[PtrState]]:

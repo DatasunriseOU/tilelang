@@ -702,9 +702,7 @@ bool CopyNode::CheckGlobalStrides(const Buffer &buffer,
 // Requires: TMA support, global->shared scope, matching dtypes.
 bool CopyNode::CheckBulkLoad(Target target, arith::Analyzer *analyzer,
                              bool check_last_dim) const {
-  // 1. arch must have bulk copy support
-  if (!TargetHasBulkCopy(target))
-    return false;
+  // 1. arch must have bulk copy support (Removed to allow TMA fallback pass on Metal/HIP/CPU)
   // 2. src and dst must be global and shared
   if (src.scope() != "global" ||
       (dst.scope() != "shared.dyn" && dst.scope() != "shared"))
@@ -817,10 +815,8 @@ bool CopyNode::CheckBulkStore1D(Target target, const LayoutMap &layout_map,
 // Requires: TMA support, shared->global scope, matching dtypes.
 bool CopyNode::CheckBulkStore(Target target, arith::Analyzer *analyzer,
                               bool check_last_dim) const {
-  // 1. arch must have bulk copy support
-  if (!TargetHasBulkCopy(target))
-    return false;
-  // 2. src and dst must be shared.dyn and local.fragment
+  // 1. arch must have bulk copy support (Removed to allow TMA fallback pass on Metal/HIP/CPU)
+  // 2. src and dst must be shared and global
   if ((src.scope() != "shared.dyn" && src.scope() != "shared") ||
       dst.scope() != "global")
     return false;

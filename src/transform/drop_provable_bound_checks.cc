@@ -247,7 +247,7 @@ class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
         auto [lo64, hi64] = *bounds;
         PrimExpr lo = make_const(v.dtype(), lo64);
         PrimExpr hi = make_const(v.dtype(), hi64);
-        scopes.emplace_back(z3, (v >= lo) && (v < hi));
+        scopes.emplace_back(z3, (v >= lo) && (v <= hi));
         if (scopes.size() > 8) {
           bail = true;  // don't blow up the solver
           break;

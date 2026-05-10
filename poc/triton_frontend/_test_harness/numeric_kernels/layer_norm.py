@@ -54,6 +54,17 @@ RTOL = 1e-3
 if triton is not None:
 
     @triton.jit
+    def _welford_combine(mean_1, m2_1, weight_1, mean_2, m2_2, weight_2):
+        delta = mean_2 - mean_1
+        new_weight = weight_1 + weight_2
+        w2_over_w = weight_2 / new_weight
+        return (
+            mean_1 + delta * w2_over_w,
+            m2_1 + m2_2 + delta * delta * weight_1 * w2_over_w,
+            new_weight,
+        )
+
+    @triton.jit
     def _layer_norm_fwd_kernel(
         x_ptr,
         w_ptr,
@@ -70,10 +81,13 @@ if triton is not None:
         mask = col_offsets < n_cols
         x_row_ptrs = x_ptr + row * x_row_stride + col_offsets
         x = tl.load(x_row_ptrs, mask=mask, other=0.0)
-        mean = tl.sum(x, axis=0) / n_cols
-        x_centered = tl.where(mask, x - mean, 0.0)
-        var = tl.sum(x_centered * x_centered, axis=0) / n_cols
+        
+        weight = tl.where(mask, 1.0, 0.0)
+        mean, m2, _weight = tl.reduce((x, tl.zeros_like(x), weight), axis=0, combine_fn=_welford_combine)
+        
+        var = m2 / n_cols
         rstd = 1.0 / tl.sqrt(var + eps)
+        x_centered = tl.where(mask, x - mean, 0.0)
         w = tl.load(w_ptr + col_offsets, mask=mask, other=0.0)
         b = tl.load(b_ptr + col_offsets, mask=mask, other=0.0)
         y = x_centered * rstd * w + b

@@ -1040,6 +1040,18 @@ def map_tt_load(op: Any, ctx: WalkerCtx) -> Any:
     #  * an opaque value used as the buffer with offset 0 (MVP path).
     resolved = ctx.get(ptr_ssa) if ptr_ssa in ctx.value_map else None
 
+    if (resolved is None or not (isinstance(resolved, dict) and "_ptrstate" in resolved)):
+        from .op_emitters.memory import _lookup_ptr_state
+        state = _lookup_ptr_state(ctx, op, ptr_ssa)
+        if state is not None:
+            resolved = {
+                "_ptrstate": state,
+                "source": state.source,
+                "offsets": list(state.offsets),
+                "sizes": list(state.sizes),
+                "strides": list(state.strides),
+            }
+
     # Tile path: PtrState describes >1 element along at least one axis -> T.copy.
     if isinstance(resolved, dict) and "_ptrstate" in resolved and _ptrstate_is_tile(resolved):
         return _emit_load_copy(op, ctx, resolved, mask_ssa, other_ssa)
@@ -1130,6 +1142,18 @@ def map_tt_store(op: Any, ctx: WalkerCtx) -> Any:
 
     resolved = ctx.get(ptr_ssa) if ptr_ssa in ctx.value_map else None
     val_expr = ctx.get(val_ssa)
+
+    if (resolved is None or not (isinstance(resolved, dict) and "_ptrstate" in resolved)):
+        from .op_emitters.memory import _lookup_ptr_state
+        state = _lookup_ptr_state(ctx, op, ptr_ssa)
+        if state is not None:
+            resolved = {
+                "_ptrstate": state,
+                "source": state.source,
+                "offsets": list(state.offsets),
+                "sizes": list(state.sizes),
+                "strides": list(state.strides),
+            }
 
     # Tile path: PtrState describes >1 element along at least one axis -> T.copy.
     if isinstance(resolved, dict) and "_ptrstate" in resolved and _ptrstate_is_tile(resolved):
@@ -1746,9 +1770,32 @@ def map_tt_async_copy(op: Any, ctx: WalkerCtx) -> Any:
     op_name = op.get("name") if isinstance(op, dict) else getattr(op, "name", "")
     name = str(op_name).lower()
 
-    # Commit / wait are pipeline boundary markers: no-ops at TIR layer.
-    if "commit" in name or "wait" in name:
-        return None
+    # Commit / wait are pipeline boundary markers.
+    if "commit" in name:
+        import tilelang.language as T  # type: ignore  # lazy
+        if hasattr(T, "ptx_commit_group"):
+            handle = T.ptx_commit_group()
+        else:
+            tir = ctx.tir()
+            handle = tir.call_intrin("handle", tir.op.Op.get("tir.ptx_commit_group"))
+        
+        tir = ctx.tir()
+        ctx.emit(tir.Evaluate(handle))
+        return handle
+
+    if "wait" in name:
+        attrs = _attrs_with_properties_shared(op)
+        num = int(attrs.get("num", 0))
+        import tilelang.language as T  # type: ignore  # lazy
+        if hasattr(T, "ptx_wait_group"):
+            handle = T.ptx_wait_group(num)
+        else:
+            tir = ctx.tir()
+            handle = tir.call_intrin("handle", tir.op.Op.get("tir.ptx_wait_group"), num)
+        
+        tir = ctx.tir()
+        ctx.emit(tir.Evaluate(handle))
+        return handle
 
     operands = _operands(op)
     if len(operands) < 2:
@@ -2028,12 +2075,23 @@ def _sanitize_printf_format(fmt: str) -> str:
     controlling the format would still need a matching argument list to
     leak anything non-trivial, and our caller fixes the arg count.
     """
+    import re
     if not fmt:
         return fmt
-    out = fmt
-    for bad in _PRINTF_FORBIDDEN_SPECS:
-        out = out.replace(bad, "%" + bad)  # %n -> %%n (literal)
-    return out
+    
+    # Split the format string by literal % (which is written as %%)
+    # This prevents us from accidentally thinking the second % in %%n is a format start.
+    parts = fmt.split("%%")
+    sanitized_parts = []
+    
+    for p in parts:
+        # Match % followed by optional flags, width, precision, length modifiers, and 'n'
+        # e.g., %n, %lln, %10n, %-10.5lln, %*.*n
+        # Replace the matched string with % + matched (e.g., %n -> %%n)
+        p = re.sub(r'%(?:[-+ #0\'I]*)(?:[0-9*]*)(?:\.[0-9*]*)?(?:hh|h|ll|l|j|z|t|L)*n', lambda m: '%' + m.group(0), p)
+        sanitized_parts.append(p)
+        
+    return "%%".join(sanitized_parts)
 
 
 # ---------------------------------------------------------------------------

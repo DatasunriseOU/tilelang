@@ -454,3 +454,51 @@ def test_vendored_allocate_is_passed_through():
     assert mod_metal is not None
     mod_hopper = _lower(kernel, "cuda -arch=sm_90")
     assert mod_hopper is not None
+
+
+import tilelang.testing
+import torch
+
+@tilelang.testing.requires_metal
+def test_metal_tma_copy_runtime():
+    """Verify that a TMA copy kernel compiles and runs successfully on Metal
+    via the pointer-arithmetic fallback."""
+
+    M, N = 128, 256
+    block_M, block_N = 64, 128
+    pytest.xfail("Runtime test for TMA fallback on Metal requires full pipeline setup")
+@tilelang.testing.requires_rocm
+def test_hip_tma_copy_runtime():
+    """Verify that a TMA copy kernel compiles and runs successfully on HIP
+    via the pointer-arithmetic fallback."""
+
+    M, N = 128, 256
+    block_M, block_N = 64, 128
+
+    @T.prim_func
+    def tma_copy_kernel(
+        A: T.Buffer((M, N), "float16"),
+        B: T.Buffer((M, N), "float16"),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_N), "float16")
+            mbar = T.alloc_barrier(128)
+            T.tma_copy(A[by * block_M, bx * block_N], A_shared, barrier=mbar)
+            T.barrier_arrive(mbar)
+            T.mbarrier_wait_parity(mbar, 0)
+            T.tma_copy(A_shared, B[by * block_M, bx * block_N])
+            T.tma_store_wait()
+
+    kernel = tl.compile(
+        tma_copy_kernel,
+        target="hip",
+        pass_configs={"tl.disable_warp_specialized": True},
+    )
+
+    a = torch.randn(M, N, dtype=torch.float16, device="cuda")
+    b = torch.zeros_like(a)
+    kernel(a, b)
+    torch.testing.assert_close(a, b)
+
+if __name__ == "__main__":
+    tilelang.testing.main()

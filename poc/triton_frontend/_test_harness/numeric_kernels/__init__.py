@@ -31,4 +31,5 @@ KERNEL_MODULES = (
     "softmax",
     "matmul",
     "layer_norm",
+    "flash_attention",
 )

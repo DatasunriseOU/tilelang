@@ -309,6 +309,15 @@ public:
                                      PtrState &state, const Location loc,
                                      OpBuilder &builder);
 
+  // Operand is the result of tts.make_gather_scatter_tptr.
+  // Main assumptions:
+  //  This function is only called when rewriting a loop
+  // Expected result:
+  //  Directly grab all corresponding fields from tts.make_gather_scatter_tptr.
+  LogicalResult visitOperandMakeGatherScatterTPtr(
+      tts::MakeGatherScatterTensorPtrOp makeTPtrOp, PtrState &state,
+      const Location loc, OpBuilder &builder);
+
   // Operand is the result of tt.int_to_ptr.
   // Expected result:
   //  Directly grab op result

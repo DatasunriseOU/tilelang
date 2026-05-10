@@ -188,7 +188,7 @@ static bool Z3ProvesIndexInRange(const Buffer &buf, size_t dim,
     auto [lo64, hi64] = *bounds;
     PrimExpr lo = make_const(dt, lo64);
     PrimExpr hi = make_const(dt, hi64);
-    PrimExpr bound = (var >= lo) && (var < hi);
+    PrimExpr bound = (var >= lo) && (var <= hi);
     scopes.emplace_back(z3, bound);
     if (scopes.size() > 8) {
       too_many_vars = true; // don't blow up the solver

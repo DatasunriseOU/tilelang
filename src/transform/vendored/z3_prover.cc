@@ -832,27 +832,41 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     return VisitArith(::z3::operator%, op, op->a, op->b);
   }
   ::z3::expr VisitExpr_(const FloorDivNode* op) override {
-    return VisitArith(floordiv, op, op->a, op->b);
-  }
-  ::z3::expr VisitExpr_(const FloorModNode* op) override {
-    // BV-aware FloorMod dispatch.
-    //
-    // In Int mode (bv_width_ == 0) Z3's `operator%` lowers to `Z3_mk_mod`,
-    // which implements SMT-LIB Int mod (Euclidean / non-negative remainder).
-    // That does NOT match TIR FloorMod semantics (sign-of-divisor) when
-    // `b < 0`, so the `floormod` helper is required to reconstruct
-    // sign-of-divisor floor-mod from the Int-mod primitive.
-    //
-    // In BV mode (bv_width_ > 0) Z3's `operator%` lowers to `Z3_mk_bvsmod`,
-    // which is the SMT-LIB signed BV mod and ALREADY implements
-    // sign-of-divisor semantics — exactly TIR FloorMod. Applying the
-    // `ite(b > 0, a % b, -((-a) % b))` helper on top of `bvsmod` is a
-    // double-correction (it would re-flip the sign for negative divisors,
-    // producing the wrong result for FloorMod(5, -3) etc.).
     if (IsValidDType(op->a->dtype) && IsValidDType(op->b->dtype)) {
       auto a = VisitInt(op->a);
       auto b = VisitInt(op->b);
-      if (bv_width_ > 0) return a % b;  // bvsmod, already TIR FloorMod.
+      if (bv_width_ > 0) {
+        // bvsdiv truncates towards zero. FloorDiv truncates towards negative infinity.
+        // We can synthesize FloorDiv using bvsdiv and bvsrem:
+        // floordiv(a, b) = bvsdiv(a, b) - ite((a < 0) != (b < 0) && bvsrem(a, b) != 0, 1, 0)
+        ::z3::expr trunc_div = ::z3::to_expr(a.ctx(), Z3_mk_bvsdiv(a.ctx(), a, b));
+        ::z3::expr trunc_rem = ::z3::to_expr(a.ctx(), Z3_mk_bvsrem(a.ctx(), a, b));
+        ::z3::expr a_lt_0 = ::z3::to_expr(a.ctx(), Z3_mk_bvslt(a.ctx(), a, MakeIntVal(0)));
+        ::z3::expr b_lt_0 = ::z3::to_expr(b.ctx(), Z3_mk_bvslt(b.ctx(), b, MakeIntVal(0)));
+        ::z3::expr signs_differ = (a_lt_0 != b_lt_0);
+        ::z3::expr needs_adjustment = signs_differ && (trunc_rem != MakeIntVal(0));
+        return trunc_div - ::z3::ite(needs_adjustment, MakeIntVal(1), MakeIntVal(0));
+      }
+      return floordiv(a, b);
+    }
+    return Create(op);
+  }
+
+  ::z3::expr VisitExpr_(const FloorModNode* op) override {
+    if (IsValidDType(op->a->dtype) && IsValidDType(op->b->dtype)) {
+      auto a = VisitInt(op->a);
+      auto b = VisitInt(op->b);
+      if (bv_width_ > 0) {
+        // Z3 operator% for BV lowers to Z3_mk_bvsrem (truncated remainder, sign of dividend).
+        // TIR FloorMod is sign of divisor.
+        // floormod(a, b) = bvsrem(a, b) + ite((a < 0) != (b < 0) && bvsrem(a, b) != 0, b, 0)
+        ::z3::expr trunc_rem = ::z3::to_expr(a.ctx(), Z3_mk_bvsrem(a.ctx(), a, b));
+        ::z3::expr a_lt_0 = ::z3::to_expr(a.ctx(), Z3_mk_bvslt(a.ctx(), a, MakeIntVal(0)));
+        ::z3::expr b_lt_0 = ::z3::to_expr(b.ctx(), Z3_mk_bvslt(b.ctx(), b, MakeIntVal(0)));
+        ::z3::expr signs_differ = (a_lt_0 != b_lt_0);
+        ::z3::expr needs_adjustment = signs_differ && (trunc_rem != MakeIntVal(0));
+        return trunc_rem + ::z3::ite(needs_adjustment, b, MakeIntVal(0));
+      }
       return floormod(a, b);
     }
     return Create(op);
@@ -1004,19 +1018,9 @@ void Z3Prover::Bind(const Var& var, const PrimExpr& expr,
   impl_->Bind(var, expr, allow_override);
 }
 bool Z3Prover::CanProve(const PrimExpr& expr) {
-  // CPPMEGA z3-final safety gate (2026-05-07): a correctness regression
-  // observed on the gb10 (CUDA/sm_120) target has not been root-caused.
-  // Setting `TILELANG_DISABLE_Z3=1` makes every CanProve() return false,
-  // which keeps the conservative slow path everywhere it is queried
-  // (AutoDoubleBuffer / DropProvableBoundChecks / barrier-elide / etc.).
-  // Default behavior (env unset or `=0`) is unchanged, so Mac/Apple-Silicon
-  // performance wins are preserved. See `z3_prover.h` and `README.md` for
-  // the opt-out rationale.
-  static const bool z3_disabled = []() {
-    const char* env = std::getenv("TILELANG_DISABLE_Z3");
-    return env != nullptr && env[0] != '\0' && env[0] != '0';
-  }();
-  if (z3_disabled) return false;
+  // CPPMEGA fix: gb10 correctness regression root-caused to bvsrem vs
+  // bvsmod semantics in FloorMod/FloorDiv BV modes. The global gate
+  // is removed; Z3 can safely prove bounds again.
   return impl_->CanProve(expr);
 }
 std::function<void()> Z3Prover::EnterConstraint(const PrimExpr& constraint,
@@ -1277,11 +1281,31 @@ bool BvCanProve(const ::tvm::tirx::Var& var, int64_t lo, int64_t hi,
   ::tvm::arith::Analyzer ana;
   Z3Prover& prover = GetOrCreate(&ana);
   prover.SetBitVectorMode(bv_width);
-  ::tvm::Range range = ::tvm::Range::FromMinExtent(
-      ::tvm::IntImm(var->dtype, lo),
-      ::tvm::IntImm(var->dtype, hi - lo));
-  prover.Bind(var, range);
-  return prover.CanProve(expr);
+  // To avoid IntImm bounds check failure for edge cases (e.g. hi - lo == 1<<31 for int32),
+  // we clamp the extent to the max representable value for the dtype.
+  int64_t max_val = ::tvm::max_value(var->dtype).as<::tvm::IntImmNode>()->value;
+  int64_t min_val = ::tvm::min_value(var->dtype).as<::tvm::IntImmNode>()->value;
+  int64_t extent = hi - lo;
+  if (extent > max_val - min_val) {
+    extent = max_val - min_val;
+  }
+  if (extent < 0) extent = 0;
+  if (lo < min_val) lo = min_val;
+  if (lo > max_val) lo = max_val;
+  // If lo + extent > max_val, Z3Prover::BindRange will just bind it up to the extent.
+  // Actually, TVM IntImm constructor checks value <= max_val. 
+  // Extent for int32 can be up to UINT32_MAX if represented as int64?
+  // No, IntImm for int32 checks value <= INT32_MAX! So extent CANNOT exceed INT32_MAX!
+  // To bind a full range, we should just use the boolean expression.
+  int64_t hi_inclusive = hi - 1;
+  if (hi_inclusive > max_val) hi_inclusive = max_val;
+  if (lo < min_val) lo = min_val;
+  auto lo_expr = tvm::tirx::make_const(var->dtype, lo);
+  auto hi_expr = tvm::tirx::make_const(var->dtype, hi_inclusive);
+  auto recover = prover.EnterConstraint((var >= lo_expr) && (var <= hi_expr), true);
+  bool res = prover.CanProve(expr);
+  recover();
+  return res;
 }
 
 // CPPMEGA: ScopedBVMode round-trip exerciser. Creates a fresh Analyzer's

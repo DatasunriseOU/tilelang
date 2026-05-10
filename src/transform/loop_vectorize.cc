@@ -1102,14 +1102,14 @@ static bool Z3CanProveAlignedAccess(const Buffer &buffer,
       auto [lo64, hi64] = *bounds;
       PrimExpr lo = make_const(dt, lo64);
       PrimExpr hi = make_const(dt, hi64);
-      PrimExpr bound = (var >= lo) && (var < hi);
+      PrimExpr bound = (var >= lo) && (var <= hi);
       // For the loop var: pin lo to 0 (loop vars are non-negative by
       // construction) and assume it's a multiple of vector_size — the
       // VectorizeRewriter's invariant for the outer-loop iteration
       // boundary at the START of each vector chunk. Goal: prove the
       // address at lane 0 of every vector chunk is aligned.
       if (v == loop_var.get()) {
-        bound = (var >= make_const(dt, 0)) && (var < hi) &&
+        bound = (var >= make_const(dt, 0)) && (var <= hi) &&
                 (FloorMod(var, make_const(dt, vector_size)) ==
                  make_const(dt, 0));
       }
@@ -1349,7 +1349,7 @@ bool IsExprInvariantInVectorBoundary(const PrimExpr &expr, Var var,
       auto bounds = ::tilelang::tlz3::BVBoundsForDtype(dt);
       if (bounds.has_value()) {
         auto [lo64, hi64] = *bounds;
-        scopes.emplace_back(z3, (var >= make_const(dt, lo64)) && (var < make_const(dt, hi64)));
+        scopes.emplace_back(z3, (var >= make_const(dt, lo64)) && (var <= make_const(dt, hi64)));
       }
       if (z3.CanProve(expr == expr_aligned)) {
         return true;
@@ -1744,3 +1744,4 @@ For VectorizeLoop(const For &loop, arith::Analyzer *analyzer,
 
 } // namespace tl
 } // namespace tvm
+

@@ -170,3 +170,51 @@ def test_dot_with_transpose_B_attr_xors_with_pre_trans_b(monkeypatch):
     # trans_b on the dot attr (True) XOR pre-transposed via tt.trans (True)
     # => transpose_B=False reaches T.gemm.
     assert captured["transpose_B"] is False
+
+
+def test_layout_inference_tt_dot_trans_b():
+    """Ensure that layout inference propagates correctly for tt.dot trans_b (float16 and int8)."""
+    import tilelang as tl
+    import tilelang.language as T
+    import tvm
+    from tilelang.utils.target import determine_target
+
+    auto_target = tvm.target.Target(determine_target("auto"))
+
+    def make_mod(dtype_a, dtype_b, dtype_c):
+        block_M, block_N, block_K = 64, 64, 32
+
+        @T.prim_func
+        def main(
+            A: T.Tensor((64, 64), dtype_a),
+            B_t: T.Tensor((64, 64), dtype_b),
+            C: T.Tensor((64, 64), dtype_c),
+        ):
+            with T.Kernel(1, threads=128) as _:
+                A_shared = T.alloc_shared((block_M, block_K), dtype_a)
+                B_shared = T.alloc_shared((block_N, block_K), dtype_b)
+                C_local = T.alloc_fragment((block_M, block_N), dtype_c)
+
+                T.clear(C_local)
+                for k in T.Pipelined(T.ceildiv(64, block_K), num_stages=3):
+                    T.copy(A[0:block_M, k * block_K : (k + 1) * block_K], A_shared)
+                    T.copy(B_t[0:block_N, k * block_K : (k + 1) * block_K], B_shared)
+                    T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+
+                T.copy(C_local, C[0:block_M, 0:block_N])
+
+        return tvm.IRModule({"main": main})
+
+    # Test float16
+    mod_f16 = make_mod(T.float16, T.float16, T.float16)
+    with tvm.target.Target(auto_target):
+        mod_f16 = tvm.tir.transform.BindTarget(auto_target)(mod_f16)
+        mod_f16 = tl.transform.LayoutInference()(mod_f16)
+        assert mod_f16 is not None
+
+    # Test int8
+    mod_i8 = make_mod(T.int8, T.int8, T.int32)
+    with tvm.target.Target(auto_target):
+        mod_i8 = tvm.tir.transform.BindTarget(auto_target)(mod_i8)
+        mod_i8 = tl.transform.LayoutInference()(mod_i8)
+        assert mod_i8 is not None

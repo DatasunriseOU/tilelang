@@ -1018,3 +1018,81 @@ def test_argmax_kind_round_trips_through_combiner_table():
     assert tvm.ir.structural_equal(argmax_id(tvm.tir, "float32"), expected_argmax)
     expected_argmin = tvm.tir.max_value("float32")
     assert tvm.ir.structural_equal(argmin_id(tvm.tir, "float32"), expected_argmin)
+
+
+# ---------------------------------------------------------------------------
+# tt.histogram
+# ---------------------------------------------------------------------------
+
+def test_tt_histogram_basic():
+    ctx = WalkerCtx()
+    src_ssa = _ssa("src", shape=[8, 8], dtype="int32")
+    out_ssa = _ssa("out", shape=[256], dtype="int32")
+    
+    op = _op("tt.histogram", [src_ssa], [out_ssa])
+    
+    src_buf = tvm.tir.decl_buffer([8, 8], "int32", name="src")
+    ctx.bind(src_ssa, src_buf)
+    
+    stmt = REDUCTION_EMITTERS["tt.histogram"](op, ctx)
+    
+    # Check that a 256-bin histogram buffer is allocated
+    assert len(ctx.local_buffers) == 1
+    hist_buf = ctx.local_buffers[0]
+    assert list(hist_buf.shape) == [256]    
+    # Verify we bound the output SSA
+    assert ctx.get(out_ssa) is hist_buf
+    
+    # Check loop structure: init_for + accum_for
+    assert isinstance(stmt, tvm.tir.SeqStmt)
+    assert len(stmt.seq) == 2
+    
+    init_for, accum_for = stmt.seq
+    assert isinstance(init_for, tvm.tir.For)
+    assert init_for.extent.value == 256
+    
+    # Outer accum loop should be nested (8x8)
+    assert isinstance(accum_for, tvm.tir.For)
+    assert accum_for.extent.value == 8
+    inner_for = accum_for.body
+    assert isinstance(inner_for, tvm.tir.For)
+    assert inner_for.extent.value == 8
+    
+    # Update should have a Bounds check and an Add
+    updates = _walk_buffer_stores(accum_for)
+    assert len(updates) == 1
+    update = updates[0]
+    assert update.buffer == hist_buf
+    assert isinstance(update.value, tvm.tir.Add)
+
+
+def test_tt_histogram_with_mask():
+    ctx = WalkerCtx()
+    src_ssa = _ssa("src", shape=[16], dtype="int32")
+    mask_ssa = _ssa("mask", shape=[16], dtype="int1")
+    out_ssa = _ssa("out", shape=[10], dtype="int32")
+    
+    op = _op("tt.histogram", [src_ssa, mask_ssa], [out_ssa])
+    
+    src_buf = tvm.tir.decl_buffer([16], "int32", name="src")
+    mask_buf = tvm.tir.decl_buffer([16], "int1", name="mask")
+    ctx.bind(src_ssa, src_buf)
+    ctx.bind(mask_ssa, mask_buf)
+    
+    stmt = REDUCTION_EMITTERS["tt.histogram"](op, ctx)
+    
+    assert isinstance(stmt, tvm.tir.SeqStmt)
+    accum_for = stmt.seq[1]
+    
+    # There should be an IfThenElse
+    def find_if(node):
+        res = []
+        def visit(n):
+            if isinstance(n, tvm.tir.IfThenElse):
+                res.append(n)
+        tvm.tir.stmt_functor.post_order_visit(node, visit)
+        return res
+
+    ifs = find_if(accum_for)
+    assert len(ifs) >= 1
+

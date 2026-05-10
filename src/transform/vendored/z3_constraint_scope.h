@@ -135,14 +135,13 @@ class ConstraintScope {
 // was also overly conservative for unsigned types and 64-bit types.
 //
 // `BVBoundsForDtype` returns `(lo, hi)` such that the expression
-// `(var >= lo) && (var < hi)` is the tightest sound BV bound for the
-// given dtype, or `std::nullopt` when that half-open range cannot be
+// `(var >= lo) && (var <= hi)` is the tightest sound BV bound for the
+// given dtype, or `std::nullopt` when that range cannot be
 // represented exactly as int64 PrimExpr constants.
 //
-//   * unsigned uintN, N < 63   →  [0, 1<<N)
-//   * signed   intN, N <= 63   →  [-(1<<(N-1)), 1<<(N-1))
+//   * unsigned uintN, N < 63   →  [0, (1<<N)-1]
+//   * signed   intN, N <= 64   →  [-(1<<(N-1)), (1<<(N-1))-1]
 //   * unsigned uint63/uint64   →  unsupported (upper bound overflows int64)
-//   * signed   int64           →  unsupported (exclusive upper overflows int64)
 //
 // Returned as `int64_t` because the entire constraint stack works in
 // int64 PrimExpr constants.
@@ -156,14 +155,18 @@ inline std::optional<std::pair<int64_t, int64_t>> BVBoundsForDtype(
     if (bits >= 63) {
       return std::nullopt;
     }
-    return std::make_pair(int64_t(0), int64_t(1) << bits);
+    return std::make_pair(int64_t(0), (int64_t(1) << bits) - 1);
   }
   // signed
-  if (bits >= 64) {
+  if (bits > 64) {
     return std::nullopt;
   }
+  if (bits == 64) {
+    // To avoid overflow in the shift expression, use literal min/max for 64-bit
+    return std::make_pair(-9223372036854775807LL - 1, 9223372036854775807LL);
+  }
   return std::make_pair(-(int64_t(1) << (bits - 1)),
-                        int64_t(1) << (bits - 1));
+                        (int64_t(1) << (bits - 1)) - 1);
 }
 
 }  // namespace tlz3

@@ -55,14 +55,10 @@ class Z3Prover {
             bool allow_override = false);
   void Bind(const ::tvm::tirx::Var& var, const ::tvm::PrimExpr& expr,
             bool allow_override = false);
-  // CPPMEGA z3-final safety gate (2026-05-07): if the env variable
-  // `TILELANG_DISABLE_Z3` is set to a non-empty value other than "0",
-  // CanProve() returns false unconditionally. This is a workaround for a
-  // CUDA/gb10 correctness regression that has not yet been bisected; the
-  // gate is checked at the top of `Z3Prover::CanProve` (see z3_prover.cc).
-  // Default (env unset) behavior is unchanged, so Mac builds keep the
-  // perf wins from the real prover. CUDA/gb10 users should export
-  // `TILELANG_DISABLE_Z3=1` until the regression is rooted out.
+  // Queries the solver to see if `expr` (interpreted as a boolean
+  // condition) is universally true under the current constraint stack.
+  // Returns true if proven, false otherwise (timeout, unsupported
+  // operator, or counter-example found).
   bool CanProve(const ::tvm::PrimExpr& expr);
   std::function<void()> EnterConstraint(const ::tvm::PrimExpr& constraint,
                                         bool is_assume = false);

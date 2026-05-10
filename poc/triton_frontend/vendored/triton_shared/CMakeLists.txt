@@ -374,50 +374,6 @@ install(FILES "${_VENDOR_ROOT}/RegisterTritonStructured.h"
 # -----------------------------------------------------------------------------
 # Optional pybind shim: register_triton_structured
 #
-# The standalone Python extension that exposes
-# `mlir::triton_shared_vendored::registerTritonStructured` to
-# `verify_dialect_loads.py` and `tests/test_triton_structured_walk.py`. The
-# source lives outside this directory at
-# `../../_cxx/register_triton_structured_pybind.cc` (Wave-1 added it there
-# alongside the existing `_triton_frontend_cxx` pybind module). Build it from
-# inside this CMakeLists so the shim ships with the vendoring step rather than
-# being entangled with the unrelated PtrAnalysis pybind module.
-#
-# Gate behind `pybind11` being findable -- when a super-project does not have
-# pybind11 available we silently skip (the rest of the vendored libs still
-# build and the dialect-walk test auto-skips when the import fails).
+# Removed in Integration #5: `register_dialects` is now exposed directly
+# by `_triton_frontend_cxx` to avoid MLIR TypeID conflicts.
 # -----------------------------------------------------------------------------
-find_package(pybind11 CONFIG QUIET)
-if(pybind11_FOUND)
-  set(_REGISTER_PYBIND_SRC
-      "${_VENDOR_ROOT}/../../_cxx/register_triton_structured_pybind.cc")
-  if(EXISTS "${_REGISTER_PYBIND_SRC}")
-    pybind11_add_module(register_triton_structured
-      "${_REGISTER_PYBIND_SRC}"
-    )
-    target_include_directories(register_triton_structured PRIVATE
-      "${_VENDOR_ROOT}"
-      "${_VENDOR_INCLUDE}"
-      ${MLIR_INCLUDE_DIRS}
-      ${LLVM_INCLUDE_DIRS}
-    )
-    target_link_libraries(register_triton_structured PRIVATE
-      TritonSharedRegister
-    )
-    # Place the .so where verify_dialect_loads.py / test_triton_structured_walk.py
-    # try to import from: poc/triton_frontend/_cxx/register_triton_structured.<ext>
-    set_target_properties(register_triton_structured PROPERTIES
-      LIBRARY_OUTPUT_DIRECTORY
-        "${_VENDOR_ROOT}/../../_cxx"
-    )
-    message(STATUS "register_triton_structured: enabled (pybind11 found)")
-  else()
-    message(STATUS
-      "register_triton_structured: source not found at ${_REGISTER_PYBIND_SRC}; "
-      "skipping shim.")
-  endif()
-else()
-  message(STATUS
-    "register_triton_structured: pybind11 not found; skipping shim "
-    "(verify_dialect_loads.py + test_triton_structured_walk.py will auto-skip).")
-endif()

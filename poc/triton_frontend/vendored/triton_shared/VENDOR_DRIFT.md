@@ -49,6 +49,7 @@ PR.
 | `include/triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.td` | TableGen drift fix | Tweak `assemblyFormat` / op trait references to compile cleanly against our pinned LLVM/MLIR TableGen. Pure surface; op names + arg types unchanged. | None — paired with regen. |
 | `lib/Analysis/MaskAnalysis.cpp` | Forward-port | Same MLIR API drift fixes as PtrAnalysis.cpp (e.g. `OpFoldResult` arithmetic helper relocation). | Pairs with `PtrAnalysis.cpp`. |
 | `lib/Analysis/OpFoldResultUtils.cpp` | Forward-port | API drift in `mlir::affine::makeComposedFoldedAffineApply` plus tightened `OpFoldResult` type checks. | Pairs with `PtrAnalysis.cpp`. |
+| `RegisterTritonStructured.cc` | Integration fix | Replaced explicit dialect loads with `loadAllAvailableDialects` to prevent Python-bindings crashing on unregistered upstream dialects (like `func`) during parsing. | Keep as local fix for shim integration. |
 
 ## Verification
 

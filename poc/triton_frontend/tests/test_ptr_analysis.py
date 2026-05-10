@@ -227,3 +227,23 @@ def test_rewrite_error_is_cached_and_re_raised() -> None:
     with pytest.raises(RuntimeError, match="stub-mode failure"):
         pa.extract_states()
     assert _BoomShim.Module.calls == 1
+
+def test_run_ptr_analysis_with_states_is_cached() -> None:
+    from poc.triton_frontend.ptr_analysis import run_ptr_analysis_with_states, _load_shim
+    from unittest.mock import patch
+    
+    run_ptr_analysis_with_states.cache_clear()
+    
+    with patch("poc.triton_frontend.ptr_analysis._load_shim") as mock_load_shim:
+        class DummyShim:
+            def run_ptr_analysis_with_states(self, text):
+                return text + "_rewritten", '[{"op": "dummy"}]'
+        
+        mock_load_shim.return_value = DummyShim()
+        
+        res1 = run_ptr_analysis_with_states("test_module_1")
+        res2 = run_ptr_analysis_with_states("test_module_1")
+        
+        assert res1 == res2
+        # The shim should only be requested and called once
+        mock_load_shim.assert_called_once()

@@ -250,3 +250,39 @@ def test_layout_inference_unknown_layout_falls_through():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+def test_lower_extern_intrinsic_per_target_dispatch():
+    """Verify that LowerExternIntrinsic injects the correct body string for the target."""
+    from tilelang.language.extern import extern_intrinsic, Frag
+    from tilelang.transform import LowerExternIntrinsic
+    from tilelang.language.extern_registry import unregister
+
+    try:
+        op = extern_intrinsic(
+            name="test_dispatch",
+            signature=lambda: (Frag("c", (16, 16), "local", "float32", is_output=True),),
+            bodies={
+                "cuda": '__device__ void test_dispatch(float* c) { c[0] = 1.0f; }',
+                "metal": 'void test_dispatch(threadgroup float* c) { c[0] = 1.0f; }'
+            }
+        )
+    except Exception:
+        pass # allow running the test multiple times or ignore if already registered
+
+    @T.prim_func
+    def kernel(C: T.Buffer((16, 16), "float32")):
+        with T.sblock("root"):
+            T.evaluate(T.call_extern("handle", "tl.extern_intrinsic.test_dispatch", C.access_ptr("rw")))
+
+    mod = tvm.IRModule({"main": kernel})
+    
+    cuda_mod = LowerExternIntrinsic("cuda")(mod)
+    cuda_func = cuda_mod["main"]
+    assert "pragma_import_c" in str(cuda_func.body)
+    assert "void test_dispatch(float* c)" in str(cuda_func.body)
+    assert "threadgroup" not in str(cuda_func.body)
+    
+    metal_mod = LowerExternIntrinsic("metal")(mod)
+    metal_func = metal_mod["main"]
+    assert "pragma_import_c" in str(metal_func.body)
+    assert "void test_dispatch(threadgroup float* c)" in str(metal_func.body)
