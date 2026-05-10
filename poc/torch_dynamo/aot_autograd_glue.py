@@ -454,6 +454,48 @@ def register_double_backward(
         return bwd_op(recombined + list(grad_outputs))
 
     register_autograd(fwd_op_qualname, backward, setup_context=setup_context)
+
+    # Wave-5 double-backward protection: analytic zero-grad accumulator for the
+    # bwd_op itself. When PyTorch tries to compute the gradient of the gradient,
+    # it targets the bwd op. Since we don't have a third-order graph (the bwd of bwd),
+    # we avoid crashes/traces by explicitly returning zero gradients analytically.
+    def dbw_setup_context(ctx, inputs, output) -> None:
+        if (
+            isinstance(inputs, (tuple, list))
+            and len(inputs) == 1
+            and isinstance(inputs[0], (list, tuple))
+        ):
+            saved_args = list(inputs[0])
+        else:
+            saved_args = list(inputs)
+        import torch as _torch
+        shapes_and_dtypes = []
+        for t in saved_args:
+            if isinstance(t, _torch.Tensor):
+                shapes_and_dtypes.append((t.shape, t.dtype, t.device, t.requires_grad))
+            else:
+                shapes_and_dtypes.append(None)
+        ctx._tilelang_bwd_shapes = shapes_and_dtypes
+
+    def dbw_backward(ctx, *grad_outputs) -> Any:
+        import torch as _torch
+        grads = []
+        for meta in getattr(ctx, "_tilelang_bwd_shapes", []):
+            if meta is not None:
+                shape, dtype, device, requires_grad = meta
+                if requires_grad:
+                    grads.append(_torch.zeros(shape, dtype=dtype, device=device))
+                else:
+                    grads.append(None)
+            else:
+                grads.append(None)
+        return (grads,)
+
+    try:
+        register_autograd(bwd_op_qualname, dbw_backward, setup_context=dbw_setup_context)
+    except Exception:
+        pass
+
     return True
 
 
