@@ -675,6 +675,7 @@ def get_propagate_map(trans: bool = True, dtype="float16", matrix_name="A", inde
         ldmatrix_32x16_to_shared_16x32_layout_a,
         ldmatrix_32x16_to_shared_16x32_layout_b,
     )
+    from tvm import DataType
 
     assert dtype in [
         "bfloat16",
@@ -683,11 +684,11 @@ def get_propagate_map(trans: bool = True, dtype="float16", matrix_name="A", inde
         "float8_e4m3",
         "float8_e5m2",
     ], "Only support bfloat16, float16, int8, float8_e4m3, float8_e5m2"
-    # TODO(lei): actually should analyze based on bits instead of dtype
-    if dtype in ["bfloat16", "float16"]:
+    dtype_bits = DataType(dtype).bits
+    if dtype_bits == 16:
         ldmatrix_layout = ldmatrix_32x8_to_shared_16x16_layout
         ldmatrix_layout_trans = ldmatrix_trans_32x8_to_shared_16x16_layout
-    elif dtype in ["int8", "float8_e4m3", "float8_e5m2"]:
+    elif dtype_bits == 8:
         # int8 mma only support 32x16 to 16x32 layout
         if matrix_name == "A" and trans is False:
             ldmatrix_layout = ldmatrix_32x16_to_shared_16x32_layout_a
@@ -712,14 +713,17 @@ def get_propagate_map(trans: bool = True, dtype="float16", matrix_name="A", inde
         local_id = kernel_j % 16
         return ldmatrix_layout(thread_id, local_id)
 
-    if dtype in ["bfloat16", "float16"]:
+    if dtype_bits == 16:
         ldmatrix_index_map = ldmatrix_trans_permutation_16x16_32x8_16x16 if trans else ldmatrix_permutation_16x16_32x8_16x16
     else:
         ldmatrix_index_map = ldmatrix_permutation_16x32_32x16_32x16
 
+    # TODO(lei): The index_dtype is currently passed as an argument.
+    # To fully resolve this, analyze `index_dtype` dynamically from `sch` (the TIR schedule)
+    # by taking `sch` as an argument and querying the iteration variables of the targeted block.
+    # Leaving this for a future structural refactor as it breaks the current API.
     ldmatrix_index_map = IndexMap.from_func(ldmatrix_index_map, index_dtype=index_dtype)
-    # TODO(lei): index_dtype should be analyzed from the schedule
-    row, col = [16, 16] if dtype in ["bfloat16", "float16"] else [16, 32]
+    row, col = [16, 16] if dtype_bits == 16 else [16, 32]
     inversed_index_map = ldmatrix_index_map.inverse([row, col])
     return ldmatrix_index_map, inversed_index_map
 
@@ -728,6 +732,8 @@ def get_propagate_map(trans: bool = True, dtype="float16", matrix_name="A", inde
 # Ladder weight propagation, which can be used to avoid the ldmatrix
 # Instructions.
 def get_ladder_stage3_map(dtype="float16", index_dtype="int32"):
+    from tvm import DataType
+    dtype_bits = DataType(dtype).bits
     def shared_32x8_to_mma_32x8_layout(i, j):
         thread_id = (i % 8) * 4 + (j // 2)
         local_id = (i // 8) * 2 + (j % 2)
@@ -769,14 +775,17 @@ def get_ladder_stage3_map(dtype="float16", index_dtype="int32"):
         new_kernel_j = (new_thread_id * 16 + new_local_id) % 32
         return new_kernel_i, new_kernel_j
 
-    if dtype in ["bfloat16", "float16"]:
+    if dtype_bits == 16:
         stage3_index_map = ladder_stage3_permutation_16x16_32x8_32x8_16x16
     else:
         stage3_index_map = ladder_stage3_permutation_16x32_32x16_32x16_16x32
 
+    # TODO(lei): The index_dtype is currently passed as an argument.
+    # To fully resolve this, analyze `index_dtype` dynamically from `sch` (the TIR schedule)
+    # by taking `sch` as an argument and querying the iteration variables of the targeted block.
+    # Leaving this for a future structural refactor as it breaks the current API.
     stage3_index_map = IndexMap.from_func(stage3_index_map, index_dtype=index_dtype)
-    # TODO(lei): index_dtype should be analyzed from the schedule
-    row, col = [16, 16] if dtype in ["bfloat16", "float16"] else [16, 32]
+    row, col = [16, 16] if dtype_bits == 16 else [16, 32]
     inversed_index_map = stage3_index_map.inverse([row, col])
     return stage3_index_map, inversed_index_map
 
