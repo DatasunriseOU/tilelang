@@ -446,12 +446,6 @@ private:
 
     auto [barrier_id, thread_count] =
         GetOrCreateBarrier(key, extent_tx, extent_ty, extent_tz);
-    if (thread_count % 32 != 0) {
-      // TODO(lei): This is a workaround for the case where the thread count is
-      // not a multiple of 32. we should enhance the pass to analysis index
-      // instead of buffer expression etc.
-      return Stmt();
-    }
 
     // Create new sync call with barrier info
     Array<PrimExpr> new_args = {StringImm(scope),

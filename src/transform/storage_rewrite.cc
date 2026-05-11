@@ -1878,19 +1878,12 @@ public:
       var_info.element_dtype = var_info.element_dtype.with_lanes(1);
     }
 
-    // TODO(Lunderberg): Uncomment this check once it can be applied.
-    // See https://discuss.tvm.apache.org/t/pre-rfc-vectorized-tir-buffers/10615
-    // for discussion.
-
-    // ICHECK_EQ(index_lanes * var_info.element_dtype.lanes(),
-    // value_dtype.lanes())
-    //     << "Attempting to retrieve " << value_dtype.lanes() << " lanes of
-    //     data with "
-    //     << index_lanes << " indices into an array whose elements have "
-    //     << var_info.element_dtype.lanes() << " lanes.  "
-    //     << "Expected output with " << index_lanes *
-    //     var_info.element_dtype.lanes()
-    //     << " lanes.";
+    ICHECK_EQ(index_lanes * var_info.element_dtype.lanes(), value_dtype.lanes())
+        << "Attempting to retrieve " << value_dtype.lanes() << " lanes of data with "
+        << index_lanes << " indices into an array whose elements have "
+        << var_info.element_dtype.lanes() << " lanes.  "
+        << "Expected output with " << index_lanes * var_info.element_dtype.lanes()
+        << " lanes.";
 
     // If the index is a RampNode with stride of 1 and offset
     // divisible by the number of number of lanes, and the predicate

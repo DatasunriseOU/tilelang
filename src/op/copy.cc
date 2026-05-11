@@ -2435,7 +2435,8 @@ Stmt Conv2DIm2ColOpNode::Lower(const LowerArgs &T,
       [&](PrimExpr e) { return TMABytesFromElements(e, src_->dtype); });
   desc.elem_stride = {1, stride_, stride_, 1};
   desc.lower_corner = {-padding_, -padding_};
-  desc.upper_corner = {-padding_, -padding_};
+  desc.upper_corner = {(kernel_ - 1) * dilation_ - padding_,
+                       (kernel_ - 1) * dilation_ - padding_};
   desc.smem_box_pixel =
       Downcast<IntImm>(dstRegion_->region[ndim - 2]->extent)->value;
   desc.smem_box_channel =

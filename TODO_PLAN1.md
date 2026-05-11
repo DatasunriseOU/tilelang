@@ -39,19 +39,19 @@
 - [x] Task 26: Implement Auto Double Buffer Soundness. `src/transform/auto_double_buffer.cc`. Implement the real soundness obligation checks for auto double buffering.
 - [x] Task 27: Enhance Vectorization Checks and Pass Ordering. `src/transform/loop_vectorize.cc`, `src/transform/vectorize_loop.cc`. Improve vectorization validation, add negative_ramp codegen support, and adjust pass ordering.
 - [x] Task 28: Refactor Layout Inference and Validation. `src/transform/layout_inference.cc`, `src/transform/layout_reducer.cc`. Phase out buffer_map, address missing thread mappings, and implement metadata validation checks for layout reducers.
-- [ ] Task 29: Improve Hardware-Specific Lowering. `src/transform/lower_blackwell_2sm.cc`, `src/transform/lower_tma_to_ptr_arith.cc`, `src/transform/pipeline_planning.cc`. Add mixed 1cta/2cta tcgen5mma support, emit conv2d-with-padding gathers, and link wgmma to buffers.
-- [ ] Task 30: Cleanup Workarounds and Refactor Storage. `src/transform/flatten_buffer.cc`, `src/transform/pipeline_planning.cc`, `src/transform/storage_rewrite.cc`, `src/transform/thread_storage_sync.cc`. Relocate boolean handling, refactor pipeline ops, apply deferred storage rewrite checks, and remove thread count workarounds.
+- [x] Task 29: Improve Hardware-Specific Lowering. `src/transform/lower_blackwell_2sm.cc`, `src/transform/lower_tma_to_ptr_arith.cc`, `src/transform/pipeline_planning.cc`. Add mixed 1cta/2cta tcgen5mma support, emit conv2d-with-padding gathers, and link wgmma to buffers.
+- [x] Task 30: Cleanup Workarounds and Refactor Storage. `src/transform/flatten_buffer.cc`, `src/transform/pipeline_planning.cc`, `src/transform/storage_rewrite.cc`, `src/transform/thread_storage_sync.cc`. Relocate boolean handling, refactor pipeline ops, apply deferred storage rewrite checks, and remove thread count workarounds.
 
 ## Group 7: C++ Ops and Codegen (`src/op/`, `src/target/`)
-- [ ] Task 31: tcgen05.cp Support and Dynamic Shared Memory Buffer Remapping. `src/op/copy.cc`. Add support for tcgen05.cp in conjunction with LowerTmemCopy and address buffer remapping for shared.dyn when is_cp is true.
-- [ ] Task 32: Smarter Shared Memory Box Dimension Deduction. `src/op/copy.cc`. Find a more robust and intelligent method to deduce the shared memory box dimensions.
-- [ ] Task 33: Type Info Retention and TF32 Workaround Cleanup. `src/target/codegen_cuda.cc`, `src/target/codegen_metal.cc`. Remove the temporary type workaround for TF32 and implement a unified way to keep type information directly in the AST.
-- [ ] Task 34: Vectorized Reduction and Ramp Lanes Optimization. `src/target/codegen_cuda.cc`. Implement vectorized reduction for various data types and revisit the ramp lanes limit logic.
-- [ ] Task 35: Target-Specific Builtin and Atomic Operation Updates. `src/target/codegen_hip.cc`, `src/target/codegen_metal.cc`. Update the HIP backend to use __builtin_amdgcn_s_barrier() and implement atomic operations for floating-point datatypes on Metal via Compare-And-Swap (CAS).
+- [x] Task 31: tcgen05.cp Support and Dynamic Shared Memory Buffer Remapping. `src/op/copy.cc`. Add support for tcgen05.cp in conjunction with LowerTmemCopy and address buffer remapping for shared.dyn when is_cp is true.
+- [x] Task 32: Smarter Shared Memory Box Dimension Deduction. `src/op/copy.cc`. Find a more robust and intelligent method to deduce the shared memory box dimensions.
+- [x] Task 33: Type Info Retention and TF32 Workaround Cleanup. `src/target/codegen_cuda.cc`, `src/target/codegen_metal.cc`. Remove the temporary type workaround for TF32 and implement a unified way to keep type information directly in the AST.
+- [x] Task 34: Vectorized Reduction and Ramp Lanes Optimization. `src/target/codegen_cuda.cc`. Implement vectorized reduction for various data types and revisit the ramp lanes limit logic.
+- [x] Task 35: Target-Specific Builtin and Atomic Operation Updates. `src/target/codegen_hip.cc`, `src/target/codegen_metal.cc`. Update the HIP backend to use __builtin_amdgcn_s_barrier() and implement atomic operations for floating-point datatypes on Metal via Compare-And-Swap (CAS).
 
 ## Group 8: C++ Headers (`src/op/*.h`, `src/tl_templates/*.h`, `src/transform/common/*.h`)
-- [ ] Task 36: Remove redundant code. `src/op/gemm_sp_py.h`. Deduplicate and remove redundant code shared with gemm.h.
-- [ ] Task 37: Expand TCGEN5MMA support and shapes. `src/op/tcgen5_meta.h`, `src/tl_templates/cuda/gemm_sm100.h`. Support more shapes and dtypes for TCGEN5MMA, add 2cta-preferred shapes, address saturation issues, and implement gemm_ts.
-- [ ] Task 38: Optimize SM80/SM90 GEMM templates. `src/tl_templates/cuda/gemm_sm90.h`, `src/tl_templates/cuda/gemm_sp_sm80.h`. Move bar.sync out of body_rs in SM90 and implement the unsupported feature in SM80 SP GEMM.
-- [ ] Task 39: Add ROCm shfl_sync support. `src/tl_templates/hip/common.h`. Implement support for shfl_sync using features provided in ROCm 7.1.1.
-- [ ] Task 40: Fix transform pass ordering and naming conflicts. `src/transform/common/loop_vectorization_utils.h`, `src/transform/common/mbarrier.h`. Move the loop vectorization pass to the correct prior stage and rename the mbarrier identifier to avoid conflicts with user-defined variables.
+- [x] Task 36: Remove redundant code. `src/op/gemm_sp_py.h`. Deduplicate and remove redundant code shared with gemm.h.
+- [x] Task 37: Expand TCGEN5MMA support and shapes. `src/op/tcgen5_meta.h`, `src/tl_templates/cuda/gemm_sm100.h`. Support more shapes and dtypes for TCGEN5MMA, add 2cta-preferred shapes, address saturation issues, and implement gemm_ts.
+- [x] Task 38: Optimize SM80/SM90 GEMM templates. `src/tl_templates/cuda/gemm_sm90.h`, `src/tl_templates/cuda/gemm_sp_sm80.h`. Move bar.sync out of body_rs in SM90 and implement the unsupported feature in SM80 SP GEMM.
+- [x] Task 39: Add ROCm shfl_sync support. `src/tl_templates/hip/common.h`. Implement support for shfl_sync using features provided in ROCm 7.1.1.
+- [x] Task 40: Fix transform pass ordering and naming conflicts. `src/transform/common/loop_vectorization_utils.h`, `src/transform/common/mbarrier.h`. Move the loop vectorization pass to the correct prior stage and rename the mbarrier identifier to avoid conflicts with user-defined variables.

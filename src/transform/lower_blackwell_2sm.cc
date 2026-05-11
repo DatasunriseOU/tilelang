@@ -62,11 +62,10 @@ static bool HasValidClusterDimsFor2Cta(const Stmt &body) {
  * Looks for T.gemm (tl.tileop.gemm Call); if it will be lowered to TCGEN5MMA
  * with use_2cta, sets the flag for the mutator to add block attr.
  */
-class Tcgen5_2SmLower : public StmtExprMutator {
+class Tcgen5_2SmAnnotator : public StmtExprMutator {
 public:
-  Tcgen5_2SmLower(bool cluster_dims_valid)
+  Tcgen5_2SmAnnotator(bool cluster_dims_valid)
       : cluster_dims_valid_(cluster_dims_valid) {}
-  bool has_2sm_tcgen5mma() const { return has_2sm_tcgen5mma_; }
 
 private:
   Stmt VisitStmt_(const EvaluateNode *op) final {
@@ -84,7 +83,7 @@ private:
                                 "TCGEN5MMA, use 1CTA variant instead.";
                 return StmtExprMutator::VisitStmt_(op);
               }
-              has_2sm_tcgen5mma_ = true;
+              has_2sm_tcgen5mma_in_current_block_ = true;
             }
           }
         }
@@ -93,32 +92,32 @@ private:
     return StmtExprMutator::VisitStmt_(op);
   }
 
-  bool cluster_dims_valid_;
-  bool has_2sm_tcgen5mma_ = false;
-};
-
-class Tcgen5_2SmAnnotator : public StmtExprMutator {
-public:
-  explicit Tcgen5_2SmAnnotator() {}
-
-private:
   Stmt VisitStmt_(const SBlockRealizeNode *op) final {
+    bool old_has = has_2sm_tcgen5mma_in_current_block_;
+    has_2sm_tcgen5mma_in_current_block_ = false;
+
     Stmt new_realize = StmtExprMutator::VisitStmt_(op);
-    if (root_block_annotated_)
-      return new_realize;
-    const auto *realize = new_realize.as<SBlockRealizeNode>();
-    ICHECK(realize);
-    SBlock block = realize->block;
-    SBlockNode *n = block.CopyOnWrite();
-    // Set block attr: {use_2cta: 1}
-    // lower_shared_tmem.cc will depend on this to allocate/deallocate tmem with
-    // 2cta.
-    n->annotations.Set(attr::kUse2Cta, IntImm(DataType::Int(32), 1));
-    root_block_annotated_ = true;
-    return SBlockRealize(realize->iter_values, realize->predicate, block);
+
+    bool contains_2cta = has_2sm_tcgen5mma_in_current_block_;
+    // Restore the state for the outer block
+    has_2sm_tcgen5mma_in_current_block_ = old_has;
+
+    if (contains_2cta) {
+      const auto *realize = new_realize.as<SBlockRealizeNode>();
+      ICHECK(realize);
+      SBlock block = realize->block;
+      SBlockNode *n = block.CopyOnWrite();
+      // Set block attr: {use_2cta: 1}
+      // lower_shared_tmem.cc will depend on this to allocate/deallocate tmem with
+      // 2cta.
+      n->annotations.Set(attr::kUse2Cta, IntImm(DataType::Int(32), 1));
+      return SBlockRealize(realize->iter_values, realize->predicate, block);
+    }
+    return new_realize;
   }
 
-  bool root_block_annotated_ = false;
+  bool cluster_dims_valid_;
+  bool has_2sm_tcgen5mma_in_current_block_ = false;
 };
 
 using namespace tirx::transform;
@@ -131,13 +130,8 @@ tvm::transform::Pass LowerBlackwell2SM() {
     }
     Stmt body = f->body;
     bool cluster_dims_valid = HasValidClusterDimsFor2Cta(body);
-    Tcgen5_2SmLower lower(cluster_dims_valid);
-    body = lower(std::move(body));
-    if (lower.has_2sm_tcgen5mma()) {
-      // Annotate block attr for using 2cta tcgen5
-      Tcgen5_2SmAnnotator annotator;
-      body = annotator(std::move(body));
-    }
+    Tcgen5_2SmAnnotator annotator(cluster_dims_valid);
+    body = annotator(std::move(body));
     return PrimFunc(f->params, body, f->ret_type, f->buffer_map, f->attrs);
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.LowerBlackwell2SM", {});

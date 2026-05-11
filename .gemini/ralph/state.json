@@ -1,8 +1,0 @@
-{
-  "active": true,
-  "current_iteration": 1,
-  "max_iterations": 40,
-  "completion_promise": "",
-  "original_prompt": "Давай чинить TODO_PLAN1.md. Бери следующую задачу из плана, запускай пайплайн (Implementer -> Code Review -> Perf Optimization -> Regression Tests). Переходи к следующей задаче только если все тесты зеленые. И так молоти до победного, пока план не закончится.",
-  "started_at": "2026-05-11T01:22:47Z"
-}

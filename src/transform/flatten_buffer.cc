@@ -147,12 +147,6 @@ private:
     AllocBuffer node = Downcast<AllocBuffer>(StmtExprMutator::VisitStmt_(op));
 
     Buffer new_buf = GetFlattenedBuffer(node->buffer);
-    // TODO(Lunderberg): Move the handling of boolean into a
-    // dedicated pass.
-    if (new_buf->dtype == DataType::Bool()) {
-      auto writer = new_buf.CopyOnWrite();
-      writer->dtype = DataType::Int(8);
-    }
     if (!node->buffer.same_as(new_buf)) {
       node.CopyOnWrite()->buffer = new_buf;
     }
@@ -184,11 +178,6 @@ private:
     auto flattened = buf.GetFlattenedBuffer();
     auto writer = flattened.CopyOnWrite();
 
-    // TODO(Lunderberg): Move the handling of boolean into a
-    // dedicated pass.
-    if (flattened->dtype == DataType::Bool()) {
-      writer->dtype = DataType::Int(8);
-    }
     // canonicalize shape
     for (size_t i = 0; i < flattened->shape.size(); ++i) {
       writer->shape.Set(i, analyzer_->canonical_simplify(flattened->shape[i]));
@@ -205,38 +194,14 @@ private:
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     BufferStore store = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
-    bool store_returns_bool = (op->value.dtype() == DataType::Bool());
     store = VisitBufferAccess(store);
-
-    // Handle casts from the value's dtype to the dtype of the
-    // backing array.
-    // TODO(Lunderberg): Move the handling of boolean into a
-    // dedicated pass.
-    if (store_returns_bool) {
-      ICHECK_EQ(store->buffer->dtype, DataType::Int(8))
-          << "Expected int8 backing array for boolean tensor";
-      auto writer = store.CopyOnWrite();
-      writer->value = tvm::cast(DataType::Int(8), store->value);
-      return std::move(store);
-    }
     return std::move(store);
   }
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
-    bool load_returns_bool = (op->dtype == DataType::Bool());
     BufferLoad load = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
     load = VisitBufferAccess(load);
-    // Handle casts from dtype of the backing array to value's dtype.
-    // TODO(Lunderberg): Move the handling of boolean into a
-    // dedicated pass.
-    if (load_returns_bool && !under_address_of) {
-      ICHECK_EQ(load->buffer->dtype, DataType::Int(8))
-          << "Expected int8 backing array for boolean tensor";
-      load.CopyOnWrite()->dtype = DataType::Int(8);
-      return tvm::cast(DataType::Bool(), load);
-    } else {
-      return std::move(load);
-    }
+    return std::move(load);
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
