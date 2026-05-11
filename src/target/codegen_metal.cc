@@ -1400,8 +1400,9 @@ void CodeGenTileLangMetal::VisitStmt_(const AllocateNode *op) {
       }
       init = user_init;
     }
+    std::string init_value = PrintExpr(init);
     PrintType(op->dtype, stream);
-    stream << ' ' << vid << " = " << PrintExpr(init) << ";\n";
+    stream << ' ' << vid << " = " << init_value << ";\n";
   } else {
     PrintStorageScope(scope, stream);
     PrintType(op->dtype, stream);
@@ -1457,8 +1458,9 @@ void CodeGenTileLangMetal::VisitStmt_(const AllocBufferNode *op) {
       }
       init = user_init;
     }
+    std::string init_value = PrintExpr(init);
     PrintType(dtype, stream);
-    stream << ' ' << vid << " = " << PrintExpr(init) << ";\n";
+    stream << ' ' << vid << " = " << init_value << ";\n";
   } else {
     PrintStorageScope(scope, stream);
     PrintType(dtype, stream);
@@ -1541,9 +1543,9 @@ void CodeGenTileLangMetal::VisitStmt_(const BufferStoreNode *op) {
     auto index = op->indices[0].as<IntImmNode>();
     ICHECK(index && index->value == 0)
         << "local.var store requires scalar index 0.";
+    std::string value = PrintExpr(op->value);
     this->PrintIndent();
-    stream << GetVarID(op->buffer->data.get()) << " = " << PrintExpr(op->value)
-           << ";\n";
+    stream << GetVarID(op->buffer->data.get()) << " = " << value << ";\n";
     return;
   }
   CodeGenC::VisitStmt_(op);

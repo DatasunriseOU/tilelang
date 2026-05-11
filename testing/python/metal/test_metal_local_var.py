@@ -23,6 +23,18 @@ def _make_local_var_func():
     return local_var_kernel
 
 
+def _make_local_var_if_then_else_store_func():
+    @T.prim_func
+    def local_var_guard_kernel(A: T.Tensor((4,), T.float32), B: T.Tensor((1,), T.float32)):
+        with T.Kernel(1, threads=1) as _:
+            idx = T.alloc_var(T.int32, init=1)
+            acc = T.alloc_var(T.float32, init=0.0)
+            acc = acc + T.if_then_else(idx < 2, A[idx], T.float32(0))
+            B[0] = acc
+
+    return local_var_guard_kernel
+
+
 def test_metal_local_var_scalar_codegen_uses_thread_scalars():
     with tvm.transform.PassContext(), tvm.target.Target("metal"):
         artifact = tilelang.lower(_make_local_var_func(), target="metal")
@@ -51,6 +63,20 @@ def test_metal_local_var_codegen_has_scalar_loads_for_outputs():
     assert all("[0]" not in line.split("=", 1)[1] for line in output_lines), output_lines
 
 
+def test_metal_local_var_if_then_else_store_emits_valid_statement_order():
+    with tvm.transform.PassContext(), tvm.target.Target("metal"):
+        artifact = tilelang.lower(_make_local_var_if_then_else_store_func(), target="metal")
+
+    src = artifact.kernel_source
+    assert src is not None
+    assert "kernel void" in src
+
+    assert re.search(r"\bfloat\s+condval(?:_\d+)?;", src), src
+    assert re.search(r"=\s*(?:thread\s+)?(?:float|half|int|uint|bool)\s+condval", src) is None, src
+    assert re.search(r"=\s*if\s*\(", src) is None, src
+    assert re.search(r"\w+\s*=\s*\([^)]+ \+ condval(?:_\d+)?\);", src), src
+
+
 @tilelang.testing.requires_metal
 def test_metal_local_var_runtime_scalar_load_store():
     kernel = tilelang.compile(_make_local_var_func(), target="metal")
@@ -60,3 +86,15 @@ def test_metal_local_var_runtime_scalar_load_store():
     torch.mps.synchronize()
 
     assert out.cpu().tolist() == [3, 7]
+
+
+@tilelang.testing.requires_metal
+def test_metal_local_var_if_then_else_store_runtime():
+    kernel = tilelang.compile(_make_local_var_if_then_else_store_func(), target="metal")
+    inp = torch.arange(4, dtype=torch.float32, device="mps")
+    out = torch.empty(1, dtype=torch.float32, device="mps")
+
+    kernel(inp, out)
+    torch.mps.synchronize()
+
+    assert out.cpu().tolist() == [1.0]
