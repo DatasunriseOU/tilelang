@@ -57,7 +57,7 @@ def reshape(src: Buffer, shape: ShapeType) -> Buffer:
     assert prim_expr_equal(bits_product(shape, src.dtype), bits_product(src.shape, src.dtype)), (
         f"T.reshape/view shape check failed. src {src} src.shape: {src.shape}, src.dtype: {src.dtype}, target shape: {shape}, target dtype: {src.dtype}"
     )
-    return T.Tensor(shape, src.dtype, src.data)
+    return T.Tensor(shape, src.dtype, src.data, scope=src.scope())
 
 
 def view(src: Buffer, shape: ShapeType | None = None, dtype: DType | None = None) -> Buffer:
@@ -70,7 +70,7 @@ def view(src: Buffer, shape: ShapeType | None = None, dtype: DType | None = None
     if dtype is None:
         dtype = src.dtype
     assert prim_expr_equal(bits_product(shape, dtype), bits_product(src.shape, src.dtype)), "T.reshape/view shape check failed."
-    return T.Tensor(shape, dtype, src.data)
+    return T.Tensor(shape, dtype, src.data, scope=src.scope())
 
 
 def loop_break() -> PrimExpr:

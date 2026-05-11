@@ -505,17 +505,6 @@ public:
   }
 
 private:
-  Map<Var, Buffer> GetBufferMap() const {
-    Map<Var, Buffer> buffer_map;
-    for (const auto &[var, buffers] : buffer_data_to_buffers_) {
-      // Use the first buffer for each var
-      // TODO(lei): phaseout buffer_map in future.
-      if (!buffers.empty()) {
-        buffer_map.Set(var, buffers[0]);
-      }
-    }
-    return buffer_map;
-  }
 
   // Return true if any buffer that this op (idx) touches already has
   // an inferred layout in layout_map. Used to prioritize enqueue order.
@@ -845,7 +834,8 @@ private:
         // src/op/utils.h:61 ``IsMetalSimdgroupBuffer``) and emits the right
         // builtin::simdgroup_* calls without needing layout inference here.
         if (str == "simdgroup_a" || str == "simdgroup_b" ||
-            str == "simdgroup_c") {
+            str == "simdgroup_c" || str == "simdgroup_a_fp8" ||
+            str == "simdgroup_b_fp8") {
           return Layout();
         }
         return Layout();

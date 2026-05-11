@@ -221,12 +221,12 @@ template <typename T> TL_DEVICE void AtomicAddx2Scalar(T *ref, T x, T y) {
   atomicAdd(ref + 1, y);
 }
 
-template <typename T>
-TL_DEVICE void AtomicAddx4Scalar(T *ref, T x, T y, T z, T w) {
-  atomicAdd(ref + 0, x);
-  atomicAdd(ref + 1, y);
-  atomicAdd(ref + 2, z);
-  atomicAdd(ref + 3, w);
+template <typename dst_dtype, typename val_dtype>
+TL_DEVICE void AtomicAddx4Scalar(dst_dtype *ref, val_dtype x, val_dtype y, val_dtype z, val_dtype w) {
+  atomicAdd(ref + 0, static_cast<dst_dtype>(x));
+  atomicAdd(ref + 1, static_cast<dst_dtype>(y));
+  atomicAdd(ref + 2, static_cast<dst_dtype>(z));
+  atomicAdd(ref + 3, static_cast<dst_dtype>(w));
 }
 
 TL_DEVICE float2 AtomicAddx2ScalarRet(float *ref, float2 add_val) {
@@ -239,10 +239,10 @@ TL_DEVICE float2 AtomicAddx2ScalarRet(float *ref, float2 add_val) {
 template <typename dst_dtype>
 TL_DEVICE float4 AtomicAddx4ScalarRet(dst_dtype *ref, float4 add_val) {
   float4 ret;
-  ret.x = atomicAdd(ref + 0, add_val.x);
-  ret.y = atomicAdd(ref + 1, add_val.y);
-  ret.z = atomicAdd(ref + 2, add_val.z);
-  ret.w = atomicAdd(ref + 3, add_val.w);
+  ret.x = static_cast<float>(atomicAdd(ref + 0, static_cast<dst_dtype>(add_val.x)));
+  ret.y = static_cast<float>(atomicAdd(ref + 1, static_cast<dst_dtype>(add_val.y)));
+  ret.z = static_cast<float>(atomicAdd(ref + 2, static_cast<dst_dtype>(add_val.z)));
+  ret.w = static_cast<float>(atomicAdd(ref + 3, static_cast<dst_dtype>(add_val.w)));
   return ret;
 }
 

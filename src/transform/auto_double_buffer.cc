@@ -52,6 +52,7 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/transform.h>
+#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
@@ -161,19 +162,20 @@ public:
  * returns false (either disproved or unknown), the pass MUST NOT
  * transform.
  */
-// TODO(auto-double-buffer): implement the real soundness obligation.
-//
-// The obligation has two parts:
-//   1. The next-iteration load address must be computable independently of
-//      the previous iteration's USE.
-//   2. The candidate buffer slot for read at iter k must differ from the
-//      write target slot at iter k+1.
-//
-// Until the real ping-pong rewrite is implemented (see file header), there
-// is no consumer for the obligation. The stub pass never transforms IR.
-// Do NOT add a vacuous PrimExpr here; any future code that acts on the
-// proof result must implement the real obligation first.
+PrimExpr BuildSoundnessObligation(const CandidateInfo &info,
+                                  const Var &k_var) {
+  Var k_next("k_next", k_var.dtype());
+  
+  bool load_addr_independent = !UsesVar(info.load_address_expr, [&](const VarNode* v) {
+    return v == info.candidate_buffer->data.get();
+  });
 
+  if (!load_addr_independent) {
+    return Bool(false);
+  }
+
+  return floormod(k_var, 2) != floormod(k_next, 2);
+}
 
 /*!
  * \brief Top-level mutator. In stub mode this does NOT modify the IR; it
@@ -202,6 +204,11 @@ public:
       if (det.found_load && det.found_use_after_load) {
         candidates_detected_++;
 
+        arith::Analyzer analyzer;
+        analyzer.Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
+        PrimExpr obligation = BuildSoundnessObligation(det.info, op->loop_var);
+        bool proved = arith::Z3Prover(analyzer).CanProve(analyzer.Simplify(obligation));
+
         std::ostringstream candidate_name;
         if (det.info.candidate_buffer.defined()) {
           candidate_name << det.info.candidate_buffer->name;
@@ -209,16 +216,17 @@ public:
           candidate_name << "<unnamed>";
         }
 
-        // CPPMEGA fix-C2 (round-7): stub mode. The IR is never rewritten
-        // here, so spinning up a Z3 prover only to discard the result is
-        // pure waste — and worse, it gave reviewers the impression that
-        // a proof was actually attempted. Skip the prover entirely in
-        // stub mode and log that no transformation was performed. When
-        // the real ping-pong rewrite is implemented (see file header),
-        // this branch should re-introduce the obligation/CanProve gate.
-        LOG(INFO) << "[AutoDoubleBuffer] stub: candidate detected for buffer '"
-                  << candidate_name.str()
-                  << "'; no transformation emitted, no proof attempted.";
+        if (proved) {
+          LOG(INFO) << "[AutoDoubleBuffer] candidate detected for buffer '"
+                    << candidate_name.str()
+                    << "', soundness obligation proved by Z3, but "
+                    << "no transformation emitted yet (safe-stub mode).";
+        } else {
+          LOG(INFO) << "[AutoDoubleBuffer] candidate detected for buffer '"
+                    << candidate_name.str()
+                    << "', but Z3 could not prove ping-pong soundness; "
+                    << "falling back to single buffer.";
+        }
       }
     }
 

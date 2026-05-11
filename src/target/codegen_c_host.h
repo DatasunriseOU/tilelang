@@ -110,6 +110,12 @@ private:
   void PrintGetFuncFromBackend(const std::string &func_name,
                                const std::string &packed_func_name);
   void PrintCallPacked(const tvm::tirx::CallNode *op);
+  void PrintPackedCallIntoResult(const tvm::tirx::CallNode *op,
+                                 const std::string &packed_func_name,
+                                 const std::string &args_stack,
+                                 int64_t num_args,
+                                 const std::string &result,
+                                 const std::string &failure_stmt);
   /*!
    * \brief Print ternary conditional operator implementing binary `op`
    * Forces the operands to be in SSA form.

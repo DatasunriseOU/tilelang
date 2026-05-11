@@ -141,7 +141,7 @@ from .builtin import syncthreads_or as syncthreads_or  # noqa: F401
 from .utils import index_to_coordinates  # noqa: F401
 
 # RFC §6 — cross-source extern intrinsic declaration mechanism.
-from .extern import extern_intrinsic, Frag  # noqa: F401
+from .extern import extern_intrinsic, Frag, simdgroup_a, simdgroup_b, simdgroup_c, simdgroup_a_fp8, simdgroup_b_fp8  # noqa: F401
 
 from .symbolics import dynamic, symbolic  # noqa: F401
 from .annotations import (  # noqa: F401

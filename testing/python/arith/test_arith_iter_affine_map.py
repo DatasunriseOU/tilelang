@@ -165,9 +165,11 @@ def test_split():
     assert_iter_sum_pattern({fld(x, 6): (4, 0), fld(flm(x, 6), 2): (3, 0), flm(x, 2): (2, 0)}, var_dom([(x, 24)]))
 
     # simple symbolic bound
-    # TODO(tvm-team) improve symbolic divisible check to enable
-    # more complicated symbolic bound
     assert_iter_sum_pattern({fld(x, c0): (c1, 0), flm(x, c0): (c0, 0)}, var_dom([(x, c1 * c0)]))
+    
+    # more complicated symbolic bound
+    assert_iter_sum_pattern({fld(x, c0 * 2): (c1, 0), flm(x, c0 * 2): (c0 * 2, 0)}, var_dom([(x, c1 * c0 * 2)]))
+    assert_iter_sum_pattern({fld(x * 2, c0 * 4): (c1, 0, 1), flm(x * 2, c0 * 4): (c0 * 2, 0, 2)}, var_dom([(x, c1 * c0 * 2)]))
 
     assert_iter_sum_pattern({fld(x * 2, 4): (4, 0, 1), flm(x * 2, 4): (2, 0, 2)}, var_dom([(x, 8)]))
 

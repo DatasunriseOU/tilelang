@@ -284,8 +284,8 @@ public:
 
   // Convenience entry to vectorize a loop body without exposing
   // the mutator invocation pattern at call sites.
-  static Stmt Vectorize(const Var &var, const PrimExpr &var_lanes, Stmt body) {
-    TLVectorizer vec{var, var_lanes};
+  static Stmt Vectorize(const Var &var, const PrimExpr &var_lanes, Stmt body, bool negative_ramp = false) {
+    TLVectorizer vec{var, var_lanes, negative_ramp};
     Stmt original_body = body;
     auto vec_stmt = vec(std::move(body));
     // If scalarization is needed, scalarize the entire original body
@@ -295,9 +295,9 @@ public:
     return vec_stmt;
   }
 
-  TLVectorizer(const Var &var, const PrimExpr &var_lanes)
+  TLVectorizer(const Var &var, const PrimExpr &var_lanes, bool negative_ramp = false)
       : var_(var), var_lanes_(var_lanes) {
-    ramp_ = Ramp(IntImm(var->dtype, 0), IntImm(var->dtype, 1), var_lanes);
+    ramp_ = Ramp(IntImm(var->dtype, 0), IntImm(var->dtype, negative_ramp ? -1 : 1), var_lanes);
   }
 
   Stmt VisitStmt(const Stmt &stmt) final {
@@ -1220,7 +1220,13 @@ public:
             << " for target " << Target::Current();
       }
       ICHECK(is_zero(op->min));
-      return TLVectorizer::Vectorize(op->loop_var, op->extent, op->body);
+      bool negative_ramp = false;
+      if (auto annot = op->annotations.Get("negative_ramp")) {
+        if (const auto* val = annot.value().as<IntImmNode>()) {
+          negative_ramp = val->value != 0;
+        }
+      }
+      return TLVectorizer::Vectorize(op->loop_var, op->extent, op->body, negative_ramp);
     } else {
       return StmtMutator::VisitStmt_(op);
     }

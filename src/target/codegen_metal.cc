@@ -497,7 +497,7 @@ CodeGenTileLangMetal::CodeGenTileLangMetal(Target target) : target_(target) {
       << "                  (threads == scale)>::run_batch(x, tid, red_buf);\n"
       << "  }\n"
       << "};\n"
-      << "}  // namespace tl\n\n";
+      << "} /* namespace tl */\n\n";
 }
 
 // CPPMEGA: hybrid tl_pr_c granularity + stack-c switch dispatch.

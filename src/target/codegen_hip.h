@@ -64,6 +64,7 @@ protected:
                        std::ostream &os) final; // NOLINT(*)
 
 private:
+  std::unordered_map<const VarNode *, IntImm> unroll_factor;
   // Handle volatile loads
   void HandleVolatileLoads(const std::string &value, const BufferLoadNode *op,
                            std::ostream &os) final;

@@ -185,7 +185,7 @@ You might interpret this in **Triton** as:
 - `block_m = 32, block_n = 64, block_k = 128`
 - Potential warp usage = `warp_m = 16, warp_n = 32`
 - `vectorize`: load data with a vector width of 8
-- If `use_tc` is true, consider using Tensor Cores (TensorOps in Triton) if supported.
+- If `use_tensorcore` is true, consider using Tensor Cores (TensorOps in Triton) if supported.
 
 This helps quickly test multiple configurations without manually guessing.
 
@@ -203,3 +203,4 @@ You can also create your own specialized templates if you have unique loop struc
 ## TODO Items
 
 - [ ] **Adapt to tile language**: Provide ready-made scheduling calls or wrappers for [tilelang](https://github.com/LeiYanggh/tilelang) to streamline end-to-end integration.
+end-to-end integration.

@@ -21,6 +21,11 @@ from tilelang.jit.adapter.base import BaseKernelAdapter
 from tilelang.utils.language import retrieve_func_from_module
 from tilelang.engine.param import KernelParam
 from tilelang.language.dtypes import dtype
+from tilelang.contrib.mlx_interop import (
+    has_mlx_arrays,
+    maybe_mlx_metal_external_command_buffer,
+    mlx_arrays_to_tvm_tensors,
+)
 
 
 COMPILE_ARGS = {}
@@ -245,7 +250,13 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                     ins_idx += 1
                 tensor_list.append(tensor)
 
-            executable(*tensor_list)
+            exec_tensor_list = (
+                mlx_arrays_to_tvm_tensors(tensor_list)
+                if has_mlx_arrays(tensor_list)
+                else tensor_list
+            )
+            with maybe_mlx_metal_external_command_buffer(tensor_list):
+                executable(*exec_tensor_list)
 
             # Return outputs in the requested form
             if len(self.result_idx) == 1:

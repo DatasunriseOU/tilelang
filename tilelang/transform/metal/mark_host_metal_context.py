@@ -8,17 +8,20 @@ from tvm.tir import (
 from tvm.tir.transform import prim_func_pass
 
 """
-Transformation pass to mark host-side kernel calls for Metal/MPS synchronization.
+Transformation pass to mark host-side kernel calls for Metal interop synchronization.
 
-To execute TVM-generated Metal kernels within a PyTorch environment, the TVM runtime
-must utilize PyTorch's active Metal command buffer (MPS). This ensures correct
-execution ordering and memory consistency between PyTorch operators and TVM kernels.
+To execute TVM-generated Metal kernels inside another framework's scheduling
+scope, the TVM runtime must be able to reuse the owner's active Metal command
+buffer. This keeps execution ordering and memory consistency without copying
+or staging tensor storage.
 
 This pass identifies calls to `tir.tvm_call_packed_lowered` occurring within a
 `compute_scope` and wraps them with a `metal_context` attribute. This attribute
-signals the downstream host C codegen to inject specific runtime logic that:
-1. Retrieves the current command buffer from `torch::mps`.
-2. Passes this stream to the TVM runtime before the kernel executes.
+signals the downstream host C codegen to inject runtime logic that:
+1. Reuses an owner-provided Metal command buffer/event when one is registered.
+2. Otherwise uses an explicit TVM Metal stream when one is active.
+3. Falls back to PyTorch MPS only when compiled with Torch headers and no
+   framework owner has provided scheduling state.
 """
 
 

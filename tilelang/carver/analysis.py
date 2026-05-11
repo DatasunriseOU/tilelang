@@ -98,10 +98,8 @@ class BlockInfo:
 
     def is_reduction(self) -> bool:
         """Whether the block is a reduction workload."""
-        if not self._reduction_block:
-            return False
-        # A pure reduction workload usually has no spatial loops or spatial loops with size 1.
-        return sum(1 for i in self.iters if i.kind == "S" and i.dom != 1) == 0
+        # A GEMV is also a reduction block, so we just return _reduction_block
+        return self._reduction_block
 
     def is_gemv(self) -> bool:
         """Whether the block is a GEMV workload."""

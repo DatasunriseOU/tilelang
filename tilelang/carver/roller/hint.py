@@ -154,7 +154,7 @@ class Hint:
 
     def __init__(self) -> None:
         self.arch = None
-        self.use_tc = None  # todo(lei): this should be renamed.
+        self.use_tensorcore = None
 
         # Special axes tiling info
         self.block = []
@@ -189,15 +189,15 @@ class Hint:
     def to_dict(self) -> dict:
         dic = {}
         dic["block"] = self.block
-        if self.use_tc:
+        if self.use_tensorcore:
             dic["warp"] = self.warp
         else:
             dic["thread"] = self.thread
         dic["rstep"] = self.rstep
         if np.prod(self.reduce_thread) > 1:
             dic["reduce_thread"] = self.reduce_thread
-        if self.use_tc:
-            dic["use_tc"] = self.use_tc
+        if self.use_tensorcore:
+            dic["use_tensorcore"] = self.use_tensorcore
         if self.output_strides:
             dic["strides"] = {}
             for k, stride in self.output_strides.items():
@@ -249,7 +249,7 @@ class Hint:
         # analysis pass context, for int8 mma, we should merge static shared memory
         merge_static_smem = False
         # int32 and float32 accum may take too much shared memory
-        if self.use_tc and self.intrin_info.out_dtype in ["float32", "int32"]:
+        if self.use_tensorcore and self.intrin_info.out_dtype in ["float32", "int32"]:
             merge_static_smem = True
         # Always merge dynamic shared memory
         if self.shared_scope == "shared.dyn":

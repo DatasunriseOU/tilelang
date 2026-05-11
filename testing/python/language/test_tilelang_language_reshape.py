@@ -20,8 +20,7 @@ def reshape_test(N, M, dtype):
 
 def run_reshape(N, M, dtype):
     program = reshape_test(N, M, dtype)
-    # TODO(lei): reshape cannot apply shared memory
-    # layout transform propagation
+    # Test that reshape correctly propagates the shared memory layout transform
     jit_kernel = tl.compile(
         program,
         out_idx=-1,
@@ -35,6 +34,7 @@ def run_reshape(N, M, dtype):
     profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
 
 
+@tilelang.testing.requires_cuda_or_rocm
 def test_reshape_smem():
     # Test reshape
     run_reshape(1024, 32, T.float32)
@@ -60,8 +60,7 @@ def reshape_test_smem_1d_2_2d(N, M, dtype):
 
 def run_reshape_smem_1d_2_2d(N, M, dtype):
     program = reshape_test_smem_1d_2_2d(N, M, dtype)
-    # TODO(lei): reshape cannot apply shared memory
-    # layout transform propagation
+    # Test that reshape correctly propagates the shared memory layout transform
     jit_kernel = tl.compile(
         program,
         out_idx=-1,
@@ -75,6 +74,7 @@ def run_reshape_smem_1d_2_2d(N, M, dtype):
     profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
 
 
+@tilelang.testing.requires_cuda_or_rocm
 def test_reshape_smem_1d_2_2d():
     run_reshape_smem_1d_2_2d(1024, 32, T.float32)
     run_reshape_smem_1d_2_2d(2048, 64, T.float16)
@@ -99,8 +99,7 @@ def reshape_test_smem_2d_2_1d(N, M, dtype):
 
 def run_reshape_smem_2d_2_1d(N, M, dtype):
     program = reshape_test_smem_2d_2_1d(N, M, dtype)
-    # TODO(lei): reshape cannot apply shared memory
-    # layout transform propagation
+    # Test that reshape correctly propagates the shared memory layout transform
     jit_kernel = tl.compile(
         program,
         out_idx=-1,
@@ -114,6 +113,7 @@ def run_reshape_smem_2d_2_1d(N, M, dtype):
     profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
 
 
+@tilelang.testing.requires_cuda_or_rocm
 def test_reshape_smem_2d_2_1d():
     run_reshape_smem_2d_2_1d(1024, 32, T.float32)
     run_reshape_smem_2d_2_1d(2048, 64, T.float16)
@@ -154,6 +154,7 @@ def run_reshape_fragment(N, M, dtype):
     profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
 
 
+@tilelang.testing.requires_cuda_or_rocm
 def test_reshape_fragment():
     run_reshape_fragment(1024, 32, T.float32)
     run_reshape_fragment(2048, 64, T.float16)

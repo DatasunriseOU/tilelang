@@ -430,7 +430,7 @@ public:
     // leak into a subsequent one (different `inner_for_`, possibly
     // different analyzer state).
     indices_can_vectorize_memo_.clear();
-    return vector_size_;
+    return common_stride_ < 0 ? -vector_size_ : vector_size_;
   }
 
 private:
@@ -687,7 +687,15 @@ private:
   }
 
   void CheckConditionVectorized(const PrimExpr &cond) {
-    // TODO: perform some checks here
+    if (!inner_for_) return;
+    bool is_dependent = UsesVar(cond, [&](const VarNode* v) {
+      return v == inner_for_->loop_var.get();
+    });
+    if (is_dependent) {
+      // If the condition depends on the vectorized loop variable, we cannot safely vectorize
+      // because we don't support divergent control flow within a vector.
+      vector_size_ = 1;
+    }
   }
 
   void HandleTvmAccessPtr(const CallNode *node) {
@@ -877,9 +885,20 @@ private:
     }
     // 4. Try to find max vectorize size for this buffer
     // CPPMEGA fix-B6 (idea712): memoized halving probe.
-    while (buffer_vec_size > 1 &&
-           !MemoizedIndicesCanVectorize(elem_offset, inner_for_->loop_var,
-                                        inner_for_->extent, buffer_vec_size)) {
+    while (buffer_vec_size > 1) {
+      int ret = MemoizedIndicesCanVectorize(elem_offset, inner_for_->loop_var,
+                                            inner_for_->extent, buffer_vec_size);
+      if (ret != 0) {
+        if (common_stride_ == 0) {
+          common_stride_ = ret;
+          break;
+        } else if (common_stride_ == ret) {
+          break;
+        } else {
+          buffer_vec_size = 1;
+          break;
+        }
+      }
       buffer_vec_size /= 2;
     }
     return buffer_vec_size;
@@ -937,13 +956,13 @@ private:
   //
   // Cache lifetime: per-planner-instance. A new planner is created per
   // `Plan(For)` entry, so the cache is naturally scoped.
-  bool MemoizedIndicesCanVectorize(const PrimExpr &expr, Var var,
+  int MemoizedIndicesCanVectorize(const PrimExpr &expr, Var var,
                                    const PrimExpr &iter_var_size,
                                    int target_vectorized_size) {
     if (target_vectorized_size <= 1) {
-      // IndicesCanVectorize itself returns true at size 1; mirror that
+      // IndicesCanVectorize itself returns 1 at size 1; mirror that
       // without touching the analyzer.
-      return true;
+      return 1;
     }
     // CPPMEGA idea712 fix-B8 (round-3): replace the FNV-xor mix with a
     // std::tuple key. The previous mix XOR'd four size_t-shaped inputs
@@ -962,8 +981,8 @@ private:
     if (it != indices_can_vectorize_memo_.end()) {
       return it->second;
     }
-    bool ok = IndicesCanVectorize(expr, var, iter_var_size,
-                                  target_vectorized_size, analyzer_);
+    int ok = IndicesCanVectorize(expr, var, iter_var_size,
+                                 target_vectorized_size, analyzer_);
     indices_can_vectorize_memo_.emplace(std::move(key), ok);
     return ok;
   }
@@ -971,6 +990,7 @@ private:
   int vector_load_bits_max_;
   int initial_vector_size_ = 128;
   int loop_extent_vector_size_ = 128;
+  int common_stride_ = 0; // 0 means uninitialized
 
   const ForNode *inner_for_{};
   bool has_nonlocal_memory_access_ = false;
@@ -981,7 +1001,7 @@ private:
   // hash. See `TupleHashMix` rationale at top of this file; the comparator
   // is std::tuple's default field-wise equality, so collisions cannot
   // alias distinct memo entries the way the XOR mix could.
-  std::unordered_map<std::tuple<size_t, const void *, size_t, int>, bool,
+  std::unordered_map<std::tuple<size_t, const void *, size_t, int>, int,
                      VectorizeMemoKeyHash>
       indices_can_vectorize_memo_;
 };
@@ -1215,7 +1235,7 @@ static Map<String, ffi::Any> MakeAlignedAnnotations(
 
 class VectorizeRewriter : public StmtExprMutator {
 public:
-  VectorizeRewriter(int vector_size) : vector_size_(vector_size) {}
+  VectorizeRewriter(int vector_size, bool negative_ramp = false) : vector_size_(vector_size), negative_ramp_(negative_ramp) {}
 
 private:
   Stmt VisitStmt_(const ForNode *node) final {
@@ -1255,10 +1275,14 @@ private:
 
       if (extent == vector_size_) {
         fnode.CopyOnWrite()->kind = ForKind::kVectorized;
+        Map<String, ffi::Any> annots = fnode->annotations;
         if (aligned) {
-          fnode.CopyOnWrite()->annotations =
-              MakeAlignedAnnotations(fnode->annotations);
+          annots = MakeAlignedAnnotations(annots);
         }
+        if (negative_ramp_) {
+          annots.Set("negative_ramp", Bool(true));
+        }
+        fnode.CopyOnWrite()->annotations = annots;
         return fnode;
       } else {
         Var inner_var = Var("vec");
@@ -1270,6 +1294,9 @@ private:
         if (aligned) {
           inner_annotations =
               MakeAlignedAnnotations(Map<String, ffi::Any>());
+        }
+        if (negative_ramp_) {
+          inner_annotations.Set("negative_ramp", Bool(true));
         }
         body = For(inner_var, 0, vector_size_, ForKind::kVectorized, body,
                    /*thread_binding=*/std::nullopt, inner_annotations);
@@ -1298,6 +1325,7 @@ private:
 
   const ForNode *inner_for_{};
   const int vector_size_;
+  bool negative_ramp_{false};
 };
 
 int GetVectorizeSize(const For &loop, const LayoutMap &layout_map) {
@@ -1578,13 +1606,13 @@ static bool Z3CanProveUnitStride(const PrimExpr &expr, const Var &var,
   }
 }
 
-bool IndicesCanVectorize(const PrimExpr &expr, Var var,
+int IndicesCanVectorize(const PrimExpr &expr, Var var,
                          const PrimExpr &iter_var_size,
                          int target_vectorized_size,
                          arith::Analyzer *analyzer) {
   ICHECK(target_vectorized_size >= 1);
   if (target_vectorized_size == 1)
-    return true;
+    return 1;
 
   // CPPMEGA idea712 round-final fix-N0: extent 0/1 short-circuit. If the
   // loop trip count is statically 0 or 1 there is no contiguity to prove
@@ -1593,7 +1621,7 @@ bool IndicesCanVectorize(const PrimExpr &expr, Var var,
   // before invoking Z3.
   if (const auto *iv_imm = iter_var_size.as<IntImmNode>()) {
     if (iv_imm->value <= 1) {
-      return false;
+      return 0;
     }
   }
 
@@ -1608,18 +1636,18 @@ bool IndicesCanVectorize(const PrimExpr &expr, Var var,
 
   if (!analyzer->CanProveEqual(FloorMod(iter_var_size, target_size_for_iter),
                                0))
-    return false;
+    return 0;
 
   if (IsExprInvariantInVectorBoundary(expr, var, target_vectorized_size,
                                       analyzer)) {
-    return true;
+    return 1;
   }
 
   auto simplified_expr = analyzer->Simplify(Substitute(expr, {{var, zero}}));
   // The base offset must be divisible
   if (!analyzer->CanProveEqual(FloorMod(simplified_expr, target_size_for_expr),
                                zero)) {
-    return false;
+    return 0;
   }
 
   // Bind thread range
@@ -1639,37 +1667,21 @@ bool IndicesCanVectorize(const PrimExpr &expr, Var var,
   if (!ramp_node) {
     // Broadcast value
     if (expr_vectorized.dtype().lanes() == 1)
-      return true;
+      return 1;
     // CPPMEGA: Z3 idea #1 — broadcast/non-ramp shape was reached but lanes
     // count > 1 means the access actually does depend on `var`. Try the
     // direct Z3 unit-stride proof as a last resort before giving up.
-    if (Z3CanProveUnitStride(expr, var, iter_var_size, analyzer)) {
-      return true;
+    int z3_res = Z3CanProveUnitStride(expr, var, iter_var_size, analyzer);
+    if (z3_res != 0) {
+      return z3_res;
     }
-    return false;
+    return 0;
   } else {
-    // CPPMEGA fix-B1 (idea712): only accept positive unit stride.
-    //
-    // Background: the parallel `z3-stack` branch adds a Z3-backed
-    // negative-stride probe. The `VectorizeRewriter` codegen, however,
-    // emits a `Ramp(min=0, stride=+1, lanes=N)` and assumes positive
-    // direction. If a negative-stride probe is ever ported here without
-    // the matching codegen change (a `negative_ramp` annotation +
-    // `Ramp(stride=-1)` emission in `VectorizeRewriter`), kernels like
-    // `for i in range(N-1, -1, -1): out[i] = in[i]` would be marked
-    // vectorizable but lowered with the wrong-order ramp.
-    //
-    // Decision: REJECT negative stride at the planner (option (a) in the
-    // cross-checked review). This is the safe-by-default position. If a
-    // future change wires the codegen, replace this with the proper
-    // negative_ramp flag plumbing (option (b)) and re-enable here.
-    //
-    // CPPMEGA Z3 idea #1 retained: still allow Z3 to prove stride==+1 for
-    // expressions that don't simplify to a literal 1 (e.g. `(k%4)+1` where
-    // k is provably a multiple of 4), and use the positive-only contiguity
-    // fallback. This drops the prior `stride == -1` branch.
     if (is_one(ramp_node->stride)) {
-      return true;
+      return 1;
+    }
+    if (is_const_int(ramp_node->stride, -1)) {
+      return -1;
     }
     // CPPMEGA z3-final per-pass gate: skip both the inline stride==1 probe
     // and the affine fallback when TILELANG_DISABLE_Z3_VECTORIZE is set.
@@ -1678,7 +1690,11 @@ bool IndicesCanVectorize(const PrimExpr &expr, Var var,
       z3.SetTimeoutMs(50);
       if (z3.CanProve(ramp_node->stride ==
                       make_const(ramp_node->stride.dtype(), 1))) {
-        return true;
+        return 1;
+      }
+      if (z3.CanProve(ramp_node->stride ==
+                      make_const(ramp_node->stride.dtype(), -1))) {
+        return -1;
       }
     }
     return Z3CanProveUnitStride(expr, var, iter_var_size, analyzer);
@@ -1719,26 +1735,28 @@ For ParallelToSerial(const For &loop) {
 
 For VectorizeLoop(const For &loop, const LayoutMap &layout_map,
                   int vectorize_hint) {
-  if (vectorize_hint <= 0) {
+  if (vectorize_hint == 0) {
     arith::Analyzer analyzer;
     VectorizePlanner planner(&analyzer, layout_map);
     vectorize_hint = planner.Plan(loop);
   }
-  if (vectorize_hint == 1)
+  if (vectorize_hint == 1 || vectorize_hint == -1)
     return ParallelToSerial(loop);
-  auto rewriter = VectorizeRewriter(vectorize_hint);
+  bool negative_ramp = vectorize_hint < 0;
+  auto rewriter = VectorizeRewriter(std::abs(vectorize_hint), negative_ramp);
   return Downcast<For>(rewriter(loop));
 }
 
 For VectorizeLoop(const For &loop, arith::Analyzer *analyzer,
                   const LayoutMap &layout_map, int vectorize_hint) {
-  if (vectorize_hint <= 0) {
+  if (vectorize_hint == 0) {
     VectorizePlanner planner(analyzer, layout_map);
     vectorize_hint = planner.Plan(loop);
   }
-  if (vectorize_hint == 1)
+  if (vectorize_hint == 1 || vectorize_hint == -1)
     return ParallelToSerial(loop);
-  auto rewriter = VectorizeRewriter(vectorize_hint);
+  bool negative_ramp = vectorize_hint < 0;
+  auto rewriter = VectorizeRewriter(std::abs(vectorize_hint), negative_ramp);
   return Downcast<For>(rewriter(loop));
 }
 

@@ -75,6 +75,36 @@ def requires_cuda_target(func):
     return _compose([func], marks)
 
 
+def requires_rocm_target(func):
+    """Skip unless the selected default target is ROCm and ROCm runtime is available."""
+    target_kind = _default_target_kind()
+    target_desc = target_kind if target_kind is not None else "unavailable"
+    marks = [
+        pytest.mark.skipif(
+            target_kind != "rocm",
+            reason=f"Requires default target to resolve to ROCm, but got {target_desc}",
+        ),
+        *requires_rocm.marks(),
+    ]
+    return _compose([func], marks)
+
+
+def requires_cuda_or_rocm(func):
+    """Skip unless the selected default target is CUDA or ROCm and corresponding runtime is available."""
+    target_kind = _default_target_kind()
+    target_desc = target_kind if target_kind is not None else "unavailable"
+    
+    # We can only reliably use the marks if one of the backends is available.
+    # We use a custom skipif for the target kind
+    marks = [
+        pytest.mark.skipif(
+            target_kind not in ("cuda", "rocm", "hip"),
+            reason=f"Requires default target to resolve to CUDA or ROCm/HIP, but got {target_desc}",
+        )
+    ]
+    return _compose([func], marks)
+
+
 # pytest.main() wrapper to allow running single test file
 def main():
     test_file = inspect.getsourcefile(sys._getframe(1))

@@ -19,8 +19,7 @@ def _check(original, transformed):
     transformed = tir.transform.LowerOpaqueBlock()(transformed)
     transformed["main"] = transformed["main"].with_attr("tma_descriptor_args", {})
 
-    # TODO: temporary remove this check
-    # tvm.ir.assert_structural_equal(mod["main"], transformed["main"], True)
+    tvm.ir.assert_structural_equal(mod["main"], transformed["main"], True)
 
 
 @tilelang.testing.requires_cuda_target

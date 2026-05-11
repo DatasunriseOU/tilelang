@@ -65,8 +65,18 @@ void CodeGenCHost::Init(bool output_ssa, bool emit_asserts,
 
   decl_stream << "#include <Metal/Metal.h>\n";
   decl_stream << "#include <Foundation/Foundation.h>\n";
+  decl_stream << "#include <dispatch/dispatch.h>\n";
 
+  decl_stream << "#if defined(__has_include)\n";
+  decl_stream << "#if __has_include(<torch/mps.h>)\n";
+  decl_stream << "#define TILELANG_HAS_TORCH_MPS 1\n";
   decl_stream << "#include <torch/mps.h>\n";
+  decl_stream << "#else\n";
+  decl_stream << "#define TILELANG_HAS_TORCH_MPS 0\n";
+  decl_stream << "#endif\n";
+  decl_stream << "#else\n";
+  decl_stream << "#define TILELANG_HAS_TORCH_MPS 0\n";
+  decl_stream << "#endif\n";
   decl_stream << "#endif\n";
 
   CodeGenCHost::InitGlobalContext();
@@ -258,6 +268,25 @@ void CodeGenCHost::PrintGetFuncFromBackend(
   this->stream << "}\n";
 }
 
+void CodeGenCHost::PrintPackedCallIntoResult(
+    const tvm::tirx::CallNode *op, const std::string &packed_func_name,
+    const std::string &args_stack, int64_t num_args, const std::string &result,
+    const std::string &failure_stmt) {
+  using namespace tvm::tirx;
+  this->PrintIndent();
+  if (op->op.same_as(builtin::tvm_call_packed_lowered())) {
+    this->stream << "if (TVMFFIFunctionCall(" << packed_func_name << ", ";
+  } else {
+    this->stream << "if (" << packed_func_name << "(NULL, ";
+  }
+  this->stream << "(TVMFFIAny*) " << args_stack << ", " << num_args << ", "
+               << "&" << result << ") != 0) {\n";
+  int func_call_scope = this->BeginScope();
+  this->PrintLine(failure_stmt);
+  this->EndScope(func_call_scope);
+  this->PrintLine("}");
+}
+
 void CodeGenCHost::PrintCallPacked(const tvm::tirx::CallNode *op) {
   using namespace tvm::tirx;
   const StringImmNode *func_name = op->args[0].as<StringImmNode>();
@@ -294,58 +323,66 @@ void CodeGenCHost::PrintCallPacked(const tvm::tirx::CallNode *op) {
   this->PrintIndent();
   this->stream << result << ".v_int64 = 0;\n";
 
-  int metal_scope;
-  int stream_hook_scope;
-  std::string metal_result;
-  if (is_in_metal_context) {
-    metal_result = name_supply_->FreshName("metal_ret");
-    this->PrintLine("__block int ", metal_result, " = 0;");
-    this->PrintLine("auto serialQueue = torch::mps::get_dispatch_queue();");
-    this->PrintLine("dispatch_sync(serialQueue, ^() {");
-    metal_scope = this->BeginScope();
-
-    this->PrintLine("const id<MTLCommandBuffer> commandBuffer = "
-                    "torch::mps::get_command_buffer();");
-    this->PrintLine(
-        "const auto set_stream = tvm::ffi::Function::GetGlobal(\"metal.SetStream\");");
-    this->PrintLine("if (!set_stream.has_value()) {");
-    int missing_stream_hook_scope = this->BeginScope();
-    this->PrintLine(
-        "TVMFFIErrorSetRaisedFromCStr(\"RuntimeError\", "
-        "\"metal.SetStream runtime hook is not registered\");");
-    this->PrintLine(metal_result, " = -1;");
-    this->EndScope(missing_stream_hook_scope);
-    this->PrintLine("} else {");
-    stream_hook_scope = this->BeginScope();
-    this->PrintLine("(*set_stream)(static_cast<TVMStreamHandle>(commandBuffer));");
+  if (!is_in_metal_context) {
+    PrintPackedCallIntoResult(op, packed_func_name, args_stack, num_args, result,
+                              "return -1;");
+    return;
   }
 
-  this->PrintIndent();
-  if (op->op.same_as(builtin::tvm_call_packed_lowered())) {
-    this->stream << "if (TVMFFIFunctionCall(" << packed_func_name << ", ";
-  } else {
-    this->stream << "if (" << packed_func_name << "(NULL, ";
-  }
-  this->stream << "(TVMFFIAny*) " << args_stack << ", " << num_args << ", "
-               << "&" << result << ") != 0) {\n";
-  int func_call_scope = this->BeginScope();
-  if (is_in_metal_context) {
-    this->PrintLine(metal_result, " = -1;");
-  } else {
-    this->PrintLine("return -1;");
-  }
-  this->EndScope(func_call_scope);
-
+  std::string metal_result = name_supply_->FreshName("metal_ret");
+  this->PrintLine("__block int ", metal_result, " = 0;");
+  this->PrintLine(
+      "const auto set_external_command_buffer = "
+      "tvm::ffi::Function::GetGlobal(\"metal.SetExternalCommandBuffer\");");
+  this->PrintLine(
+      "const auto get_external_command_buffer = "
+      "tvm::ffi::Function::GetGlobal(\"metal.GetExternalCommandBuffer\");");
+  this->PrintLine(
+      "const auto get_current_tvm_stream = "
+      "tvm::ffi::Function::GetGlobal(\"metal.GetCurrentTVMStream\");");
+  this->PrintLine(
+      "if (!set_external_command_buffer.has_value() || "
+      "!get_external_command_buffer.has_value() || "
+      "!get_current_tvm_stream.has_value()) {");
+  int missing_stream_hook_scope = this->BeginScope();
+  this->PrintLine(
+      "TVMFFIErrorSetRaisedFromCStr(\"RuntimeError\", "
+      "\"Metal external command buffer runtime hooks are not registered\");");
+  this->PrintLine("return -1;");
+  this->EndScope(missing_stream_hook_scope);
   this->PrintLine("}");
-
-  if (is_in_metal_context) {
-    this->PrintLine("(*set_stream)(static_cast<TVMStreamHandle>(nullptr));");
-    this->EndScope(stream_hook_scope);
-    this->PrintLine("}");
-    this->EndScope(metal_scope);
-    this->PrintLine("});");
-    this->PrintLine("if (", metal_result, " != 0) return ", metal_result, ";");
-  }
+  this->PrintLine("void* owner_command_buffer = "
+                  "(*get_external_command_buffer)().cast<void*>();");
+  this->PrintLine(
+      "void* current_tvm_stream = (*get_current_tvm_stream)().cast<void*>();");
+  this->PrintLine(
+      "if (owner_command_buffer != nullptr || current_tvm_stream != nullptr) {");
+  int owner_scope = this->BeginScope();
+  PrintPackedCallIntoResult(op, packed_func_name, args_stack, num_args, result,
+                            metal_result + " = -1;");
+  this->EndScope(owner_scope);
+  this->PrintLine("} else {");
+  int no_owner_scope = this->BeginScope();
+  this->PrintLine("#if TILELANG_HAS_TORCH_MPS");
+  this->PrintLine("auto serialQueue = torch::mps::get_dispatch_queue();");
+  this->PrintLine("dispatch_sync(serialQueue, ^() {");
+  int metal_scope = this->BeginScope();
+  this->PrintLine("const id<MTLCommandBuffer> commandBuffer = "
+                  "torch::mps::get_command_buffer();");
+  this->PrintLine(
+      "(*set_external_command_buffer)(static_cast<TVMStreamHandle>(commandBuffer));");
+  PrintPackedCallIntoResult(op, packed_func_name, args_stack, num_args, result,
+                            metal_result + " = -1;");
+  this->PrintLine("(*set_external_command_buffer)(static_cast<TVMStreamHandle>(nullptr));");
+  this->EndScope(metal_scope);
+  this->PrintLine("});");
+  this->PrintLine("#else");
+  PrintPackedCallIntoResult(op, packed_func_name, args_stack, num_args, result,
+                            metal_result + " = -1;");
+  this->PrintLine("#endif");
+  this->EndScope(no_owner_scope);
+  this->PrintLine("}");
+  this->PrintLine("if (", metal_result, " != 0) return ", metal_result, ";");
 }
 
 std::string CodeGenCHost::GetPackedName(const tvm::tirx::CallNode *op) {

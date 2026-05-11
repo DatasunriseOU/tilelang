@@ -139,9 +139,9 @@ def run_atomic_different_memory_orders(M, N, block_M, block_N, dtype=T.float32):
 
 
 @tilelang.jit
-def atomic_addx4_program(M, N, block_M, block_N):
+def atomic_addx4_program(M, N, block_M, block_N, dtype=T.float32):
     @T.prim_func
-    def atomic_addx4(A: T.Tensor((M, N), T.float32), B: T.Tensor((M, N), T.float32)):
+    def atomic_addx4(A: T.Tensor((M, N), dtype), B: T.Tensor((M, N), dtype)):
         with T.Kernel(T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=32) as (bx, by):
             for i, j in T.Parallel(block_M, block_N // 4):
                 idx_i = bx * block_M + i
@@ -151,12 +151,13 @@ def atomic_addx4_program(M, N, block_M, block_N):
     return atomic_addx4
 
 
-def run_atomic_addx4(M, N, block_M, block_N):
-    kernel = atomic_addx4_program(M, N, block_M, block_N)
+def run_atomic_addx4(M, N, block_M, block_N, dtype=T.float32):
+    kernel = atomic_addx4_program(M, N, block_M, block_N, dtype)
     import torch
 
-    A = torch.randn(M, N, dtype=torch.float32).cuda()
-    B = torch.zeros(M, N, dtype=torch.float32).cuda()
+    torch_dtype = getattr(torch, dtype.name)
+    A = torch.randn(M, N, dtype=torch_dtype).cuda()
+    B = torch.zeros(M, N, dtype=torch_dtype).cuda()
     ref_B = B.clone()
 
     for i in range(M):
@@ -297,9 +298,10 @@ def test_atomic_different_memory_orders():
 
 
 @tilelang.testing.requires_cuda_target
-# TODO: atomic_addx4 currently not support half
 def test_atomic_addx4():
     run_atomic_addx4(16, 64, 4, 4)
+    run_atomic_addx4(16, 64, 4, 4, dtype=T.float16)
+    run_atomic_addx4(16, 64, 4, 4, dtype=T.bfloat16)
 
 
 @tilelang.testing.requires_cuda_target

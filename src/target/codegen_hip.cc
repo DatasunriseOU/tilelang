@@ -245,7 +245,12 @@ std::string CodeGenTileLangHIP::Finish() {
 void CodeGenTileLangHIP::VisitStmt_(const tirx::ForNode *op) {
   if (op->kind == tirx::ForKind::kUnrolled) {
     PrintIndent();
-    stream << "#pragma unroll\n";
+    if (unroll_factor.count(op->loop_var.get())) {
+      stream << "#pragma unroll "
+             << PrintExpr(unroll_factor[op->loop_var.get()]) << "\n";
+    } else {
+      stream << "#pragma unroll\n";
+    }
   }
   std::string extent =
       PrintExpr(arith::Analyzer().Simplify(op->extent + op->min));
@@ -1516,6 +1521,12 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
 }
 
 void CodeGenTileLangHIP::VisitStmt_(const AttrStmtNode *op) {
+  if (op->attr_key == "pragma_unroll_factor") {
+    const IntImmNode *factor = op->value.as<IntImmNode>();
+    ICHECK(factor);
+    unroll_factor[op->node.as<VarNode>()] = Downcast<IntImm>(factor);
+  }
+
   if (op->attr_key == tl::attr::kLexicalAllocScope) {
     PrintIndent();
     stream << "{\n";

@@ -43,8 +43,6 @@ class TensorCorePolicy(DefaultPolicy):
                 self.use_async_copy = True
             else:
                 self.use_async_copy = False
-        # TODO: block reduction depth is not used for now.
-        # As there still exists some performance issues for block reduction.
         block_reduction_depth = self.prim_func_node.get_tag("block_reduction_depth")
         if block_reduction_depth:
             self.block_reduction_depth = block_reduction_depth
@@ -65,8 +63,8 @@ class TensorCorePolicy(DefaultPolicy):
         A_ax_m, A_ax_k, B_ax_k, B_ax_n, C_ax_m, C_ax_n = node.infer_tensorcore_axis()
 
         # applying strides
-        # TODO(leiwang1999): offset should be dynamically set. we can use tag -> enable_offset to control this option..
-        offset = 8
+        enable_offset = node.get_tag("enable_offset")
+        offset = 8 if enable_offset is not False else 0
         A_high_ax = min(A_ax_m, A_ax_k)
         B_high_ax = min(B_ax_n, B_ax_k)
         C_high_ax = min(C_ax_m, C_ax_n)
@@ -118,7 +116,7 @@ class TensorCorePolicy(DefaultPolicy):
 
             def _optimize(node, rstep):
                 all_steps = self.get_node_reduce_step_candidates(node)
-                # todo(lei): optimize the all_steps enlarge policy to be a multiple of the original all_steps[k]
+                # The all_steps candidates are already filtered to be multiples of rstep[k]
                 for k in all_steps:
                     all_steps[k] = list(filter(lambda x: x % rstep[k] == 0, all_steps[k]))
                 if any([v == [] for v in all_steps.values()]):
@@ -229,11 +227,15 @@ class TensorCorePolicy(DefaultPolicy):
         output_strides = {int(i + len(node.input_buffers)): Stride() for i, _ in enumerate(node.output_buffers)}
         tensor_strides = {}
         # when connected to shared input, should use full stride without rstep
-        for i, (_, _) in enumerate(zip([AS_stride, BS_stride], [A_stride, B_stride])):
+        for i, (S_stride, F_stride) in enumerate(zip([AS_stride, BS_stride], [A_stride, B_stride])):
             if use_layout:
                 continue
-            _ = node.block_analyzer.get_input_buffers(node.reduction_block)[i].name
-        # TODO(lei): should dig further for shared memory connection case.
+            buf = node.block_analyzer.get_input_buffers(node.reduction_block)[i]
+            scope = buf.scope()
+            if scope == "shared" or scope == "shared.dyn":
+                tensor_strides[int(i)] = F_stride
+            else:
+                tensor_strides[int(i)] = S_stride
 
         return output_strides, tensor_strides
 
@@ -284,7 +286,7 @@ class TensorCorePolicy(DefaultPolicy):
         codegen_dict = Hint()
         codegen_dict.block = tile
         codegen_dict.warp = warp_tile
-        codegen_dict.use_tc = True
+        codegen_dict.use_tensorcore = True
         codegen_dict.pipeline_stage = self.pipeline_stage
         codegen_dict.block_reduction_depth = self.block_reduction_depth
         codegen_dict.use_async = self.use_async_copy
