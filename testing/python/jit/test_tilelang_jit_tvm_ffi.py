@@ -86,6 +86,33 @@ def test_tvm_ffi_adapter_allocates_mlx_compact_output_without_torch(monkeypatch)
     assert len(adapter.executable.calls[-1]) == 2
 
 
+def test_mlx_metal_output_prefers_write_only_empty(monkeypatch):
+    import tilelang.contrib.mlx_interop as mlx_interop
+
+    calls = []
+
+    class _FakeMLX:
+        float32 = object()
+
+        @staticmethod
+        def empty(shape, *, dtype):
+            calls.append(("empty", shape, dtype))
+            return {"kind": "empty", "shape": shape, "dtype": dtype}
+
+        @staticmethod
+        def zeros(shape, *, dtype):
+            calls.append(("zeros", shape, dtype))
+            return {"kind": "zeros", "shape": shape, "dtype": dtype}
+
+    monkeypatch.setattr(mlx_interop, "_mlx_core", lambda: _FakeMLX)
+
+    out = mlx_interop.mlx_metal_output((2, 3), "float32")
+
+    assert out["kind"] == "empty"
+    assert out["shape"] == (2, 3)
+    assert calls == [("empty", (2, 3), _FakeMLX.float32)]
+
+
 def matmul(
     M,
     N,

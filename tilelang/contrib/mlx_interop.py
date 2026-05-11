@@ -89,6 +89,10 @@ class DLPackConversionError(DLPackInteropError):
     """Raised when a DLPack producer cannot be imported without a copy."""
 
 
+MLX_OUTPUT_WRITE_ONLY = "write_only"
+MLX_OUTPUT_ZEROED = "zeroed"
+
+
 def _mlx_core():
     try:
         import mlx.core as mx  # type: ignore[import-not-found]
@@ -402,13 +406,33 @@ def mlx_dtype_from_tvm(dtype: Any):
     return mlx_dtype
 
 
-def mlx_metal_output(shape: Iterable[int], dtype: Any):
-    """Allocate an MLX Metal output buffer for TVM to fill through DLPack."""
+def mlx_metal_output(
+    shape: Iterable[int],
+    dtype: Any,
+    *,
+    policy: str = MLX_OUTPUT_WRITE_ONLY,
+):
+    """Allocate an MLX Metal output buffer for TVM to fill through DLPack.
+
+    ``write_only`` is the default because ``out_idx`` buffers are kernel
+    results. They must have storage, but they do not need zero-fill work before
+    TVM overwrites them. Older MLX builds without ``mx.empty`` fall back to
+    ``mx.zeros`` so the ABI remains functional.
+    """
 
     mx = _mlx_core()
     if mx is None:
         raise DLPackConversionError("mlx.core is required to allocate MLX Metal outputs")
-    return mx.zeros(tuple(int(dim) for dim in shape), dtype=mlx_dtype_from_tvm(dtype))
+    shape_tuple = tuple(int(dim) for dim in shape)
+    mlx_dtype = mlx_dtype_from_tvm(dtype)
+    if policy == MLX_OUTPUT_WRITE_ONLY:
+        empty = getattr(mx, "empty", None)
+        if empty is not None:
+            return empty(shape_tuple, dtype=mlx_dtype)
+        return mx.zeros(shape_tuple, dtype=mlx_dtype)
+    if policy == MLX_OUTPUT_ZEROED:
+        return mx.zeros(shape_tuple, dtype=mlx_dtype)
+    raise DLPackConversionError(f"unknown MLX output allocation policy: {policy!r}")
 
 
 def tvm_tensor_to_mlx_array(tensor: Any):

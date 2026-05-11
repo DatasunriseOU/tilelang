@@ -23,6 +23,7 @@ from tilelang.engine.param import KernelParam
 from tilelang.language.dtypes import dtype
 from tilelang.contrib.mlx_interop import (
     DLPackDeviceError,
+    MLX_OUTPUT_WRITE_ONLY,
     first_mlx_array_device,
     has_mlx_arrays,
     is_mlx_array,
@@ -325,7 +326,11 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                         )
                     dtype = param_dtypes[i]
                     if uses_mlx_runtime:
-                        tensor = mlx_metal_output(shape, expected_dtype_strs[i])
+                        tensor = mlx_metal_output(
+                            shape,
+                            expected_dtype_strs[i],
+                            policy=MLX_OUTPUT_WRITE_ONLY,
+                        )
                     else:
                         if out_device is None:
                             out_device = current_device_functor()
