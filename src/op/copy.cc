@@ -1005,7 +1005,7 @@ CopyInst CopyNode::GetCopyInst(Target target, const LayoutMap &layout_map,
   // Also honour the (deprecated) global pass config for backward compat.
   if (!GetDisableTMA() && !tvm::transform::PassContext::Current()
                                ->GetConfig<Bool>(kDisableTMALower, Bool(false))
-                               .value()) {
+                               .value() && (TargetIsHopper(target) || TargetIsSm100(target))) {
     bool is_cutedsl = TargetIsCuTeDSL(target);
     if (!is_cutedsl && !buffer_oob &&
         CheckBulkStore1D(target, layout_map, analyzer)) {

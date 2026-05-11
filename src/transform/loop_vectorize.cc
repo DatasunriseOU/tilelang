@@ -239,6 +239,7 @@ public:
   int Plan(const For &node) {
     bool disable_vectorize_256 = tl_config::Vectorize256Disabled();
     bool verbose = tl_config::VectorizePlannerVerboseEnabled();
+    common_stride_ = 0;
 
     if (TargetSupportVectorize256(Target::Current(false)) &&
         !disable_vectorize_256 &&
@@ -418,19 +419,10 @@ public:
     // GCD with loop extent to ensure vector_size divides the loop extent
     vector_size_ = arith::ZeroAwareGCD(loop_extent_vector_size_, vector_size_);
 
-    if (verbose) {
-      std::cerr << "=== Final vector_size: " << vector_size_ << " ===" << "\n";
-    }
-    // CPPMEGA idea712 fix-B8 (round-3): conservative cache invalidation.
-    // The memo's cache lifetime was already documented as "per-planner-
-    // instance", but a planner is reused across multiple `Plan(For)`
-    // invocations on the same VectorizePlanner object (e.g. nested
-    // For nodes). Clearing here scopes the cache strictly to a single
-    // top-level Plan call so no stale entries from a prior body can
-    // leak into a subsequent one (different `inner_for_`, possibly
-    // different analyzer state).
     indices_can_vectorize_memo_.clear();
-    return common_stride_ < 0 ? -vector_size_ : vector_size_;
+    int final_res = common_stride_ < 0 ? -vector_size_ : vector_size_;
+    std::cout << "DEBUG PLAN RETURN: " << final_res << std::endl;
+    return final_res;
   }
 
 private:
@@ -1735,7 +1727,7 @@ For ParallelToSerial(const For &loop) {
 
 For VectorizeLoop(const For &loop, const LayoutMap &layout_map,
                   int vectorize_hint) {
-  if (vectorize_hint == 0) {
+  if (vectorize_hint <= 0) {
     arith::Analyzer analyzer;
     VectorizePlanner planner(&analyzer, layout_map);
     vectorize_hint = planner.Plan(loop);
@@ -1749,7 +1741,7 @@ For VectorizeLoop(const For &loop, const LayoutMap &layout_map,
 
 For VectorizeLoop(const For &loop, arith::Analyzer *analyzer,
                   const LayoutMap &layout_map, int vectorize_hint) {
-  if (vectorize_hint == 0) {
+  if (vectorize_hint <= 0) {
     VectorizePlanner planner(analyzer, layout_map);
     vectorize_hint = planner.Plan(loop);
   }

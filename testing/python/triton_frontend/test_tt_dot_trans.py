@@ -109,22 +109,27 @@ def test_dot_after_trans_b_emits_gemm_with_transpose_B_true(monkeypatch):
     monkeypatch.setitem(sys.modules, "tilelang.language", _FakeT)  # type: ignore[arg-type]
 
     ctx = om.WalkerCtx()
-    ctx.bind("%a", "TIR_A")
-    ctx.bind("%b", "TIR_B")
+    a_fake = _FakeRes((16, 16), "float32")
+    b_fake = _FakeRes((16, 16), "float32")
+    bt_fake = _FakeRes((16, 16), "float32")
+    # Bind them in context
+    ctx.bind(a_fake, "TIR_A")
+    ctx.bind(b_fake, "TIR_B")
 
     # tt.trans %b -> %bt
     om.map_tt_trans(
-        {"operands": ["%b"], "results": ["%bt"], "attrs": {}}, ctx
+        {"operands": [b_fake], "results": [bt_fake], "attrs": {}}, ctx
     )
 
     # tt.dot %a, %bt -> %c. No transpose_B in attrs; the trans should fold.
     dot_op = {
-        "operands": ["%a", "%bt"],
+        "operands": [a_fake, bt_fake],
         "results": [_FakeRes((16, 16), "float32")],
         "attrs": {},
     }
-    om.map_tt_dot(dot_op, ctx)
-
+    from poc.triton_frontend.op_emitters.reduction import map_tt_dot
+    
+    map_tt_dot(dot_op, ctx)
     assert "gemm" in captured, "T.gemm should have been called"
     assert captured["gemm"]["transpose_B"] is True, (
         "trans_b on %bt should fold into transpose_B=True at gemm time"
@@ -156,18 +161,22 @@ def test_dot_with_transpose_B_attr_xors_with_pre_trans_b(monkeypatch):
     monkeypatch.setitem(sys.modules, "tilelang.language", _FakeT)  # type: ignore[arg-type]
 
     ctx = om.WalkerCtx()
-    ctx.bind("%a", "A")
-    ctx.bind("%b", "B")
+    a_fake = _FakeRes((4, 4), "float32")
+    b_fake = _FakeRes((4, 4), "float32")
+    bt_fake = _FakeRes((4, 4), "float32")
+    ctx.bind(a_fake, "A")
+    ctx.bind(b_fake, "B")
     om.map_tt_trans(
-        {"operands": ["%b"], "results": ["%bt"], "attrs": {}}, ctx
+        {"operands": [b_fake], "results": [bt_fake], "attrs": {}}, ctx
     )
+    
     dot_op = {
-        "operands": ["%a", "%bt"],
+        "operands": [a_fake, bt_fake],
         "results": [_FakeRes((4, 4), "float32")],
         "attrs": {"trans_b": True},
     }
-    om.map_tt_dot(dot_op, ctx)
-    # trans_b on the dot attr (True) XOR pre-transposed via tt.trans (True)
+    from poc.triton_frontend.op_emitters.reduction import map_tt_dot
+    map_tt_dot(dot_op, ctx)    # trans_b on the dot attr (True) XOR pre-transposed via tt.trans (True)
     # => transpose_B=False reaches T.gemm.
     assert captured["transpose_B"] is False
 

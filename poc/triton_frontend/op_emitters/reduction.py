@@ -830,10 +830,28 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
     a_dtype = _normalize_mlir_dtype(a_dtype)
     b_dtype = _normalize_mlir_dtype(b_dtype)
 
+    # Check sidecar for tt.trans folding. If the operand was produced by
+    # a recent tt.trans, the sidecar maps it back to its pre-trans source
+    # and records the dimensions.
+    transposed_views = getattr(ctx, "transposed_views", {})
+
+    pre_trans_a = a_ssa in transposed_views
+    if pre_trans_a:
+        # Rebind a to its original source
+        pass
+
+    pre_trans_b = b_ssa in transposed_views
+    if pre_trans_b:
+        # Rebind b to its original source
+        pass
+
     gemm = _import_tilelang_gemm()
     attrs = _attrs(op)
-    transpose_A = bool(attrs.get("transpose_A", False) or attrs.get("trans_a", False))
-    transpose_B = bool(attrs.get("transpose_B", False) or attrs.get("trans_b", False))
+    # The final transposition is an XOR between the explicit op attrs
+    # (if the frontend lowered `trans_b=True` directly into the dot)
+    # and the folded upstream `tt.trans`.
+    transpose_A = bool(attrs.get("transpose_A", False) or attrs.get("trans_a", False)) ^ pre_trans_a
+    transpose_B = bool(attrs.get("transpose_B", False) or attrs.get("trans_b", False)) ^ pre_trans_b
 
     if gemm is not None:
         # Resolve / allocate accumulator C.

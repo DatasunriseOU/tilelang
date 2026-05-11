@@ -430,6 +430,7 @@ public:
     PrimExpr value = this->VisitExpr(op->value);
     if (value.dtype().is_scalable_or_fixed_length_vector()) {
       need_scalarize_ = true;
+      std::cout << "SCALARIZE 1" << std::endl;
       return tvm::ffi::GetRef<PrimExpr>(op);
     }
     if (value.same_as(op->value)) {
@@ -507,6 +508,7 @@ public:
     PrimExpr cond = this->VisitExpr(op->args[0]);
     if (cond.dtype().is_scalable_or_fixed_length_vector()) {
       need_scalarize_ = true;
+      std::cout << "SCALARIZE 1" << std::endl;
       return tvm::ffi::GetRef<PrimExpr>(op);
     }
     PrimExpr t = this->VisitExpr(op->args[1]);
@@ -731,9 +733,9 @@ public:
       auto pred = VisitExpr(op->args[3]);
       if (pred.dtype().is_scalable_or_fixed_length_vector()) {
         need_scalarize_ = true;
+        std::cout << "SCALARIZE 2" << std::endl;
         return tvm::ffi::GetRef<PrimExpr>(op);
-      }
-      predicate = pred;
+      }      predicate = pred;
     }
 
     auto lanes_ptr = as_const_int(var_lanes_);
@@ -751,6 +753,7 @@ public:
     auto bits_per_call = GetCPAsyncBitsPerCall(op, count);
     if (!bits_per_call.has_value()) {
       need_scalarize_ = true;
+      std::cout << "SCALARIZE 1" << std::endl;
       return tvm::ffi::GetRef<PrimExpr>(op);
     }
 
@@ -758,11 +761,13 @@ public:
     int total_bits = bits_per_call.value() * vector_size;
     if (total_bits % 8 != 0) {
       need_scalarize_ = true;
+      std::cout << "SCALARIZE 1" << std::endl;
       return tvm::ffi::GetRef<PrimExpr>(op);
     }
     int total_bytes = total_bits / 8;
     if (!IsValidCPAsyncTransferBytes(total_bytes)) {
       need_scalarize_ = true;
+      std::cout << "SCALARIZE 1" << std::endl;
       return tvm::ffi::GetRef<PrimExpr>(op);
     }
 
@@ -823,6 +828,7 @@ public:
         auto new_arg = this->VisitExpr(arg);
         if (new_arg.dtype().is_scalable_or_fixed_length_vector()) {
           need_scalarize_ = true;
+          std::cout << "SCALARIZE 3" << std::endl;
           return tvm::ffi::GetRef<PrimExpr>(op);
         }
         new_args.push_back(new_arg);
