@@ -16,6 +16,7 @@ algorithm at the TileLang frontend layer. Every test:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -197,6 +198,47 @@ def _make_direct_m1_kernel(
     return fp8_scaled_direct_kernel
 
 
+def _make_direct_transposed_b_matmul_kernel(
+    M: int,
+    N: int,
+    K: int,
+    BM: int,
+    BN: int,
+):
+    """Build a direct global-store full matmul for row-major B[N, K]."""
+    g = globals()
+    g.update(
+        _DTB_M=M, _DTB_N=N, _DTB_K=K, _DTB_BM=BM, _DTB_BN=BN,
+    )
+
+    @T.prim_func
+    def fp8_scaled_direct_transposed_b_kernel(
+        A_fp8: T.Tensor((_DTB_M, _DTB_K), "float8_e4m3"),
+        A_scale: T.Tensor((1,), "float32"),
+        B_fp8: T.Tensor((_DTB_N, _DTB_K), "float8_e4m3"),
+        B_scale: T.Tensor((1,), "float32"),
+        C: T.Tensor((_DTB_M, _DTB_N), "float32"),
+    ):
+        with T.Kernel(
+            T.ceildiv(_DTB_N, _DTB_BN),
+            T.ceildiv(_DTB_M, _DTB_BM),
+            threads=_DTB_BM * _DTB_BN,
+        ) as (bx, by):
+            T.fp8_scaled_matmul(
+                A_fp8,
+                A_scale,
+                B_fp8,
+                B_scale,
+                C,
+                transpose_B=True,
+                c_row_offset=by * _DTB_BM,
+                c_col_offset=bx * _DTB_BN,
+                outputs_per_block=_DTB_BN,
+            )
+
+    return fp8_scaled_direct_transposed_b_kernel
+
+
 def _xcrun_compile(msl_source: str) -> tuple[int, str]:
     """Run ``xcrun --sdk macosx metal -c`` against the provided MSL.
 
@@ -240,6 +282,14 @@ def test_per_tensor_scale_lowers_on_metal():
     assert "__tvm_fp8_e4m3_to_half(A_shared" in body
     assert "__tvm_fp8_e4m3_to_half(B_shared" in body
     assert "A_scale[0]" in body and "B_scale[0]" in body
+    assert re.search(
+        r"(?:int (?P<bound>cse_v\d+(?:_\d+)?) = "
+        r"\(\(\(i_\d+ & 15\) \* 8\) \+ \(j >> 2\)\);\n\s*)?"
+        r"if \(\(\(int\)threadIdx\.x\) == "
+        r"(?:(?P=bound)|\(\(\(i_\d+ & 15\) \* 8\) \+ \(j >> 2\)\))\)",
+        body,
+    ), body
+    assert "threadIdx.x) <= (((i_" not in body
 
     # No simdgroup MMA for FP8 — Apple has no native FP8 ALU through M5.
     assert "simdgroup_multiply_accumulate" not in body, (
@@ -375,7 +425,7 @@ def test_m1_transposed_b_vecmat_keeps_metal_intrinsics_until_codegen():
 
 
 def test_m1_transposed_b_vecmat_without_macro_target_uses_late_scalar_lowering():
-    """Omitted macro target emits a marker, then lowers safely for fragment output."""
+    """Omitted macro target emits a marker, then lowers to scalar SIMD reduction."""
     fn = _make_vecmat_m1_kernel(N=64, K=96, BN=64, BK=96)
     assert "tl.fp8_scaled_matmul.marker" in str(fn)
     artifact = tilelang.lower(fn, target=Target("metal"))
@@ -384,7 +434,30 @@ def test_m1_transposed_b_vecmat_without_macro_target_uses_late_scalar_lowering()
 
     assert "__tvm_fp8_e4m3_dot4_packed" not in body
     assert "tl.fp8_scaled_matmul.marker" not in body
+    assert "thread_index_in_simdgroup" in body
+    assert "simd_sum(" in body
     assert "__tvm_fp8_e4m3_to_half" in body
+
+
+def test_m1_non_transposed_b_vecmat_late_lowers_to_simd_sum():
+    """M=1 B[K,N] row-vector lowers to an MLX-style scalar SIMD reduction."""
+    fn = _make_kernel(M=1, N=64, K=96, BM=1, BN=64, BK=96)
+    artifact = tilelang.lower(fn, target=Target("metal"))
+    src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
+    body = src[src.find("kernel void"):]
+
+    assert "tl.fp8_scaled_matmul.marker" not in body
+    assert "__tvm_fp8_e4m3_dot4_packed" not in body
+    assert "thread_index_in_simdgroup" in body
+    assert "simd_sum(" in body
+    assert re.search(
+        r"if \(\(j_outer >> 3\) == "
+        r"\((?:\(\(int\)threadIdx\.x\)|threadgroup_tid) >> 5\)\)",
+        body,
+    ), body
+    assert "__tvm_fp8_e4m3_to_half(A_shared" in body
+    assert "__tvm_fp8_e4m3_to_half(B_shared" in body
+    assert "for (int k = 0; k < 96;" not in body
 
 
 def test_m1_transposed_b_vecmat_unsafe_dot4_marker_uses_scalar_fallback():
@@ -404,6 +477,7 @@ def test_m1_transposed_b_vecmat_unsafe_dot4_marker_uses_scalar_fallback():
 
     assert "tl.fp8_scaled_matmul.marker" not in body
     assert "__tvm_fp8_e4m3_dot4_packed" not in body
+    assert "simd_sum(" in body
     assert "__tvm_fp8_e5m2_to_half" in body
 
 
@@ -421,6 +495,7 @@ def test_m1_transposed_b_vecmat_jit_metal_target_uses_marker_late_lowering():
     body = src[src.find("kernel void"):]
 
     assert "tl.fp8_scaled_matmul.marker" not in body
+    assert "simd_sum(" in body
     assert "__tvm_fp8_e4m3_to_half" in body
 
 
@@ -477,8 +552,31 @@ def test_m1_transposed_b_direct_marker_stores_global_column_index():
 
     assert "__tvm_fp8_e4m3_dot4_packed" in body
     assert "simd_sum(" in body
-    assert any("C[(gridThreadIdx >> 5)]" in line for line in c_access_lines)
+    assert any(
+        "C[(gridThreadIdx >> 5)]" in line or "C[(grid_tid >> 5)]" in line
+        for line in c_access_lines
+    ) or re.search(
+        r"int (?P<idx>cse_v\d+(?:_\d+)?) = \(grid_tid >> 5\);\n.*C\[(?P=idx)\]",
+        body,
+        re.S,
+    )
     assert not any("C[((gridThreadIdx >> 5) -" in line for line in c_access_lines)
+
+
+def test_full_transposed_b_direct_marker_late_lowers_to_dot4():
+    """Full matmul uses packed dot4 when B is already row/K-contiguous."""
+    fn = _make_direct_transposed_b_matmul_kernel(M=32, N=64, K=128, BM=8, BN=16)
+    assert "tl.fp8_scaled_matmul.marker" in str(fn)
+    artifact = tilelang.lower(fn, target=Target("metal"))
+    src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
+    body = src[src.find("kernel void"):]
+
+    assert "tl.fp8_scaled_matmul.marker" not in body
+    assert "__tvm_fp8_e4m3_dot4_packed" in body
+    assert "simd_sum(" not in body
+    assert "__tvm_fp8_e4m3_to_half(" not in body
+    assert re.search(r"threadIdx\.x\).*>> 4", body)
+    assert re.search(r"threadIdx\.x\).*& 15", body)
 
 
 # --------------------------------------------------------------------------
@@ -523,6 +621,17 @@ def test_xcrun_compile_mixed_dtype():
     )
     target = Target("metal")
     artifact = tilelang.lower(fn, target=target)
+    src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
+    rc, stderr = _xcrun_compile(src)
+    assert rc == 0, f"xcrun metal -c failed:\n{stderr}"
+
+
+@pytest.mark.skipif(
+    not _HAS_METAL_SDK, reason="macOS metal SDK (xcrun) not available"
+)
+def test_xcrun_compile_full_transposed_b_direct_dot4():
+    fn = _make_direct_transposed_b_matmul_kernel(M=32, N=64, K=128, BM=8, BN=16)
+    artifact = tilelang.lower(fn, target=Target("metal"))
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
     rc, stderr = _xcrun_compile(src)
     assert rc == 0, f"xcrun metal -c failed:\n{stderr}"
@@ -943,10 +1052,10 @@ def test_e2e_audiohacking_parity_vecmat_4096():
     """M=1 vecmat at K=N=4096 — TileLang vs audiohacking simdgroup kernel.
 
     The audiohacking project ships a dedicated ``fp8_scaled_vecmat_kernel``
-    with simdgroup reduction for M=1. The TileLang lowering uses the same
-    scalar dequant + FMA pattern but without the simdgroup reduction
-    (the macro emits a per-cell K-loop). This test verifies that the
-    fp32 outputs agree numerically; the bench test
+    with simdgroup reduction for M=1. The TileLang lowering uses scalar
+    dequant + FMA with a Metal ``simd_sum`` reduction when B is stored as
+    ``B[K, N]`` and the packed-dot4 path when B is row-contiguous. This test
+    verifies that the fp32 outputs agree numerically; the bench test
     ``test_bench_vecmat_vs_audiohacking`` records relative timing.
     """
     import torch
@@ -985,6 +1094,53 @@ def test_e2e_audiohacking_parity_vecmat_4096():
         f"vecmat parity failed: max abs err {abs_max:.3g}\n"
         f"c_out range: [{c_out.cpu().min():.3f}, {c_out.cpu().max():.3f}]\n"
         f"c_ref range: [{c_ref.min():.3f}, {c_ref.max():.3f}]"
+    )
+
+
+@pytest.mark.skipif(
+    not (_AUDIO_AVAILABLE and _HAS_TORCH_MPS_E2E),
+    reason="audiohacking MSL kernel and torch.mps required",
+)
+@tilelang.testing.requires_metal
+def test_e2e_audiohacking_parity_full_transposed_b_direct_128():
+    """Direct dot4 full matmul vs audiohacking with native B[N, K] layout."""
+    import torch
+    import mlx.core as mx
+    import numpy as np
+
+    M, N, K = 128, 128, 128
+    BM, BN = 8, 16
+    fn = _make_direct_transposed_b_matmul_kernel(M, N, K, BM, BN)
+    jit_kernel = tilelang.compile(fn, target="metal")
+
+    torch.manual_seed(0xD047)
+    a_orig = torch.randn(M, K, dtype=torch.float32) * 4.0
+    b_t_orig = torch.randn(N, K, dtype=torch.float32) * 4.0
+    sa = 0.5
+    sb = 0.25
+
+    a_fp8 = a_orig.to(torch.float8_e4m3fn).to("mps")
+    b_t_fp8 = b_t_orig.to(torch.float8_e4m3fn).to("mps")
+    a_scale = torch.tensor([sa], dtype=torch.float32, device="mps")
+    b_scale = torch.tensor([sb], dtype=torch.float32, device="mps")
+
+    c_out = torch.zeros(M, N, dtype=torch.float32, device="mps")
+    jit_kernel(a_fp8, a_scale, b_t_fp8, b_scale, c_out)
+    torch.mps.synchronize()
+
+    a_mx = mx.array(a_fp8.cpu().view(torch.uint8).numpy())
+    b_t_mx = mx.array(b_t_fp8.cpu().view(torch.uint8).numpy())
+    c_mx = _audio_fp8_scaled_matmul(a_mx, b_t_mx, scale_a=sa, scale_b=sb)
+    mx.eval(c_mx)
+    c_ref = torch.from_numpy(np.array(c_mx))
+
+    diff = (c_out.cpu() - c_ref).abs()
+    rel = diff / (c_ref.abs() + 1e-6)
+    abs_max = diff.max().item()
+    rel_max = rel.max().item()
+    assert abs_max < 1e-3, (
+        f"direct dot4 audiohacking parity failed: max abs err {abs_max:.3g}, "
+        f"max rel err {rel_max:.3g}"
     )
 
 
@@ -1083,16 +1239,69 @@ def test_bench_matmul_vs_audiohacking(capsys):
     reason="audiohacking MSL kernel and torch.mps required",
 )
 @tilelang.testing.requires_metal
+def test_bench_transposed_b_direct_dot4_vs_audiohacking(capsys):
+    """Bench direct TileLang dot4 when B is supplied as row-major B[N, K]."""
+    import torch
+    import mlx.core as mx
+
+    M, N, K = 128, 128, 128
+    BM, BN = 8, 16
+    flops = 2.0 * M * N * K
+
+    fn = _make_direct_transposed_b_matmul_kernel(M, N, K, BM, BN)
+    jit_kernel = tilelang.compile(fn, target="metal")
+
+    torch.manual_seed(0)
+    a_orig = torch.randn(M, K, dtype=torch.float32) * 4.0
+    b_t_orig = torch.randn(N, K, dtype=torch.float32) * 4.0
+    a_fp8 = a_orig.to(torch.float8_e4m3fn).to("mps")
+    b_t_fp8 = b_t_orig.to(torch.float8_e4m3fn).to("mps")
+    a_scale = torch.tensor([0.5], dtype=torch.float32, device="mps")
+    b_scale = torch.tensor([0.25], dtype=torch.float32, device="mps")
+    c_out = torch.zeros(M, N, dtype=torch.float32, device="mps")
+
+    def run_tilelang_dot4():
+        c_out.zero_()
+        jit_kernel(a_fp8, a_scale, b_t_fp8, b_scale, c_out)
+
+    tl_mean, tl_std = _bench_callable(run_tilelang_dot4, torch.mps.synchronize)
+
+    a_mx = mx.array(a_fp8.cpu().view(torch.uint8).numpy())
+    b_t_mx = mx.array(b_t_fp8.cpu().view(torch.uint8).numpy())
+
+    def run_audio():
+        c = _audio_fp8_scaled_matmul(a_mx, b_t_mx, scale_a=0.5, scale_b=0.25)
+        mx.eval(c)
+
+    au_mean, au_std = _bench_callable(run_audio, lambda: None)
+
+    tl_tflops = flops / tl_mean / 1e12
+    au_tflops = flops / au_mean / 1e12
+
+    with capsys.disabled():
+        print(
+            f"\n[bench] {M}x{N}x{K} direct e4m3 FP8 scaled matmul, B[N,K]:\n"
+            f"  TileLang dot4 : {tl_mean*1e3:7.3f} +/- {tl_std*1e3:5.3f} ms  "
+            f"({tl_tflops:5.3f} TFLOPS)\n"
+            f"  audiohack dot4: {au_mean*1e3:7.3f} +/- {au_std*1e3:5.3f} ms  "
+            f"({au_tflops:5.3f} TFLOPS)\n"
+            f"  ratio TileLang / audio = {tl_mean/au_mean:.2f}x"
+        )
+
+
+@pytest.mark.skipif(
+    not (_AUDIO_AVAILABLE and _HAS_TORCH_MPS_E2E),
+    reason="audiohacking MSL kernel and torch.mps required",
+)
+@tilelang.testing.requires_metal
 def test_bench_vecmat_vs_audiohacking(capsys):
     """Bench: M=1 4096x4096 TileLang vs audiohacking vecmat kernel.
 
     The audiohacking project ships a dedicated simdgroup-reduction
-    ``fp8_scaled_vecmat_kernel`` for M=1; the TileLang lowering uses the
-    same scalar K-loop as the matmul case. We expect the audiohacking
-    kernel to be substantially faster because its per-row simdgroup
-    reduction amortises the K-loop across 32 lanes; the TileLang scalar
-    fallback offers no reduction and is included as a correctness
-    baseline.
+    ``fp8_scaled_vecmat_kernel`` for M=1. TileLang now lowers the same
+    row-vector case to a scalar-dequant ``simd_sum`` reduction at the IR
+    level for ``B[K, N]`` shared tiles; packed dot4 remains reserved for
+    row-contiguous transposed-B layouts.
     """
     import torch
     import mlx.core as mx
@@ -1137,10 +1346,9 @@ def test_bench_vecmat_vs_audiohacking(capsys):
     with capsys.disabled():
         print(
             f"\n[bench] M=1 N={N} K={K} e4m3 FP8 vecmat:\n"
-            f"  TileLang scalar  : {tl_mean*1e3:7.3f} +/- {tl_std*1e3:5.3f} ms  "
+            f"  TileLang simdg   : {tl_mean*1e3:7.3f} +/- {tl_std*1e3:5.3f} ms  "
             f"({tl_tflops:6.3f} TFLOPS)\n"
             f"  audiohack simdg  : {av_mean*1e3:7.3f} +/- {av_std*1e3:5.3f} ms  "
             f"({av_tflops:6.3f} TFLOPS)\n"
             f"  ratio TileLang / audio = {tl_mean/av_mean:.2f}x"
-            f" (audiohacking wins; TileLang has no simdgroup reduction yet)"
         )

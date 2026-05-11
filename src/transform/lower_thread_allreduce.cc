@@ -103,6 +103,12 @@ public:
         max_num_threads_(target->GetAttr<Integer>("max_num_threads", -1)
                              .value()
                              .IntValue()) {
+    if (target_->kind->name == "metal") {
+      // MSL simd_shuffle* operates over the hardware simdgroup.  The generic
+      // TVM Metal target may report thread_warp_size=16, but TileLang's Metal
+      // codegen templates and Apple GPU reductions use 32-lane simdgroups.
+      warp_size_ = 32;
+    }
     if (is_dynamic) {
       shared_scope = "shared.dyn";
     }
@@ -479,9 +485,7 @@ private:
           PrimExpr val = BufferLoad(buf, {zero_index});
           ICHECK_EQ(val->dtype, types[i]);
           PrimExpr broadcast_lane =
-              (metal_split_reduce && reduce_extent == warp_size_)
-                  ? zero_index
-                  : reduce_extent * group_index;
+              WarpBroadcastLane(group_index, reduce_extent);
           PrimExpr splat =
               WarpShuffle(builtin::tvm_warp_shuffle(), new_alloc_bufs.back(),
                           val, broadcast_lane);
@@ -949,6 +953,17 @@ private:
     PrimExpr width = IntImm(DataType::Int(32), warp_size_);
     Array<PrimExpr> args{mask, val, std::move(delta_or_lane), width, width};
     return Call(val.dtype(), op, args);
+  }
+
+  PrimExpr WarpBroadcastLane(const PrimExpr &group_index, int reduce_extent) {
+    ICHECK_LE(reduce_extent, warp_size_);
+    int groups_per_warp = warp_size_ / reduce_extent;
+    if (groups_per_warp <= 1) {
+      return make_zero(group_index.dtype());
+    }
+    PrimExpr group_in_warp = floormod(
+        group_index, make_const(group_index.dtype(), groups_per_warp));
+    return group_in_warp * make_const(group_index.dtype(), reduce_extent);
   }
 
   // Check if we can use warp level reduction.

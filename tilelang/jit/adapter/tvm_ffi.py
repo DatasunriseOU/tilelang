@@ -22,9 +22,14 @@ from tilelang.utils.language import retrieve_func_from_module
 from tilelang.engine.param import KernelParam
 from tilelang.language.dtypes import dtype
 from tilelang.contrib.mlx_interop import (
+    DLPackDeviceError,
+    first_mlx_array_device,
     has_mlx_arrays,
+    is_mlx_array,
     maybe_mlx_metal_external_command_buffer,
     mlx_arrays_to_tvm_tensors,
+    mlx_metal_output,
+    validate_dlpack_inputs_for_target,
 )
 
 
@@ -201,11 +206,82 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 expected_dtype_strs.append(None)
                 is_buffer_param.append(False)
 
-        def func(*inputs: torch.Tensor | Any):
-            # Validate input count strictly
+        def normalize_out_argument(out_arg: Any) -> list[Any] | None:
+            if out_arg is None:
+                return None
+            if not self.result_idx:
+                raise ValueError("Output buffers can only be provided when out_idx/result_idx is set.")
+            if len(self.result_idx) == 1:
+                return [out_arg]
+            if not isinstance(out_arg, (list, tuple)):
+                raise ValueError(f"Kernel expected {len(self.result_idx)} output buffers, but out= is not a sequence.")
+            if len(out_arg) != len(self.result_idx):
+                raise ValueError(f"Kernel expected {len(self.result_idx)} output buffers, but {len(out_arg)} are provided.")
+            return list(out_arg)
+
+        def _shape_dim(tensor: Any, dim: int) -> int:
+            return int(tensor.shape[dim])
+
+        def _compact_stride(shape: tuple[int, ...], dim: int) -> int:
+            stride = 1
+            for extent in reversed(shape[dim + 1:]):
+                stride *= int(extent)
+            return stride
+
+        def _stride_dim(tensor: Any, dim: int) -> int:
+            stride = getattr(tensor, "stride", None)
+            if callable(stride):
+                return int(stride()[dim])
+            strides = getattr(tensor, "strides", None)
+            if strides is not None:
+                return int(strides[dim])
+            if is_mlx_array(tensor):
+                return _compact_stride(tuple(int(s) for s in tensor.shape), dim)
+            raise ValueError(
+                f"Cannot resolve dynamic stride from {type(tensor).__name__}; "
+                "pass a DLPack tensor with exposed strides or specialize the stride."
+            )
+
+        def func(*inputs: torch.Tensor | Any, out: Any | None = None):
+            # Validate input count.  The compact calling convention omits
+            # result_idx outputs so the adapter allocates them; the full ABI
+            # convention supplies every PrimFunc parameter and reuses caller
+            # owned result buffers.
             expected_inputs = len(self.params) - len(self.result_idx)
-            if len(inputs) != expected_inputs:
-                raise ValueError(f"Kernel expected {expected_inputs} inputs, but {len(inputs)} are provided.")
+            output_overrides = normalize_out_argument(out)
+            using_full_abi_args = (
+                output_overrides is None and bool(self.result_idx) and len(inputs) == len(self.params)
+            )
+            if output_overrides is not None and len(inputs) == len(self.params):
+                raise ValueError("Output buffers were provided both positionally and via out=.")
+            if output_overrides is not None:
+                if len(inputs) != expected_inputs:
+                    raise ValueError(f"Kernel expected {expected_inputs} inputs with out=, but {len(inputs)} are provided.")
+                provided_outputs = dict(zip(self.result_idx, output_overrides))
+            elif using_full_abi_args:
+                provided_outputs = {idx: inputs[idx] for idx in self.result_idx}
+            else:
+                provided_outputs = {}
+                if len(inputs) != expected_inputs:
+                    if self.result_idx:
+                        raise ValueError(
+                            f"Kernel expected {expected_inputs} inputs, or {len(self.params)} full ABI arguments "
+                            f"including output buffers, but {len(inputs)} are provided."
+                        )
+                    raise ValueError(f"Kernel expected {expected_inputs} inputs, but {len(inputs)} are provided.")
+
+            dlpack_args = inputs
+            if output_overrides is not None:
+                dlpack_args = inputs + tuple(output_overrides)
+            target_kind = self.target.kind.name
+            uses_mlx_runtime = has_mlx_arrays(dlpack_args)
+            if uses_mlx_runtime and target_kind != "metal":
+                raise DLPackDeviceError(
+                    f"MLX arrays export Metal DLPack buffers, but this kernel targets {target_kind!r}."
+                )
+            validate_dlpack_inputs_for_target(dlpack_args, target_kind)
+            if uses_mlx_runtime:
+                first_mlx_array_device(dlpack_args)
 
             # Resolve the device used for outputs. Prefer the first tensor input's device
             # if available, otherwise use PyTorch's current device.
@@ -213,12 +289,15 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
 
             # Stitch the full positional argument list expected by the TVM executable
             ins_idx: int = 0
-            tensor_list: list[torch.Tensor] = []
+            tensor_list: list[Any] = []
 
             # Prepare input and output tensors
             for i in range(len(self.params)):
-                if i in self.result_idx:
-                    dtype = param_dtypes[i]
+                if using_full_abi_args:
+                    tensor = inputs[i]
+                elif i in provided_outputs:
+                    tensor = provided_outputs[i]
+                elif i in self.result_idx:
                     shape = []
                     # Now working with native Python list, no FFI calls needed
                     for s in param_shapes[i]:
@@ -229,14 +308,14 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                                     if ref_id == 2:
                                         shape.append(inputs[ref_tensor_idx])
                                     elif ref_id == 0:
-                                        shape.append(tensor_list[ref_tensor_idx].shape[ref_shape_idx])
+                                        shape.append(_shape_dim(tensor_list[ref_tensor_idx], ref_shape_idx))
                                     elif ref_id == 1:
-                                        shape.append(tensor_list[ref_tensor_idx].stride()[ref_shape_idx] * stride_scale)
+                                        shape.append(
+                                            _stride_dim(tensor_list[ref_tensor_idx], ref_shape_idx)
+                                            * stride_scale
+                                        )
                         else:  # Already converted to Python int during initialization
                             shape.append(s)
-
-                    if out_device is None:
-                        out_device = current_device_functor()
 
                     if len(shape) == 0:
                         param_name = self.params[i].name if hasattr(self.params[i], "name") else f"parameter_{i}"
@@ -244,15 +323,24 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                             f"Cannot create output tensor (name={param_name}) - 0-dimensional tensors are not supported. "
                             f"Expected shape: {shape}"
                         )
-                    tensor = torch.empty(*shape, dtype=dtype, device=out_device)
+                    dtype = param_dtypes[i]
+                    if uses_mlx_runtime:
+                        tensor = mlx_metal_output(shape, expected_dtype_strs[i])
+                    else:
+                        if out_device is None:
+                            out_device = current_device_functor()
+                        tensor = torch.empty(*shape, dtype=dtype, device=out_device)
                 else:
                     tensor = inputs[ins_idx]
                     ins_idx += 1
                 tensor_list.append(tensor)
 
             exec_tensor_list = (
-                mlx_arrays_to_tvm_tensors(tensor_list)
-                if has_mlx_arrays(tensor_list)
+                mlx_arrays_to_tvm_tensors(
+                    tensor_list,
+                    expected_dtypes=expected_dtype_strs,
+                )
+                if uses_mlx_runtime
                 else tensor_list
             )
             with maybe_mlx_metal_external_command_buffer(tensor_list):

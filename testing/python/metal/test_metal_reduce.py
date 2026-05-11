@@ -235,17 +235,19 @@ def _make_row_reduce_kernel(*, rows=8, cols=32, threads=None):
     return row_reduce_kernel
 
 
-def _make_split_thread_allreduce_kernel():
+def _make_split_thread_allreduce_kernel(*, reduce_extent=32, groups=4):
+    total_threads = reduce_extent * groups
+
     @T.prim_func
     def split_thread_allreduce(
-        A: T.Tensor((128,), T.float32), B: T.Tensor((4,), T.float32)
+        A: T.Tensor((total_threads,), T.float32), B: T.Tensor((groups,), T.float32)
     ):
-        with T.Kernel(1, threads=128):
+        with T.Kernel(1, threads=total_threads):
             accum = T.alloc_local((1,), T.float32)
             reduced = T.alloc_local((1,), T.float32)
             lane = T.get_thread_binding(0)
-            kr = T.floormod(lane, 32)
-            group = T.floordiv(lane, 32)
+            kr = T.floormod(lane, reduce_extent)
+            group = T.floordiv(lane, reduce_extent)
             accum[0] = A[lane]
             with T.attr(
                 T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
@@ -449,6 +451,29 @@ def test_metal_template_row_reduce_1024_uses_one_simdgroup_per_row_fast_path():
     assert "workspace" not in kernel_body
 
 
+@tilelang.testing.requires_metal
+def test_metal_template_row_reduce_runtime_mps_matches_torch_sum():
+    rows = 10
+    cols = 1024
+    kernel = tilelang.compile(
+        _make_metal_template_row_reduce_sum(rows=rows, cols=cols),
+        target="metal",
+    )
+    values = (
+        torch.arange(rows * cols, dtype=torch.float32, device="mps").reshape(
+            rows, cols
+        )
+        / 1024.0
+    )
+    out = torch.empty(rows, dtype=torch.float32, device="mps")
+
+    kernel(values, out)
+    torch.mps.synchronize()
+
+    expected = values.cpu().sum(dim=1)
+    torch.testing.assert_close(out.cpu(), expected, rtol=1e-5, atol=1e-4)
+
+
 def test_metal_template_row_reduce_rejects_non_innermost_structure():
     template = GeneralReductionTemplate(structure="RS", shape=[1024, 16], dtype="float32")
 
@@ -461,7 +486,40 @@ def test_metal_lower_thread_allreduce_accepts_split_simdgroup_index():
 
     _assert_no_cuda_reduce_leakage(src)
     assert "simd_shuffle_down" in src, src
+    assert "simd_shuffle(red_buf0[0], 0)" in src, src
+    assert "red_result[" not in src, src
+
+
+def test_metal_lower_thread_allreduce_split_cross_simdgroup_keeps_shared_result():
+    src = _lower_source(
+        _make_split_thread_allreduce_kernel(reduce_extent=64, groups=2)
+    )
+
+    _assert_no_cuda_reduce_leakage(src)
+    assert "simd_shuffle_down" in src, src
     assert "red_result[" in src, src
+
+
+def test_metal_lower_thread_allreduce_split_subgroups_broadcast_local_lane():
+    src = _lower_source(
+        _make_split_thread_allreduce_kernel(reduce_extent=16, groups=4)
+    )
+
+    _assert_no_cuda_reduce_leakage(src)
+    _assert_body_workspace(src, expected=False)
+    shuffle_calls = [
+        line.strip()
+        for line in src.splitlines()
+        if "simd_shuffle(" in line and "red_buf0" in line
+    ]
+    assert shuffle_calls, src
+    assert "simd_shuffle(red_buf0[0], 0)" not in "\n".join(shuffle_calls)
+    assert any(
+        ("* 16" in line and ("& 31" in line or "% 2" in line))
+        for line in shuffle_calls
+    ), (
+        f"expected simdgroup-local 16-lane broadcast source; calls={shuffle_calls}\n{src}"
+    )
 
 
 @tilelang.testing.requires_metal
@@ -475,6 +533,32 @@ def test_metal_split_simdgroup_allreduce_runtime_mps():
 
     expected = torch.tensor(
         [sum(range(i * 32, (i + 1) * 32)) for i in range(4)],
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+@tilelang.testing.requires_metal
+def test_metal_split_subsimdgroup_allreduce_runtime_mps():
+    reduce_extent = 16
+    groups = 4
+    kernel = tilelang.compile(
+        _make_split_thread_allreduce_kernel(
+            reduce_extent=reduce_extent, groups=groups
+        ),
+        target="metal",
+    )
+    values = torch.arange(reduce_extent * groups, dtype=torch.float32, device="mps")
+    out = torch.empty(groups, dtype=torch.float32, device="mps")
+
+    kernel(values, out)
+    torch.mps.synchronize()
+
+    expected = torch.tensor(
+        [
+            sum(range(i * reduce_extent, (i + 1) * reduce_extent))
+            for i in range(groups)
+        ],
         dtype=torch.float32,
     )
     torch.testing.assert_close(out.cpu(), expected)

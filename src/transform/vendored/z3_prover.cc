@@ -26,6 +26,7 @@
 #include "z3_prover.h"
 
 #include <tvm/arith/analyzer.h>
+#include <tvm/ir/transform.h>
 #include <tvm/ir/expr.h>
 #include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/ffi/extra/structural_hash.h>
@@ -55,6 +56,7 @@
 #include "tvm/ffi/object.h"
 #include "tvm/ffi/reflection/registry.h"
 #include "tvm/ffi/string.h"
+#include "z3_proof_hooks.h"
 
 namespace tilelang {
 namespace tlz3 {
@@ -1350,6 +1352,11 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::GlobalDef().def("tl.z3.clear_prover_cache",
                         []() { ClearProverCache(); });
 }
+
+TVM_REGISTER_PASS_CONFIG_OPTION(kProofHookVectorization, ::tvm::Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kProofHookBarrierMinimization, ::tvm::Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kProofHookAsyncEligibility, ::tvm::Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kProofHookAliasShape, ::tvm::Bool);
 
 // ---------------------------------------------------------------------------
 // CPPMEGA z3-final per-pass gate (2026-05-07).

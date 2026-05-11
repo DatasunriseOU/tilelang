@@ -25,6 +25,69 @@ from typing import Any
 
 from tilelang import tvm
 
+DLPACK_DEVICE_CPU = 1
+DLPACK_DEVICE_CUDA = 2
+DLPACK_DEVICE_METAL = 8
+DLPACK_DEVICE_ROCM = 10
+
+_DLPACK_DEVICE_NAMES = {
+    DLPACK_DEVICE_CPU: "kDLCPU",
+    DLPACK_DEVICE_CUDA: "kDLCUDA",
+    DLPACK_DEVICE_METAL: "kDLMetal",
+    DLPACK_DEVICE_ROCM: "kDLROCM",
+}
+
+
+class _DLDevice(ctypes.Structure):
+    _fields_ = [
+        ("device_type", ctypes.c_int32),
+        ("device_id", ctypes.c_int32),
+    ]
+
+
+class _DLDataType(ctypes.Structure):
+    _fields_ = [
+        ("code", ctypes.c_uint8),
+        ("bits", ctypes.c_uint8),
+        ("lanes", ctypes.c_uint16),
+    ]
+
+
+class _DLTensor(ctypes.Structure):
+    _fields_ = [
+        ("data", ctypes.c_void_p),
+        ("device", _DLDevice),
+        ("ndim", ctypes.c_int32),
+        ("dtype", _DLDataType),
+        ("shape", ctypes.POINTER(ctypes.c_int64)),
+        ("strides", ctypes.POINTER(ctypes.c_int64)),
+        ("byte_offset", ctypes.c_uint64),
+    ]
+
+
+class _DLManagedTensor(ctypes.Structure):
+    _fields_ = [
+        ("dl_tensor", _DLTensor),
+        ("manager_ctx", ctypes.c_void_p),
+        ("deleter", ctypes.c_void_p),
+    ]
+
+
+class DLPackInteropError(RuntimeError):
+    """Base class for Python-side DLPack interop failures."""
+
+
+class DLPackDeviceError(DLPackInteropError):
+    """Raised when a DLPack producer reports an incompatible device."""
+
+
+class DLPackOwnershipError(DLPackInteropError):
+    """Raised when a DLPack capsule cannot transfer ownership safely."""
+
+
+class DLPackConversionError(DLPackInteropError):
+    """Raised when a DLPack producer cannot be imported without a copy."""
+
 
 def _mlx_core():
     try:
@@ -57,20 +120,319 @@ def has_mlx_arrays(args: Iterable[Any]) -> bool:
     return any(_contains_mlx_array(arg) for arg in args)
 
 
-def mlx_arrays_to_tvm_tensors(args: Iterable[Any]) -> list[Any]:
+def _format_dlpack_device(device_type: int, device_id: int) -> str:
+    name = _DLPACK_DEVICE_NAMES.get(device_type, f"DLDeviceType({device_type})")
+    return f"{name}:{device_id}"
+
+
+def _is_py_capsule(arg: Any) -> bool:
+    return type(arg).__name__ == "PyCapsule"
+
+
+def _pycapsule_is_valid(arg: Any, name: bytes) -> bool:
+    is_valid = ctypes.pythonapi.PyCapsule_IsValid
+    is_valid.argtypes = [ctypes.py_object, ctypes.c_char_p]
+    is_valid.restype = ctypes.c_int
+    return bool(is_valid(arg, name))
+
+
+def _pycapsule_get_pointer(arg: Any, name: bytes) -> int:
+    get_pointer = ctypes.pythonapi.PyCapsule_GetPointer
+    get_pointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+    get_pointer.restype = ctypes.c_void_p
+    ptr = get_pointer(arg, name)
+    if not ptr:
+        raise DLPackOwnershipError("DLPack capsule has a null tensor pointer")
+    return int(ptr)
+
+
+def _get_dlpack_capsule_device(arg: Any) -> tuple[int, int]:
+    if _pycapsule_is_valid(arg, b"dltensor"):
+        ptr = _pycapsule_get_pointer(arg, b"dltensor")
+        tensor = ctypes.cast(ptr, ctypes.POINTER(_DLManagedTensor)).contents
+        return int(tensor.dl_tensor.device.device_type), int(tensor.dl_tensor.device.device_id)
+    if _pycapsule_is_valid(arg, b"used_dltensor") or _pycapsule_is_valid(
+        arg, b"used_dltensor_versioned"
+    ):
+        raise DLPackOwnershipError("DLPack capsule has already been consumed")
+    if _pycapsule_is_valid(arg, b"dltensor_versioned"):
+        raise DLPackConversionError(
+            "Versioned DLPack capsules cannot be preflighted for device ownership"
+        )
+    raise DLPackConversionError("DLPack capsule is not a valid dltensor capsule")
+
+
+def _is_used_dlpack_capsule(arg: Any) -> bool:
+    return _is_py_capsule(arg) and (
+        _pycapsule_is_valid(arg, b"used_dltensor")
+        or _pycapsule_is_valid(arg, b"used_dltensor_versioned")
+    )
+
+
+def _iter_nested_values(args: Iterable[Any]):
+    for arg in args:
+        if isinstance(arg, Mapping):
+            yield from _iter_nested_values(arg.values())
+        elif isinstance(arg, (list, tuple, set, frozenset)):
+            yield from _iter_nested_values(arg)
+        else:
+            yield arg
+
+
+def _get_dlpack_device(arg: Any) -> tuple[int, int]:
+    get_device = getattr(arg, "__dlpack_device__", None)
+    if get_device is None:
+        if _is_py_capsule(arg):
+            return _get_dlpack_capsule_device(arg)
+        raise DLPackDeviceError(f"{type(arg).__name__} does not expose __dlpack_device__")
+    try:
+        device = get_device()
+    except Exception as exc:
+        raise DLPackDeviceError(
+            f"{type(arg).__name__}.__dlpack_device__() failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(device, tuple) or len(device) != 2:
+        raise DLPackDeviceError(
+            f"{type(arg).__name__}.__dlpack_device__() must return (device_type, device_id), "
+            f"got {device!r}"
+        )
+    try:
+        return int(device[0]), int(device[1])
+    except Exception as exc:
+        raise DLPackDeviceError(
+            f"{type(arg).__name__}.__dlpack_device__() returned non-integer values: {device!r}"
+        ) from exc
+
+
+def validate_dlpack_device(
+    arg: Any,
+    *,
+    expected_device_type: int | None = None,
+    expected_device_id: int | None = None,
+    owner_name: str = "DLPack producer",
+) -> tuple[int, int]:
+    """Validate a DLPack producer's reported device before consuming it."""
+
+    device_type, device_id = _get_dlpack_device(arg)
+    if expected_device_type is not None and device_type != expected_device_type:
+        raise DLPackDeviceError(
+            f"{owner_name} is on {_format_dlpack_device(device_type, device_id)}, "
+            f"but this path requires "
+            f"{_format_dlpack_device(expected_device_type, expected_device_id or 0)}"
+        )
+    if expected_device_id is not None and device_id != expected_device_id:
+        raise DLPackDeviceError(
+            f"{owner_name} is on {_format_dlpack_device(device_type, device_id)}, "
+            f"but this path requires {_format_dlpack_device(device_type, expected_device_id)}"
+        )
+    return device_type, device_id
+
+
+def validate_dlpack_inputs_for_target(args: Iterable[Any], target_kind: str) -> None:
+    """Fail early when DLPack inputs cannot be consumed by the target backend."""
+
+    expected_device_type = None
+    if target_kind == "metal":
+        expected_device_type = DLPACK_DEVICE_METAL
+    if expected_device_type is None:
+        return
+
+    for arg in _iter_nested_values(args):
+        if hasattr(arg, "__dlpack_device__") or _is_py_capsule(arg):
+            validate_dlpack_device(
+                arg,
+                expected_device_type=expected_device_type,
+                owner_name=type(arg).__name__,
+            )
+
+
+def first_mlx_array_device(args: Iterable[Any]) -> tuple[int, int] | None:
+    """Return the first MLX array's DLPack device, if any."""
+
+    for arg in _iter_nested_values(args):
+        if is_mlx_array(arg):
+            return validate_dlpack_device(
+                arg,
+                expected_device_type=DLPACK_DEVICE_METAL,
+                owner_name="MLX array",
+            )
+    return None
+
+
+def dlpack_to_tvm_tensor(
+    arg: Any,
+    *,
+    expected_device_type: int | None = None,
+    expected_device_id: int | None = None,
+    owner_name: str = "DLPack producer",
+):
+    """Import a DLPack producer as a TVM tensor view with typed failures."""
+
+    if (
+        hasattr(arg, "__dlpack_device__")
+        or expected_device_type is not None
+        or expected_device_id is not None
+        or _is_used_dlpack_capsule(arg)
+    ):
+        validate_dlpack_device(
+            arg,
+            expected_device_type=expected_device_type,
+            expected_device_id=expected_device_id,
+            owner_name=owner_name,
+        )
+    try:
+        return tvm.runtime.from_dlpack(arg)
+    except ValueError as exc:
+        msg = str(exc)
+        if "consume" in msg or "used_dltensor" in msg or "used_dltensor_versioned" in msg:
+            raise DLPackOwnershipError(
+                f"{owner_name} ownership transfer failed: {msg}"
+            ) from exc
+        raise DLPackConversionError(f"{owner_name} import failed: {msg}") from exc
+    except BufferError as exc:
+        raise DLPackOwnershipError(
+            f"{owner_name} ownership transfer failed: {exc}"
+        ) from exc
+    except TypeError as exc:
+        msg = str(exc)
+        if "PyCapsule" in msg and (
+            "used_dltensor" in repr(arg) or "used_dltensor_versioned" in repr(arg)
+        ):
+            raise DLPackOwnershipError(
+                f"{owner_name} ownership transfer failed: {msg}"
+            ) from exc
+        raise DLPackConversionError(
+            f"{owner_name} import failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    except RuntimeError as exc:
+        raise DLPackConversionError(
+            f"{owner_name} import failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _dtype_name(dtype: Any | None) -> str | None:
+    if dtype is None:
+        return None
+    dtype_name = str(dtype)
+    if dtype_name.startswith("torch."):
+        dtype_name = dtype_name.removeprefix("torch.")
+    return dtype_name
+
+
+def _view_tvm_tensor_for_expected_dtype(tensor: Any, arg: Any, expected_dtype: Any | None):
+    expected = _dtype_name(expected_dtype)
+    if expected is None or str(tensor.dtype) == expected:
+        return tensor
+    if expected.startswith("float8") and str(tensor.dtype) in {"uint8", "int8"}:
+        try:
+            return tensor._create_view(tuple(int(dim) for dim in arg.shape), dtype=expected)
+        except Exception as exc:
+            raise DLPackConversionError(
+                f"MLX array import failed: could not view {tensor.dtype} DLPack storage "
+                f"as expected {expected} without copying: {type(exc).__name__}: {exc}"
+            ) from exc
+    raise DLPackConversionError(
+        f"MLX array import failed: DLPack dtype {tensor.dtype} does not match "
+        f"expected kernel dtype {expected}"
+    )
+
+
+def mlx_array_to_tvm_tensor(arg: Any, *, expected_dtype: Any | None = None):
+    """Import an MLX Metal array as a TVM tensor view without copying."""
+
+    if not is_mlx_array(arg):
+        raise TypeError(f"expected mlx.core.array, got {type(arg).__name__}")
+    tensor = dlpack_to_tvm_tensor(
+        arg,
+        expected_device_type=DLPACK_DEVICE_METAL,
+        owner_name="MLX array",
+    )
+    return _view_tvm_tensor_for_expected_dtype(tensor, arg, expected_dtype)
+
+
+def mlx_arrays_to_tvm_tensors(
+    args: Iterable[Any],
+    *,
+    expected_dtypes: Iterable[Any | None] | None = None,
+) -> list[Any]:
     """Convert MLX array arguments to TVM Tensor views with DLPack.
 
     DLPack imports borrow the existing producer allocation; this does not
-    allocate or copy tensor payloads.
+    allocate or copy tensor payloads.  MLX stores FP8 arrays as uint8 DLPack
+    buffers; when a TileLang ABI expects float8, re-view the TVM tensor with
+    the expected dtype so the runtime sees the correct ABI without staging.
     """
 
+    arg_list = list(args)
+    if expected_dtypes is None:
+        expected_list: list[Any | None] = [None] * len(arg_list)
+    else:
+        expected_list = list(expected_dtypes)
+        if len(expected_list) != len(arg_list):
+            raise DLPackConversionError(
+                f"expected_dtypes length {len(expected_list)} does not match "
+                f"argument length {len(arg_list)}"
+            )
     converted = []
-    for arg in args:
+    for arg, expected_dtype in zip(arg_list, expected_list, strict=True):
         if is_mlx_array(arg):
-            converted.append(tvm.runtime.from_dlpack(arg))
+            converted.append(mlx_array_to_tvm_tensor(arg, expected_dtype=expected_dtype))
         else:
             converted.append(arg)
     return converted
+
+
+def mlx_dtype_from_tvm(dtype: Any):
+    """Map a TVM/TileLang dtype to an MLX dtype without casting data."""
+
+    mx = _mlx_core()
+    if mx is None:
+        raise DLPackConversionError("mlx.core is required to allocate MLX Metal outputs")
+
+    dtype_name = str(dtype)
+    if dtype_name.startswith("torch."):
+        dtype_name = dtype_name.removeprefix("torch.")
+    dtype_name = {
+        "bool": "bool_",
+        "uint1": "bool_",
+    }.get(dtype_name, dtype_name)
+    mlx_dtype = getattr(mx, dtype_name, None)
+    if mlx_dtype is None:
+        raise DLPackConversionError(f"MLX output allocation does not support dtype {dtype!s}")
+    return mlx_dtype
+
+
+def mlx_metal_output(shape: Iterable[int], dtype: Any):
+    """Allocate an MLX Metal output buffer for TVM to fill through DLPack."""
+
+    mx = _mlx_core()
+    if mx is None:
+        raise DLPackConversionError("mlx.core is required to allocate MLX Metal outputs")
+    return mx.zeros(tuple(int(dim) for dim in shape), dtype=mlx_dtype_from_tvm(dtype))
+
+
+def tvm_tensor_to_mlx_array(tensor: Any):
+    """Export a TVM Metal tensor to MLX via DLPack without copying."""
+
+    mx = _mlx_core()
+    if mx is None:
+        raise DLPackConversionError("mlx.core is required to export TVM Metal tensors to MLX")
+    validate_dlpack_device(
+        tensor,
+        expected_device_type=DLPACK_DEVICE_METAL,
+        owner_name="TVM tensor",
+    )
+    try:
+        return mx.array(tensor.__dlpack__())
+    except ValueError as exc:
+        msg = str(exc)
+        if "consume" in msg or "used_dltensor" in msg or "used_dltensor_versioned" in msg:
+            raise DLPackOwnershipError(f"TVM tensor export failed: {msg}") from exc
+        raise DLPackConversionError(f"TVM tensor export failed: {msg}") from exc
+    except (BufferError, TypeError, RuntimeError) as exc:
+        raise DLPackConversionError(
+            f"TVM tensor export failed: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _metal_func(name: str):

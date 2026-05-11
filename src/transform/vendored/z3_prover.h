@@ -191,6 +191,7 @@ Z3Prover& GetOrCreate(::tvm::arith::Analyzer* analyzer);
 //   DROP_BOUND_CHECKS  (drop_provable_bound_checks.cc, idea #4)
 //   TMA_LEGALITY       (op/copy.cc, idea #6)
 //   BARRIER_ELISION    (thread_storage_sync.cc, idea #11)
+//   ALIAS_SHAPE        (reserved central alias/shape proof hook)
 //   AUTO_DOUBLE_BUFFER (auto_double_buffer.cc, idea #2; reserved — currently
 //                       no live Z3 call sites in stub mode)
 //   INT24              (analysis/int24_overflow_proof.py, idea #5)

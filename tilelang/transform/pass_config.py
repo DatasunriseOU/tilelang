@@ -228,6 +228,25 @@ class PassConfigKey(str, Enum):
     buffer base address is aligned to ``vec_width * dtype_bytes``.
     Default: False (additive optimization)."""
 
+    TL_Z3_PROOF_VECTORIZATION = "tl.z3_proof.vectorization"
+    """Central Z3 proof hook for vectorization legality queries. Default:
+    False. When disabled, vectorization keeps the analyzer-only path and any
+    Z3-only proof falls back conservatively."""
+
+    TL_Z3_PROOF_BARRIER_MINIMIZATION = "tl.z3_proof.barrier_minimization"
+    """Central Z3 proof hook for barrier minimization. Default: False. When
+    disabled or unproved, ThreadSync keeps the conservative
+    ``T.tvm_storage_sync`` barrier."""
+
+    TL_Z3_PROOF_ASYNC_ELIGIBILITY = "tl.z3_proof.async_eligibility"
+    """Central Z3 proof hook for async/TMA eligibility. Default: False. When
+    enabled, symbolic async-copy legality must have a positive proof or falls
+    back to the synchronous/conservative route."""
+
+    TL_Z3_PROOF_ALIAS_SHAPE = "tl.z3_proof.alias_shape"
+    """Reserved central Z3 proof hook for alias and shape obligations.
+    Default: False."""
+
     TL_DISABLE_THREAD_STORAGE_SYNC = "tl.disable_thread_storage_sync"
     """Disable thread storage synchronization pass. When enabled, disables the
     automatic insertion of thread synchronization barriers (e.g., __syncthreads())
@@ -295,7 +314,7 @@ class PassConfigKey(str, Enum):
     TIR_ENABLE_EQUIV_TERMS_IN_CSE = "tir.enable_equiv_terms_in_cse_tir"
     """Enable equivalent terms in TIR Common Subexpression Elimination. Default: True"""
 
-    TIR_DISABLE_CSE = "tir.disable_cse_tir"
+    TIR_DISABLE_CSE = "tirx.disable_cse_tir"
     """Disable TIR Common Subexpression Elimination. Default: False"""
 
     TIR_SIMPLIFY = "tir.Simplify"

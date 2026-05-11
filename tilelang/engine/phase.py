@@ -64,6 +64,27 @@ def allow_vectorize(pass_ctx: PassContext | None = None) -> bool:
     return not disable_vectorize
 
 
+def allow_tir_cse(pass_ctx: PassContext | None = None) -> bool:
+    if pass_ctx is None:
+        pass_ctx = tilelang.transform.get_pass_context()
+    return not bool(pass_ctx.config.get(tilelang.PassConfigKey.TIR_DISABLE_CSE, False))
+
+
+def apply_metal_scalar_pipeline(
+    mod: IRModule, target: Target, pass_ctx: PassContext | None = None
+) -> IRModule:
+    if target.kind.name != "metal" or not allow_tir_cse(pass_ctx):
+        return mod
+    mod = tilelang.transform.BindMetalScalarIntrinsics()(mod)
+    mod = tir.transform.CommonSubexprElim()(mod)
+    mod = tilelang.transform.BindMetalScalarIntrinsics()(mod)
+    mod = tir.transform.HoistExpression()(mod)
+    mod = tilelang.transform.BindMetalScalarIntrinsics()(mod)
+    mod = tir.transform.CommonSubexprElim()(mod)
+    mod = tilelang.transform.BindMetalScalarIntrinsics()(mod)
+    return mod
+
+
 def allow_global_thread_synchronization(pass_ctx: PassContext | None = None) -> bool:
     if pass_ctx is None:
         pass_ctx = tilelang.transform.get_pass_context()
@@ -355,13 +376,13 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tir.transform.NarrowDataType(32)(mod)
-    
+
     mod = tilelang.transform.FlattenBuffer()(mod)
     # ConfigIndexBitwidth must be applied after FlattenBuffer
     # as it will flatten index computing
     mod = tilelang.transform.ConfigIndexBitwidth()(mod)
     mod = tir.transform.Simplify()(mod)
-    
+
     # CPPMEGA: Z3 roadmap idea #4 — drop provable buffer-bound guards before
     # vectorization. Gated by `tl.drop_provable_bound_checks` PassConfig
     # (default OFF). See src/transform/drop_provable_bound_checks.cc.
@@ -427,6 +448,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.InjectFenceProxy()(mod)
     mod = tilelang.transform.ThreadSync("shared")(mod)
     mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
+    mod = tilelang.transform.MetalMergeRoundBarrierCleanup()(mod)
     # Inject conservative tcgen05 fences on Blackwell (SM100+).
     # Must run after ThreadSync so that tvm_storage_sync calls are present.
     # The pass handles shared syncs and simple linear wait/use, use/arrive
@@ -440,8 +462,13 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # the normal flattening point.  Re-flatten before wrapping the host API so
     # local buffer elem_offset symbols do not become phantom API arguments.
     mod = tilelang.transform.FlattenBuffer()(mod)
+    # Metal scalar cleanup: CSE feeds HoistExpression, then a second CSE pass
+    # restores scalar bindings that HoistExpression may expand. Launch lowering
+    # inlines those binds when collecting launch args.
+    mod = apply_metal_scalar_pipeline(mod, target, pass_ctx)
     mod = tilelang.transform.MakePackedAPI()(mod)
     mod = tilelang.transform.Simplify()(mod)
+    mod = apply_metal_scalar_pipeline(mod, target, pass_ctx)
     mod = tilelang.transform.LowerDeviceKernelLaunch()(mod)
 
     # Transform threadblock to persistent threadblock

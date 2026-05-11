@@ -20,6 +20,7 @@ from tilelang.engine.phase import (
     PreLowerSemanticCheck,
     LowerAndLegalize,
     OptimizeForTarget,
+    apply_metal_scalar_pipeline,
 )
 
 
@@ -239,6 +240,7 @@ def device_codegen(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
     device_mod = tilelang.transform.LowerExternIntrinsic(target.kind.name)(device_mod)
     device_mod = tir.transform.Simplify()(device_mod)
     device_mod = tilelang.transform.HoistBroadcastValues()(device_mod)
+    device_mod = apply_metal_scalar_pipeline(device_mod, target)
 
     if target.kind.name == "cuda":
         global_func = "target.build.tilelang_" + ("cutedsl" if "cutedsl" in target.keys else "cuda")
@@ -262,6 +264,7 @@ def device_codegen_without_compile(device_mod: tvm.IRModule, target: Target) -> 
     device_mod = tilelang.transform.LowerExternIntrinsic(target.kind.name)(device_mod)
     device_mod = tir.transform.Simplify()(device_mod)
     device_mod = tilelang.transform.HoistBroadcastValues()(device_mod)
+    device_mod = apply_metal_scalar_pipeline(device_mod, target)
 
     if target.kind.name == "cuda":
         global_func = "target.build.tilelang_" + ("cutedsl" if "cutedsl" in target.keys else "cuda") + "_without_compile"

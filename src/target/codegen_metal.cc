@@ -702,6 +702,7 @@ class MetalFp8DTypeCollector final : public StmtExprVisitor {
 public:
   std::set<int> referenced_codes;
   bool uses_dot4{false};
+  bool uses_atomic_add{false};
   // CPPMEGA / Path C: track usage of the two MSL kernel-attribute intrinsics
   // emitted by tilelang/language/fp8_op.py. These do not have a matching
   // ``[[thread_position_in_grid]]`` / ``[[thread_index_in_simdgroup]]``
@@ -731,6 +732,10 @@ public:
   static bool IsGridTidXIntrin(const std::string &name) {
     return name == "tir.metal.thread_position_in_grid_x" ||
            name == "tirx.metal.thread_position_in_grid_x";
+  }
+  static bool IsThreadgroupTidXIntrin(const std::string &name) {
+    return name == "tir.metal.thread_position_in_threadgroup_x" ||
+           name == "tirx.metal.thread_position_in_threadgroup_x";
   }
   static bool IsSimdLaneIdIntrin(const std::string &name) {
     return name == "tir.metal.thread_index_in_simdgroup" ||
@@ -762,6 +767,10 @@ public:
     Note(op->dtype);
     for (const auto &arg : op->args) {
       Note(arg.dtype());
+    }
+    if (op->op.same_as(tl::atomic_add_elem_op()) ||
+        op->op.same_as(tl::atomic_add_ret_elem_op())) {
+      uses_atomic_add = true;
     }
     if (auto *opn = op->op.as<OpNode>()) {
       // CPPMEGA: the python ``T.call_intrin("tir.metal.fp8_e4m3_dot4", ...)``
@@ -827,6 +836,7 @@ void CodeGenTileLangMetal::CollectReferencedLowPrecisionDtypes(
     const PrimFunc &f) {
   referenced_fp8_codes_.clear();
   uses_fp8_dot4_ = false;
+  uses_atomic_add_ = false;
   MetalFp8DTypeCollector collector;
   // Inspect parameter dtypes (handle pointers carry their pointee dtype via
   // the buffer_map; non-handle parameters carry it directly).
@@ -852,6 +862,46 @@ void CodeGenTileLangMetal::CollectReferencedLowPrecisionDtypes(
   referenced_fp8_codes_.insert(collector.referenced_codes.begin(),
                                collector.referenced_codes.end());
   if (collector.uses_dot4) uses_fp8_dot4_ = true;
+  if (collector.uses_atomic_add) uses_atomic_add_ = true;
+}
+
+void CodeGenTileLangMetal::EmitAtomicAddHelperPrelude() {
+  if (!uses_atomic_add_ || emitted_atomic_add_helper_) return;
+  emitted_atomic_add_helper_ = true;
+  decl_stream
+      << "namespace tl {\n"
+      << "static inline float AtomicAdd(device float* address, float val,\n"
+      << "                              int memory_order = 0) {\n"
+      << "  (void)memory_order;\n"
+      << "  device atomic_uint* bits = reinterpret_cast<device atomic_uint*>(address);\n"
+      << "  uint old_bits = atomic_load_explicit(bits, memory_order_relaxed);\n"
+      << "  while (true) {\n"
+      << "    float old_val = as_type<float>(old_bits);\n"
+      << "    uint new_bits = as_type<uint>(old_val + val);\n"
+      << "    uint expected = old_bits;\n"
+      << "    if (atomic_compare_exchange_weak_explicit(\n"
+      << "            bits, &expected, new_bits, memory_order_relaxed,\n"
+      << "            memory_order_relaxed)) {\n"
+      << "      return old_val;\n"
+      << "    }\n"
+      << "    old_bits = expected;\n"
+      << "  }\n"
+      << "}\n"
+      << "static inline int AtomicAdd(device int* address, int val,\n"
+      << "                            int memory_order = 0) {\n"
+      << "  (void)memory_order;\n"
+      << "  return atomic_fetch_add_explicit(\n"
+      << "      reinterpret_cast<device atomic_int*>(address), val,\n"
+      << "      memory_order_relaxed);\n"
+      << "}\n"
+      << "static inline uint AtomicAdd(device uint* address, uint val,\n"
+      << "                             int memory_order = 0) {\n"
+      << "  (void)memory_order;\n"
+      << "  return atomic_fetch_add_explicit(\n"
+      << "      reinterpret_cast<device atomic_uint*>(address), val,\n"
+      << "      memory_order_relaxed);\n"
+      << "}\n"
+      << "} /* namespace tl */\n\n";
 }
 
 void CodeGenTileLangMetal::EmitFPHelperPrelude() {
@@ -930,6 +980,7 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
   // body generated later in this method. Pure-fp32 kernels emit zero
   // helpers.
   this->CollectReferencedLowPrecisionDtypes(func);
+  this->EmitAtomicAddHelperPrelude();
   this->EmitFPHelperPrelude();
 
   // add to alloc buffer type.
@@ -1596,6 +1647,25 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
         << "tl.sync_threads_partial expects <mask, n_threads>.";
     this->PrintIndent();
     this->stream << "simdgroup_barrier(mem_flags::mem_threadgroup);\n";
+  } else if (op->op.same_as(tl::atomic_add_elem_op())) {
+    ICHECK_GE(op->args.size(), 2U)
+        << "tl.atomic_add_elem_op expects dst_ptr and src_value.";
+    this->PrintIndent();
+    this->stream << "tl::AtomicAdd(" << PrintExpr(op->args[0]) << ", "
+                 << PrintExpr(op->args[1]);
+    if (op->args.size() > 2) {
+      this->stream << ", " << PrintExpr(op->args[2]);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::atomic_add_ret_elem_op())) {
+    ICHECK_GE(op->args.size(), 2U)
+        << "tl.atomic_add_ret_elem_op expects dst_ptr and src_value.";
+    os << "tl::AtomicAdd(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]);
+    if (op->args.size() > 2) {
+      os << ", " << PrintExpr(op->args[2]);
+    }
+    os << ")";
   } else if (op->op.same_as(tl::atomic_xchg_elem_op()) ||
              op->op.same_as(tl::atomic_xchg_ret_elem_op()) ||
              op->op.same_as(tl::atomic_and_elem_op()) ||
@@ -1677,6 +1747,10 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
         << "whose signature was not augmented with [[thread_index_in_simdgroup]]"
         << " — body collector missed the call site, file a bug.";
     os << it->second.simd_lane_id;
+  } else if (auto *opn = op->op.as<OpNode>();
+             opn != nullptr &&
+             MetalFp8DTypeCollector::IsThreadgroupTidXIntrin(opn->name)) {
+    os << "((int)threadIdx.x)";
   } else {
     CodeGenC::VisitExpr_(op, os);
   }

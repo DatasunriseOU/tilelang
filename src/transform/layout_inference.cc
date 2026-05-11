@@ -1236,7 +1236,6 @@ private:
 
       // Try each member as the root of inference for this component
       for (int attempt_infer_root : members) {
-        std::cout << "----------------------- try root " << attempt_infer_root << " members " << members.size() << std::endl;
         // Backup the current infer_list_ state
         auto back_infer_list = BackupInferList();
         // Copy the current layout_map for temporary use

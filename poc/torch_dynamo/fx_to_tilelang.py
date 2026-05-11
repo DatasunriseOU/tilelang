@@ -352,6 +352,7 @@ def _build_metal_launcher(
             output_count=len(output_specs),
             name=name,
             args_struct_inline=args_struct_inline,
+            allow_mx_fast_metal_kernel=True,
         )
     except Exception as exc:  # noqa: BLE001
         raise FXToTileLangMetalBridgeError(

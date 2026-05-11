@@ -28,10 +28,13 @@ elision pass is a no-op by design (`is_metal_` guard in
 from tilelang import tvm as tvm
 import tilelang
 import tilelang.testing
+from tilelang.transform import PassConfigKey
 from tvm.script import tir as T
 
 
-def _run_thread_sync_metal(func: tvm.tir.PrimFunc) -> tvm.IRModule:
+def _run_thread_sync_metal(
+    func: tvm.tir.PrimFunc, *, enable_barrier_proof: bool = True
+) -> tvm.IRModule:
     """Apply ThreadSync("shared") under a Metal target so the
     Apple intra-warp elision path is enabled."""
     mod = tvm.IRModule.from_expr(func)
@@ -43,11 +46,19 @@ def _run_thread_sync_metal(func: tvm.tir.PrimFunc) -> tvm.IRModule:
         }))(mod)
     mod = tvm.tir.transform.AnnotateDeviceRegions()(mod)
     mod = tvm.tir.transform.SplitHostDevice()(mod)
-    return tilelang.transform.ThreadSync("shared")(mod)
+    config = {}
+    if enable_barrier_proof:
+        config[PassConfigKey.TL_Z3_PROOF_BARRIER_MINIMIZATION.value] = True
+    with tvm.transform.PassContext(config=config):
+        return tilelang.transform.ThreadSync("shared")(mod)
 
 
 def _count_storage_sync(mod: tvm.IRModule) -> int:
     return str(mod.script()).count('T.tvm_storage_sync("shared")')
+
+
+def _has_barrier_metadata(mod: tvm.IRModule, key: str) -> bool:
+    return key in str(mod.script())
 
 
 @tilelang.testing.requires_metal
@@ -80,6 +91,33 @@ def test_2d_launch_intra_simdgroup_elides():
         "Expected ProveIntraWarpRAW to elide the barrier on a 2-D "
         "launch with tx in [0, 16) (entirely inside one simdgroup); "
         f"found {n_sync} sync(s):\n{mod.script()}")
+    assert _has_barrier_metadata(mod, "tl.z3_barrier_elisions")
+
+
+@tilelang.testing.requires_metal
+def test_barrier_proof_disabled_by_default_keeps_barrier():
+    """The central proof hook is default-off. Without
+    ``tl.z3_proof.barrier_minimization=True``, ThreadSync must keep the
+    conservative barrier even for a shape that the proof-enabled path can
+    remove.
+    """
+
+    @T.prim_func(private=True)
+    def func():
+        A_shared = T.alloc_buffer((16,), dtype="float32", scope="shared")
+        bx = T.launch_thread("blockIdx.x", 1)
+        tx = T.launch_thread("threadIdx.x", 16)
+        A_shared[tx] = T.float32(1)
+        if tx > 0:
+            _ = A_shared[tx - 1]
+
+    mod = _run_thread_sync_metal(func, enable_barrier_proof=False)
+    n_sync = _count_storage_sync(mod)
+    assert n_sync >= 1, (
+        "Expected conservative fallback to keep the barrier when the "
+        "central proof hook is not enabled; "
+        f"got {n_sync} sync(s):\n{mod.script()}")
+    assert _has_barrier_metadata(mod, "tl.z3_barrier_fallbacks")
 
 
 @tilelang.testing.requires_metal
@@ -108,6 +146,7 @@ def test_1d_launch_straddling_simdgroup_keeps_barrier():
         "Expected ThreadSync to keep the barrier when reader/writer "
         "can fall in different simdgroups (tx XOR 32 straddles the "
         f"boundary); got {n_sync} sync(s):\n{mod.script()}")
+    assert _has_barrier_metadata(mod, "tl.z3_barrier_fallbacks")
 
 
 @tilelang.testing.requires_metal
@@ -137,11 +176,10 @@ def test_1d_launch_within_single_simdgroup_elides():
 
 
 @tilelang.testing.requires_metal
-def test_1d_launch_within_single_simdgroup_elides_when_z3_disabled(monkeypatch):
-    """The deterministic same-simdgroup proof should cover the simplest
-    one-row reduction shape even when the Z3 barrier-elision query is gated
-    off. This keeps the Metal row-reduce fast path independent of optional
-    solver availability.
+def test_1d_launch_within_single_simdgroup_keeps_barrier_when_z3_disabled(monkeypatch):
+    """The env kill switch is part of the central proof gate. Even with the
+    PassConfig hook enabled, disabling the barrier-elision proof must keep the
+    conservative barrier.
     """
 
     monkeypatch.setenv("TILELANG_DISABLE_Z3_BARRIER_ELISION", "1")
@@ -157,10 +195,11 @@ def test_1d_launch_within_single_simdgroup_elides_when_z3_disabled(monkeypatch):
 
     mod = _run_thread_sync_metal(func)
     n_sync = _count_storage_sync(mod)
-    assert n_sync == 0, (
-        "Expected deterministic same-simdgroup proof to elide the barrier "
+    assert n_sync >= 1, (
+        "Expected central proof gate fallback to keep the barrier "
         "with TILELANG_DISABLE_Z3_BARRIER_ELISION=1; "
         f"found {n_sync} sync(s):\n{mod.script()}")
+    assert _has_barrier_metadata(mod, "tl.z3_barrier_fallbacks")
 
 
 # ----------------------------------------------------------------------

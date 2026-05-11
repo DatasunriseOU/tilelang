@@ -29,8 +29,10 @@
 #include "vendored/let_stmt.h"
 #include "vendored/tl_runtime_symbols.h"
 #include "vendored/z3_constraint_scope.h"
+#include "vendored/z3_proof_hooks.h"
 #include "vendored/z3_prover_stub.h"
 #include <algorithm>
+#include <sstream>
 #include <string>
 #include <tvm/arith/analyzer.h>
 #include <tvm/arith/int_set.h>
@@ -703,11 +705,11 @@ private:
 };
 
 struct TileLangThreadSyncPlanner : public ConstrVisitor {
-  explicit TileLangThreadSyncPlanner(StorageScope sync_scope,
-                                     int warp_size = 32,
-                                     bool is_metal = false)
+  explicit TileLangThreadSyncPlanner(
+      StorageScope sync_scope, int warp_size = 32, bool is_metal = false,
+      bool barrier_proof_enabled = false)
       : sync_scope_(std::move(sync_scope)), warp_size_(warp_size),
-        is_metal_(is_metal) {
+        is_metal_(is_metal), barrier_proof_enabled_(barrier_proof_enabled) {
     scope_.push_back(std::vector<StmtEntry>());
   }
 
@@ -1573,11 +1575,14 @@ private:
   // barrier when Z3 conclusively proves intra-warp; on timeout/unknown we
   // keep the barrier (safety mode).
   bool is_metal_{false};
+  bool barrier_proof_enabled_{false};
 
 public:
   // Diagnostic counter — incremented every time we elide a barrier via the
   // Apple intra-warp Z3 path. Exposed for tests / logging.
   mutable int apple_intra_warp_elisions_{0};
+  mutable int barrier_proof_disabled_fallbacks_{0};
+  mutable int barrier_proof_unproven_fallbacks_{0};
 
 private:
 
@@ -1656,6 +1661,10 @@ private:
   // doubt, *keep* the barrier. We only elide on a positive Z3 proof.
   bool ProveIntraWarpRAW(const AccessEntry &prev, const AccessEntry &curr) {
     if (!is_metal_) {
+      return false;
+    }
+    if (!barrier_proof_enabled_) {
+      ++barrier_proof_disabled_fallbacks_;
       return false;
     }
     // Only meaningful for cross-thread (RAW/WAR) on shared scope.
@@ -1739,6 +1748,7 @@ private:
       // (conservative-by-default early exit).
       LOG(WARNING) << "ProveIntraWarpRAW: no canonical threadIdx.x found "
                       "(prev or curr); keeping barrier.";
+      ++barrier_proof_unproven_fallbacks_;
       return false;
     }
     auto ty_p_iv = find_axis(prev.threads, "threadIdx.y");
@@ -1777,6 +1787,7 @@ private:
 
     if (!tx_w.defined() || !tx_r.defined()) {
       // Defensive: bind_axis on tx must have populated these.
+      ++barrier_proof_unproven_fallbacks_;
       return false;
     }
 
@@ -1884,6 +1895,7 @@ private:
         !extract_extent(tx_c_iv).defined()) {
       LOG(WARNING) << "ProveIntraWarpRAW: threadIdx.x extent missing on "
                       "prev or curr; keeping barrier (conservative).";
+      ++barrier_proof_unproven_fallbacks_;
       return false;
     }
     auto add_axis_bounds = [&](const Var &w_var, const Var &r_var,
@@ -1930,12 +1942,6 @@ private:
     // Timeout tuning: 500 ms in the initial draft; the floor-div-by-32
     // query closes in single-digit ms once range constraints are present,
     // so 200 ms is plenty (per second-pass review feedback).
-    // CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_BARRIER_ELISION
-    // bypasses the intra-warp RAW proof (idea #11). Conservative default —
-    // keep the barrier when disabled.
-    if (!::tilelang::tlz3::Z3PassGate::IsEnabled("BARRIER_ELISION")) {
-      return false;
-    }
     auto &prover = arith::Z3Prover(analyzer);
     prover.SetTimeoutMs(200);
     bool proven = false;
@@ -1962,6 +1968,9 @@ private:
       proven = false;
     }
     // scope destructs here — solver state rebalanced.
+    if (!proven) {
+      ++barrier_proof_unproven_fallbacks_;
+    }
     return proven;
   }
 
@@ -2359,7 +2368,8 @@ private:
   }
 };
 
-PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
+PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope,
+                            const tvm::transform::PassContext &ctx) {
   StorageScope sync_scope = StorageScope::Create(storage_scope);
   auto *n = func.CopyOnWrite();
   auto stmt = n->body;
@@ -2379,7 +2389,11 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
                     .IntValue();
     is_metal = target.value()->kind->name == "metal";
   }
-  TileLangThreadSyncPlanner planner(sync_scope, warp_size, is_metal);
+  auto barrier_status = ::tilelang::tlz3::GetProofHookStatus(
+      ctx, ::tilelang::tlz3::ProofHookKind::kBarrierMinimization);
+  TileLangThreadSyncPlanner planner(
+      sync_scope, warp_size, is_metal,
+      /*barrier_proof_enabled=*/is_metal && barrier_status.enabled);
   for (const auto &[_, buffer] : func->buffer_map) {
     planner.SetBufferDataToBuffer(buffer->data, buffer);
   }
@@ -2387,6 +2401,25 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
   stmt =
       ThreadSyncInserter(sync_scope, planner.syncs_inserted_)(std::move(stmt));
   n->body = ThreadPartialSyncRewriter::Rewrite(std::move(stmt));
+  if (planner.apple_intra_warp_elisions_ > 0) {
+    func = WithAttr(std::move(func), "tl.z3_barrier_elisions",
+                    IntImm(DataType::Int(32),
+                           planner.apple_intra_warp_elisions_));
+  }
+  if (planner.barrier_proof_disabled_fallbacks_ > 0 ||
+      planner.barrier_proof_unproven_fallbacks_ > 0) {
+    const char *fallback_reason =
+        (barrier_status.fallback_reason &&
+         barrier_status.fallback_reason[0] != '\0')
+            ? barrier_status.fallback_reason
+            : "unproven";
+    std::ostringstream reason;
+    reason << "disabled=" << planner.barrier_proof_disabled_fallbacks_
+           << ",unproven=" << planner.barrier_proof_unproven_fallbacks_
+           << ",reason=" << fallback_reason;
+    func = WithAttr(std::move(func), "tl.z3_barrier_fallbacks",
+                    StringImm(reason.str()));
+  }
   return func;
 }
 
@@ -2404,7 +2437,7 @@ tvm::transform::Pass ThreadSync(const String &storage_scope) {
     if (disable_syncthreads) {
       return f;
     }
-    return tl::TileLangThreadSync(std::move(f), storage_scope);
+    return tl::TileLangThreadSync(std::move(f), storage_scope, ctx);
     ;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.ThreadSync", {});

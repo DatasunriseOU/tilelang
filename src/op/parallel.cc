@@ -471,7 +471,38 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
     }
   }
 
-  if (!analyzer_.CanProveEqual(loop_thread_extent, block_size)) {
+  // A scalar fragment update can be wrapped as T.parallel(1) after frontend
+  // legalization.  Its loop layout has a single logical point, but the owning
+  // thread is still determined by the surrounding fragment indices, e.g.
+  // C_local[i, j] maps to lane ``i % 16 * 8 + j // 4``.  The generic
+  // ThreadExtent guard above only proves ``tx < owner + 1`` for that degenerate
+  // layout, which lets every lower-numbered lane execute the same update.  Add
+  // the missing ownership guard so exactly the lane that owns the fragment cell
+  // runs the scalar body.  For normal multi-point parallel loops this branch is
+  // false, and partitioning continues to supply the usual inverse-map guards.
+  bool single_point_loop = !loop_vars_.empty();
+  Array<PrimExpr> owner_indices;
+  owner_indices.reserve(loop_vars_.size());
+  for (const auto &iv : loop_vars_) {
+    single_point_loop =
+        single_point_loop &&
+        analyzer_.CanProveEqual(iv->dom->min, make_zero(iv->var.dtype())) &&
+        analyzer_.CanProveEqual(iv->dom->extent, make_const(iv->var.dtype(), 1));
+    owner_indices.push_back(make_zero(iv->var.dtype()));
+  }
+  bool single_output_point = loop_layout_->OutputDim() == 1 &&
+                             analyzer_.CanProveEqual(loop_layout_->OutputShape()[0],
+                                                     make_const(DataType::Int(32), 1));
+  bool single_replica =
+      analyzer_.CanProveEqual(loop_layout_->ReplicateExtent(),
+                              make_const(DataType::Int(32), 1));
+  if (single_point_loop && single_output_point && single_replica &&
+      !store_fragment_buffers_.empty()) {
+    PrimExpr owner =
+        analyzer_.Simplify(loop_layout_->ForwardThread(owner_indices, std::nullopt) +
+                           T.thread_bounds->min);
+    AddPredicate(EQ(InputPlaceholder(0), owner));
+  } else if (!analyzer_.CanProveEqual(loop_thread_extent, block_size)) {
     AddPredicate(
         LT(InputPlaceholder(0), loop_thread_extent + T.thread_bounds->min));
   }

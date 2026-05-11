@@ -20,8 +20,7 @@ This pass identifies calls to `tir.tvm_call_packed_lowered` occurring within a
 signals the downstream host C codegen to inject runtime logic that:
 1. Reuses an owner-provided Metal command buffer/event when one is registered.
 2. Otherwise uses an explicit TVM Metal stream when one is active.
-3. Falls back to PyTorch MPS only when compiled with Torch headers and no
-   framework owner has provided scheduling state.
+3. Otherwise lets TVM's Metal runtime use its own default scheduling path.
 """
 
 

@@ -5,6 +5,86 @@ import tilelang
 import torch
 import pytest
 
+from tilelang.engine.param import KernelParam
+from tilelang.jit.adapter.tvm_ffi import TVMFFIKernelAdapter
+
+
+class _RecordingExecutable:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, *args):
+        self.calls.append(args)
+
+
+def _make_fake_tvm_ffi_adapter(func, out_idx, target="llvm"):
+    adapter = TVMFFIKernelAdapter.__new__(TVMFFIKernelAdapter)
+    adapter.params = [
+        KernelParam.from_buffer(func.buffer_map[param])
+        if param in func.buffer_map
+        else KernelParam.from_var(param)
+        for param in func.params
+    ]
+    adapter.result_idx = adapter._legalize_result_idx(out_idx)
+    adapter.ir_module = tvm.IRModule({func.attrs["global_symbol"]: func})
+    adapter.target = tvm.target.Target(target)
+    adapter.executable = _RecordingExecutable()
+    adapter.rt_mod = None
+    return adapter
+
+
+def test_tvm_ffi_adapter_accepts_caller_owned_output_without_allocating(monkeypatch):
+    @T.prim_func
+    def main(A: T.Tensor((4,), T.float32), C: T.Tensor((4,), T.float32)):
+        with T.Kernel(1, threads=1):
+            C[0] = A[0]
+
+    adapter = _make_fake_tvm_ffi_adapter(main, out_idx=-1)
+    wrapped = TVMFFIKernelAdapter._convert_torch_func(adapter)
+    source = torch.empty(4)
+    output = torch.empty(4)
+
+    def fail_empty(*args, **kwargs):
+        raise AssertionError("owner-provided output path must not allocate")
+
+    monkeypatch.setattr(torch, "empty", fail_empty)
+
+    returned = wrapped(source, output)
+    assert returned is output
+    assert adapter.executable.calls[-1] == (source, output)
+
+    returned = wrapped(source, out=output)
+    assert returned is output
+    assert adapter.executable.calls[-1] == (source, output)
+
+
+def test_tvm_ffi_adapter_allocates_mlx_compact_output_without_torch(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+
+    @T.prim_func
+    def main(A: T.Tensor((4,), T.float32), C: T.Tensor((4,), T.float32)):
+        with T.Kernel(1, threads=1):
+            C[0] = A[0]
+
+    adapter = _make_fake_tvm_ffi_adapter(main, out_idx=-1, target="metal")
+    wrapped = TVMFFIKernelAdapter._convert_torch_func(adapter)
+    source = mx.zeros((4,), dtype=mx.float32)
+    mx.eval(source)
+
+    def fail_empty(*args, **kwargs):
+        raise AssertionError("MLX compact output path must not allocate torch tensors")
+
+    monkeypatch.setattr(torch, "empty", fail_empty)
+
+    returned = wrapped(source)
+
+    assert isinstance(returned, mx.array)
+    assert returned.shape == (4,)
+    assert returned.dtype == mx.float32
+    assert returned.__dlpack_device__() == (8, 0)
+    assert len(adapter.executable.calls) == 1
+    assert len(adapter.executable.calls[-1]) == 2
+
 
 def matmul(
     M,

@@ -363,23 +363,8 @@ void CodeGenCHost::PrintCallPacked(const tvm::tirx::CallNode *op) {
   this->EndScope(owner_scope);
   this->PrintLine("} else {");
   int no_owner_scope = this->BeginScope();
-  this->PrintLine("#if TILELANG_HAS_TORCH_MPS");
-  this->PrintLine("auto serialQueue = torch::mps::get_dispatch_queue();");
-  this->PrintLine("dispatch_sync(serialQueue, ^() {");
-  int metal_scope = this->BeginScope();
-  this->PrintLine("const id<MTLCommandBuffer> commandBuffer = "
-                  "torch::mps::get_command_buffer();");
-  this->PrintLine(
-      "(*set_external_command_buffer)(static_cast<TVMStreamHandle>(commandBuffer));");
   PrintPackedCallIntoResult(op, packed_func_name, args_stack, num_args, result,
                             metal_result + " = -1;");
-  this->PrintLine("(*set_external_command_buffer)(static_cast<TVMStreamHandle>(nullptr));");
-  this->EndScope(metal_scope);
-  this->PrintLine("});");
-  this->PrintLine("#else");
-  PrintPackedCallIntoResult(op, packed_func_name, args_stack, num_args, result,
-                            metal_result + " = -1;");
-  this->PrintLine("#endif");
   this->EndScope(no_owner_scope);
   this->PrintLine("}");
   this->PrintLine("if (", metal_result, " != 0) return ", metal_result, ";");

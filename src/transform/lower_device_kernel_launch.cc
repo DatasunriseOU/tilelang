@@ -144,6 +144,16 @@ private:
     return extent.value();
   }
 
+  void VisitStmt_(const BindNode *op) final {
+    // CSE/LICM may introduce Bind nodes before thread_extent AttrStmts.
+    // Kernel launch arguments must be expressible from PrimFunc parameters,
+    // so inline local Bind definitions while collecting launch geometry.
+    PrimExpr value =
+        bind_map_.size() ? Substitute(op->value, bind_map_) : op->value;
+    bind_map_.Set(op->var, value);
+    StmtVisitor::VisitStmt_(op);
+  }
+
   void VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key == tirx::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
@@ -153,7 +163,9 @@ private:
       if (!defined_thread.count(iv.get())) {
         defined_thread.insert(iv.get());
         info_.launch_params.push_back(iv->thread_tag);
-        thread_extent.Set(iv->thread_tag, op->value);
+        PrimExpr value =
+            bind_map_.size() ? Substitute(op->value, bind_map_) : op->value;
+        thread_extent.Set(iv->thread_tag, value);
       }
     }
 
@@ -178,6 +190,9 @@ private:
       }
       dyn_size *= buf->dtype.bytes() * buf->dtype.lanes();
 
+      if (bind_map_.size()) {
+        dyn_size = Substitute(dyn_size, bind_map_);
+      }
       dyn_shmem_size = dyn_size;
     }
     StmtVisitor::VisitStmt_(op);
@@ -191,6 +206,8 @@ private:
   Map<String, PrimExpr> thread_extent;
   // The amount of dynamic shared memory used
   Optional<PrimExpr> dyn_shmem_size{std::nullopt};
+  // Accumulated Bind definitions for inlining into extent/size expressions.
+  Map<Var, PrimExpr> bind_map_;
 };
 
 class ReturnRemover : public StmtExprMutator {

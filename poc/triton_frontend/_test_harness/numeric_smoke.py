@@ -572,6 +572,7 @@ def _run_mlx(
             output_count=1,
             name="triton_e2e_kernel",
             args_struct_inline=args_struct_inline,
+            allow_mx_fast_metal_kernel=True,
         )
     except MLXRuntimeError as exc:
         return None, f"wrap_tilelang_metal_kernel: {exc}"

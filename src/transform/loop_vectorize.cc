@@ -35,6 +35,7 @@
 #include "vendored/allocate_visit_passthrough.h"
 #include "vendored/let_stmt.h"
 #include "vendored/z3_constraint_scope.h"
+#include "vendored/z3_proof_hooks.h"
 #include "vendored/z3_prover.h"
 #include <iostream>
 #include <optional>
@@ -250,6 +251,17 @@ public:
       vector_load_bits_max_ = initial_vector_size_ = loop_extent_vector_size_ =
           128;
     }
+    Target current_target = Target::Current(false);
+    if (current_target.defined() && current_target->kind->name == "metal") {
+      // Metal's native scalar/vector integer types top out at 4 lanes in this
+      // codegen path. Even when a payload dtype can be packed wider (for
+      // example FP8x16 as uint4), the generic vectorizer still emits int32
+      // ramp indices for contiguous loads/stores. Keep the generic vector
+      // width at 4 lanes; specialized Metal intrinsics can still pack wider
+      // internally when they own both address arithmetic and code emission.
+      initial_vector_size_ = std::min(initial_vector_size_, 4);
+      loop_extent_vector_size_ = std::min(loop_extent_vector_size_, 4);
+    }
 
     // Check if For body contains SeqStmt (multiple statements).
     // When there's SeqStmt, we use conservative strategy - treating local
@@ -421,7 +433,6 @@ public:
 
     indices_can_vectorize_memo_.clear();
     int final_res = common_stride_ < 0 ? -vector_size_ : vector_size_;
-    std::cout << "DEBUG PLAN RETURN: " << final_res << std::endl;
     return final_res;
   }
 
@@ -1038,10 +1049,11 @@ static bool Z3CanProveAlignedAccess(const Buffer &buffer,
   if (vector_size <= 1) {
     return false;
   }
-  // CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_VECTORIZE bypasses
-  // the Z3-aided alignment proof for this pass (idea #1/#12). Conservative
-  // default — pass behaves as if proof failed.
-  if (!::tilelang::tlz3::Z3PassGate::IsEnabled("VECTORIZE")) {
+  auto proof_status = ::tilelang::tlz3::GetProofHookStatus(
+      tvm::transform::PassContext::Current(),
+      ::tilelang::tlz3::ProofHookKind::kVectorization,
+      kVectorizeAlignmentProof);
+  if (!proof_status.enabled) {
     return false;
   }
   int dtype_bytes = buffer->dtype.bytes();
@@ -1248,9 +1260,11 @@ private:
       bool alignment_proof_enabled = false;
       try {
         alignment_proof_enabled =
-            tvm::transform::PassContext::Current()
-                ->GetConfig<Bool>(kVectorizeAlignmentProof, Bool(false))
-                .value();
+            ::tilelang::tlz3::GetProofHookStatus(
+                tvm::transform::PassContext::Current(),
+                ::tilelang::tlz3::ProofHookKind::kVectorization,
+                kVectorizeAlignmentProof)
+                .enabled;
       } catch (...) {
         alignment_proof_enabled = false;
       }
@@ -1360,7 +1374,10 @@ bool IsExprInvariantInVectorBoundary(const PrimExpr &expr, Var var,
   if (analyzer->CanProveEqual(expr, expr_aligned)) {
     return true;
   }
-  if (::tilelang::tlz3::Z3PassGate::IsEnabled("VECTORIZE")) {
+  if (::tilelang::tlz3::GetProofHookStatus(
+          tvm::transform::PassContext::Current(),
+          ::tilelang::tlz3::ProofHookKind::kVectorization)
+          .enabled) {
     try {
       auto &z3 = arith::Z3Prover(analyzer);
       z3.SetTimeoutMs(50);
@@ -1478,9 +1495,10 @@ static bool Z3CanProveUnitStride(const PrimExpr &expr, const Var &var,
       return false;
     }
   }
-  // CPPMEGA z3-final per-pass gate: TILELANG_DISABLE_Z3_VECTORIZE bypasses
-  // the unit-stride / contiguity proof (idea #1/#12). Conservative default.
-  if (!::tilelang::tlz3::Z3PassGate::IsEnabled("VECTORIZE")) {
+  if (!::tilelang::tlz3::GetProofHookStatus(
+           tvm::transform::PassContext::Current(),
+           ::tilelang::tlz3::ProofHookKind::kVectorization)
+           .enabled) {
     return false;
   }
   try {
@@ -1675,18 +1693,23 @@ int IndicesCanVectorize(const PrimExpr &expr, Var var,
     if (is_const_int(ramp_node->stride, -1)) {
       return -1;
     }
-    // CPPMEGA z3-final per-pass gate: skip both the inline stride==1 probe
-    // and the affine fallback when TILELANG_DISABLE_Z3_VECTORIZE is set.
-    if (::tilelang::tlz3::Z3PassGate::IsEnabled("VECTORIZE")) {
-      auto &z3 = arith::Z3Prover(analyzer);
-      z3.SetTimeoutMs(50);
-      if (z3.CanProve(ramp_node->stride ==
-                      make_const(ramp_node->stride.dtype(), 1))) {
-        return 1;
-      }
-      if (z3.CanProve(ramp_node->stride ==
-                      make_const(ramp_node->stride.dtype(), -1))) {
-        return -1;
+    if (::tilelang::tlz3::GetProofHookStatus(
+            tvm::transform::PassContext::Current(),
+            ::tilelang::tlz3::ProofHookKind::kVectorization)
+            .enabled) {
+      try {
+        auto &z3 = arith::Z3Prover(analyzer);
+        z3.SetTimeoutMs(50);
+        if (z3.CanProve(ramp_node->stride ==
+                        make_const(ramp_node->stride.dtype(), 1))) {
+          return 1;
+        }
+        if (z3.CanProve(ramp_node->stride ==
+                        make_const(ramp_node->stride.dtype(), -1))) {
+          return -1;
+        }
+      } catch (...) {
+        // Conservative fallback: leave the access scalar if the proof fails.
       }
     }
     return Z3CanProveUnitStride(expr, var, iter_var_size, analyzer);
@@ -1754,4 +1777,3 @@ For VectorizeLoop(const For &loop, arith::Analyzer *analyzer,
 
 } // namespace tl
 } // namespace tvm
-

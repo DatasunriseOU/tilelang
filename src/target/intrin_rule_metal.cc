@@ -59,6 +59,12 @@ TVM_REGISTER_OP("tirx.metal.thread_position_in_grid_x")
     .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure))
     .set_attr<TScriptPrinterName>("TScriptPrinterName", "metal_thread_position_in_grid_x");
 
+TVM_REGISTER_OP("tirx.metal.thread_position_in_threadgroup_x")
+    .set_num_inputs(0)
+    .set_attr<TGlobalSymbol>("TGlobalSymbol", "thread_position_in_threadgroup_x")
+    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure))
+    .set_attr<TScriptPrinterName>("TScriptPrinterName", "metal_thread_position_in_threadgroup_x");
+
 TVM_REGISTER_OP("tirx.metal.thread_index_in_simdgroup")
     .set_num_inputs(0)
     .set_attr<TGlobalSymbol>("TGlobalSymbol", "thread_index_in_simdgroup")

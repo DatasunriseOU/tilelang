@@ -17,6 +17,7 @@
 #include "../transform/loop_vectorize.h"
 #include "../transform/ptx_async_copy_injector.h"
 #include "../transform/vendored/z3_constraint_scope.h"
+#include "../transform/vendored/z3_proof_hooks.h"
 #include "../transform/vendored/z3_prover.h"
 #include "utils.h"
 
@@ -651,18 +652,23 @@ bool CopyNode::CheckGlobalStrides(const Buffer &buffer,
     // Z3 idea #6: when the cheap analyzer cannot prove the stride is
     // misaligned (returns false above) AND cannot prove it is aligned
     // either, the prior flow silently admitted TMA — unsound for symbolic
-    // strides. Opt-in: enable `tl.tma_legality_z3` in the pass context to
-    // require a positive proof of alignment; constants are decided
-    // cheaply, symbolic strides fall through to Z3. Default off to
-    // preserve historical behavior for in-tree tests.
+    // strides. Opt-in: enable either the legacy `tl.tma_legality_z3` gate or
+    // the central async proof hook `tl.z3_proof.async_eligibility` in the pass
+    // context to require a positive proof of alignment; constants are decided
+    // cheaply, symbolic strides fall through to Z3. Default off to preserve
+    // historical behavior for in-tree tests.
     PrimExpr aligned =
         FloorMod(stride_bytes, IntImm(DataType::Int(64), 16)) ==
         IntImm(DataType::Int(64), 0);
     if (!analyzer->CanProve(aligned, arith::ProofStrength::kSymbolicBound)) {
       using namespace tvm::transform;
       PassContext pass_ctx = PassContext::Current();
-      bool z3_legality_enabled =
-          pass_ctx->GetConfig<Bool>(kTMALegalityZ3, Bool(false)).value();
+      bool z3_legality_enabled = ::tilelang::tlz3::GetProofHookStatus(
+                                     pass_ctx,
+                                     ::tilelang::tlz3::ProofHookKind::
+                                         kAsyncEligibility,
+                                     kTMALegalityZ3)
+                                     .enabled;
       if (z3_legality_enabled) {
         // Symbolic byte-base address of the buffer as visible in TIR.
         // `buffer->elem_offset` is in element units; scale to bytes so the

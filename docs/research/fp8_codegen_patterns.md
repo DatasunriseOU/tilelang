@@ -236,6 +236,26 @@ function call); the layout factory is already correct.
 
 ## 9. Open items / risks
 
+### 2026-05-11 direct Metal dot4 result
+
+Late lowering now recognizes the direct global-store full-matmul marker
+when `transpose_B=True` and B is already row-major `B[N, K]`. Under the
+same Z3/static legality gate used by the M=1 path
+(`K % 4 == 0`, K-contiguous A/B rows, 4-byte alignment, e4m3, int24-safe
+K), TileLang emits one packed `__tvm_fp8_e4m3_dot4_packed` loop per
+output cell. The 128x128x128 Metal benchmark measured:
+
+| Lane | TileLang | audiohack | Ratio |
+|---|---:|---:|---:|
+| Existing shared `B[K,N]` scalar fallback | 1.617 ms | 0.123 ms | 13.13x |
+| Direct `transpose_B=True`, input `B[N,K]` dot4 | 0.113 ms | 0.112 ms | 1.01x |
+
+This confirms the remaining full-matmul gap is layout-bound: the
+`B[K,N]` shared tile is strided along K for each output column, so packed
+dot4 would be incorrect unless a producer changes the layout. The direct
+path avoids wrapper-side transposes and tensor copies by requiring the
+producer to materialize B in K-contiguous row-major `B[N,K]`.
+
 * **Apple has no FP8 MMA**: confirmed via WWDC25 cooperative-tensor
   session ([Metal 4 talk](https://developers.apple.com/videos/play/wwdc2025/205))
   and MLX's lack of fp8 simdgroup paths
