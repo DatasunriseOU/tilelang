@@ -3,7 +3,7 @@
 	url = https://github.com/NVIDIA/cutlass
 [submodule "3rdparty/tvm"]
 	path = 3rdparty/tvm
-	url = https://github.com/apstenku123/tvm
+	url = https://github.com/DatasunriseOU/tvm
 	branch = tilelang-apache-tvm-migration
 [submodule "3rdparty/composable_kernel"]
 	path = 3rdparty/composable_kernel
