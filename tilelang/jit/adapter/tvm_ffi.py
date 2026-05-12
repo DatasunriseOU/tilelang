@@ -37,9 +37,30 @@ from tilelang.contrib.mlx_interop import (
 COMPILE_ARGS = {}
 
 if sys.platform == "darwin":
+    import os
+
     from torch.utils import cpp_extension
 
-    COMPILE_ARGS["options"] = ["-x", "objective-c++", "-g", "-std=gnu++17"] + ["-I" + i for i in cpp_extension.include_paths()]
+    include_paths = list(cpp_extension.include_paths())
+    tvm_ffi_include = os.environ.get("TVM_FFI_INCLUDE_PATH")
+    if not tvm_ffi_include:
+        tvm_home = os.environ.get("TVM_HOME")
+        if tvm_home:
+            candidate = os.path.join(tvm_home, "3rdparty", "tvm-ffi", "include")
+            if os.path.isdir(candidate):
+                tvm_ffi_include = candidate
+    if tvm_ffi_include and os.path.isdir(tvm_ffi_include):
+        include_paths.append(tvm_ffi_include)
+        tvm_ffi_root = os.path.dirname(tvm_ffi_include)
+        dlpack_include = os.environ.get("TVM_FFI_DLPACK_INCLUDE_PATH")
+        if not dlpack_include:
+            candidate = os.path.join(tvm_ffi_root, "3rdparty", "dlpack", "include")
+            if os.path.isdir(candidate):
+                dlpack_include = candidate
+        if dlpack_include and os.path.isdir(dlpack_include):
+            include_paths.append(dlpack_include)
+
+    COMPILE_ARGS["options"] = ["-x", "objective-c++", "-g", "-std=gnu++17"] + ["-I" + i for i in include_paths]
 
 
 class TVMFFIKernelAdapter(BaseKernelAdapter):
