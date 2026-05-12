@@ -453,7 +453,7 @@ class TVMFFIMetalCall : public mx::Primitive {
         if (out.buffer().ptr() == nullptr) {
           debug_counters().null_output_buffers.fetch_add(1, std::memory_order_relaxed);
           throw std::runtime_error(
-              "MLX output buffer became null after TVM-FFI Metal sync guard");
+              "MLX output buffer became null after TVM-FFI Metal debug hook install");
         }
       }
     }
