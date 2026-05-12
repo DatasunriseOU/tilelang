@@ -19,6 +19,9 @@
 from __future__ import annotations
 
 import ctypes
+import functools
+import hashlib
+import re
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager, nullcontext
 from typing import Any
@@ -89,8 +92,37 @@ class DLPackConversionError(DLPackInteropError):
     """Raised when a DLPack producer cannot be imported without a copy."""
 
 
+class MLXGraphInteropError(DLPackInteropError):
+    """Raised when TileLang Metal source cannot be mapped to an MLX graph op."""
+
+
 MLX_OUTPUT_WRITE_ONLY = "write_only"
 MLX_OUTPUT_ZEROED = "zeroed"
+
+_MSL_COMMENT_OR_STRING_RE = re.compile(
+    r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'",
+    re.DOTALL,
+)
+_KERNEL_DEF_RE = re.compile(r"\bkernel\s+void\s+(?P<name>[A-Za-z_]\w*)\s*\(")
+_PARAM_NAME_RE = re.compile(r"\b([A-Za-z_]\w*)\s*$")
+_METAL_BUILTIN_PARAM_NAMES = frozenset(
+    {
+        "blockDim",
+        "blockIdx",
+        "gridDim",
+        "grid_size",
+        "simdgroup_index_in_threadgroup",
+        "threadIdx",
+        "thread_execution_width",
+        "thread_index_in_simdgroup",
+        "thread_index_in_threadgroup",
+        "thread_position_in_grid",
+        "thread_position_in_threadgroup",
+        "threadgroup_position_in_grid",
+        "threadgroups_per_grid",
+        "threads_per_threadgroup",
+    }
+)
 
 
 def _mlx_core():
@@ -99,6 +131,269 @@ def _mlx_core():
     except Exception:
         return None
     return mx
+
+
+def _mask_msl_comments_and_strings(msl: str) -> str:
+    return _MSL_COMMENT_OR_STRING_RE.sub(lambda match: " " * len(match.group(0)), msl)
+
+
+def _rewrite_msl_code_segments(msl: str, rewrite) -> str:
+    chunks: list[str] = []
+    start = 0
+    for match in _MSL_COMMENT_OR_STRING_RE.finditer(msl):
+        chunks.append(rewrite(msl[start : match.start()]))
+        chunks.append(match.group(0))
+        start = match.end()
+    chunks.append(rewrite(msl[start:]))
+    return "".join(chunks)
+
+
+def _split_kernel_msl(msl: str) -> tuple[str, str, str, str]:
+    """Split TileLang-emitted MSL into prelude, kernel name, signature, body."""
+
+    masked = _mask_msl_comments_and_strings(msl)
+    match = _KERNEL_DEF_RE.search(masked)
+    if match is None:
+        raise MLXGraphInteropError("TileLang Metal source does not contain a kernel function")
+    if _KERNEL_DEF_RE.search(masked, match.end()) is not None:
+        raise MLXGraphInteropError("TileLang Metal source contains multiple kernel functions")
+
+    prelude = msl[: match.start()].rstrip()
+    kernel_name = match.group("name")
+
+    sig_start = match.end()
+    depth = 1
+    i = sig_start
+    while i < len(msl) and depth > 0:
+        ch = masked[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        i += 1
+    if depth != 0:
+        raise MLXGraphInteropError("TileLang Metal source has an unbalanced kernel signature")
+    sig_text = msl[sig_start : i - 1]
+
+    j = i
+    while j < len(msl) and msl[j].isspace():
+        j += 1
+    if j >= len(msl) or msl[j] != "{":
+        raise MLXGraphInteropError("TileLang Metal source is missing a kernel body")
+    body_start = j
+    depth = 1
+    j += 1
+    while j < len(msl) and depth > 0:
+        ch = masked[j]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        j += 1
+    if depth != 0:
+        raise MLXGraphInteropError("TileLang Metal source has an unbalanced kernel body")
+    return prelude, kernel_name, sig_text, msl[body_start:j]
+
+
+def _split_signature_decls(sig_text: str) -> list[str]:
+    decls: list[str] = []
+    current: list[str] = []
+    depth_paren = 0
+    depth_attr = 0
+    i = 0
+    while i < len(sig_text):
+        ch = sig_text[i]
+        if ch == "[" and i + 1 < len(sig_text) and sig_text[i + 1] == "[":
+            depth_attr += 1
+            current.append("[[")
+            i += 2
+            continue
+        if ch == "]" and i + 1 < len(sig_text) and sig_text[i + 1] == "]" and depth_attr:
+            depth_attr -= 1
+            current.append("]]")
+            i += 2
+            continue
+        if ch == "(":
+            depth_paren += 1
+        elif ch == ")":
+            depth_paren -= 1
+        if ch == "," and depth_paren == 0 and depth_attr == 0:
+            decls.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+        i += 1
+    tail = "".join(current).strip()
+    if tail:
+        decls.append(tail)
+    return decls
+
+
+def _strip_attribute_markers(decl: str) -> str:
+    out: list[str] = []
+    i = 0
+    while i < len(decl):
+        if decl[i] == "[" and i + 1 < len(decl) and decl[i + 1] == "[":
+            depth = 1
+            i += 2
+            while i < len(decl) and depth:
+                if decl[i] == "[" and i + 1 < len(decl) and decl[i + 1] == "[":
+                    depth += 1
+                    i += 2
+                elif decl[i] == "]" and i + 1 < len(decl) and decl[i + 1] == "]":
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            out.append(" ")
+            continue
+        out.append(decl[i])
+        i += 1
+    return "".join(out)
+
+
+def _extract_param_identifier(decl: str) -> str | None:
+    cleaned = _strip_attribute_markers(decl).strip()
+    cleaned = re.sub(r"\[[^\]]*\]\s*$", "", cleaned).strip()
+    cleaned = cleaned.replace("*", " ").replace("&", " ").strip()
+    match = _PARAM_NAME_RE.search(cleaned)
+    return match.group(1) if match else None
+
+
+def _parse_buffer_param_names(sig_text: str) -> list[str]:
+    names: list[str] = []
+    for decl in _split_signature_decls(sig_text):
+        clean = _strip_attribute_markers(decl).strip()
+        if not clean or re.search(r"\bthreadgroup\b", clean):
+            continue
+        if re.search(r"_args_t\s*&", clean):
+            continue
+        if not (re.search(r"\bdevice\b", clean) or re.search(r"\bconstant\b", clean)):
+            continue
+        ident = _extract_param_identifier(clean)
+        if ident is None or ident in _METAL_BUILTIN_PARAM_NAMES:
+            continue
+        names.append(ident)
+    return names
+
+
+def _metal_builtin_for_tilelang_alias(alias: str, axis: str) -> str:
+    if alias == "threadIdx":
+        return f"thread_position_in_threadgroup.{axis}"
+    if alias == "blockIdx":
+        return f"threadgroup_position_in_grid.{axis}"
+    if alias == "blockDim":
+        return f"threads_per_threadgroup.{axis}"
+    if alias == "gridDim":
+        return f"threadgroups_per_grid.{axis}"
+    raise ValueError(f"unexpected TileLang builtin alias: {alias}")
+
+
+def _canonicalize_tilelang_builtin_aliases(body: str) -> str:
+    def rewrite(code: str) -> str:
+        code = re.sub(
+            r"\b(?P<alias>threadIdx|blockIdx|blockDim|gridDim)\.(?P<axis>[xyz])\b",
+            lambda m: _metal_builtin_for_tilelang_alias(m.group("alias"), m.group("axis")),
+            code,
+        )
+        return code
+
+    return _rewrite_msl_code_segments(body, rewrite)
+
+
+def _canonicalize_metal_surface(body: str) -> str:
+    def rewrite(code: str) -> str:
+        code = re.sub(
+            r"\bthreadgroup_barrier\s*\(\s*mem_flags::mem_threadgroup\s*\)",
+            "metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup)",
+            code,
+        )
+        code = re.sub(r"\bmemory_order_relaxed\b", "metal::memory_order_relaxed", code)
+        for name in (
+            "atomic_fetch_add_explicit",
+            "atomic_fetch_min_explicit",
+            "atomic_fetch_max_explicit",
+        ):
+            code = re.sub(rf"(?<![:\w]){name}\b", f"metal::{name}", code)
+        return code
+
+    return _rewrite_msl_code_segments(body, rewrite)
+
+
+def _tilelang_msl_body_for_mlx(body_text: str) -> str:
+    body = body_text[1:-1]
+    body = (
+        "    uint3 blockIdx = threadgroup_position_in_grid;\n"
+        "    uint3 threadIdx = thread_position_in_threadgroup;\n"
+        "    uint3 blockDim = threads_per_threadgroup;\n"
+        "    uint3 gridDim = threadgroups_per_grid;\n"
+        + body
+    )
+    body = _canonicalize_tilelang_builtin_aliases(body)
+    return _canonicalize_metal_surface(body)
+
+
+@functools.lru_cache(maxsize=128)
+def _cached_mlx_tilelang_metal_kernel(
+    msl_source: str,
+    input_names: tuple[str, ...],
+    output_names: tuple[str, ...],
+):
+    mx = _mlx_core()
+    metal_kernel = getattr(getattr(mx, "fast", None), "metal_kernel", None) if mx is not None else None
+    if metal_kernel is None:
+        raise MLXGraphInteropError("mlx.core.fast.metal_kernel is not available")
+
+    prelude, kernel_name, sig_text, body_text = _split_kernel_msl(msl_source)
+    buffer_names = _parse_buffer_param_names(sig_text)
+    expected = set(input_names) | set(output_names)
+    missing = expected.difference(buffer_names)
+    if missing:
+        raise MLXGraphInteropError(
+            "TileLang Metal source is missing expected MLX buffers: "
+            + ", ".join(sorted(missing))
+        )
+    unsupported = set(buffer_names).difference(expected)
+    if unsupported:
+        raise MLXGraphInteropError(
+            "TileLang Metal source has unsupported non-MLX buffers: "
+            + ", ".join(sorted(unsupported))
+        )
+
+    abi_fingerprint = "\0".join(
+        (msl_source, *input_names, "\1", *output_names)
+    ).encode()
+    kernel_digest = hashlib.sha1(abi_fingerprint).hexdigest()[:16]
+    header = prelude + ("\n" if prelude and not prelude.endswith("\n") else "")
+    source = _tilelang_msl_body_for_mlx(body_text)
+    return metal_kernel(
+        name=f"tilelang_{kernel_name}_{kernel_digest}",
+        input_names=list(input_names),
+        output_names=list(output_names),
+        source=source,
+        header=header,
+        ensure_row_contiguous=False,
+    )
+
+
+def mlx_tilelang_metal_kernel(
+    msl_source: str | None,
+    *,
+    input_names: Iterable[str],
+    output_names: Iterable[str],
+):
+    """Build an MLX graph-safe custom Metal kernel from TileLang MSL."""
+
+    if not msl_source:
+        return None
+    try:
+        return _cached_mlx_tilelang_metal_kernel(
+            msl_source,
+            tuple(input_names),
+            tuple(output_names),
+        )
+    except MLXGraphInteropError:
+        return None
 
 
 def is_mlx_array(arg: Any) -> bool:

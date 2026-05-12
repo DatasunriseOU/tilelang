@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 import torch
 import tvm_ffi
+import importlib
 
 import tilelang
 from tvm import runtime
@@ -27,6 +28,30 @@ def _make_add_2d_kernel():
             C[1, 2] = A[1, 2] + T.float32(4.0)
 
     return add_2d
+
+
+def _make_add_all_2d_kernel():
+    @T.prim_func
+    def add_all_2d(A: T.Tensor((2, 3), T.float32), C: T.Tensor((2, 3), T.float32)):
+        with T.Kernel(1, threads=1):
+            C[0, 0] = A[0, 0] + T.float32(1.0)
+            C[0, 1] = A[0, 1] + T.float32(2.0)
+            C[0, 2] = A[0, 2] + T.float32(3.0)
+            C[1, 0] = A[1, 0] + T.float32(4.0)
+            C[1, 1] = A[1, 1] + T.float32(5.0)
+            C[1, 2] = A[1, 2] + T.float32(6.0)
+
+    return add_all_2d
+
+
+def _make_parallel_add_1d_kernel():
+    @T.prim_func
+    def parallel_add_1d(A: T.Tensor((8,), T.float32), C: T.Tensor((8,), T.float32)):
+        with T.Kernel(1, threads=8):
+            for i in T.Parallel(8):
+                C[i] = A[i] + T.float32(1.0)
+
+    return parallel_add_1d
 
 
 def _capsule_data_ptr(capsule) -> int:
@@ -362,3 +387,131 @@ def test_tvm_ffi_metal_mlx_compact_result_idx_allocates_mlx_output():
         np.array(returned),
         np.array([[3.0, 0.0, 0.0], [0.0, 0.0, 5.0]], dtype=np.float32),
     )
+
+
+@tilelang.testing.requires_metal
+def test_tvm_ffi_metal_mlx_compile_compact_result_idx_is_graph_safe():
+    mx = pytest.importorskip("mlx.core")
+
+    kernel = tilelang.compile(
+        _make_add_all_2d_kernel(),
+        target="metal",
+        execution_backend="tvm_ffi",
+        out_idx=-1,
+    )
+
+    compiled = mx.compile(lambda source: kernel(source))
+    returned = compiled(mx.ones((2, 3), dtype=mx.float32))
+    assert isinstance(returned, mx.array)
+    mx.eval(returned)
+
+    np.testing.assert_allclose(
+        np.array(returned),
+        np.array([[2.0, 3.0, 4.0], [5.0, 6.0, 7.0]], dtype=np.float32),
+    )
+
+
+@tilelang.testing.requires_metal
+def test_tvm_ffi_metal_mlx_compile_uses_native_graph_primitive(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    from tilelang.contrib.mlx_tvm_ffi import is_available as native_bridge_is_available
+    tvm_ffi_adapter = importlib.import_module("tilelang.jit.adapter.tvm_ffi")
+
+    if not native_bridge_is_available():
+        pytest.skip("native MLX TVM-FFI bridge is not built")
+
+    def reject_legacy_metal_kernel(*args, **kwargs):
+        raise AssertionError("legacy mx.fast.metal_kernel fallback was used")
+
+    monkeypatch.setattr(
+        tvm_ffi_adapter,
+        "mlx_tilelang_metal_kernel",
+        reject_legacy_metal_kernel,
+    )
+
+    kernel = tilelang.compile(
+        _make_add_all_2d_kernel(),
+        target="metal",
+        execution_backend="tvm_ffi",
+        out_idx=-1,
+    )
+
+    compiled = mx.compile(lambda source: kernel(source))
+    returned = compiled(mx.ones((2, 3), dtype=mx.float32))
+    mx.eval(returned)
+
+    np.testing.assert_allclose(
+        np.array(returned),
+        np.array([[2.0, 3.0, 4.0], [5.0, 6.0, 7.0]], dtype=np.float32),
+    )
+
+
+@tilelang.testing.requires_metal
+def test_tvm_ffi_metal_mlx_graph_kernels_with_same_symbol_do_not_collide():
+    mx = pytest.importorskip("mlx.core")
+    from tilelang.contrib.mlx_interop import mlx_tilelang_metal_kernel
+
+    msl_template = """
+#include <metal_stdlib>
+using namespace metal;
+kernel void same_symbol(device const float* A [[buffer(0)]],
+                        device float* C [[buffer(1)]],
+                        uint3 thread_position_in_grid [[thread_position_in_grid]]) {{
+    uint i = thread_position_in_grid.x;
+    if (i < 6) {{
+        C[i] = {expr};
+    }}
+}}
+"""
+    add_kernel = mlx_tilelang_metal_kernel(
+        msl_template.format(expr="A[i] + 1.0f"),
+        input_names=["A"],
+        output_names=["C"],
+    )
+    mul_kernel = mlx_tilelang_metal_kernel(
+        msl_template.format(expr="A[i] * 2.0f"),
+        input_names=["A"],
+        output_names=["C"],
+    )
+    assert add_kernel is not None
+    assert mul_kernel is not None
+
+    source = mx.arange(6, dtype=mx.float32).reshape(2, 3)
+    added = add_kernel(
+        inputs=[source],
+        output_shapes=[source.shape],
+        output_dtypes=[source.dtype],
+        grid=(6, 1, 1),
+        threadgroup=(1, 1, 1),
+    )[0]
+    doubled = mul_kernel(
+        inputs=[source],
+        output_shapes=[source.shape],
+        output_dtypes=[source.dtype],
+        grid=(6, 1, 1),
+        threadgroup=(1, 1, 1),
+    )[0]
+    mx.eval(added, doubled)
+
+    np.testing.assert_allclose(
+        np.array(added),
+        np.arange(6, dtype=np.float32).reshape(2, 3) + 1.0,
+    )
+    np.testing.assert_allclose(
+        np.array(doubled),
+        np.arange(6, dtype=np.float32).reshape(2, 3) * 2.0,
+    )
+
+
+@tilelang.testing.requires_metal
+def test_tvm_ffi_metal_cached_host_source_restores_launch_config():
+    kernel = tilelang.compile(
+        _make_parallel_add_1d_kernel(),
+        target="metal",
+        execution_backend="tvm_ffi",
+        out_idx=-1,
+    )
+
+    kernel.adapter.device_mod = None
+
+    assert kernel.adapter._metal_launch_config() == ((1, 1, 1), (8, 1, 1))

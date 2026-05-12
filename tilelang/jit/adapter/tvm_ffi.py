@@ -9,6 +9,7 @@ On non-CUDA builds, the stream/device fall back to 0/CPU semantics.
 from __future__ import annotations
 
 from typing import Callable, Any
+import re
 import sys
 
 import torch
@@ -30,7 +31,13 @@ from tilelang.contrib.mlx_interop import (
     maybe_mlx_metal_external_command_buffer,
     mlx_arrays_to_tvm_tensors,
     mlx_metal_output,
+    mlx_tilelang_metal_kernel,
     validate_dlpack_inputs_for_target,
+)
+from tilelang.contrib.mlx_tvm_ffi import (
+    MLXTVMFFIBridgeUnavailable,
+    is_available as mlx_tvm_ffi_is_available,
+    metal_call as mlx_tvm_ffi_metal_call,
 )
 
 
@@ -220,13 +227,16 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         expected_dtype_strs: list[str | None] = []
         # Track whether each param is a buffer (has dtype) vs scalar
         is_buffer_param: list[bool] = []
+        param_names: list[str] = []
         for p in params:
             if p in buffer_map:
                 expected_dtype_strs.append(str(buffer_map[p].dtype))
                 is_buffer_param.append(True)
+                param_names.append(str(buffer_map[p].name))
             else:
                 expected_dtype_strs.append(None)
                 is_buffer_param.append(False)
+                param_names.append(str(p))
 
         def normalize_out_argument(out_arg: Any) -> list[Any] | None:
             if out_arg is None:
@@ -263,6 +273,12 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 f"Cannot resolve dynamic stride from {type(tensor).__name__}; "
                 "pass a DLPack tensor with exposed strides or specialize the stride."
             )
+
+        class _NativeMLXOutput:
+            def __init__(self, shape: list[int], dtype: Any):
+                self.shape = tuple(int(dim) for dim in shape)
+                self.dtype = dtype
+                self.strides = tuple(_compact_stride(self.shape, dim) for dim in range(len(self.shape)))
 
         def func(*inputs: torch.Tensor | Any, out: Any | None = None):
             # Validate input count.  The compact calling convention omits
@@ -305,6 +321,18 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             if uses_mlx_runtime:
                 first_mlx_array_device(dlpack_args)
 
+            mlx_compact_graph_candidate = (
+                uses_mlx_runtime
+                and target_kind == "metal"
+                and self.result_idx
+                and output_overrides is None
+                and not using_full_abi_args
+                and hasattr(executable, "__getitem__")
+                and all(is_buffer_param[i] for i in range(len(self.params)) if i not in self.result_idx)
+                and all(is_buffer_param[i] for i in self.result_idx)
+            )
+            use_native_mlx_graph = mlx_compact_graph_candidate and mlx_tvm_ffi_is_available()
+
             # Resolve the device used for outputs. Prefer the first tensor input's device
             # if available, otherwise use PyTorch's current device.
             out_device: torch.device | None = None
@@ -346,7 +374,9 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                             f"Expected shape: {shape}"
                         )
                     dtype = param_dtypes[i]
-                    if uses_mlx_runtime:
+                    if use_native_mlx_graph:
+                        tensor = _NativeMLXOutput(shape, expected_dtype_strs[i])
+                    elif uses_mlx_runtime:
                         tensor = mlx_metal_output(
                             shape,
                             expected_dtype_strs[i],
@@ -360,6 +390,54 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                     tensor = inputs[ins_idx]
                     ins_idx += 1
                 tensor_list.append(tensor)
+
+            graph_outputs = None
+            if use_native_mlx_graph:
+                input_param_indices = [i for i in range(len(self.params)) if i not in self.result_idx]
+                try:
+                    graph_outputs = mlx_tvm_ffi_metal_call(
+                        executable["main"],
+                        inputs=[tensor_list[i] for i in input_param_indices],
+                        output_shapes=[tensor_list[i].shape for i in self.result_idx],
+                        output_dtypes=[tensor_list[i].dtype for i in self.result_idx],
+                        result_indices=self.result_idx,
+                        num_params=len(self.params),
+                    )
+                except MLXTVMFFIBridgeUnavailable:
+                    graph_outputs = None
+            if graph_outputs is None and mlx_compact_graph_candidate:
+                input_param_indices = [i for i in range(len(self.params)) if i not in self.result_idx]
+                try:
+                    device_source = self.get_device_source()
+                except Exception:
+                    device_source = None
+                graph_kernel = mlx_tilelang_metal_kernel(
+                    device_source,
+                    input_names=[param_names[i] for i in input_param_indices],
+                    output_names=[param_names[i] for i in self.result_idx],
+                )
+                if graph_kernel is not None:
+                    grid, threadgroup = self._metal_launch_config()
+                    dispatch_grid = (
+                        max(1, grid[0] * threadgroup[0]),
+                        max(1, grid[1] * threadgroup[1]),
+                        max(1, grid[2] * threadgroup[2]),
+                    )
+                    graph_outputs = graph_kernel(
+                        inputs=[tensor_list[i] for i in input_param_indices],
+                        output_shapes=[
+                            tuple(int(dim) for dim in tensor_list[i].shape)
+                            for i in self.result_idx
+                        ],
+                        output_dtypes=[tensor_list[i].dtype for i in self.result_idx],
+                        grid=dispatch_grid,
+                        threadgroup=threadgroup,
+                        init_value=0.0,
+                    )
+            if graph_outputs is not None:
+                if len(self.result_idx) == 1:
+                    return graph_outputs[0]
+                return list(graph_outputs)
 
             exec_tensor_list = (
                 mlx_arrays_to_tvm_tensors(
@@ -434,6 +512,115 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             return self.get_device_source()
         else:
             return self.get_device_source() + "\n\n" + self.get_host_source()
+
+    def _metal_launch_config(self) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+        """Return TileLang block and threadgroup extents for MLX Metal dispatch."""
+
+        grid = [1, 1, 1]
+        threadgroup = [1, 1, 1]
+        device_mod = getattr(self, "device_mod", None)
+        if device_mod is None:
+            from_host = self._metal_launch_config_from_host_source()
+            if from_host is not None:
+                return from_host
+            return (grid[0], grid[1], grid[2]), (threadgroup[0], threadgroup[1], threadgroup[2])
+        try:
+            functions = device_mod.functions.values()
+        except Exception:
+            from_host = self._metal_launch_config_from_host_source()
+            if from_host is not None:
+                return from_host
+            return (grid[0], grid[1], grid[2]), (threadgroup[0], threadgroup[1], threadgroup[2])
+        for func in functions:
+            attrs = getattr(func, "attrs", None)
+            if attrs is None:
+                continue
+            thread_extent = attrs.get("thread_extent")
+            if thread_extent is None:
+                continue
+            for tag, extent in thread_extent.items():
+                tag_str = str(tag)
+                axis = tag_str[-1]
+                if axis not in "xyz":
+                    continue
+                idx = "xyz".index(axis)
+                if "threadIdx" in tag_str:
+                    threadgroup[idx] = int(extent)
+                elif "blockIdx" in tag_str:
+                    grid[idx] = int(extent)
+            break
+        if grid == [1, 1, 1] and threadgroup == [1, 1, 1]:
+            from_host = self._metal_launch_config_from_host_source()
+            if from_host is not None:
+                return from_host
+        return (grid[0], grid[1], grid[2]), (threadgroup[0], threadgroup[1], threadgroup[2])
+
+    def _metal_launch_config_from_host_source(
+        self,
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+        """Recover Metal launch extents from cached TVM host source."""
+
+        try:
+            source = self.get_host_source()
+        except Exception:
+            source = self.host_kernel_source
+        if not source:
+            return None
+        call_matches = list(
+            re.finditer(
+                r"TVMFFIFunctionCall\(\s*(?P<symbol>[A-Za-z_]\w*kernel_packed)\s*,"
+                r"\s*\(TVMFFIAny\*\)\s*stack_ffi_any\s*,\s*(?P<count>\d+)\s*,",
+                source,
+            )
+        )
+        if not call_matches:
+            return None
+
+        launch_base = len(self.params)
+        for match in reversed(call_matches):
+            arg_count = int(match.group("count"))
+            launch_count = arg_count - launch_base
+            if launch_count <= 0:
+                continue
+
+            window_start = max(0, match.start() - 12000)
+            window = source[window_start : match.start()]
+            values_by_index: dict[int, int] = {}
+            for assign in re.finditer(
+                r"\[\s*(?P<idx>\d+)\s*\]\.v_int64\)\s*=\s*"
+                r"\(\(int64_t\)(?P<value>-?\d+)\)",
+                window,
+            ):
+                values_by_index[int(assign.group("idx"))] = int(assign.group("value"))
+
+            launch_values = [
+                values_by_index.get(i)
+                for i in range(launch_base, launch_base + launch_count)
+            ]
+            if any(value is None for value in launch_values):
+                continue
+            values = [int(value) for value in launch_values if value is not None]
+
+            grid = [1, 1, 1]
+            threadgroup = [1, 1, 1]
+            # LowerDeviceKernelLaunch emits launch args in the order thread
+            # extents are first encountered. TileLang Metal kernels generated
+            # through TVM use blockIdx.x, threadIdx.x, then the remaining grid
+            # axes when they are statically one.
+            if len(values) >= 1:
+                grid[0] = values[0]
+            if len(values) >= 2:
+                threadgroup[0] = values[1]
+            if len(values) >= 3:
+                grid[1] = values[2]
+            if len(values) >= 4:
+                grid[2] = values[3]
+            if len(values) >= 5:
+                threadgroup[1] = values[4]
+            if len(values) >= 6:
+                threadgroup[2] = values[5]
+            return (grid[0], grid[1], grid[2]), (threadgroup[0], threadgroup[1], threadgroup[2])
+        return None
 
     @property
     def prim_func(self) -> tir.PrimFunc:

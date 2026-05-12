@@ -687,6 +687,37 @@ void CodeGenTileLangMetal::EmitFp8Dot4Helpers() {
               << "}\n"
               << "static inline float __tvm_fp8_e4m3_dot4_packed(constant const uchar* a, constant const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
               << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+	              << "}\n\n";
+}
+
+void CodeGenTileLangMetal::EmitBFloat16Helper() {
+  if (emitted_bfloat16_helper_) {
+    return;
+  }
+  emitted_bfloat16_helper_ = true;
+  decl_stream << "struct tvm_bfloat16 {\n"
+              << "  ushort bits;\n"
+              << "  tvm_bfloat16() = default;\n"
+              << "  tvm_bfloat16(float value) {\n"
+              << "    uint raw = as_type<uint>(value);\n"
+              << "    uint lsb = (raw >> 16) & 1u;\n"
+              << "    bits = ushort((raw + 0x7fffu + lsb) >> 16);\n"
+              << "  }\n"
+              << "  operator float() const {\n"
+              << "    return as_type<float>(uint(bits) << 16);\n"
+              << "  }\n"
+              << "};\n"
+              << "static inline float __tvm_bfloat16_to_float(thread const tvm_bfloat16& value) {\n"
+              << "  return as_type<float>(uint(value.bits) << 16);\n"
+              << "}\n"
+              << "static inline float __tvm_bfloat16_to_float(device const tvm_bfloat16& value) {\n"
+              << "  return as_type<float>(uint(value.bits) << 16);\n"
+              << "}\n"
+              << "static inline float __tvm_bfloat16_to_float(threadgroup const tvm_bfloat16& value) {\n"
+              << "  return as_type<float>(uint(value.bits) << 16);\n"
+              << "}\n"
+              << "static inline float __tvm_bfloat16_to_float(constant const tvm_bfloat16& value) {\n"
+              << "  return as_type<float>(uint(value.bits) << 16);\n"
               << "}\n\n";
 }
 
@@ -1298,7 +1329,9 @@ void CodeGenTileLangMetal::PrintType(DataType t,
       return;
     }
   } else if (t.is_bfloat16()) {
-    os << "bfloat";
+    ICHECK_EQ(lanes, 1) << "only scalar bfloat16 is supported in Metal codegen";
+    EmitBFloat16Helper();
+    os << "tvm_bfloat16";
     return;
   }
   LOG(FATAL) << "Cannot convert type " << t << " to Metal type";
@@ -1798,6 +1831,25 @@ std::string CodeGenTileLangMetal::CastFromTo(std::string value, DataType from,
         return "((float)" + decoded + ")";
       }
       return decoded;
+    }
+  }
+  if (from.is_bfloat16() && target.is_float()) {
+    EmitBFloat16Helper();
+    std::string decoded = "__tvm_bfloat16_to_float(" + value + ")";
+    if (target.bits() == 32) {
+      return decoded;
+    }
+    if (target.bits() == 16) {
+      return "((half)" + decoded + ")";
+    }
+  }
+  if (from.is_float() && target.is_bfloat16()) {
+    EmitBFloat16Helper();
+    if (from.bits() == 32) {
+      return "tvm_bfloat16(" + value + ")";
+    }
+    if (from.bits() == 16) {
+      return "tvm_bfloat16((float)" + value + ")";
     }
   }
   return CodeGenC::CastFromTo(std::move(value), from, target);

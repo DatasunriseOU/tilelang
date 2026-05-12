@@ -78,6 +78,8 @@ public:
   using CodeGenC::PrintType;
 
 private:
+  void EmitBFloat16Helper();
+
   // CPPMEGA: hybrid tl_pr_c granularity + stack-c switch dispatch.
   // Emit FP8/FP4 prelude helpers only for dtypes actually referenced by the
   // kernel body (not unconditionally for all FP8 variants). Without this,
@@ -105,6 +107,7 @@ private:
   bool uses_fp8_dot4_{false};
   bool uses_atomic_add_{false};
   bool emitted_atomic_add_helper_{false};
+  bool emitted_bfloat16_helper_{false};
 
   std::unordered_map<const VarNode *, std::string> simdgroup_dtype_;
   std::unordered_map<const VarNode *, IntImm> unroll_factor_;

@@ -361,6 +361,72 @@ install(TARGETS tilelang_cython_wrapper
         RUNTIME DESTINATION tilelang/lib
         ARCHIVE DESTINATION tilelang/lib)
 
+option(TILELANG_BUILD_MLX_TVM_FFI
+       "Build optional MLX graph-safe TVM-FFI Metal bridge"
+       ON)
+
+if(APPLE AND USE_METAL AND TILELANG_BUILD_MLX_TVM_FFI)
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+    OUTPUT_VARIABLE TILELANG_NANOBIND_ROOT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE TILELANG_NANOBIND_RESULT)
+  if(TILELANG_NANOBIND_RESULT EQUAL 0 AND EXISTS "${TILELANG_NANOBIND_ROOT}")
+    list(APPEND CMAKE_PREFIX_PATH "${TILELANG_NANOBIND_ROOT}")
+    find_package(nanobind CONFIG QUIET)
+  endif()
+
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -m mlx --cmake-dir
+    OUTPUT_VARIABLE TILELANG_MLX_ROOT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE TILELANG_MLX_RESULT)
+  if(TILELANG_MLX_RESULT EQUAL 0 AND EXISTS "${TILELANG_MLX_ROOT}")
+    list(APPEND CMAKE_PREFIX_PATH "${TILELANG_MLX_ROOT}")
+    find_package(MLX CONFIG QUIET)
+  endif()
+  if(NOT MLX_FOUND AND TILELANG_MLX_RESULT EQUAL 0 AND EXISTS "${TILELANG_MLX_ROOT}/include/mlx/array.h")
+    set(TILELANG_MLX_LIB "${TILELANG_MLX_ROOT}/lib/libmlx.dylib")
+    if(EXISTS "${TILELANG_MLX_LIB}" AND NOT TARGET mlx)
+      add_library(mlx SHARED IMPORTED)
+      set_target_properties(mlx PROPERTIES
+        IMPORTED_LOCATION "${TILELANG_MLX_LIB}"
+        INTERFACE_INCLUDE_DIRECTORIES "${TILELANG_MLX_ROOT}/include")
+      set(MLX_FOUND TRUE)
+    endif()
+  endif()
+
+  if(nanobind_FOUND AND MLX_FOUND AND TARGET tvm_ffi_shared)
+    nanobind_add_module(
+      _tilelang_mlx_tvm_ffi
+      NB_STATIC
+      STABLE_ABI
+      LTO
+      NOMINSIZE
+      NB_DOMAIN
+      mlx
+      src/contrib/mlx_tvm_ffi/mlx_tvm_ffi_ext.cpp)
+    target_include_directories(_tilelang_mlx_tvm_ffi PRIVATE
+      "${TVM_SOURCE}/3rdparty/tvm-ffi/include"
+      "${TVM_SOURCE}/3rdparty/tvm-ffi/3rdparty/dlpack/include")
+    target_link_libraries(_tilelang_mlx_tvm_ffi PRIVATE mlx tvm_ffi_shared)
+    set_target_properties(_tilelang_mlx_tvm_ffi PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      BUILD_RPATH "${TILELANG_MLX_ROOT}/lib"
+      INSTALL_RPATH "@loader_path;${TILELANG_MLX_ROOT}/lib")
+    install(TARGETS _tilelang_mlx_tvm_ffi
+            LIBRARY DESTINATION tilelang/lib
+            RUNTIME DESTINATION tilelang/lib
+            ARCHIVE DESTINATION tilelang/lib)
+  else()
+    message(STATUS "Skipping optional MLX TVM-FFI bridge: nanobind/MLX/tvm_ffi_shared target not available")
+  endif()
+endif()
+
 # Copy libz3.so to build folder to workaround isolated build env issue
 if(USE_Z3 AND USE_PYPI_Z3)
   get_target_property(Z3_LIBRARY_PATH z3::libz3 IMPORTED_LOCATION)
