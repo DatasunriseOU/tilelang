@@ -1,10 +1,9 @@
 """Z3-backed sync planning for MLX/Metal graph launches.
 
-The MLX TVM-FFI bridge borrows MLX's current Metal command buffer. For the
-normal Path C graph case, producer and consumer kernels are encoded into that
-same command buffer, so Metal's command-buffer order is the synchronization
-primitive. A host ``synchronize()`` is only legal at an explicit host boundary;
-cross-command-buffer hazards need a device event edge instead.
+The MLX TVM-FFI bridge borrows MLX's current Metal command buffer. MLX can
+prove command-buffer order for resources it tracks, but opaque TVM-FFI launches
+pass raw MTLBuffer pointers outside that tracker. Those producer->consumer
+edges need a device-side event, not a host ``synchronize()``.
 """
 
 from __future__ import annotations
@@ -66,13 +65,15 @@ def plan_metal_buffer_sync(
     same_command_buffer: bool | None,
     producer_before_consumer: bool | None,
     host_observer: bool = False,
+    resource_tracked: bool = True,
     timeout_ms: int = 50,
 ) -> MetalSyncPlan:
     """Return the narrowest required sync action for one buffer dependency.
 
     ``host_sync`` is reserved for graph-output observation by the CPU. Runtime
     producer->consumer hazards either prove to ``none`` on the same borrowed
-    command buffer or become a device-event edge across command buffers.
+    command buffer when resource tracking owns the buffers, or become a
+    device-event edge for opaque/external encoder boundaries.
     """
 
     if host_observer:
@@ -96,6 +97,15 @@ def plan_metal_buffer_sync(
         )
 
     if same_command_buffer is True:
+        if not resource_tracked:
+            return MetalSyncPlan(
+                action="device_event",
+                where="opaque_external_encoder_edge",
+                host_sync_required=False,
+                device_event_required=True,
+                reason="same command buffer uses raw external buffers outside MLX resource tracking",
+                z3_proved=False,
+            )
         if producer_before_consumer is True and _prove_same_command_buffer_order(timeout_ms):
             return MetalSyncPlan(
                 action="none",

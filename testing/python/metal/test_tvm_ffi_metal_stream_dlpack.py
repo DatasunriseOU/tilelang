@@ -489,6 +489,82 @@ def test_tvm_ffi_metal_mlx_native_debug_completion_hook_is_nonblocking(monkeypat
 
 
 @tilelang.testing.requires_metal
+def test_tvm_ffi_metal_mlx_graph_same_domain_opaque_edge_emits_device_event():
+    mx = pytest.importorskip("mlx.core")
+    from tilelang.contrib.mlx_tvm_ffi import (
+        debug_state,
+        is_available as native_bridge_is_available,
+        reset_debug_state,
+    )
+
+    if not native_bridge_is_available():
+        pytest.skip("native MLX TVM-FFI bridge is not built")
+
+    reset_debug_state()
+    kernel = tilelang.compile(
+        _make_add_all_2d_kernel(),
+        target="metal",
+        execution_backend="tvm_ffi",
+        out_idx=-1,
+    )
+
+    compiled = mx.compile(lambda source: kernel(kernel(source)))
+    returned = compiled(mx.ones((2, 3), dtype=mx.float32))
+    mx.eval(returned)
+
+    state = debug_state()
+    assert state["device_event_waits_encoded"] >= 1
+    assert state["device_event_signals_encoded"] >= 1
+    np.testing.assert_allclose(
+        np.array(returned),
+        np.array([[3.0, 5.0, 7.0], [9.0, 11.0, 13.0]], dtype=np.float32),
+    )
+
+
+@tilelang.testing.requires_metal
+def test_tvm_ffi_metal_mlx_graph_cross_domain_emits_device_event():
+    mx = pytest.importorskip("mlx.core")
+    from tilelang.contrib.mlx_tvm_ffi import (
+        debug_state,
+        is_available as native_bridge_is_available,
+        reset_debug_state,
+    )
+
+    if not native_bridge_is_available():
+        pytest.skip("native MLX TVM-FFI bridge is not built")
+
+    reset_debug_state()
+    kernel = tilelang.compile(
+        _make_add_all_2d_kernel(),
+        target="metal",
+        execution_backend="tvm_ffi",
+        out_idx=-1,
+    )
+
+    def graph(source):
+        mid = kernel(
+            source,
+            _tilelang_metal_command_buffer_domain="producer-domain",
+        )
+        return kernel(
+            mid,
+            _tilelang_metal_command_buffer_domain="consumer-domain",
+        )
+
+    compiled = mx.compile(graph)
+    returned = compiled(mx.ones((2, 3), dtype=mx.float32))
+    mx.eval(returned)
+
+    state = debug_state()
+    assert state["device_event_waits_encoded"] >= 1
+    assert state["device_event_signals_encoded"] >= 1
+    np.testing.assert_allclose(
+        np.array(returned),
+        np.array([[3.0, 5.0, 7.0], [9.0, 11.0, 13.0]], dtype=np.float32),
+    )
+
+
+@tilelang.testing.requires_metal
 def test_tvm_ffi_metal_mlx_graph_kernels_with_same_symbol_do_not_collide():
     mx = pytest.importorskip("mlx.core")
     from tilelang.contrib.mlx_interop import mlx_tilelang_metal_kernel

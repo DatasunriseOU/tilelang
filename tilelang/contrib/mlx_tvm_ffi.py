@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
+from tilelang.analysis.metal_graph_sync import (
+    plan_mlx_tvm_ffi_launch,
+    register_mlx_tvm_ffi_outputs,
+)
+
 
 class MLXTVMFFIBridgeUnavailable(RuntimeError):
     """Raised when the optional native MLX/TVM-FFI bridge is unavailable."""
@@ -33,8 +38,11 @@ def debug_state() -> dict[str, Any]:
 
 
 def reset_debug_state() -> None:
+    from tilelang.analysis.metal_graph_sync import clear_metal_graph_sync_state_for_tests
+
     native = _load_native_module()
     native.reset_debug_state()
+    clear_metal_graph_sync_state_for_tests()
 
 
 def _function_handle(func: Any) -> int:
@@ -67,6 +75,7 @@ def metal_call(
     output_dtypes: Iterable[Any],
     result_indices: Iterable[int],
     num_params: int,
+    command_buffer_domain: Any | None = None,
 ):
     """Create MLX graph outputs that call a TVM-FFI Metal function at eval time.
 
@@ -76,11 +85,26 @@ def metal_call(
     """
 
     native = _load_native_module()
-    return native.metal_call(
+    input_list = list(inputs)
+    launch_sync_state, wait_edges = plan_mlx_tvm_ffi_launch(
+        native,
+        input_list,
+        command_buffer_domain=command_buffer_domain,
+    )
+    outputs = native.metal_call(
         _function_handle(func),
-        list(inputs),
+        input_list,
         [[int(dim) for dim in shape] for shape in output_shapes],
         [_dtype_name(dtype) for dtype in output_dtypes],
         [int(idx) for idx in result_indices],
         int(num_params),
+        launch_sync_state,
+        wait_edges,
     )
+    output_list = list(outputs)
+    register_mlx_tvm_ffi_outputs(
+        output_list,
+        launch_sync_state,
+        command_buffer_domain=command_buffer_domain,
+    )
+    return output_list

@@ -280,7 +280,11 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 self.dtype = dtype
                 self.strides = tuple(_compact_stride(self.shape, dim) for dim in range(len(self.shape)))
 
-        def func(*inputs: torch.Tensor | Any, out: Any | None = None):
+        def func(
+            *inputs: torch.Tensor | Any,
+            out: Any | None = None,
+            _tilelang_metal_command_buffer_domain: Any | None = None,
+        ):
             # Validate input count.  The compact calling convention omits
             # result_idx outputs so the adapter allocates them; the full ABI
             # convention supplies every PrimFunc parameter and reuses caller
@@ -402,6 +406,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                         output_dtypes=[tensor_list[i].dtype for i in self.result_idx],
                         result_indices=self.result_idx,
                         num_params=len(self.params),
+                        command_buffer_domain=_tilelang_metal_command_buffer_domain,
                     )
                 except MLXTVMFFIBridgeUnavailable:
                     graph_outputs = None

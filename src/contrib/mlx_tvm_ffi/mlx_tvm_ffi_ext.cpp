@@ -3,12 +3,15 @@
 #include <cstdlib>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
@@ -44,6 +47,8 @@ struct DebugCounters {
   std::atomic<uint64_t> completion_handlers_installed{0};
   std::atomic<uint64_t> completed_command_buffers{0};
   std::atomic<uint64_t> errored_command_buffers{0};
+  std::atomic<uint64_t> device_event_waits_encoded{0};
+  std::atomic<uint64_t> device_event_signals_encoded{0};
 };
 
 DebugCounters& debug_counters() {
@@ -73,6 +78,8 @@ void reset_debug_counters() {
   counters.completion_handlers_installed.store(0, std::memory_order_relaxed);
   counters.completed_command_buffers.store(0, std::memory_order_relaxed);
   counters.errored_command_buffers.store(0, std::memory_order_relaxed);
+  counters.device_event_waits_encoded.store(0, std::memory_order_relaxed);
+  counters.device_event_signals_encoded.store(0, std::memory_order_relaxed);
 }
 
 nb::dict debug_state() {
@@ -99,6 +106,10 @@ nb::dict debug_state() {
       counters.completed_command_buffers.load(std::memory_order_relaxed);
   state["errored_command_buffers"] =
       counters.errored_command_buffers.load(std::memory_order_relaxed);
+  state["device_event_waits_encoded"] =
+      counters.device_event_waits_encoded.load(std::memory_order_relaxed);
+  state["device_event_signals_encoded"] =
+      counters.device_event_signals_encoded.load(std::memory_order_relaxed);
   state["debug_completion_enabled"] = env_flag_enabled(kDebugCompletionEnv);
   return state;
 }
@@ -113,6 +124,97 @@ void install_completion_debug_hook(MTL::CommandBuffer* command_buffer) {
     }
     counters.completed_command_buffers.fetch_add(1, std::memory_order_relaxed);
   }));
+}
+
+struct MetalSyncEdge {
+  ~MetalSyncEdge() {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (event != nullptr) {
+      event->release();
+      event = nullptr;
+    }
+  }
+
+  MTL::Event* ensure_event(mx::Stream stream) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (event == nullptr) {
+      auto* device = mx::metal::device(stream.device).mtl_device();
+      event = device->newSharedEvent();
+      if (event == nullptr) {
+        throw std::runtime_error("failed to allocate Metal shared event for TVM-FFI edge");
+      }
+    }
+    return static_cast<MTL::Event*>(event);
+  }
+
+  uint64_t value() const {
+    return value_;
+  }
+
+ private:
+  std::mutex mutex;
+  MTL::SharedEvent* event{nullptr};
+  uint64_t value_{1};
+};
+
+struct MetalLaunchSyncState {
+  void add_signal_edge(std::shared_ptr<MetalSyncEdge> edge) {
+    if (edge == nullptr) {
+      throw std::runtime_error("cannot add a null Metal sync edge");
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    if (std::find(signal_edges.begin(), signal_edges.end(), edge) == signal_edges.end()) {
+      signal_edges.push_back(std::move(edge));
+    }
+  }
+
+  std::vector<std::shared_ptr<MetalSyncEdge>> snapshot_signal_edges() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    return signal_edges;
+  }
+
+  size_t signal_edge_count() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    return signal_edges.size();
+  }
+
+ private:
+  mutable std::mutex mutex;
+  std::vector<std::shared_ptr<MetalSyncEdge>> signal_edges;
+};
+
+std::shared_ptr<MetalLaunchSyncState> make_launch_sync_state() {
+  return std::make_shared<MetalLaunchSyncState>();
+}
+
+std::shared_ptr<MetalSyncEdge> make_sync_edge() {
+  return std::make_shared<MetalSyncEdge>();
+}
+
+void encode_device_event_waits(
+    MTL::CommandBuffer* command_buffer,
+    mx::Stream stream,
+    const std::vector<std::shared_ptr<MetalSyncEdge>>& edges) {
+  for (const auto& edge : edges) {
+    if (edge == nullptr) {
+      continue;
+    }
+    command_buffer->encodeWait(edge->ensure_event(stream), edge->value());
+    debug_counters().device_event_waits_encoded.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void encode_device_event_signals(
+    MTL::CommandBuffer* command_buffer,
+    mx::Stream stream,
+    const std::vector<std::shared_ptr<MetalSyncEdge>>& edges) {
+  for (const auto& edge : edges) {
+    if (edge == nullptr) {
+      continue;
+    }
+    command_buffer->encodeSignalEvent(edge->ensure_event(stream), edge->value());
+    debug_counters().device_event_signals_encoded.fetch_add(1, std::memory_order_relaxed);
+  }
 }
 
 DLDataType mlx_dtype_to_dlpack(mx::Dtype dtype) {
@@ -228,6 +330,27 @@ std::vector<int64_t> parse_i64_sequence(nb::handle values) {
     integers.push_back(nb::cast<int64_t>(item));
   }
   return integers;
+}
+
+std::shared_ptr<MetalLaunchSyncState> parse_launch_sync_state(nb::handle handle) {
+  if (handle.is_none()) {
+    return make_launch_sync_state();
+  }
+  return nb::cast<std::shared_ptr<MetalLaunchSyncState>>(handle);
+}
+
+std::vector<std::shared_ptr<MetalSyncEdge>> parse_sync_edge_sequence(nb::handle handle) {
+  std::vector<std::shared_ptr<MetalSyncEdge>> edges;
+  if (handle.is_none()) {
+    return edges;
+  }
+  for (nb::handle item : nb::iter(handle)) {
+    auto edge = nb::cast<std::shared_ptr<MetalSyncEdge>>(item);
+    if (edge != nullptr) {
+      edges.push_back(std::move(edge));
+    }
+  }
+  return edges;
 }
 
 struct BorrowedTensorView {
@@ -348,13 +471,20 @@ class TVMFFIMetalCall : public mx::Primitive {
       mx::Stream stream,
       uint64_t func_handle,
       int64_t num_params,
-      std::vector<int64_t> result_indices)
+      std::vector<int64_t> result_indices,
+      std::shared_ptr<MetalLaunchSyncState> launch_sync_state,
+      std::vector<std::shared_ptr<MetalSyncEdge>> wait_edges)
       : mx::Primitive(stream),
         func_handle_(reinterpret_cast<TVMFFIObjectHandle>(func_handle)),
         num_params_(num_params),
-        result_indices_(std::move(result_indices)) {
+        result_indices_(std::move(result_indices)),
+        launch_sync_state_(std::move(launch_sync_state)),
+        wait_edges_(std::move(wait_edges)) {
     if (func_handle_ == nullptr) {
       throw std::runtime_error("TVM-FFI function handle is null");
+    }
+    if (launch_sync_state_ == nullptr) {
+      launch_sync_state_ = make_launch_sync_state();
     }
     if (num_params_ <= 0) {
       throw std::runtime_error("TVM-FFI bridge requires a positive parameter count");
@@ -427,10 +557,12 @@ class TVMFFIMetalCall : public mx::Primitive {
     }
 
     auto* command_buffer = encoder.finish_encoding_and_get_command_buffer();
+    encode_device_event_waits(command_buffer, stream(), wait_edges_);
     for (auto& out : outputs) {
       zero_output_buffer(command_buffer, out);
     }
 
+    auto signal_edges = launch_sync_state_->snapshot_signal_edges();
     TVMFFIAny result;
     result.type_index = kTVMFFINone;
     result.zero_padding = 0;
@@ -443,6 +575,7 @@ class TVMFFIMetalCall : public mx::Primitive {
           static_cast<int32_t>(args.size()),
           &result));
     }
+    encode_device_event_signals(command_buffer, stream(), signal_edges);
     if (result.type_index >= kTVMFFIStaticObjectBegin && result.v_obj != nullptr) {
       TVM_FFI_CHECK_SAFE_CALL(TVMFFIObjectDecRef(result.v_obj));
     }
@@ -470,6 +603,8 @@ class TVMFFIMetalCall : public mx::Primitive {
   TVMFFIObjectHandle func_handle_;
   int64_t num_params_;
   std::vector<int64_t> result_indices_;
+  std::shared_ptr<MetalLaunchSyncState> launch_sync_state_;
+  std::vector<std::shared_ptr<MetalSyncEdge>> wait_edges_;
 };
 
 std::vector<mx::array> tvm_ffi_metal_call(
@@ -479,6 +614,8 @@ std::vector<mx::array> tvm_ffi_metal_call(
     const std::vector<std::string>& output_dtypes,
     const std::vector<int64_t>& result_indices,
     int64_t num_params,
+    std::shared_ptr<MetalLaunchSyncState> launch_sync_state,
+    std::vector<std::shared_ptr<MetalSyncEdge>> wait_edges,
     mx::StreamOrDevice s = {}) {
   if (output_shapes.size() != output_dtypes.size()) {
     throw std::runtime_error("TVM-FFI output_shapes/output_dtypes length mismatch");
@@ -500,7 +637,9 @@ std::vector<mx::array> tvm_ffi_metal_call(
       mx::to_stream(s),
       func_handle,
       num_params,
-      result_indices);
+      result_indices,
+      std::move(launch_sync_state),
+      std::move(wait_edges));
   return mx::array::make_arrays(std::move(shapes), dtypes, primitive, inputs);
 }
 
@@ -508,6 +647,10 @@ std::vector<mx::array> tvm_ffi_metal_call(
 
 NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
   m.doc() = "Native graph-safe MLX primitive for TileLang TVM-FFI Metal kernels";
+  nb::class_<tilelang::mlx_tvm_ffi::MetalSyncEdge>(m, "MetalSyncEdge");
+  nb::class_<tilelang::mlx_tvm_ffi::MetalLaunchSyncState>(m, "MetalLaunchSyncState")
+      .def("add_signal_edge", &tilelang::mlx_tvm_ffi::MetalLaunchSyncState::add_signal_edge)
+      .def("signal_edge_count", &tilelang::mlx_tvm_ffi::MetalLaunchSyncState::signal_edge_count);
   m.def(
       "metal_call",
       [](uint64_t func_handle,
@@ -515,21 +658,29 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
          nb::handle output_shapes,
          nb::handle output_dtypes,
          nb::handle result_indices,
-         int64_t num_params) {
+         int64_t num_params,
+         nb::handle launch_sync_state,
+         nb::handle wait_edges) {
         return tilelang::mlx_tvm_ffi::tvm_ffi_metal_call(
             func_handle,
             tilelang::mlx_tvm_ffi::parse_array_sequence(inputs),
             tilelang::mlx_tvm_ffi::parse_shape_sequence(output_shapes),
             tilelang::mlx_tvm_ffi::parse_string_sequence(output_dtypes),
             tilelang::mlx_tvm_ffi::parse_i64_sequence(result_indices),
-            num_params);
+            num_params,
+            tilelang::mlx_tvm_ffi::parse_launch_sync_state(launch_sync_state),
+            tilelang::mlx_tvm_ffi::parse_sync_edge_sequence(wait_edges));
       },
       "func_handle"_a,
       "inputs"_a,
       "output_shapes"_a,
       "output_dtypes"_a,
       "result_indices"_a,
-      "num_params"_a);
+      "num_params"_a,
+      "launch_sync_state"_a = nb::none(),
+      "wait_edges"_a = nb::none());
+  m.def("make_launch_sync_state", &tilelang::mlx_tvm_ffi::make_launch_sync_state);
+  m.def("make_sync_edge", &tilelang::mlx_tvm_ffi::make_sync_edge);
   m.def("debug_state", &tilelang::mlx_tvm_ffi::debug_state);
   m.def("reset_debug_state", &tilelang::mlx_tvm_ffi::reset_debug_counters);
 }
