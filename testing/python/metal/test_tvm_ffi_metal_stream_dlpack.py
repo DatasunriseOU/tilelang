@@ -447,6 +447,48 @@ def test_tvm_ffi_metal_mlx_compile_uses_native_graph_primitive(monkeypatch):
 
 
 @tilelang.testing.requires_metal
+def test_tvm_ffi_metal_mlx_native_debug_completion_hook_is_nonblocking(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    from tilelang.contrib.mlx_tvm_ffi import (
+        debug_state,
+        is_available as native_bridge_is_available,
+        reset_debug_state,
+    )
+
+    if not native_bridge_is_available():
+        pytest.skip("native MLX TVM-FFI bridge is not built")
+
+    monkeypatch.setenv("TILELANG_MLX_TVM_FFI_DEBUG_COMPLETION", "1")
+    reset_debug_state()
+
+    kernel = tilelang.compile(
+        _make_add_all_2d_kernel(),
+        target="metal",
+        execution_backend="tvm_ffi",
+        out_idx=-1,
+    )
+
+    compiled = mx.compile(lambda source: kernel(source))
+    returned = compiled(mx.ones((2, 3), dtype=mx.float32))
+    mx.eval(returned)
+
+    state = debug_state()
+    assert state["debug_completion_enabled"] is True
+    assert state["launches"] >= 1
+    assert state["debug_completion_launches"] >= 1
+    assert state["command_buffers_checked"] >= 1
+    assert state["completion_handlers_installed"] >= 1
+    assert state["null_command_buffers"] == 0
+    assert state["null_input_buffers"] == 0
+    assert state["null_output_buffers"] == 0
+    assert state["errored_command_buffers"] == 0
+    np.testing.assert_allclose(
+        np.array(returned),
+        np.array([[2.0, 3.0, 4.0], [5.0, 6.0, 7.0]], dtype=np.float32),
+    )
+
+
+@tilelang.testing.requires_metal
 def test_tvm_ffi_metal_mlx_graph_kernels_with_same_symbol_do_not_collide():
     mx = pytest.importorskip("mlx.core")
     from tilelang.contrib.mlx_interop import mlx_tilelang_metal_kernel

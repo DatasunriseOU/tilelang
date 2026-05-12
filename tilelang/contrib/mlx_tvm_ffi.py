@@ -27,6 +27,16 @@ def is_available() -> bool:
     return True
 
 
+def debug_state() -> dict[str, Any]:
+    native = _load_native_module()
+    return dict(native.debug_state())
+
+
+def reset_debug_state() -> None:
+    native = _load_native_module()
+    native.reset_debug_state()
+
+
 def _function_handle(func: Any) -> int:
     chandle = getattr(func, "__chandle__", None)
     if callable(chandle):

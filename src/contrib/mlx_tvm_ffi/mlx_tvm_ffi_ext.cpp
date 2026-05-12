@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -28,6 +30,90 @@ namespace mx = mlx::core;
 namespace tilelang::mlx_tvm_ffi {
 
 constexpr int32_t kDLMetalDeviceType = 8;
+constexpr const char* kDebugCompletionEnv = "TILELANG_MLX_TVM_FFI_DEBUG_COMPLETION";
+
+struct DebugCounters {
+  std::atomic<uint64_t> launches{0};
+  std::atomic<uint64_t> debug_completion_launches{0};
+  std::atomic<uint64_t> input_buffers_checked{0};
+  std::atomic<uint64_t> output_buffers_checked{0};
+  std::atomic<uint64_t> null_input_buffers{0};
+  std::atomic<uint64_t> null_output_buffers{0};
+  std::atomic<uint64_t> command_buffers_checked{0};
+  std::atomic<uint64_t> null_command_buffers{0};
+  std::atomic<uint64_t> completion_handlers_installed{0};
+  std::atomic<uint64_t> completed_command_buffers{0};
+  std::atomic<uint64_t> errored_command_buffers{0};
+};
+
+DebugCounters& debug_counters() {
+  static DebugCounters counters;
+  return counters;
+}
+
+bool env_flag_enabled(const char* name) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return false;
+  }
+  std::string flag(value);
+  return flag != "0" && flag != "false" && flag != "False" && flag != "FALSE";
+}
+
+void reset_debug_counters() {
+  auto& counters = debug_counters();
+  counters.launches.store(0, std::memory_order_relaxed);
+  counters.debug_completion_launches.store(0, std::memory_order_relaxed);
+  counters.input_buffers_checked.store(0, std::memory_order_relaxed);
+  counters.output_buffers_checked.store(0, std::memory_order_relaxed);
+  counters.null_input_buffers.store(0, std::memory_order_relaxed);
+  counters.null_output_buffers.store(0, std::memory_order_relaxed);
+  counters.command_buffers_checked.store(0, std::memory_order_relaxed);
+  counters.null_command_buffers.store(0, std::memory_order_relaxed);
+  counters.completion_handlers_installed.store(0, std::memory_order_relaxed);
+  counters.completed_command_buffers.store(0, std::memory_order_relaxed);
+  counters.errored_command_buffers.store(0, std::memory_order_relaxed);
+}
+
+nb::dict debug_state() {
+  const auto& counters = debug_counters();
+  nb::dict state;
+  state["launches"] = counters.launches.load(std::memory_order_relaxed);
+  state["debug_completion_launches"] =
+      counters.debug_completion_launches.load(std::memory_order_relaxed);
+  state["input_buffers_checked"] =
+      counters.input_buffers_checked.load(std::memory_order_relaxed);
+  state["output_buffers_checked"] =
+      counters.output_buffers_checked.load(std::memory_order_relaxed);
+  state["null_input_buffers"] =
+      counters.null_input_buffers.load(std::memory_order_relaxed);
+  state["null_output_buffers"] =
+      counters.null_output_buffers.load(std::memory_order_relaxed);
+  state["command_buffers_checked"] =
+      counters.command_buffers_checked.load(std::memory_order_relaxed);
+  state["null_command_buffers"] =
+      counters.null_command_buffers.load(std::memory_order_relaxed);
+  state["completion_handlers_installed"] =
+      counters.completion_handlers_installed.load(std::memory_order_relaxed);
+  state["completed_command_buffers"] =
+      counters.completed_command_buffers.load(std::memory_order_relaxed);
+  state["errored_command_buffers"] =
+      counters.errored_command_buffers.load(std::memory_order_relaxed);
+  state["debug_completion_enabled"] = env_flag_enabled(kDebugCompletionEnv);
+  return state;
+}
+
+void install_completion_debug_hook(MTL::CommandBuffer* command_buffer) {
+  debug_counters().completion_handlers_installed.fetch_add(1, std::memory_order_relaxed);
+  command_buffer->addCompletedHandler(MTL::HandlerFunction([](MTL::CommandBuffer* completed) {
+    auto& counters = debug_counters();
+    if (completed != nullptr && completed->status() == MTL::CommandBufferStatusError) {
+      counters.errored_command_buffers.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    counters.completed_command_buffers.fetch_add(1, std::memory_order_relaxed);
+  }));
+}
 
 DLDataType mlx_dtype_to_dlpack(mx::Dtype dtype) {
   switch (dtype.val()) {
@@ -150,11 +236,27 @@ struct BorrowedTensorView {
   std::vector<int64_t> strides;
 };
 
-BorrowedTensorView make_tensor_view(const mx::array& array, mx::Stream stream) {
+BorrowedTensorView make_tensor_view(
+    const mx::array& array,
+    mx::Stream stream,
+    bool is_output) {
   void* buffer = const_cast<void*>(array.buffer().ptr());
+  auto& counters = debug_counters();
+  if (is_output) {
+    counters.output_buffers_checked.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    counters.input_buffers_checked.fetch_add(1, std::memory_order_relaxed);
+  }
   if (buffer == nullptr) {
+    if (is_output) {
+      counters.null_output_buffers.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      counters.null_input_buffers.fetch_add(1, std::memory_order_relaxed);
+    }
     throw std::runtime_error(
-        "MLX array has no materialized Metal buffer at TVM-FFI launch time");
+        is_output
+            ? "MLX output array has no materialized Metal buffer at TVM-FFI launch time"
+            : "MLX input array has no materialized Metal buffer at TVM-FFI launch time");
   }
 
   BorrowedTensorView view;
@@ -178,7 +280,10 @@ BorrowedTensorView make_tensor_view(const mx::array& array, mx::Stream stream) {
 
 struct ExternalCommandBufferScope {
   explicit ExternalCommandBufferScope(void* command_buffer) {
+    auto& counters = debug_counters();
+    counters.command_buffers_checked.fetch_add(1, std::memory_order_relaxed);
     if (command_buffer == nullptr) {
+      counters.null_command_buffers.fetch_add(1, std::memory_order_relaxed);
       throw std::runtime_error("MLX returned a null Metal command buffer for TVM-FFI launch");
     }
     TVMFFIAny arg;
@@ -285,6 +390,7 @@ class TVMFFIMetalCall : public mx::Primitive {
   void eval_gpu(
       const std::vector<mx::array>& inputs,
       std::vector<mx::array>& outputs) override {
+    debug_counters().launches.fetch_add(1, std::memory_order_relaxed);
     if (outputs.size() != result_indices_.size()) {
       throw std::runtime_error("TVM-FFI bridge output count mismatch");
     }
@@ -313,7 +419,7 @@ class TVMFFIMetalCall : public mx::Primitive {
           result_indices_.end(),
           param_idx);
       const mx::array& array = is_output ? outputs.at(output_pos++) : inputs.at(input_pos++);
-      views.push_back(make_tensor_view(array, stream()));
+      views.push_back(make_tensor_view(array, stream(), is_output));
       TVMFFIAny& arg = args[static_cast<size_t>(param_idx)];
       arg.type_index = kTVMFFIDLTensorPtr;
       arg.zero_padding = 0;
@@ -324,26 +430,40 @@ class TVMFFIMetalCall : public mx::Primitive {
     for (auto& out : outputs) {
       zero_output_buffer(command_buffer, out);
     }
-    ExternalCommandBufferScope external(command_buffer);
 
     TVMFFIAny result;
     result.type_index = kTVMFFINone;
     result.zero_padding = 0;
     result.v_int64 = 0;
-    TVM_FFI_CHECK_SAFE_CALL(TVMFFIFunctionCall(
-        func_handle_,
-        args.data(),
-        static_cast<int32_t>(args.size()),
-        &result));
+    {
+      ExternalCommandBufferScope external(command_buffer);
+      TVM_FFI_CHECK_SAFE_CALL(TVMFFIFunctionCall(
+          func_handle_,
+          args.data(),
+          static_cast<int32_t>(args.size()),
+          &result));
+    }
     if (result.type_index >= kTVMFFIStaticObjectBegin && result.v_obj != nullptr) {
       TVM_FFI_CHECK_SAFE_CALL(TVMFFIObjectDecRef(result.v_obj));
+    }
+    if (env_flag_enabled(kDebugCompletionEnv)) {
+      debug_counters().debug_completion_launches.fetch_add(1, std::memory_order_relaxed);
+      install_completion_debug_hook(command_buffer);
+      for (const auto& out : outputs) {
+        if (out.buffer().ptr() == nullptr) {
+          debug_counters().null_output_buffers.fetch_add(1, std::memory_order_relaxed);
+          throw std::runtime_error(
+              "MLX output buffer became null after TVM-FFI Metal sync guard");
+        }
+      }
     }
   }
 
   bool is_equivalent(const mx::Primitive& other) const override {
-    const auto& o = static_cast<const TVMFFIMetalCall&>(other);
-    return func_handle_ == o.func_handle_ && num_params_ == o.num_params_ &&
-        result_indices_ == o.result_indices_;
+    // The underlying TVM call is mathematically pure but operationally opaque:
+    // it borrows MLX's current command buffer and writes caller-owned Metal
+    // output buffers. Do not let MLX CSE/merge distinct launch nodes.
+    return this == &other;
   }
 
  private:
@@ -410,4 +530,6 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
       "output_dtypes"_a,
       "result_indices"_a,
       "num_params"_a);
+  m.def("debug_state", &tilelang::mlx_tvm_ffi::debug_state);
+  m.def("reset_debug_state", &tilelang::mlx_tvm_ffi::reset_debug_counters);
 }
