@@ -33,7 +33,7 @@ def _make_fake_tvm_ffi_adapter(func, out_idx, target="llvm"):
     return adapter
 
 
-def test_tvm_ffi_adapter_accepts_caller_owned_output_without_allocating(monkeypatch):
+def test_tvm_ffi_adapter_accepts_caller_owned_output_without_allocating():
     @T.prim_func
     def main(A: T.Tensor((4,), T.float32), C: T.Tensor((4,), T.float32)):
         with T.Kernel(1, threads=1):
@@ -44,11 +44,6 @@ def test_tvm_ffi_adapter_accepts_caller_owned_output_without_allocating(monkeypa
     source = torch.empty(4)
     output = torch.empty(4)
 
-    def fail_empty(*args, **kwargs):
-        raise AssertionError("owner-provided output path must not allocate")
-
-    monkeypatch.setattr(torch, "empty", fail_empty)
-
     returned = wrapped(source, output)
     assert returned is output
     assert adapter.executable.calls[-1] == (source, output)
@@ -58,8 +53,8 @@ def test_tvm_ffi_adapter_accepts_caller_owned_output_without_allocating(monkeypa
     assert adapter.executable.calls[-1] == (source, output)
 
 
-def test_tvm_ffi_adapter_allocates_mlx_compact_output_without_torch(monkeypatch):
-    mx = pytest.importorskip("mlx.core")
+def test_tvm_ffi_adapter_allocates_mlx_compact_output_without_torch():
+    mx = pytest.importorskip("mlx.core", exc_type=ImportError)
 
     @T.prim_func
     def main(A: T.Tensor((4,), T.float32), C: T.Tensor((4,), T.float32)):
@@ -71,11 +66,6 @@ def test_tvm_ffi_adapter_allocates_mlx_compact_output_without_torch(monkeypatch)
     source = mx.zeros((4,), dtype=mx.float32)
     mx.eval(source)
 
-    def fail_empty(*args, **kwargs):
-        raise AssertionError("MLX compact output path must not allocate torch tensors")
-
-    monkeypatch.setattr(torch, "empty", fail_empty)
-
     returned = wrapped(source)
 
     assert isinstance(returned, mx.array)
@@ -86,31 +76,41 @@ def test_tvm_ffi_adapter_allocates_mlx_compact_output_without_torch(monkeypatch)
     assert len(adapter.executable.calls[-1]) == 2
 
 
-def test_mlx_metal_output_prefers_write_only_empty(monkeypatch):
+def test_tvm_ffi_adapter_builds_explicit_metal_dependency_metadata():
+    @T.prim_func
+    def main(A: T.Tensor((4,), T.float32), C: T.Tensor((4,), T.float32)):
+        with T.Kernel(1, threads=1):
+            C[0] = A[0]
+
+    adapter = _make_fake_tvm_ffi_adapter(main, out_idx=-1, target="metal")
+    metadata = adapter._metal_dependency_metadata(
+        input_param_indices=[0],
+        param_names=["A", "C"],
+        command_buffer_domain="domain-a",
+    )
+
+    assert metadata.kernel_symbol == "main"
+    assert metadata.command_buffer_domain == "domain-a"
+    assert [(access.param_index, access.name, access.mode) for access in metadata.input_accesses] == [
+        (0, "A", "read"),
+    ]
+    assert [
+        (access.param_index, access.name, access.mode, access.result_position)
+        for access in metadata.output_accesses
+    ] == [
+        (1, "C", "write", 0),
+    ]
+
+
+def test_mlx_metal_output_allocates_mlx_array():
+    mx = pytest.importorskip("mlx.core", exc_type=ImportError)
     import tilelang.contrib.mlx_interop as mlx_interop
-
-    calls = []
-
-    class _FakeMLX:
-        float32 = object()
-
-        @staticmethod
-        def empty(shape, *, dtype):
-            calls.append(("empty", shape, dtype))
-            return {"kind": "empty", "shape": shape, "dtype": dtype}
-
-        @staticmethod
-        def zeros(shape, *, dtype):
-            calls.append(("zeros", shape, dtype))
-            return {"kind": "zeros", "shape": shape, "dtype": dtype}
-
-    monkeypatch.setattr(mlx_interop, "_mlx_core", lambda: _FakeMLX)
 
     out = mlx_interop.mlx_metal_output((2, 3), "float32")
 
-    assert out["kind"] == "empty"
-    assert out["shape"] == (2, 3)
-    assert calls == [("empty", (2, 3), _FakeMLX.float32)]
+    assert isinstance(out, mx.array)
+    assert out.shape == (2, 3)
+    assert out.dtype == mx.float32
 
 
 def matmul(

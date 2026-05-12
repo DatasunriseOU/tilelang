@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 from tilelang.analysis.metal_graph_sync import (
+    MetalLaunchDependencyMetadata,
+    make_tvm_ffi_metal_dependency_metadata,
     plan_mlx_tvm_ffi_launch,
     register_mlx_tvm_ffi_outputs,
 )
@@ -76,6 +78,7 @@ def metal_call(
     result_indices: Iterable[int],
     num_params: int,
     command_buffer_domain: Any | None = None,
+    dependency_metadata: MetalLaunchDependencyMetadata | None = None,
 ):
     """Create MLX graph outputs that call a TVM-FFI Metal function at eval time.
 
@@ -86,17 +89,26 @@ def metal_call(
 
     native = _load_native_module()
     input_list = list(inputs)
+    result_index_list = [int(idx) for idx in result_indices]
+    if dependency_metadata is None:
+        result_index_set = set(result_index_list)
+        dependency_metadata = make_tvm_ffi_metal_dependency_metadata(
+            kernel_symbol="<tvm_ffi_metal>",
+            input_param_indices=[i for i in range(int(num_params)) if i not in result_index_set],
+            output_param_indices=result_index_list,
+            command_buffer_domain=command_buffer_domain,
+        )
     launch_sync_state, wait_edges = plan_mlx_tvm_ffi_launch(
         native,
         input_list,
-        command_buffer_domain=command_buffer_domain,
+        dependency_metadata=dependency_metadata,
     )
     outputs = native.metal_call(
         _function_handle(func),
         input_list,
         [[int(dim) for dim in shape] for shape in output_shapes],
         [_dtype_name(dtype) for dtype in output_dtypes],
-        [int(idx) for idx in result_indices],
+        result_index_list,
         int(num_params),
         launch_sync_state,
         wait_edges,
@@ -105,6 +117,6 @@ def metal_call(
     register_mlx_tvm_ffi_outputs(
         output_list,
         launch_sync_state,
-        command_buffer_domain=command_buffer_domain,
+        dependency_metadata=dependency_metadata,
     )
     return output_list

@@ -39,6 +39,7 @@ from tilelang.contrib.mlx_tvm_ffi import (
     is_available as mlx_tvm_ffi_is_available,
     metal_call as mlx_tvm_ffi_metal_call,
 )
+from tilelang.analysis.metal_graph_sync import make_tvm_ffi_metal_dependency_metadata
 
 
 COMPILE_ARGS = {}
@@ -398,6 +399,11 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             graph_outputs = None
             if use_native_mlx_graph:
                 input_param_indices = [i for i in range(len(self.params)) if i not in self.result_idx]
+                dependency_metadata = self._metal_dependency_metadata(
+                    input_param_indices=input_param_indices,
+                    param_names=param_names,
+                    command_buffer_domain=_tilelang_metal_command_buffer_domain,
+                )
                 try:
                     graph_outputs = mlx_tvm_ffi_metal_call(
                         executable["main"],
@@ -406,7 +412,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                         output_dtypes=[tensor_list[i].dtype for i in self.result_idx],
                         result_indices=self.result_idx,
                         num_params=len(self.params),
-                        command_buffer_domain=_tilelang_metal_command_buffer_domain,
+                        dependency_metadata=dependency_metadata,
                     )
                 except MLXTVMFFIBridgeUnavailable:
                     graph_outputs = None
@@ -461,6 +467,21 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             return [tensor_list[i] for i in self.result_idx]
 
         return func
+
+    def _metal_dependency_metadata(
+        self,
+        *,
+        input_param_indices: list[int],
+        param_names: list[str],
+        command_buffer_domain: Any | None = None,
+    ):
+        return make_tvm_ffi_metal_dependency_metadata(
+            kernel_symbol=str(self.prim_func.attrs.get("global_symbol", "main")),
+            input_param_indices=input_param_indices,
+            output_param_indices=self.result_idx,
+            param_names=param_names,
+            command_buffer_domain=command_buffer_domain,
+        )
 
     @classmethod
     def from_database(
