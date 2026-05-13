@@ -412,6 +412,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                         result_indices=self.result_idx,
                         num_params=len(self.params),
                         dependency_metadata=dependency_metadata,
+                        zero_init_output_positions=self._metal_zero_init_output_positions(),
                     )
                 except MLXTVMFFIBridgeUnavailable:
                     graph_outputs = None
@@ -452,6 +453,29 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             param_names=param_names,
             command_buffer_domain=command_buffer_domain,
         )
+
+    def _metal_zero_init_output_positions(self) -> list[int]:
+        """Return output positions that need zero-init before launching Metal.
+
+        Full-write kernels must not be pre-cleared by the bridge because the
+        extra blit is an observable command-buffer side effect. Kernels that
+        accumulate with atomics do need a zero identity buffer when the MLX
+        graph path allocates owner outputs lazily.
+        """
+
+        source_parts = [
+            source
+            for source in (self.device_kernel_source, self.host_kernel_source)
+            if isinstance(source, str)
+        ]
+        try:
+            source_parts.append(str(self.prim_func))
+        except Exception:
+            pass
+        source = "\n".join(source_parts)
+        if "atomic_add" not in source and "atomic_fetch_add" not in source:
+            return []
+        return list(range(len(self.result_idx)))
 
     @classmethod
     def from_database(

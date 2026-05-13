@@ -47,6 +47,28 @@ def reset_debug_state() -> None:
     clear_metal_graph_sync_state_for_tests()
 
 
+def owner_output_buffer(shape: Iterable[int], dtype: Any):
+    """Allocate a materialized MLX owner-output buffer in the native bridge."""
+
+    native = _load_native_module()
+    return native.owner_output_buffer([int(dim) for dim in shape], _dtype_name(dtype))
+
+
+def owner_output_buffers(
+    shapes: Iterable[Iterable[int]],
+    dtypes: Iterable[Any],
+):
+    """Allocate materialized MLX owner-output buffers in the native bridge."""
+
+    native = _load_native_module()
+    return list(
+        native.owner_output_buffers(
+            [[int(dim) for dim in shape] for shape in shapes],
+            [_dtype_name(dtype) for dtype in dtypes],
+        )
+    )
+
+
 def _function_handle(func: Any) -> int:
     chandle = getattr(func, "__chandle__", None)
     if callable(chandle):
@@ -69,6 +91,18 @@ def _dtype_name(dtype: Any) -> str:
     return name
 
 
+def _contiguous_mlx_input(value: Any) -> Any:
+    """Normalize MLX graph inputs to the compact ABI expected by TVM kernels."""
+
+    try:
+        import mlx.core as mx
+    except Exception:  # pragma: no cover - native bridge is MLX-only.
+        return value
+    if isinstance(value, mx.array):
+        return mx.contiguous(value)
+    return value
+
+
 def metal_call(
     func: Any,
     *,
@@ -79,6 +113,7 @@ def metal_call(
     num_params: int,
     command_buffer_domain: Any | None = None,
     dependency_metadata: MetalLaunchDependencyMetadata | None = None,
+    zero_init_output_positions: Iterable[int] = (),
 ):
     """Create MLX graph outputs that call a TVM-FFI Metal function at eval time.
 
@@ -88,7 +123,7 @@ def metal_call(
     """
 
     native = _load_native_module()
-    input_list = list(inputs)
+    input_list = [_contiguous_mlx_input(value) for value in inputs]
     result_index_list = [int(idx) for idx in result_indices]
     if dependency_metadata is None:
         result_index_set = set(result_index_list)
@@ -110,6 +145,7 @@ def metal_call(
         [_dtype_name(dtype) for dtype in output_dtypes],
         result_index_list,
         int(num_params),
+        [int(idx) for idx in zero_init_output_positions],
         launch_sync_state,
         wait_edges,
     )

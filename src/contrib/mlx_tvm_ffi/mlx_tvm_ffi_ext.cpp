@@ -414,6 +414,24 @@ struct BorrowedTensorView {
   std::vector<int64_t> strides;
 };
 
+bool is_compact_array(const mx::array& array) {
+  const auto& shape = array.shape();
+  const auto& strides = array.strides();
+  if (shape.size() != strides.size()) {
+    return false;
+  }
+  int64_t expected_stride = 1;
+  for (int i = static_cast<int>(shape.size()) - 1; i >= 0; --i) {
+    const int dim = shape[static_cast<size_t>(i)];
+    const int64_t stride = static_cast<int64_t>(strides[static_cast<size_t>(i)]);
+    if (dim > 1 && stride != expected_stride) {
+      return false;
+    }
+    expected_stride *= static_cast<int64_t>(std::max(dim, 1));
+  }
+  return true;
+}
+
 BorrowedTensorView make_tensor_view(
     const mx::array& array,
     mx::Stream stream,
@@ -435,6 +453,11 @@ BorrowedTensorView make_tensor_view(
         is_output
             ? "MLX output array has no materialized Metal buffer at TVM-FFI launch time"
             : "MLX input array has no materialized Metal buffer at TVM-FFI launch time");
+  }
+  if (!is_output && !is_compact_array(array)) {
+    throw std::runtime_error(
+        "MLX input array is not compact at TVM-FFI launch time; "
+        "TileLang MLX graph lowering must insert a compact-layout mapping");
   }
 
   BorrowedTensorView view;
@@ -510,6 +533,12 @@ struct ExternalCommandBufferScope {
   }
 };
 
+MTL::CommandBuffer* finish_encoding_and_get_command_buffer(mx::Stream stream) {
+  auto& encoder = mx::metal::get_command_encoder(stream);
+  encoder.end_encoding();
+  return encoder.get_command_buffer();
+}
+
 void zero_output_buffer(MTL::CommandBuffer* command_buffer, mx::array& out) {
   if (out.nbytes() == 0) {
     return;
@@ -518,12 +547,6 @@ void zero_output_buffer(MTL::CommandBuffer* command_buffer, mx::array& out) {
   auto* blit_encoder = command_buffer->blitCommandEncoder();
   blit_encoder->fillBuffer(buffer, NS::Range::Make(out.offset(), out.nbytes()), 0);
   blit_encoder->endEncoding();
-}
-
-MTL::CommandBuffer* finish_encoding_and_get_command_buffer(mx::Stream stream) {
-  auto& encoder = mx::metal::get_command_encoder(stream);
-  encoder.end_encoding();
-  return encoder.get_command_buffer();
 }
 
 mx::metal::CommandEncoder* get_command_encoder(mx::Stream stream) {
@@ -537,12 +560,14 @@ class TVMFFIMetalCall : public mx::Primitive {
       uint64_t func_handle,
       int64_t num_params,
       std::vector<int64_t> result_indices,
+      std::vector<int64_t> zero_init_output_positions,
       std::shared_ptr<MetalLaunchSyncState> launch_sync_state,
       std::vector<std::shared_ptr<MetalSyncEdge>> wait_edges)
       : mx::Primitive(stream),
         func_handle_(reinterpret_cast<TVMFFIObjectHandle>(func_handle)),
         num_params_(num_params),
         result_indices_(std::move(result_indices)),
+        zero_init_output_positions_(std::move(zero_init_output_positions)),
         launch_sync_state_(std::move(launch_sync_state)),
         wait_edges_(std::move(wait_edges)) {
     if (func_handle_ == nullptr) {
@@ -558,9 +583,18 @@ class TVMFFIMetalCall : public mx::Primitive {
     result_indices_.erase(
         std::unique(result_indices_.begin(), result_indices_.end()),
         result_indices_.end());
+    std::sort(zero_init_output_positions_.begin(), zero_init_output_positions_.end());
+    zero_init_output_positions_.erase(
+        std::unique(zero_init_output_positions_.begin(), zero_init_output_positions_.end()),
+        zero_init_output_positions_.end());
     for (int64_t idx : result_indices_) {
       if (idx < 0 || idx >= num_params_) {
         throw std::runtime_error("TVM-FFI result index is outside the parameter list");
+      }
+    }
+    for (int64_t idx : zero_init_output_positions_) {
+      if (idx < 0 || idx >= static_cast<int64_t>(result_indices_.size())) {
+        throw std::runtime_error("TVM-FFI zero-init output position is outside the output list");
       }
     }
     TVM_FFI_CHECK_SAFE_CALL(TVMFFIObjectIncRef(func_handle_));
@@ -623,8 +657,8 @@ class TVMFFIMetalCall : public mx::Primitive {
 
     auto* command_buffer = finish_encoding_and_get_command_buffer(stream());
     encode_device_event_waits(command_buffer, stream(), wait_edges_);
-    for (auto& out : outputs) {
-      zero_output_buffer(command_buffer, out);
+    for (int64_t output_pos : zero_init_output_positions_) {
+      zero_output_buffer(command_buffer, outputs.at(static_cast<size_t>(output_pos)));
     }
 
     auto signal_edges = launch_sync_state_->snapshot_signal_edges();
@@ -668,6 +702,7 @@ class TVMFFIMetalCall : public mx::Primitive {
   TVMFFIObjectHandle func_handle_;
   int64_t num_params_;
   std::vector<int64_t> result_indices_;
+  std::vector<int64_t> zero_init_output_positions_;
   std::shared_ptr<MetalLaunchSyncState> launch_sync_state_;
   std::vector<std::shared_ptr<MetalSyncEdge>> wait_edges_;
 };
@@ -679,6 +714,7 @@ std::vector<mx::array> tvm_ffi_metal_call(
     const std::vector<std::string>& output_dtypes,
     const std::vector<int64_t>& result_indices,
     int64_t num_params,
+    const std::vector<int64_t>& zero_init_output_positions,
     std::shared_ptr<MetalLaunchSyncState> launch_sync_state,
     std::vector<std::shared_ptr<MetalSyncEdge>> wait_edges) {
   if (output_shapes.size() != output_dtypes.size()) {
@@ -702,25 +738,54 @@ std::vector<mx::array> tvm_ffi_metal_call(
       func_handle,
       num_params,
       result_indices,
+      zero_init_output_positions,
       std::move(launch_sync_state),
       std::move(wait_edges));
   return mx::array::make_arrays(std::move(shapes), dtypes, primitive, inputs);
 }
 
+nb::object wrap_mlx_array(mx::array&& array) {
+  auto payload = std::make_unique<mx::array>(std::move(array));
+  PyObject* py_array = mlx_core_wrap_mx_array_move(payload.get());
+  if (py_array == nullptr) {
+    if (PyErr_Occurred() != nullptr) {
+      throw nb::python_error();
+    }
+    throw std::runtime_error("MLX array wrapper returned null without a Python exception");
+  }
+  payload.release();
+  return nb::steal(py_array);
+}
+
 nb::list wrap_mlx_arrays(std::vector<mx::array>&& arrays) {
   nb::list result;
   for (auto& array : arrays) {
-    auto* payload = new mx::array(std::move(array));
-    PyObject* py_array = mlx_core_wrap_mx_array_move(payload);
-    if (py_array == nullptr) {
-      if (PyErr_Occurred() != nullptr) {
-        throw nb::python_error();
-      }
-      throw std::runtime_error("MLX array wrapper returned null without a Python exception");
-    }
-    result.append(nb::steal(py_array));
+    result.append(wrap_mlx_array(std::move(array)));
   }
   return result;
+}
+
+mx::array make_owner_output_buffer(
+    const std::vector<int64_t>& shape,
+    const std::string& dtype_name) {
+  return mx::empty(
+      shape_from_i64(shape),
+      dtype_from_name(dtype_name),
+      mx::default_stream(mx::Device::gpu));
+}
+
+std::vector<mx::array> make_owner_output_buffers(
+    const std::vector<std::vector<int64_t>>& shapes,
+    const std::vector<std::string>& dtype_names) {
+  if (shapes.size() != dtype_names.size()) {
+    throw std::runtime_error("owner output shapes/dtypes length mismatch");
+  }
+  std::vector<mx::array> outputs;
+  outputs.reserve(shapes.size());
+  for (size_t i = 0; i < shapes.size(); ++i) {
+    outputs.push_back(make_owner_output_buffer(shapes[i], dtype_names[i]));
+  }
+  return outputs;
 }
 
 }  // namespace tilelang::mlx_tvm_ffi
@@ -739,12 +804,14 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
          nb::handle output_dtypes,
          nb::handle result_indices,
          int64_t num_params,
+         nb::handle zero_init_output_positions,
          nb::handle launch_sync_state,
          nb::handle wait_edges) {
         std::vector<mx::array> parsed_inputs;
         std::vector<std::vector<int64_t>> parsed_output_shapes;
         std::vector<std::string> parsed_output_dtypes;
         std::vector<int64_t> parsed_result_indices;
+        std::vector<int64_t> parsed_zero_init_output_positions;
         std::shared_ptr<tilelang::mlx_tvm_ffi::MetalLaunchSyncState> parsed_launch_sync_state;
         std::vector<std::shared_ptr<tilelang::mlx_tvm_ffi::MetalSyncEdge>> parsed_wait_edges;
         try {
@@ -768,6 +835,13 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
           throw std::runtime_error(std::string("failed to parse result indices: ") + exc.what());
         }
         try {
+          parsed_zero_init_output_positions =
+              tilelang::mlx_tvm_ffi::parse_i64_sequence(zero_init_output_positions);
+        } catch (const std::exception& exc) {
+          throw std::runtime_error(
+              std::string("failed to parse zero-init output positions: ") + exc.what());
+        }
+        try {
           parsed_launch_sync_state =
               tilelang::mlx_tvm_ffi::parse_launch_sync_state(launch_sync_state);
         } catch (const std::exception& exc) {
@@ -786,6 +860,7 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
                 parsed_output_dtypes,
                 parsed_result_indices,
                 num_params,
+                parsed_zero_init_output_positions,
                 parsed_launch_sync_state,
                 parsed_wait_edges));
       },
@@ -795,10 +870,31 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
       "output_dtypes"_a,
       "result_indices"_a,
       "num_params"_a,
+      "zero_init_output_positions"_a = nb::make_tuple(),
       "launch_sync_state"_a = nb::none(),
       "wait_edges"_a = nb::none());
   m.def("make_launch_sync_state", &tilelang::mlx_tvm_ffi::make_launch_sync_state);
   m.def("make_sync_edge", &tilelang::mlx_tvm_ffi::make_sync_edge);
   m.def("debug_state", &tilelang::mlx_tvm_ffi::debug_state);
   m.def("reset_debug_state", &tilelang::mlx_tvm_ffi::reset_debug_counters);
+  m.def(
+      "owner_output_buffer",
+      [](nb::handle shape, const std::string& dtype_name) {
+        return tilelang::mlx_tvm_ffi::wrap_mlx_array(
+            tilelang::mlx_tvm_ffi::make_owner_output_buffer(
+                tilelang::mlx_tvm_ffi::parse_i64_sequence(shape),
+                dtype_name));
+      },
+      "shape"_a,
+      "dtype"_a);
+  m.def(
+      "owner_output_buffers",
+      [](nb::handle shapes, nb::handle dtypes) {
+        return tilelang::mlx_tvm_ffi::wrap_mlx_arrays(
+            tilelang::mlx_tvm_ffi::make_owner_output_buffers(
+                tilelang::mlx_tvm_ffi::parse_shape_sequence(shapes),
+                tilelang::mlx_tvm_ffi::parse_string_sequence(dtypes)));
+      },
+      "shapes"_a,
+      "dtypes"_a);
 }
