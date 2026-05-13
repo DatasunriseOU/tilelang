@@ -8,6 +8,8 @@
 
 #include "operator.h"
 
+#include <string>
+
 namespace tvm {
 
 namespace tl {
@@ -96,6 +98,13 @@ TVM_DLL bool IsSameSimdgroupMetalReductionSafe(
     const Target &target, int reducing_threads, int scale,
     const PrimExpr &thread_offset_expr, arith::Analyzer *analyzer);
 
+struct ReductionPlan {
+  int reducing_threads{0};
+  int scale{0};
+  PrimExpr thread_offset;
+  bool same_simdgroup_metal_fast_path_safe{false};
+};
+
 /// Node class for reduction operations
 class ReduceOpNode : public TileOperatorNode {
 public:
@@ -144,7 +153,6 @@ public:
   static const Op &Get();
   TileOperator Clone() const override;
 
-private:
   /// Generate initial value for reduction
   PrimExpr MakeInitValue() const;
   /// Generate reduction expression
@@ -152,6 +160,37 @@ private:
   /// Generate codegen reducer string
   std::string MakeCodegenReducer() const;
 };
+
+using ReduceTargetPredicate = bool (*)(Target target);
+
+struct ReduceImpl {
+  const char *name;
+  ReduceTargetPredicate match_target;
+  int priority;
+
+  std::string (*make_scalar_allreduce)(const ReduceOpNode &op,
+                                       const LowerArgs &T,
+                                       const ReductionPlan &plan);
+  std::string (*make_batch_allreduce)(const ReduceOpNode &op,
+                                      const LowerArgs &T,
+                                      const ReductionPlan &plan, int batch);
+
+  bool (*needs_scalar_workspace)(const LowerArgs &T,
+                                 const ReductionPlan &plan);
+  int (*scalar_workspace_size)(const LowerArgs &T,
+                               const ReductionPlan &plan);
+  bool (*needs_batch_workspace)(const LowerArgs &T,
+                                const ReductionPlan &plan, int batch);
+  int (*batch_workspace_size)(const LowerArgs &T,
+                              const ReductionPlan &plan, int batch);
+
+  void (*append_scalar_args)(Array<PrimExpr> *args, const LowerArgs &T,
+                             bool need_workspace, const PrimExpr &workspace);
+  void (*append_batch_args)(Array<PrimExpr> *args, const LowerArgs &T,
+                            bool need_workspace, const PrimExpr &workspace);
+};
+
+void RegisterReduceImpl(ReduceImpl impl);
 
 /// Wrapper class for reduction operations
 class ReduceOp : public TileOperator {

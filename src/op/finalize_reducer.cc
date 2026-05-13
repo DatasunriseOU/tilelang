@@ -6,6 +6,11 @@
 
 #include "finalize_reducer.h"
 
+#include <array>
+#include <limits>
+#include <sstream>
+#include <vector>
+
 #include <tvm/arith/iter_affine_map.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
@@ -19,6 +24,153 @@ namespace tvm {
 namespace tl {
 
 using namespace tirx;
+
+namespace {
+
+std::vector<FinalizeReducerImpl> &FinalizeReducerImplRegistry() {
+  static std::vector<FinalizeReducerImpl> registry;
+  return registry;
+}
+
+const FinalizeReducerImpl &ResolveFinalizeReducerImpl(Target target) {
+  const auto &registry = FinalizeReducerImplRegistry();
+  const FinalizeReducerImpl *best_impl = nullptr;
+  int best_priority = std::numeric_limits<int>::min();
+  for (const FinalizeReducerImpl &impl : registry) {
+    if (impl.match_target(target) && impl.priority >= best_priority) {
+      best_impl = &impl;
+      best_priority = impl.priority;
+    }
+  }
+  ICHECK(best_impl != nullptr)
+      << "finalize_reducer requires a target-specific implementation, but no "
+         "implementation is registered for "
+      << target;
+  return *best_impl;
+}
+
+int ThreadBlockExtent(const LowerArgs &T) {
+  return static_cast<int>(*as_const_int(T.thread_bounds->extent));
+}
+
+bool MatchDefaultFinalizeReducerTarget(Target target) {
+  return !TargetIsMetal(target);
+}
+
+std::string MakeDefaultFinalizeScalarAllReduce(
+    const FinalizeReducerOpNode &op, const LowerArgs &T,
+    const ReductionPlan &plan, const std::string &op_str) {
+  (void)op;
+  std::stringstream ss;
+  if (TargetHasSMVersionGE(T.target, 90)) {
+    auto all_threads = T.thread_bounds->extent;
+    ss << "tl::AllReduce<" << op_str << ", " << plan.reducing_threads << ", "
+       << plan.scale << ", " << plan.thread_offset << ", tl::NamedBarrier<"
+       << all_threads << ">>::run";
+  } else {
+    ss << "tl::AllReduce<" << op_str << ", " << plan.reducing_threads << ", "
+       << plan.scale << ", " << plan.thread_offset << ">::run";
+  }
+  return ss.str();
+}
+
+std::string MakeDefaultFinalizeBatchAllReduce(
+    const FinalizeReducerOpNode &op, const LowerArgs &T,
+    const ReductionPlan &plan, const std::string &op_str, int64_t batch) {
+  (void)op;
+  std::stringstream ss;
+  const int workspace_stride = ThreadBlockExtent(T);
+  if (TargetHasSMVersionGE(T.target, 90)) {
+    auto all_threads = T.thread_bounds->extent;
+    ss << "tl::AllReduce<" << op_str << ", " << plan.reducing_threads << ", "
+       << plan.scale << ", " << plan.thread_offset << ", tl::NamedBarrier<"
+       << all_threads << ">, " << batch << ", " << workspace_stride
+       << ">::run_batch";
+  } else if (TargetIsRocm(T.target)) {
+    ss << "tl::AllReduce<" << op_str << ", " << plan.reducing_threads << ", "
+       << plan.scale << ", " << plan.thread_offset << ", " << batch << ", "
+       << workspace_stride << ">::run_batch";
+  } else {
+    ss << "tl::AllReduce<" << op_str << ", " << plan.reducing_threads << ", "
+       << plan.scale << ", " << plan.thread_offset
+       << ", tl::SyncThreadsBarrier, " << batch << ", " << workspace_stride
+       << ">::run_batch";
+  }
+  return ss.str();
+}
+
+bool DefaultFinalizeNeedsScalarWorkspace(const LowerArgs &T,
+                                         const ReductionPlan &plan) {
+  (void)T;
+  return plan.reducing_threads >= 32;
+}
+
+int DefaultFinalizeScalarWorkspaceSize(const LowerArgs &T,
+                                       const ReductionPlan &plan) {
+  (void)plan;
+  return ThreadBlockExtent(T);
+}
+
+bool DefaultFinalizeNeedsBatchWorkspace(const LowerArgs &T,
+                                        const ReductionPlan &plan,
+                                        int64_t batch) {
+  (void)T;
+  (void)plan;
+  (void)batch;
+  return true;
+}
+
+int DefaultFinalizeBatchWorkspaceSize(const LowerArgs &T,
+                                      const ReductionPlan &plan,
+                                      int64_t batch) {
+  (void)plan;
+  return ThreadBlockExtent(T) * static_cast<int>(batch);
+}
+
+void AppendDefaultFinalizeArgs(Array<PrimExpr> *args, const LowerArgs &T,
+                               bool need_workspace,
+                               const PrimExpr &workspace) {
+  (void)T;
+  if (need_workspace) {
+    args->push_back(workspace);
+  }
+}
+
+bool RegisterDefaultFinalizeReducer() {
+  RegisterFinalizeReducerImpl(FinalizeReducerImpl{
+      "default.FinalizeReducer",
+      MatchDefaultFinalizeReducerTarget,
+      0,
+      MakeDefaultFinalizeScalarAllReduce,
+      MakeDefaultFinalizeBatchAllReduce,
+      DefaultFinalizeNeedsScalarWorkspace,
+      DefaultFinalizeScalarWorkspaceSize,
+      DefaultFinalizeNeedsBatchWorkspace,
+      DefaultFinalizeBatchWorkspaceSize,
+      AppendDefaultFinalizeArgs,
+      AppendDefaultFinalizeArgs,
+  });
+  return true;
+}
+
+const bool default_finalize_reducer_registered =
+    RegisterDefaultFinalizeReducer();
+
+} // namespace
+
+void RegisterFinalizeReducerImpl(FinalizeReducerImpl impl) {
+  ICHECK(impl.name != nullptr);
+  ICHECK(impl.match_target != nullptr);
+  ICHECK(impl.make_scalar_allreduce != nullptr);
+  ICHECK(impl.make_batch_allreduce != nullptr);
+  ICHECK(impl.needs_scalar_workspace != nullptr);
+  ICHECK(impl.scalar_workspace_size != nullptr);
+  ICHECK(impl.needs_batch_workspace != nullptr);
+  ICHECK(impl.batch_workspace_size != nullptr);
+  ICHECK(impl.append_scalar_args != nullptr);
+  ICHECK(impl.append_batch_args != nullptr);
+  FinalizeReducerImplRegistry().push_back(impl);
+}
 
 /**
  * @brief Construct a FinalizeReducerOp from TL operator arguments and a buffer
@@ -101,13 +253,17 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
     return Evaluate(0);
 
   std::array op_names{"tl::SumOp", "tl::MaxOp", "tl::MinOp", "tl::MulOp"};
-  auto op_str = op_names[(int)op];
+  std::string op_str = op_names[(int)op];
 
   // adopted from ReduceOp
   int reducing_threads = extent;
   auto thread_offset = T.thread_bounds->min;
   bool same_simdgroup_metal_fast_path_safe = IsSameSimdgroupMetalReductionSafe(
       T.target, reducing_threads, scale, thread_offset, analyzer);
+  ReductionPlan plan{reducing_threads, scale, thread_offset,
+                     same_simdgroup_metal_fast_path_safe};
+  const FinalizeReducerImpl &finalize_impl =
+      ResolveFinalizeReducerImpl(T.target);
 
   // Validate batch against the layout's total output element count.
   int64_t layout_batch_size = 1;
@@ -144,77 +300,34 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
 
   if (use_batch) {
     // Batched AllReduce: single butterfly pass for all output elements.
-    int workspace_stride =
-        same_simdgroup_metal_fast_path_safe
-            ? 0
-            : static_cast<int>(*as_const_int(T.thread_bounds->extent));
-    std::stringstream ss;
-    if (TargetHasSMVersionGE(T.target, 90)) {
-      auto all_threads = T.thread_bounds->extent;
-      ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
-         << ", " << thread_offset << ", tl::NamedBarrier<" << all_threads
-         << ">, " << effective_batch << ", " << workspace_stride
-         << ">::run_batch";
-    } else if (TargetIsRocm(T.target)) {
-      // HIP AllReduce has no Barrier type parameter.
-      ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
-         << ", " << thread_offset << ", " << effective_batch << ", "
-         << workspace_stride << ">::run_batch";
-    } else if (TargetIsMetal(T.target)) {
-      ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
-         << ", " << thread_offset << ", tl::SyncThreadsBarrier, "
-         << effective_batch << ", " << workspace_stride << ">::run_batch";
-    } else {
-      ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
-         << ", " << thread_offset << ", tl::SyncThreadsBarrier, "
-         << effective_batch << ", " << workspace_stride << ">::run_batch";
-    }
-    bool need_workspace =
-        !TargetIsMetal(T.target) || !same_simdgroup_metal_fast_path_safe;
+    std::string allreduce = finalize_impl.make_batch_allreduce(
+        *this, T, plan, op_str, effective_batch);
+    bool need_workspace = finalize_impl.needs_batch_workspace(
+        T, plan, effective_batch);
     PrimExpr workspace;
     if (need_workspace) {
-      int ws_size = workspace_stride * static_cast<int>(effective_batch);
+      int ws_size = finalize_impl.batch_workspace_size(
+          T, plan, effective_batch);
       workspace = T.AddWorkspace(ws_size, buffer->dtype);
     }
-    Array<PrimExpr> args = {StringImm(ss.str()), buffer->data};
-    if (TargetIsMetal(T.target)) {
-      args.push_back(T.thread_var);
-    }
-    if (need_workspace) {
-      args.push_back(workspace);
-    }
+    Array<PrimExpr> args = {StringImm(allreduce), buffer->data};
+    finalize_impl.append_batch_args(&args, T, need_workspace, workspace);
     return Evaluate(Call(DataType::Handle(), builtin::call_extern(), args));
   }
 
   // Scalar AllReduce path (original).
-  std::stringstream ss;
-  if (TargetHasSMVersionGE(T.target, 90)) {
-    auto all_threads = T.thread_bounds->extent;
-    ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
-       << ", " << thread_offset << ", tl::NamedBarrier<" << all_threads
-       << ">>::run";
-  } else if (TargetIsMetal(T.target)) {
-    ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
-       << ", " << thread_offset << ", tl::SyncThreadsBarrier, 1, "
-       << (same_simdgroup_metal_fast_path_safe ? 0 : reducing_threads)
-       << ">::run";
-  } else {
-    ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
-       << ", " << thread_offset << ">::run";
-  }
-  Array<PrimExpr> thread_reduce_args = {StringImm(ss.str()),
+  std::string allreduce =
+      finalize_impl.make_scalar_allreduce(*this, T, plan, op_str);
+  Array<PrimExpr> thread_reduce_args = {StringImm(allreduce),
                                         BufferLoad(buffer, indices_0)};
-  if (TargetIsMetal(T.target)) {
-    thread_reduce_args.push_back(T.thread_var);
-    if (!same_simdgroup_metal_fast_path_safe) {
-      PrimExpr workspace = T.AddWorkspace(reducing_threads, buffer->dtype);
-      thread_reduce_args.push_back(workspace);
-    }
-  } else if (reducing_threads >= 32) {
-    PrimExpr workspace =
-        T.AddWorkspace(*as_const_int(T.thread_bounds->extent), buffer->dtype);
-    thread_reduce_args.push_back(workspace);
+  bool need_workspace = finalize_impl.needs_scalar_workspace(T, plan);
+  PrimExpr workspace;
+  if (need_workspace) {
+    workspace = T.AddWorkspace(finalize_impl.scalar_workspace_size(T, plan),
+                               buffer->dtype);
   }
+  finalize_impl.append_scalar_args(&thread_reduce_args, T, need_workspace,
+                                   workspace);
   auto call = Call(buffer->dtype, builtin::call_extern(), thread_reduce_args);
   Stmt body = BufferStore(buffer, call, indices_0);
 

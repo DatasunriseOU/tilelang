@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <cmath>
 #include <limits>
+#include <sstream>
+#include <vector>
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/builtin.h>
@@ -34,12 +36,27 @@ using namespace tirx;
 
 namespace {
 
-struct ReductionPlan {
-  int reducing_threads{0};
-  int scale{0};
-  PrimExpr thread_offset;
-  bool same_simdgroup_metal_fast_path_safe{false};
-};
+std::vector<ReduceImpl> &ReduceImplRegistry() {
+  static std::vector<ReduceImpl> registry;
+  return registry;
+}
+
+const ReduceImpl &ResolveReduceImpl(Target target) {
+  const auto &registry = ReduceImplRegistry();
+  const ReduceImpl *best_impl = nullptr;
+  int best_priority = std::numeric_limits<int>::min();
+  for (const ReduceImpl &impl : registry) {
+    if (impl.match_target(target) && impl.priority >= best_priority) {
+      best_impl = &impl;
+      best_priority = impl.priority;
+    }
+  }
+  ICHECK(best_impl != nullptr)
+      << "tl.reduce requires a target-specific implementation, but no reduce "
+         "implementation is registered for "
+      << target;
+  return *best_impl;
+}
 
 bool IsPositivePowerOfTwo(int64_t value) {
   return value > 0 && (value & (value - 1)) == 0;
@@ -106,6 +123,122 @@ ReductionPlan MakeReductionPlan(const PrimExpr &extent_expr,
 }
 
 }  // namespace
+
+void RegisterReduceImpl(ReduceImpl impl) {
+  ICHECK(impl.name != nullptr);
+  ICHECK(impl.match_target != nullptr);
+  ICHECK(impl.make_scalar_allreduce != nullptr);
+  ICHECK(impl.make_batch_allreduce != nullptr);
+  ICHECK(impl.needs_scalar_workspace != nullptr);
+  ICHECK(impl.scalar_workspace_size != nullptr);
+  ICHECK(impl.needs_batch_workspace != nullptr);
+  ICHECK(impl.batch_workspace_size != nullptr);
+  ICHECK(impl.append_scalar_args != nullptr);
+  ICHECK(impl.append_batch_args != nullptr);
+  ReduceImplRegistry().push_back(impl);
+}
+
+namespace {
+
+bool MatchDefaultReduceTarget(Target target) { return !TargetIsMetal(target); }
+
+std::string MakeDefaultScalarAllReduce(const ReduceOpNode &op,
+                                       const LowerArgs &T,
+                                       const ReductionPlan &plan) {
+  std::stringstream ss;
+  if (TargetHasSMVersionGE(T.target, 90)) {
+    auto all_threads = T.thread_bounds->extent;
+    ss << "tl::AllReduce<" << op.MakeCodegenReducer() << ", "
+       << plan.reducing_threads << ", " << plan.scale << ", "
+       << plan.thread_offset << ", tl::NamedBarrier<" << all_threads
+       << ">>::run";
+  } else {
+    ss << "tl::AllReduce<" << op.MakeCodegenReducer() << ", "
+       << plan.reducing_threads << ", " << plan.scale << ", "
+       << plan.thread_offset << ">::run";
+  }
+  return ss.str();
+}
+
+std::string MakeDefaultBatchAllReduce(const ReduceOpNode &op,
+                                      const LowerArgs &T,
+                                      const ReductionPlan &plan, int batch) {
+  std::stringstream ss;
+  const int workspace_stride = plan.reducing_threads;
+  if (TargetHasSMVersionGE(T.target, 90)) {
+    auto all_threads = T.thread_bounds->extent;
+    ss << "tl::AllReduce<" << op.MakeCodegenReducer() << ", "
+       << plan.reducing_threads << ", " << plan.scale << ", "
+       << plan.thread_offset << ", tl::NamedBarrier<" << all_threads << ">, "
+       << batch << ", " << plan.reducing_threads << ">::run_batch";
+  } else if (TargetIsRocm(T.target)) {
+    ss << "tl::AllReduce<" << op.MakeCodegenReducer() << ", "
+       << plan.reducing_threads << ", " << plan.scale << ", "
+       << plan.thread_offset << ", " << batch << ", " << workspace_stride
+       << ">::run_batch";
+  } else {
+    ss << "tl::AllReduce<" << op.MakeCodegenReducer() << ", "
+       << plan.reducing_threads << ", " << plan.scale << ", "
+       << plan.thread_offset << ", tl::SyncThreadsBarrier, " << batch << ", "
+       << workspace_stride << ">::run_batch";
+  }
+  return ss.str();
+}
+
+bool DefaultNeedsScalarWorkspace(const LowerArgs &T,
+                                 const ReductionPlan &plan) {
+  (void)T;
+  return plan.reducing_threads > 32;
+}
+
+int DefaultScalarWorkspaceSize(const LowerArgs &T,
+                               const ReductionPlan &plan) {
+  (void)plan;
+  return static_cast<int>(*as_const_int(T.thread_bounds->extent));
+}
+
+bool DefaultNeedsBatchWorkspace(const LowerArgs &T,
+                                const ReductionPlan &plan, int batch) {
+  (void)T;
+  (void)batch;
+  return plan.reducing_threads > 32;
+}
+
+int DefaultBatchWorkspaceSize(const LowerArgs &T, const ReductionPlan &plan,
+                              int batch) {
+  (void)T;
+  return plan.reducing_threads * batch;
+}
+
+void AppendDefaultReduceArgs(Array<PrimExpr> *args, const LowerArgs &T,
+                             bool need_workspace,
+                             const PrimExpr &workspace) {
+  (void)T;
+  if (need_workspace) {
+    args->push_back(workspace);
+  }
+}
+
+bool RegisterDefaultReduce() {
+  RegisterReduceImpl(ReduceImpl{
+      "default.Reduce",
+      MatchDefaultReduceTarget,
+      0,
+      MakeDefaultScalarAllReduce,
+      MakeDefaultBatchAllReduce,
+      DefaultNeedsScalarWorkspace,
+      DefaultScalarWorkspaceSize,
+      DefaultNeedsBatchWorkspace,
+      DefaultBatchWorkspaceSize,
+      AppendDefaultReduceArgs,
+      AppendDefaultReduceArgs,
+  });
+  return true;
+}
+
+const bool default_reduce_registered = RegisterDefaultReduce();
+
+} // namespace
 
 bool IsSameSimdgroupMetalReductionSafe(const Target &target,
                                        int reducing_threads, int scale,
@@ -412,6 +545,7 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
                   "__hmax_nan/__hmin_nan intrinsics). Target was: "
                << T.target->str();
   }
+  const ReduceImpl &reduce_impl = ResolveReduceImpl(T.target);
   auto get_buffer = [&](const Buffer &buf) {
     if (T.buffer_remap.count(buf))
       return T.buffer_remap[buf];
@@ -633,46 +767,16 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         if (plan.reducing_threads == plan.scale)
           continue;
 
-        int reducing_threads = plan.reducing_threads;
-        int scale = plan.scale;
-        auto thread_offset = plan.thread_offset;
-        std::stringstream ss;
-        int workspace_stride =
-            plan.same_simdgroup_metal_fast_path_safe ? 0 : reducing_threads;
-
-        // Use run_batch (not run) to avoid overload-resolution ambiguity when
-        // a pointer is passed as first argument.
-        if (TargetHasSMVersionGE(T.target, 90)) {
-          auto all_threads = T.thread_bounds->extent;
-          ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
-             << reducing_threads << ", " << scale << ", " << thread_offset
-             << ", tl::NamedBarrier<" << all_threads << ">, " << batch << ", "
-             << reducing_threads << ">::run_batch";
-        } else if (TargetIsRocm(T.target)) {
-          ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
-             << reducing_threads << ", " << scale << ", " << thread_offset
-             << ", " << batch << ", " << workspace_stride << ">::run_batch";
-        } else if (TargetIsMetal(T.target)) {
-          ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
-             << reducing_threads << ", " << scale << ", " << thread_offset
-             << ", tl::SyncThreadsBarrier, " << batch << ", "
-             << workspace_stride << ">::run_batch";
-        } else {
-          ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
-             << reducing_threads << ", " << scale << ", " << thread_offset
-             << ", tl::SyncThreadsBarrier, " << batch << ", "
-             << workspace_stride << ">::run_batch";
-        }
+        std::string allreduce =
+            reduce_impl.make_batch_allreduce(*this, T, plan, batch);
 
         // Workspace is only needed for cross-warp reduce (> 32 threads), or for
         // Metal reductions that cannot be proven to stay inside one simdgroup.
         PrimExpr workspace;
         bool need_workspace =
-            (TargetIsMetal(T.target) &&
-             !plan.same_simdgroup_metal_fast_path_safe) ||
-            (!TargetIsMetal(T.target) && reducing_threads > 32);
+            reduce_impl.needs_batch_workspace(T, plan, batch);
         if (need_workspace) {
-          int ws_size = workspace_stride * batch;
+          int ws_size = reduce_impl.batch_workspace_size(T, plan, batch);
           workspace = T.AddWorkspace(ws_size, clear_buffer->dtype);
         }
 
@@ -703,15 +807,8 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
           PrimExpr ptr = Call(DataType::Handle(), builtin::address_of(),
                               {BufferLoad(clear_buffer, chunk_indices)});
 
-          Array<PrimExpr> args = {StringImm(ss.str()), ptr};
-          if (TargetIsMetal(T.target)) {
-            args.push_back(T.thread_var);
-            if (need_workspace) {
-              args.push_back(workspace);
-            }
-          } else if (need_workspace) {
-            args.push_back(workspace);
-          }
+          Array<PrimExpr> args = {StringImm(allreduce), ptr};
+          reduce_impl.append_batch_args(&args, T, need_workspace, workspace);
           phases.push_back(
               Evaluate(Call(DataType::Handle(), builtin::call_extern(), args)));
         }
@@ -802,44 +899,20 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
           // wave-10 HIGH on "silent wrong product on non-warp-divisible N"
           // by refusing to lower to AllReduce when the structural
           // power-of-two invariant cannot hold.
-          int reducing_threads = plan.reducing_threads;
-          int scale = plan.scale;
-          std::stringstream ss;
-
-          auto thread_offset = plan.thread_offset;
-          int workspace_stride =
-              plan.same_simdgroup_metal_fast_path_safe ? 0 : reducing_threads;
-          if (TargetHasSMVersionGE(T.target, 90)) {
-            auto all_threads = T.thread_bounds->extent;
-            ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
-               << reducing_threads << ", " << scale << ", " << thread_offset
-               << ", tl::NamedBarrier<" << all_threads << ">>::run";
-          } else if (TargetIsMetal(T.target)) {
-            ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
-               << reducing_threads << ", " << scale << ", "
-               << thread_offset << ", tl::SyncThreadsBarrier, 1, "
-               << workspace_stride << ">::run";
-          } else {
-            ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
-               << reducing_threads << ", " << scale << ", " << thread_offset
-               << ">::run";
-          }
+          std::string allreduce =
+              reduce_impl.make_scalar_allreduce(*this, T, plan);
           Array<PrimExpr> thread_reduce_args = {
-              StringImm(ss.str()), BufferLoad(clear_buffer, red_indices)};
-          if (TargetIsMetal(T.target)) {
-            thread_reduce_args.push_back(T.thread_var);
-            if (!plan.same_simdgroup_metal_fast_path_safe) {
-              PrimExpr workspace =
-                  T.AddWorkspace(workspace_stride, clear_buffer->dtype);
-              thread_reduce_args.push_back(workspace);
-            }
-          } else if (reducing_threads > 32) {
+              StringImm(allreduce), BufferLoad(clear_buffer, red_indices)};
+          bool need_workspace =
+              reduce_impl.needs_scalar_workspace(T, plan);
+          PrimExpr workspace;
+          if (need_workspace) {
             int workspace_size =
-                static_cast<int>(*as_const_int(T.thread_bounds->extent));
-            PrimExpr workspace =
-                T.AddWorkspace(workspace_size, clear_buffer->dtype);
-            thread_reduce_args.push_back(workspace);
+                reduce_impl.scalar_workspace_size(T, plan);
+            workspace = T.AddWorkspace(workspace_size, clear_buffer->dtype);
           }
+          reduce_impl.append_scalar_args(&thread_reduce_args, T,
+                                         need_workspace, workspace);
           auto call = Call(clear_buffer->dtype, builtin::call_extern(),
                            thread_reduce_args);
           stmts.push_back(BufferStore(clear_buffer, call, red_indices));

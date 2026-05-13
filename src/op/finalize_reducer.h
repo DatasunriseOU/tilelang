@@ -11,6 +11,10 @@
 
 #include "../transform/layout_reducer.h"
 #include "./operator.h"
+#include "./reduce.h"
+
+#include <cstdint>
+#include <string>
 
 /**
  * Get the Op singleton for the public FinalizeReducerOp handle.
@@ -45,8 +49,42 @@ public:
   LayoutMap InferLayout(const LayoutInferArgs &T,
                         InferLevel level) const override;
   static const Op &Get();
-  TileOperator Clone() const;
+  TileOperator Clone() const override;
 };
+
+using FinalizeReducerTargetPredicate = bool (*)(Target target);
+
+struct FinalizeReducerImpl {
+  const char *name;
+  FinalizeReducerTargetPredicate match_target;
+  int priority;
+
+  std::string (*make_scalar_allreduce)(const FinalizeReducerOpNode &op,
+                                       const LowerArgs &T,
+                                       const ReductionPlan &plan,
+                                       const std::string &op_str);
+  std::string (*make_batch_allreduce)(const FinalizeReducerOpNode &op,
+                                      const LowerArgs &T,
+                                      const ReductionPlan &plan,
+                                      const std::string &op_str,
+                                      int64_t batch);
+
+  bool (*needs_scalar_workspace)(const LowerArgs &T,
+                                 const ReductionPlan &plan);
+  int (*scalar_workspace_size)(const LowerArgs &T,
+                               const ReductionPlan &plan);
+  bool (*needs_batch_workspace)(const LowerArgs &T,
+                                const ReductionPlan &plan, int64_t batch);
+  int (*batch_workspace_size)(const LowerArgs &T,
+                              const ReductionPlan &plan, int64_t batch);
+
+  void (*append_scalar_args)(Array<PrimExpr> *args, const LowerArgs &T,
+                             bool need_workspace, const PrimExpr &workspace);
+  void (*append_batch_args)(Array<PrimExpr> *args, const LowerArgs &T,
+                            bool need_workspace, const PrimExpr &workspace);
+};
+
+void RegisterFinalizeReducerImpl(FinalizeReducerImpl impl);
 
 class FinalizeReducerOp : public TileOperator {
 public:
