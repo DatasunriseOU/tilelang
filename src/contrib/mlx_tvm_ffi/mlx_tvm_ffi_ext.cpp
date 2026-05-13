@@ -24,11 +24,14 @@
 #include "mlx/dtype.h"
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
+#include "mlx/stream.h"
 #include "mlx/utils.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
 namespace mx = mlx::core;
+
+extern "C" PyObject* mlx_core_wrap_mx_array_move(mx::array* array);
 
 namespace tilelang::mlx_tvm_ffi {
 
@@ -296,10 +299,62 @@ mx::Shape shape_from_i64(const std::vector<int64_t>& shape) {
   return out;
 }
 
+std::string python_type_name(nb::handle item) {
+  PyObject* type = reinterpret_cast<PyObject*>(Py_TYPE(item.ptr()));
+  nb::object module = nb::steal(PyObject_GetAttrString(type, "__module__"));
+  if (!module.is_valid()) {
+    PyErr_Clear();
+    module = nb::str("<unknown>");
+  }
+  nb::object qualname = nb::steal(PyObject_GetAttrString(type, "__qualname__"));
+  if (!qualname.is_valid()) {
+    PyErr_Clear();
+    qualname = nb::steal(PyObject_GetAttrString(type, "__name__"));
+  }
+  if (!qualname.is_valid()) {
+    PyErr_Clear();
+    qualname = nb::str("<unknown>");
+  }
+  const char* module_c = PyUnicode_AsUTF8(module.ptr());
+  if (module_c == nullptr) {
+    PyErr_Clear();
+    module_c = "<unknown>";
+  }
+  const char* qualname_c = PyUnicode_AsUTF8(qualname.ptr());
+  if (qualname_c == nullptr) {
+    PyErr_Clear();
+    qualname_c = "<unknown>";
+  }
+  return std::string(module_c) + "." + qualname_c;
+}
+
+mx::array parse_mlx_array(nb::handle item) {
+  // MLX arrays are nanobind class instances. In mixed dev environments the
+  // normal cross-module nb::cast<mx::array>() path can fail if the active MLX
+  // wheel and this bridge were built in separate CMake trees, even when they
+  // use the same NB_DOMAIN. For the exact mlx.core.array type, copying the
+  // C++ mx::array handle out of the nanobind instance is still zero-copy with
+  // respect to tensor storage and avoids any DLPack/eval boundary.
+  const std::string type_name = python_type_name(item);
+  if (type_name == "mlx.core.array") {
+    auto* array = nb::inst_ptr<mx::array>(item);
+    if (array == nullptr) {
+      throw std::runtime_error("mlx.core.array instance has null C++ storage");
+    }
+    return *array;
+  }
+  try {
+    return nb::cast<mx::array>(item);
+  } catch (const std::exception& exc) {
+    throw std::runtime_error(
+        "expected mlx.core.array input, got " + type_name + ": " + exc.what());
+  }
+}
+
 std::vector<mx::array> parse_array_sequence(nb::handle values) {
   std::vector<mx::array> arrays;
   for (nb::handle item : nb::iter(values)) {
-    arrays.push_back(nb::cast<mx::array>(item));
+    arrays.push_back(parse_mlx_array(item));
   }
   return arrays;
 }
@@ -465,6 +520,16 @@ void zero_output_buffer(MTL::CommandBuffer* command_buffer, mx::array& out) {
   blit_encoder->endEncoding();
 }
 
+MTL::CommandBuffer* finish_encoding_and_get_command_buffer(mx::Stream stream) {
+  auto& encoder = mx::metal::get_command_encoder(stream);
+  encoder.end_encoding();
+  return encoder.get_command_buffer();
+}
+
+mx::metal::CommandEncoder* get_command_encoder(mx::Stream stream) {
+  return &mx::metal::get_command_encoder(stream);
+}
+
 class TVMFFIMetalCall : public mx::Primitive {
  public:
   TVMFFIMetalCall(
@@ -529,13 +594,13 @@ class TVMFFIMetalCall : public mx::Primitive {
       throw std::runtime_error("TVM-FFI bridge input count mismatch");
     }
 
-    auto& encoder = mx::metal::get_command_encoder(stream());
+    auto* encoder = get_command_encoder(stream());
     for (auto& out : outputs) {
       out.set_data(mx::allocator::malloc(out.nbytes()));
       if (out.buffer().ptr() == nullptr) {
         throw std::runtime_error("MLX failed to allocate TVM-FFI output buffer");
       }
-      encoder.register_output_array(out);
+      encoder->register_output_array(out);
     }
 
     std::vector<BorrowedTensorView> views;
@@ -556,7 +621,7 @@ class TVMFFIMetalCall : public mx::Primitive {
       arg.v_ptr = &views.back().tensor;
     }
 
-    auto* command_buffer = encoder.finish_encoding_and_get_command_buffer();
+    auto* command_buffer = finish_encoding_and_get_command_buffer(stream());
     encode_device_event_waits(command_buffer, stream(), wait_edges_);
     for (auto& out : outputs) {
       zero_output_buffer(command_buffer, out);
@@ -615,8 +680,7 @@ std::vector<mx::array> tvm_ffi_metal_call(
     const std::vector<int64_t>& result_indices,
     int64_t num_params,
     std::shared_ptr<MetalLaunchSyncState> launch_sync_state,
-    std::vector<std::shared_ptr<MetalSyncEdge>> wait_edges,
-    mx::StreamOrDevice s = {}) {
+    std::vector<std::shared_ptr<MetalSyncEdge>> wait_edges) {
   if (output_shapes.size() != output_dtypes.size()) {
     throw std::runtime_error("TVM-FFI output_shapes/output_dtypes length mismatch");
   }
@@ -634,13 +698,29 @@ std::vector<mx::array> tvm_ffi_metal_call(
   }
 
   auto primitive = std::make_shared<TVMFFIMetalCall>(
-      mx::to_stream(s),
+      mx::default_stream(mx::Device::gpu),
       func_handle,
       num_params,
       result_indices,
       std::move(launch_sync_state),
       std::move(wait_edges));
   return mx::array::make_arrays(std::move(shapes), dtypes, primitive, inputs);
+}
+
+nb::list wrap_mlx_arrays(std::vector<mx::array>&& arrays) {
+  nb::list result;
+  for (auto& array : arrays) {
+    auto* payload = new mx::array(std::move(array));
+    PyObject* py_array = mlx_core_wrap_mx_array_move(payload);
+    if (py_array == nullptr) {
+      if (PyErr_Occurred() != nullptr) {
+        throw nb::python_error();
+      }
+      throw std::runtime_error("MLX array wrapper returned null without a Python exception");
+    }
+    result.append(nb::steal(py_array));
+  }
+  return result;
 }
 
 }  // namespace tilelang::mlx_tvm_ffi
@@ -661,15 +741,53 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
          int64_t num_params,
          nb::handle launch_sync_state,
          nb::handle wait_edges) {
-        return tilelang::mlx_tvm_ffi::tvm_ffi_metal_call(
-            func_handle,
-            tilelang::mlx_tvm_ffi::parse_array_sequence(inputs),
-            tilelang::mlx_tvm_ffi::parse_shape_sequence(output_shapes),
-            tilelang::mlx_tvm_ffi::parse_string_sequence(output_dtypes),
-            tilelang::mlx_tvm_ffi::parse_i64_sequence(result_indices),
-            num_params,
-            tilelang::mlx_tvm_ffi::parse_launch_sync_state(launch_sync_state),
-            tilelang::mlx_tvm_ffi::parse_sync_edge_sequence(wait_edges));
+        std::vector<mx::array> parsed_inputs;
+        std::vector<std::vector<int64_t>> parsed_output_shapes;
+        std::vector<std::string> parsed_output_dtypes;
+        std::vector<int64_t> parsed_result_indices;
+        std::shared_ptr<tilelang::mlx_tvm_ffi::MetalLaunchSyncState> parsed_launch_sync_state;
+        std::vector<std::shared_ptr<tilelang::mlx_tvm_ffi::MetalSyncEdge>> parsed_wait_edges;
+        try {
+          parsed_inputs = tilelang::mlx_tvm_ffi::parse_array_sequence(inputs);
+        } catch (const std::exception& exc) {
+          throw std::runtime_error(std::string("failed to parse MLX input arrays: ") + exc.what());
+        }
+        try {
+          parsed_output_shapes = tilelang::mlx_tvm_ffi::parse_shape_sequence(output_shapes);
+        } catch (const std::exception& exc) {
+          throw std::runtime_error(std::string("failed to parse output shapes: ") + exc.what());
+        }
+        try {
+          parsed_output_dtypes = tilelang::mlx_tvm_ffi::parse_string_sequence(output_dtypes);
+        } catch (const std::exception& exc) {
+          throw std::runtime_error(std::string("failed to parse output dtypes: ") + exc.what());
+        }
+        try {
+          parsed_result_indices = tilelang::mlx_tvm_ffi::parse_i64_sequence(result_indices);
+        } catch (const std::exception& exc) {
+          throw std::runtime_error(std::string("failed to parse result indices: ") + exc.what());
+        }
+        try {
+          parsed_launch_sync_state =
+              tilelang::mlx_tvm_ffi::parse_launch_sync_state(launch_sync_state);
+        } catch (const std::exception& exc) {
+          throw std::runtime_error(std::string("failed to parse launch sync state: ") + exc.what());
+        }
+        try {
+          parsed_wait_edges = tilelang::mlx_tvm_ffi::parse_sync_edge_sequence(wait_edges);
+        } catch (const std::exception& exc) {
+          throw std::runtime_error(std::string("failed to parse wait sync edges: ") + exc.what());
+        }
+        return tilelang::mlx_tvm_ffi::wrap_mlx_arrays(
+            tilelang::mlx_tvm_ffi::tvm_ffi_metal_call(
+                func_handle,
+                parsed_inputs,
+                parsed_output_shapes,
+                parsed_output_dtypes,
+                parsed_result_indices,
+                num_params,
+                parsed_launch_sync_state,
+                parsed_wait_edges));
       },
       "func_handle"_a,
       "inputs"_a,

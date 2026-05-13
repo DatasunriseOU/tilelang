@@ -31,7 +31,6 @@ from tilelang.contrib.mlx_interop import (
     maybe_mlx_metal_external_command_buffer,
     mlx_arrays_to_tvm_tensors,
     mlx_metal_output,
-    mlx_tilelang_metal_kernel,
     validate_dlpack_inputs_for_target,
 )
 from tilelang.contrib.mlx_tvm_ffi import (
@@ -416,35 +415,6 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                     )
                 except MLXTVMFFIBridgeUnavailable:
                     graph_outputs = None
-            if graph_outputs is None and mlx_compact_graph_candidate:
-                input_param_indices = [i for i in range(len(self.params)) if i not in self.result_idx]
-                try:
-                    device_source = self.get_device_source()
-                except Exception:
-                    device_source = None
-                graph_kernel = mlx_tilelang_metal_kernel(
-                    device_source,
-                    input_names=[param_names[i] for i in input_param_indices],
-                    output_names=[param_names[i] for i in self.result_idx],
-                )
-                if graph_kernel is not None:
-                    grid, threadgroup = self._metal_launch_config()
-                    dispatch_grid = (
-                        max(1, grid[0] * threadgroup[0]),
-                        max(1, grid[1] * threadgroup[1]),
-                        max(1, grid[2] * threadgroup[2]),
-                    )
-                    graph_outputs = graph_kernel(
-                        inputs=[tensor_list[i] for i in input_param_indices],
-                        output_shapes=[
-                            tuple(int(dim) for dim in tensor_list[i].shape)
-                            for i in self.result_idx
-                        ],
-                        output_dtypes=[tensor_list[i].dtype for i in self.result_idx],
-                        grid=dispatch_grid,
-                        threadgroup=threadgroup,
-                        init_value=0.0,
-                    )
             if graph_outputs is not None:
                 if len(self.result_idx) == 1:
                     return graph_outputs[0]

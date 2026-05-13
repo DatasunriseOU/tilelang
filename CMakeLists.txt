@@ -390,23 +390,187 @@ if(APPLE AND USE_METAL AND TILELANG_BUILD_MLX_TVM_FFI)
   endif()
 
   execute_process(
+    COMMAND "${Python_EXECUTABLE}" -c
+            "import mlx, mlx.core as mx, sys; root=next(iter(getattr(mlx, '__path__', [])), ''); print(root); print(getattr(mx, '__file__', '')); print(getattr(mx, '__version__', ''))"
+    OUTPUT_VARIABLE TILELANG_MLX_PY_INFO
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_VARIABLE TILELANG_MLX_PY_ERROR
+    RESULT_VARIABLE TILELANG_MLX_PY_RESULT)
+  if(TILELANG_MLX_PY_RESULT EQUAL 0)
+    string(REPLACE "\r\n" "\n" TILELANG_MLX_PY_INFO "${TILELANG_MLX_PY_INFO}")
+    string(REPLACE "\n" ";" TILELANG_MLX_PY_INFO_LINES "${TILELANG_MLX_PY_INFO}")
+    list(LENGTH TILELANG_MLX_PY_INFO_LINES TILELANG_MLX_PY_INFO_COUNT)
+    if(TILELANG_MLX_PY_INFO_COUNT LESS 3)
+      message(FATAL_ERROR
+        "MLX Python package introspection returned incomplete data from ${Python_EXECUTABLE}: "
+        "${TILELANG_MLX_PY_INFO}")
+    endif()
+    list(GET TILELANG_MLX_PY_INFO_LINES 0 TILELANG_MLX_PY_ROOT)
+    list(GET TILELANG_MLX_PY_INFO_LINES 1 TILELANG_MLX_PY_CORE)
+    list(GET TILELANG_MLX_PY_INFO_LINES 2 TILELANG_MLX_PY_VERSION)
+    if(TILELANG_MLX_PY_ROOT STREQUAL "" OR TILELANG_MLX_PY_VERSION STREQUAL "")
+      message(FATAL_ERROR
+        "MLX Python package did not expose a usable package root/version from "
+        "${Python_EXECUTABLE}: root='${TILELANG_MLX_PY_ROOT}' version='${TILELANG_MLX_PY_VERSION}'")
+    endif()
+  else()
+    message(STATUS
+      "Skipping optional MLX TVM-FFI bridge: Python MLX import failed from "
+      "${Python_EXECUTABLE}: ${TILELANG_MLX_PY_ERROR}")
+  endif()
+
+  execute_process(
     COMMAND "${Python_EXECUTABLE}" -m mlx --cmake-dir
     OUTPUT_VARIABLE TILELANG_MLX_ROOT
     OUTPUT_STRIP_TRAILING_WHITESPACE
     ERROR_QUIET
     RESULT_VARIABLE TILELANG_MLX_RESULT)
-  if(TILELANG_MLX_RESULT EQUAL 0 AND EXISTS "${TILELANG_MLX_ROOT}")
-    list(APPEND CMAKE_PREFIX_PATH "${TILELANG_MLX_ROOT}")
-    find_package(MLX CONFIG QUIET)
-  endif()
-  if(NOT MLX_FOUND AND TILELANG_MLX_RESULT EQUAL 0 AND EXISTS "${TILELANG_MLX_ROOT}/include/mlx/array.h")
-    set(TILELANG_MLX_LIB "${TILELANG_MLX_ROOT}/lib/libmlx.dylib")
-    if(EXISTS "${TILELANG_MLX_LIB}" AND NOT TARGET mlx)
-      add_library(mlx SHARED IMPORTED)
-      set_target_properties(mlx PROPERTIES
-        IMPORTED_LOCATION "${TILELANG_MLX_LIB}"
-        INTERFACE_INCLUDE_DIRECTORIES "${TILELANG_MLX_ROOT}/include")
-      set(MLX_FOUND TRUE)
+
+  if(TILELANG_MLX_PY_RESULT EQUAL 0)
+    if(DEFINED MLX_DIR AND NOT "${MLX_DIR}" STREQUAL "")
+      get_filename_component(TILELANG_MLX_ROOT "${MLX_DIR}/../../.." ABSOLUTE)
+    elseif(NOT TILELANG_MLX_RESULT EQUAL 0 OR NOT EXISTS "${TILELANG_MLX_ROOT}")
+      set(TILELANG_MLX_ROOT "${TILELANG_MLX_PY_ROOT}")
+    endif()
+
+    file(REAL_PATH "${TILELANG_MLX_ROOT}" TILELANG_MLX_ROOT_REAL)
+    file(REAL_PATH "${TILELANG_MLX_PY_ROOT}" TILELANG_MLX_PY_ROOT_REAL)
+    if(NOT TILELANG_MLX_ROOT_REAL STREQUAL TILELANG_MLX_PY_ROOT_REAL)
+      message(FATAL_ERROR
+        "MLX CMake root does not match the active Python MLX package.\n"
+        "  Python executable: ${Python_EXECUTABLE}\n"
+        "  Python MLX root:   ${TILELANG_MLX_PY_ROOT_REAL}\n"
+        "  Requested MLX root: ${TILELANG_MLX_ROOT_REAL}\n"
+        "Set MLX_DIR to the active Python package's share/cmake/MLX directory, "
+        "or run CMake with the Python environment that owns the requested MLX build.")
+    endif()
+
+    set(TILELANG_MLX_CONFIG_DIR "${TILELANG_MLX_ROOT}/share/cmake/MLX")
+    set(TILELANG_MLX_CONFIG_VERSION_FILE "${TILELANG_MLX_CONFIG_DIR}/MLXConfigVersion.cmake")
+    if(NOT EXISTS "${TILELANG_MLX_CONFIG_DIR}/MLXConfig.cmake" OR
+       NOT EXISTS "${TILELANG_MLX_CONFIG_VERSION_FILE}")
+      message(FATAL_ERROR
+        "Active Python MLX package is missing CMake package metadata: "
+        "${TILELANG_MLX_CONFIG_DIR}")
+    endif()
+
+    file(READ "${TILELANG_MLX_CONFIG_VERSION_FILE}" TILELANG_MLX_CONFIG_VERSION_TEXT)
+    string(REGEX MATCH "set\\(PACKAGE_VERSION \"([^\"]+)\"\\)"
+           TILELANG_MLX_CONFIG_VERSION_MATCH
+           "${TILELANG_MLX_CONFIG_VERSION_TEXT}")
+    if(NOT CMAKE_MATCH_1)
+      message(FATAL_ERROR
+        "Could not parse MLX package version from ${TILELANG_MLX_CONFIG_VERSION_FILE}")
+    endif()
+    set(TILELANG_MLX_CONFIG_VERSION "${CMAKE_MATCH_1}")
+    if(NOT TILELANG_MLX_CONFIG_VERSION STREQUAL TILELANG_MLX_PY_VERSION)
+      message(FATAL_ERROR
+        "MLX Python package version and CMake package version differ.\n"
+        "  Python MLX version: ${TILELANG_MLX_PY_VERSION}\n"
+        "  CMake MLX version:  ${TILELANG_MLX_CONFIG_VERSION}\n"
+        "  MLX root:           ${TILELANG_MLX_ROOT_REAL}")
+    endif()
+
+    set(MLX_LIBRARY "${TILELANG_MLX_ROOT}/lib/libmlx.dylib" CACHE FILEPATH
+        "libmlx.dylib used by TileLang's MLX TVM-FFI bridge" FORCE)
+    set(MLX_DIR "${TILELANG_MLX_CONFIG_DIR}" CACHE PATH
+        "MLX CMake package used by TileLang's MLX TVM-FFI bridge" FORCE)
+    find_package(MLX CONFIG QUIET
+                 PATHS "${TILELANG_MLX_ROOT}"
+                 NO_DEFAULT_PATH)
+    if(MLX_FOUND AND TARGET mlx)
+      get_target_property(TILELANG_MLX_LIB mlx IMPORTED_LOCATION_RELEASE)
+      if(NOT TILELANG_MLX_LIB)
+        get_target_property(TILELANG_MLX_LIB mlx IMPORTED_LOCATION)
+      endif()
+      if(NOT TILELANG_MLX_LIB OR NOT EXISTS "${TILELANG_MLX_LIB}")
+        message(FATAL_ERROR
+          "MLX imported target does not point at an existing libmlx.dylib")
+      endif()
+      file(REAL_PATH "${TILELANG_MLX_LIB}" TILELANG_MLX_LIB_REAL)
+      file(REAL_PATH "${MLX_LIBRARY}" TILELANG_MLX_LIBRARY_VAR_REAL)
+      if(NOT TILELANG_MLX_LIBRARY_VAR_REAL STREQUAL TILELANG_MLX_LIB_REAL)
+        message(FATAL_ERROR
+          "MLX_LIBRARY cache entry and MLX imported target disagree.\n"
+          "  MLX_LIBRARY: ${TILELANG_MLX_LIBRARY_VAR_REAL}\n"
+          "  target mlx:  ${TILELANG_MLX_LIB_REAL}")
+      endif()
+      string(FIND "${TILELANG_MLX_LIB_REAL}" "${TILELANG_MLX_ROOT_REAL}/" TILELANG_MLX_LIB_ROOT_POS)
+      if(NOT TILELANG_MLX_LIB_ROOT_POS EQUAL 0)
+        message(FATAL_ERROR
+          "MLX imported target points outside the active MLX package.\n"
+          "  MLX root: ${TILELANG_MLX_ROOT_REAL}\n"
+          "  libmlx:   ${TILELANG_MLX_LIB_REAL}")
+      endif()
+      file(SHA256 "${TILELANG_MLX_LIB_REAL}" TILELANG_MLX_LIB_SHA256)
+      set(TILELANG_MLX_PY_BRIDGE "${TILELANG_MLX_ROOT}/lib/libmlx_python_bridge.dylib")
+      if(NOT EXISTS "${TILELANG_MLX_PY_BRIDGE}")
+        message(FATAL_ERROR
+          "Active Python MLX package is missing libmlx_python_bridge.dylib, "
+          "which TileLang needs to wrap native mx::array outputs without "
+          "constructing dummy Python arrays.\n"
+          "  Expected bridge: ${TILELANG_MLX_PY_BRIDGE}\n"
+          "  MLX root:        ${TILELANG_MLX_ROOT_REAL}")
+      endif()
+      file(REAL_PATH "${TILELANG_MLX_PY_BRIDGE}" TILELANG_MLX_PY_BRIDGE_REAL)
+      string(FIND "${TILELANG_MLX_PY_BRIDGE_REAL}" "${TILELANG_MLX_ROOT_REAL}/"
+             TILELANG_MLX_PY_BRIDGE_ROOT_POS)
+      if(NOT TILELANG_MLX_PY_BRIDGE_ROOT_POS EQUAL 0)
+        message(FATAL_ERROR
+          "MLX Python bridge points outside the active MLX package.\n"
+          "  MLX root: ${TILELANG_MLX_ROOT_REAL}\n"
+          "  bridge:   ${TILELANG_MLX_PY_BRIDGE_REAL}")
+      endif()
+      file(SHA256 "${TILELANG_MLX_PY_BRIDGE_REAL}" TILELANG_MLX_PY_BRIDGE_SHA256)
+      message(STATUS "MLX bridge Python executable: ${Python_EXECUTABLE}")
+      message(STATUS "MLX bridge Python package: root=${TILELANG_MLX_PY_ROOT_REAL}, core=${TILELANG_MLX_PY_CORE}, version=${TILELANG_MLX_PY_VERSION}")
+      message(STATUS "MLX bridge CMake package: root=${TILELANG_MLX_ROOT_REAL}, config=${TILELANG_MLX_CONFIG_DIR}, version=${TILELANG_MLX_CONFIG_VERSION}")
+      message(STATUS "MLX bridge libmlx: ${TILELANG_MLX_LIB_REAL} sha256=${TILELANG_MLX_LIB_SHA256}")
+      message(STATUS "MLX bridge wrapper: ${TILELANG_MLX_PY_BRIDGE_REAL} sha256=${TILELANG_MLX_PY_BRIDGE_SHA256}")
+
+      include(CheckCXXSourceCompiles)
+      set(CMAKE_REQUIRED_LIBRARIES mlx)
+      set(CMAKE_REQUIRED_QUIET TRUE)
+      check_cxx_source_compiles([=[
+        #include <mlx/backend/metal/device.h>
+        #include <mlx/device.h>
+        #include <mlx/stream.h>
+        int main() {
+          auto stream = mlx::core::default_stream(mlx::core::Device::gpu);
+          auto& encoder = mlx::core::metal::get_command_encoder(stream);
+          encoder.end_encoding();
+          (void)encoder.get_command_buffer();
+          (void)&encoder;
+          return 0;
+        }
+      ]=] TILELANG_MLX_HAS_DIRECT_METAL_COMMAND_ENCODER_API)
+      unset(CMAKE_REQUIRED_LIBRARIES)
+      unset(CMAKE_REQUIRED_QUIET)
+      if(NOT TILELANG_MLX_HAS_DIRECT_METAL_COMMAND_ENCODER_API)
+        message(FATAL_ERROR
+          "MLX lib/header pair does not expose the direct Metal CommandEncoder API required "
+          "by TileLang's graph-safe TVM-FFI bridge. Checked libmlx: "
+          "${TILELANG_MLX_LIB_REAL}")
+      endif()
+      set(CMAKE_REQUIRED_LIBRARIES mlx "${TILELANG_MLX_PY_BRIDGE_REAL}")
+      set(CMAKE_REQUIRED_QUIET TRUE)
+      check_cxx_source_compiles([=[
+        #include <mlx/array.h>
+        extern "C" void* mlx_core_wrap_mx_array_move(mlx::core::array*);
+        int main() {
+          auto* wrapper = &mlx_core_wrap_mx_array_move;
+          return wrapper == nullptr;
+        }
+      ]=] TILELANG_MLX_HAS_ARRAY_WRAPPER)
+      unset(CMAKE_REQUIRED_LIBRARIES)
+      unset(CMAKE_REQUIRED_QUIET)
+      if(NOT TILELANG_MLX_HAS_ARRAY_WRAPPER)
+        message(FATAL_ERROR
+          "MLX Python bridge does not export mlx_core_wrap_mx_array_move().\n"
+          "  Checked bridge: ${TILELANG_MLX_PY_BRIDGE_REAL}\n"
+          "  Bridge sha256:  ${TILELANG_MLX_PY_BRIDGE_SHA256}\n"
+          "  MLX version:    ${TILELANG_MLX_CONFIG_VERSION}")
+      endif()
     endif()
   endif()
 
@@ -423,7 +587,7 @@ if(APPLE AND USE_METAL AND TILELANG_BUILD_MLX_TVM_FFI)
     target_include_directories(_tilelang_mlx_tvm_ffi PRIVATE
       "${TVM_SOURCE}/3rdparty/tvm-ffi/include"
       "${TVM_SOURCE}/3rdparty/tvm-ffi/3rdparty/dlpack/include")
-    target_link_libraries(_tilelang_mlx_tvm_ffi PRIVATE mlx tvm_ffi_shared)
+    target_link_libraries(_tilelang_mlx_tvm_ffi PRIVATE mlx tvm_ffi_shared "${TILELANG_MLX_PY_BRIDGE_REAL}")
     set_target_properties(_tilelang_mlx_tvm_ffi PROPERTIES
       LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"

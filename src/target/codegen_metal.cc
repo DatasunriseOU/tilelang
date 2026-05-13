@@ -1834,17 +1834,15 @@ std::string CodeGenTileLangMetal::CastFromTo(std::string value, DataType from,
     }
   }
   if (from.is_bfloat16() && target.is_float()) {
-    EmitBFloat16Helper();
     std::string decoded = "__tvm_bfloat16_to_float(" + value + ")";
     if (target.bits() == 32) {
-      return decoded;
+      return "((float)" + decoded + ")";
     }
     if (target.bits() == 16) {
       return "((half)" + decoded + ")";
     }
   }
   if (from.is_float() && target.is_bfloat16()) {
-    EmitBFloat16Helper();
     if (from.bits() == 32) {
       return "tvm_bfloat16(" + value + ")";
     }
