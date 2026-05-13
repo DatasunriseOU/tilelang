@@ -128,6 +128,12 @@ def _lookup_producer(array: Any) -> MetalProducerRecord | None:
     return None
 
 
+def has_mlx_tvm_ffi_producer(array: Any) -> bool:
+    """Return whether ``array`` is a registered native TVM-FFI graph output."""
+
+    return _lookup_producer(array) is not None
+
+
 def _remember_producer(array: Any, record: MetalProducerRecord) -> None:
     key = id(array)
 
@@ -253,6 +259,7 @@ __all__ = [
     "MetalLaunchDependencyMetadata",
     "MetalProducerRecord",
     "clear_metal_graph_sync_state_for_tests",
+    "has_mlx_tvm_ffi_producer",
     "make_tvm_ffi_metal_dependency_metadata",
     "plan_mlx_tvm_ffi_launch",
     "register_mlx_tvm_ffi_outputs",

@@ -6,6 +6,7 @@ from typing import Any, Iterable
 
 from tilelang.analysis.metal_graph_sync import (
     MetalLaunchDependencyMetadata,
+    has_mlx_tvm_ffi_producer,
     make_tvm_ffi_metal_dependency_metadata,
     plan_mlx_tvm_ffi_launch,
     register_mlx_tvm_ffi_outputs,
@@ -93,6 +94,12 @@ def _dtype_name(dtype: Any) -> str:
 
 def _contiguous_mlx_input(value: Any) -> Any:
     """Normalize MLX graph inputs to the compact ABI expected by TVM kernels."""
+
+    if has_mlx_tvm_ffi_producer(value):
+        # Native TVM-FFI outputs are allocated by the bridge as compact buffers.
+        # Preserve the Python object identity so graph lowering can wire the
+        # producer->consumer device-event edge for chained launches.
+        return value
 
     try:
         import mlx.core as mx

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from tilelang.analysis.metal_graph_sync import (
     clear_metal_graph_sync_state_for_tests,
+    has_mlx_tvm_ffi_producer,
     make_tvm_ffi_metal_dependency_metadata,
     plan_mlx_tvm_ffi_launch,
     register_mlx_tvm_ffi_outputs,
@@ -40,7 +41,7 @@ class _FakeNative:
         return edge
 
 
-def test_same_command_buffer_domain_for_opaque_ffi_wires_device_event():
+def test_same_command_buffer_domain_for_opaque_ffi_uses_encode_order():
     clear_metal_graph_sync_state_for_tests()
     native = _FakeNative()
     output = _FakeArray()
@@ -76,9 +77,9 @@ def test_same_command_buffer_domain_for_opaque_ffi_wires_device_event():
     )
 
     assert producer_waits == []
-    assert len(native.edges) == 1
-    assert consumer_waits == native.edges
-    assert producer_state.signal_edges == native.edges
+    assert len(native.edges) == 0
+    assert consumer_waits == []
+    assert producer_state.signal_edges == []
 
 
 def test_cross_command_buffer_domain_wires_signal_and_wait_event():
@@ -154,9 +155,9 @@ def test_explicit_metadata_only_wires_actual_output_to_input_hazard():
     )
 
     assert producer_waits == []
-    assert len(native.edges) == 1
-    assert consumer_waits == native.edges
-    assert producer_state.signal_edges == native.edges
+    assert len(native.edges) == 0
+    assert consumer_waits == []
+    assert producer_state.signal_edges == []
 
 
 def test_dependency_metadata_preserves_tir_param_names_and_result_positions():
@@ -181,3 +182,29 @@ def test_dependency_metadata_preserves_tir_param_names_and_result_positions():
         (1, "C", "write", 0),
         (3, "D", "write", 1),
     ]
+
+
+def test_registered_native_output_identity_is_preserved_before_compaction():
+    from tilelang.contrib.mlx_tvm_ffi import _contiguous_mlx_input
+
+    clear_metal_graph_sync_state_for_tests()
+    native = _FakeNative()
+    output = _FakeArray()
+    producer_metadata = make_tvm_ffi_metal_dependency_metadata(
+        kernel_symbol="producer",
+        input_param_indices=(),
+        output_param_indices=(0,),
+    )
+    producer_state, _ = plan_mlx_tvm_ffi_launch(
+        native,
+        [],
+        dependency_metadata=producer_metadata,
+    )
+    register_mlx_tvm_ffi_outputs(
+        [output],
+        producer_state,
+        dependency_metadata=producer_metadata,
+    )
+
+    assert has_mlx_tvm_ffi_producer(output)
+    assert _contiguous_mlx_input(output) is output

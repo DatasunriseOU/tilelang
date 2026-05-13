@@ -549,8 +549,45 @@ void zero_output_buffer(MTL::CommandBuffer* command_buffer, mx::array& out) {
   blit_encoder->endEncoding();
 }
 
+void encode_command_buffer_boundary(MTL::CommandBuffer* command_buffer, mx::Stream stream) {
+  auto* device = mx::metal::device(stream.device).mtl_device();
+  auto* event = device->newSharedEvent();
+  if (event == nullptr) {
+    throw std::runtime_error("failed to allocate Metal shared event for TVM-FFI boundary");
+  }
+  constexpr uint64_t kBoundaryValue = 1;
+  command_buffer->encodeSignalEvent(event, kBoundaryValue);
+  command_buffer->encodeWait(event, kBoundaryValue);
+  command_buffer->addCompletedHandler([event](MTL::CommandBuffer*) { event->release(); });
+}
+
 mx::metal::CommandEncoder* get_command_encoder(mx::Stream stream) {
   return &mx::metal::get_command_encoder(stream);
+}
+
+void register_external_inputs(
+    mx::metal::CommandEncoder* encoder,
+    const std::vector<mx::array>& inputs) {
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    encoder->set_input_array(inputs[i], static_cast<int>(i));
+  }
+}
+
+void publish_external_outputs(
+    mx::Stream stream,
+    const std::vector<mx::array>& outputs) {
+  if (outputs.empty()) {
+    return;
+  }
+  auto* encoder = get_command_encoder(stream);
+  for (const auto& out : outputs) {
+    encoder->register_output_array(out);
+  }
+  // Create a post-launch encoder so MLX records an output fence after the
+  // external TVM-FFI commands. Without this, same-graph MLX consumers can race
+  // a TileLang producer even though the output array is a normal graph value.
+  encoder->barrier();
+  encoder->end_encoding();
 }
 
 class TVMFFIMetalCall : public mx::Primitive {
@@ -634,7 +671,6 @@ class TVMFFIMetalCall : public mx::Primitive {
       if (out.buffer().ptr() == nullptr) {
         throw std::runtime_error("MLX failed to allocate TVM-FFI output buffer");
       }
-      encoder->register_output_array(out);
     }
 
     std::vector<BorrowedTensorView> views;
@@ -655,11 +691,14 @@ class TVMFFIMetalCall : public mx::Primitive {
       arg.v_ptr = &views.back().tensor;
     }
 
+    register_external_inputs(encoder, inputs);
     auto* command_buffer = finish_encoding_and_get_command_buffer(stream());
+    encode_command_buffer_boundary(command_buffer, stream());
     encode_device_event_waits(command_buffer, stream(), wait_edges_);
     for (int64_t output_pos : zero_init_output_positions_) {
       zero_output_buffer(command_buffer, outputs.at(static_cast<size_t>(output_pos)));
     }
+    encode_command_buffer_boundary(command_buffer, stream());
 
     auto signal_edges = launch_sync_state_->snapshot_signal_edges();
     TVMFFIAny result;
@@ -675,6 +714,8 @@ class TVMFFIMetalCall : public mx::Primitive {
           &result));
     }
     encode_device_event_signals(command_buffer, stream(), signal_edges);
+    encode_command_buffer_boundary(command_buffer, stream());
+    publish_external_outputs(stream(), outputs);
     if (result.type_index >= kTVMFFIStaticObjectBegin && result.v_obj != nullptr) {
       TVM_FFI_CHECK_SAFE_CALL(TVMFFIObjectDecRef(result.v_obj));
     }

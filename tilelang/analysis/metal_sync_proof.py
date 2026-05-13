@@ -97,22 +97,13 @@ def plan_metal_buffer_sync(
         )
 
     if same_command_buffer is True:
-        if not resource_tracked:
-            return MetalSyncPlan(
-                action="device_event",
-                where="opaque_external_encoder_edge",
-                host_sync_required=False,
-                device_event_required=True,
-                reason="same command buffer uses raw external buffers outside MLX resource tracking",
-                z3_proved=False,
-            )
         if producer_before_consumer is True and _prove_same_command_buffer_order(timeout_ms):
             return MetalSyncPlan(
                 action="none",
                 where="same_command_buffer_encode_order",
                 host_sync_required=False,
                 device_event_required=False,
-                reason="Z3 proved producer ordinal precedes consumer ordinal",
+                reason="Z3 proved producer ordinal precedes consumer ordinal in the borrowed command buffer",
                 z3_proved=True,
             )
         return MetalSyncPlan(

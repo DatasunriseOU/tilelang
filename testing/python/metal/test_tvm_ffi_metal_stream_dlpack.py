@@ -55,6 +55,18 @@ def _make_parallel_add_1d_kernel():
     return parallel_add_1d
 
 
+def _make_large_parallel_add_1d_kernel(size=65536, threads=256):
+    @T.prim_func
+    def parallel_add_1d(A: T.Tensor((size,), T.float32), C: T.Tensor((size,), T.float32)):
+        with T.Kernel(T.ceildiv(size, threads), threads=threads) as bx:
+            for tx in T.Parallel(threads):
+                i = bx * threads + tx
+                if i < size:
+                    C[i] = A[i] + T.float32(1.0)
+
+    return parallel_add_1d
+
+
 def _capsule_data_ptr(capsule) -> int:
     import ctypes
 
@@ -445,6 +457,33 @@ def test_tvm_ffi_metal_mlx_compile_uses_native_graph_primitive():
 
 
 @tilelang.testing.requires_metal
+def test_tvm_ffi_metal_mlx_lazy_producer_and_consumer_are_device_ordered():
+    mx = pytest.importorskip("mlx.core")
+    from tilelang.contrib.mlx_tvm_ffi import is_available as native_bridge_is_available
+
+    if not native_bridge_is_available():
+        pytest.skip("native MLX TVM-FFI bridge is not built")
+
+    size = 65536
+    kernel = tilelang.compile(
+        _make_large_parallel_add_1d_kernel(size=size),
+        target="metal",
+        execution_backend="tvm_ffi",
+        out_idx=-1,
+    )
+
+    seed = mx.arange(size, dtype=mx.float32)
+    source = seed * mx.array(1.5, dtype=mx.float32) - mx.array(7.0, dtype=mx.float32)
+    returned = kernel(source)
+    consumed = returned * mx.array(2.0, dtype=mx.float32) + source
+    mx.eval(consumed)
+
+    expected_source = np.arange(size, dtype=np.float32) * 1.5 - 7.0
+    expected = (expected_source + 1.0) * 2.0 + expected_source
+    np.testing.assert_allclose(np.array(consumed), expected, rtol=1e-6, atol=1e-6)
+
+
+@tilelang.testing.requires_metal
 def test_tvm_ffi_metal_mlx_native_debug_completion_hook_is_nonblocking():
     mx = pytest.importorskip("mlx.core")
     from tilelang.contrib.mlx_tvm_ffi import (
@@ -494,7 +533,7 @@ def test_tvm_ffi_metal_mlx_native_debug_completion_hook_is_nonblocking():
 
 
 @tilelang.testing.requires_metal
-def test_tvm_ffi_metal_mlx_graph_same_domain_opaque_edge_emits_device_event():
+def test_tvm_ffi_metal_mlx_graph_same_domain_uses_encode_order_without_device_event():
     mx = pytest.importorskip("mlx.core")
     from tilelang.contrib.mlx_tvm_ffi import (
         debug_state,
@@ -518,8 +557,8 @@ def test_tvm_ffi_metal_mlx_graph_same_domain_opaque_edge_emits_device_event():
     mx.eval(returned)
 
     state = debug_state()
-    assert state["device_event_waits_encoded"] >= 1
-    assert state["device_event_signals_encoded"] >= 1
+    assert state["device_event_waits_encoded"] == 0
+    assert state["device_event_signals_encoded"] == 0
     np.testing.assert_allclose(
         np.array(returned),
         np.array([[3.0, 5.0, 7.0], [9.0, 11.0, 13.0]], dtype=np.float32),

@@ -29,10 +29,11 @@ def test_same_command_buffer_opaque_external_encoder_uses_device_event():
         resource_tracked=False,
     )
 
-    assert plan.action == "device_event"
-    assert plan.where == "opaque_external_encoder_edge"
+    assert plan.action == "none"
+    assert plan.where == "same_command_buffer_encode_order"
     assert plan.host_sync_required is False
-    assert plan.device_event_required is True
+    assert plan.device_event_required is False
+    assert plan.z3_proved is True
 
 
 @pytest.mark.skipif(not _Z3_AVAILABLE, reason="z3-solver not installed")
