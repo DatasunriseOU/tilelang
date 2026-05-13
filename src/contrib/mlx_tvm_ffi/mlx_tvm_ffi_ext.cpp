@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <cstdlib>
 #include <cstdint>
 #include <limits>
@@ -18,6 +19,8 @@
 #include <tvm/ffi/c_api.h>
 #include <tvm/ffi/function.h>
 
+#include "contrib/mlx_tvm_ffi/mlx_tvm_ffi_c_api.h"
+
 #include "mlx/allocator.h"
 #include "mlx/array.h"
 #include "mlx/backend/metal/device.h"
@@ -34,6 +37,26 @@ namespace mx = mlx::core;
 extern "C" PyObject* mlx_core_wrap_mx_array_move(mx::array* array);
 
 namespace tilelang::mlx_tvm_ffi {
+
+#ifndef TILELANG_MLX_TVM_FFI_C_API_HEADER_SHA256
+#define TILELANG_MLX_TVM_FFI_C_API_HEADER_SHA256 "unknown"
+#endif
+
+#ifndef TILELANG_MLX_TVM_FFI_BUILD_MLX_VERSION
+#define TILELANG_MLX_TVM_FFI_BUILD_MLX_VERSION "unknown"
+#endif
+
+#ifndef TILELANG_MLX_TVM_FFI_BUILD_MLX_LIB_SHA256
+#define TILELANG_MLX_TVM_FFI_BUILD_MLX_LIB_SHA256 "unknown"
+#endif
+
+#ifndef TILELANG_MLX_TVM_FFI_BUILD_MLX_PY_BRIDGE_SHA256
+#define TILELANG_MLX_TVM_FFI_BUILD_MLX_PY_BRIDGE_SHA256 "unknown"
+#endif
+
+#ifndef TILELANG_MLX_TVM_FFI_WITH_PY_MODULE
+#define TILELANG_MLX_TVM_FFI_WITH_PY_MODULE 1
+#endif
 
 constexpr int32_t kDLMetalDeviceType = 8;
 constexpr const char* kDebugCompletionEnv = "TILELANG_MLX_TVM_FFI_DEBUG_COMPLETION";
@@ -829,8 +852,232 @@ std::vector<mx::array> make_owner_output_buffers(
   return outputs;
 }
 
+int fill_c_api_status(TileLangMLXTVMFFIStatus* out, size_t out_size) {
+  if (out == nullptr) {
+    return kTileLangMLXTVMFFICApiNullOut;
+  }
+  if (out_size < sizeof(TileLangMLXTVMFFIStatus)) {
+    return kTileLangMLXTVMFFICApiStructTooSmall;
+  }
+  *out = TileLangMLXTVMFFIStatus{};
+  out->version = TILELANG_MLX_TVM_FFI_C_API_VERSION;
+  out->struct_size = sizeof(TileLangMLXTVMFFIStatus);
+  out->code = kTileLangMLXTVMFFICApiOk;
+  out->state = "available";
+  out->reason = "TileLang MLX TVM-FFI C API is linked";
+  out->abi_hash = TILELANG_MLX_TVM_FFI_C_API_ABI_HASH;
+  out->header_sha256 = TILELANG_MLX_TVM_FFI_C_API_HEADER_SHA256;
+  out->mlx_version = TILELANG_MLX_TVM_FFI_BUILD_MLX_VERSION;
+  out->mlx_lib_sha256 = TILELANG_MLX_TVM_FFI_BUILD_MLX_LIB_SHA256;
+  out->mlx_python_bridge_sha256 = TILELANG_MLX_TVM_FFI_BUILD_MLX_PY_BRIDGE_SHA256;
+  return kTileLangMLXTVMFFICApiOk;
+}
+
+nb::dict c_api_status_dict() {
+  TileLangMLXTVMFFIStatus status{};
+  int rc = fill_c_api_status(&status, sizeof(status));
+  nb::dict result;
+  result["code"] = rc;
+  result["state"] = status.state == nullptr ? "unavailable" : status.state;
+  result["reason"] = status.reason == nullptr ? "" : status.reason;
+  result["version"] = status.version;
+  result["struct_size"] = status.struct_size;
+  result["abi_hash"] = status.abi_hash == nullptr ? "" : status.abi_hash;
+  result["header_sha256"] = status.header_sha256 == nullptr ? "" : status.header_sha256;
+  result["mlx_version"] = status.mlx_version == nullptr ? "" : status.mlx_version;
+  result["mlx_lib_sha256"] = status.mlx_lib_sha256 == nullptr ? "" : status.mlx_lib_sha256;
+  result["mlx_python_bridge_sha256"] =
+      status.mlx_python_bridge_sha256 == nullptr ? "" : status.mlx_python_bridge_sha256;
+  return result;
+}
+
+PyObject* release_py_object(nb::object&& obj) {
+  return obj.release().ptr();
+}
+
+PyObject* c_api_metal_call(
+    uint64_t func_handle,
+    PyObject* inputs,
+    PyObject* output_shapes,
+    PyObject* output_dtypes,
+    PyObject* result_indices,
+    int64_t num_params,
+    PyObject* zero_init_output_positions,
+    PyObject* launch_sync_state,
+    PyObject* wait_edges) {
+  nb::gil_scoped_acquire gil;
+  if (inputs == nullptr || output_shapes == nullptr || output_dtypes == nullptr ||
+      result_indices == nullptr) {
+    PyErr_SetString(PyExc_TypeError, "TileLang MLX TVM-FFI C API received a null PyObject");
+    return nullptr;
+  }
+  PyObject* zero_init = zero_init_output_positions == nullptr ? Py_None : zero_init_output_positions;
+  PyObject* launch_state = launch_sync_state == nullptr ? Py_None : launch_sync_state;
+  PyObject* waits = wait_edges == nullptr ? Py_None : wait_edges;
+  try {
+    return release_py_object(wrap_mlx_arrays(tvm_ffi_metal_call(
+        func_handle,
+        parse_array_sequence(nb::handle(inputs)),
+        parse_shape_sequence(nb::handle(output_shapes)),
+        parse_string_sequence(nb::handle(output_dtypes)),
+        parse_i64_sequence(nb::handle(result_indices)),
+        num_params,
+        parse_i64_sequence(nb::handle(zero_init)),
+        parse_launch_sync_state(nb::handle(launch_state)),
+        parse_sync_edge_sequence(nb::handle(waits)))));
+  } catch (nb::python_error& exc) {
+    exc.restore();
+    return nullptr;
+  } catch (const std::exception& exc) {
+    PyErr_SetString(PyExc_RuntimeError, exc.what());
+    return nullptr;
+  }
+}
+
+PyObject* c_api_owner_output_buffer(PyObject* shape, const char* dtype_name) {
+  nb::gil_scoped_acquire gil;
+  if (shape == nullptr || dtype_name == nullptr) {
+    PyErr_SetString(PyExc_TypeError, "owner_output_buffer received a null argument");
+    return nullptr;
+  }
+  try {
+    return release_py_object(wrap_mlx_array(
+        make_owner_output_buffer(parse_i64_sequence(nb::handle(shape)), dtype_name)));
+  } catch (nb::python_error& exc) {
+    exc.restore();
+    return nullptr;
+  } catch (const std::exception& exc) {
+    PyErr_SetString(PyExc_RuntimeError, exc.what());
+    return nullptr;
+  }
+}
+
+PyObject* c_api_owner_output_buffers(PyObject* shapes, PyObject* dtype_names) {
+  nb::gil_scoped_acquire gil;
+  if (shapes == nullptr || dtype_names == nullptr) {
+    PyErr_SetString(PyExc_TypeError, "owner_output_buffers received a null argument");
+    return nullptr;
+  }
+  try {
+    return release_py_object(wrap_mlx_arrays(make_owner_output_buffers(
+        parse_shape_sequence(nb::handle(shapes)),
+        parse_string_sequence(nb::handle(dtype_names)))));
+  } catch (nb::python_error& exc) {
+    exc.restore();
+    return nullptr;
+  } catch (const std::exception& exc) {
+    PyErr_SetString(PyExc_RuntimeError, exc.what());
+    return nullptr;
+  }
+}
+
+PyObject* c_api_make_launch_sync_state() {
+  nb::gil_scoped_acquire gil;
+  try {
+    return release_py_object(nb::cast(make_launch_sync_state()));
+  } catch (nb::python_error& exc) {
+    exc.restore();
+    return nullptr;
+  } catch (const std::exception& exc) {
+    PyErr_SetString(PyExc_RuntimeError, exc.what());
+    return nullptr;
+  }
+}
+
+PyObject* c_api_make_sync_edge() {
+  nb::gil_scoped_acquire gil;
+  try {
+    return release_py_object(nb::cast(make_sync_edge()));
+  } catch (nb::python_error& exc) {
+    exc.restore();
+    return nullptr;
+  } catch (const std::exception& exc) {
+    PyErr_SetString(PyExc_RuntimeError, exc.what());
+    return nullptr;
+  }
+}
+
+PyObject* c_api_debug_state() {
+  nb::gil_scoped_acquire gil;
+  try {
+    return release_py_object(debug_state());
+  } catch (nb::python_error& exc) {
+    exc.restore();
+    return nullptr;
+  } catch (const std::exception& exc) {
+    PyErr_SetString(PyExc_RuntimeError, exc.what());
+    return nullptr;
+  }
+}
+
 }  // namespace tilelang::mlx_tvm_ffi
 
+extern "C" TILELANG_MLX_TVM_FFI_EXPORT int tilelang_mlx_tvm_ffi_status(
+    TileLangMLXTVMFFIStatus* out,
+    size_t out_size) {
+  return tilelang::mlx_tvm_ffi::fill_c_api_status(out, out_size);
+}
+
+extern "C" TILELANG_MLX_TVM_FFI_EXPORT const char* tilelang_mlx_tvm_ffi_c_api_abi_hash(void) {
+  return TILELANG_MLX_TVM_FFI_C_API_ABI_HASH;
+}
+
+extern "C" TILELANG_MLX_TVM_FFI_EXPORT const char*
+tilelang_mlx_tvm_ffi_c_api_header_sha256(void) {
+  return TILELANG_MLX_TVM_FFI_C_API_HEADER_SHA256;
+}
+
+extern "C" TILELANG_MLX_TVM_FFI_EXPORT const char* tilelang_mlx_tvm_ffi_mlx_version(void) {
+  return TILELANG_MLX_TVM_FFI_BUILD_MLX_VERSION;
+}
+
+extern "C" TILELANG_MLX_TVM_FFI_EXPORT const char* tilelang_mlx_tvm_ffi_mlx_lib_sha256(void) {
+  return TILELANG_MLX_TVM_FFI_BUILD_MLX_LIB_SHA256;
+}
+
+extern "C" TILELANG_MLX_TVM_FFI_EXPORT const char*
+tilelang_mlx_tvm_ffi_mlx_python_bridge_sha256(void) {
+  return TILELANG_MLX_TVM_FFI_BUILD_MLX_PY_BRIDGE_SHA256;
+}
+
+extern "C" TILELANG_MLX_TVM_FFI_EXPORT int tilelang_mlx_tvm_ffi_get_c_api(
+    uint32_t requested_version,
+    const char* requested_abi_hash,
+    TileLangMLXTVMFFICAPI* out,
+    size_t out_size) {
+  if (out == nullptr) {
+    return kTileLangMLXTVMFFICApiNullOut;
+  }
+  if (out_size < sizeof(TileLangMLXTVMFFICAPI)) {
+    return kTileLangMLXTVMFFICApiStructTooSmall;
+  }
+  if (requested_version != TILELANG_MLX_TVM_FFI_C_API_VERSION) {
+    return kTileLangMLXTVMFFICApiVersionMismatch;
+  }
+  if (requested_abi_hash != nullptr && requested_abi_hash[0] != '\0' &&
+      std::strcmp(requested_abi_hash, TILELANG_MLX_TVM_FFI_C_API_ABI_HASH) != 0) {
+    return kTileLangMLXTVMFFICApiHashMismatch;
+  }
+  *out = TileLangMLXTVMFFICAPI{};
+  out->version = TILELANG_MLX_TVM_FFI_C_API_VERSION;
+  out->struct_size = sizeof(TileLangMLXTVMFFICAPI);
+  out->abi_hash = TILELANG_MLX_TVM_FFI_C_API_ABI_HASH;
+  out->header_sha256 = TILELANG_MLX_TVM_FFI_C_API_HEADER_SHA256;
+  out->mlx_version = TILELANG_MLX_TVM_FFI_BUILD_MLX_VERSION;
+  out->mlx_lib_sha256 = TILELANG_MLX_TVM_FFI_BUILD_MLX_LIB_SHA256;
+  out->mlx_python_bridge_sha256 = TILELANG_MLX_TVM_FFI_BUILD_MLX_PY_BRIDGE_SHA256;
+  out->status = tilelang_mlx_tvm_ffi_status;
+  out->metal_call = tilelang::mlx_tvm_ffi::c_api_metal_call;
+  out->owner_output_buffer = tilelang::mlx_tvm_ffi::c_api_owner_output_buffer;
+  out->owner_output_buffers = tilelang::mlx_tvm_ffi::c_api_owner_output_buffers;
+  out->make_launch_sync_state = tilelang::mlx_tvm_ffi::c_api_make_launch_sync_state;
+  out->make_sync_edge = tilelang::mlx_tvm_ffi::c_api_make_sync_edge;
+  out->debug_state = tilelang::mlx_tvm_ffi::c_api_debug_state;
+  out->reset_debug_state = tilelang::mlx_tvm_ffi::reset_debug_counters;
+  return kTileLangMLXTVMFFICApiOk;
+}
+
+#if TILELANG_MLX_TVM_FFI_WITH_PY_MODULE
 NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
   m.doc() = "Native graph-safe MLX primitive for TileLang TVM-FFI Metal kernels";
   nb::class_<tilelang::mlx_tvm_ffi::MetalSyncEdge>(m, "MetalSyncEdge");
@@ -918,6 +1165,9 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
   m.def("make_sync_edge", &tilelang::mlx_tvm_ffi::make_sync_edge);
   m.def("debug_state", &tilelang::mlx_tvm_ffi::debug_state);
   m.def("reset_debug_state", &tilelang::mlx_tvm_ffi::reset_debug_counters);
+  m.def("c_api_status", &tilelang::mlx_tvm_ffi::c_api_status_dict);
+  m.def("c_api_abi_hash", []() { return TILELANG_MLX_TVM_FFI_C_API_ABI_HASH; });
+  m.def("c_api_header_sha256", []() { return TILELANG_MLX_TVM_FFI_C_API_HEADER_SHA256; });
   m.def(
       "owner_output_buffer",
       [](nb::handle shape, const std::string& dtype_name) {
@@ -939,3 +1189,4 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
       "shapes"_a,
       "dtypes"_a);
 }
+#endif  // TILELANG_MLX_TVM_FFI_WITH_PY_MODULE

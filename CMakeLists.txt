@@ -575,6 +575,50 @@ if(APPLE AND USE_METAL AND TILELANG_BUILD_MLX_TVM_FFI)
   endif()
 
   if(nanobind_FOUND AND MLX_FOUND AND TARGET tvm_ffi_shared)
+    set(TILELANG_MLX_TVM_FFI_C_API_HEADER
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/contrib/mlx_tvm_ffi/mlx_tvm_ffi_c_api.h")
+    file(SHA256 "${TILELANG_MLX_TVM_FFI_C_API_HEADER}"
+         TILELANG_MLX_TVM_FFI_C_API_HEADER_SHA256)
+    set(TILELANG_MLX_TVM_FFI_INCLUDE_DIRS
+      "${CMAKE_CURRENT_SOURCE_DIR}/src"
+      "${TVM_SOURCE}/3rdparty/tvm-ffi/include"
+      "${TVM_SOURCE}/3rdparty/tvm-ffi/3rdparty/dlpack/include")
+    set(TILELANG_MLX_TVM_FFI_COMPILE_DEFS
+      "TILELANG_MLX_TVM_FFI_C_API_HEADER_SHA256=\"${TILELANG_MLX_TVM_FFI_C_API_HEADER_SHA256}\""
+      "TILELANG_MLX_TVM_FFI_BUILD_MLX_VERSION=\"${TILELANG_MLX_CONFIG_VERSION}\""
+      "TILELANG_MLX_TVM_FFI_BUILD_MLX_LIB_SHA256=\"${TILELANG_MLX_LIB_SHA256}\""
+      "TILELANG_MLX_TVM_FFI_BUILD_MLX_PY_BRIDGE_SHA256=\"${TILELANG_MLX_PY_BRIDGE_SHA256}\"")
+
+    nanobind_build_library(nanobind-static)
+    add_library(
+      tilelang_mlx_tvm_ffi_c_api
+      SHARED
+      src/contrib/mlx_tvm_ffi/mlx_tvm_ffi_ext.cpp)
+    nanobind_compile_options(tilelang_mlx_tvm_ffi_c_api)
+    nanobind_link_options(tilelang_mlx_tvm_ffi_c_api)
+    target_include_directories(tilelang_mlx_tvm_ffi_c_api PRIVATE
+      ${TILELANG_MLX_TVM_FFI_INCLUDE_DIRS})
+    target_compile_definitions(tilelang_mlx_tvm_ffi_c_api PRIVATE
+      TILELANG_MLX_TVM_FFI_EXPORTS
+      TILELANG_MLX_TVM_FFI_WITH_PY_MODULE=0
+      NB_DOMAIN=mlx
+      ${TILELANG_MLX_TVM_FFI_COMPILE_DEFS})
+    target_link_libraries(tilelang_mlx_tvm_ffi_c_api PRIVATE
+      nanobind-static
+      mlx
+      tvm_ffi_shared
+      "${TILELANG_MLX_PY_BRIDGE_REAL}")
+    set_target_properties(tilelang_mlx_tvm_ffi_c_api PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      BUILD_RPATH "${TILELANG_MLX_ROOT}/lib"
+      INSTALL_RPATH "@loader_path;${TILELANG_MLX_ROOT}/lib")
+    install(TARGETS tilelang_mlx_tvm_ffi_c_api
+            LIBRARY DESTINATION tilelang/lib
+            RUNTIME DESTINATION tilelang/lib
+            ARCHIVE DESTINATION tilelang/lib)
+
     nanobind_add_module(
       _tilelang_mlx_tvm_ffi
       NB_STATIC
@@ -585,8 +629,11 @@ if(APPLE AND USE_METAL AND TILELANG_BUILD_MLX_TVM_FFI)
       mlx
       src/contrib/mlx_tvm_ffi/mlx_tvm_ffi_ext.cpp)
     target_include_directories(_tilelang_mlx_tvm_ffi PRIVATE
-      "${TVM_SOURCE}/3rdparty/tvm-ffi/include"
-      "${TVM_SOURCE}/3rdparty/tvm-ffi/3rdparty/dlpack/include")
+      ${TILELANG_MLX_TVM_FFI_INCLUDE_DIRS})
+    target_compile_definitions(_tilelang_mlx_tvm_ffi PRIVATE
+      TILELANG_MLX_TVM_FFI_EXPORTS
+      TILELANG_MLX_TVM_FFI_WITH_PY_MODULE=1
+      ${TILELANG_MLX_TVM_FFI_COMPILE_DEFS})
     target_link_libraries(_tilelang_mlx_tvm_ffi PRIVATE mlx tvm_ffi_shared "${TILELANG_MLX_PY_BRIDGE_REAL}")
     set_target_properties(_tilelang_mlx_tvm_ffi PROPERTIES
       LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
@@ -598,6 +645,8 @@ if(APPLE AND USE_METAL AND TILELANG_BUILD_MLX_TVM_FFI)
             LIBRARY DESTINATION tilelang/lib
             RUNTIME DESTINATION tilelang/lib
             ARCHIVE DESTINATION tilelang/lib)
+    install(FILES "${TILELANG_MLX_TVM_FFI_C_API_HEADER}"
+            DESTINATION tilelang/include/tilelang/contrib)
   else()
     message(STATUS "Skipping optional MLX TVM-FFI bridge: nanobind/MLX/tvm_ffi_shared target not available")
   endif()
