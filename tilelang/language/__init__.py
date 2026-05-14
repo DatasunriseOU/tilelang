@@ -86,6 +86,7 @@ from .reduce_op import (
     reduce_bitxor,  # noqa: F401
     cumsum,  # noqa: F401
     finalize_reducer,  # noqa: F401
+    thread_allreduce_sum,  # noqa: F401
     warp_reduce_sum,  # noqa: F401
     warp_reduce_max,  # noqa: F401
     warp_reduce_min,  # noqa: F401

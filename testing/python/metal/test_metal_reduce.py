@@ -291,21 +291,7 @@ def _make_split_thread_allreduce_parallel_kernel(
             kr = T.floormod(lane, reduce_extent)
             group = T.floordiv(lane, reduce_extent)
             accum[0] = A[row * reduce_threads + lane]
-            with T.attr(
-                T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
-                "reduce_scope",
-                T.reinterpret(T.uint64(0), dtype="handle"),
-            ):
-                T.evaluate(
-                    T.tvm_thread_allreduce(
-                        T.uint32(1),
-                        accum[0],
-                        True,
-                        reduced[0],
-                        kr,
-                        dtype="handle",
-                    )
-                )
+            T.thread_allreduce_sum(accum[0], reduced[0], kr)
             if kr == 0:
                 B[row * groups + group] = reduced[0]
 

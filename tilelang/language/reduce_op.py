@@ -5,6 +5,7 @@ import warnings
 from typing import Literal
 from tilelang._typing import BufferLikeType
 from tvm import tir
+import tvm.script.parser.tir as T
 from tilelang.language import copy, macro, alloc_shared, alloc_fragment
 from tilelang.utils.language import to_buffer_region, retrieve_shape, _get_buffer
 from tilelang.utils.language import is_shared, is_fragment
@@ -21,6 +22,40 @@ _REDUCE_OP_KEY = "tl.tileop.reduce"
 
 ReduceKind = Literal["sum", "abssum", "max", "absmax", "min", "mul", "bitand", "bitor", "bitxor"]
 _REDUCE_PROD_WARNED = False
+
+
+def thread_allreduce_sum(
+    value: tir.PrimExpr,
+    out: tir.BufferLoad,
+    reduce_index: tir.PrimExpr,
+    predicate: tir.PrimExpr | bool = True,
+    dtype: str | None = None,
+) -> None:
+    """Emit semantic thread-allreduce sum IR for the active thread axis.
+
+    This helper deliberately lowers to ``tir.tvm_thread_allreduce`` instead of
+    target-specific intrinsics such as Metal ``simd_sum``.  Target lowering can
+    then choose a same-simdgroup, split-simdgroup, or shared-memory strategy
+    from the IR shape instead of requiring callsites to hand-code partial
+    buffers or backend-specific shuffle calls.
+    """
+
+    reduce_dtype = dtype or str(value.dtype)
+    with T.attr(
+        T.comm_reducer(lambda x, y: x + y, [T.cast(0, reduce_dtype)]),
+        "reduce_scope",
+        T.reinterpret(T.uint64(0), dtype="handle"),
+    ):
+        T.evaluate(
+            T.tvm_thread_allreduce(
+                T.uint32(1),
+                value,
+                predicate,
+                out,
+                reduce_index,
+                dtype="handle",
+            )
+        )
 
 
 # NOTE(chaofan): T.reduce is implemented as a macro, so no return
