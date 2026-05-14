@@ -23,6 +23,7 @@ import pytest
 import tilelang.language as T
 from tilelang import tvm as tvm
 from tvm import tir
+from tvm.target import Target
 
 
 def _load_worktree_module():
@@ -42,7 +43,11 @@ def _load_worktree_module():
 
 metal_simd_lift = _load_worktree_module()
 rewrite_reductions = metal_simd_lift.rewrite_reductions
+rewrite_reductions_to_thread_allreduce = (
+    metal_simd_lift.rewrite_reductions_to_thread_allreduce
+)
 count_shfl_xor_calls = metal_simd_lift.count_shfl_xor_calls
+count_thread_allreduce_calls = metal_simd_lift.count_thread_allreduce_calls
 detect_candidates = metal_simd_lift.detect_candidates
 _butterfly_stages = metal_simd_lift._butterfly_stages
 LOOP_ANNOTATION_KEY = metal_simd_lift.LOOP_ANNOTATION_KEY
@@ -115,6 +120,17 @@ def test_static_32lane_reduction_emits_butterfly():
     assert count_shfl_xor_calls(new_func) == 5
 
 
+def test_static_32lane_reduction_emits_semantic_thread_allreduce():
+    func = _build_annotated_reduction(32, op="add")
+    new_func, n_replaced = rewrite_reductions_to_thread_allreduce(func)
+    assert n_replaced == 1
+    assert count_thread_allreduce_calls(new_func) == 1
+    assert count_shfl_xor_calls(new_func) == 0
+    script = new_func.script()
+    assert "T.tvm_thread_allreduce" in script
+    assert "reduce_scope" in script
+
+
 def test_static_8lane_reduction_emits_butterfly():
     func = _build_annotated_reduction(8, op="add")
     new_func, n_replaced, n_stages = rewrite_reductions(func)
@@ -129,6 +145,9 @@ def test_static_64lane_reduction_keeps_threadgroup():
     new_func, n_replaced, _ = rewrite_reductions(func)
     assert n_replaced == 0
     assert count_shfl_xor_calls(new_func) == 0
+    semantic_func, n_semantic = rewrite_reductions_to_thread_allreduce(func)
+    assert n_semantic == 0
+    assert count_thread_allreduce_calls(semantic_func) == 0
 
 
 def test_unsupported_op_keeps_threadgroup():
@@ -147,6 +166,13 @@ def test_max_reduction_emits_butterfly():
     assert count_shfl_xor_calls(new_func) == 4
 
 
+def test_max_reduction_waits_for_reduction_plan_semantic_identity():
+    func = _build_annotated_reduction(16, op="max")
+    new_func, n_replaced = rewrite_reductions_to_thread_allreduce(func)
+    assert n_replaced == 0
+    assert count_thread_allreduce_calls(new_func) == 0
+
+
 def test_unannotated_loop_keeps_threadgroup():
     """Without the per-loop annotation, the rewrite must not fire.
 
@@ -159,6 +185,9 @@ def test_unannotated_loop_keeps_threadgroup():
     new_func, n_replaced, _ = rewrite_reductions(func)
     assert n_replaced == 0
     assert count_shfl_xor_calls(new_func) == 0
+    semantic_func, n_semantic = rewrite_reductions_to_thread_allreduce(func)
+    assert n_semantic == 0
+    assert count_thread_allreduce_calls(semantic_func) == 0
 
 
 def test_default_off_preserves_behavior():
@@ -183,6 +212,20 @@ def test_pass_on_non_metal_target_preserves_behavior():
             out = metal_simd_lift.MetalSimdLiftReductions(mod)
     # On non-metal: pass returns func unchanged.
     tvm.ir.assert_structural_equal(out["main"], mod["main"], True)
+
+
+def test_pass_on_metal_target_prefers_semantic_thread_allreduce():
+    func = _build_annotated_reduction(16, op="add").with_attr(
+        "global_symbol", "main"
+    )
+    mod = tvm.IRModule.from_expr(func)
+    with tvm.transform.PassContext(
+        config={metal_simd_lift.PASS_CONFIG_KEY: True}
+    ):
+        with Target("metal"):
+            out = metal_simd_lift.MetalSimdLiftReductions(mod)
+    assert count_thread_allreduce_calls(out["main"]) == 1
+    assert count_shfl_xor_calls(out["main"]) == 0
 
 
 # ---------------------------------------------------------------------------

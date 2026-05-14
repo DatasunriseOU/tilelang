@@ -9,11 +9,15 @@ intrinsics and skip the threadgroup-memory round-trip. This pass
    ``tl.simd_lift_candidates`` for downstream tooling.
 
 2. **Rewrites** loops that are *both* proved <= 32 by Z3 *and* explicitly
-   marked with the ``tl.simd_butterfly_lane`` annotation into a
-   ``tl.shfl_xor_sync``-based butterfly reduction. The annotation is
-   load-bearing: a bare serial reduction loop ``for i: acc = f(acc,
-   buf[i])`` does not carry the lane-mapping semantics required for a
-   safe rewrite — without the annotation we keep the IR untouched.
+   marked with the ``tl.simd_butterfly_lane`` annotation into semantic
+   ``tir.tvm_thread_allreduce`` IR. The annotation is load-bearing: a bare
+   serial reduction loop ``for i: acc = f(acc, buf[i])`` does not carry the
+   lane-mapping semantics required for a safe rewrite — without the annotation
+   we keep the IR untouched.
+
+The older explicit ``tl.shfl_xor_sync`` butterfly helper remains available for
+direct backend-shape tests, but the scheduled pass now prefers semantic
+reduction IR so backend lowerers can choose the implementation strategy.
 
 Z3 query shape::
 
@@ -31,6 +35,7 @@ import math
 import os
 from dataclasses import dataclass
 
+from tvm import ir as tvm_ir
 from tvm import tir, IRModule
 from tvm.target import Target
 from tvm.tir.transform import prim_func_pass
@@ -242,6 +247,78 @@ def _apply_op(op: str, a: tir.PrimExpr, b: tir.PrimExpr) -> tir.PrimExpr:
     raise ValueError(f"unsupported simd reduce op: {op}")
 
 
+def _same_primexpr(a: tir.PrimExpr, b: tir.PrimExpr) -> bool:
+    try:
+        return tvm_ir.structural_equal(a, b, map_free_vars=True)
+    except Exception:
+        return bool(a.same_as(b)) if hasattr(a, "same_as") else False
+
+
+def _same_buffer_indices(lhs, rhs) -> bool:
+    if len(lhs) != len(rhs):
+        return False
+    return all(_same_primexpr(a, b) for a, b in zip(lhs, rhs))
+
+
+def _is_accumulator_load(
+    value: tir.PrimExpr,
+    buffer: tir.Buffer,
+    indices,
+) -> bool:
+    if not isinstance(value, tir.BufferLoad):
+        return False
+    if not value.buffer.same_as(buffer):
+        return False
+    return _same_buffer_indices(value.indices, indices)
+
+
+def _extract_add_contribution(store: tir.BufferStore) -> tir.PrimExpr | None:
+    """Return ``x`` from ``acc = acc + x`` or ``acc = x + acc``.
+
+    The semantic allreduce input must be the per-lane contribution, not the
+    whole serial accumulator expression. Other reductions remain on the older
+    explicit helper until ReductionPlan carries reducer-specific identities.
+    """
+    value = store.value
+    if not isinstance(value, tir.Add):
+        return None
+    indices = list(store.indices)
+    if _is_accumulator_load(value.a, store.buffer, indices):
+        return value.b
+    if _is_accumulator_load(value.b, store.buffer, indices):
+        return value.a
+    return None
+
+
+def _build_thread_allreduce(
+    value: tir.PrimExpr,
+    out: tir.BufferLoad,
+    reduce_index: tir.PrimExpr,
+    span=None,
+) -> tir.Stmt:
+    reducer = tir.comm_reducer(
+        lambda x, y: x + y,
+        lambda dtype: tir.const(0, dtype=dtype),
+        name="sum",
+    )
+    call = tir.call_intrin(
+        "handle",
+        "tir.tvm_thread_allreduce",
+        tir.const(1, "uint32"),
+        value,
+        tir.const(True, "bool"),
+        out,
+        reduce_index,
+    )
+    return tir.AttrStmt(
+        reducer,
+        "reduce_scope",
+        tir.reinterpret("handle", tir.const(0, "uint64")),
+        tir.Evaluate(call, span),
+        span,
+    )
+
+
 def _build_butterfly(
     acc_load: tir.PrimExpr,
     op: str,
@@ -265,6 +342,109 @@ def _build_butterfly(
         )
         value = _apply_op(op, value, shifted)
     return value
+
+
+class _ThreadAllreduceRewriter:
+    """Replace annotated add reductions with semantic thread allreduce IR."""
+
+    def __init__(self):
+        self.replaced = 0
+
+    def __call__(self, body: tir.Stmt) -> tir.Stmt:
+        return self._mutate(body)
+
+    @staticmethod
+    def _span(node):
+        return getattr(node, "span", None)
+
+    def _for_with_body(self, node: tir.For, body: tir.Stmt) -> tir.For:
+        return tir.For(
+            node.loop_var, node.min, node.extent, node.kind, body,
+            getattr(node, "thread_binding", None),
+            getattr(node, "annotations", {}),
+            self._span(node),
+        )
+
+    def _mutate(self, node):
+        if isinstance(node, tir.For):
+            return self._visit_for(node)
+        if isinstance(node, tir.SeqStmt):
+            new_seq = [self._mutate(s) for s in node.seq]
+            return tir.SeqStmt(new_seq, self._span(node))
+        if isinstance(node, tir.IfThenElse):
+            new_then = self._mutate(node.then_case) if node.then_case is not None else None
+            new_else = self._mutate(node.else_case) if node.else_case is not None else None
+            return tir.IfThenElse(node.condition, new_then, new_else, self._span(node))
+        if isinstance(node, tir.LetStmt):
+            return tir.LetStmt(node.var, node.value, self._mutate(node.body), self._span(node))
+        if isinstance(node, tir.AttrStmt):
+            return tir.AttrStmt(
+                node.node, node.attr_key, node.value, self._mutate(node.body), self._span(node)
+            )
+        allocate_const = getattr(tir, "AllocateConst", None)
+        if allocate_const is not None and isinstance(node, allocate_const):
+            return allocate_const(
+                node.buffer_var, node.dtype, node.extents, node.data,
+                self._mutate(node.body), node.annotations, self._span(node),
+            )
+        if isinstance(node, tir.Allocate):
+            return tir.Allocate(
+                node.buffer_var, node.dtype, node.extents, node.condition,
+                self._mutate(node.body), node.annotations, self._span(node),
+            )
+        if isinstance(node, tir.DeclBuffer):
+            return tir.DeclBuffer(node.buffer, self._mutate(node.body), self._span(node))
+        if isinstance(node, tir.Block):
+            return tir.Block(
+                node.iter_vars, node.reads, node.writes, node.name_hint,
+                self._mutate(node.body),
+                getattr(node, "init", None),
+                getattr(node, "alloc_buffers", []),
+                getattr(node, "match_buffers", []),
+                getattr(node, "annotations", {}),
+                self._span(node),
+            )
+        if isinstance(node, tir.BlockRealize):
+            return tir.BlockRealize(
+                node.iter_values, node.predicate,
+                self._mutate(node.block), self._span(node),
+            )
+        if hasattr(node, "body") and node.body is not None:
+            new_body = self._mutate(node.body)
+            if not new_body.same_as(node.body) and hasattr(node, "with_body"):
+                return node.with_body(new_body)
+        return node
+
+    def _visit_for(self, node: tir.For) -> tir.Stmt:
+        recursed_body = self._mutate(node.body)
+        body_stmt = recursed_body
+        if isinstance(body_stmt, tir.SeqStmt) and len(body_stmt.seq) == 1:
+            body_stmt = body_stmt.seq[0]
+        if not isinstance(body_stmt, tir.BufferStore):
+            return self._for_with_body(node, recursed_body)
+        if _classify_reduce_op(body_stmt.value, body_stmt.buffer) != "add":
+            return self._for_with_body(node, recursed_body)
+        if not _is_butterfly_annotated(node):
+            return self._for_with_body(node, recursed_body)
+        proved, query = _z3_extent_le_32(node.extent)
+        if not proved:
+            logger.warning(
+                "semantic-reduction-rewrite: declining annotated loop var=%s extent=%s "
+                "reason=z3_extent_unproved query=%s",
+                str(node.loop_var.name), str(node.extent), query,
+            )
+            return self._for_with_body(node, recursed_body)
+        contribution = _extract_add_contribution(body_stmt)
+        if contribution is None:
+            logger.warning(
+                "semantic-reduction-rewrite: declining annotated loop var=%s extent=%s "
+                "reason=accumulator_contribution_not_extracted",
+                str(node.loop_var.name), str(node.extent),
+            )
+            return self._for_with_body(node, recursed_body)
+        out = tir.BufferLoad(body_stmt.buffer, list(body_stmt.indices))
+        self.replaced += 1
+        return _build_thread_allreduce(contribution, out, node.loop_var, self._span(body_stmt))
 
 
 class _ButterflyRewriter:
@@ -429,6 +609,27 @@ def rewrite_reductions(func: tir.PrimFunc) -> tuple[tir.PrimFunc, int, int]:
     return new_func, rw.replaced, rw.stages_emitted
 
 
+def rewrite_reductions_to_thread_allreduce(
+    func: tir.PrimFunc,
+) -> tuple[tir.PrimFunc, int]:
+    """Public helper: rewrite annotated add reductions to semantic IR.
+
+    Returns ``(new_func, n_replaced)``. The pass uses this path before backend
+    lowering so scheduler/codegen can choose the reduction strategy from
+    ``tir.tvm_thread_allreduce`` instead of from hand-written partial buffers
+    or target intrinsics.
+    """
+    rw = _ThreadAllreduceRewriter()
+    new_body = rw(func.body)
+    if rw.replaced == 0:
+        return func, 0
+    new_func = tir.PrimFunc(
+        func.params, new_body, func.ret_type, func.buffer_map, func.attrs,
+        getattr(func, "span", None),
+    )
+    return new_func, rw.replaced
+
+
 def count_shfl_xor_calls(func: tir.PrimFunc) -> int:
     """Test helper: count ``tl.shfl_xor_sync`` Calls in a PrimFunc."""
     n = 0
@@ -438,6 +639,21 @@ def count_shfl_xor_calls(func: tir.PrimFunc) -> int:
         if isinstance(node, tir.Call):
             op_name = getattr(getattr(node, "op", None), "name", "")
             if op_name == "tl.shfl_xor_sync":
+                n += 1
+
+    tir.stmt_functor.post_order_visit(func.body, _visit)
+    return n
+
+
+def count_thread_allreduce_calls(func: tir.PrimFunc) -> int:
+    """Test helper: count semantic ``tvm_thread_allreduce`` Calls."""
+    n = 0
+
+    def _visit(node):
+        nonlocal n
+        if isinstance(node, tir.Call):
+            op_name = getattr(getattr(node, "op", None), "name", "")
+            if op_name.endswith("tvm_thread_allreduce"):
                 n += 1
 
     tir.stmt_functor.post_order_visit(func.body, _visit)
@@ -494,8 +710,24 @@ def _metal_simd_lift(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.PrimFunc:
         except Exception:
             pass
 
-    # Conservative IR rewrite: only fires on annotated, proved candidates.
+    # Conservative semantic rewrite: only fires on annotated, proved add
+    # reductions where the accumulator contribution can be extracted.
     if any(c.annotated and c.proved for c in candidates):
+        semantic_rewritten, n_semantic = rewrite_reductions_to_thread_allreduce(func)
+        if n_semantic:
+            logger.warning(
+                "semantic-reduction-rewrite: func=%s replaced=%d",
+                func_name, n_semantic,
+            )
+            try:
+                if func.attrs is not None:
+                    semantic_rewritten = semantic_rewritten.with_attrs(dict(func.attrs))
+            except Exception:
+                pass
+            return semantic_rewritten
+
+        # Keep the explicit backend-shape helper as a fallback for reducer
+        # kinds whose semantic ReductionPlan support has not landed yet.
         rewritten, n_replaced, n_stages = rewrite_reductions(func)
         if n_replaced:
             logger.warning(
