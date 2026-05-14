@@ -1,6 +1,7 @@
 """Reduce operations exposed on the TileLang language surface."""
 
 from __future__ import annotations
+from dataclasses import dataclass
 import warnings
 from typing import Literal
 from tilelang._typing import BufferLikeType
@@ -21,26 +22,62 @@ def _legalize_dim(buffer: tir.Buffer, dim: int):
 _REDUCE_OP_KEY = "tl.tileop.reduce"
 
 ReduceKind = Literal["sum", "abssum", "max", "absmax", "min", "mul", "bitand", "bitor", "bitxor"]
+ThreadReduceKind = Literal["sum"]
 _REDUCE_PROD_WARNED = False
 
 
-def thread_allreduce_sum(
+@dataclass(frozen=True)
+class ReductionAxis:
+    """Semantic reduction-axis metadata carried by TileLang IR builders."""
+
+    name: str
+    extent: int | tir.PrimExpr
+    map_expr: tir.PrimExpr
+    role: str = "lane"
+
+
+def reduction_axis(
+    name: str,
+    extent: int | tir.PrimExpr,
+    map_expr: tir.PrimExpr,
+    role: str = "lane",
+) -> ReductionAxis:
+    """Describe a logical reduction axis for semantic thread reductions."""
+
+    if not name:
+        raise ValueError("reduction_axis requires a non-empty name")
+    if role not in {"lane", "row", "block"}:
+        raise ValueError(f"unsupported reduction_axis role {role!r}")
+    return ReductionAxis(name=name, extent=extent, map_expr=map_expr, role=role)
+
+
+def _reduce_index(axis: ReductionAxis | tir.PrimExpr) -> tir.PrimExpr:
+    if isinstance(axis, ReductionAxis):
+        return axis.map_expr
+    return axis
+
+
+def thread_reduce(
     value: tir.PrimExpr,
     out: tir.BufferLoad,
-    reduce_index: tir.PrimExpr,
+    axis: ReductionAxis | tir.PrimExpr,
+    op: ThreadReduceKind = "sum",
     predicate: tir.PrimExpr | bool = True,
     dtype: str | None = None,
 ) -> None:
-    """Emit semantic thread-allreduce sum IR for the active thread axis.
+    """Emit semantic thread reduction IR for the active thread axis.
 
-    This helper deliberately lowers to ``tir.tvm_thread_allreduce`` instead of
-    target-specific intrinsics such as Metal ``simd_sum``.  Target lowering can
-    then choose a same-simdgroup, split-simdgroup, or shared-memory strategy
-    from the IR shape instead of requiring callsites to hand-code partial
-    buffers or backend-specific shuffle calls.
+    The helper lowers to ``tir.tvm_thread_allreduce`` instead of target-specific
+    intrinsics such as Metal ``simd_sum``.  Target lowering can then choose a
+    same-simdgroup, split-simdgroup, or shared-memory strategy from the IR
+    shape instead of requiring callsites to hand-code partial buffers or
+    backend-specific shuffle calls.
     """
 
+    if op != "sum":
+        raise ValueError(f"unsupported thread_reduce op {op!r}; supported ops: 'sum'")
     reduce_dtype = dtype or str(value.dtype)
+    reduce_index = _reduce_index(axis)
     with T.attr(
         T.comm_reducer(lambda x, y: x + y, [T.cast(0, reduce_dtype)]),
         "reduce_scope",
@@ -56,6 +93,72 @@ def thread_allreduce_sum(
                 dtype="handle",
             )
         )
+
+
+def thread_reduce_sum(
+    value: tir.PrimExpr,
+    out: tir.BufferLoad,
+    axis: ReductionAxis | tir.PrimExpr,
+    predicate: tir.PrimExpr | bool = True,
+    dtype: str | None = None,
+) -> None:
+    """Emit a semantic sum reduction over the active thread axis."""
+
+    thread_reduce(value, out, axis, op="sum", predicate=predicate, dtype=dtype)
+
+
+def thread_allreduce_sum(
+    value: tir.PrimExpr,
+    out: tir.BufferLoad,
+    reduce_index: tir.PrimExpr,
+    predicate: tir.PrimExpr | bool = True,
+    dtype: str | None = None,
+) -> None:
+    """Backward-compatible alias for ``thread_reduce_sum``."""
+
+    thread_reduce_sum(value, out, reduce_index, predicate=predicate, dtype=dtype)
+
+
+def row_reduce(
+    buffer: tir.Buffer,
+    out: tir.Buffer,
+    op: ReduceKind = "sum",
+    axis: int = -1,
+    clear: bool = True,
+    batch: int = 1,
+    nan_propagate: bool = False,
+    policy: object | None = None,
+) -> None:
+    """Emit semantic row-oriented TileOp reduction IR.
+
+    ``policy`` is reserved for scheduler-level strategy selection.  Today the
+    backend strategy still comes from the normal TileOp reduction lowering.
+    """
+
+    if policy is not None:
+        raise ValueError("row_reduce policy is reserved for scheduler ReductionPlan")
+    reduce(buffer, out, op, _legalize_dim(buffer, axis), clear, batch, nan_propagate)
+
+
+def block_reduce(
+    buffer: tir.Buffer,
+    out: tir.Buffer,
+    op: ReduceKind = "sum",
+    axis: int = -1,
+    clear: bool = True,
+    batch: int = 1,
+    nan_propagate: bool = False,
+    policy: object | None = None,
+) -> None:
+    """Emit semantic block-oriented TileOp reduction IR.
+
+    This is an API-level distinction for callers and future scheduler metadata;
+    current lowering shares the existing TileOp reduction implementation.
+    """
+
+    if policy is not None:
+        raise ValueError("block_reduce policy is reserved for scheduler ReductionPlan")
+    reduce(buffer, out, op, _legalize_dim(buffer, axis), clear, batch, nan_propagate)
 
 
 # NOTE(chaofan): T.reduce is implemented as a macro, so no return

@@ -212,6 +212,24 @@ def _make_reduce_kernel(op, *, length=32, dtype=T.float32, threads=32):
     return reduce_kernel
 
 
+def _make_semantic_reduce_api_kernel(api, *, length=32, dtype=T.float32, threads=32):
+    @T.prim_func
+    def reduce_kernel(A: T.Tensor((length,), dtype), B: T.Tensor((1,), dtype)):
+        with T.Kernel(1, threads=threads):
+            src = T.alloc_fragment((length,), dtype)
+            dst = T.alloc_fragment((1,), dtype)
+            T.copy(A, src)
+            if api == "row":
+                T.row_reduce(src, dst, op="sum")
+            elif api == "block":
+                T.block_reduce(src, dst, op="sum")
+            else:
+                raise ValueError(api)
+            T.copy(dst, B)
+
+    return reduce_kernel
+
+
 def _make_metal_template_row_reduce_sum(rows=16, cols=1024, dtype="float32"):
     template = GeneralReductionTemplate(structure="SR", shape=[rows, cols], dtype=dtype)
     return template.make_metal_row_reduce_sum()
@@ -291,7 +309,8 @@ def _make_split_thread_allreduce_parallel_kernel(
             kr = T.floormod(lane, reduce_extent)
             group = T.floordiv(lane, reduce_extent)
             accum[0] = A[row * reduce_threads + lane]
-            T.thread_allreduce_sum(accum[0], reduced[0], kr)
+            reduce_axis = T.reduction_axis("p", reduce_extent, kr)
+            T.thread_reduce(accum[0], reduced[0], reduce_axis, op="sum")
             if kr == 0:
                 B[row * groups + group] = reduced[0]
 
@@ -507,6 +526,33 @@ def test_metal_template_row_reduce_rejects_non_innermost_structure():
 
     with pytest.raises(ValueError, match="structure='SR'"):
         template.make_metal_row_reduce_sum()
+
+
+def test_thread_reduce_surface_rejects_unsupported_op():
+    with pytest.raises(ValueError, match="unsupported thread_reduce op"):
+        T.thread_reduce(T.float32(1.0), None, T.int32(0), op="max")
+
+
+def test_reduction_axis_rejects_invalid_metadata():
+    with pytest.raises(ValueError, match="non-empty name"):
+        T.reduction_axis("", 32, T.int32(0))
+    with pytest.raises(ValueError, match="unsupported reduction_axis role"):
+        T.reduction_axis("p", 32, T.int32(0), role="warp")
+
+
+@pytest.mark.parametrize("api", ["row", "block"])
+def test_semantic_reduce_api_lowers_existing_tileop_reduce(api):
+    src = _lower_source(_make_semantic_reduce_api_kernel(api))
+
+    _assert_no_cuda_reduce_leakage(src)
+    _assert_metal_reduce_tokens(src)
+
+
+def test_row_and_block_reduce_policy_is_reserved_for_scheduler():
+    with pytest.raises(ValueError, match="row_reduce policy is reserved"):
+        T.row_reduce(None, None, policy={"strategy": "simd"})
+    with pytest.raises(ValueError, match="block_reduce policy is reserved"):
+        T.block_reduce(None, None, policy={"strategy": "simd"})
 
 
 def test_metal_lower_thread_allreduce_accepts_split_simdgroup_index():
