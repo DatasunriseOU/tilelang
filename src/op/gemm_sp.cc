@@ -273,7 +273,7 @@ LayoutMap GemmSPNode::InferLayout(const LayoutInferArgs &T,
       const int64_t mat_continuous = *as_const_int(a_->shape[dim_A - 1]);
       auto layout =
           makeGemmABLayoutHopper(mat_stride, mat_continuous, mat_continuous,
-                                 a_->dtype.bits(), transA_ ? 1 : 2);
+                                 a_->dtype.bits(), /*k_inner=*/true);
       results.Set(a_, ExpandLayoutToMatchBuffer(layout, a_));
     } else {
       ICHECK(false) << "Not implemented";
@@ -287,7 +287,7 @@ LayoutMap GemmSPNode::InferLayout(const LayoutInferArgs &T,
           transB_ ? mat_continuous : mat_continuous / warp_n;
       auto layout =
           makeGemmABLayoutHopper(mat_stride, mat_continuous, continuity,
-                                 b_->dtype.bits(), transB_ ? 2 : 1);
+                                 b_->dtype.bits(), /*k_inner=*/true);
       results.Set(b_, ExpandLayoutToMatchBuffer(layout, b_));
     } else {
       ICHECK(false) << "WGMMA only support B in shared.";

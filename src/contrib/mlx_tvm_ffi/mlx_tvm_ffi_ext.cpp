@@ -6,6 +6,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -307,7 +308,75 @@ mx::Dtype dtype_from_name(const std::string& raw_name) {
   if (name == "float64") return mx::float64;
   if (name == "bfloat16") return mx::bfloat16;
   if (name == "complex64") return mx::complex64;
+  if (name == "float8_e3m4" || name == "float8_e4m3" ||
+      name == "float8_e4m3b11fnuz" || name == "float8_e4m3fn" ||
+      name == "float8_e4m3fnuz" || name == "float8_e5m2" ||
+      name == "float8_e5m2fnuz" || name == "float8_e8m0fnu") {
+    return mx::uint8;
+  }
   throw std::runtime_error("unsupported MLX output dtype for TVM-FFI bridge: " + raw_name);
+}
+
+bool dl_dtype_equal(DLDataType lhs, DLDataType rhs) {
+  return lhs.code == rhs.code && lhs.bits == rhs.bits && lhs.lanes == rhs.lanes;
+}
+
+bool is_fp8_dlpack_dtype(DLDataType dtype) {
+  return dtype.bits == 8 && dtype.lanes == 1 &&
+         (dtype.code == kDLFloat8_e3m4 || dtype.code == kDLFloat8_e4m3 ||
+          dtype.code == kDLFloat8_e4m3b11fnuz || dtype.code == kDLFloat8_e4m3fn ||
+          dtype.code == kDLFloat8_e4m3fnuz || dtype.code == kDLFloat8_e5m2 ||
+          dtype.code == kDLFloat8_e5m2fnuz || dtype.code == kDLFloat8_e8m0fnu);
+}
+
+DLDataType expected_dlpack_dtype_from_name(const std::string& raw_name) {
+  const auto name = normalize_dtype_name(raw_name);
+  if (name == "bool_") return DLDataType{kDLBool, 8, 1};
+  if (name == "uint8") return DLDataType{kDLUInt, 8, 1};
+  if (name == "uint16") return DLDataType{kDLUInt, 16, 1};
+  if (name == "uint32") return DLDataType{kDLUInt, 32, 1};
+  if (name == "uint64") return DLDataType{kDLUInt, 64, 1};
+  if (name == "int8") return DLDataType{kDLInt, 8, 1};
+  if (name == "int16") return DLDataType{kDLInt, 16, 1};
+  if (name == "int32") return DLDataType{kDLInt, 32, 1};
+  if (name == "int64") return DLDataType{kDLInt, 64, 1};
+  if (name == "float16") return DLDataType{kDLFloat, 16, 1};
+  if (name == "float32") return DLDataType{kDLFloat, 32, 1};
+  if (name == "float64") return DLDataType{kDLFloat, 64, 1};
+  if (name == "bfloat16") return DLDataType{kDLBfloat, 16, 1};
+  if (name == "complex64") return DLDataType{kDLComplex, 64, 1};
+  if (name == "float8_e3m4") return DLDataType{kDLFloat8_e3m4, 8, 1};
+  if (name == "float8_e4m3") return DLDataType{kDLFloat8_e4m3, 8, 1};
+  if (name == "float8_e4m3b11fnuz") return DLDataType{kDLFloat8_e4m3b11fnuz, 8, 1};
+  if (name == "float8_e4m3fn") return DLDataType{kDLFloat8_e4m3fn, 8, 1};
+  if (name == "float8_e4m3fnuz") return DLDataType{kDLFloat8_e4m3fnuz, 8, 1};
+  if (name == "float8_e5m2") return DLDataType{kDLFloat8_e5m2, 8, 1};
+  if (name == "float8_e5m2fnuz") return DLDataType{kDLFloat8_e5m2fnuz, 8, 1};
+  if (name == "float8_e8m0fnu") return DLDataType{kDLFloat8_e8m0fnu, 8, 1};
+  throw std::runtime_error("unsupported expected TVM dtype for MLX TVM-FFI bridge: " + raw_name);
+}
+
+DLDataType dlpack_dtype_for_tensor_view(
+    mx::Dtype actual_mlx_dtype,
+    const std::string* expected_dtype_name) {
+  const DLDataType actual = mlx_dtype_to_dlpack(actual_mlx_dtype);
+  if (expected_dtype_name == nullptr || expected_dtype_name->empty() ||
+      *expected_dtype_name == "None" || *expected_dtype_name == "none" ||
+      *expected_dtype_name == "null") {
+    return actual;
+  }
+  const DLDataType expected = expected_dlpack_dtype_from_name(*expected_dtype_name);
+  if (dl_dtype_equal(actual, expected)) {
+    return actual;
+  }
+  if (is_fp8_dlpack_dtype(expected) &&
+      (actual.code == kDLUInt || actual.code == kDLInt) &&
+      actual.bits == 8 && actual.lanes == 1) {
+    return expected;
+  }
+  throw std::runtime_error(
+      "MLX DLTensor dtype does not match expected TileLang ABI dtype: expected " +
+      *expected_dtype_name + " for native TVM-FFI tensor view");
 }
 
 mx::Shape shape_from_i64(const std::vector<int64_t>& shape) {
@@ -437,6 +506,37 @@ struct BorrowedTensorView {
   std::vector<int64_t> strides;
 };
 
+int64_t product_i64(const std::vector<int64_t>& shape) {
+  int64_t product = 1;
+  for (int64_t dim : shape) {
+    if (dim < 0 || (dim != 0 && product > std::numeric_limits<int64_t>::max() / dim)) {
+      throw std::runtime_error("tensor shape product is out of range");
+    }
+    product *= dim;
+  }
+  return product;
+}
+
+std::vector<int64_t> compact_strides_for_shape(const std::vector<int64_t>& shape) {
+  std::vector<int64_t> strides(shape.size(), 1);
+  int64_t stride = 1;
+  for (int i = static_cast<int>(shape.size()) - 1; i >= 0; --i) {
+    strides[static_cast<size_t>(i)] = stride;
+    stride *= std::max<int64_t>(shape[static_cast<size_t>(i)], 1);
+  }
+  return strides;
+}
+
+mx::Strides compact_mlx_strides_for_shape(const std::vector<int64_t>& shape) {
+  auto vector_strides = compact_strides_for_shape(shape);
+  mx::Strides strides;
+  strides.reserve(vector_strides.size());
+  for (int64_t stride : vector_strides) {
+    strides.push_back(stride);
+  }
+  return strides;
+}
+
 bool is_compact_array(const mx::array& array) {
   const auto& shape = array.shape();
   const auto& strides = array.strides();
@@ -458,7 +558,9 @@ bool is_compact_array(const mx::array& array) {
 BorrowedTensorView make_tensor_view(
     const mx::array& array,
     mx::Stream stream,
-    bool is_output) {
+    bool is_output,
+    const std::string* expected_dtype_name = nullptr,
+    const std::vector<int64_t>* shape_override = nullptr) {
   void* buffer = const_cast<void*>(array.buffer().ptr());
   auto& counters = debug_counters();
   if (is_output) {
@@ -484,22 +586,35 @@ BorrowedTensorView make_tensor_view(
   }
 
   BorrowedTensorView view;
-  view.shape.reserve(array.ndim());
-  for (auto dim : array.shape()) {
-    view.shape.push_back(static_cast<int64_t>(dim));
+  if (shape_override != nullptr) {
+    view.shape = *shape_override;
+    if (is_output && product_i64(view.shape) != static_cast<int64_t>(array.size())) {
+      throw std::runtime_error(
+          "MLX owner output size does not match TileLang result ABI shape");
+    }
+    view.strides = compact_strides_for_shape(view.shape);
+  } else {
+    view.shape.reserve(array.ndim());
+    for (auto dim : array.shape()) {
+      view.shape.push_back(static_cast<int64_t>(dim));
+    }
+    view.strides.assign(array.strides().begin(), array.strides().end());
   }
-  view.strides.assign(array.strides().begin(), array.strides().end());
 
   view.tensor.data = buffer;
   view.tensor.device = DLDevice{
       static_cast<DLDeviceType>(kDLMetalDeviceType),
       stream.device.index};
   view.tensor.ndim = static_cast<int>(view.shape.size());
-  view.tensor.dtype = mlx_dtype_to_dlpack(array.dtype());
+  view.tensor.dtype = dlpack_dtype_for_tensor_view(array.dtype(), expected_dtype_name);
   view.tensor.shape = view.shape.data();
   view.tensor.strides = view.strides.data();
   view.tensor.byte_offset = static_cast<uint64_t>(array.offset());
   return view;
+}
+
+mx::array compact_input_array(const mx::array& array) {
+  return mx::contiguous(array, false, mx::default_stream(mx::Device::gpu));
 }
 
 struct ExternalCommandBufferScope {
@@ -620,14 +735,20 @@ class TVMFFIMetalCall : public mx::Primitive {
       uint64_t func_handle,
       int64_t num_params,
       std::vector<int64_t> result_indices,
+      std::vector<std::vector<int64_t>> output_shapes,
+      std::vector<std::string> expected_param_dtypes,
       std::vector<int64_t> zero_init_output_positions,
+      bool owner_outputs_are_inputs,
       std::shared_ptr<MetalLaunchSyncState> launch_sync_state,
       std::vector<std::shared_ptr<MetalSyncEdge>> wait_edges)
       : mx::Primitive(stream),
         func_handle_(reinterpret_cast<TVMFFIObjectHandle>(func_handle)),
         num_params_(num_params),
         result_indices_(std::move(result_indices)),
+        output_shapes_(std::move(output_shapes)),
+        expected_param_dtypes_(std::move(expected_param_dtypes)),
         zero_init_output_positions_(std::move(zero_init_output_positions)),
+        owner_outputs_are_inputs_(owner_outputs_are_inputs),
         launch_sync_state_(std::move(launch_sync_state)),
         wait_edges_(std::move(wait_edges)) {
     if (func_handle_ == nullptr) {
@@ -638,6 +759,10 @@ class TVMFFIMetalCall : public mx::Primitive {
     }
     if (num_params_ <= 0) {
       throw std::runtime_error("TVM-FFI bridge requires a positive parameter count");
+    }
+    if (!expected_param_dtypes_.empty() &&
+        static_cast<int64_t>(expected_param_dtypes_.size()) != num_params_) {
+      throw std::runtime_error("TVM-FFI expected param dtype metadata length mismatch");
     }
     std::sort(result_indices_.begin(), result_indices_.end());
     result_indices_.erase(
@@ -651,6 +776,9 @@ class TVMFFIMetalCall : public mx::Primitive {
       if (idx < 0 || idx >= num_params_) {
         throw std::runtime_error("TVM-FFI result index is outside the parameter list");
       }
+    }
+    if (output_shapes_.size() != result_indices_.size()) {
+      throw std::runtime_error("TVM-FFI output shape metadata/result_idx length mismatch");
     }
     for (int64_t idx : zero_init_output_positions_) {
       if (idx < 0 || idx >= static_cast<int64_t>(result_indices_.size())) {
@@ -684,15 +812,46 @@ class TVMFFIMetalCall : public mx::Primitive {
       throw std::runtime_error("TVM-FFI bridge output count mismatch");
     }
     const int64_t expected_inputs = num_params_ - static_cast<int64_t>(result_indices_.size());
-    if (static_cast<int64_t>(inputs.size()) != expected_inputs) {
+    const int64_t expected_primitive_inputs =
+        expected_inputs +
+        (owner_outputs_are_inputs_ ? static_cast<int64_t>(result_indices_.size()) : 0);
+    if (static_cast<int64_t>(inputs.size()) != expected_primitive_inputs) {
       throw std::runtime_error("TVM-FFI bridge input count mismatch");
     }
 
     auto* encoder = get_command_encoder(stream());
-    for (auto& out : outputs) {
-      out.set_data(mx::allocator::malloc(out.nbytes()));
-      if (out.buffer().ptr() == nullptr) {
-        throw std::runtime_error("MLX failed to allocate TVM-FFI output buffer");
+    std::vector<mx::array> call_inputs;
+    call_inputs.reserve(static_cast<size_t>(expected_inputs));
+    for (int64_t i = 0; i < expected_inputs; ++i) {
+      call_inputs.push_back(inputs.at(static_cast<size_t>(i)));
+    }
+    std::vector<mx::array> owner_outputs;
+    if (owner_outputs_are_inputs_) {
+      owner_outputs.reserve(outputs.size());
+      for (size_t i = 0; i < outputs.size(); ++i) {
+        const auto& owner = inputs.at(static_cast<size_t>(expected_inputs) + i);
+        if (owner.buffer().ptr() == nullptr) {
+          throw std::runtime_error(
+              "MLX owner output array has no materialized Metal buffer at TVM-FFI launch time");
+        }
+        if (!is_compact_array(owner)) {
+          throw std::runtime_error(
+              "MLX owner output array is not compact at TVM-FFI launch time");
+        }
+        owner_outputs.push_back(owner);
+        outputs.at(i).copy_shared_buffer(
+            owner,
+            compact_mlx_strides_for_shape(output_shapes_.at(i)),
+            mx::array::Flags{true, true, true},
+            static_cast<size_t>(product_i64(output_shapes_.at(i))),
+            owner.offset());
+      }
+    } else {
+      for (auto& out : outputs) {
+        out.set_data(mx::allocator::malloc(out.nbytes()));
+        if (out.buffer().ptr() == nullptr) {
+          throw std::runtime_error("MLX failed to allocate TVM-FFI output buffer");
+        }
       }
     }
 
@@ -706,8 +865,25 @@ class TVMFFIMetalCall : public mx::Primitive {
           result_indices_.begin(),
           result_indices_.end(),
           param_idx);
-      const mx::array& array = is_output ? outputs.at(output_pos++) : inputs.at(input_pos++);
-      views.push_back(make_tensor_view(array, stream(), is_output));
+      const std::vector<int64_t>* shape_override = nullptr;
+      const mx::array& array =
+          is_output ? outputs.at(output_pos) : call_inputs.at(input_pos++);
+      if (is_output) {
+        shape_override = &output_shapes_.at(output_pos);
+        ++output_pos;
+      }
+      const std::string* expected_dtype = expected_param_dtypes_.empty()
+          ? nullptr
+          : &expected_param_dtypes_.at(static_cast<size_t>(param_idx));
+      try {
+        views.push_back(
+            make_tensor_view(array, stream(), is_output, expected_dtype, shape_override));
+      } catch (const std::exception& exc) {
+        std::ostringstream os;
+        os << "TVM-FFI parameter " << param_idx << (is_output ? " output" : " input")
+           << " failed DLTensor binding: " << exc.what();
+        throw std::runtime_error(os.str());
+      }
       TVMFFIAny& arg = args[static_cast<size_t>(param_idx)];
       arg.type_index = kTVMFFIDLTensorPtr;
       arg.zero_padding = 0;
@@ -766,7 +942,10 @@ class TVMFFIMetalCall : public mx::Primitive {
   TVMFFIObjectHandle func_handle_;
   int64_t num_params_;
   std::vector<int64_t> result_indices_;
+  std::vector<std::vector<int64_t>> output_shapes_;
+  std::vector<std::string> expected_param_dtypes_;
   std::vector<int64_t> zero_init_output_positions_;
+  bool owner_outputs_are_inputs_;
   std::shared_ptr<MetalLaunchSyncState> launch_sync_state_;
   std::vector<std::shared_ptr<MetalSyncEdge>> wait_edges_;
 };
@@ -778,9 +957,11 @@ std::vector<mx::array> tvm_ffi_metal_call(
     const std::vector<std::string>& output_dtypes,
     const std::vector<int64_t>& result_indices,
     int64_t num_params,
+    const std::vector<std::string>& expected_param_dtypes,
     const std::vector<int64_t>& zero_init_output_positions,
     std::shared_ptr<MetalLaunchSyncState> launch_sync_state,
-    std::vector<std::shared_ptr<MetalSyncEdge>> wait_edges) {
+    std::vector<std::shared_ptr<MetalSyncEdge>> wait_edges,
+    const std::vector<mx::array>* owner_outputs = nullptr) {
   if (output_shapes.size() != output_dtypes.size()) {
     throw std::runtime_error("TVM-FFI output_shapes/output_dtypes length mismatch");
   }
@@ -802,10 +983,18 @@ std::vector<mx::array> tvm_ffi_metal_call(
       func_handle,
       num_params,
       result_indices,
+      output_shapes,
+      expected_param_dtypes,
       zero_init_output_positions,
+      owner_outputs != nullptr,
       std::move(launch_sync_state),
       std::move(wait_edges));
-  return mx::array::make_arrays(std::move(shapes), dtypes, primitive, inputs);
+  std::vector<mx::array> primitive_inputs = inputs;
+  if (owner_outputs != nullptr) {
+    primitive_inputs.insert(
+        primitive_inputs.end(), owner_outputs->begin(), owner_outputs->end());
+  }
+  return mx::array::make_arrays(std::move(shapes), dtypes, primitive, primitive_inputs);
 }
 
 nb::object wrap_mlx_array(mx::array&& array) {
@@ -922,6 +1111,7 @@ PyObject* c_api_metal_call(
         parse_string_sequence(nb::handle(output_dtypes)),
         parse_i64_sequence(nb::handle(result_indices)),
         num_params,
+        std::vector<std::string>{},
         parse_i64_sequence(nb::handle(zero_init)),
         parse_launch_sync_state(nb::handle(launch_state)),
         parse_sync_edge_sequence(nb::handle(waits)))));
@@ -1094,11 +1284,13 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
          int64_t num_params,
          nb::handle zero_init_output_positions,
          nb::handle launch_sync_state,
-         nb::handle wait_edges) {
+         nb::handle wait_edges,
+         nb::handle param_dtypes) {
         std::vector<mx::array> parsed_inputs;
         std::vector<std::vector<int64_t>> parsed_output_shapes;
         std::vector<std::string> parsed_output_dtypes;
         std::vector<int64_t> parsed_result_indices;
+        std::vector<std::string> parsed_param_dtypes;
         std::vector<int64_t> parsed_zero_init_output_positions;
         std::shared_ptr<tilelang::mlx_tvm_ffi::MetalLaunchSyncState> parsed_launch_sync_state;
         std::vector<std::shared_ptr<tilelang::mlx_tvm_ffi::MetalSyncEdge>> parsed_wait_edges;
@@ -1121,6 +1313,13 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
           parsed_result_indices = tilelang::mlx_tvm_ffi::parse_i64_sequence(result_indices);
         } catch (const std::exception& exc) {
           throw std::runtime_error(std::string("failed to parse result indices: ") + exc.what());
+        }
+        try {
+          if (!param_dtypes.is_none()) {
+            parsed_param_dtypes = tilelang::mlx_tvm_ffi::parse_string_sequence(param_dtypes);
+          }
+        } catch (const std::exception& exc) {
+          throw std::runtime_error(std::string("failed to parse param dtypes: ") + exc.what());
         }
         try {
           parsed_zero_init_output_positions =
@@ -1148,6 +1347,7 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
                 parsed_output_dtypes,
                 parsed_result_indices,
                 num_params,
+                parsed_param_dtypes,
                 parsed_zero_init_output_positions,
                 parsed_launch_sync_state,
                 parsed_wait_edges));
@@ -1160,7 +1360,88 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
       "num_params"_a,
       "zero_init_output_positions"_a = nb::make_tuple(),
       "launch_sync_state"_a = nb::none(),
-      "wait_edges"_a = nb::none());
+      "wait_edges"_a = nb::none(),
+      "param_dtypes"_a = nb::none());
+  m.def(
+      "metal_call_owner_outputs",
+      [](uint64_t func_handle,
+         nb::handle inputs,
+         nb::handle owner_outputs,
+         nb::handle output_shapes,
+         nb::handle output_dtypes,
+         nb::handle result_indices,
+         int64_t num_params,
+         nb::handle zero_init_output_positions,
+         nb::handle launch_sync_state,
+         nb::handle wait_edges,
+         nb::handle param_dtypes) {
+        std::vector<mx::array> parsed_inputs;
+        std::vector<mx::array> parsed_owner_outputs;
+        std::vector<std::vector<int64_t>> parsed_output_shapes;
+        std::vector<std::string> parsed_output_dtypes;
+        std::vector<int64_t> parsed_result_indices;
+        std::vector<std::string> parsed_param_dtypes;
+        std::vector<int64_t> parsed_zero_init_output_positions;
+        std::shared_ptr<tilelang::mlx_tvm_ffi::MetalLaunchSyncState> parsed_launch_sync_state;
+        std::vector<std::shared_ptr<tilelang::mlx_tvm_ffi::MetalSyncEdge>> parsed_wait_edges;
+        try {
+          parsed_inputs = tilelang::mlx_tvm_ffi::parse_array_sequence(inputs);
+          parsed_owner_outputs = tilelang::mlx_tvm_ffi::parse_array_sequence(owner_outputs);
+          parsed_output_shapes = tilelang::mlx_tvm_ffi::parse_shape_sequence(output_shapes);
+          parsed_output_dtypes = tilelang::mlx_tvm_ffi::parse_string_sequence(output_dtypes);
+          parsed_result_indices = tilelang::mlx_tvm_ffi::parse_i64_sequence(result_indices);
+          if (!param_dtypes.is_none()) {
+            parsed_param_dtypes = tilelang::mlx_tvm_ffi::parse_string_sequence(param_dtypes);
+          }
+          parsed_zero_init_output_positions =
+              tilelang::mlx_tvm_ffi::parse_i64_sequence(zero_init_output_positions);
+          parsed_launch_sync_state =
+              tilelang::mlx_tvm_ffi::parse_launch_sync_state(launch_sync_state);
+          parsed_wait_edges = tilelang::mlx_tvm_ffi::parse_sync_edge_sequence(wait_edges);
+        } catch (const std::exception& exc) {
+          throw std::runtime_error(
+              std::string("failed to parse native owner-output call: ") + exc.what());
+        }
+        return tilelang::mlx_tvm_ffi::wrap_mlx_arrays(
+            tilelang::mlx_tvm_ffi::tvm_ffi_metal_call(
+                func_handle,
+                parsed_inputs,
+                parsed_output_shapes,
+                parsed_output_dtypes,
+                parsed_result_indices,
+                num_params,
+                parsed_param_dtypes,
+                parsed_zero_init_output_positions,
+                parsed_launch_sync_state,
+                parsed_wait_edges,
+                &parsed_owner_outputs));
+      },
+      "func_handle"_a,
+      "inputs"_a,
+      "owner_outputs"_a,
+      "output_shapes"_a,
+      "output_dtypes"_a,
+      "result_indices"_a,
+      "num_params"_a,
+      "zero_init_output_positions"_a = nb::make_tuple(),
+      "launch_sync_state"_a = nb::none(),
+      "wait_edges"_a = nb::none(),
+      "param_dtypes"_a = nb::none());
+  m.def(
+      "is_compact",
+      [](nb::handle array) {
+        return tilelang::mlx_tvm_ffi::is_compact_array(
+            tilelang::mlx_tvm_ffi::parse_mlx_array(array));
+      },
+      "array"_a);
+  m.def(
+      "compact_input",
+      [](nb::handle array) {
+        return tilelang::mlx_tvm_ffi::wrap_mlx_array(
+            tilelang::mlx_tvm_ffi::compact_input_array(
+                tilelang::mlx_tvm_ffi::parse_mlx_array(array)));
+      },
+      "array"_a);
   m.def("make_launch_sync_state", &tilelang::mlx_tvm_ffi::make_launch_sync_state);
   m.def("make_sync_edge", &tilelang::mlx_tvm_ffi::make_sync_edge);
   m.def("debug_state", &tilelang::mlx_tvm_ffi::debug_state);

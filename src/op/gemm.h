@@ -162,7 +162,7 @@ public:
                         InferLevel level) const override;
   AccessRegions GetAccessRegions() const override;
 
-  TileOperator Clone() const;
+  TileOperator Clone() const override;
 
   // Target-specific GEMM instruction key.
   String getGemmInstructionKey(int block_size, Target target) const;

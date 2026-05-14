@@ -72,7 +72,7 @@ public:
                         InferLevel level) const override;
   AccessRegions GetAccessRegions() const override;
 
-  TileOperator Clone() const;
+  TileOperator Clone() const override;
 
 private:
   mutable bool completed_ = false;

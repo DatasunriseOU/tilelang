@@ -24,14 +24,14 @@ public:
                                     TileOperatorNode);
 
   /// Override Lower to add TMA support
-  Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const;
+  Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
 
   /// Override InferLayout to add TMA layout inference
-  LayoutMap InferLayout(const LayoutInferArgs &T, InferLevel level) const;
+  LayoutMap InferLayout(const LayoutInferArgs &T, InferLevel level) const override;
 
   static const Op &Get();
   const Op &GetElemOp() const override;
-  TileOperator Clone() const;
+  TileOperator Clone() const override;
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;

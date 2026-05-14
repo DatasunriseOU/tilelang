@@ -35,10 +35,10 @@ public:
   mutable ParallelOp par_op_; ///< Associated parallel operation
 
   /// Default Lower implementation for non-TMA atomic ops
-  Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const;
+  Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
 
   /// Default InferLayout implementation
-  LayoutMap InferLayout(const LayoutInferArgs &T, InferLevel level) const;
+  LayoutMap InferLayout(const LayoutInferArgs &T, InferLevel level) const override;
 
   /// Get memory order from annotations (default: relaxed = 0)
   int GetMemoryOrder() const {
@@ -76,7 +76,7 @@ public:
 
   static const Op &Get();
   const Op &GetElemOp() const override;
-  TileOperator Clone() const;
+  TileOperator Clone() const override;
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
@@ -109,7 +109,7 @@ public:
 
   static const Op &Get();
   const Op &GetElemOp() const override;
-  TileOperator Clone() const;
+  TileOperator Clone() const override;
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;

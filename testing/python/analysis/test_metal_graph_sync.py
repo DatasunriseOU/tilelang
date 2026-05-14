@@ -185,7 +185,7 @@ def test_dependency_metadata_preserves_tir_param_names_and_result_positions():
 
 
 def test_registered_native_output_identity_is_preserved_before_compaction():
-    from tilelang.contrib.mlx_tvm_ffi import _contiguous_mlx_input
+    from tilelang.jit.adapter._mlx_tvm_ffi import _contiguous_mlx_input
 
     clear_metal_graph_sync_state_for_tests()
     native = _FakeNative()

@@ -33,7 +33,7 @@ from tilelang.contrib.mlx_interop import (
     mlx_metal_output,
     validate_dlpack_inputs_for_target,
 )
-from tilelang.contrib.mlx_tvm_ffi import (
+from tilelang.jit.adapter._mlx_tvm_ffi import (
     MLXTVMFFIBridgeUnavailable,
     is_available as mlx_tvm_ffi_is_available,
     metal_call as mlx_tvm_ffi_metal_call,
@@ -336,6 +336,17 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 and all(is_buffer_param[i] for i in self.result_idx)
             )
             use_native_mlx_graph = mlx_compact_graph_candidate and mlx_tvm_ffi_is_available()
+            owner_outputs_requested = output_overrides is not None or using_full_abi_args
+            use_native_mlx_owner_outputs = (
+                uses_mlx_runtime
+                and target_kind == "metal"
+                and self.result_idx
+                and owner_outputs_requested
+                and hasattr(executable, "__getitem__")
+                and all(is_buffer_param[i] for i in range(len(self.params)) if i not in self.result_idx)
+                and all(is_buffer_param[i] for i in self.result_idx)
+                and mlx_tvm_ffi_is_available()
+            )
 
             # Resolve the device used for outputs. Prefer the first tensor input's device
             # if available, otherwise use PyTorch's current device.
@@ -345,6 +356,26 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             ins_idx: int = 0
             tensor_list: list[Any] = []
 
+            def resolved_param_shape(param_index: int) -> list[int]:
+                shape = []
+                for s in param_shapes[param_index]:
+                    if isinstance(s, tir.Var):
+                        for key in dynamic_symbolic_map:
+                            if str(s) == str(key):
+                                ref_id, ref_tensor_idx, ref_shape_idx, stride_scale = dynamic_symbolic_map[key]
+                                if ref_id == 2:
+                                    shape.append(inputs[ref_tensor_idx])
+                                elif ref_id == 0:
+                                    shape.append(_shape_dim(tensor_list[ref_tensor_idx], ref_shape_idx))
+                                elif ref_id == 1:
+                                    shape.append(
+                                        _stride_dim(tensor_list[ref_tensor_idx], ref_shape_idx)
+                                        * stride_scale
+                                    )
+                    else:
+                        shape.append(int(s))
+                return shape
+
             # Prepare input and output tensors
             for i in range(len(self.params)):
                 if using_full_abi_args:
@@ -352,24 +383,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 elif i in provided_outputs:
                     tensor = provided_outputs[i]
                 elif i in self.result_idx:
-                    shape = []
-                    # Now working with native Python list, no FFI calls needed
-                    for s in param_shapes[i]:
-                        if isinstance(s, tir.Var):
-                            for key in dynamic_symbolic_map:
-                                if str(s) == str(key):
-                                    ref_id, ref_tensor_idx, ref_shape_idx, stride_scale = dynamic_symbolic_map[key]
-                                    if ref_id == 2:
-                                        shape.append(inputs[ref_tensor_idx])
-                                    elif ref_id == 0:
-                                        shape.append(_shape_dim(tensor_list[ref_tensor_idx], ref_shape_idx))
-                                    elif ref_id == 1:
-                                        shape.append(
-                                            _stride_dim(tensor_list[ref_tensor_idx], ref_shape_idx)
-                                            * stride_scale
-                                        )
-                        else:  # Already converted to Python int during initialization
-                            shape.append(s)
+                    shape = resolved_param_shape(i)
 
                     if len(shape) == 0:
                         param_name = self.params[i].name if hasattr(self.params[i], "name") else f"parameter_{i}"
@@ -411,6 +425,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                         output_dtypes=[tensor_list[i].dtype for i in self.result_idx],
                         result_indices=self.result_idx,
                         num_params=len(self.params),
+                        param_dtypes=expected_dtype_strs,
                         dependency_metadata=dependency_metadata,
                         zero_init_output_positions=self._metal_zero_init_output_positions(),
                     )
@@ -420,6 +435,41 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 if len(self.result_idx) == 1:
                     return graph_outputs[0]
                 return list(graph_outputs)
+            if use_native_mlx_owner_outputs:
+                input_param_indices = [i for i in range(len(self.params)) if i not in self.result_idx]
+                dependency_metadata = self._metal_dependency_metadata(
+                    input_param_indices=input_param_indices,
+                    param_names=param_names,
+                    command_buffer_domain=_tilelang_metal_command_buffer_domain,
+                )
+                try:
+                    owner_aliases = mlx_tvm_ffi_metal_call(
+                        executable["main"],
+                        inputs=[tensor_list[i] for i in input_param_indices],
+                        owner_outputs=[tensor_list[i] for i in self.result_idx],
+                        output_shapes=[resolved_param_shape(i) for i in self.result_idx],
+                        output_dtypes=[expected_dtype_strs[i] for i in self.result_idx],
+                        result_indices=self.result_idx,
+                        num_params=len(self.params),
+                        param_dtypes=expected_dtype_strs,
+                        dependency_metadata=dependency_metadata,
+                        zero_init_output_positions=self._metal_zero_init_output_positions(),
+                    )
+                    import mlx.core as mx  # type: ignore[import-not-found]
+
+                    mx.eval(*owner_aliases)
+                    returned_outputs = (
+                        output_overrides
+                        if output_overrides is not None
+                        else tuple(tensor_list[i] for i in self.result_idx)
+                    )
+                    if len(self.result_idx) == 1:
+                        return returned_outputs[0]
+                    if output_overrides is not None:
+                        return output_overrides
+                    return list(returned_outputs)
+                except MLXTVMFFIBridgeUnavailable:
+                    pass
 
             exec_tensor_list = (
                 mlx_arrays_to_tvm_tensors(

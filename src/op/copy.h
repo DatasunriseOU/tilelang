@@ -116,7 +116,7 @@ protected:
    * \brief Get the TVM Op handle corresponding to this Conv2DIm2Col operator.
    * @return Reference to the singleton TVM Op representing this operator.
    */
-  TileOperator Clone() const;
+  TileOperator Clone() const override;
 };
 
 using CopyTargetPredicate = bool (*)(Target target);
@@ -208,7 +208,7 @@ public:
    * \brief Get TVM Op handle.
    */
   static const Op &Get();
-  TileOperator Clone() const;
+  TileOperator Clone() const override;
 };
 
 struct Conv2DIm2ColImpl {

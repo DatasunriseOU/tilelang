@@ -22,8 +22,8 @@ public:
   Array<Range> region; ///< Region to fill within the buffer
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.Fill", FillNode, TileOperatorNode);
 
-  Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const;
-  LayoutMap InferLayout(const LayoutInferArgs &T, InferLevel level) const;
+  Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
+  LayoutMap InferLayout(const LayoutInferArgs &T, InferLevel level) const override;
   static const Op &Get();
 
   static void RegisterReflection() {
@@ -34,7 +34,7 @@ public:
         .def_ro("region", &FillNode::region);
   }
 
-  TileOperator Clone() const;
+  TileOperator Clone() const override;
 
 private:
   /// Create SIMT-style parallel loop for filling
