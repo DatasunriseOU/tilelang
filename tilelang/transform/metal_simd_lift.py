@@ -39,6 +39,7 @@ from tvm import ir as tvm_ir
 from tvm import tir, IRModule
 from tvm.target import Target
 from tvm.tir.transform import prim_func_pass
+from tilelang.analysis.reduction_legality import attach_reduction_legality_metadata
 from tilelang.analysis.reduction_plan import attach_reduction_plan_metadata
 
 logger = logging.getLogger("tilelang.metal_simd_lift")
@@ -320,6 +321,14 @@ def _build_thread_allreduce(
     )
 
 
+def _reduce_index_with_static_extent(node: tir.For) -> tir.PrimExpr:
+    if isinstance(node.extent, tir.IntImm):
+        return node.loop_var % tir.IntImm("int32", int(node.extent.value))
+    if isinstance(node.extent, int):
+        return node.loop_var % tir.IntImm("int32", int(node.extent))
+    return node.loop_var
+
+
 def _build_butterfly(
     acc_load: tir.PrimExpr,
     op: str,
@@ -444,8 +453,9 @@ class _ThreadAllreduceRewriter:
             )
             return self._for_with_body(node, recursed_body)
         out = tir.BufferLoad(body_stmt.buffer, list(body_stmt.indices))
+        reduce_index = _reduce_index_with_static_extent(node)
         self.replaced += 1
-        return _build_thread_allreduce(contribution, out, node.loop_var, self._span(body_stmt))
+        return _build_thread_allreduce(contribution, out, reduce_index, self._span(body_stmt))
 
 
 class _ButterflyRewriter:
@@ -726,6 +736,7 @@ def _metal_simd_lift(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.PrimFunc:
             except Exception:
                 pass
             semantic_rewritten = attach_reduction_plan_metadata(semantic_rewritten)
+            semantic_rewritten = attach_reduction_legality_metadata(semantic_rewritten)
             return semantic_rewritten
 
         # Keep the explicit backend-shape helper as a fallback for reducer

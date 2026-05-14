@@ -11,3 +11,9 @@ from .reduction_plan import (  # noqa: F401
     attach_reduction_plan_metadata,
     extract_reduction_plans,
 )
+from .reduction_legality import (  # noqa: F401
+    ReductionLegalityProof,
+    attach_reduction_legality_metadata,
+    prove_reduction_plan_legality,
+    prove_reduction_plans,
+)

@@ -230,6 +230,9 @@ def test_pass_on_metal_target_prefers_semantic_thread_allreduce():
     payload = json.loads(out["main"].attrs["tl.reduction_plans"].value)
     assert payload[0]["op"] == "sum"
     assert payload[0]["candidate_strategies"][0] == "same-simdgroup"
+    legality = json.loads(out["main"].attrs["tl.reduction_legality"].value)
+    assert legality[0]["proved_no_sync"] is True
+    assert legality[0]["cannot_parallelize_reason"] is None
 
 
 # ---------------------------------------------------------------------------
