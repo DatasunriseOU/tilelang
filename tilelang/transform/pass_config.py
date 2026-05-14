@@ -157,8 +157,8 @@ class PassConfigKey(str, Enum):
 
     TL_SIMD_LIFT_REDUCTIONS = "tl.simd_lift_reductions"
     """Idea #9 (Z3 roadmap): on Metal, lift reductions whose tile extent fits
-    within a single simdgroup (<= 32 lanes) into ``simd_shuffle_xor``-based
-    reductions, bypassing threadgroup memory.
+    within a single simdgroup (<= 32 lanes) into semantic thread-reduction IR
+    before backend lowering.
 
     Behaviour:
 
@@ -170,8 +170,10 @@ class PassConfigKey(str, Enum):
       annotation): when both the PassConfig is True *and* the loop is
       explicitly annotated as a lane-mapped reduction (i.e. ``loop_var``
       maps to ``lane_id`` within a single simdgroup), the threadgroup-mem
-      reduction is replaced by a butterfly sequence of
-      ``tl.shfl_xor_sync`` calls. The annotation is required because a
+      reduction is replaced by ``tir.tvm_thread_allreduce`` plus
+      ``tl.reduction_plans`` metadata. Backend lowerers then choose whether
+      to emit same-simdgroup, split-simdgroup, threadgroup, or two-pass
+      code. The annotation is required because a
       bare serial reduction loop does not carry lane-mapping information,
       and rewriting blindly would change semantics.
 

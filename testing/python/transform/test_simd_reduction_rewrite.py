@@ -15,6 +15,7 @@ IR without requiring a built libtilelang or a Metal device.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 
@@ -226,6 +227,9 @@ def test_pass_on_metal_target_prefers_semantic_thread_allreduce():
             out = metal_simd_lift.MetalSimdLiftReductions(mod)
     assert count_thread_allreduce_calls(out["main"]) == 1
     assert count_shfl_xor_calls(out["main"]) == 0
+    payload = json.loads(out["main"].attrs["tl.reduction_plans"].value)
+    assert payload[0]["op"] == "sum"
+    assert payload[0]["candidate_strategies"][0] == "same-simdgroup"
 
 
 # ---------------------------------------------------------------------------

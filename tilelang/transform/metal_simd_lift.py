@@ -39,6 +39,7 @@ from tvm import ir as tvm_ir
 from tvm import tir, IRModule
 from tvm.target import Target
 from tvm.tir.transform import prim_func_pass
+from tilelang.analysis.reduction_plan import attach_reduction_plan_metadata
 
 logger = logging.getLogger("tilelang.metal_simd_lift")
 
@@ -724,6 +725,7 @@ def _metal_simd_lift(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.PrimFunc:
                     semantic_rewritten = semantic_rewritten.with_attrs(dict(func.attrs))
             except Exception:
                 pass
+            semantic_rewritten = attach_reduction_plan_metadata(semantic_rewritten)
             return semantic_rewritten
 
         # Keep the explicit backend-shape helper as a fallback for reducer
