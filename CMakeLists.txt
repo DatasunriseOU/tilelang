@@ -325,6 +325,20 @@ if(USE_Z3 AND USE_PYPI_Z3)
   target_include_directories(tilelang_objs PRIVATE
     "$<TARGET_PROPERTY:z3::libz3,INTERFACE_INCLUDE_DIRECTORIES>")
   target_link_libraries(tilelang PRIVATE z3::libz3)
+  if(APPLE)
+    # PyPI z3-solver ships libz3.dylib with a bare install name
+    # ("libz3.dylib"). dyld does not resolve bare install names through
+    # LC_RPATH, so the installed wheel can fail to import even though the
+    # z3 package path is present in INSTALL_RPATH. Normalize the dependency
+    # edge to @rpath so the rpath below is actually used.
+    add_custom_command(
+      TARGET tilelang
+      POST_BUILD
+      COMMAND "${CMAKE_INSTALL_NAME_TOOL}" -change libz3.dylib
+              @rpath/libz3.dylib "$<TARGET_FILE:tilelang>"
+      COMMENT "Normalizing TileLang Z3 install name to @rpath/libz3.dylib"
+      VERBATIM)
+  endif()
 endif()
 
 # Place dev build outputs under build/lib for consistency
