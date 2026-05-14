@@ -377,9 +377,6 @@ private:
         << "Metal split allreduce supports one split thread axis for now";
     ICHECK(split_vred.empty() || vred.empty())
         << "Metal split allreduce cannot be mixed with full-axis reduction";
-    ICHECK(split_vred.empty() || vpar.empty())
-        << "Metal split allreduce with extra parallel thread axes is not "
-           "supported yet";
     std::sort(vred.begin(), vred.end());
     std::sort(vpar.begin(), vpar.end());
     // the size of each index.
@@ -389,14 +386,22 @@ private:
     bool metal_split_reduce = !split_vred.empty();
     if (metal_split_reduce) {
       const SplitThreadReduceEntry &split = split_vred.front();
+      int split_group_extent = split.thread.extent / split.reduce_extent;
+      int parallel_group_extent = 1;
+      PrimExpr parallel_group_index =
+          FlattenThread(vpar, &parallel_group_extent);
       reduce_extent = split.reduce_extent;
-      group_extent = split.thread.extent / split.reduce_extent;
+      group_extent = split_group_extent * parallel_group_extent;
       PrimExpr split_extent =
           make_const(split.thread.iv->var.dtype(), split.reduce_extent);
       reduce_index =
           analyzer_.Simplify(floormod(split.thread.iv->var, split_extent));
-      group_index =
+      PrimExpr split_group_index =
           analyzer_.Simplify(floordiv(split.thread.iv->var, split_extent));
+      group_index = analyzer_.Simplify(
+          split_group_index +
+          parallel_group_index *
+              make_const(parallel_group_index.dtype(), split_group_extent));
     } else {
       reduce_index = FlattenThread(vred, &reduce_extent);
       group_index = FlattenThread(vpar, &group_extent);
@@ -546,31 +551,19 @@ private:
         new_alloc_bufs.insert(new_alloc_bufs.end(), local_bufs.begin(),
                               local_bufs.end());
 
-        // 5. Create shared memory buffer(s) of `group_extent` elements, storing
-        // the allreduce results so each thread can access.
+        // 5. Store the final allreduce result back into the first staging slot
+        // for this group.  The second-stage reduction has already consumed the
+        // per-warp partials, so the staging buffer can double as the broadcast
+        // buffer without allocating a separate shared-memory result array.
         std::vector<Stmt> write_result;
         write_result.reserve(size);
+        PrimExpr result_slot = group_index * n_warps;
         for (size_t i = 0; i < size; ++i) {
           new_alloc_bufs.push_back(
               Downcast<BufferLoad>(reduce_results[i])->buffer);
-          Buffer broadcast_shared_buf = decl_buffer(
-              /*shape=*/{make_const(reduce_index->dtype, group_extent)},
-              /*dtype=*/buffers[i]->dtype, /*name=*/"red_result",
-              /*storage_scope=*/shared_scope);
-          // The broadcast shared buffer is referenced by the BufferLoad
-          // installed below (and by the BufferStore in `write_result`). It
-          // must be added to `new_alloc_bufs` so the fix-up at the end of
-          // this method emits an `Allocate` for it; otherwise the buffer's
-          // data Var leaks out as an undefined free Var and downstream
-          // `make_packed_api` aborts with
-          // "variables (red_result,) are used, but are not passed in as
-          // API arguments".
-          new_alloc_bufs.push_back(broadcast_shared_buf);
-          write_result.push_back(BufferStore(broadcast_shared_buf,
-                                             reduce_results[i], {group_index}));
-          // Update `reduce_results`, pointing to the value loaded from the
-          // shared memory buffer.
-          reduce_results[i] = BufferLoad(broadcast_shared_buf, {group_index});
+          write_result.push_back(BufferStore(staging_shared_bufs[i],
+                                             reduce_results[i], {result_slot}));
+          reduce_results[i] = BufferLoad(staging_shared_bufs[i], {result_slot});
         }
         seq.push_back(IfThenElse(reduce_index == zero_index,
                                  SeqStmt::Flatten(write_result)));

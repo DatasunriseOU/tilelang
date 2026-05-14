@@ -270,6 +270,48 @@ def _make_split_thread_allreduce_kernel(*, reduce_extent=32, groups=4):
     return split_thread_allreduce
 
 
+def _make_split_thread_allreduce_parallel_kernel(
+    *, reduce_extent=32, groups=2, rows=3
+):
+    row_threads = rows
+    reduce_threads = reduce_extent * groups
+    total_values = row_threads * reduce_threads
+    total_outputs = row_threads * groups
+
+    @T.prim_func
+    def split_thread_allreduce_parallel(
+        A: T.Tensor((total_values,), T.float32),
+        B: T.Tensor((total_outputs,), T.float32),
+    ):
+        with T.Kernel(1, threads=(reduce_threads, row_threads)):
+            accum = T.alloc_local((1,), T.float32)
+            reduced = T.alloc_local((1,), T.float32)
+            lane = T.get_thread_binding(0)
+            row = T.get_thread_binding(1)
+            kr = T.floormod(lane, reduce_extent)
+            group = T.floordiv(lane, reduce_extent)
+            accum[0] = A[row * reduce_threads + lane]
+            with T.attr(
+                T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
+                "reduce_scope",
+                T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(
+                    T.tvm_thread_allreduce(
+                        T.uint32(1),
+                        accum[0],
+                        True,
+                        reduced[0],
+                        kr,
+                        dtype="handle",
+                    )
+                )
+            if kr == 0:
+                B[row * groups + group] = reduced[0]
+
+    return split_thread_allreduce_parallel
+
+
 def _make_finalize_reducer_kernel(*, rows=4, dtype=T.float32, threads=32):
     layout = Fragment((rows,), forward_fn=lambda i, rep: (rep, i), replicate=threads)
 
@@ -490,14 +532,15 @@ def test_metal_lower_thread_allreduce_accepts_split_simdgroup_index():
     assert "red_result[" not in src, src
 
 
-def test_metal_lower_thread_allreduce_split_cross_simdgroup_keeps_shared_result():
+def test_metal_lower_thread_allreduce_split_cross_simdgroup_reuses_staging_result():
     src = _lower_source(
         _make_split_thread_allreduce_kernel(reduce_extent=64, groups=2)
     )
 
     _assert_no_cuda_reduce_leakage(src)
     assert "simd_shuffle_down" in src, src
-    assert "red_result[" in src, src
+    assert "red_result[" not in src, src
+    assert "red_buf_staging[" in src, src
 
 
 def test_metal_lower_thread_allreduce_split_subgroups_broadcast_local_lane():
@@ -520,6 +563,37 @@ def test_metal_lower_thread_allreduce_split_subgroups_broadcast_local_lane():
     ), (
         f"expected simdgroup-local 16-lane broadcast source; calls={shuffle_calls}\n{src}"
     )
+
+
+def test_metal_lower_thread_allreduce_split_allows_parallel_axis():
+    src = _lower_source(_make_split_thread_allreduce_parallel_kernel())
+
+    _assert_no_cuda_reduce_leakage(src)
+    assert "simd_shuffle_down" in src, src
+    assert "red_result[" not in src, src
+
+
+@tilelang.testing.requires_metal
+def test_metal_split_simdgroup_allreduce_parallel_axis_runtime_mps():
+    reduce_extent = 32
+    groups = 2
+    rows = 3
+    kernel = tilelang.compile(
+        _make_split_thread_allreduce_parallel_kernel(
+            reduce_extent=reduce_extent, groups=groups, rows=rows
+        ),
+        target="metal",
+    )
+    values = torch.arange(
+        rows * groups * reduce_extent, dtype=torch.float32, device="mps"
+    )
+    out = torch.empty(rows * groups, dtype=torch.float32, device="mps")
+
+    kernel(values, out)
+    torch.mps.synchronize()
+
+    expected = values.reshape(rows, groups, reduce_extent).sum(dim=2).reshape(-1)
+    torch.testing.assert_close(out.cpu(), expected.cpu())
 
 
 @tilelang.testing.requires_metal
