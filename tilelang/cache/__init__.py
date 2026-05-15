@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Literal
+import atexit
 from tvm.target import Target
 from tvm.tir import PrimFunc
 from tilelang.jit import JITKernel
@@ -25,6 +26,16 @@ _dispatch_map: dict[str, KernelCache] = {
     "cutedsl": CuTeDSLKernelCache(),
     "torch": TorchKernelCache(),
 }
+
+
+def clear_memory_caches() -> None:
+    """Release process-local JIT kernels without touching disk caches."""
+
+    for cache in _dispatch_map.values():
+        cache.clear_memory_cache()
+
+
+atexit.register(clear_memory_caches)
 
 
 def cached(

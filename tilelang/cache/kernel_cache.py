@@ -372,6 +372,16 @@ class KernelCache:
             self._memory_cache.clear()  # Clear in-memory cache
             self._clear_disk_cache()  # Clear disk cache
 
+    def clear_memory_cache(self):
+        """
+        Clears only the process-local kernel cache.
+
+        This is used during interpreter shutdown so native resources held by
+        JITKernel adapters are released before extension leak checkers run.
+        """
+        with self._lock:
+            self._memory_cache.clear()
+
     def _get_cache_path(self, key: str) -> str:
         """
         Gets the filesystem path for a cached kernel.

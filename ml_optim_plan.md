@@ -867,3 +867,42 @@ blocker still reproduces after the direct Metal parameter-order fix.
 - This does not complete the overall goal. The strict FP8 `vecmat_4096` gate,
   `PreparedMetalCall` leak warning, and full 1B matrix are still open before
   P0 can be marked green.
+
+### 2026-05-15 P0 Mamba3 bwd SIMD regression bisect and fix
+
+**Root cause**: the Mamba3 production-shape NaN was our regression in
+`cppmega.mlx`, introduced by `9f04178 Use TileLang allreduce IR for Mamba3 P
+reductions`. The optimized SIMD bwd route reduced `dB/dC/dA/ddt/dD` through
+TileLang reduction IR, but it also switched long-sequence backward back to
+inverse state reconstruction (`h_prev = (h_t - x*B) / decay`). Real 1B bf16
+projection tensors can drive `decay` close enough to zero that the inverse
+walk produces non-finite `dC/dz/dA/ddt`. The parent commit (`839a927`) stayed
+finite because it used the snapshot-backed backward path.
+
+**Change under test**: the SIMD P-reduction route now keeps the reduction IR
+but consumes the same forward state snapshots as the stable long-sequence
+backward path. This removes the inverse `1 / decay` reconstruction from
+production-length bwd while avoiding the huge per-lane partial-output route.
+
+**Commands and results**
+
+| Command | Result |
+| --- | --- |
+| Regression script on `/tmp/cppmega-regress-pre-m3` at `839a927`, real `Mamba3ReferenceBlock(d_model=1024)`, `T=2048`, bf16 projections | pass: all grads finite; max diffs vs Path B: `dx=7.78e-04`, `dC=3.96e-09`, `dz=5.51e-06`, `dA=5.77e-12`, `ddt=1.83e-09`, `dh0=1.35e-04` |
+| Same script on `/tmp/cppmega-regress-post-m3` at `9f04178` | fail: `dC/dz/dA/ddt` non-finite; `dh0` drifted to `0.515625` |
+| `pytest tests/test_tilelang_mamba3_path_c.py::test_bwd_path_c_long_model_bf16_uses_stable_snapshot_simd -q` | pass: 1 passed in 6.67s |
+| `pytest tests/test_tilelang_mamba3_path_c.py -q` | pass: 41 passed in 44.33s |
+| `bench_local_gb10_quarter_throughput.py --batch-sizes 1 --seq-len 2048 --allow-non-4k-seq-len --optimizers muon_adamw --steps 40 --warmup 0 --memory-cap-gb 60 --no-path-b-comparison` with Path C Mamba3 | pass: step 40 finite, median `209 tok/s`, peak `26.86 GB`, wrote `/tmp/mamba3_path_c_1b_40step_after_snapshot_simd.json` |
+
+**Status**
+
+- Mamba3 1B Path C training NaN is fixed for the reproduced `B=1,T=2048`,
+  `muon_adamw`, 40-step receipt.
+- The first bad optimization is confirmed: `9f04178`'s long-sequence
+  `bwd_simd` inverse reconstruction, not optimizer state, forward, or the
+  direct Metal parameter-order fix.
+- Strict FP8 `vecmat_4096` perf remains open. The separate FP8 pre/post run
+  under current TileLang showed `6691cba` already slow (`1.088x` paired JSON
+  ratio) and `ca5fec8` slower again (`1.147x` paired JSON ratio), so FP8 needs
+  its own follow-up in the TileLang `T.fp8_scaled_matmul` lowerer / native
+  TVM-FFI bridge path.

@@ -199,7 +199,7 @@ void install_completion_debug_hook(MTL::CommandBuffer* command_buffer) {
   }));
 }
 
-struct MetalSyncEdge {
+struct MetalSyncEdge : public std::enable_shared_from_this<MetalSyncEdge> {
   ~MetalSyncEdge() {
     std::lock_guard<std::mutex> lock(mutex);
     if (event != nullptr) {
@@ -230,7 +230,7 @@ struct MetalSyncEdge {
   uint64_t value_{1};
 };
 
-struct MetalLaunchSyncState {
+struct MetalLaunchSyncState : public std::enable_shared_from_this<MetalLaunchSyncState> {
   void add_signal_edge(std::shared_ptr<MetalSyncEdge> edge) {
     if (edge == nullptr) {
       throw std::runtime_error("cannot add a null Metal sync edge");
@@ -873,7 +873,7 @@ void publish_external_outputs(
   }
 }
 
-struct PreparedMetalCall {
+struct PreparedMetalCall : public std::enable_shared_from_this<PreparedMetalCall> {
   ~PreparedMetalCall() {
     if (func_handle_ptr != nullptr) {
       (void)TVMFFIObjectDecRef(func_handle_ptr);
