@@ -147,22 +147,20 @@ def _remember_compact_mlx_input(value: Any) -> None:
 def _contiguous_mlx_input(value: Any) -> Any:
     """Preserve MLX graph inputs for the native TVM-FFI boundary.
 
-    Compact inputs keep object identity so producer/consumer dependency
-    metadata remains exact. Non-compact views get an explicit native MLX
-    compact-layout graph node; that is the framework lowering step required by
-    the flat TileLang TVM-FFI ABI, not a Python-side ``mx.contiguous`` repair.
+    Always route inputs through ``native.compact_input`` (mx.contiguous on
+    the GPU stream). The wrap-time ``is_compact`` check is unreliable
+    because MLX rewrites strides during eval: a slice node looks compact
+    at graph-construction time but becomes a non-compact view of the
+    parent buffer after evaluation. ``mx.contiguous`` is a near-no-op
+    for already-row-contiguous inputs and an explicit row-contiguous
+    copy otherwise, matching what ``mx.fast.metal_kernel`` does via its
+    ``ensure_row_contiguous`` path.
     """
 
     if not _is_mlx_array(value):
         return value
-    if _known_compact_mlx_input(value):
-        return value
     native = _load_native_module()
-    if native.is_compact(value):
-        _remember_compact_mlx_input(value)
-        return value
     return native.compact_input(value)
-    return value
 
 
 def prepare_metal_call(

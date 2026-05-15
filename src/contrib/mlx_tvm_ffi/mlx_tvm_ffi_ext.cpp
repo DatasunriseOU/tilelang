@@ -842,6 +842,14 @@ void register_external_inputs(
   }
 }
 
+void register_external_inputs_ptr(
+    mx::metal::CommandEncoder* encoder,
+    const std::vector<const mx::array*>& inputs) {
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    encoder->set_input_array(*inputs[i], static_cast<int>(i));
+  }
+}
+
 void publish_external_outputs(
     mx::Stream stream,
     const std::vector<mx::array>& outputs) {
@@ -1024,9 +1032,20 @@ class TVMFFIMetalCall : public mx::Primitive {
     }
 
     auto* encoder = get_command_encoder(stream());
+    // Compact-input contract: callers must pass row-contiguous inputs. The
+    // Python adapter wraps non-compact inputs with mx.contiguous() at graph
+    // construction time so MLX scheduler materializes copies before this
+    // primitive's eval_gpu runs. We can't call mx::eval here -- we are
+    // already on the scheduler thread and would deadlock.
+    std::vector<const mx::array*> effective_inputs;
+    effective_inputs.reserve(inputs.size());
+    for (const auto& in : inputs) {
+      effective_inputs.push_back(&in);
+    }
     if (owner_outputs_are_inputs_) {
       for (size_t i = 0; i < outputs.size(); ++i) {
-        const auto& owner = inputs.at(static_cast<size_t>(expected_inputs) + i);
+        const auto& owner =
+            *effective_inputs.at(static_cast<size_t>(expected_inputs) + i);
         if (owner.buffer().ptr() == nullptr) {
           throw std::runtime_error(
               "MLX owner output array has no materialized Metal buffer at TVM-FFI launch time");
@@ -1080,7 +1099,8 @@ class TVMFFIMetalCall : public mx::Primitive {
           param_idx);
       const std::vector<int64_t>* shape_override = nullptr;
       const mx::array& array =
-          is_output ? outputs.at(output_pos) : inputs.at(input_pos++);
+          is_output ? outputs.at(output_pos)
+                    : *effective_inputs.at(input_pos++);
       if (is_output) {
         if (!param_shapes.empty()) {
           shape_override = &param_shapes.at(static_cast<size_t>(param_idx));
@@ -1144,7 +1164,7 @@ class TVMFFIMetalCall : public mx::Primitive {
       }
     }
 
-    register_external_inputs(encoder, inputs);
+    register_external_inputs_ptr(encoder, effective_inputs);
     auto signal_edges = launch_sync_state_->snapshot_signal_edges();
     TVMFFIAny result;
     result.type_index = kTVMFFINone;
