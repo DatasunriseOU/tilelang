@@ -3,6 +3,7 @@ from __future__ import annotations
 from tilelang.analysis.metal_graph_sync import (
     clear_metal_graph_sync_state_for_tests,
     has_mlx_tvm_ffi_producer,
+    inspect_mlx_tvm_ffi_launch_sync,
     make_tvm_ffi_metal_dependency_metadata,
     plan_mlx_tvm_ffi_launch,
     register_mlx_tvm_ffi_outputs,
@@ -109,12 +110,23 @@ def test_cross_command_buffer_domain_wires_signal_and_wait_event():
         producer_state,
         dependency_metadata=producer_metadata,
     )
+    decisions = inspect_mlx_tvm_ffi_launch_sync(
+        [output],
+        dependency_metadata=consumer_metadata,
+    )
     _, consumer_waits = plan_mlx_tvm_ffi_launch(
         native,
         [output],
         dependency_metadata=consumer_metadata,
     )
 
+    assert len(decisions) == 1
+    assert decisions[0].action == "device_event"
+    assert decisions[0].device_event_required is True
+    assert decisions[0].host_sync_required is False
+    assert decisions[0].external_materialization_required is False
+    assert decisions[0].producer_kernel_symbol == "producer"
+    assert decisions[0].consumer_kernel_symbol == "consumer"
     assert len(native.edges) == 1
     assert consumer_waits == native.edges
     assert producer_state.signal_edges == native.edges

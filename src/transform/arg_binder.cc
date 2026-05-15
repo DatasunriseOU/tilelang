@@ -4,6 +4,7 @@
  */
 #include "arg_binder.h"
 
+#include <tvm/ir/transform.h>
 #include <tvm/runtime/device_api.h>
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>
@@ -32,6 +33,15 @@ using namespace tirx;
 using ::tilelang::tl_tir::LetStmt;
 using ::tilelang::tl_tir::LetStmtNode;
 
+namespace {
+
+bool RuntimeAssertsDisabled() {
+  tvm::transform::PassContext ctx = tvm::transform::PassContext::Current();
+  return ctx->GetConfig<Bool>("tirx.disable_assert", Bool(false)).value();
+}
+
+} // namespace
+
 void BinderAddAssert(arith::Analyzer *ana, PrimExpr cond,
                      const std::string &arg_name, std::vector<Stmt> *asserts,
                      PrimExpr nullable_guard = PrimExpr()) {
@@ -39,6 +49,10 @@ void BinderAddAssert(arith::Analyzer *ana, PrimExpr cond,
   if (is_zero(scond)) {
     LOG(FATAL) << "Bind have an unmet assertion: " << cond << ", "
                << " on argument " << arg_name;
+  }
+
+  if (RuntimeAssertsDisabled()) {
+    return;
   }
 
   if (!is_one(scond)) {
@@ -398,6 +412,7 @@ void ArgBinder::BindDLTensors(
   const DataType tvm_shape_type = DataType::ShapeIndex();
   const DataType tvm_ndim_type = DataType::Int(32);
   const Stmt nop = Evaluate(0);
+  const bool disable_runtime_asserts = RuntimeAssertsDisabled();
 
   // Create all is_null vars and shape buffers first
   for (const auto &[handle, buffer] : buffer_def) {
@@ -494,10 +509,13 @@ void ArgBinder::BindDLTensors(
     ndim_args.push_back(cast(DataType::Int(64), v_ndim));
     Stmt ndim_call = Evaluate(
         Call(DataType::Int(32), builtin::tvm_call_packed(), ndim_args));
-    init_nest_.emplace_back(
-        SeqStmt({IfThenElse(Not(is_null), IfThenElse(Not(ndim_ok), ndim_call),
-                            Evaluate(0)),
-                 nop}));
+    if (!disable_runtime_asserts) {
+      init_nest_.emplace_back(
+          SeqStmt({IfThenElse(Not(is_null),
+                              IfThenElse(Not(ndim_ok), ndim_call),
+                              Evaluate(0)),
+                   nop}));
+    }
     // type checks
     // Guard all dtype field loads by `is_null` using if_then_else
     PrimExpr v_type_code = tvm::if_then_else(
@@ -599,7 +617,7 @@ void ArgBinder::BindDLTensors(
                       arg_name + " is a subtype, but total bits mismatch",
                       &asserts_, is_null);
     }
-    if (!data_is_subtype) {
+    if (!data_is_subtype && !disable_runtime_asserts) {
       // Build FFI packed call to __tvm_error_dtype_mismatch when mismatch
       // occurs. Only issue the call when handle is non-NULL and cond is false.
       ffi::Array<PrimExpr> packed_args;
@@ -927,7 +945,7 @@ void ArgBinder::BindDLTensors(
         stride_err_msg
             << stride_handle_name()
             << ": expected to be compact array, but got non-compact strides";
-        if (!conds.empty()) {
+        if (!conds.empty() && !disable_runtime_asserts) {
           PrimExpr all_ok =
               foldl([](PrimExpr a, PrimExpr b,
                        Span span) { return logical_and(a, b, span); },
@@ -1021,9 +1039,12 @@ void ArgBinder::BindDLTensors(
       pargs.push_back(cast(DataType::Int(64), actual_byte_offset));
       Stmt call_err =
           Evaluate(Call(DataType::Int(32), builtin::tvm_call_packed(), pargs));
-      asserts_.emplace_back(SeqStmt(
-          {IfThenElse(Not(is_null), IfThenElse(Not(ok), call_err), Evaluate(0)),
-           nop}));
+      if (!disable_runtime_asserts) {
+        asserts_.emplace_back(
+            SeqStmt({IfThenElse(Not(is_null), IfThenElse(Not(ok), call_err),
+                                Evaluate(0)),
+                     nop}));
+      }
     } else {
       PrimExpr actual_byte_offset = tvm::if_then_else(
           Not(is_null),
@@ -1061,7 +1082,7 @@ void ArgBinder::BindDLTensors(
                  is_null);
     // Check device_type consistency (device_id equality is implicitly ensured
     // by binding above)
-    {
+    if (!disable_runtime_asserts) {
       PrimExpr ok = (device_type == actual_dev_type);
       ffi::Array<PrimExpr> pargs2;
       pargs2.push_back(StringImm(tvm_error_device_type_mismatch));
@@ -1071,10 +1092,10 @@ void ArgBinder::BindDLTensors(
       pargs2.push_back(cast(DataType::Int(64), actual_dev_type));
       Stmt call_err2 =
           Evaluate(Call(DataType::Int(32), builtin::tvm_call_packed(), pargs2));
-      asserts_.emplace_back(
-          SeqStmt({IfThenElse(Not(is_null), IfThenElse(Not(ok), call_err2),
-                              Evaluate(0)),
-                   Evaluate(0)}));
+      asserts_.emplace_back(SeqStmt(
+          {IfThenElse(Not(is_null), IfThenElse(Not(ok), call_err2),
+                      Evaluate(0)),
+           Evaluate(0)}));
     }
 
     // Data field.  Because the validation of the data field may depend
@@ -1103,23 +1124,26 @@ void ArgBinder::BindDLTensors(
         kernel_nm2 = arg_name.substr(0, dot_pos2);
         buf_nm2 = arg_name.substr(dot_pos2 + 1);
       }
-      // expand combined condition via nested IfThenElse for portability
-      ffi::Array<PrimExpr> pargs3;
-      pargs3.push_back(StringImm(tvm_error_null_ptr));
-      pargs3.push_back(StringImm(kernel_nm2));
-      pargs3.push_back(StringImm(buf_nm2));
-      pargs3.push_back(StringImm("data pointer"));
-      Stmt call_err3 =
-          Evaluate(Call(DataType::Int(32), builtin::tvm_call_packed(), pargs3));
-      asserts_.emplace_back(SeqStmt(
-          {IfThenElse(Not(is_null),
-                      IfThenElse(Not(alloc_size == 0),
-                                 IfThenElse(Call(DataType::Bool(),
-                                                 builtin::isnullptr(), {vptr}),
-                                            call_err3),
-                                 Evaluate(0)),
-                      Evaluate(0)),
-           nop}));
+      if (!disable_runtime_asserts) {
+        // expand combined condition via nested IfThenElse for portability
+        ffi::Array<PrimExpr> pargs3;
+        pargs3.push_back(StringImm(tvm_error_null_ptr));
+        pargs3.push_back(StringImm(kernel_nm2));
+        pargs3.push_back(StringImm(buf_nm2));
+        pargs3.push_back(StringImm("data pointer"));
+        Stmt call_err3 = Evaluate(
+            Call(DataType::Int(32), builtin::tvm_call_packed(), pargs3));
+        asserts_.emplace_back(SeqStmt(
+            {IfThenElse(Not(is_null),
+                        IfThenElse(
+                            Not(alloc_size == 0),
+                            IfThenElse(Call(DataType::Bool(),
+                                            builtin::isnullptr(), {vptr}),
+                                       call_err3),
+                            Evaluate(0)),
+                        Evaluate(0)),
+             nop}));
+      }
 
       // mark alignment of external bufs
       init_nest_.emplace_back(

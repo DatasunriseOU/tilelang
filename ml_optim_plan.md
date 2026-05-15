@@ -2,455 +2,594 @@
 
 Date: 2026-05-14
 
-Scope: make TileLang scheduler and IR builder emit semantic optimization IR,
-then let TileLang/TVM/TVM-FFI/MLX lower, prove, schedule, and tune it. Model
-repos such as `cppmega_mlx` may contain regression fixtures and benchmarks, but
-they must not own backend-specific lowering decisions.
+This is the execution plan for making Path C a real framework path:
+TileLang IR -> scheduler/proofs -> TVM -> TVM-FFI -> MLX. cppmega is a
+consumer and benchmark suite, not the place where backend scheduling decisions
+are hardcoded.
 
-## Goals
+## Hard Rules
 
-- TileLang model code describes reductions, scans, dependencies, aliases, and
-  materialization requirements as IR metadata, not as hand-written backend
-  partial buffers or Metal/CUDA intrinsics.
-- Scheduler chooses a lowering from semantic IR using rule checks, Z3 legality
-  proofs, and profiling feedback.
-- Synchronization is inserted only for proven hazards. If Z3 proves no
-  inter-buffer or intra-buffer hazard, no barrier/event is emitted.
-- Supported shapes do not return `*_partial` tensors to Python/MLX unless the
-  requested public API explicitly asks for debug partials.
-- Path C reaches Path B performance class through scheduler/codegen
-  improvements, not by reintroducing model-specific MSL or monkeypatches.
+- No production monkeypatches.
+- No production `mx.fast.metal_kernel` or handwritten model-owned MSL.
+- No public cppmega direct TVM-FFI bypass. A private TileLang adapter may call
+  TVM-FFI, but it must be ABI/version checked and hidden behind TileLang APIs.
+- No public `*_partial` tensors for supported reductions. Internal scratch is
+  allowed only inside TileLang/runtime ownership.
+- Sync/event insertion is proof driven. If Z3 and dependency metadata prove no
+  hazard, no barrier/event/materialization is emitted.
+- Path C performance work must happen in TileLang scheduler/codegen,
+  TVM/TVM-FFI, or MLX bridge layers.
+- Move to the next package only after the current package has green tests,
+  review, and performance receipt.
 
-## Non-Goals
+## Standard Environment
 
-- No direct cppmega-to-TVM-FFI bypass as a public model path.
-- No `mx.fast.metal_kernel` or handwritten MSL for production Path C kernels.
-- No Python monkeypatches for production functionality.
-- No hidden large allocations or host-side reductions in model training paths.
-
-## Current Baseline
-
-Already landed:
-
-- TileLang exposes `T.thread_allreduce_sum(...)` and emits
-  `tir.tvm_thread_allreduce`.
-- Mamba3 Path C bwd uses semantic P-axis allreduce for aligned P dimensions.
-- Regression coverage verifies P=32, P=64, P=96, P=128, and P=256 lower without
-  `dA_partial`, `dB_partial`, `dC_partial`, `dD_partial`, or `ddt_partial`.
-
-Remaining gap: this is still one explicit IR helper callsite in a model
-generator. The broader scheduler must learn to detect and produce reduction IR
-and dependency metadata automatically.
-
-## Workstreams and Tests
-
-### 1. Reduction IR Surface
-
-Plan:
-
-- Generalize `T.thread_allreduce_sum` into a reduction API family:
-  - `T.thread_reduce(value, op, axis, predicate=True, dtype=None)`
-  - `T.row_reduce(buffer/value, op, axis, output, policy=None)`
-  - `T.block_reduce(value, op, axis, output, policy=None)`
-  - `T.reduction_axis(name, extent, map_expr, role="lane")`
-- Keep backend-specific operations out of user/model code.
-- Preserve existing `T.reduce_sum`, `T.reduce_max`, etc. by routing compatible
-  cases through the same semantic reduction representation where possible.
-
-Test:
-
-- Unit: TileLang language tests assert generated TIR contains
-  `tir.tvm_thread_allreduce` or semantic reduction op, not backend intrinsics.
-- Lowering: Metal/CUDA/CPU smoke tests lower the same semantic IR.
-- Negative: unsupported malformed axes fail with a clear scheduler error.
-- Command:
+TileLang shell setup:
 
 ```bash
-python -m pytest testing/python/metal/test_metal_reduce.py -q
-python -m pytest testing/python/language/ -q -k "reduce"
+cd /private/tmp/tl_apache_tvm_swap
+export TL_ROOT=/private/tmp/tl_apache_tvm_swap
+export Z3_LIB="$TL_ROOT/.venv313/lib/python3.13/site-packages/z3/lib"
+export TILELANG_DISABLE_CACHE=1
+export DYLD_LIBRARY_PATH="$Z3_LIB:$TL_ROOT/build/lib:$TL_ROOT/build/tvm"
+export PYTHONPATH="$TL_ROOT:$TL_ROOT/3rdparty/tvm/python:$TL_ROOT/3rdparty/tvm/3rdparty/tvm-ffi/python"
+cmake --build build -j$(sysctl -n hw.ncpu)
 ```
 
-Acceptance:
-
-- No new model-level `tir.metal.*` or `tir.cuda.*` reduction intrinsics.
-- Existing reduction tests continue to pass.
-
-### 2. IR Builder Reduction Detection
-
-Plan:
-
-- Add a pass that recognizes common manual reduction idioms:
-  - per-lane accumulation followed by `if lane == 0: store`
-  - `*_partial` write patterns over a reduce axis
-  - host-side sum of device partial tensors in adapter code
-  - direct `simd_sum` or shuffle intrinsic calls
-- Rewrite matched idioms to semantic reduction IR plus explicit output shape.
-- Emit diagnostics for patterns that look reducible but fail legality checks.
-
-Test:
-
-- Golden TIR tests for pattern rewrite.
-- cppmega Mamba3 bwd no longer needs model-specific reduction helper calls
-  after this pass is enabled.
-- Static check: search for production `*_partial` outputs and backend reduction
-  intrinsics.
-- Commands:
+cppmega commands with this TileLang checkout injected:
 
 ```bash
-rg -n "simd_sum|simd_shuffle|d[A-Z]?_partial|ddt_partial" tilelang cppmega_mlx
-python -m pytest testing/python/transform/ -q -k "reduction"
+cd /Volumes/external/sources/cppmega.mlx
+export TL_ROOT=/private/tmp/tl_apache_tvm_swap
+export TILELANG_DISABLE_CACHE=1
+export TILELANG_DEV_BUILD_ROOT="$TL_ROOT"
+export TVM_LIBRARY_PATH="$TL_ROOT/build/lib:$TL_ROOT/build/tvm"
+export DYLD_LIBRARY_PATH="$TL_ROOT/build/lib:$TL_ROOT/build/tvm"
+export PYTHONPATH="$TL_ROOT:$TL_ROOT/3rdparty/tvm/python:$TL_ROOT/3rdparty/tvm/3rdparty/tvm-ffi/python"
 ```
 
-Acceptance:
+Universal completion gate for every package:
 
-- Reducible patterns become semantic reduction IR before backend lowering.
-- Non-reducible cases explain exactly which legality proof failed.
+```bash
+cd /private/tmp/tl_apache_tvm_swap
+git diff --check
+cmake --build build -j$(sysctl -n hw.ncpu)   # required when C++/Metal/runtime changed
+```
 
-### 3. Scheduler ReductionPlan
+Every package also needs:
 
-Plan:
+1. Implementer/Fixer pass.
+2. Code review of changed scheduler, lowering, runtime, and model-facing APIs.
+3. Perf optimization pass when generated code, dispatch, sync, or allocation
+   can change.
+4. Regression tests listed in that package.
+5. Receipt with exact command, git SHAs, cache state, pass/fail, and timings
+   when performance is part of the package.
 
-- Introduce a scheduler-level `ReductionPlan` metadata object:
-  - input buffer regions
-  - output buffer regions
-  - reduction axes and extents
-  - thread/block mapping
-  - accumulator dtype
-  - candidate strategies
-  - required memory visibility scope
-  - alias/in-place constraints
-- Candidate strategies:
-  - same-simdgroup
-  - split-simdgroup
-  - shared/threadgroup reduction
-  - row-reduce helper
-  - two-pass global reduction
-  - vectorized CPU fallback
+Package execution loop:
 
-Test:
+1. Implementer/Fixer: make the smallest framework-level change that satisfies
+   the package scope. Do not move the workaround into cppmega.
+2. Code Review: inspect changed files for wrong ownership, hidden copies,
+   hidden materialization, stale ABI checks, and backend leakage into model
+   code.
+3. Perf Optimization: inspect generated source and profiler/bench output before
+   changing schedule/codegen knobs. Every performance claim needs a before/after
+   receipt.
+4. Regression Tests: run the package test block and the universal completion
+   gate. If any test fails, stay in the same package and repeat from fixer.
+5. Advance Gate: update the receipt table only after tests are green and the
+   package-specific green criteria are met.
 
-- Unit tests construct ReductionPlan from representative TIR.
+When a package changes only documentation, run `git diff --check`. When a
+package changes Python lowering/scheduler, run its focused pytest block. When a
+package changes C++/Metal/TVM/MLX bridge code, rebuild first and then run both
+TileLang and cppmega focused tests.
+
+## Execution Order
+
+| ID | Package | Do not start until |
+| --- | --- | --- |
+| P0 | Current FP8 Path C gate | Current blocker, starts now |
+| P1 | Semantic reduction IR | P0 green |
+| P2 | Automatic reduction rewrite | P1 green |
+| P3 | ReductionPlan scheduler metadata | P1 green |
+| P4 | Z3 legality proofs | P3 green |
+| P5 | Sync/event planner | P4 green |
+| P6 | Backend lowerer registry | P3 green |
+| P7 | Large-axis generated reductions | P4 and P6 green |
+| P8 | Reverse recurrence scan planner | P4, P5, and P6 green |
+| P9 | Cost model/codegen cleanup | P6 green |
+| P10 | Autotune/profiling memoization | P9 green |
+| P11 | Production lint | Can run after each package, final gate after P10 |
+| P12 | Full 1B training matrix | P0 green for first pass, final after P10/P11 |
+
+## P0: Current FP8 Path C Gate
+
+### Planned Changes
+
+- Finish FP8 owner-output ABI for MLX arrays through TileLang's private
+  TVM-FFI adapter.
+- Preserve named shape metadata so shaped tensors cannot swap dimensions such
+  as `D_V` and `QK_DIM`.
+- Keep FP8 inputs const through Metal lowering.
+- Remove duplicated hot-path host validation only when TileLang has already
+  validated the ABI, dtype, compactness, pointer, and shape contract.
+- Hoist repeated row/column/index math out of FP8 inner loops.
+- Keep CSE enabled unless a generated-source regression proves one exact
+  lowering must opt out.
+- Recover `vecmat_4096` Path C speed in scheduler/codegen/runtime, not by
+  falling back to model-owned MSL.
+
+### Tests
+
+TileLang focused tests:
+
+```bash
+cd /private/tmp/tl_apache_tvm_swap
+cmake --build build -j$(sysctl -n hw.ncpu)
+.venv313/bin/python -m pytest \
+  testing/python/metal/test_fp8_scaled_matmul_metal.py \
+  testing/python/metal/test_tvm_ffi_metal_stream_dlpack.py \
+  testing/python/analysis/test_metal_graph_sync.py \
+  testing/python/scheduler/test_sync_event_plan.py \
+  -q
+```
+
+cppmega FP8 Path C tests:
+
+```bash
+cd /Volumes/external/sources/cppmega.mlx
+TILELANG_DISABLE_CACHE=1 \
+TILELANG_DEV_BUILD_ROOT=/private/tmp/tl_apache_tvm_swap \
+TVM_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+DYLD_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+PYTHONPATH=/private/tmp/tl_apache_tvm_swap:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/python:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/3rdparty/tvm-ffi/python \
+.venv/bin/python -m pytest tests/test_tilelang_fp8_vecmat_path_c.py -q
+```
+
+Strict performance gate:
+
+```bash
+cd /Volumes/external/sources/cppmega.mlx
+TILELANG_DISABLE_CACHE=1 \
+TILELANG_DEV_BUILD_ROOT=/private/tmp/tl_apache_tvm_swap \
+TVM_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+DYLD_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+PYTHONPATH=/private/tmp/tl_apache_tvm_swap:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/python:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/3rdparty/tvm-ffi/python \
+.venv/bin/python scripts/bench_tilelang_fp8_path_c.py \
+  --warmup 5 \
+  --iters 20 \
+  --shapes matmul_128 vecmat_4096 \
+  --skip-xcrun \
+  --skip-sparse \
+  --strict \
+  --out /tmp/fp8_path_c_p0.json
+```
+
+Generated-source checks:
+
+```bash
+rg -n "mx\\.fast\\.metal_kernel|monkeypatch|simd_sum" \
+  /Volumes/external/sources/cppmega.mlx/cppmega_mlx/nn/_tilelang
+rg -n "__tvm_error_ndim_mismatch|__tvm_error_dtype_mismatch|tvm_error_expect" \
+  /tmp/fp8_path_c_generated_host.c
+```
+
+### Green Criteria
+
+- All listed pytest commands pass.
+- The strict bench passes. Target: warm Path C within 3 percent of Path B for
+  `matmul_128` and `vecmat_4096`; any looser threshold must be called out in
+  the receipt.
+- Generated Metal keeps FP8 input buffers const.
+- No production `mx.fast.metal_kernel`, monkeypatch, or public cppmega TVM-FFI
+  route is used.
+- Receipt includes Path B/Path C median/min/max timings, cache state, selected
+  pass config, generated Metal snippet, TileLang SHA, and cppmega SHA.
+
+## P1: Semantic Reduction IR
+
+### Planned Changes
+
+- Generalize the current `T.thread_allreduce_sum(...)` into semantic reduction
+  IR that represents operation, axis, extent, predicate, accumulator dtype, and
+  output region.
+- Route compatible `T.reduce_sum`, `T.reduce_max`, and row/block reductions
+  through the same representation.
+- Keep backend primitives out of model generators.
+
+### Tests
+
+```bash
+cd /private/tmp/tl_apache_tvm_swap
+.venv313/bin/python -m pytest testing/python/language/ -q -k "reduce"
+.venv313/bin/python -m pytest testing/python/metal/test_metal_reduce.py -q
+rg -n "tir\\.metal|tir\\.cuda|simd_sum|simd_shuffle" tilelang/language tilelang/transform
+```
+
+### Green Criteria
+
+- Golden TIR tests show semantic reduction IR, not backend intrinsics.
+- The same semantic reduction lowers on Metal and at least one non-Metal
+  fallback path where available.
+- Unsupported malformed axes fail before codegen with an explicit scheduler
+  error.
+
+## P2: Automatic Reduction Rewrite
+
+### Planned Changes
+
+- Add a transform that detects manual reduction idioms:
+  per-lane accumulation, lane-zero stores, `*_partial` tensors, host sums over
+  device partials, and direct `simd_sum`/shuffle calls.
+- Rewrite legal patterns into semantic reduction IR.
+- Emit a diagnostic for every pattern that looks reducible but fails legality.
+
+### Tests
+
+```bash
+cd /private/tmp/tl_apache_tvm_swap
+.venv313/bin/python -m pytest testing/python/transform/ -q -k "reduction"
+rg -n "simd_sum|simd_shuffle|d[A-Z]?_partial|ddt_partial" tilelang testing src
+
+cd /Volumes/external/sources/cppmega.mlx
+rg -n "simd_sum|simd_shuffle|d[A-Z]?_partial|ddt_partial" cppmega_mlx tests
+```
+
+### Green Criteria
+
+- Existing Mamba3/M2RNN reduction callsites can be represented by the rewrite
+  pass or by explicit semantic IR, not by public partial tensors.
+- Non-rewritten patterns include a machine-readable reason.
+
+## P3: ReductionPlan Scheduler Metadata
+
+### Planned Changes
+
+- Add `ReductionPlan` metadata with:
+  input/output regions, axes, extents, thread/block mapping, accumulator dtype,
+  alias constraints, in-place legality constraints, memory scope, candidate
+  strategies, and selected strategy.
+- Candidate strategies must include same-simdgroup, split-simdgroup,
+  threadgroup staging, row reduce, two-pass global reduce, and CPU fallback.
+
+### Tests
+
+```bash
+cd /private/tmp/tl_apache_tvm_swap
+.venv313/bin/python -m pytest testing/python/scheduler/ -q -k "reduction_plan"
+.venv313/bin/python -m pytest testing/python/metal/test_metal_reduce.py -q
+```
+
+### Green Criteria
+
 - Plan serialization snapshots are stable and reviewable.
-- Backend lowerers reject only the strategy, not the semantic reduction itself.
-- Commands:
+- P=32/64/96/128/256 select single-kernel legal strategies.
+- Larger extents select generated internal two-pass plans instead of public
+  partial outputs.
+
+## P4: Z3 Legality Proofs
+
+### Planned Changes
+
+- Prove exact coverage, bounds safety, no write-write race, read-after-write
+  hazards, alias/in-place legality, tail dimensions, broadcast semantics, and
+  int64/index-width safety.
+- Attach proof result to scheduler metadata:
+  `proved_no_sync`, `requires_threadgroup_barrier`, `requires_device_event`,
+  `requires_two_pass`, or `cannot_parallelize(reason)`.
+
+### Tests
 
 ```bash
-python -m pytest testing/python/scheduler/ -q -k "reduction_plan"
-python -m pytest testing/python/metal/test_metal_reduce.py -q
+cd /private/tmp/tl_apache_tvm_swap
+.venv313/bin/python -m pytest testing/python/scheduler/ -q -k "z3 or legality"
+.venv313/bin/python -m pytest testing/python/analysis/ -q -k "z3 or overflow or alias"
+.venv313/bin/python -m pytest testing/python/metal/ -q -k "hazard or sync or reduce"
 ```
 
-Acceptance:
+### Green Criteria
 
-- P=32/64/96/128/256 choose single-kernel allreduce strategies.
-- P greater than one threadgroup cap chooses a generated two-pass strategy
-  instead of exposing partial tensors to Python.
+- Positive and negative fixtures cover tails, broadcast, int64, aliasing, and
+  overlapping writes.
+- Impossible plans fail before codegen.
+- Proven no-sync plans emit no sync in generated source.
 
-### 4. Z3 Legality Proofs
+## P5: Sync and Event Planner
 
-Plan:
+### Planned Changes
 
-- Add proof obligations for each plan:
-  - exact coverage: every element reduced once
-  - no out-of-bounds access
-  - no write-write race
-  - no read-after-write hazard without event/barrier
-  - in-place legality
-  - tail-dim and broadcast legality
-  - int64/index-width safety
-- Proof result becomes scheduler metadata:
-  - `proved_no_sync`
-  - `requires_threadgroup_barrier`
-  - `requires_device_event`
-  - `requires_two_pass`
-  - `cannot_parallelize(reason)`
+- Build dependency metadata from buffer regions, streams, owner-output handles,
+  DLPack/TVM-FFI boundaries, and MLX graph boundaries.
+- Insert no sync, threadgroup barrier, or device event only from proof result.
+- Materialize only when an external pointer boundary truly requires storage.
+- Add native debug hooks/guards for deterministic race and null-pointer
+  detection.
 
-Test:
-
-- Property tests generate small shapes and compare proof result against a
-  reference enumerator.
-- Regression tests cover tail dims, broadcast, int64 indexing, and aliasing.
-- Negative tests deliberately create overlapping writes and require rejection.
-- Commands:
+### Tests
 
 ```bash
-python -m pytest testing/python/scheduler/ -q -k "z3 or legality"
-python -m pytest testing/python/metal/ -q -k "hazard or sync or reduce"
+cd /private/tmp/tl_apache_tvm_swap
+.venv313/bin/python -m pytest \
+  testing/python/analysis/test_metal_graph_sync.py \
+  testing/python/scheduler/test_sync_event_plan.py \
+  testing/python/metal/test_tvm_ffi_metal_stream_dlpack.py \
+  -q
+
+cd /Volumes/external/sources/cppmega.mlx
+TILELANG_DEV_BUILD_ROOT=/private/tmp/tl_apache_tvm_swap \
+TVM_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+DYLD_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+PYTHONPATH=/private/tmp/tl_apache_tvm_swap:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/python:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/3rdparty/tvm-ffi/python \
+.venv/bin/python -m pytest tests -q -k "dlpack or tvm_ffi or path_c"
 ```
 
-Acceptance:
+### Green Criteria
 
-- A plan with `proved_no_sync=True` emits no barrier/event.
-- A proven hazard emits the minimal required sync primitive.
-- Impossible plans fail before codegen, not at runtime.
-
-### 5. Sync and Event Planner
-
-Plan:
-
-- Build a dependency graph from buffer regions, streams, owner-output handles,
-  and DLPack/TVM-FFI boundaries.
-- Insert:
-  - no sync when proof says no hazard
-  - threadgroup barrier for local shared-memory hazards
-  - device event for cross-buffer/cross-stream hazards
-  - materialization only when a real external pointer boundary requires storage
-- Make sync decisions inspectable in lowered metadata.
-
-Test:
-
-- IR tests assert barrier absence/presence by hazard class.
-- MLX graph transform tests assert no eager eval/materialization unless an
-  external pointer boundary is proven.
-- Runtime race tests run kernels repeatedly with deterministic debug guards.
-- Commands:
-
-```bash
-python -m pytest testing/python/metal/ -q -k "sync or hazard"
-python -m pytest /Volumes/external/sources/cppmega.mlx/tests -q -k "dlpack or tvm_ffi or path_c"
-```
-
-Acceptance:
-
-- No unconditional sync in generated Path C kernels.
+- Same-stream/no-hazard kernels emit no device event.
+- Cross-stream/cross-buffer real hazards emit exactly one required event.
 - Debug guard catches stale/null pointer races deterministically.
 
-### 6. Backend Lowerer Registry
+## P6: Backend Lowerer Registry
 
-Plan:
+### Planned Changes
 
-- Route semantic reduction/scan/dependency IR through backend registries:
-  - Metal lowerers
-  - CUDA lowerers
-  - ROCm lowerers
-  - CPU fallback lowerers
-- Backend registry decides implementation, not model code.
-- Existing Metal lowerer handles:
-  - same-simdgroup
-  - split-simdgroup
-  - threadgroup staging
-  - row-reduce helpers
-  - generated two-pass reductions
+- Move semantic reduction, scan, and dependency lowering into backend
+  registries for Metal, CUDA, ROCm, CPU, and future backends.
+- Metal reduce/finalize lowerers must live in the registry, not in model code.
+- Diagnostics must show which backend lowerer and strategy were selected.
 
-Test:
-
-- Same TIR lowers on multiple backends where available.
-- Metal source does not contain CUDA tokens.
-- CUDA source does not contain Metal tokens.
-- Commands:
+### Tests
 
 ```bash
-python -m pytest testing/python/metal/ -q
-python -m pytest testing/python/language/ -q -k "reduce"
+cd /private/tmp/tl_apache_tvm_swap
+.venv313/bin/python -m pytest testing/python/metal/ -q -k "reduce or finalize"
+.venv313/bin/python -m pytest testing/python/language/ -q -k "reduce"
+rg -n "metal|cuda|rocm|simd_sum" tilelang/language tilelang/transform
 ```
 
-Acceptance:
+### Green Criteria
 
-- Model generator contains no backend-specific reduction code.
-- Lowerer choice is visible in diagnostics and stable under cache.
+- Model generators contain no backend-specific reduction/finalize code.
+- Backend leakage checks are clean or have explicit test/debug allowlist.
+- Lowerer selection is cached and reproducible.
 
-### 7. Two-Pass Reductions for Large Axes
+## P7: Large-Axis Generated Reductions
 
-Plan:
+### Planned Changes
 
-- For reduction extents beyond one threadgroup cap, scheduler generates:
-  - pass 1: per-block partials in internal scratch/owner output
-  - pass 2: final reduction into public output
-- Scratch is internal to TileLang runtime/lowering, not a public model output.
-- Cache and reuse scratch buffers when lifetime analysis allows it.
+- Generalize beyond P=64. Scheduler decides same-simdgroup, split-simdgroup,
+  threadgroup staging, or generated two-pass reduction for any legal extent.
+- Internal scratch buffers are runtime-owned and lifetime-analyzed.
+- Public APIs return only final outputs unless debug partials are explicitly
+  requested.
 
-Test:
-
-- P=512, P=1024, and model-real larger rows lower and run.
-- Public outputs do not include `*_partial`.
-- Runtime parity against Path B/reference.
-- Commands:
+### Tests
 
 ```bash
-python -m pytest /Volumes/external/sources/cppmega.mlx/tests/test_tilelang_mamba3_path_c.py -q -k "headdim or bwd"
-python -m pytest testing/python/metal/ -q -k "two_pass or reduce"
+cd /private/tmp/tl_apache_tvm_swap
+.venv313/bin/python -m pytest testing/python/metal/ -q -k "two_pass or reduce"
+
+cd /Volumes/external/sources/cppmega.mlx
+TILELANG_DEV_BUILD_ROOT=/private/tmp/tl_apache_tvm_swap \
+TVM_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+DYLD_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+PYTHONPATH=/private/tmp/tl_apache_tvm_swap:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/python:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/3rdparty/tvm-ffi/python \
+.venv/bin/python -m pytest tests/test_tilelang_mamba3_path_c.py -q -k "headdim or bwd"
 ```
 
-Acceptance:
+### Green Criteria
 
-- No Python host reduction for large P.
-- No public partial tensors for generated two-pass reductions.
+- P=32/64/96/128/256/512/1024 and at least one model-real larger extent pass
+  parity.
+- No Python host reduction is used for large axes.
+- No public `*_partial` outputs appear in generated model routes.
 
-### 8. Reverse Recurrence and Scan Planning
+## P8: Reverse Recurrence and Scan Planner
 
-Plan:
+### Planned Changes
 
-- Represent reverse recurrence as scheduler IR:
-  - state dependencies
-  - rematerialization policy
-  - snapshot/cache policy
-  - parallel chunks
-  - legal in-place updates
-- Use Z3 to prove chunk independence and minimal sync.
-- Fuse post-recurrence residual/gate reductions into the recurrence kernel when
+- Represent reverse recurrence as scan/dependency IR with state dependencies,
+  chunking, snapshot/cache policy, rematerialization policy, and in-place
+  legality.
+- Prove chunk independence and minimal sync with Z3.
+- Fuse post-recurrence residual/gate work into the recurrence kernel when
   legality and register pressure allow.
 
-Test:
-
-- Unit tests for scan dependency metadata.
-- Runtime parity for Mamba3/M2RNN/hybrid RNN.
-- Performance profiles show reduced serial-over-T bottleneck.
-- Commands:
+### Tests
 
 ```bash
-python -m pytest /Volumes/external/sources/cppmega.mlx/tests -q -k "mamba3 or m2rnn or hybrid"
+cd /private/tmp/tl_apache_tvm_swap
+.venv313/bin/python -m pytest testing/python/scheduler/ -q -k "scan or recurrence"
+
+cd /Volumes/external/sources/cppmega.mlx
+TILELANG_DEV_BUILD_ROOT=/private/tmp/tl_apache_tvm_swap \
+TVM_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+DYLD_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+PYTHONPATH=/private/tmp/tl_apache_tvm_swap:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/python:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/3rdparty/tvm-ffi/python \
+.venv/bin/python -m pytest tests -q -k "mamba3 or m2rnn or hybrid"
 ```
 
-Acceptance:
+### Green Criteria
 
-- No forced serial path when chunk parallelization is proven legal.
-- In-place bwd route is chosen only when alias proof passes.
+- No forced serial-over-T path when chunk parallelization is proven legal.
+- In-place bwd is selected only when alias proof passes.
+- Profiler receipt shows reduced serial recurrence bottleneck on model shapes.
 
-### 9. Register Pressure, Split/Inline, and Hoisting
+## P9: Cost Model and Codegen Cleanup
 
-Plan:
+### Planned Changes
 
-- Scheduler attaches cost metadata:
-  - estimated registers
-  - local memory pressure
-  - threadgroup memory pressure
-  - index math cost
-  - occupancy estimate
-- Apply:
-  - hoist repeated index math
-  - split kernels only when register pressure exceeds threshold
-  - inline only when it improves occupancy or reduces memory traffic
-  - choose SIMD reductions for P multiples of 32
+- Attach cost metadata for registers, local memory, threadgroup memory, index
+  math, occupancy, dispatch count, and sync/materialization cost.
+- Hoist repeated hot index math.
+- Choose SIMD reductions by extent and backend capability.
+- Split or inline kernels only when register pressure and traffic estimates
+  justify it.
+- Make every selected strategy explainable in metadata.
 
-Test:
-
-- Codegen text tests assert repeated expensive index expressions are hoisted.
-- Profiler tests compare selected plan against baseline candidates.
-- Commands:
+### Tests
 
 ```bash
-python -m pytest testing/python/scheduler/ -q -k "cost or register or hoist"
-python -m pytest /Volumes/external/sources/cppmega.mlx/tests -q -k "path_c"
+cd /private/tmp/tl_apache_tvm_swap
+.venv313/bin/python -m pytest testing/python/scheduler/ -q -k "cost or register or hoist"
+.venv313/bin/python -m pytest testing/python/metal/ -q -k "source or reduce"
+
+cd /Volumes/external/sources/cppmega.mlx
+TILELANG_DEV_BUILD_ROOT=/private/tmp/tl_apache_tvm_swap \
+TVM_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+DYLD_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+PYTHONPATH=/private/tmp/tl_apache_tvm_swap:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/python:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/3rdparty/tvm-ffi/python \
+.venv/bin/python -m pytest tests -q -k "path_c"
 ```
 
-Acceptance:
+### Green Criteria
 
-- Path C generated code has no obvious repeated hot index math in inner loops.
-- Plan selection is reproducible from recorded cost metadata.
+- Generated source has no repeated expensive inner-loop index expressions.
+- Scheduler metadata explains hoist/split/inline decisions.
+- Path C generated code moves closer to Path B without model-specific kernels.
 
-### 10. Autotune, Profiling, and Memoization
+## P10: Autotune, Profiling, and Memoization
 
-Plan:
+### Planned Changes
 
-- Store tuned schedule records keyed by:
-  - op signature
-  - shape
-  - dtype
-  - backend target
-  - TileLang/TVM/MLX ABI hashes
-  - proof hash
-- On first run, benchmark legal candidates.
-- On later runs, reuse best known schedule unless ABI/proof/codegen hash
-  changes.
+- Benchmark only legal schedules.
+- Cache tuned schedules by op signature, shape, dtype, backend target,
+  TileLang/TVM/TVM-FFI/MLX ABI hashes, proof hash, and codegen hash.
+- Reuse warm schedule unless ABI/proof/codegen changes.
+- Record cold compile time separately from warm execution time.
 
-Test:
-
-- Cache hit/miss tests.
-- ABI/hash invalidation tests.
-- Profiler smoke tests for Path B vs Path C.
-- Commands:
+### Tests
 
 ```bash
-python -m pytest testing/python/scheduler/ -q -k "autotune or cache"
-python -m pytest /Volumes/external/sources/cppmega.mlx/tests -q -k "profile or bench"
+cd /private/tmp/tl_apache_tvm_swap
+.venv313/bin/python -m pytest testing/python/scheduler/ -q -k "autotune or cache"
+
+cd /Volumes/external/sources/cppmega.mlx
+TILELANG_DEV_BUILD_ROOT=/private/tmp/tl_apache_tvm_swap \
+TVM_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+DYLD_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+PYTHONPATH=/private/tmp/tl_apache_tvm_swap:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/python:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/3rdparty/tvm-ffi/python \
+.venv/bin/python -m pytest tests -q -k "profile or bench or path_c"
 ```
 
-Acceptance:
+### Green Criteria
 
-- Compile-time slow path is paid once per signature.
-- Cached Path C uses the tuned schedule and records the proof/cost reason.
+- Cache hit/miss/invalidation tests pass.
+- Cold compile is paid once per signature.
+- Warm run records selected schedule, proof hash, cache key, and timing.
 
-### 11. Production Lint: No Monkeypatch, No Direct Backend Hacks
+## P11: Production Lint
 
-Plan:
+### Planned Changes
 
-- Add lint checks for production paths:
-  - no monkeypatch for MLX/TileLang/TVM-FFI production behavior
-  - no `mx.fast.metal_kernel` in Path C production route
-  - no direct cppmega public TVM-FFI bypass
-  - no direct backend intrinsic calls from model generators
-- Allow explicit tests and debug tools to opt in by path/name.
+- Add lint tests blocking production:
+  `monkeypatch`, `mx.fast.metal_kernel`, public cppmega TVM-FFI bypasses,
+  model-level backend intrinsics, and public partial outputs.
+- Allow only test/debug paths with explicit allowlist entries.
 
-Test:
-
-- Static lint fails on forbidden tokens outside allowlisted test/debug paths.
-- Commands:
+### Tests
 
 ```bash
-python -m pytest /Volumes/external/sources/cppmega.mlx/tests -q -k "lint or monkeypatch"
-rg -n "monkeypatch|mx\\.fast\\.metal_kernel|tir\\.metal|simd_sum" /Volumes/external/sources/cppmega.mlx/cppmega_mlx
+cd /private/tmp/tl_apache_tvm_swap
+.venv313/bin/python -m pytest testing/python/ -q -k "lint or monkeypatch"
+
+cd /Volumes/external/sources/cppmega.mlx
+TILELANG_DEV_BUILD_ROOT=/private/tmp/tl_apache_tvm_swap \
+TVM_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+DYLD_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+PYTHONPATH=/private/tmp/tl_apache_tvm_swap:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/python:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/3rdparty/tvm-ffi/python \
+.venv/bin/python -m pytest tests -q -k "lint or monkeypatch"
+rg -n "monkeypatch|mx\\.fast\\.metal_kernel|tir\\.metal|simd_sum|_partial" cppmega_mlx
 ```
 
-Acceptance:
+### Green Criteria
 
-- Production code path is framework-owned, not monkeypatched.
+- Production code path is framework-owned and lint-clean.
+- Any forbidden token in tests/debug code has a documented allowlist reason.
 
-### 12. Full Model Performance Matrix
+## P12: Full 1B Training Matrix
 
-Plan:
+### Planned Changes
 
-- Run the real 1B model, block size 2048, batch size 1 first.
-- Matrix:
-  - dtype: bf16, fp8, int8 where supported
-  - optimizer: adamw, lion, muon, muon+adamw, other configured mixes
-  - path: Path B, Path C cold, Path C warm/cache hit
-  - steps: 20
-  - metrics: tok/sec, step/sec, compile time, peak memory, cache hit, selected
-    schedule, proof result
-- Free memory after every run; each case runs in a fresh subprocess.
+- Add or use a benchmark harness that runs the real 1B model with:
+  batch size 1, block size 2048, 20 steps, fresh subprocess per cell.
+- Matrix dimensions:
+  dtype: bf16, fp8, int8 where supported;
+  optimizer: adamw, lion, muon, muon+adamw, and configured mixes;
+  path: Path B, Path C cold, Path C warm.
+- Capture tok/sec, step/sec, compile time, peak memory, cache hit, selected
+  schedule, proof result, and pass/fail reason.
+- Free memory after every cell by process isolation.
 
-Test:
+### Tests
 
-- Benchmark script emits a CSV/Markdown table with no failed cells hidden.
-- Path C warm should be within the agreed threshold of Path B, initially
-  targeting single-digit percent gap, then tighter after scheduler work.
-- Commands:
+Harness regression:
 
 ```bash
 cd /Volumes/external/sources/cppmega.mlx
 TILELANG_DEV_BUILD_ROOT=/private/tmp/tl_apache_tvm_swap \
-TVM_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib \
-PYTHONPATH=/private/tmp/tl_apache_tvm_swap:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/python \
-.venv/bin/python -m pytest tests -q -k "path_c"
+TVM_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+DYLD_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+PYTHONPATH=/private/tmp/tl_apache_tvm_swap:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/python:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/3rdparty/tvm-ffi/python \
+.venv/bin/python -m pytest tests -q -k "bench or path_c or optimizer"
 ```
 
-Acceptance:
+Full run command, once P0 is green:
 
-- Full table includes pass/fail reason for every dtype/optimizer/path.
-- No benchmark result is reported without exact command, git SHAs, and cache
-  state.
+```bash
+cd /Volumes/external/sources/cppmega.mlx
+TILELANG_DEV_BUILD_ROOT=/private/tmp/tl_apache_tvm_swap \
+TVM_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+DYLD_LIBRARY_PATH=/private/tmp/tl_apache_tvm_swap/build/lib:/private/tmp/tl_apache_tvm_swap/build/tvm \
+PYTHONPATH=/private/tmp/tl_apache_tvm_swap:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/python:/private/tmp/tl_apache_tvm_swap/3rdparty/tvm/3rdparty/tvm-ffi/python \
+.venv/bin/python scripts/bench_1b_training_matrix.py \
+  --batch-size 1 \
+  --block-size 2048 \
+  --steps 20 \
+  --dtypes bf16,fp8,int8 \
+  --optimizers adamw,lion,muon,muon_adamw \
+  --paths path_b,path_c_cold,path_c_warm \
+  --fresh-process \
+  --out /tmp/cppmega_1b_path_matrix.md \
+  --csv /tmp/cppmega_1b_path_matrix.csv
+```
 
-## Execution Order
+### Green Criteria
 
-1. Reduction IR API generalization.
-2. ReductionPlan metadata in scheduler.
-3. Z3 proof module for reductions and hazards.
-4. Backend lowerer registry integration.
-5. IR pattern rewrite from hand partials to semantic reduction IR.
-6. Two-pass generated reductions for axes larger than one threadgroup.
-7. Reverse recurrence scan metadata and chunk planner.
-8. Sync/event planner connected to dependency metadata.
-9. Cost model and register/index hoisting.
-10. Autotune/cache and benchmark matrix.
-11. Production lint and CI gates.
-12. Full 1B model performance table.
+- Table includes every dtype/optimizer/path cell, including unsupported cells
+  with explicit reason.
+- No result is reported without exact command, TileLang SHA, cppmega SHA, MLX
+  SHA, cache state, tok/sec, step/sec, compile time, and peak memory.
+- Path C warm is compared side by side against Path B for every supported cell.
+
+## Required Receipts
+
+| Package | Receipt |
+| --- | --- |
+| P0 | FP8 pytest output, strict Path B/Path C JSON, generated source snippet |
+| P1 | Golden semantic reduction IR snapshot |
+| P2 | Rewrite test proving manual partial pattern becomes semantic IR |
+| P3 | Serialized `ReductionPlan` snapshot |
+| P4 | Z3 positive and negative proof fixtures |
+| P5 | Sync metadata showing no event for no-hazard and event for real hazard |
+| P6 | Backend registry diagnostic naming selected lowerer |
+| P7 | Large-axis parity run with no public partial outputs |
+| P8 | Scan metadata plus Mamba3/M2RNN/hybrid profiler receipt |
+| P9 | Cost metadata plus generated-source hoist/split/inline evidence |
+| P10 | Cold/warm cache receipt with cache/proof/codegen hashes |
+| P11 | Static lint receipt proving production path is clean |
+| P12 | Markdown and CSV full 1B matrix |
 
 ## Definition of Done
 
-- Production model code contains semantic TileLang operations, not backend
-  reduction intrinsics.
-- Scheduler output includes machine-readable proof, sync, and strategy metadata.
-- Z3 tests cover both allowed and rejected plans.
-- Metal generated code for supported reductions has no public partial outputs.
-- Full cppmega 1B matrix runs with Path B and Path C results reported side by
-  side.
-- No monkeypatch is required for the production path.
+- Path C production path is TileLang -> TVM -> TVM-FFI -> MLX.
+- Scheduler emits semantic reduction/scan/dependency metadata.
+- Z3 legality results control parallelization and sync decisions.
+- Backend registries own backend-specific lowering.
+- Autotune chooses among legal schedules and memoizes the result.
+- Full 1B matrix reports Path B and Path C side by side with no hidden failed
+  cells.
+- No production monkeypatch, model-owned MSL, or public partial-output workaround
+  remains.

@@ -37,6 +37,8 @@ from tilelang.jit.adapter._mlx_tvm_ffi import (
     MLXTVMFFIBridgeUnavailable,
     is_available as mlx_tvm_ffi_is_available,
     metal_call as mlx_tvm_ffi_metal_call,
+    prepare_metal_call as mlx_tvm_ffi_prepare_metal_call,
+    prepared_metal_call as mlx_tvm_ffi_prepared_metal_call,
 )
 from tilelang.analysis.metal_graph_sync import make_tvm_ffi_metal_dependency_metadata
 
@@ -163,7 +165,11 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         buffer_map = func.buffer_map
         dynamic_symbolic_map = {}
         for i, param in enumerate(params):
-            if isinstance(param, tir.Var) and (param not in dynamic_symbolic_map):
+            if (
+                isinstance(param, tir.Var)
+                and param not in buffer_map
+                and param not in dynamic_symbolic_map
+            ):
                 dynamic_symbolic_map[param] = (2, i, -1, 1)
         for i, param in enumerate(params):
             if param in buffer_map:
@@ -218,6 +224,37 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
 
         dynamic_symbolic_map = self._process_dynamic_symbolic()
         executable = self.executable
+        target_kind_static = self.target.kind.name
+        metal_zero_init_output_positions = (
+            self._metal_zero_init_output_positions()
+            if target_kind_static == "metal"
+            else []
+        )
+        metal_direct_device_call = (
+            self._metal_direct_device_call()
+            if target_kind_static == "metal"
+            else None
+        )
+        direct_func = (
+            metal_direct_device_call[0]
+            if metal_direct_device_call is not None
+            else None
+        )
+        direct_launch_args = (
+            metal_direct_device_call[1]
+            if metal_direct_device_call is not None
+            else None
+        )
+        direct_module = (
+            metal_direct_device_call[2]
+            if metal_direct_device_call is not None
+            else None
+        )
+        direct_kernel_name = (
+            metal_direct_device_call[3]
+            if metal_direct_device_call is not None
+            else None
+        )
 
         # Prepare helpers for friendly dtype error messages
         prim_func = self.prim_func
@@ -237,6 +274,60 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 expected_dtype_strs.append(None)
                 is_buffer_param.append(False)
                 param_names.append(str(p))
+        input_param_indices = [
+            i for i in range(len(self.params)) if i not in self.result_idx
+        ]
+        default_metal_dependency_metadata = (
+            self._metal_dependency_metadata(
+                input_param_indices=input_param_indices,
+                param_names=param_names,
+                command_buffer_domain=None,
+            )
+            if target_kind_static == "metal"
+            else None
+        )
+        static_native_param_shapes = None
+        if not dynamic_symbolic_map:
+            static_native_param_shapes = [
+                [int(dim) for dim in shape] for shape in param_shapes
+            ]
+        native_mlx_bridge_available_static = (
+            target_kind_static == "metal" and mlx_tvm_ffi_is_available()
+        )
+        all_native_params_are_buffers = (
+            all(is_buffer_param[i] for i in range(len(self.params)) if i not in self.result_idx)
+            and all(is_buffer_param[i] for i in self.result_idx)
+        )
+        prepared_native_metal_call = None
+        if (
+            native_mlx_bridge_available_static
+            and target_kind_static == "metal"
+            and self.result_idx
+            and static_native_param_shapes is not None
+            and hasattr(executable, "__getitem__")
+            and all_native_params_are_buffers
+        ):
+            try:
+                prepared_native_metal_call = mlx_tvm_ffi_prepare_metal_call(
+                    executable["main"],
+                    output_shapes=[
+                        static_native_param_shapes[i] for i in self.result_idx
+                    ],
+                    output_dtypes=[
+                        expected_dtype_strs[i] for i in self.result_idx
+                    ],
+                    result_indices=self.result_idx,
+                    num_params=len(self.params),
+                    param_dtypes=expected_dtype_strs,
+                    param_shapes=static_native_param_shapes,
+                    direct_func=direct_func,
+                    direct_launch_args=direct_launch_args,
+                    direct_module=direct_module,
+                    direct_kernel_name=direct_kernel_name,
+                    zero_init_output_positions=metal_zero_init_output_positions,
+                )
+            except (AttributeError, MLXTVMFFIBridgeUnavailable):
+                prepared_native_metal_call = None
 
         def normalize_out_argument(out_arg: Any) -> list[Any] | None:
             if out_arg is None:
@@ -284,6 +375,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             *inputs: torch.Tensor | Any,
             out: Any | None = None,
             _tilelang_metal_command_buffer_domain: Any | None = None,
+            _tilelang_mlx_async_owner_outputs: bool = False,
         ):
             # Validate input count.  The compact calling convention omits
             # result_idx outputs so the adapter allocates them; the full ABI
@@ -315,15 +407,18 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             dlpack_args = inputs
             if output_overrides is not None:
                 dlpack_args = inputs + tuple(output_overrides)
-            target_kind = self.target.kind.name
+            target_kind = target_kind_static
             uses_mlx_runtime = has_mlx_arrays(dlpack_args)
             if uses_mlx_runtime and target_kind != "metal":
                 raise DLPackDeviceError(
                     f"MLX arrays export Metal DLPack buffers, but this kernel targets {target_kind!r}."
                 )
-            validate_dlpack_inputs_for_target(dlpack_args, target_kind)
-            if uses_mlx_runtime:
-                first_mlx_array_device(dlpack_args)
+            owner_outputs_requested = output_overrides is not None or using_full_abi_args
+            native_mlx_bridge_available = (
+                uses_mlx_runtime
+                and target_kind == "metal"
+                and native_mlx_bridge_available_static
+            )
 
             mlx_compact_graph_candidate = (
                 uses_mlx_runtime
@@ -332,21 +427,22 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 and output_overrides is None
                 and not using_full_abi_args
                 and hasattr(executable, "__getitem__")
-                and all(is_buffer_param[i] for i in range(len(self.params)) if i not in self.result_idx)
-                and all(is_buffer_param[i] for i in self.result_idx)
+                and all_native_params_are_buffers
             )
-            use_native_mlx_graph = mlx_compact_graph_candidate and mlx_tvm_ffi_is_available()
-            owner_outputs_requested = output_overrides is not None or using_full_abi_args
+            use_native_mlx_graph = mlx_compact_graph_candidate and native_mlx_bridge_available
             use_native_mlx_owner_outputs = (
                 uses_mlx_runtime
                 and target_kind == "metal"
                 and self.result_idx
                 and owner_outputs_requested
                 and hasattr(executable, "__getitem__")
-                and all(is_buffer_param[i] for i in range(len(self.params)) if i not in self.result_idx)
-                and all(is_buffer_param[i] for i in self.result_idx)
-                and mlx_tvm_ffi_is_available()
+                and all_native_params_are_buffers
+                and native_mlx_bridge_available
             )
+            if not (use_native_mlx_graph or use_native_mlx_owner_outputs):
+                validate_dlpack_inputs_for_target(dlpack_args, target_kind)
+                if uses_mlx_runtime:
+                    first_mlx_array_device(dlpack_args)
 
             # Resolve the device used for outputs. Prefer the first tensor input's device
             # if available, otherwise use PyTorch's current device.
@@ -409,26 +505,49 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                     ins_idx += 1
                 tensor_list.append(tensor)
 
+            native_param_shapes = (
+                static_native_param_shapes
+                if static_native_param_shapes is not None
+                else [resolved_param_shape(i) for i in range(len(self.params))]
+                if uses_mlx_runtime and target_kind == "metal" and self.result_idx
+                else None
+            )
+
             graph_outputs = None
             if use_native_mlx_graph:
-                input_param_indices = [i for i in range(len(self.params)) if i not in self.result_idx]
-                dependency_metadata = self._metal_dependency_metadata(
-                    input_param_indices=input_param_indices,
-                    param_names=param_names,
-                    command_buffer_domain=_tilelang_metal_command_buffer_domain,
+                dependency_metadata = (
+                    default_metal_dependency_metadata
+                    if _tilelang_metal_command_buffer_domain is None
+                    else self._metal_dependency_metadata(
+                        input_param_indices=input_param_indices,
+                        param_names=param_names,
+                        command_buffer_domain=_tilelang_metal_command_buffer_domain,
+                    )
                 )
                 try:
-                    graph_outputs = mlx_tvm_ffi_metal_call(
-                        executable["main"],
-                        inputs=[tensor_list[i] for i in input_param_indices],
-                        output_shapes=[tensor_list[i].shape for i in self.result_idx],
-                        output_dtypes=[tensor_list[i].dtype for i in self.result_idx],
-                        result_indices=self.result_idx,
-                        num_params=len(self.params),
-                        param_dtypes=expected_dtype_strs,
-                        dependency_metadata=dependency_metadata,
-                        zero_init_output_positions=self._metal_zero_init_output_positions(),
-                    )
+                    if prepared_native_metal_call is not None:
+                        graph_outputs = mlx_tvm_ffi_prepared_metal_call(
+                            prepared_native_metal_call,
+                            inputs=[tensor_list[i] for i in input_param_indices],
+                            dependency_metadata=dependency_metadata,
+                        )
+                    else:
+                        graph_outputs = mlx_tvm_ffi_metal_call(
+                            executable["main"],
+                            inputs=[tensor_list[i] for i in input_param_indices],
+                            output_shapes=[tensor_list[i].shape for i in self.result_idx],
+                            output_dtypes=[tensor_list[i].dtype for i in self.result_idx],
+                            result_indices=self.result_idx,
+                            num_params=len(self.params),
+                            param_dtypes=expected_dtype_strs,
+                            param_shapes=native_param_shapes,
+                            direct_func=direct_func,
+                            direct_launch_args=direct_launch_args,
+                            direct_module=direct_module,
+                            direct_kernel_name=direct_kernel_name,
+                            dependency_metadata=dependency_metadata,
+                            zero_init_output_positions=metal_zero_init_output_positions,
+                        )
                 except MLXTVMFFIBridgeUnavailable:
                     graph_outputs = None
             if graph_outputs is not None:
@@ -436,25 +555,50 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                     return graph_outputs[0]
                 return list(graph_outputs)
             if use_native_mlx_owner_outputs:
-                input_param_indices = [i for i in range(len(self.params)) if i not in self.result_idx]
-                dependency_metadata = self._metal_dependency_metadata(
-                    input_param_indices=input_param_indices,
-                    param_names=param_names,
-                    command_buffer_domain=_tilelang_metal_command_buffer_domain,
+                dependency_metadata = (
+                    default_metal_dependency_metadata
+                    if _tilelang_metal_command_buffer_domain is None
+                    else self._metal_dependency_metadata(
+                        input_param_indices=input_param_indices,
+                        param_names=param_names,
+                        command_buffer_domain=_tilelang_metal_command_buffer_domain,
+                    )
                 )
                 try:
-                    owner_aliases = mlx_tvm_ffi_metal_call(
-                        executable["main"],
-                        inputs=[tensor_list[i] for i in input_param_indices],
-                        owner_outputs=[tensor_list[i] for i in self.result_idx],
-                        output_shapes=[resolved_param_shape(i) for i in self.result_idx],
-                        output_dtypes=[expected_dtype_strs[i] for i in self.result_idx],
-                        result_indices=self.result_idx,
-                        num_params=len(self.params),
-                        param_dtypes=expected_dtype_strs,
-                        dependency_metadata=dependency_metadata,
-                        zero_init_output_positions=self._metal_zero_init_output_positions(),
-                    )
+                    if prepared_native_metal_call is not None:
+                        owner_aliases = mlx_tvm_ffi_prepared_metal_call(
+                            prepared_native_metal_call,
+                            inputs=[tensor_list[i] for i in input_param_indices],
+                            owner_outputs=[tensor_list[i] for i in self.result_idx],
+                            dependency_metadata=dependency_metadata,
+                        )
+                    else:
+                        owner_output_shapes = [
+                            [int(dim) for dim in getattr(tensor_list[i], "shape", ())]
+                            for i in self.result_idx
+                        ]
+                        owner_aliases = mlx_tvm_ffi_metal_call(
+                            executable["main"],
+                            inputs=[tensor_list[i] for i in input_param_indices],
+                            owner_outputs=[tensor_list[i] for i in self.result_idx],
+                            output_shapes=owner_output_shapes,
+                            output_dtypes=[expected_dtype_strs[i] for i in self.result_idx],
+                            result_indices=self.result_idx,
+                            num_params=len(self.params),
+                            param_dtypes=expected_dtype_strs,
+                            param_shapes=native_param_shapes,
+                            direct_func=direct_func,
+                            direct_launch_args=direct_launch_args,
+                            direct_module=direct_module,
+                            direct_kernel_name=direct_kernel_name,
+                            dependency_metadata=dependency_metadata,
+                            zero_init_output_positions=metal_zero_init_output_positions,
+                        )
+                    if _tilelang_mlx_async_owner_outputs:
+                        if len(self.result_idx) == 1:
+                            return owner_aliases[0]
+                        return list(owner_aliases)
+
                     import mlx.core as mx  # type: ignore[import-not-found]
 
                     mx.eval(*owner_aliases)
@@ -503,6 +647,74 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             param_names=param_names,
             command_buffer_domain=command_buffer_domain,
         )
+
+    def _metal_direct_device_call(self):
+        """Return the imported TVM Metal device function and static launch args.
+
+        TileLang's TVM host wrapper ultimately calls the imported Metal module
+        with raw buffer handles plus the launch parameters stored on the device
+        PrimFunc.  The MLX bridge can call that same generated TVM runtime
+        function directly when all parameters are buffers, avoiding host-side
+        DLTensor unpacking while keeping the standard TileLang -> TVM -> TVM-FFI
+        compilation path.
+        """
+
+        metadata = self._metal_device_launch_metadata()
+        if metadata is None:
+            return None
+        kernel_name, launch_args = metadata
+        rt_mod = getattr(self, "rt_mod", None)
+        if rt_mod is None:
+            return None
+        imports = getattr(rt_mod, "imports", None)
+        if imports is None:
+            return None
+        try:
+            imported_modules = list(imports)
+        except Exception:
+            return None
+        if len(imported_modules) != 1:
+            return None
+        try:
+            imported_module = imported_modules[0]
+            return imported_module[kernel_name], launch_args, imported_module, kernel_name
+        except Exception:
+            return None
+
+    def _metal_device_launch_metadata(self) -> tuple[str, list[int]] | None:
+        device_mod = getattr(self, "device_mod", None)
+        if device_mod is None:
+            return None
+        try:
+            items = list(device_mod.functions.items())
+        except Exception:
+            return None
+        for global_var, func in items:
+            attrs = getattr(func, "attrs", None)
+            if attrs is None:
+                continue
+            thread_extent = attrs.get("thread_extent")
+            launch_params = attrs.get("tirx.kernel_launch_params")
+            if thread_extent is None or launch_params is None:
+                continue
+            global_symbol = attrs.get("global_symbol")
+            if global_symbol is not None:
+                kernel_name = str(global_symbol).strip('"')
+            else:
+                kernel_name = str(getattr(global_var, "name_hint", "")).strip('"')
+            if not kernel_name:
+                continue
+            extent_by_tag = {str(tag): int(extent) for tag, extent in thread_extent.items()}
+            launch_args: list[int] = []
+            for tag in launch_params:
+                tag_str = str(tag).strip('"')
+                if tag_str not in extent_by_tag:
+                    launch_args = []
+                    break
+                launch_args.append(extent_by_tag[tag_str])
+            if launch_args:
+                return kernel_name, launch_args
+        return None
 
     def _metal_zero_init_output_positions(self) -> list[int]:
         """Return output positions that need zero-init before launching Metal.

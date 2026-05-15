@@ -30,6 +30,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "../op/builtin.h"
@@ -100,6 +101,32 @@ private:
 
   std::unordered_map<std::string, const VarNode *> param_aliases_;
   std::unordered_map<const VarNode *, Alias> aliases_;
+};
+
+class MetalBodyBufferWriteCollector final : public StmtExprVisitor {
+public:
+  void VisitStmt_(const BufferStoreNode *op) final {
+    MaybeCollect(op->buffer);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  const std::unordered_set<const VarNode *> &written_vars() const {
+    return written_vars_;
+  }
+
+  const std::unordered_set<std::string> &written_names() const {
+    return written_names_;
+  }
+
+private:
+  void MaybeCollect(const Buffer &buffer) {
+    const VarNode *data = buffer->data.get();
+    written_vars_.insert(data);
+    written_names_.insert(data->name_hint);
+  }
+
+  std::unordered_set<const VarNode *> written_vars_;
+  std::unordered_set<std::string> written_names_;
 };
 
 } // namespace
@@ -660,6 +687,15 @@ void CodeGenTileLangMetal::EmitFp8Dot4Helpers() {
               << "}\n"
               << "static inline uint __tvm_fp8_load_u32(constant const uchar* p, uint word_idx) {\n"
               << "  return reinterpret_cast<constant const uint*>(p)[word_idx];\n"
+              << "}\n"
+              << "static inline uint __tvm_fp8_load_u32(device const uint* p, uint word_idx) {\n"
+              << "  return p[word_idx];\n"
+              << "}\n"
+              << "static inline uint __tvm_fp8_load_u32(threadgroup const uint* p, uint word_idx) {\n"
+              << "  return p[word_idx];\n"
+              << "}\n"
+              << "static inline uint __tvm_fp8_load_u32(constant const uint* p, uint word_idx) {\n"
+              << "  return p[word_idx];\n"
               << "}\n\n";
   decl_stream << "static inline float __tvm_fp8_e4m3_dot4_packed(device const uchar* a, device const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
               << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
@@ -760,6 +796,18 @@ public:
     return name == "tir.metal.fp8_e4m3_dot4" ||
            name == "tirx.metal.fp8_e4m3_dot4";
   }
+  static bool IsFp8LoadU32Intrin(const std::string &name) {
+    return name == "tir.metal.fp8_load_u32" ||
+           name == "tirx.metal.fp8_load_u32";
+  }
+  static bool IsFp8Dot4WordsIntrin(const std::string &name) {
+    return name == "tir.metal.fp8_e4m3_dot4_words" ||
+           name == "tirx.metal.fp8_e4m3_dot4_words";
+  }
+  static bool UsesFp8Dot4HelperIntrin(const std::string &name) {
+    return IsFp8Dot4Intrin(name) || IsFp8LoadU32Intrin(name) ||
+           IsFp8Dot4WordsIntrin(name);
+  }
   static bool IsGridTidXIntrin(const std::string &name) {
     return name == "tir.metal.thread_position_in_grid_x" ||
            name == "tirx.metal.thread_position_in_grid_x";
@@ -771,6 +819,12 @@ public:
   static bool IsSimdLaneIdIntrin(const std::string &name) {
     return name == "tir.metal.thread_index_in_simdgroup" ||
            name == "tirx.metal.thread_index_in_simdgroup";
+  }
+  static bool IsGridTidXVarName(const std::string &name) {
+    return name == "grid_tid" || name.rfind("grid_tid_", 0) == 0;
+  }
+  static bool IsSimdLaneIdVarName(const std::string &name) {
+    return name == "simd_lane" || name.rfind("simd_lane_", 0) == 0;
   }
 
   void Note(const DataType &t) {
@@ -809,7 +863,7 @@ public:
       // 3rdparty/tvm/python/tvm/tirx/expr.py:Call.__init__), so the registered
       // op name is ``tirx.metal.fp8_e4m3_dot4``. ``IsFp8Dot4Intrin`` matches
       // both spellings to avoid a silent miss on the helper-prelude emission.
-      if (IsFp8Dot4Intrin(opn->name)) {
+      if (UsesFp8Dot4HelperIntrin(opn->name)) {
         uses_dot4 = true;
       } else if (IsGridTidXIntrin(opn->name)) {
         uses_grid_tid_x = true;
@@ -834,6 +888,11 @@ public:
   }
   void VisitExpr_(const VarNode *op) final {
     Note(op->dtype);
+    if (IsGridTidXVarName(op->name_hint)) {
+      uses_grid_tid_x = true;
+    } else if (IsSimdLaneIdVarName(op->name_hint)) {
+      uses_simd_lane_id = true;
+    }
     StmtExprVisitor::VisitExpr_(op);
   }
   void VisitExpr_(const LetNode *op) final {
@@ -1033,6 +1092,10 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
                     "buffers in the kernel";
   }
   std::unordered_map<std::string, const VarNode *> external_buffer_aliases;
+  MetalBodyBufferWriteCollector write_collector;
+  write_collector(func->body);
+  const auto &written_buffer_vars = write_collector.written_vars();
+  const auto &written_buffer_names = write_collector.written_names();
   for (size_t i = 0; i < func->params.size(); ++i, ++num_buffer) {
     Var v = func->params[i];
     if (!v.dtype().is_handle())
@@ -1057,6 +1120,20 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
     auto it = alloc_storage_scope_.find(v.get());
     if (it != alloc_storage_scope_.end()) {
       PrintStorageScope(it->second, this->stream);
+    }
+    bool readonly_buffer = false;
+    if (uses_fp8_dot4_) {
+      readonly_buffer = !written_buffer_vars.count(v.get()) &&
+                        !written_buffer_names.count(v->name_hint);
+      auto it_buf = func->buffer_map.find(v);
+      if (readonly_buffer && it_buf != func->buffer_map.end()) {
+        const Buffer &buf = (*it_buf).second;
+        readonly_buffer = !written_buffer_vars.count(buf->data.get()) &&
+                          !written_buffer_names.count(buf->data->name_hint);
+      }
+    }
+    if (readonly_buffer) {
+      this->stream << "const ";
     }
     PrintType(GetType(v), this->stream);
     // Register handle data type
@@ -1135,6 +1212,7 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
   }
   std::string grid_tid_x_id;
   std::string simd_lane_id_id;
+  std::string grid_tid_x_expr;
   if (needs_grid_tid_x) {
     // Identifier name is observable from cppmega.mlx tests
     // (tests/test_tilelang_fp8_vecmat_path_c.py asserts the substring
@@ -1163,7 +1241,19 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
     }
   }
   if (needs_grid_tid_x) {
-    stream << "  uint " << grid_tid_x_id << " [[thread_position_in_grid]]";
+    stream << "  ";
+    if (work_dim != 0) {
+      // Metal requires all thread-position attributes in one kernel
+      // signature to use the same scalar/vector width. The ordinary
+      // TileLang launch parameters above use `work_dim`, so mirror that
+      // width here and have the intrinsic expression read `.x`.
+      PrintType(DataType::UInt(thread_index_bits_, work_dim), stream);
+      grid_tid_x_expr = grid_tid_x_id + ".x";
+    } else {
+      stream << "uint";
+      grid_tid_x_expr = grid_tid_x_id;
+    }
+    stream << " " << grid_tid_x_id << " [[thread_position_in_grid]]";
     if (needs_simd_lane_id) {
       stream << ",\n";
     } else {
@@ -1179,7 +1269,7 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
   // (not a member) because per the Path-C task contract the .h header is not
   // part of this fix.
   GetMetalScalarIntrinIdMap()[this] = MetalScalarIntrinIds{
-      needs_grid_tid_x ? grid_tid_x_id : std::string(),
+      needs_grid_tid_x ? grid_tid_x_expr : std::string(),
       needs_simd_lane_id ? simd_lane_id_id : std::string(),
   };
   thread_work_dim_ = work_dim;
@@ -1517,6 +1607,37 @@ void CodeGenTileLangMetal::VisitStmt_(const AttrStmtNode *op) {
   CodeGenC::VisitStmt_(op);
 }
 
+void CodeGenTileLangMetal::VisitStmt_(const BindNode *op) {
+  const auto *call = op->value.as<CallNode>();
+  if (uses_fp8_dot4_ && op->var.dtype().is_handle() && call != nullptr &&
+      call->op.same_as(builtin::address_of()) && call->args.size() == 1) {
+    if (const auto *load = call->args[0].as<BufferLoadNode>();
+        load != nullptr && load->buffer->dtype.is_float8()) {
+      std::string value = PrintExpr(op->value);
+      std::string scope;
+      auto it = alloc_storage_scope_.find(load->buffer->data.get());
+      if (it != alloc_storage_scope_.end()) {
+        scope = it->second;
+      }
+      if (scope.empty()) {
+        scope = GetPtrStorageScope(load->buffer->data);
+      }
+      PrintIndent();
+      if (!scope.empty() && IsScopePartOfType()) {
+        PrintStorageScope(scope, stream);
+      }
+      stream << "const uint* " << AllocVarID(op->var.get())
+             << " = reinterpret_cast<";
+      if (!scope.empty() && IsScopePartOfType()) {
+        PrintStorageScope(scope, stream);
+      }
+      stream << "const uint*>(" << value << ");\n";
+      return;
+    }
+  }
+  CodeGenC::VisitStmt_(op);
+}
+
 void CodeGenTileLangMetal::VisitStmt_(const ForNode *op) {
   if (op->kind == ForKind::kUnrolled) {
     PrintIndent();
@@ -1554,6 +1675,29 @@ void CodeGenTileLangMetal::VisitExpr_(const BufferLoadNode *op,
     ICHECK(index && index->value == 0)
         << "local.var load requires scalar index 0.";
     os << GetVarID(op->buffer->data.get());
+    return;
+  }
+  CodeGenC::VisitExpr_(op, os);
+}
+
+void CodeGenTileLangMetal::VisitExpr_(const VarNode *op,
+                                      std::ostream &os) { // NOLINT(*)
+  if (MetalFp8DTypeCollector::IsGridTidXVarName(op->name_hint)) {
+    auto it = GetMetalScalarIntrinIdMap().find(this);
+    ICHECK(it != GetMetalScalarIntrinIdMap().end() &&
+           !it->second.grid_tid_x.empty())
+        << "canonical Metal grid-tid scalar var referenced from a kernel "
+        << "whose signature was not augmented with [[thread_position_in_grid]]";
+    os << it->second.grid_tid_x;
+    return;
+  }
+  if (MetalFp8DTypeCollector::IsSimdLaneIdVarName(op->name_hint)) {
+    auto it = GetMetalScalarIntrinIdMap().find(this);
+    ICHECK(it != GetMetalScalarIntrinIdMap().end() &&
+           !it->second.simd_lane_id.empty())
+        << "canonical Metal SIMD-lane scalar var referenced from a kernel "
+        << "whose signature was not augmented with [[thread_index_in_simdgroup]]";
+    os << it->second.simd_lane_id;
     return;
   }
   CodeGenC::VisitExpr_(op, os);
@@ -1739,20 +1883,33 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
   } else if (auto *opn = op->op.as<OpNode>();
              opn != nullptr &&
              MetalFp8DTypeCollector::IsFp8Dot4Intrin(opn->name)) {
-    // CPPMEGA / Path C: lower ``T.call_intrin("tir[x].metal.fp8_e4m3_dot4",
-    //   a_ptr, b_ptr, a_word_idx, b_word_idx)`` to the overloaded MSL helper
-    // emitted by ``EmitFp8Dot4Helpers`` (see decl_stream block around line
-    // 290-315). The helper is overloaded across address spaces, so we just
-    // print the call literally — MSL overload resolution picks the right
-    // body based on the buffer pointer's storage qualifier.
+    // CPPMEGA / Path C: lower packed e4m3 dot4 to word loads plus LUT decode.
+    // FP8 buffer binds above cast the hot-loop aliases to uint pointers, so
+    // the load helper becomes a direct word load for the vecmat fast path.
     ICHECK_EQ(op->args.size(), 4)
         << "tir[x].metal.fp8_e4m3_dot4 expects 4 args (a_ptr, b_ptr, "
         << "a_word_idx, b_word_idx), got " << op->args.size();
-    os << "__tvm_fp8_e4m3_dot4_packed("
+    os << "__tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32("
        << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[2]) << "), "
+       << "__tvm_fp8_load_u32("
        << PrintExpr(op->args[1]) << ", "
-       << PrintExpr(op->args[2]) << ", "
-       << PrintExpr(op->args[3]) << ")";
+       << PrintExpr(op->args[3]) << "))";
+  } else if (auto *opn = op->op.as<OpNode>();
+             opn != nullptr &&
+             MetalFp8DTypeCollector::IsFp8LoadU32Intrin(opn->name)) {
+    ICHECK_EQ(op->args.size(), 2)
+        << "tir[x].metal.fp8_load_u32 expects 2 args (ptr, word_idx), got "
+        << op->args.size();
+    os << PrintExpr(op->args[0]) << "[" << PrintExpr(op->args[1]) << "]";
+  } else if (auto *opn = op->op.as<OpNode>();
+             opn != nullptr &&
+             MetalFp8DTypeCollector::IsFp8Dot4WordsIntrin(opn->name)) {
+    ICHECK_EQ(op->args.size(), 2)
+        << "tir[x].metal.fp8_e4m3_dot4_words expects 2 args (a_word, "
+        << "b_word), got " << op->args.size();
+    os << "__tvm_fp8_e4m3_dot4_words(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]) << ")";
   } else if (auto *opn = op->op.as<OpNode>();
              opn != nullptr &&
              MetalFp8DTypeCollector::IsGridTidXIntrin(opn->name)) {

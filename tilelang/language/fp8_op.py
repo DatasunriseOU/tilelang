@@ -264,6 +264,8 @@ _DOT4_INTRINSICS = (
     "tir.metal.thread_position_in_grid_x",
     "tir.metal.thread_index_in_simdgroup",
     "tir.metal.fp8_e4m3_dot4",
+    "tir.metal.fp8_load_u32",
+    "tir.metal.fp8_e4m3_dot4_words",
 )
 _dot4_intrinsics_registered_cache: Optional[bool] = None
 
@@ -420,6 +422,7 @@ def _z3_prove_dot4_legal(
     addr_b,
     A_buf=None,
     B_buf=None,
+    require_int24_safe: bool = True,
 ) -> tuple[bool, str]:
     """Prove the FP8 packed-dot4 fast path is legal for these args.
 
@@ -485,19 +488,21 @@ def _z3_prove_dot4_legal(
             return False, f"static: stride != 1 ({sa}, {sb})"
         if aa % 4 != 0 or ab % 4 != 0:
             return False, f"static: addr not 4-aligned ({aa}, {ab})"
-        # CPPMEGA Z3 idea #5: the alignment proof above is necessary but not
-        # sufficient -- the Metal dot4 lane accumulates in int24, so we
-        # additionally need ``K * 127 * 127 < 2^23``. Without this gate the
-        # fast path silently overflows for K beyond 520. See
-        # ``tilelang.analysis.int24_overflow_proof`` for the full obligation;
-        # the int8/e4m3 max-abs of 127 is the worst case for the LUT-decoded
-        # path on Apple Silicon.
-        from tilelang.analysis.int24_overflow_proof import prove_dot4_int24_safe
-        if not prove_dot4_int24_safe(ka):
-            return False, f"static: int24 overflow at K={ka} (K*127*127 >= 2^23)"
+        if require_int24_safe:
+            # CPPMEGA Z3 idea #5: the alignment proof above is necessary but not
+            # sufficient for backends whose dot4 lane accumulates in int24, so
+            # they also need ``K * 127 * 127 < 2^23``. Metal's current helper
+            # path lowers to LUT-decoded fp32 arithmetic, so late Metal lowering
+            # passes require_int24_safe=False and uses only layout legality.
+            from tilelang.analysis.int24_overflow_proof import prove_dot4_int24_safe
+            if not prove_dot4_int24_safe(ka):
+                return False, f"static: int24 overflow at K={ka} (K*127*127 >= 2^23)"
+        accumulation_reason = (
+            "int24 safe" if require_int24_safe else "fp32 helper accumulation"
+        )
         return True, (
-            f"static fast path: K={ka}, strides=(1,1), addrs=({aa}%4=0,{ab}%4=0), "
-            "int24 safe"
+            f"static fast path: K={ka}, strides=(1,1), "
+            f"addrs=({aa}%4=0,{ab}%4=0), {accumulation_reason}"
         )
 
     # ----- Symbolic / Z3 fallback -------------------------------------------
@@ -592,22 +597,26 @@ def _z3_prove_dot4_legal(
         res = s.check()
         s.pop()
         if res == _z3.unsat:
-            # CPPMEGA Z3 idea #5: pair the alignment proof with the int24
-            # non-overflow proof. If K is symbolic-and-unbounded the int24
-            # prover returns False (see its docstring), keeping us on the
-            # legacy scalar path. If K is constant or pinned the int24
-            # prover discharges the overflow obligation in plain Python.
-            from tilelang.analysis.int24_overflow_proof import prove_dot4_int24_safe
-            int24_ok = prove_dot4_int24_safe(K_a)
-            if not int24_ok:
-                return False, (
-                    "z3 proved dot4 alignment but int24 overflow proof failed; "
-                    "falling back to scalar accumulator"
-                )
+            if require_int24_safe:
+                # CPPMEGA Z3 idea #5: pair the alignment proof with the int24
+                # non-overflow proof. If K is symbolic-and-unbounded the int24
+                # prover returns False (see its docstring), keeping us on the
+                # legacy scalar path. If K is constant or pinned the int24
+                # prover discharges the overflow obligation in plain Python.
+                from tilelang.analysis.int24_overflow_proof import prove_dot4_int24_safe
+                int24_ok = prove_dot4_int24_safe(K_a)
+                if not int24_ok:
+                    return False, (
+                        "z3 proved dot4 alignment but int24 overflow proof failed; "
+                        "falling back to scalar accumulator"
+                    )
+            accumulation_reason = (
+                "int24 safe" if require_int24_safe else "fp32 helper accumulation"
+            )
             return True, (
                 "z3 proved dot4 legal under symbolic constraints "
-                f"(timeout={_Z3_DOT4_TIMEOUT_MS}ms, addr_bits={_Z3_DOT4_ADDR_BITS}, "
-                "int24 safe)"
+                f"(timeout={_Z3_DOT4_TIMEOUT_MS}ms, "
+                f"addr_bits={_Z3_DOT4_ADDR_BITS}, {accumulation_reason})"
             )
         if res == _z3.unknown:
             return False, "z3 returned UNKNOWN (timeout / incomplete); falling back"
@@ -871,12 +880,14 @@ def _emit_fp8_scaled_matmul_marker(
     c_col_offset,
     simd_group_width,
     outputs_per_block,
+    accumulate: bool,
 ):
     """Emit a target-visible TIR marker for late target-specific lowering."""
     if simd_group_width is None:
         simd_group_width = 0
     if outputs_per_block is None:
         outputs_per_block = 0
+    c_access_type = "rw" if accumulate else "w"
     return tir.call_extern(
         "handle",
         FP8_SCALED_MATMUL_MARKER,
@@ -884,7 +895,7 @@ def _emit_fp8_scaled_matmul_marker(
         _as_tile_region_arg(A_scale, "r"),
         _as_tile_region_arg(B_fp8, "r"),
         _as_tile_region_arg(B_scale, "r"),
-        _as_tile_region_arg(C_out, "rw"),
+        _as_tile_region_arg(C_out, c_access_type),
         tir.IntImm("int32", int(bool(transpose_B))),
         a_scale_offset,
         b_scale_offset,
@@ -892,6 +903,7 @@ def _emit_fp8_scaled_matmul_marker(
         c_col_offset,
         tir.IntImm("int32", int(simd_group_width)),
         tir.IntImm("int32", int(outputs_per_block)),
+        tir.IntImm("int32", int(bool(accumulate))),
     )
 
 
@@ -1208,6 +1220,7 @@ def fp8_scaled_matmul(
     c_col_offset=None,
     simd_group_width: Optional[int] = None,
     outputs_per_block: Optional[int] = None,
+    accumulate: bool = True,
 ):
     """Scaled FP8 matmul intrinsic — accumulate scaled FP8 product into ``C``.
 
@@ -1272,6 +1285,9 @@ def fp8_scaled_matmul(
         c_col_offset: Global column offset for direct Metal stores.
         simd_group_width: Metal vecmat SIMD-group width. Defaults to 32.
         outputs_per_block: Number of output columns owned by one block.
+        accumulate: When True, preserve ``C_out +=`` semantics. When False,
+            write ``C_out =`` for owner-output kernels that do not need to
+            read the previous output value.
 
     Returns:
         The handle returned by the underlying ``@T.macro`` invocation,
@@ -1330,6 +1346,7 @@ def fp8_scaled_matmul(
             c_col_offset=c_col_offset,
             simd_group_width=simd_group_width,
             outputs_per_block=outputs_per_block,
+            accumulate=accumulate,
         )
 
     # CPPMEGA Z3 idea #10: before falling back to the scalar legacy M=1 vecmat

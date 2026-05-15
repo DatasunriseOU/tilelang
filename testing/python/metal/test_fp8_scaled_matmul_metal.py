@@ -39,6 +39,13 @@ _HAS_METAL_SDK = (
 )
 
 
+def _has_e4m3_dot4_helper(body: str) -> bool:
+    return (
+        "__tvm_fp8_e4m3_dot4_packed" in body
+        or "__tvm_fp8_e4m3_dot4_words" in body
+    )
+
+
 def _make_kernel(
     M: int,
     N: int,
@@ -388,7 +395,7 @@ def test_m1_transposed_b_vecmat_explicit_metal_target_lowers_to_dot4_simd_sum():
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
     body = src[src.find("kernel void"):]
 
-    assert "__tvm_fp8_e4m3_dot4_packed" in body
+    assert _has_e4m3_dot4_helper(body)
     assert "simd_sum(" in body
     assert "#pragma unroll 4" in body
     simd_pos = body.find("simd_sum(")
@@ -412,7 +419,7 @@ def test_m1_transposed_b_vecmat_keeps_metal_intrinsics_until_codegen():
 
     assert "T.metal_fp8_e4m3_dot4" in tir_text
     assert "T.tirx.metal.simd_sum" in tir_text
-    assert "__tvm_fp8_e4m3_dot4_packed" not in tir_text
+    assert not _has_e4m3_dot4_helper(tir_text)
 
     artifact = tilelang.lower(fn, target=Target("metal"))
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
@@ -420,7 +427,7 @@ def test_m1_transposed_b_vecmat_keeps_metal_intrinsics_until_codegen():
 
     assert "T.metal_fp8_e4m3_dot4" not in body
     assert "T.tirx.metal.simd_sum" not in body
-    assert "__tvm_fp8_e4m3_dot4_packed" in body
+    assert _has_e4m3_dot4_helper(body)
     assert "simd_sum(" in body
 
 
@@ -432,7 +439,7 @@ def test_m1_transposed_b_vecmat_without_macro_target_uses_late_scalar_lowering()
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
     body = src[src.find("kernel void"):]
 
-    assert "__tvm_fp8_e4m3_dot4_packed" not in body
+    assert not _has_e4m3_dot4_helper(body)
     assert "tl.fp8_scaled_matmul.marker" not in body
     assert "thread_index_in_simdgroup" in body
     assert "simd_sum(" in body
@@ -447,7 +454,7 @@ def test_m1_non_transposed_b_vecmat_late_lowers_to_simd_sum():
     body = src[src.find("kernel void"):]
 
     assert "tl.fp8_scaled_matmul.marker" not in body
-    assert "__tvm_fp8_e4m3_dot4_packed" not in body
+    assert not _has_e4m3_dot4_helper(body)
     assert "thread_index_in_simdgroup" in body
     assert "simd_sum(" in body
     assert re.search(
@@ -476,7 +483,7 @@ def test_m1_transposed_b_vecmat_unsafe_dot4_marker_uses_scalar_fallback():
     body = src[src.find("kernel void"):]
 
     assert "tl.fp8_scaled_matmul.marker" not in body
-    assert "__tvm_fp8_e4m3_dot4_packed" not in body
+    assert not _has_e4m3_dot4_helper(body)
     assert "simd_sum(" in body
     assert "__tvm_fp8_e5m2_to_half" in body
 
@@ -512,7 +519,7 @@ def test_m1_transposed_b_vecmat_explicit_non_metal_target_uses_scalar_fallback()
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
     body = src[src.find("kernel void"):]
 
-    assert "__tvm_fp8_e4m3_dot4_packed" not in body
+    assert not _has_e4m3_dot4_helper(body)
     assert "simd_sum(" not in body
     assert "a_val" in body and "b_val" in body
 
@@ -524,7 +531,7 @@ def test_m1_transposed_b_direct_explicit_metal_target_lowers_to_dot4():
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
     body = src[src.find("kernel void"):]
 
-    assert "__tvm_fp8_e4m3_dot4_packed" in body
+    assert _has_e4m3_dot4_helper(body)
     assert "simd_sum(" in body
     assert "a_val" not in body and "b_val" not in body
 
@@ -538,7 +545,7 @@ def test_m1_transposed_b_direct_without_macro_target_late_lowers_to_dot4():
     body = src[src.find("kernel void"):]
 
     assert "tl.fp8_scaled_matmul.marker" not in body
-    assert "__tvm_fp8_e4m3_dot4_packed" in body
+    assert _has_e4m3_dot4_helper(body)
     assert "simd_sum(" in body
 
 
@@ -550,13 +557,24 @@ def test_m1_transposed_b_direct_marker_stores_global_column_index():
     body = src[src.find("kernel void"):]
     c_access_lines = [line.strip() for line in body.splitlines() if "C[" in line]
 
-    assert "__tvm_fp8_e4m3_dot4_packed" in body
+    assert _has_e4m3_dot4_helper(body)
     assert "simd_sum(" in body
     assert any(
         "C[(gridThreadIdx >> 5)]" in line or "C[(grid_tid >> 5)]" in line
         for line in c_access_lines
     ) or re.search(
         r"int (?P<idx>cse_v\d+(?:_\d+)?) = \(grid_tid >> 5\);\n.*C\[(?P=idx)\]",
+        body,
+        re.S,
+    ) or re.search(
+        r"int (?P<idx>cse_v\d+(?:_\d+)?) = \(gridThreadIdx\.x >> 5\);\n.*C\[(?P=idx)\]",
+        body,
+        re.S,
+    ) or re.search(
+        r"int (?P<idx>cse_v\d+(?:_\d+)?) = "
+        r"\(\(\(\(int\)blockIdx\.x\) \* 64\) \+ "
+        r"\((?:\(\(int\)threadIdx\.x\)|threadgroup_tid(?:_\d+)?) >> "
+        r"(?:\((?:long|int)\))?5\)\);\n.*C\[(?P=idx)\]",
         body,
         re.S,
     )
@@ -572,7 +590,7 @@ def test_full_transposed_b_direct_marker_late_lowers_to_dot4():
     body = src[src.find("kernel void"):]
 
     assert "tl.fp8_scaled_matmul.marker" not in body
-    assert "__tvm_fp8_e4m3_dot4_packed" in body
+    assert _has_e4m3_dot4_helper(body)
     assert "simd_sum(" not in body
     assert "__tvm_fp8_e4m3_to_half(" not in body
     assert re.search(r"threadIdx\.x\).*>> 4", body)

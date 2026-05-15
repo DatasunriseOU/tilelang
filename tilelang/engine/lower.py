@@ -223,6 +223,8 @@ def host_codegen(host_mod: tvm.IRModule, target_host: Target, target: Target | N
     host_mod = tilelang.transform.CombineContextCall()(host_mod)
     if target is not None and target.kind.name == "metal":
         host_mod = MarkHostMetalContext()(host_mod)
+    if tvm.transform.PassContext.current().config.get("tirx.disable_assert", False):
+        host_mod = tvm.tirx.transform.SkipAssert()(host_mod)
     if target_host.kind.name == "llvm":
         host_mod = tvm.ffi.get_global_func("target.build.llvm")(host_mod, target_host)
     elif target_host.kind.name == "c":

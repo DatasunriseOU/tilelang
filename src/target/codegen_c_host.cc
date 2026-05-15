@@ -25,6 +25,7 @@
 #include <tvm/ffi/container/shape.h>
 #include <tvm/ffi/extra/module.h>
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/ir/transform.h>
 #include <tvm/target/codegen.h>
 
 #include <algorithm>
@@ -38,6 +39,14 @@
 
 namespace tvm {
 namespace tl {
+namespace {
+
+bool RuntimeAssertsDisabled() {
+  auto ctx = transform::PassContext::Current();
+  return ctx->GetConfig<Bool>("tirx.disable_assert", Bool(false)).value();
+}
+
+} // namespace
 
 CodeGenCHost::CodeGenCHost() {
   module_name_ = name_supply_->FreshName(tvm::ffi::symbol::tvm_ffi_library_ctx);
@@ -308,6 +317,11 @@ void CodeGenCHost::PrintCallPacked(const tvm::tirx::CallNode *op) {
         tvm::ffi::symbol::tvm_ffi_symbol_prefix + func_name->value;
   }
 
+  if (is_in_metal_context && RuntimeAssertsDisabled() &&
+      packed_func_name == "__tvm_set_device") {
+    return;
+  }
+
   std::string args_stack = PrintExpr(op->args[1]);
   this->PrintIndent();
   std::string result = name_supply_->FreshName("result");
@@ -324,6 +338,12 @@ void CodeGenCHost::PrintCallPacked(const tvm::tirx::CallNode *op) {
   this->stream << result << ".v_int64 = 0;\n";
 
   if (!is_in_metal_context) {
+    PrintPackedCallIntoResult(op, packed_func_name, args_stack, num_args, result,
+                              "return -1;");
+    return;
+  }
+
+  if (RuntimeAssertsDisabled()) {
     PrintPackedCallIntoResult(op, packed_func_name, args_stack, num_args, result,
                               "return -1;");
     return;

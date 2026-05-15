@@ -7,11 +7,11 @@ import or call this bridge directly.
 
 from __future__ import annotations
 
+import weakref
 from typing import Any, Iterable
 
 from tilelang.analysis.metal_graph_sync import (
     MetalLaunchDependencyMetadata,
-    has_mlx_tvm_ffi_producer,
     make_tvm_ffi_metal_dependency_metadata,
     plan_mlx_tvm_ffi_launch,
     register_mlx_tvm_ffi_outputs,
@@ -22,13 +22,22 @@ class MLXTVMFFIBridgeUnavailable(RuntimeError):
     """Raised when the optional native MLX/TVM-FFI bridge is unavailable."""
 
 
+_NATIVE_MODULE: Any | None = None
+_COMPACT_INPUT_CACHE: dict[int, weakref.ref[Any]] = {}
+_MLX_ARRAY_TYPE: type[Any] | None | bool = None
+
+
 def _load_native_module():
+    global _NATIVE_MODULE
+    if _NATIVE_MODULE is not None:
+        return _NATIVE_MODULE
     try:
         import _tilelang_mlx_tvm_ffi  # type: ignore
     except Exception as exc:  # pragma: no cover - depends on optional native build
         raise MLXTVMFFIBridgeUnavailable(
             "native MLX TVM-FFI bridge is not built or cannot be loaded"
         ) from exc
+    _NATIVE_MODULE = _tilelang_mlx_tvm_ffi
     return _tilelang_mlx_tvm_ffi
 
 
@@ -100,11 +109,39 @@ def _dtype_name(dtype: Any) -> str:
 
 
 def _is_mlx_array(value: Any) -> bool:
-    try:
-        import mlx.core as mx  # type: ignore[import-not-found]
-    except Exception:
+    global _MLX_ARRAY_TYPE
+    if _MLX_ARRAY_TYPE is None:
+        try:
+            import mlx.core as mx  # type: ignore[import-not-found]
+        except Exception:
+            _MLX_ARRAY_TYPE = False
+            return False
+        _MLX_ARRAY_TYPE = mx.array
+    if _MLX_ARRAY_TYPE is False:
         return False
-    return isinstance(value, mx.array)
+    return isinstance(value, _MLX_ARRAY_TYPE)
+
+
+def _known_compact_mlx_input(value: Any) -> bool:
+    entry = _COMPACT_INPUT_CACHE.get(id(value))
+    if entry is None:
+        return False
+    if entry() is value:
+        return True
+    _COMPACT_INPUT_CACHE.pop(id(value), None)
+    return False
+
+
+def _remember_compact_mlx_input(value: Any) -> None:
+    key = id(value)
+
+    def remove(_ref: weakref.ref[Any], *, stale_key: int = key) -> None:
+        _COMPACT_INPUT_CACHE.pop(stale_key, None)
+
+    try:
+        _COMPACT_INPUT_CACHE[key] = weakref.ref(value, remove)
+    except TypeError:
+        pass
 
 
 def _contiguous_mlx_input(value: Any) -> Any:
@@ -116,17 +153,106 @@ def _contiguous_mlx_input(value: Any) -> Any:
     the flat TileLang TVM-FFI ABI, not a Python-side ``mx.contiguous`` repair.
     """
 
-    if has_mlx_tvm_ffi_producer(value):
-        if not _is_mlx_array(value):
-            return value
-        native = _load_native_module()
-        if native.is_compact(value):
-            return value
-        return native.compact_input(value)
-    if _is_mlx_array(value):
-        native = _load_native_module()
-        return native.compact_input(value)
+    if not _is_mlx_array(value):
+        return value
+    if _known_compact_mlx_input(value):
+        return value
+    native = _load_native_module()
+    if native.is_compact(value):
+        _remember_compact_mlx_input(value)
+        return value
+    return native.compact_input(value)
     return value
+
+
+def prepare_metal_call(
+    func: Any,
+    *,
+    output_shapes: Iterable[Iterable[int]],
+    output_dtypes: Iterable[Any],
+    result_indices: Iterable[int],
+    num_params: int,
+    param_dtypes: Iterable[Any | None] | None = None,
+    param_shapes: Iterable[Iterable[int]] | None = None,
+    direct_func: Any | None = None,
+    direct_launch_args: Iterable[int] | None = None,
+    direct_module: Any | None = None,
+    direct_kernel_name: str | None = None,
+    zero_init_output_positions: Iterable[int] = (),
+):
+    """Pre-parse static metadata for repeated native MLX graph launches."""
+
+    native = _load_native_module()
+    func_for_native_call = direct_func if direct_func is not None else func
+    param_dtype_names = None
+    if param_dtypes is not None:
+        param_dtype_names = [_dtype_name(dtype) for dtype in param_dtypes]
+    param_shape_list = None
+    if param_shapes is not None:
+        param_shape_list = [[int(dim) for dim in shape] for shape in param_shapes]
+    direct_launch_arg_list = None
+    if direct_launch_args is not None:
+        direct_launch_arg_list = [int(value) for value in direct_launch_args]
+    direct_module_handle = 0
+    if direct_module is not None:
+        direct_module_handle = _function_handle(direct_module)
+    direct_kernel_name_str = "" if direct_kernel_name is None else str(direct_kernel_name)
+    return native.prepare_metal_call(
+        _function_handle(func_for_native_call),
+        [[int(dim) for dim in shape] for shape in output_shapes],
+        [_dtype_name(dtype) for dtype in output_dtypes],
+        [int(idx) for idx in result_indices],
+        int(num_params),
+        param_dtype_names,
+        param_shape_list,
+        direct_launch_arg_list,
+        direct_module_handle,
+        direct_kernel_name_str,
+        [int(idx) for idx in zero_init_output_positions],
+    )
+
+
+def prepared_metal_call(
+    prepared: Any,
+    *,
+    inputs: Iterable[Any],
+    owner_outputs: Iterable[Any] | None = None,
+    command_buffer_domain: Any | None = None,
+    dependency_metadata: MetalLaunchDependencyMetadata | None = None,
+):
+    """Create MLX graph outputs from a pre-parsed native Metal call."""
+
+    native = _load_native_module()
+    input_list = [_contiguous_mlx_input(value) for value in inputs]
+    launch_sync_state, wait_edges = plan_mlx_tvm_ffi_launch(
+        native,
+        input_list,
+        dependency_metadata=dependency_metadata,
+        command_buffer_domain=command_buffer_domain,
+    )
+    if owner_outputs is None:
+        outputs = native.prepared_metal_call(
+            prepared,
+            input_list,
+            launch_sync_state,
+            wait_edges,
+        )
+    else:
+        outputs = native.prepared_metal_call_owner_outputs(
+            prepared,
+            input_list,
+            list(owner_outputs),
+            launch_sync_state,
+            wait_edges,
+        )
+    output_list = list(outputs)
+    register_mlx_tvm_ffi_outputs(
+        output_list,
+        launch_sync_state,
+        dependency_metadata=dependency_metadata,
+        command_buffer_domain=command_buffer_domain,
+    )
+    return output_list
 
 
 def metal_call(
@@ -139,6 +265,11 @@ def metal_call(
     result_indices: Iterable[int],
     num_params: int,
     param_dtypes: Iterable[Any | None] | None = None,
+    param_shapes: Iterable[Iterable[int]] | None = None,
+    direct_func: Any | None = None,
+    direct_launch_args: Iterable[int] | None = None,
+    direct_module: Any | None = None,
+    direct_kernel_name: str | None = None,
     command_buffer_domain: Any | None = None,
     dependency_metadata: MetalLaunchDependencyMetadata | None = None,
     zero_init_output_positions: Iterable[int] = (),
@@ -159,6 +290,17 @@ def metal_call(
     param_dtype_names = None
     if param_dtypes is not None:
         param_dtype_names = [_dtype_name(dtype) for dtype in param_dtypes]
+    param_shape_list = None
+    if param_shapes is not None:
+        param_shape_list = [[int(dim) for dim in shape] for shape in param_shapes]
+    direct_launch_arg_list = None
+    if direct_launch_args is not None:
+        direct_launch_arg_list = [int(value) for value in direct_launch_args]
+    direct_module_handle = 0
+    if direct_module is not None:
+        direct_module_handle = _function_handle(direct_module)
+    direct_kernel_name_str = "" if direct_kernel_name is None else str(direct_kernel_name)
+    func_for_native_call = direct_func if direct_func is not None else func
     if dependency_metadata is None:
         result_index_set = set(result_index_list)
         dependency_metadata = make_tvm_ffi_metal_dependency_metadata(
@@ -176,7 +318,7 @@ def metal_call(
     output_dtype_list = [_dtype_name(dtype) for dtype in output_dtypes]
     if owner_output_list is None:
         outputs = native.metal_call(
-            _function_handle(func),
+            _function_handle(func_for_native_call),
             input_list,
             output_shape_list,
             output_dtype_list,
@@ -186,10 +328,14 @@ def metal_call(
             launch_sync_state,
             wait_edges,
             param_dtypes=param_dtype_names,
+            param_shapes=param_shape_list,
+            direct_launch_args=direct_launch_arg_list,
+            direct_module_handle=direct_module_handle,
+            direct_kernel_name=direct_kernel_name_str,
         )
     else:
         outputs = native.metal_call_owner_outputs(
-            _function_handle(func),
+            _function_handle(func_for_native_call),
             input_list,
             owner_output_list,
             output_shape_list,
@@ -200,6 +346,10 @@ def metal_call(
             launch_sync_state,
             wait_edges,
             param_dtypes=param_dtype_names,
+            param_shapes=param_shape_list,
+            direct_launch_args=direct_launch_arg_list,
+            direct_module_handle=direct_module_handle,
+            direct_kernel_name=direct_kernel_name_str,
         )
     output_list = list(outputs)
     register_mlx_tvm_ffi_outputs(

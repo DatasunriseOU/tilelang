@@ -17,3 +17,8 @@ from .reduction_legality import (  # noqa: F401
     prove_reduction_plan_legality,
     prove_reduction_plans,
 )
+from .sync_event_plan import (  # noqa: F401
+    SyncEventDecision,
+    attach_sync_event_plan_metadata,
+    build_reduction_sync_event_plan,
+)

@@ -1,4 +1,5 @@
 import os
+from contextlib import contextmanager
 
 import numpy as np
 import pytest
@@ -9,6 +10,22 @@ import tilelang
 from tvm import runtime
 import tilelang.language as T
 import tilelang.testing
+
+
+_ACTIVE_COMPUTE_ENCODER_ENV = "TILELANG_MLX_TVM_FFI_USE_ACTIVE_COMPUTE_ENCODER"
+
+
+@contextmanager
+def _temporary_env(name: str, value: str):
+    previous = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
 
 
 def _make_write_2d_kernel():
@@ -53,6 +70,26 @@ def _make_parallel_add_1d_kernel():
                 C[i] = A[i] + T.float32(1.0)
 
     return parallel_add_1d
+
+
+def _make_flattened_1d_input_kernel():
+    @T.prim_func
+    def flattened_1d_input(A: T.Tensor((8,), T.float32), C: T.Tensor((8,), T.float32)):
+        with T.Kernel(1, threads=8):
+            for i in T.Parallel(8):
+                C[i] = A[i] * T.float32(2.0)
+
+    return flattened_1d_input
+
+
+def _make_abi_2d_owner_output_kernel():
+    @T.prim_func
+    def abi_2d_owner_output(C: T.Tensor((1, 8), T.float32)):
+        with T.Kernel(1, threads=8):
+            for i in T.Parallel(8):
+                C[0, i] = T.cast(i, T.float32) + T.float32(10.0)
+
+    return abi_2d_owner_output
 
 
 def _make_large_parallel_add_1d_kernel(size=65536, threads=256):
@@ -377,6 +414,48 @@ def test_tvm_ffi_metal_result_idx_reuses_caller_owned_mlx_output():
 
 
 @tilelang.testing.requires_metal
+def test_tvm_ffi_metal_mlx_owner_output_can_return_graph_alias_without_sync():
+    mx = pytest.importorskip("mlx.core")
+    from tilelang.contrib.mlx_tvm_ffi import (
+        debug_state,
+        is_available as native_bridge_is_available,
+        reset_debug_state,
+    )
+
+    if not native_bridge_is_available():
+        pytest.skip("native MLX TVM-FFI bridge is not built")
+    if not hasattr(mx, "metal") or not hasattr(mx.metal, "_current_command_buffer"):
+        pytest.skip("MLX build does not expose Metal command buffer interop hook")
+
+    with _temporary_env(_ACTIVE_COMPUTE_ENCODER_ENV, "0"):
+        reset_debug_state()
+        kernel = tilelang.compile(
+            _make_write_2d_kernel(),
+            target="metal",
+            execution_backend="tvm_ffi",
+            out_idx=-1,
+        )
+
+        out = mx.zeros((2, 3), dtype=mx.float32) + 1
+        mx.eval(out)
+        returned = kernel(out, _tilelang_mlx_async_owner_outputs=True)
+        assert isinstance(returned, mx.array)
+        assert returned is not out
+        mx.eval(returned)
+
+        state = debug_state()
+    assert state["use_active_compute_encoder_enabled"] is False
+    assert state["direct_device_launches"] >= 1
+    assert state["direct_compute_encoder_launches"] == 0
+    assert state["command_buffers_checked"] >= 1
+    assert _capsule_data_ptr(returned.__dlpack__()) == _capsule_data_ptr(out.__dlpack__())
+    np.testing.assert_allclose(
+        np.array(out),
+        np.array([[3.0, 1.0, 1.0], [1.0, 1.0, 7.0]], dtype=np.float32),
+    )
+
+
+@tilelang.testing.requires_metal
 def test_tvm_ffi_metal_mlx_compact_result_idx_allocates_mlx_output():
     mx = pytest.importorskip("mlx.core")
     if not hasattr(mx, "metal") or not hasattr(mx.metal, "_current_command_buffer"):
@@ -436,23 +515,81 @@ def test_tvm_ffi_metal_mlx_compile_uses_native_graph_primitive():
     if not native_bridge_is_available():
         pytest.skip("native MLX TVM-FFI bridge is not built")
 
-    reset_debug_state()
+    with _temporary_env(_ACTIVE_COMPUTE_ENCODER_ENV, "1"):
+        reset_debug_state()
+
+        kernel = tilelang.compile(
+            _make_add_all_2d_kernel(),
+            target="metal",
+            execution_backend="tvm_ffi",
+            out_idx=-1,
+        )
+
+        compiled = mx.compile(lambda source: kernel(source))
+        returned = compiled(mx.ones((2, 3), dtype=mx.float32))
+        mx.eval(returned)
+
+        state = debug_state()
+    assert state["use_active_compute_encoder_enabled"] is True
+    assert state["launches"] >= 1
+    assert state["direct_device_launches"] >= 1
+    assert state["direct_compute_encoder_launches"] >= 1
+    np.testing.assert_allclose(
+        np.array(returned),
+        np.array([[2.0, 3.0, 4.0], [5.0, 6.0, 7.0]], dtype=np.float32),
+    )
+
+
+@tilelang.testing.requires_metal
+def test_tvm_ffi_metal_native_bridge_uses_tilelang_abi_shape_for_inputs():
+    mx = pytest.importorskip("mlx.core")
+    from tilelang.contrib.mlx_tvm_ffi import is_available as native_bridge_is_available
+
+    if not native_bridge_is_available():
+        pytest.skip("native MLX TVM-FFI bridge is not built")
 
     kernel = tilelang.compile(
-        _make_add_all_2d_kernel(),
+        _make_flattened_1d_input_kernel(),
         target="metal",
         execution_backend="tvm_ffi",
         out_idx=-1,
     )
 
-    compiled = mx.compile(lambda source: kernel(source))
-    returned = compiled(mx.ones((2, 3), dtype=mx.float32))
+    source = mx.arange(8, dtype=mx.float32).reshape(2, 4)
+    returned = kernel(source)
     mx.eval(returned)
 
-    assert debug_state()["launches"] >= 1
     np.testing.assert_allclose(
         np.array(returned),
-        np.array([[2.0, 3.0, 4.0], [5.0, 6.0, 7.0]], dtype=np.float32),
+        np.arange(8, dtype=np.float32) * 2.0,
+    )
+
+
+@tilelang.testing.requires_metal
+def test_tvm_ffi_metal_owner_output_returns_owner_shape_with_tilelang_abi_shape():
+    mx = pytest.importorskip("mlx.core")
+    from tilelang.contrib.mlx_tvm_ffi import is_available as native_bridge_is_available
+
+    if not native_bridge_is_available():
+        pytest.skip("native MLX TVM-FFI bridge is not built")
+
+    kernel = tilelang.compile(
+        _make_abi_2d_owner_output_kernel(),
+        target="metal",
+        execution_backend="tvm_ffi",
+        out_idx=-1,
+    )
+
+    out = mx.zeros((8,), dtype=mx.float32)
+    mx.eval(out)
+    returned = kernel(out, _tilelang_mlx_async_owner_outputs=True)
+    assert returned.shape == out.shape
+    assert _capsule_data_ptr(returned.__dlpack__()) == _capsule_data_ptr(out.__dlpack__())
+    mx.eval(returned)
+
+    np.testing.assert_allclose(
+        np.array(out),
+        np.arange(8, dtype=np.float32) + 10.0,
     )
 
 
@@ -520,6 +657,7 @@ def test_tvm_ffi_metal_mlx_native_debug_completion_hook_is_nonblocking():
     assert state["debug_completion_enabled"] is True
     assert state["launches"] >= 1
     assert state["debug_completion_launches"] >= 1
+    assert state["direct_compute_encoder_launches"] == 0
     assert state["command_buffers_checked"] >= 1
     assert state["completion_handlers_installed"] >= 1
     assert state["null_command_buffers"] == 0
@@ -544,19 +682,23 @@ def test_tvm_ffi_metal_mlx_graph_same_domain_uses_encode_order_without_device_ev
     if not native_bridge_is_available():
         pytest.skip("native MLX TVM-FFI bridge is not built")
 
-    reset_debug_state()
-    kernel = tilelang.compile(
-        _make_add_all_2d_kernel(),
-        target="metal",
-        execution_backend="tvm_ffi",
-        out_idx=-1,
-    )
+    with _temporary_env(_ACTIVE_COMPUTE_ENCODER_ENV, "0"):
+        reset_debug_state()
+        kernel = tilelang.compile(
+            _make_add_all_2d_kernel(),
+            target="metal",
+            execution_backend="tvm_ffi",
+            out_idx=-1,
+        )
 
-    compiled = mx.compile(lambda source: kernel(kernel(source)))
-    returned = compiled(mx.ones((2, 3), dtype=mx.float32))
-    mx.eval(returned)
+        compiled = mx.compile(lambda source: kernel(kernel(source)))
+        returned = compiled(mx.ones((2, 3), dtype=mx.float32))
+        mx.eval(returned)
 
-    state = debug_state()
+        state = debug_state()
+    assert state["use_active_compute_encoder_enabled"] is False
+    assert state["direct_compute_encoder_launches"] == 0
+    assert state["command_buffers_checked"] >= 1
     assert state["device_event_waits_encoded"] == 0
     assert state["device_event_signals_encoded"] == 0
     np.testing.assert_allclose(
@@ -600,6 +742,7 @@ def test_tvm_ffi_metal_mlx_graph_cross_domain_emits_device_event():
     mx.eval(returned)
 
     state = debug_state()
+    assert state["direct_compute_encoder_launches"] == 0
     assert state["device_event_waits_encoded"] >= 1
     assert state["device_event_signals_encoded"] >= 1
     np.testing.assert_allclose(

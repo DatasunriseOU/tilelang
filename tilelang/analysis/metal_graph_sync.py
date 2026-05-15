@@ -50,6 +50,25 @@ class MetalProducerRecord:
         return self.launch_metadata.command_buffer_domain
 
 
+@dataclass(frozen=True)
+class MetalLaunchSyncDecision:
+    """Inspectable sync decision for one producer->consumer graph edge."""
+
+    consumer_kernel_symbol: str
+    consumer_input_param_index: int
+    consumer_input_name: str
+    producer_kernel_symbol: str
+    producer_output_param_index: int
+    producer_result_position: int | None
+    action: str
+    where: str
+    host_sync_required: bool
+    device_event_required: bool
+    external_materialization_required: bool
+    reason: str
+    z3_proved: bool
+
+
 def _domain(command_buffer_domain: Any | None) -> Any:
     return _DEFAULT_COMMAND_BUFFER_DOMAIN if command_buffer_domain is None else command_buffer_domain
 
@@ -164,6 +183,110 @@ def _real_interbuffer_hazard(
     return producer_access.mode == "write" and consumer_access.mode == "read"
 
 
+def _launch_metadata(
+    inputs: list[Any],
+    *,
+    dependency_metadata: MetalLaunchDependencyMetadata | None = None,
+    command_buffer_domain: Any | None = None,
+) -> MetalLaunchDependencyMetadata:
+    metadata = dependency_metadata or _fallback_metadata(
+        input_count=len(inputs),
+        command_buffer_domain=command_buffer_domain,
+    )
+    if command_buffer_domain is not None and dependency_metadata is not None:
+        metadata = with_command_buffer_domain(metadata, command_buffer_domain)
+    if len(inputs) != len(metadata.input_accesses):
+        raise ValueError(
+            "TVM-FFI Metal dependency metadata/input count mismatch: "
+            f"{len(metadata.input_accesses)} metadata inputs for {len(inputs)} runtime inputs"
+        )
+    return metadata
+
+
+def _sync_decision_from_plan(
+    *,
+    producer: MetalProducerRecord,
+    consumer_metadata: MetalLaunchDependencyMetadata,
+    consumer_access: MetalBufferDependency,
+) -> MetalLaunchSyncDecision:
+    plan = plan_metal_buffer_sync(
+        may_alias=True,
+        same_command_buffer=(
+            producer.command_buffer_domain == consumer_metadata.command_buffer_domain
+        ),
+        producer_before_consumer=consumer_metadata.producer_before_consumer,
+        resource_tracked=(
+            producer.output_access.resource_tracked
+            and consumer_access.resource_tracked
+        ),
+    )
+    return MetalLaunchSyncDecision(
+        consumer_kernel_symbol=consumer_metadata.kernel_symbol,
+        consumer_input_param_index=consumer_access.param_index,
+        consumer_input_name=consumer_access.name,
+        producer_kernel_symbol=producer.launch_metadata.kernel_symbol,
+        producer_output_param_index=producer.output_access.param_index,
+        producer_result_position=producer.output_access.result_position,
+        action=plan.action,
+        where=plan.where,
+        host_sync_required=plan.host_sync_required,
+        device_event_required=plan.device_event_required,
+        external_materialization_required=False,
+        reason=plan.reason,
+        z3_proved=plan.z3_proved,
+    )
+
+
+def _planned_launch_dependencies(
+    inputs: list[Any],
+    metadata: MetalLaunchDependencyMetadata,
+) -> tuple[tuple[MetalProducerRecord, MetalLaunchSyncDecision], ...]:
+    planned: list[tuple[MetalProducerRecord, MetalLaunchSyncDecision]] = []
+    seen_producers: set[int] = set()
+
+    for array, consumer_access in zip(inputs, metadata.input_accesses):
+        producer = _lookup_producer(array)
+        if producer is None:
+            continue
+        if not _real_interbuffer_hazard(producer.output_access, consumer_access):
+            continue
+
+        producer_key = id(producer.sync_state)
+        if producer_key in seen_producers:
+            continue
+        seen_producers.add(producer_key)
+        planned.append(
+            (
+                producer,
+                _sync_decision_from_plan(
+                    producer=producer,
+                    consumer_metadata=metadata,
+                    consumer_access=consumer_access,
+                ),
+            )
+        )
+    return tuple(planned)
+
+
+def inspect_mlx_tvm_ffi_launch_sync(
+    inputs: list[Any],
+    *,
+    dependency_metadata: MetalLaunchDependencyMetadata | None = None,
+    command_buffer_domain: Any | None = None,
+) -> tuple[MetalLaunchSyncDecision, ...]:
+    """Return scheduler sync decisions for a launch without wiring events."""
+
+    metadata = _launch_metadata(
+        inputs,
+        dependency_metadata=dependency_metadata,
+        command_buffer_domain=command_buffer_domain,
+    )
+    return tuple(
+        decision
+        for _producer, decision in _planned_launch_dependencies(inputs, metadata)
+    )
+
+
 def plan_mlx_tvm_ffi_launch(
     native: Any,
     inputs: list[Any],
@@ -178,48 +301,24 @@ def plan_mlx_tvm_ffi_launch(
     current input object; the hazard decision comes from the metadata.
     """
 
-    metadata = dependency_metadata or _fallback_metadata(
-        input_count=len(inputs),
+    metadata = _launch_metadata(
+        inputs,
+        dependency_metadata=dependency_metadata,
         command_buffer_domain=command_buffer_domain,
     )
-    if command_buffer_domain is not None and dependency_metadata is not None:
-        metadata = with_command_buffer_domain(metadata, command_buffer_domain)
-    if len(inputs) != len(metadata.input_accesses):
-        raise ValueError(
-            "TVM-FFI Metal dependency metadata/input count mismatch: "
-            f"{len(metadata.input_accesses)} metadata inputs for {len(inputs)} runtime inputs"
-        )
 
     launch_sync_state = native.make_launch_sync_state()
     wait_edges: list[Any] = []
-    seen_producers: set[int] = set()
 
-    for array, consumer_access in zip(inputs, metadata.input_accesses):
-        producer = _lookup_producer(array)
-        if producer is None:
+    for producer, decision in _planned_launch_dependencies(inputs, metadata):
+        if decision.action == "none":
             continue
-        if not _real_interbuffer_hazard(producer.output_access, consumer_access):
-            continue
-
-        producer_key = id(producer.sync_state)
-        if producer_key in seen_producers:
-            continue
-        seen_producers.add(producer_key)
-
-        plan = plan_metal_buffer_sync(
-            may_alias=True,
-            same_command_buffer=producer.command_buffer_domain == metadata.command_buffer_domain,
-            producer_before_consumer=metadata.producer_before_consumer,
-            resource_tracked=producer.output_access.resource_tracked and consumer_access.resource_tracked,
-        )
-        if plan.action == "none":
-            continue
-        if plan.action == "device_event":
+        if decision.action == "device_event":
             edge = native.make_sync_edge()
             producer.sync_state.add_signal_edge(edge)
             wait_edges.append(edge)
             continue
-        raise RuntimeError(f"unsupported Metal graph sync plan for TVM-FFI launch: {plan}")
+        raise RuntimeError(f"unsupported Metal graph sync plan for TVM-FFI launch: {decision}")
 
     return launch_sync_state, wait_edges
 
@@ -257,9 +356,11 @@ def register_mlx_tvm_ffi_outputs(
 __all__ = [
     "MetalBufferDependency",
     "MetalLaunchDependencyMetadata",
+    "MetalLaunchSyncDecision",
     "MetalProducerRecord",
     "clear_metal_graph_sync_state_for_tests",
     "has_mlx_tvm_ffi_producer",
+    "inspect_mlx_tvm_ffi_launch_sync",
     "make_tvm_ffi_metal_dependency_metadata",
     "plan_mlx_tvm_ffi_launch",
     "register_mlx_tvm_ffi_outputs",

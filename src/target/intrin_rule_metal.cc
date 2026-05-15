@@ -9,7 +9,7 @@
  * ``InternalError: Unresolved call ir.Op tirx.metal.fp8_e4m3_dot4`` because
  * neither a TGlobalSymbol nor an FLowerIntrinsic attribute was attached.
  *
- * The ``__tvm_fp8_e4m3_dot4_packed`` C symbol is provided by
+ * The ``__tvm_fp8_e4m3_dot4_*`` C symbols are provided by
  * ``CodeGenTileLangMetal::EmitFp8E4M3Helper`` (see codegen_metal.cc) which
  * emits the LUT-decoded helper prelude when ``uses_fp8_dot4_`` is set.
  */
@@ -49,6 +49,22 @@ TVM_REGISTER_OP("tirx.metal.fp8_e4m3_dot4")
     .set_attr<TGlobalSymbol>("TGlobalSymbol", "__tvm_fp8_e4m3_dot4_packed")
     .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure))
     .set_attr<TScriptPrinterName>("TScriptPrinterName", "metal_fp8_e4m3_dot4");
+
+TVM_REGISTER_OP("tirx.metal.fp8_load_u32")
+    .set_num_inputs(2)
+    .add_argument("ptr", "Expr", "Pointer to packed FP8 byte or uint32 buffer.")
+    .add_argument("word_idx", "Expr", "uint32 word index (4 bytes per word).")
+    .set_attr<TGlobalSymbol>("TGlobalSymbol", "__tvm_fp8_load_u32")
+    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure))
+    .set_attr<TScriptPrinterName>("TScriptPrinterName", "metal_fp8_load_u32");
+
+TVM_REGISTER_OP("tirx.metal.fp8_e4m3_dot4_words")
+    .set_num_inputs(2)
+    .add_argument("a_word", "Expr", "Packed uint32 word from FP8 e4m3 buffer A.")
+    .add_argument("b_word", "Expr", "Packed uint32 word from FP8 e4m3 buffer B.")
+    .set_attr<TGlobalSymbol>("TGlobalSymbol", "__tvm_fp8_e4m3_dot4_words")
+    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure))
+    .set_attr<TScriptPrinterName>("TScriptPrinterName", "metal_fp8_e4m3_dot4_words");
 
 // Metal thread-position / SIMD-lane intrinsics used by the dot4 vecmat macro.
 // MSL exposes these as the ``thread_position_in_grid`` / ``thread_index_in_simdgroup``

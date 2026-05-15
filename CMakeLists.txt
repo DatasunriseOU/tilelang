@@ -552,6 +552,8 @@ if(APPLE AND USE_METAL AND TILELANG_BUILD_MLX_TVM_FFI)
         int main() {
           auto stream = mlx::core::default_stream(mlx::core::Device::gpu);
           auto& encoder = mlx::core::metal::get_command_encoder(stream);
+          encoder.prepare_external_dispatch();
+          (void)encoder.raw_command_encoder();
           encoder.end_encoding();
           (void)encoder.get_command_buffer();
           (void)&encoder;
@@ -563,7 +565,8 @@ if(APPLE AND USE_METAL AND TILELANG_BUILD_MLX_TVM_FFI)
       if(NOT TILELANG_MLX_HAS_DIRECT_METAL_COMMAND_ENCODER_API)
         message(FATAL_ERROR
           "MLX lib/header pair does not expose the direct Metal CommandEncoder API required "
-          "by TileLang's graph-safe TVM-FFI bridge. Checked libmlx: "
+          "by TileLang's graph-safe TVM-FFI bridge, including active compute encoder interop. "
+          "Checked libmlx: "
           "${TILELANG_MLX_LIB_REAL}")
       endif()
       set(CMAKE_REQUIRED_LIBRARIES mlx "${TILELANG_MLX_PY_BRIDGE_REAL}")
@@ -620,6 +623,7 @@ if(APPLE AND USE_METAL AND TILELANG_BUILD_MLX_TVM_FFI)
     target_link_libraries(tilelang_mlx_tvm_ffi_c_api PRIVATE
       nanobind-static
       mlx
+      tvm_runtime
       tvm_ffi_shared
       "${TILELANG_MLX_PY_BRIDGE_REAL}")
     set_target_properties(tilelang_mlx_tvm_ffi_c_api PROPERTIES
@@ -648,7 +652,11 @@ if(APPLE AND USE_METAL AND TILELANG_BUILD_MLX_TVM_FFI)
       TILELANG_MLX_TVM_FFI_EXPORTS
       TILELANG_MLX_TVM_FFI_WITH_PY_MODULE=1
       ${TILELANG_MLX_TVM_FFI_COMPILE_DEFS})
-    target_link_libraries(_tilelang_mlx_tvm_ffi PRIVATE mlx tvm_ffi_shared "${TILELANG_MLX_PY_BRIDGE_REAL}")
+    target_link_libraries(_tilelang_mlx_tvm_ffi PRIVATE
+      mlx
+      tvm_runtime
+      tvm_ffi_shared
+      "${TILELANG_MLX_PY_BRIDGE_REAL}")
     set_target_properties(_tilelang_mlx_tvm_ffi PROPERTIES
       LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"

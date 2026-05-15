@@ -233,6 +233,9 @@ def test_pass_on_metal_target_prefers_semantic_thread_allreduce():
     legality = json.loads(out["main"].attrs["tl.reduction_legality"].value)
     assert legality[0]["proved_no_sync"] is True
     assert legality[0]["cannot_parallelize_reason"] is None
+    sync_plan = json.loads(out["main"].attrs["tl.sync_event_plan"].value)
+    assert sync_plan[0]["action"] == "none"
+    assert sync_plan[0]["external_materialization_required"] is False
 
 
 # ---------------------------------------------------------------------------
