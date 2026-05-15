@@ -652,6 +652,13 @@ bool is_compact_array(const mx::array& array) {
   return true;
 }
 
+bool can_borrow_compact_input_array(const mx::array& array) {
+  if (array.is_tracer() || array.has_primitive()) {
+    return false;
+  }
+  return array.buffer().ptr() != nullptr && array.offset() == 0 && is_compact_array(array);
+}
+
 BorrowedTensorView make_tensor_view(
     const mx::array& array,
     mx::Stream stream,
@@ -885,6 +892,7 @@ struct PreparedMetalCall {
   std::vector<std::string> expected_param_dtypes;
   std::vector<std::vector<int64_t>> param_shapes;
   std::vector<int64_t> direct_launch_args;
+  std::vector<int64_t> direct_param_indices;
   uint64_t direct_module_handle{0};
   std::string direct_kernel_name;
   std::shared_ptr<CachedDirectLaunchHandle> direct_launch_handle;
@@ -902,6 +910,7 @@ class TVMFFIMetalCall : public mx::Primitive {
       std::vector<std::string> expected_param_dtypes,
       std::vector<std::vector<int64_t>> param_shapes,
       std::vector<int64_t> direct_launch_args,
+      std::vector<int64_t> direct_param_indices,
       uint64_t direct_module_handle,
       std::string direct_kernel_name,
       std::vector<int64_t> zero_init_output_positions,
@@ -916,6 +925,7 @@ class TVMFFIMetalCall : public mx::Primitive {
         expected_param_dtypes_(std::move(expected_param_dtypes)),
         param_shapes_(std::move(param_shapes)),
         direct_launch_args_(std::move(direct_launch_args)),
+        direct_param_indices_(std::move(direct_param_indices)),
         direct_module_handle_(reinterpret_cast<TVMFFIObjectHandle>(direct_module_handle)),
         direct_kernel_name_(std::move(direct_kernel_name)),
         zero_init_output_positions_(std::move(zero_init_output_positions)),
@@ -1017,6 +1027,8 @@ class TVMFFIMetalCall : public mx::Primitive {
     const auto& param_shapes = prepared_ ? prepared_->param_shapes : param_shapes_;
     const auto& direct_launch_args =
         prepared_ ? prepared_->direct_launch_args : direct_launch_args_;
+    const auto& direct_param_indices =
+        prepared_ ? prepared_->direct_param_indices : direct_param_indices_;
     const auto& zero_init_output_positions =
         prepared_ ? prepared_->zero_init_output_positions : zero_init_output_positions_;
     debug_counters().launches.fetch_add(1, std::memory_order_relaxed);
@@ -1076,11 +1088,46 @@ class TVMFFIMetalCall : public mx::Primitive {
         direct_device_launch &&
         direct_launch_handle_ != nullptr &&
         direct_launch_handle_->handle != nullptr;
+    std::vector<int64_t> direct_param_order;
+    std::vector<int64_t> direct_arg_position_by_param;
+    if (direct_device_launch) {
+      if (!direct_param_indices.empty()) {
+        if (static_cast<int64_t>(direct_param_indices.size()) != num_params_) {
+          throw std::runtime_error(
+              "TVM-FFI direct Metal parameter permutation length mismatch");
+        }
+        direct_param_order = direct_param_indices;
+      } else {
+        direct_param_order.reserve(static_cast<size_t>(num_params_));
+        for (int64_t i = 0; i < num_params_; ++i) {
+          direct_param_order.push_back(i);
+        }
+      }
+      direct_arg_position_by_param.assign(static_cast<size_t>(num_params_), -1);
+      for (size_t pos = 0; pos < direct_param_order.size(); ++pos) {
+        const int64_t param_idx = direct_param_order[pos];
+        if (param_idx < 0 || param_idx >= num_params_) {
+          throw std::runtime_error("TVM-FFI direct Metal parameter index out of range");
+        }
+        auto& mapped_pos = direct_arg_position_by_param[static_cast<size_t>(param_idx)];
+        if (mapped_pos >= 0) {
+          throw std::runtime_error("TVM-FFI direct Metal parameter permutation has duplicates");
+        }
+        mapped_pos = static_cast<int64_t>(pos);
+      }
+      for (int64_t pos : direct_arg_position_by_param) {
+        if (pos < 0) {
+          throw std::runtime_error("TVM-FFI direct Metal parameter permutation is incomplete");
+        }
+      }
+    }
     const size_t arg_count = static_cast<size_t>(num_params_) +
                              (direct_device_launch ? direct_launch_args.size() : 0);
     std::vector<void*> direct_buffers;
+    std::vector<void*> direct_buffers_by_param;
     if (direct_device_launch) {
       direct_buffers.reserve(static_cast<size_t>(num_params_));
+      direct_buffers_by_param.assign(static_cast<size_t>(num_params_), nullptr);
     }
     std::vector<TVMFFIAny> args;
     if (!direct_pipeline_launch) {
@@ -1117,7 +1164,8 @@ class TVMFFIMetalCall : public mx::Primitive {
       if (direct_device_launch) {
         TVMFFIAny* arg = direct_pipeline_launch
             ? nullptr
-            : &args[static_cast<size_t>(param_idx)];
+            : &args[static_cast<size_t>(
+                  direct_arg_position_by_param[static_cast<size_t>(param_idx)])];
         if (arg != nullptr) {
           arg->type_index = kTVMFFIOpaquePtr;
           arg->zero_padding = 0;
@@ -1132,7 +1180,7 @@ class TVMFFIMetalCall : public mx::Primitive {
           if (arg != nullptr) {
             arg->v_ptr = ptr;
           }
-          direct_buffers.push_back(ptr);
+          direct_buffers_by_param[static_cast<size_t>(param_idx)] = ptr;
         } catch (const std::exception& exc) {
           std::ostringstream os;
           os << "TVM-FFI parameter " << param_idx << (is_output ? " output" : " input")
@@ -1153,6 +1201,15 @@ class TVMFFIMetalCall : public mx::Primitive {
         }
         arg.type_index = kTVMFFIDLTensorPtr;
         arg.v_ptr = &views.back().tensor;
+      }
+    }
+    if (direct_device_launch) {
+      for (int64_t param_idx : direct_param_order) {
+        void* ptr = direct_buffers_by_param[static_cast<size_t>(param_idx)];
+        if (ptr == nullptr) {
+          throw std::runtime_error("TVM-FFI direct Metal parameter pointer is null");
+        }
+        direct_buffers.push_back(ptr);
       }
     }
     if (direct_device_launch && !direct_pipeline_launch) {
@@ -1273,6 +1330,7 @@ class TVMFFIMetalCall : public mx::Primitive {
   std::vector<std::string> expected_param_dtypes_;
   std::vector<std::vector<int64_t>> param_shapes_;
   std::vector<int64_t> direct_launch_args_;
+  std::vector<int64_t> direct_param_indices_;
   TVMFFIObjectHandle direct_module_handle_{nullptr};
   std::string direct_kernel_name_;
   std::shared_ptr<CachedDirectLaunchHandle> direct_launch_handle_;
@@ -1293,6 +1351,7 @@ std::vector<mx::array> tvm_ffi_metal_call(
     const std::vector<std::string>& expected_param_dtypes,
     const std::vector<std::vector<int64_t>>& param_shapes,
     const std::vector<int64_t>& direct_launch_args,
+    const std::vector<int64_t>& direct_param_indices,
     uint64_t direct_module_handle,
     const std::string& direct_kernel_name,
     const std::vector<int64_t>& zero_init_output_positions,
@@ -1324,6 +1383,7 @@ std::vector<mx::array> tvm_ffi_metal_call(
       expected_param_dtypes,
       param_shapes,
       direct_launch_args,
+      direct_param_indices,
       direct_module_handle,
       direct_kernel_name,
       zero_init_output_positions,
@@ -1347,6 +1407,7 @@ std::shared_ptr<PreparedMetalCall> prepare_metal_call(
     const std::vector<std::string>& expected_param_dtypes,
     const std::vector<std::vector<int64_t>>& param_shapes,
     const std::vector<int64_t>& direct_launch_args,
+    const std::vector<int64_t>& direct_param_indices,
     uint64_t direct_module_handle,
     const std::string& direct_kernel_name,
     const std::vector<int64_t>& zero_init_output_positions) {
@@ -1381,6 +1442,7 @@ std::shared_ptr<PreparedMetalCall> prepare_metal_call(
   prepared->expected_param_dtypes = expected_param_dtypes;
   prepared->param_shapes = param_shapes;
   prepared->direct_launch_args = direct_launch_args;
+  prepared->direct_param_indices = direct_param_indices;
   prepared->direct_module_handle = direct_module_handle;
   prepared->direct_kernel_name = direct_kernel_name;
   prepared->zero_init_output_positions = zero_init_output_positions;
@@ -1480,6 +1542,25 @@ nb::list wrap_mlx_arrays(std::vector<mx::array>&& arrays) {
   return result;
 }
 
+nb::object tvm_ffi_metal_call_prepared_borrowed_no_wait(
+    const std::shared_ptr<PreparedMetalCall>& prepared,
+    const std::vector<mx::array>& inputs,
+    const std::vector<mx::array>* owner_outputs = nullptr) {
+  for (const auto& input : inputs) {
+    if (!can_borrow_compact_input_array(input)) {
+      return nb::none();
+    }
+  }
+  auto launch_sync_state = make_launch_sync_state();
+  auto outputs = wrap_mlx_arrays(tvm_ffi_metal_call_prepared(
+      prepared,
+      inputs,
+      launch_sync_state,
+      {},
+      owner_outputs));
+  return nb::make_tuple(std::move(outputs), launch_sync_state);
+}
+
 mx::array make_owner_output_buffer(
     const std::vector<int64_t>& shape,
     const std::string& dtype_name) {
@@ -1575,6 +1656,7 @@ PyObject* c_api_metal_call(
         num_params,
         std::vector<std::string>{},
         std::vector<std::vector<int64_t>>{},
+        std::vector<int64_t>{},
         std::vector<int64_t>{},
         0,
         std::string{},
@@ -1751,6 +1833,7 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
          nb::handle param_dtypes,
          nb::handle param_shapes,
          nb::handle direct_launch_args,
+         nb::handle direct_param_indices,
          uint64_t direct_module_handle,
          const std::string& direct_kernel_name,
          nb::handle zero_init_output_positions) {
@@ -1760,6 +1843,7 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
         std::vector<std::string> parsed_param_dtypes;
         std::vector<std::vector<int64_t>> parsed_param_shapes;
         std::vector<int64_t> parsed_direct_launch_args;
+        std::vector<int64_t> parsed_direct_param_indices;
         std::vector<int64_t> parsed_zero_init_output_positions;
         try {
           parsed_output_shapes = tilelang::mlx_tvm_ffi::parse_shape_sequence(output_shapes);
@@ -1774,6 +1858,10 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
           if (!direct_launch_args.is_none()) {
             parsed_direct_launch_args =
                 tilelang::mlx_tvm_ffi::parse_i64_sequence(direct_launch_args);
+          }
+          if (!direct_param_indices.is_none()) {
+            parsed_direct_param_indices =
+                tilelang::mlx_tvm_ffi::parse_i64_sequence(direct_param_indices);
           }
           parsed_zero_init_output_positions =
               tilelang::mlx_tvm_ffi::parse_i64_sequence(zero_init_output_positions);
@@ -1790,6 +1878,7 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
             parsed_param_dtypes,
             parsed_param_shapes,
             parsed_direct_launch_args,
+            parsed_direct_param_indices,
             direct_module_handle,
             direct_kernel_name,
             parsed_zero_init_output_positions);
@@ -1802,6 +1891,7 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
       "param_dtypes"_a = nb::none(),
       "param_shapes"_a = nb::none(),
       "direct_launch_args"_a = nb::none(),
+      "direct_param_indices"_a = nb::none(),
       "direct_module_handle"_a = 0,
       "direct_kernel_name"_a = "",
       "zero_init_output_positions"_a = nb::make_tuple());
@@ -1819,6 +1909,7 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
          nb::handle param_dtypes,
          nb::handle param_shapes,
          nb::handle direct_launch_args,
+         nb::handle direct_param_indices,
          uint64_t direct_module_handle,
          const std::string& direct_kernel_name) {
         std::vector<mx::array> parsed_inputs;
@@ -1828,6 +1919,7 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
         std::vector<std::string> parsed_param_dtypes;
         std::vector<std::vector<int64_t>> parsed_param_shapes;
         std::vector<int64_t> parsed_direct_launch_args;
+        std::vector<int64_t> parsed_direct_param_indices;
         std::vector<int64_t> parsed_zero_init_output_positions;
         std::shared_ptr<tilelang::mlx_tvm_ffi::MetalLaunchSyncState> parsed_launch_sync_state;
         std::vector<std::shared_ptr<tilelang::mlx_tvm_ffi::MetalSyncEdge>> parsed_wait_edges;
@@ -1870,6 +1962,10 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
             parsed_direct_launch_args =
                 tilelang::mlx_tvm_ffi::parse_i64_sequence(direct_launch_args);
           }
+          if (!direct_param_indices.is_none()) {
+            parsed_direct_param_indices =
+                tilelang::mlx_tvm_ffi::parse_i64_sequence(direct_param_indices);
+          }
         } catch (const std::exception& exc) {
           throw std::runtime_error(
               std::string("failed to parse direct device launch args: ") + exc.what());
@@ -1903,6 +1999,7 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
                 parsed_param_dtypes,
                 parsed_param_shapes,
                 parsed_direct_launch_args,
+                parsed_direct_param_indices,
                 direct_module_handle,
                 direct_kernel_name,
                 parsed_zero_init_output_positions,
@@ -1921,6 +2018,7 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
       "param_dtypes"_a = nb::none(),
       "param_shapes"_a = nb::none(),
       "direct_launch_args"_a = nb::none(),
+      "direct_param_indices"_a = nb::none(),
       "direct_module_handle"_a = 0,
       "direct_kernel_name"_a = "");
   m.def(
@@ -1938,6 +2036,7 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
          nb::handle param_dtypes,
          nb::handle param_shapes,
          nb::handle direct_launch_args,
+         nb::handle direct_param_indices,
          uint64_t direct_module_handle,
          const std::string& direct_kernel_name) {
         std::vector<mx::array> parsed_inputs;
@@ -1948,6 +2047,7 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
         std::vector<std::string> parsed_param_dtypes;
         std::vector<std::vector<int64_t>> parsed_param_shapes;
         std::vector<int64_t> parsed_direct_launch_args;
+        std::vector<int64_t> parsed_direct_param_indices;
         std::vector<int64_t> parsed_zero_init_output_positions;
         std::shared_ptr<tilelang::mlx_tvm_ffi::MetalLaunchSyncState> parsed_launch_sync_state;
         std::vector<std::shared_ptr<tilelang::mlx_tvm_ffi::MetalSyncEdge>> parsed_wait_edges;
@@ -1966,6 +2066,10 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
           if (!direct_launch_args.is_none()) {
             parsed_direct_launch_args =
                 tilelang::mlx_tvm_ffi::parse_i64_sequence(direct_launch_args);
+          }
+          if (!direct_param_indices.is_none()) {
+            parsed_direct_param_indices =
+                tilelang::mlx_tvm_ffi::parse_i64_sequence(direct_param_indices);
           }
           parsed_zero_init_output_positions =
               tilelang::mlx_tvm_ffi::parse_i64_sequence(zero_init_output_positions);
@@ -1987,6 +2091,7 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
                 parsed_param_dtypes,
                 parsed_param_shapes,
                 parsed_direct_launch_args,
+                parsed_direct_param_indices,
                 direct_module_handle,
                 direct_kernel_name,
                 parsed_zero_init_output_positions,
@@ -2007,6 +2112,7 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
       "param_dtypes"_a = nb::none(),
       "param_shapes"_a = nb::none(),
       "direct_launch_args"_a = nb::none(),
+      "direct_param_indices"_a = nb::none(),
       "direct_module_handle"_a = 0,
       "direct_kernel_name"_a = "");
   m.def(
@@ -2073,9 +2179,41 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
       "launch_sync_state"_a = nb::none(),
       "wait_edges"_a = nb::none());
   m.def(
+      "prepared_metal_call_borrowed_no_wait",
+      [](const std::shared_ptr<tilelang::mlx_tvm_ffi::PreparedMetalCall>& prepared,
+         nb::handle inputs,
+         nb::handle owner_outputs) {
+        std::vector<mx::array> parsed_inputs;
+        std::vector<mx::array> parsed_owner_outputs;
+        try {
+          parsed_inputs = tilelang::mlx_tvm_ffi::parse_array_sequence(inputs);
+          if (!owner_outputs.is_none()) {
+            parsed_owner_outputs =
+                tilelang::mlx_tvm_ffi::parse_array_sequence(owner_outputs);
+          }
+        } catch (const std::exception& exc) {
+          throw std::runtime_error(
+              std::string("failed to parse prepared borrowed native call: ") + exc.what());
+        }
+        return tilelang::mlx_tvm_ffi::tvm_ffi_metal_call_prepared_borrowed_no_wait(
+            prepared,
+            parsed_inputs,
+            owner_outputs.is_none() ? nullptr : &parsed_owner_outputs);
+      },
+      "prepared"_a,
+      "inputs"_a,
+      "owner_outputs"_a = nb::none());
+  m.def(
       "is_compact",
       [](nb::handle array) {
         return tilelang::mlx_tvm_ffi::is_compact_array(
+            tilelang::mlx_tvm_ffi::parse_mlx_array(array));
+      },
+      "array"_a);
+  m.def(
+      "can_borrow_compact_input",
+      [](nb::handle array) {
+        return tilelang::mlx_tvm_ffi::can_borrow_compact_input_array(
             tilelang::mlx_tvm_ffi::parse_mlx_array(array));
       },
       "array"_a);

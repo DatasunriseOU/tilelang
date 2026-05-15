@@ -255,6 +255,11 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             if metal_direct_device_call is not None
             else None
         )
+        direct_param_indices = (
+            metal_direct_device_call[4]
+            if metal_direct_device_call is not None
+            else None
+        )
 
         # Prepare helpers for friendly dtype error messages
         prim_func = self.prim_func
@@ -322,6 +327,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                     param_shapes=static_native_param_shapes,
                     direct_func=direct_func,
                     direct_launch_args=direct_launch_args,
+                    direct_param_indices=direct_param_indices,
                     direct_module=direct_module,
                     direct_kernel_name=direct_kernel_name,
                     zero_init_output_positions=metal_zero_init_output_positions,
@@ -543,6 +549,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                             param_shapes=native_param_shapes,
                             direct_func=direct_func,
                             direct_launch_args=direct_launch_args,
+                            direct_param_indices=direct_param_indices,
                             direct_module=direct_module,
                             direct_kernel_name=direct_kernel_name,
                             dependency_metadata=dependency_metadata,
@@ -589,6 +596,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                             param_shapes=native_param_shapes,
                             direct_func=direct_func,
                             direct_launch_args=direct_launch_args,
+                            direct_param_indices=direct_param_indices,
                             direct_module=direct_module,
                             direct_kernel_name=direct_kernel_name,
                             dependency_metadata=dependency_metadata,
@@ -677,9 +685,58 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             return None
         try:
             imported_module = imported_modules[0]
-            return imported_module[kernel_name], launch_args, imported_module, kernel_name
+            direct_param_indices = self._metal_direct_param_indices(
+                imported_module[kernel_name]
+            )
+            if direct_param_indices is None:
+                return None
+            return (
+                imported_module[kernel_name],
+                launch_args,
+                imported_module,
+                kernel_name,
+                direct_param_indices,
+            )
         except Exception:
             return None
+
+    def _metal_direct_param_indices(self, device_func) -> list[int] | None:
+        """Map device-kernel buffer order back to the host PrimFunc order.
+
+        TVM's split-host-device pass may reorder Metal device function
+        parameters, while the packed host wrapper preserves the original
+        PrimFunc order. Direct launch bypasses the host wrapper, so the native
+        bridge needs the device ABI permutation explicitly.
+        """
+
+        try:
+            host_buffer_map = self.prim_func.buffer_map
+            host_params = list(self.prim_func.params)
+            device_params = list(device_func.params)
+        except Exception:
+            return None
+        host_name_to_idx: dict[str, int] = {}
+        for idx, param in enumerate(host_params):
+            if param not in host_buffer_map:
+                return None
+            name = str(host_buffer_map[param].name)
+            if name in host_name_to_idx:
+                return None
+            host_name_to_idx[name] = idx
+        direct_param_indices: list[int] = []
+        for param in device_params:
+            name_obj = (
+                getattr(param, "name", None)
+                or getattr(param, "name_hint", None)
+                or param
+            )
+            name = str(name_obj)
+            if name not in host_name_to_idx:
+                return None
+            direct_param_indices.append(host_name_to_idx[name])
+        if len(direct_param_indices) != len(host_params):
+            return None
+        return direct_param_indices
 
     def _metal_device_launch_metadata(self) -> tuple[str, list[int]] | None:
         device_mod = getattr(self, "device_mod", None)

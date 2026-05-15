@@ -593,3 +593,137 @@ PYTHONPATH=/private/tmp/tl_apache_tvm_swap:/private/tmp/tl_apache_tvm_swap/3rdpa
   cells.
 - No production monkeypatch, model-owned MSL, or public partial-output workaround
   remains.
+
+## Run Log
+
+### 2026-05-15 P0 in progress
+
+**Bridge fix (commit `bd51fbf1`)**: `_contiguous_mlx_input` now always wraps
+inputs through `mx.contiguous` on the GPU stream. The previous wrap-time
+`is_compact` cache was unreliable because MLX rewrites slice strides during
+eval (slice node: pre-eval `row_contiguous=True`, post-eval `False`).
+Cross-domain hazard test relaxed to allow either device-event path or the
+MLX-mediated copy path (correctness preserved either way). 60 focused tests
+passing.
+
+**1B end-to-end baseline (`scripts/bench_local_gb10_quarter_throughput.py`,
+batch=1, T=4096, 20 measured steps after 5 warmup, M4 Max)**
+
+Path C combo (`SPARSE_MLA + M2RNN` on Path C, Mamba3 on Path B):
+
+| Optimizer    | Path B tok/s | Path C tok/s | Δ      | Path B peak GB | Path C peak GB |
+| ------------ | -----------: | -----------: | -----: | -------------: | -------------: |
+| lion         |          733 |      **765** | +4.4 % |          45.59 |          45.57 |
+| muon_adamw   |          369 |      **378** | +2.4 % |          44.83 |          44.50 |
+
+Per-op isolation:
+- `SPARSE_MLA` only on Path C: 384 vs 357 tok/s (+7.5 %), peak 41.30 GB
+  (vs Path B 44.83 GB).
+- `M2RNN` only on Path C: 361 vs 357 tok/s (+1.1 %), peak 58.48 GB
+  (vs Path B 44.83 GB).
+- `MAMBA3_MIMO` only on Path C: 394 vs 357 tok/s (+10.4 %) BUT loss → NaN
+  by step 5 — correctness regression. Excluded from combo until fixed.
+- All three combined: GPU page fault / hang (likely Mamba3 NaN poisoning
+  downstream attention indexing). Blocked on Mamba3 bwd correctness.
+
+**Open P0 follow-ups before declaring P0 green**
+
+- Mamba3 bwd correctness on Path C (12/40 path-c tests fail in full-file
+  pytest run; isolated runs sometimes pass — pytest order pollution; the
+  1B-bench NaN reproduces deterministically).
+- Extended 1B optimizer matrix (`adamw`, `adam8bit`, `lion8bit`); bench
+  was extended in-place at `bench_local_gb10_quarter_throughput.py` and
+  results pending.
+- Strict FP8 `vecmat_4096` remains above the 3 % micro-bench gate. Do not
+  mark P0 green until the strict gate passes or the gate is explicitly changed
+  with a replacement receipt.
+
+### 2026-05-15 P0 bridge guard rerun
+
+**Change under test**: `_contiguous_mlx_input` now preserves registered
+TVM-FFI producer outputs before asking the native compactness guard. This keeps
+graph producer identity visible to the dependency planner; generic lazy MLX
+inputs still route through `native.compact_input(...)`.
+
+**SHAs / cache state**
+
+| Repo | SHA | State |
+| --- | --- | --- |
+| TileLang | `bd51fbf1` + dirty bridge/doc/test edits | `TILELANG_DISABLE_CACHE=1` |
+| cppmega.mlx | `6691cba` + existing dirty benchmark/test edits | `TILELANG_DEV_BUILD_ROOT=/private/tmp/tl_apache_tvm_swap` |
+| MLX | `d168ca5ca` | imported as `0.32.0.dev20260514+d168ca5ca` |
+
+**Commands and results**
+
+| Command | Result |
+| --- | --- |
+| `cmake --build build -j$(sysctl -n hw.ncpu)` | pass |
+| `.venv313/bin/python -m py_compile tilelang/jit/adapter/_mlx_tvm_ffi.py tilelang/jit/adapter/tvm_ffi.py` | pass |
+| `git diff --check -- src/contrib/mlx_tvm_ffi/mlx_tvm_ffi_ext.cpp tilelang/jit/adapter/_mlx_tvm_ffi.py testing/python/metal/test_tvm_ffi_metal_stream_dlpack.py ml_optim_plan.md` | pass |
+| `pytest test_tvm_ffi_metal_stream_dlpack.py::{compile_compact_result_idx,native_bridge_borrows_only_materialized_compact_inputs,mlx_graph_cross_domain_emits_device_event}` | pass: 3 passed, 50 warnings |
+| `pytest testing/python/metal/test_tvm_ffi_metal_stream_dlpack.py -q` | pass: 20 passed, 5 skipped, 50 warnings |
+| `pytest testing/python/metal/test_fp8_scaled_matmul_metal.py testing/python/metal/test_tvm_ffi_metal_stream_dlpack.py testing/python/analysis/test_metal_graph_sync.py testing/python/scheduler/test_sync_event_plan.py -q` | pass: 61 passed, 5 skipped, 68 warnings |
+| `pytest tests/test_tilelang_fp8_vecmat_path_c.py -q` in cppmega | pass: 28 passed, 1 warning |
+| strict `scripts/bench_tilelang_fp8_path_c.py --warmup 5 --iters 20 --shapes matmul_128 vecmat_4096 --skip-xcrun --skip-sparse --strict --max-ratio 1.03 --out /tmp/fp8_path_c_p0.json` | fail: `vecmat_4096` ratio 1.130x |
+| non-strict receipt `scripts/bench_tilelang_fp8_path_c.py --warmup 5 --iters 20 --shapes matmul_128 vecmat_4096 --skip-xcrun --skip-sparse --out /tmp/fp8_path_c_p0_latest.json` | pass, wrote `/tmp/fp8_path_c_p0_latest.json` |
+
+**Latest FP8 Path B / Path C receipt (`/tmp/fp8_path_c_p0_latest.json`)**
+
+| Shape | Path | Median ms | Min ms | P90 ms | Max ms | Tok/s | Ratio |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `matmul_128` | Path B MSL | 0.163771 | 0.124458 | 0.213500 | 0.266500 | 781581.478 | baseline |
+| `matmul_128` | Path C TileLang | 0.141834 | 0.121916 | 0.172542 | 0.247750 | 902466.616 | 0.848x |
+| `vecmat_4096` | Path B MSL | 0.187125 | 0.167250 | 0.201000 | 0.235625 | 5344.021 | baseline |
+| `vecmat_4096` | Path C TileLang | 0.211812 | 0.192750 | 0.270542 | 0.313917 | 4721.157 | 1.148x |
+
+**Current P0 status**
+
+- Correctness/bridge tests are green after preserving TVM-FFI producer outputs
+  through `_contiguous_mlx_input`.
+- Performance gate is still red: `vecmat_4096` Path C is 13-15 % slower than
+  Path B on the latest paired runs.
+- Next fixer target: reduce Path C host/runtime overhead or generated vecmat
+  dispatch cost without reintroducing model-owned MSL, public TVM-FFI bypasses,
+  or unsafe MLX graph materialization.
+
+### 2026-05-15 P0 borrowed no-wait fast path
+
+**Change under test**: native `_tilelang_mlx_tvm_ffi` gained
+`prepared_metal_call_borrowed_no_wait(...)`. For prepared Metal calls whose
+inputs are already materialized compact MLX arrays, the bridge now creates the
+launch sync state and primitive in one native call, skipping the Python
+compact-input and dependency-planner path. Lazy inputs, views, and TVM-FFI
+producer outputs still fall back to the normal planner/compact path.
+
+**Commands and results**
+
+| Command | Result |
+| --- | --- |
+| `cmake --build build -j$(sysctl -n hw.ncpu)` | pass |
+| targeted graph-safe bridge pytest | pass: 3 passed, 50 warnings |
+| `pytest testing/python/metal/test_tvm_ffi_metal_stream_dlpack.py -q` | pass: 20 passed, 5 skipped, 50 warnings |
+| `pytest tests/test_tilelang_fp8_vecmat_path_c.py -q` in cppmega | pass: 28 passed, 1 warning |
+| P0 TileLang focused pytest block | pass: 61 passed, 5 skipped, 68 warnings |
+| no-eval wrapper profile, `vecmat_4096`, 1000 calls | Path C improved from 28.646 us/call to 21.473 us/call; Path B was 8.504 us/call in the same rerun |
+| strict `scripts/bench_tilelang_fp8_path_c.py --warmup 5 --iters 20 --shapes matmul_128 vecmat_4096 --skip-xcrun --skip-sparse --strict --max-ratio 1.03 --out /tmp/fp8_path_c_p0_fast_strict.json` | fail: `vecmat_4096` ratio 1.121x |
+| non-strict receipt `scripts/bench_tilelang_fp8_path_c.py --warmup 5 --iters 20 --shapes matmul_128 vecmat_4096 --skip-xcrun --skip-sparse --out /tmp/fp8_path_c_p0_fast_latest.json` | pass, wrote `/tmp/fp8_path_c_p0_fast_latest.json` |
+
+**Latest fast-path FP8 receipt (`/tmp/fp8_path_c_p0_fast_latest.json`)**
+
+| Shape | Path | Median ms | Min ms | P90 ms | Max ms | Tok/s | Ratio |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `matmul_128` | Path B MSL | 0.142001 | 0.123459 | 0.174750 | 0.249125 | 901404.912 | baseline |
+| `matmul_128` | Path C TileLang | 0.121083 | 0.112708 | 0.130125 | 0.147166 | 1057122.089 | 0.854x |
+| `vecmat_4096` | Path B MSL | 0.186854 | 0.163208 | 0.223875 | 0.277625 | 5351.771 | baseline |
+| `vecmat_4096` | Path C TileLang | 0.197292 | 0.167959 | 0.233084 | 0.239583 | 5068.641 | 1.032x |
+
+**Current P0 status after fast path**
+
+- Correctness is still green.
+- Host wrapper overhead is materially lower, but not Path-B-level yet.
+- Strict perf gate remains red because the 20-iteration paired run is not
+  stable below 1.03x (`1.121x` strict rerun, `1.032x` best latest receipt).
+- Next fixer target: close the remaining 10-13 us host gap or remove the
+  generated vecmat scheduling variance. Knob sweep over
+  `outputs_per_block={1,2,4,8,16}` and `reduce_threads={16,32,64,128}` did not
+  produce a stable scheduler win; all useful variants stayed around 0.20 ms.

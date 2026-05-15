@@ -504,6 +504,23 @@ def test_tvm_ffi_metal_mlx_compile_compact_result_idx_is_graph_safe():
 
 
 @tilelang.testing.requires_metal
+def test_tvm_ffi_metal_native_bridge_borrows_only_materialized_compact_inputs():
+    mx = pytest.importorskip("mlx.core")
+    native = pytest.importorskip("_tilelang_mlx_tvm_ffi")
+
+    materialized = mx.ones((2, 3), dtype=mx.float32)
+    mx.eval(materialized)
+    assert native.can_borrow_compact_input(materialized) is True
+
+    lazy = mx.ones((2, 3), dtype=mx.float32) + 1.0
+    assert native.can_borrow_compact_input(lazy) is False
+
+    offset_view = materialized[:, 1:]
+    mx.eval(offset_view)
+    assert native.can_borrow_compact_input(offset_view) is False
+
+
+@tilelang.testing.requires_metal
 def test_tvm_ffi_metal_mlx_compile_uses_native_graph_primitive():
     mx = pytest.importorskip("mlx.core")
     from tilelang.contrib.mlx_tvm_ffi import (

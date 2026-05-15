@@ -7,11 +7,11 @@ import or call this bridge directly.
 
 from __future__ import annotations
 
-import weakref
 from typing import Any, Iterable
 
 from tilelang.analysis.metal_graph_sync import (
     MetalLaunchDependencyMetadata,
+    has_mlx_tvm_ffi_producer,
     make_tvm_ffi_metal_dependency_metadata,
     plan_mlx_tvm_ffi_launch,
     register_mlx_tvm_ffi_outputs,
@@ -23,7 +23,6 @@ class MLXTVMFFIBridgeUnavailable(RuntimeError):
 
 
 _NATIVE_MODULE: Any | None = None
-_COMPACT_INPUT_CACHE: dict[int, weakref.ref[Any]] = {}
 _MLX_ARRAY_TYPE: type[Any] | None | bool = None
 
 
@@ -122,44 +121,24 @@ def _is_mlx_array(value: Any) -> bool:
     return isinstance(value, _MLX_ARRAY_TYPE)
 
 
-def _known_compact_mlx_input(value: Any) -> bool:
-    entry = _COMPACT_INPUT_CACHE.get(id(value))
-    if entry is None:
-        return False
-    if entry() is value:
-        return True
-    _COMPACT_INPUT_CACHE.pop(id(value), None)
-    return False
-
-
-def _remember_compact_mlx_input(value: Any) -> None:
-    key = id(value)
-
-    def remove(_ref: weakref.ref[Any], *, stale_key: int = key) -> None:
-        _COMPACT_INPUT_CACHE.pop(stale_key, None)
-
-    try:
-        _COMPACT_INPUT_CACHE[key] = weakref.ref(value, remove)
-    except TypeError:
-        pass
-
-
 def _contiguous_mlx_input(value: Any) -> Any:
     """Preserve MLX graph inputs for the native TVM-FFI boundary.
 
-    Always route inputs through ``native.compact_input`` (mx.contiguous on
-    the GPU stream). The wrap-time ``is_compact`` check is unreliable
-    because MLX rewrites strides during eval: a slice node looks compact
-    at graph-construction time but becomes a non-compact view of the
-    parent buffer after evaluation. ``mx.contiguous`` is a near-no-op
-    for already-row-contiguous inputs and an explicit row-contiguous
-    copy otherwise, matching what ``mx.fast.metal_kernel`` does via its
-    ``ensure_row_contiguous`` path.
+    TVM-FFI graph outputs are already compact by construction and must keep
+    their producer registry identity so the dependency planner can see
+    producer->consumer hazards. For other inputs, trust only already
+    materialized compact zero-offset arrays. Lazy MLX graph nodes and views
+    still go through ``native.compact_input`` because wrap-time shape/stride
+    metadata can change when MLX evaluates the graph.
     """
 
     if not _is_mlx_array(value):
         return value
     native = _load_native_module()
+    if native.can_borrow_compact_input(value):
+        return value
+    if has_mlx_tvm_ffi_producer(value):
+        return value
     return native.compact_input(value)
 
 
@@ -174,6 +153,7 @@ def prepare_metal_call(
     param_shapes: Iterable[Iterable[int]] | None = None,
     direct_func: Any | None = None,
     direct_launch_args: Iterable[int] | None = None,
+    direct_param_indices: Iterable[int] | None = None,
     direct_module: Any | None = None,
     direct_kernel_name: str | None = None,
     zero_init_output_positions: Iterable[int] = (),
@@ -191,6 +171,9 @@ def prepare_metal_call(
     direct_launch_arg_list = None
     if direct_launch_args is not None:
         direct_launch_arg_list = [int(value) for value in direct_launch_args]
+    direct_param_index_list = None
+    if direct_param_indices is not None:
+        direct_param_index_list = [int(value) for value in direct_param_indices]
     direct_module_handle = 0
     if direct_module is not None:
         direct_module_handle = _function_handle(direct_module)
@@ -204,6 +187,7 @@ def prepare_metal_call(
         param_dtype_names,
         param_shape_list,
         direct_launch_arg_list,
+        direct_param_index_list,
         direct_module_handle,
         direct_kernel_name_str,
         [int(idx) for idx in zero_init_output_positions],
@@ -221,7 +205,25 @@ def prepared_metal_call(
     """Create MLX graph outputs from a pre-parsed native Metal call."""
 
     native = _load_native_module()
-    input_list = [_contiguous_mlx_input(value) for value in inputs]
+    raw_input_list = list(inputs)
+    owner_output_list = None if owner_outputs is None else list(owner_outputs)
+    fast_result = native.prepared_metal_call_borrowed_no_wait(
+        prepared,
+        raw_input_list,
+        owner_output_list,
+    )
+    if fast_result is not None:
+        outputs, launch_sync_state = fast_result
+        output_list = list(outputs)
+        register_mlx_tvm_ffi_outputs(
+            output_list,
+            launch_sync_state,
+            dependency_metadata=dependency_metadata,
+            command_buffer_domain=command_buffer_domain,
+        )
+        return output_list
+
+    input_list = [_contiguous_mlx_input(value) for value in raw_input_list]
     launch_sync_state, wait_edges = plan_mlx_tvm_ffi_launch(
         native,
         input_list,
@@ -239,7 +241,7 @@ def prepared_metal_call(
         outputs = native.prepared_metal_call_owner_outputs(
             prepared,
             input_list,
-            list(owner_outputs),
+            owner_output_list,
             launch_sync_state,
             wait_edges,
         )
@@ -266,6 +268,7 @@ def metal_call(
     param_shapes: Iterable[Iterable[int]] | None = None,
     direct_func: Any | None = None,
     direct_launch_args: Iterable[int] | None = None,
+    direct_param_indices: Iterable[int] | None = None,
     direct_module: Any | None = None,
     direct_kernel_name: str | None = None,
     command_buffer_domain: Any | None = None,
@@ -294,6 +297,9 @@ def metal_call(
     direct_launch_arg_list = None
     if direct_launch_args is not None:
         direct_launch_arg_list = [int(value) for value in direct_launch_args]
+    direct_param_index_list = None
+    if direct_param_indices is not None:
+        direct_param_index_list = [int(value) for value in direct_param_indices]
     direct_module_handle = 0
     if direct_module is not None:
         direct_module_handle = _function_handle(direct_module)
@@ -328,6 +334,7 @@ def metal_call(
             param_dtypes=param_dtype_names,
             param_shapes=param_shape_list,
             direct_launch_args=direct_launch_arg_list,
+            direct_param_indices=direct_param_index_list,
             direct_module_handle=direct_module_handle,
             direct_kernel_name=direct_kernel_name_str,
         )
@@ -346,6 +353,7 @@ def metal_call(
             param_dtypes=param_dtype_names,
             param_shapes=param_shape_list,
             direct_launch_args=direct_launch_arg_list,
+            direct_param_indices=direct_param_index_list,
             direct_module_handle=direct_module_handle,
             direct_kernel_name=direct_kernel_name_str,
         )
