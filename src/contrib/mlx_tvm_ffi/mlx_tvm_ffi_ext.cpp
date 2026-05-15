@@ -1049,15 +1049,9 @@ class TVMFFIMetalCall : public mx::Primitive {
     // construction time so MLX scheduler materializes copies before this
     // primitive's eval_gpu runs. We can't call mx::eval here -- we are
     // already on the scheduler thread and would deadlock.
-    std::vector<const mx::array*> effective_inputs;
-    effective_inputs.reserve(inputs.size());
-    for (const auto& in : inputs) {
-      effective_inputs.push_back(&in);
-    }
     if (owner_outputs_are_inputs_) {
       for (size_t i = 0; i < outputs.size(); ++i) {
-        const auto& owner =
-            *effective_inputs.at(static_cast<size_t>(expected_inputs) + i);
+        const auto& owner = inputs.at(static_cast<size_t>(expected_inputs) + i);
         if (owner.buffer().ptr() == nullptr) {
           throw std::runtime_error(
               "MLX owner output array has no materialized Metal buffer at TVM-FFI launch time");
@@ -1088,6 +1082,134 @@ class TVMFFIMetalCall : public mx::Primitive {
         direct_device_launch &&
         direct_launch_handle_ != nullptr &&
         direct_launch_handle_->handle != nullptr;
+    if (direct_pipeline_launch) {
+      std::vector<void*> direct_buffers;
+      direct_buffers.reserve(static_cast<size_t>(num_params_));
+
+      auto result_position_for_param = [&](int64_t param_idx) -> int64_t {
+        auto it = std::lower_bound(result_indices.begin(), result_indices.end(), param_idx);
+        if (it == result_indices.end() || *it != param_idx) {
+          return -1;
+        }
+        return static_cast<int64_t>(std::distance(result_indices.begin(), it));
+      };
+      auto input_position_for_param = [&](int64_t param_idx) -> int64_t {
+        auto it = std::lower_bound(result_indices.begin(), result_indices.end(), param_idx);
+        return param_idx - static_cast<int64_t>(std::distance(result_indices.begin(), it));
+      };
+      auto bind_direct_param = [&](int64_t param_idx) -> void* {
+        const int64_t output_pos = result_position_for_param(param_idx);
+        const bool is_output = output_pos >= 0;
+        const mx::array* array = nullptr;
+        const std::vector<int64_t>* shape_override = nullptr;
+        if (is_output) {
+          array = &outputs.at(static_cast<size_t>(output_pos));
+          if (!param_shapes.empty()) {
+            shape_override = &param_shapes.at(static_cast<size_t>(param_idx));
+          } else {
+            shape_override = &output_shapes.at(static_cast<size_t>(output_pos));
+          }
+        } else {
+          const int64_t input_pos = input_position_for_param(param_idx);
+          if (input_pos < 0 || input_pos >= expected_inputs) {
+            throw std::runtime_error("TVM-FFI direct Metal input position is out of range");
+          }
+          array = &inputs.at(static_cast<size_t>(input_pos));
+          if (!param_shapes.empty()) {
+            shape_override = &param_shapes.at(static_cast<size_t>(param_idx));
+          }
+        }
+        const std::string* expected_dtype = expected_param_dtypes.empty()
+            ? nullptr
+            : &expected_param_dtypes.at(static_cast<size_t>(param_idx));
+        try {
+          return make_direct_opaque_ptr(
+              *array,
+              is_output,
+              param_idx,
+              expected_dtype,
+              shape_override);
+        } catch (const std::exception& exc) {
+          std::ostringstream os;
+          os << "TVM-FFI parameter " << param_idx << (is_output ? " output" : " input")
+             << " failed direct Metal pointer binding: " << exc.what();
+          throw std::runtime_error(os.str());
+        }
+      };
+
+      if (!direct_param_indices.empty()) {
+        for (int64_t param_idx : direct_param_indices) {
+          direct_buffers.push_back(bind_direct_param(param_idx));
+        }
+      } else {
+        for (int64_t param_idx = 0; param_idx < num_params_; ++param_idx) {
+          direct_buffers.push_back(bind_direct_param(param_idx));
+        }
+      }
+
+      register_external_inputs(encoder, inputs);
+      auto signal_edges = launch_sync_state_->snapshot_signal_edges();
+      auto call_direct = [&]() {
+        debug_counters().direct_device_launches.fetch_add(1, std::memory_order_relaxed);
+        debug_counters().direct_pipeline_launches.fetch_add(1, std::memory_order_relaxed);
+        int rc = TVMMetalDirectLaunch(
+            direct_launch_handle_->handle,
+            direct_buffers.data(),
+            static_cast<int32_t>(direct_buffers.size()),
+            direct_launch_args.data(),
+            static_cast<int32_t>(direct_launch_args.size()));
+        if (rc != 0) {
+          const char* error = TVMMetalDirectLaunchLastError();
+          throw std::runtime_error(
+              std::string("TVM Metal direct pipeline launch failed inside MLX graph eval: ") +
+              (error == nullptr ? "unknown error" : error));
+        }
+      };
+      const bool can_launch_on_active_compute_encoder =
+          env_flag_enabled_by_default(kUseActiveComputeEncoderEnv) &&
+          zero_init_output_positions.empty() &&
+          wait_edges_.empty() &&
+          signal_edges.empty() &&
+          !env_flag_enabled(kDebugCompletionEnv) &&
+          !env_flag_enabled(kForceCommandBufferBoundaryEnv);
+      if (can_launch_on_active_compute_encoder) {
+        encoder->prepare_external_dispatch();
+        {
+          ExternalComputeEncoderScope external(encoder->raw_command_encoder());
+          debug_counters().direct_compute_encoder_launches.fetch_add(1, std::memory_order_relaxed);
+          call_direct();
+        }
+        publish_external_outputs(stream(), outputs);
+        return;
+      }
+
+      auto* command_buffer = finish_encoding_and_get_command_buffer(stream());
+      maybe_encode_command_buffer_boundary(command_buffer, stream());
+      encode_device_event_waits(command_buffer, stream(), wait_edges_);
+      for (int64_t output_pos : zero_init_output_positions) {
+        zero_output_buffer(command_buffer, outputs.at(static_cast<size_t>(output_pos)));
+      }
+      maybe_encode_command_buffer_boundary(command_buffer, stream());
+      {
+        ExternalCommandBufferScope external(command_buffer);
+        call_direct();
+      }
+      encode_device_event_signals(command_buffer, stream(), signal_edges);
+      maybe_encode_command_buffer_boundary(command_buffer, stream());
+      publish_external_outputs(stream(), outputs);
+      if (env_flag_enabled(kDebugCompletionEnv)) {
+        debug_counters().debug_completion_launches.fetch_add(1, std::memory_order_relaxed);
+        install_completion_debug_hook(command_buffer);
+        for (const auto& out : outputs) {
+          if (out.buffer().ptr() == nullptr) {
+            debug_counters().null_output_buffers.fetch_add(1, std::memory_order_relaxed);
+            throw std::runtime_error(
+                "MLX output buffer became null after TVM-FFI Metal debug hook install");
+          }
+        }
+      }
+      return;
+    }
     std::vector<int64_t> direct_param_order;
     std::vector<int64_t> direct_arg_position_by_param;
     if (direct_device_launch) {
@@ -1147,7 +1269,7 @@ class TVMFFIMetalCall : public mx::Primitive {
       const std::vector<int64_t>* shape_override = nullptr;
       const mx::array& array =
           is_output ? outputs.at(output_pos)
-                    : *effective_inputs.at(input_pos++);
+                    : inputs.at(input_pos++);
       if (is_output) {
         if (!param_shapes.empty()) {
           shape_override = &param_shapes.at(static_cast<size_t>(param_idx));
@@ -1221,7 +1343,7 @@ class TVMFFIMetalCall : public mx::Primitive {
       }
     }
 
-    register_external_inputs_ptr(encoder, effective_inputs);
+    register_external_inputs(encoder, inputs);
     auto signal_edges = launch_sync_state_->snapshot_signal_edges();
     TVMFFIAny result;
     result.type_index = kTVMFFINone;
@@ -1431,6 +1553,27 @@ std::shared_ptr<PreparedMetalCall> prepare_metal_call(
       static_cast<int64_t>(param_shapes.size()) != num_params) {
     throw std::runtime_error("TVM-FFI parameter shape metadata length mismatch");
   }
+  if (!direct_param_indices.empty()) {
+    if (static_cast<int64_t>(direct_param_indices.size()) != num_params) {
+      throw std::runtime_error("TVM-FFI direct Metal parameter permutation length mismatch");
+    }
+    std::vector<uint8_t> seen(static_cast<size_t>(num_params), 0);
+    for (int64_t param_idx : direct_param_indices) {
+      if (param_idx < 0 || param_idx >= num_params) {
+        throw std::runtime_error("TVM-FFI direct Metal parameter index out of range");
+      }
+      auto& mapped = seen[static_cast<size_t>(param_idx)];
+      if (mapped) {
+        throw std::runtime_error("TVM-FFI direct Metal parameter permutation has duplicates");
+      }
+      mapped = 1;
+    }
+    for (uint8_t mapped : seen) {
+      if (!mapped) {
+        throw std::runtime_error("TVM-FFI direct Metal parameter permutation is incomplete");
+      }
+    }
+  }
   auto prepared = std::make_shared<PreparedMetalCall>();
   prepared->func_handle = func_handle;
   prepared->func_handle_ptr = reinterpret_cast<TVMFFIObjectHandle>(func_handle);
@@ -1496,10 +1639,33 @@ std::vector<mx::array> tvm_ffi_metal_call_prepared(
       owner_outputs != nullptr,
       std::move(launch_sync_state),
       std::move(wait_edges));
-  std::vector<mx::array> primitive_inputs = inputs;
+  std::vector<mx::array> primitive_inputs;
+  primitive_inputs.reserve(
+      inputs.size() + (owner_outputs == nullptr ? 0 : owner_outputs->size()));
+  primitive_inputs.insert(primitive_inputs.end(), inputs.begin(), inputs.end());
   if (owner_outputs != nullptr) {
     primitive_inputs.insert(
         primitive_inputs.end(), owner_outputs->begin(), owner_outputs->end());
+    bool owners_match_prepared_outputs =
+        owner_outputs->size() == prepared->output_mlx_shapes.size() &&
+        owner_outputs->size() == prepared->output_mlx_dtypes.size();
+    if (owners_match_prepared_outputs) {
+      for (size_t i = 0; i < owner_outputs->size(); ++i) {
+        const auto& owner = owner_outputs->at(i);
+        if (owner.shape() != prepared->output_mlx_shapes[i] ||
+            owner.dtype() != prepared->output_mlx_dtypes[i]) {
+          owners_match_prepared_outputs = false;
+          break;
+        }
+      }
+    }
+    if (owners_match_prepared_outputs) {
+      return mx::array::make_arrays(
+          prepared->output_mlx_shapes,
+          prepared->output_mlx_dtypes,
+          primitive,
+          primitive_inputs);
+    }
     std::vector<mx::Shape> owner_shapes;
     owner_shapes.reserve(owner_outputs->size());
     std::vector<mx::Dtype> owner_dtypes;

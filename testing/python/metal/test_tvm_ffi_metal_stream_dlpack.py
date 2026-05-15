@@ -62,6 +62,20 @@ def _make_add_all_2d_kernel():
     return add_all_2d
 
 
+def _make_reordered_param_add_kernel():
+    @T.prim_func
+    def reordered_param_add(
+        Z: T.Tensor((4,), T.float32),
+        A: T.Tensor((4,), T.float32),
+        C: T.Tensor((4,), T.float32),
+    ):
+        with T.Kernel(1, threads=4):
+            for i in T.Parallel(4):
+                C[i] = A[i] + Z[i] * T.float32(10.0)
+
+    return reordered_param_add
+
+
 def _make_parallel_add_1d_kernel():
     @T.prim_func
     def parallel_add_1d(A: T.Tensor((8,), T.float32), C: T.Tensor((8,), T.float32)):
@@ -635,6 +649,44 @@ def test_tvm_ffi_metal_mlx_lazy_producer_and_consumer_are_device_ordered():
     expected_source = np.arange(size, dtype=np.float32) * 1.5 - 7.0
     expected = (expected_source + 1.0) * 2.0 + expected_source
     np.testing.assert_allclose(np.array(consumed), expected, rtol=1e-6, atol=1e-6)
+
+
+@tilelang.testing.requires_metal
+def test_tvm_ffi_metal_direct_launch_uses_device_param_order():
+    mx = pytest.importorskip("mlx.core")
+    from tilelang.contrib.mlx_tvm_ffi import (
+        debug_state,
+        is_available as native_bridge_is_available,
+        reset_debug_state,
+    )
+
+    if not native_bridge_is_available():
+        pytest.skip("native MLX TVM-FFI bridge is not built")
+
+    reset_debug_state()
+    kernel = tilelang.compile(
+        _make_reordered_param_add_kernel(),
+        target="metal",
+        execution_backend="tvm_ffi",
+        out_idx=-1,
+    )
+
+    direct_call = kernel.adapter._metal_direct_device_call()
+    assert direct_call is not None
+    assert direct_call[4] == [1, 2, 0]
+
+    z = mx.arange(4, dtype=mx.float32) + mx.array(1.0, dtype=mx.float32)
+    a = mx.arange(4, dtype=mx.float32) + mx.array(100.0, dtype=mx.float32)
+    returned = kernel(z, a)
+    mx.eval(returned)
+
+    state = debug_state()
+    assert state["direct_device_launches"] >= 1
+    assert state["direct_pipeline_launches"] >= 1
+    np.testing.assert_allclose(
+        np.array(returned),
+        np.array([110.0, 121.0, 132.0, 143.0], dtype=np.float32),
+    )
 
 
 @tilelang.testing.requires_metal

@@ -104,6 +104,27 @@ TileLang and cppmega focused tests.
 | P11 | Production lint | Can run after each package, final gate after P10 |
 | P12 | Full 1B training matrix | P0 green for first pass, final after P10/P11 |
 
+## Current Remaining Work
+
+As of 2026-05-15, this plan is not complete. P0 is still open; later packages
+must not be treated as done or ready for final 1B claims until their gates pass.
+
+| ID | Status | Remaining work | Latest receipt |
+| --- | --- | --- | --- |
+| P0 | Red | Make strict `vecmat_4096` FP8 Path C pass within 3 percent of Path B; fix `PreparedMetalCall` nanobind keep-alive leak; rerun full P0 receipts after the next codegen/runtime change. | Correctness green; latest strict gate still failed at `1.058x` to `1.063x`; non-strict receipt `/tmp/fp8_path_c_p0_direct_eval_fast_latest.json` still shows `vecmat_4096` ratio `1.105x`. |
+| P1 | Not started | Implement semantic reduction IR and golden snapshots. | Blocked by P0. |
+| P2 | Not started | Rewrite manual partial reductions into semantic reduction IR. | Blocked by P1. |
+| P3 | Not started | Add `ReductionPlan` scheduler metadata and stable serialization. | Blocked by P1. |
+| P4 | Not started | Add Z3 legality proofs for coverage, alias, tails, broadcast, int64, and sync legality. | Blocked by P3. |
+| P5 | Not started | Move sync/event insertion to dependency metadata plus proof results. | Blocked by P4. |
+| P6 | Not started | Move reduce/finalize/scan/dependency lowerers into backend registries. | Blocked by P3. |
+| P7 | Not started | Generalize generated reductions for large axes without public partial outputs. | Blocked by P4 and P6. |
+| P8 | Not started | Add reverse recurrence / scan planner, snapshot/cache policy, and recurrence residual/gate fusion. | Blocked by P4, P5, and P6. |
+| P9 | Not started | Add cost metadata and codegen cleanup for hoist/split/inline choices. | Blocked by P6. |
+| P10 | Not started | Add legal-schedule autotune, profiling, and memoized warm schedule cache. | Blocked by P9. |
+| P11 | Partial/checkpoint only | Add final production lint gates for monkeypatch/MSL/public TVM-FFI bypass/model intrinsics/public partial outputs. | Can run after each package; final gate waits on P10. |
+| P12 | Not final | Run full 1B matrix only after P0 green for the first real pass, and after P10/P11 for final claims. | Earlier 1B baseline exists, but it is not the final matrix and excludes unresolved P0 work. |
+
 ## P0: Current FP8 Path C Gate
 
 ### Planned Changes
@@ -727,3 +748,122 @@ producer outputs still fall back to the normal planner/compact path.
   generated vecmat scheduling variance. Knob sweep over
   `outputs_per_block={1,2,4,8,16}` and `reduce_threads={16,32,64,128}` did not
   produce a stable scheduler win; all useful variants stayed around 0.20 ms.
+
+### 2026-05-15 P0 direct Metal parameter order fix
+
+**Root cause**: direct Metal launch was using the imported runtime PackedFunc
+to infer kernel parameter order. That object has no TIR `.params`, so direct
+launch metadata fell back to `None` and Mamba3 either used the generic TVM-FFI
+wrapper or, in earlier direct-launch attempts, bound host-order buffers to the
+device ABI order. TVM's Metal device PrimFunc may reorder buffer params
+alphabetically; the failing Mamba3 fwd shape compiled host order
+`x,B,C,z,A,dt,D,h0,y,h_last` and device order
+`A,B,C,D,dt,h0,h_last,x,y,z`.
+
+**Change under test**: `_metal_device_launch_metadata()` now returns the device
+PrimFunc together with launch args, and `_metal_direct_device_call()` computes
+the direct ABI permutation from that device PrimFunc while still launching the
+runtime imported function. A new Metal bridge regression compiles a simple
+non-identity host/device parameter order and asserts both the permutation and
+direct-launch counters.
+
+**Commands and results**
+
+| Command | Result |
+| --- | --- |
+| `python3 -m py_compile tilelang/jit/adapter/tvm_ffi.py tilelang/jit/adapter/_mlx_tvm_ffi.py testing/python/metal/test_tvm_ffi_metal_stream_dlpack.py` | pass |
+| `.venv313/bin/python -m pytest testing/python/metal/test_tvm_ffi_metal_stream_dlpack.py::test_tvm_ffi_metal_direct_launch_uses_device_param_order -q` with `DYLD_LIBRARY_PATH=build/lib:build/tvm` | fail during collection: `z3-solver 4.16.0.0` loaded `build/lib/libz3.dylib` without `Z3_mk_seq_replace_all` |
+| same pytest with `.venv313/lib/python3.13/site-packages/z3/lib` prepended to `DYLD_LIBRARY_PATH` | pass: 1 passed, 52 warnings |
+| `pytest testing/python/metal/test_tvm_ffi_metal_stream_dlpack.py -q` with z3 package lib first | pass: 21 passed, 5 skipped, 52 warnings |
+| Mamba3 direct metadata probe, `B=1,T=8,H=2,P=4,N=4` | direct call enabled; `param_indices=[4,1,2,6,5,7,9,0,8,3]`; launch args `[1,8,1,1]` |
+| Mamba3 direct fwd diagnostic vs Path B, same shape | `direct_device_launches=1`, `direct_pipeline_launches=1`, `direct_compute_encoder_launches=1`; `maxdiff_y=1.86e-09`, `maxdiff_h=7.45e-09`, output nonzero |
+| `pytest tests/test_tilelang_mamba3_path_c.py::test_fwd_path_c_matches_path_b_fp32_small_shape -q` in cppmega.mlx | pass: 1 passed |
+| `pytest tests/test_tilelang_mamba3_path_c.py -q -x` in cppmega.mlx | pass: 40 passed |
+
+**Current P0 status after direct-order fix**
+
+- Mamba3 Path C full test file is green on the direct TVM-FFI Metal path.
+- The previous "Mamba3 bwd correctness / pytest order pollution" blocker is
+  no longer reproduced by the full file after the direct parameter permutation
+  fix.
+- `.venv313` test commands must put the z3 package dylib directory before
+  `build/lib` while `z3-solver` remains newer than the build-tree libz3.
+- P0 is still not green overall: the strict FP8 `vecmat_4096` Path C perf gate
+  remains the active blocker, and the full 1B matrix still needs a fresh run
+  after that gate is stable.
+
+### 2026-05-15 P0 owner-output bridge optimization pass
+
+**Change under test**: the Path C prepared Metal call path now has three
+shorter hot paths. Python skips generic tensor-list setup for graph-safe MLX
+array calls, skips the generic owner-output adapter for static full-ABI prepared
+calls, and caches the MLX array type in the closure. Native
+`_tilelang_mlx_tvm_ffi` now validates the direct device-ABI permutation at
+prepare time, registers inputs without building a duplicate pointer vector,
+binds direct-pipeline launch params in device order without the generic
+`TVMFFIAny` path, and reuses prepared output shape/dtype metadata when
+owner-output arrays match the prepared ABI.
+
+**Commands and results**
+
+| Command | Result |
+| --- | --- |
+| `cmake --build build -j$(sysctl -n hw.ncpu)` | pass |
+| `python3 -m py_compile tilelang/jit/adapter/tvm_ffi.py tilelang/jit/adapter/_mlx_tvm_ffi.py` | pass |
+| `pytest tests/test_tilelang_fp8_vecmat_path_c.py -q` in cppmega.mlx | pass: 28 passed, 1 warning |
+| `pytest testing/python/metal/test_tvm_ffi_metal_stream_dlpack.py -q` with z3 package lib first | pass: 21 passed, 5 skipped, 52 warnings |
+| `pytest tests/test_tilelang_mamba3_path_c.py -q` in cppmega.mlx | pass: 40 passed |
+| strict FP8 bench after C++ direct eval fast path | fail: best observed `vecmat_4096` Path C / Path B ratio `1.058x` |
+| strict FP8 bench after owner shape/dtype reuse | fail: `vecmat_4096` Path C / Path B ratio `1.063x` |
+| non-strict FP8 receipt after direct eval fast path | pass, wrote `/tmp/fp8_path_c_p0_direct_eval_fast_latest.json` |
+
+**No-eval wrapper profile, `vecmat_4096`**
+
+| Path | Median us | P90 us | Min us | Max us |
+| --- | ---: | ---: | ---: | ---: |
+| Path B MSL | 3.666 | 4.121 | 3.417 | 72.917 |
+| Path C TileLang | 9.375 | 10.625 | 9.000 | 188.833 |
+
+**Latest non-strict FP8 receipt
+(`/tmp/fp8_path_c_p0_direct_eval_fast_latest.json`)**
+
+| Shape | Path | Median ms | Min ms | P90 ms | Max ms | Tok/s | Ratio |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `matmul_128` | Path B MSL | 0.149167 | 0.141541 | 0.163375 | 0.168709 | 858101.50 | baseline |
+| `matmul_128` | Path C TileLang | 0.135042 | 0.125708 | 0.155291 | 0.256708 | 947853.63 | 0.893x |
+| `vecmat_4096` | Path B MSL | 0.186437 | 0.169583 | 0.208125 | 0.219875 | 5363.74 | baseline |
+| `vecmat_4096` | Path C TileLang | 0.204688 | 0.192167 | 0.223375 | 0.257000 | 4885.50 | 1.105x |
+
+**Current P0 status after owner-output optimization**
+
+- Correctness remains green for the bridge, FP8 cppmega tests, and Mamba3 Path
+  C full-file tests.
+- Direct Path C eval overhead is much lower than the original generic bridge
+  path, but it is still slower than Path B in no-eval wrapper cost
+  (`9.375 us` vs `3.666 us` median).
+- The active P0 blocker is still strict `vecmat_4096` perf. The remaining gap
+  is now narrowed to native bridge / MLX graph overhead and residual generated
+  vecmat dispatch variance, not Mamba3 correctness or device parameter order.
+- Bridge tests still report a nanobind leak warning for `PreparedMetalCall`
+  keep-alive records. This is tracked as a quality risk and must be fixed
+  before declaring the bridge production-clean, even though it is not the
+  current FP8 perf gate.
+
+### 2026-05-15 P0 NaN checkpoint rerun
+
+**Question under test**: whether the earlier Mamba3 Path C NaN/correctness
+blocker still reproduces after the direct Metal parameter-order fix.
+
+**Command and result**
+
+| Command | Result |
+| --- | --- |
+| `pytest tests/test_tilelang_mamba3_path_c.py -q` in cppmega.mlx with this TileLang checkout injected | pass: 40 passed in 35.35s |
+
+**Status**
+
+- The Mamba3 Path C NaN symptom is not reproduced by the current focused
+  Mamba3 regression file.
+- This does not complete the overall goal. The strict FP8 `vecmat_4096` gate,
+  `PreparedMetalCall` leak warning, and full 1B matrix are still open before
+  P0 can be marked green.

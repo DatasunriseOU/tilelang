@@ -299,6 +299,18 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         native_mlx_bridge_available_static = (
             target_kind_static == "metal" and mlx_tvm_ffi_is_available()
         )
+        mlx_array_type_static = None
+        if native_mlx_bridge_available_static:
+            try:
+                import mlx.core as _mx  # type: ignore[import-not-found]
+
+                mlx_array_type_static = _mx.array
+            except Exception:
+                mlx_array_type_static = None
+
+        def is_static_mlx_array(value: Any) -> bool:
+            return mlx_array_type_static is not None and isinstance(value, mlx_array_type_static)
+
         all_native_params_are_buffers = (
             all(is_buffer_param[i] for i in range(len(self.params)) if i not in self.result_idx)
             and all(is_buffer_param[i] for i in self.result_idx)
@@ -392,6 +404,56 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             using_full_abi_args = (
                 output_overrides is None and bool(self.result_idx) and len(inputs) == len(self.params)
             )
+            if (
+                output_overrides is None
+                and not using_full_abi_args
+                and prepared_native_metal_call is not None
+                and _tilelang_metal_command_buffer_domain is None
+                and not _tilelang_mlx_async_owner_outputs
+                and len(inputs) == expected_inputs
+                and all(is_static_mlx_array(input_arg) for input_arg in inputs)
+            ):
+                try:
+                    graph_outputs = mlx_tvm_ffi_prepared_metal_call(
+                        prepared_native_metal_call,
+                        inputs=inputs,
+                        dependency_metadata=default_metal_dependency_metadata,
+                    )
+                    if len(self.result_idx) == 1:
+                        return graph_outputs[0]
+                    return list(graph_outputs)
+                except MLXTVMFFIBridgeUnavailable:
+                    pass
+
+            if (
+                output_overrides is None
+                and using_full_abi_args
+                and prepared_native_metal_call is not None
+                and _tilelang_metal_command_buffer_domain is None
+                and all(is_static_mlx_array(inputs[i]) for i in input_param_indices)
+                and all(is_static_mlx_array(inputs[i]) for i in self.result_idx)
+            ):
+                try:
+                    owner_aliases = mlx_tvm_ffi_prepared_metal_call(
+                        prepared_native_metal_call,
+                        inputs=[inputs[i] for i in input_param_indices],
+                        owner_outputs=[inputs[i] for i in self.result_idx],
+                        dependency_metadata=default_metal_dependency_metadata,
+                    )
+                    if _tilelang_mlx_async_owner_outputs:
+                        if len(self.result_idx) == 1:
+                            return owner_aliases[0]
+                        return list(owner_aliases)
+
+                    import mlx.core as mx  # type: ignore[import-not-found]
+
+                    mx.eval(*owner_aliases)
+                    if len(self.result_idx) == 1:
+                        return inputs[self.result_idx[0]]
+                    return [inputs[i] for i in self.result_idx]
+                except MLXTVMFFIBridgeUnavailable:
+                    pass
+
             if output_overrides is not None and len(inputs) == len(self.params):
                 raise ValueError("Output buffers were provided both positionally and via out=.")
             if output_overrides is not None:
@@ -670,7 +732,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         metadata = self._metal_device_launch_metadata()
         if metadata is None:
             return None
-        kernel_name, launch_args = metadata
+        kernel_name, launch_args, device_func = metadata
         rt_mod = getattr(self, "rt_mod", None)
         if rt_mod is None:
             return None
@@ -685,9 +747,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             return None
         try:
             imported_module = imported_modules[0]
-            direct_param_indices = self._metal_direct_param_indices(
-                imported_module[kernel_name]
-            )
+            direct_param_indices = self._metal_direct_param_indices(device_func)
             if direct_param_indices is None:
                 return None
             return (
@@ -738,7 +798,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             return None
         return direct_param_indices
 
-    def _metal_device_launch_metadata(self) -> tuple[str, list[int]] | None:
+    def _metal_device_launch_metadata(self) -> tuple[str, list[int], Any] | None:
         device_mod = getattr(self, "device_mod", None)
         if device_mod is None:
             return None
@@ -770,7 +830,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                     break
                 launch_args.append(extent_by_tag[tag_str])
             if launch_args:
-                return kernel_name, launch_args
+                return kernel_name, launch_args, func
         return None
 
     def _metal_zero_init_output_positions(self) -> list[int]:
