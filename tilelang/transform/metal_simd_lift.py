@@ -30,10 +30,12 @@ The pass is gated behind PassConfig key ``tl.simd_lift_reductions``
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
 from dataclasses import dataclass
+from typing import Any
 
 from tvm import ir as tvm_ir
 from tvm import tir, IRModule
@@ -67,6 +69,52 @@ class _ReductionCandidate:
     proved: bool
     query: str
     annotated: bool = False
+
+
+def _candidate_rewrite_diagnostic(
+    candidate: _ReductionCandidate,
+) -> dict[str, Any] | None:
+    if not candidate.annotated:
+        reason = "missing_simd_butterfly_lane_annotation"
+    elif not candidate.proved:
+        reason = "z3_extent_unproved"
+    elif candidate.op != "add":
+        reason = "semantic_thread_allreduce_op_unsupported"
+    else:
+        return None
+    return {
+        "loop_var": candidate.loop_var,
+        "extent": candidate.extent_repr,
+        "op": candidate.op,
+        "annotated": candidate.annotated,
+        "proved": candidate.proved,
+        "reason": reason,
+        "query": candidate.query,
+    }
+
+
+def reduction_rewrite_diagnostics(
+    func: tir.PrimFunc,
+) -> list[dict[str, Any]]:
+    """Return machine-readable reasons for reduction candidates not rewritten.
+
+    This is intentionally conservative: it reports why the scheduler cannot
+    select the semantic thread-allreduce path from the candidate metadata. The
+    backend-specific butterfly fallback may still rewrite some reported cases.
+    """
+
+    diagnostics: list[dict[str, Any]] = []
+    for candidate in _walk_reductions(func.body):
+        diagnostic = _candidate_rewrite_diagnostic(candidate)
+        if diagnostic is not None:
+            diagnostics.append(diagnostic)
+    return diagnostics
+
+
+def _serialize_rewrite_diagnostics(
+    diagnostics: list[dict[str, Any]],
+) -> str:
+    return json.dumps(diagnostics, sort_keys=True)
 
 
 def _is_supported_reduce(op_name: str) -> bool:
@@ -299,10 +347,13 @@ def _build_thread_allreduce(
     reduce_index: tir.PrimExpr,
     span=None,
 ) -> tir.Stmt:
-    reducer = tir.comm_reducer(
-        lambda x, y: x + y,
-        lambda dtype: tir.const(0, dtype=dtype),
-        name="sum",
+    lhs = tir.Var("x", value.dtype)
+    rhs = tir.Var("y", value.dtype)
+    reducer = tir.CommReducer(
+        [lhs],
+        [rhs],
+        [lhs + rhs],
+        [tir.const(0, value.dtype)],
     )
     call = tir.call_intrin(
         "handle",
@@ -709,6 +760,10 @@ def _metal_simd_lift(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.PrimFunc:
 
     # Stash candidate metadata.
     if candidates:
+        diagnostics = [
+            diagnostic for c in candidates
+            if (diagnostic := _candidate_rewrite_diagnostic(c)) is not None
+        ]
         new_attrs = dict(func.attrs) if func.attrs is not None else {}
         new_attrs["tl.simd_lift_candidates"] = tir.StringImm(
             ";".join(
@@ -717,6 +772,10 @@ def _metal_simd_lift(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.PrimFunc:
                 for c in candidates
             )
         )
+        if diagnostics:
+            new_attrs["tl.reduction_rewrite_diagnostics"] = tir.StringImm(
+                _serialize_rewrite_diagnostics(diagnostics)
+            )
         try:
             func = func.with_attrs(new_attrs)
         except Exception:

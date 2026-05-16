@@ -353,6 +353,35 @@ def register_mlx_tvm_ffi_outputs(
         )
 
 
+def register_mlx_tvm_ffi_output(
+    output: Any,
+    launch_sync_state: Any,
+    *,
+    dependency_metadata: MetalLaunchDependencyMetadata | None = None,
+    command_buffer_domain: Any | None = None,
+) -> None:
+    metadata = dependency_metadata or _fallback_metadata(
+        input_count=0,
+        output_count=1,
+        command_buffer_domain=command_buffer_domain,
+    )
+    if command_buffer_domain is not None and dependency_metadata is not None:
+        metadata = with_command_buffer_domain(metadata, command_buffer_domain)
+    if len(metadata.output_accesses) != 1:
+        raise ValueError(
+            "TVM-FFI Metal dependency metadata/output count mismatch: "
+            f"{len(metadata.output_accesses)} metadata outputs for 1 runtime output"
+        )
+    _remember_producer(
+        output,
+        MetalProducerRecord(
+            sync_state=launch_sync_state,
+            launch_metadata=metadata,
+            output_access=metadata.output_accesses[0],
+        ),
+    )
+
+
 __all__ = [
     "MetalBufferDependency",
     "MetalLaunchDependencyMetadata",
@@ -363,6 +392,7 @@ __all__ = [
     "inspect_mlx_tvm_ffi_launch_sync",
     "make_tvm_ffi_metal_dependency_metadata",
     "plan_mlx_tvm_ffi_launch",
+    "register_mlx_tvm_ffi_output",
     "register_mlx_tvm_ffi_outputs",
     "with_command_buffer_domain",
 ]

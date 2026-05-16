@@ -50,6 +50,7 @@ rewrite_reductions_to_thread_allreduce = (
 count_shfl_xor_calls = metal_simd_lift.count_shfl_xor_calls
 count_thread_allreduce_calls = metal_simd_lift.count_thread_allreduce_calls
 detect_candidates = metal_simd_lift.detect_candidates
+reduction_rewrite_diagnostics = metal_simd_lift.reduction_rewrite_diagnostics
 _butterfly_stages = metal_simd_lift._butterfly_stages
 LOOP_ANNOTATION_KEY = metal_simd_lift.LOOP_ANNOTATION_KEY
 
@@ -172,6 +173,18 @@ def test_max_reduction_waits_for_reduction_plan_semantic_identity():
     new_func, n_replaced = rewrite_reductions_to_thread_allreduce(func)
     assert n_replaced == 0
     assert count_thread_allreduce_calls(new_func) == 0
+    diagnostics = reduction_rewrite_diagnostics(func)
+    assert diagnostics == [
+        {
+            "annotated": True,
+            "extent": "16",
+            "loop_var": "i",
+            "op": "max",
+            "proved": True,
+            "query": "static: extent=16 <= 32? True",
+            "reason": "semantic_thread_allreduce_op_unsupported",
+        }
+    ]
 
 
 def test_unannotated_loop_keeps_threadgroup():
@@ -189,6 +202,10 @@ def test_unannotated_loop_keeps_threadgroup():
     semantic_func, n_semantic = rewrite_reductions_to_thread_allreduce(func)
     assert n_semantic == 0
     assert count_thread_allreduce_calls(semantic_func) == 0
+    diagnostics = reduction_rewrite_diagnostics(func)
+    assert diagnostics[0]["reason"] == "missing_simd_butterfly_lane_annotation"
+    assert diagnostics[0]["annotated"] is False
+    assert diagnostics[0]["proved"] is True
 
 
 def test_default_off_preserves_behavior():
@@ -236,6 +253,46 @@ def test_pass_on_metal_target_prefers_semantic_thread_allreduce():
     sync_plan = json.loads(out["main"].attrs["tl.sync_event_plan"].value)
     assert sync_plan[0]["action"] == "none"
     assert sync_plan[0]["external_materialization_required"] is False
+
+
+def test_pass_records_machine_readable_reduction_rewrite_diagnostics():
+    func = _build_annotated_reduction(64, op="add").with_attr(
+        "global_symbol", "main"
+    )
+    mod = tvm.IRModule.from_expr(func)
+    with tvm.transform.PassContext(
+        config={metal_simd_lift.PASS_CONFIG_KEY: True}
+    ):
+        with Target("metal"):
+            out = metal_simd_lift.MetalSimdLiftReductions(mod)
+    payload = json.loads(out["main"].attrs["tl.reduction_rewrite_diagnostics"].value)
+    assert payload == [
+        {
+            "annotated": True,
+            "extent": "64",
+            "loop_var": "i",
+            "op": "add",
+            "proved": False,
+            "query": "static: extent=64 <= 32? False",
+            "reason": "z3_extent_unproved",
+        }
+    ]
+
+
+def test_pass_preserves_semantic_diagnostic_when_backend_fallback_rewrites():
+    func = _build_annotated_reduction(16, op="max").with_attr(
+        "global_symbol", "main"
+    )
+    mod = tvm.IRModule.from_expr(func)
+    with tvm.transform.PassContext(
+        config={metal_simd_lift.PASS_CONFIG_KEY: True}
+    ):
+        with Target("metal"):
+            out = metal_simd_lift.MetalSimdLiftReductions(mod)
+    assert count_thread_allreduce_calls(out["main"]) == 0
+    assert count_shfl_xor_calls(out["main"]) == 4
+    payload = json.loads(out["main"].attrs["tl.reduction_rewrite_diagnostics"].value)
+    assert payload[0]["reason"] == "semantic_thread_allreduce_op_unsupported"
 
 
 # ---------------------------------------------------------------------------

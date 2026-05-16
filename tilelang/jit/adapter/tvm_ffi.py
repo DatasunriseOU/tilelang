@@ -38,6 +38,9 @@ from tilelang.jit.adapter._mlx_tvm_ffi import (
     is_available as mlx_tvm_ffi_is_available,
     metal_call as mlx_tvm_ffi_metal_call,
     prepare_metal_call as mlx_tvm_ffi_prepare_metal_call,
+    prepared_metal_call_4in1out_single as mlx_tvm_ffi_prepared_metal_call_4in1out_single,
+    prepared_metal_call_args as mlx_tvm_ffi_prepared_metal_call_args,
+    prepared_metal_call_single_arg as mlx_tvm_ffi_prepared_metal_call_single_arg,
     prepared_metal_call as mlx_tvm_ffi_prepared_metal_call,
 )
 from tilelang.analysis.metal_graph_sync import make_tvm_ffi_metal_dependency_metadata
@@ -311,6 +314,10 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         def is_static_mlx_array(value: Any) -> bool:
             return mlx_array_type_static is not None and isinstance(value, mlx_array_type_static)
 
+        owner_outputs_are_tail_params = bool(self.result_idx) and input_param_indices == list(
+            range(len(input_param_indices))
+        ) and self.result_idx == list(range(len(input_param_indices), len(self.params)))
+
         all_native_params_are_buffers = (
             all(is_buffer_param[i] for i in range(len(self.params)) if i not in self.result_idx)
             and all(is_buffer_param[i] for i in self.result_idx)
@@ -406,6 +413,33 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             )
             if (
                 output_overrides is None
+                and using_full_abi_args
+                and prepared_native_metal_call is not None
+                and _tilelang_mlx_async_owner_outputs
+                and _tilelang_metal_command_buffer_domain is None
+                and owner_outputs_are_tail_params
+                and len(self.result_idx) == 1
+                and len(inputs) == 5
+                and is_static_mlx_array(inputs[0])
+                and is_static_mlx_array(inputs[1])
+                and is_static_mlx_array(inputs[2])
+                and is_static_mlx_array(inputs[3])
+                and is_static_mlx_array(inputs[4])
+            ):
+                try:
+                    return mlx_tvm_ffi_prepared_metal_call_4in1out_single(
+                        prepared_native_metal_call,
+                        inputs[0],
+                        inputs[1],
+                        inputs[2],
+                        inputs[3],
+                        inputs[4],
+                        dependency_metadata=default_metal_dependency_metadata,
+                    )
+                except MLXTVMFFIBridgeUnavailable:
+                    pass
+            if (
+                output_overrides is None
                 and not using_full_abi_args
                 and prepared_native_metal_call is not None
                 and _tilelang_metal_command_buffer_domain is None
@@ -434,12 +468,42 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 and all(is_static_mlx_array(inputs[i]) for i in self.result_idx)
             ):
                 try:
-                    owner_aliases = mlx_tvm_ffi_prepared_metal_call(
-                        prepared_native_metal_call,
-                        inputs=[inputs[i] for i in input_param_indices],
-                        owner_outputs=[inputs[i] for i in self.result_idx],
-                        dependency_metadata=default_metal_dependency_metadata,
-                    )
+                    if owner_outputs_are_tail_params:
+                        if len(self.result_idx) == 1:
+                            if len(inputs) == 5:
+                                owner_alias = mlx_tvm_ffi_prepared_metal_call_4in1out_single(
+                                    prepared_native_metal_call,
+                                    inputs[0],
+                                    inputs[1],
+                                    inputs[2],
+                                    inputs[3],
+                                    inputs[4],
+                                    dependency_metadata=default_metal_dependency_metadata,
+                                )
+                            else:
+                                owner_alias = mlx_tvm_ffi_prepared_metal_call_single_arg(
+                                    prepared_native_metal_call,
+                                    *inputs,
+                                    owner_output_count=1,
+                                    dependency_metadata=default_metal_dependency_metadata,
+                                )
+                            if _tilelang_mlx_async_owner_outputs:
+                                return owner_alias
+                            owner_aliases = [owner_alias]
+                        else:
+                            owner_aliases = mlx_tvm_ffi_prepared_metal_call_args(
+                                prepared_native_metal_call,
+                                *inputs,
+                                owner_output_count=len(self.result_idx),
+                                dependency_metadata=default_metal_dependency_metadata,
+                            )
+                    else:
+                        owner_aliases = mlx_tvm_ffi_prepared_metal_call(
+                            prepared_native_metal_call,
+                            inputs=[inputs[i] for i in input_param_indices],
+                            owner_outputs=[inputs[i] for i in self.result_idx],
+                            dependency_metadata=default_metal_dependency_metadata,
+                        )
                     if _tilelang_mlx_async_owner_outputs:
                         if len(self.result_idx) == 1:
                             return owner_aliases[0]
@@ -635,12 +699,42 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 )
                 try:
                     if prepared_native_metal_call is not None:
-                        owner_aliases = mlx_tvm_ffi_prepared_metal_call(
-                            prepared_native_metal_call,
-                            inputs=[tensor_list[i] for i in input_param_indices],
-                            owner_outputs=[tensor_list[i] for i in self.result_idx],
-                            dependency_metadata=dependency_metadata,
-                        )
+                        if owner_outputs_are_tail_params:
+                            if len(self.result_idx) == 1:
+                                if len(tensor_list) == 5:
+                                    owner_alias = mlx_tvm_ffi_prepared_metal_call_4in1out_single(
+                                        prepared_native_metal_call,
+                                        tensor_list[0],
+                                        tensor_list[1],
+                                        tensor_list[2],
+                                        tensor_list[3],
+                                        tensor_list[4],
+                                        dependency_metadata=dependency_metadata,
+                                    )
+                                else:
+                                    owner_alias = mlx_tvm_ffi_prepared_metal_call_single_arg(
+                                        prepared_native_metal_call,
+                                        *tensor_list,
+                                        owner_output_count=1,
+                                        dependency_metadata=dependency_metadata,
+                                    )
+                                if _tilelang_mlx_async_owner_outputs:
+                                    return owner_alias
+                                owner_aliases = [owner_alias]
+                            else:
+                                owner_aliases = mlx_tvm_ffi_prepared_metal_call_args(
+                                    prepared_native_metal_call,
+                                    *tensor_list,
+                                    owner_output_count=len(self.result_idx),
+                                    dependency_metadata=dependency_metadata,
+                                )
+                        else:
+                            owner_aliases = mlx_tvm_ffi_prepared_metal_call(
+                                prepared_native_metal_call,
+                                inputs=[tensor_list[i] for i in input_param_indices],
+                                owner_outputs=[tensor_list[i] for i in self.result_idx],
+                                dependency_metadata=dependency_metadata,
+                            )
                     else:
                         owner_output_shapes = [
                             [int(dim) for dim in getattr(tensor_list[i], "shape", ())]

@@ -820,6 +820,9 @@ public:
     return name == "tir.metal.thread_index_in_simdgroup" ||
            name == "tirx.metal.thread_index_in_simdgroup";
   }
+  static bool IsSimdSumIntrin(const std::string &name) {
+    return name == "tir.metal.simd_sum" || name == "tirx.metal.simd_sum";
+  }
   static bool IsGridTidXVarName(const std::string &name) {
     return name == "grid_tid" || name.rfind("grid_tid_", 0) == 0;
   }
@@ -1943,6 +1946,12 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
              opn != nullptr &&
              MetalFp8DTypeCollector::IsThreadgroupTidXIntrin(opn->name)) {
     os << "((int)threadIdx.x)";
+  } else if (auto *opn = op->op.as<OpNode>();
+             opn != nullptr &&
+             MetalFp8DTypeCollector::IsSimdSumIntrin(opn->name)) {
+    ICHECK_EQ(op->args.size(), 1)
+        << "tir[x].metal.simd_sum expects 1 arg, got " << op->args.size();
+    os << "simd_sum(" << PrintExpr(op->args[0]) << ")";
   } else {
     CodeGenC::VisitExpr_(op, os);
   }

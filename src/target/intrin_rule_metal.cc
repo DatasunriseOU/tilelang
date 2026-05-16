@@ -87,6 +87,11 @@ TVM_REGISTER_OP("tirx.metal.thread_index_in_simdgroup")
     .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure))
     .set_attr<TScriptPrinterName>("TScriptPrinterName", "metal_thread_index_in_simdgroup");
 
+TVM_REGISTER_OP("tirx.metal.simd_sum")
+    .set_num_inputs(1)
+    .add_argument("value", "Expr", "Value to reduce with Metal simd_sum.")
+    .set_attr<TScriptPrinterName>("TScriptPrinterName", "metal_simd_sum");
+
 }  // namespace intrin
 }  // namespace codegen
 }  // namespace tvm

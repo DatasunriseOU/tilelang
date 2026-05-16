@@ -121,6 +121,32 @@ def _seq(stmts: list[tir.Stmt]) -> tir.Stmt:
     return SeqStmt(stmts)
 
 
+def _thread_allreduce_sum(value: tir.PrimExpr, out: tir.BufferLoad, reduce_index) -> tir.Stmt:
+    lhs = tir.Var("x", value.dtype)
+    rhs = tir.Var("y", value.dtype)
+    reducer = tir.CommReducer(
+        [lhs],
+        [rhs],
+        [lhs + rhs],
+        [tir.const(0, value.dtype)],
+    )
+    call = tir.call_intrin(
+        "handle",
+        "tir.tvm_thread_allreduce",
+        tir.const(1, "uint32"),
+        value,
+        tir.const(True, "bool"),
+        out,
+        reduce_index,
+    )
+    return tir.AttrStmt(
+        reducer,
+        "reduce_scope",
+        tir.reinterpret("handle", tir.const(0, "uint64")),
+        tir.Evaluate(call),
+    )
+
+
 def _for(var: tir.Var, extent, body: tir.Stmt, kind=tir.ForKind.SERIAL, annotations=None):
     return tir.For(var, 0, extent, kind, body, annotations=annotations)
 
@@ -376,14 +402,20 @@ def _lower_m1_dot4(
     b_ptr_var = tir.Var("B_fp8_ptr", "handle")
     a_word_var = tir.Var("a_word", "uint32")
     b_word_var = tir.Var("b_word", "uint32")
+    simd_lane_var = tir.Var("simd_lane", "int32")
     base_var = tir.Var("base", "float32")
     reduced_var = tir.Var("reduced", "float32")
     sa_var = tir.Var("sa", "float32")
     sb_var = tir.Var("sb", "float32")
     dot = tir.decl_buffer((1,), "float32", name="dot", scope="local.var")
-    direct_col_buf = tir.decl_buffer((1,), "int32", name="row", scope="local.var")
-    simd_lane = tir.call_intrin("int32", "tir.metal.thread_index_in_simdgroup")
+    reduced_buf = tir.decl_buffer((1,), "float32", name="reduced", scope="local.var")
     tx_info = thread_vars.get("threadIdx.x") if thread_vars is not None else None
+    tx_var = tx_info[0] if tx_info is not None else None
+    simd_lane = (
+        tx_var % tir.IntImm("int32", sgw)
+        if tx_var is not None
+        else tir.call_intrin("int32", "tir.metal.thread_index_in_simdgroup")
+    )
     n_int = _region_extent_int(b, 0)
     direct_grid_tile = (
         tx_info is not None
@@ -401,10 +433,11 @@ def _lower_m1_dot4(
     )
     col = col_var
     local_col = local_col_var
-    b_col = tir.BufferLoad(direct_col_buf, [0]) if direct_grid_tile else col
+    b_col = col
 
     k_words = k_extent // tir.IntImm("int32", 4)
     dot_load = tir.BufferLoad(dot, [0])
+    reduced_load = tir.BufferLoad(reduced_buf, [0])
     a_ptr = _access_ptr(a.buffer, [_region_min(a, 0), _region_min(a, 1)], k_extent)
     b_ptr = _access_ptr(b.buffer, [_region_min(b, 0) + b_col, _region_min(b, 1)], k_extent)
     dot4 = tir.call_intrin(
@@ -434,20 +467,15 @@ def _lower_m1_dot4(
     if _int_value(k_words, -1) % sgw != 0:
         dot4_body = _if(word_i < k_words, dot4_body)
     kk_body = SeqStmt([
-        Bind(word_i, kk * tir.IntImm("int32", sgw) + simd_lane),
+        Bind(word_i, kk * tir.IntImm("int32", sgw) + simd_lane_var),
         dot4_body,
     ])
     kk_loop = _for(
         kk,
         tir.ceildiv(k_words, tir.IntImm("int32", sgw)),
         kk_body,
-        tir.ForKind.UNROLLED,
-        {
-            "pragma_unroll_explicit": False,
-            "pragma_unroll_factor": 4,
-        },
+        tir.ForKind.SERIAL,
     )
-    reduced = tir.call_intrin("float32", "tir.metal.simd_sum", dot_load)
     c_idx = [
         _region_min(c, 0) + marker.c_row_offset,
         _region_min(c, 1) + col,
@@ -487,8 +515,9 @@ def _lower_m1_dot4(
     lane0_store = _seq(lane0_store_stmts)
     body = _seq([
         kk_loop,
-        Bind(reduced_var, reduced),
-        _if(simd_lane == tir.IntImm("int32", 0), lane0_store),
+        _thread_allreduce_sum(dot_load, reduced_load, simd_lane_var),
+        Bind(reduced_var, reduced_load),
+        _if(simd_lane_var == tir.IntImm("int32", 0), lane0_store),
     ])
     if not exact_output_tile:
         body = _if(col < n_extent, body)
@@ -508,9 +537,8 @@ def _lower_m1_dot4(
             body,
         )
     grid_tid_bind = None
-    direct_col_store = None
     if tx_info is not None:
-        local_tid = tir.call_intrin("int32", "tir.metal.thread_position_in_threadgroup_x")
+        local_tid = tx_var
         if direct_grid_tile:
             # Global owner-output vecmat matches Path B's execution model:
             # one Metal SIMDgroup owns one output row and the global thread
@@ -521,11 +549,6 @@ def _lower_m1_dot4(
             grid_tid_var = tir.Var("grid_tid", "int32")
             grid_tid = tir.call_intrin("int32", "tir.metal.thread_position_in_grid_x")
             grid_tid_bind = Bind(grid_tid_var, grid_tid)
-            direct_col_store = tir.BufferStore(
-                direct_col_buf,
-                grid_tid_var // tir.IntImm("int32", sgw),
-                [0],
-            )
             col_expr = grid_tid_var // tir.IntImm("int32", sgw)
             local_col_expr = None
         elif single_output_tile:
@@ -544,8 +567,9 @@ def _lower_m1_dot4(
         col_expr = grid_tid_var // tir.IntImm("int32", sgw)
         local_col_expr = col_var - marker.c_col_offset
     prefix = [grid_tid_bind]
+    prefix.append(Bind(simd_lane_var, simd_lane))
     if direct_grid_tile:
-        prefix.extend([direct_col_store, Bind(col_var, col_expr)])
+        prefix.append(Bind(col_var, col_expr))
     else:
         prefix.extend([
             Bind(local_col_var, local_col_expr),
@@ -556,15 +580,8 @@ def _lower_m1_dot4(
         Bind(b_ptr_var, b_ptr),
     ])
     body = _seq(prefix + [body])
+    body = tir.Allocate(reduced_buf.data, "float32", [1], tir.IntImm("bool", 1), body)
     body = tir.Allocate(dot.data, "float32", [1], tir.IntImm("bool", 1), body)
-    if direct_grid_tile:
-        body = tir.Allocate(
-            direct_col_buf.data,
-            "int32",
-            [1],
-            tir.IntImm("bool", 1),
-            body,
-        )
     return body
 
 
@@ -662,7 +679,11 @@ def _lower_trans_b_direct_dot4(
     return tir.Allocate(dot.data, "float32", [1], tir.IntImm("bool", 1), body)
 
 
-def _lower_m1_simd_scalar(marker: _Marker, target) -> tir.Stmt:
+def _lower_m1_simd_scalar(
+    marker: _Marker,
+    target,
+    thread_vars: dict[str, tuple[tir.Var, int]] | None = None,
+) -> tir.Stmt:
     """Lower M=1 vecmat to one SIMD reduction per output column.
 
     This is the safe row-vector fast path for layouts where B is not
@@ -688,6 +709,7 @@ def _lower_m1_simd_scalar(marker: _Marker, target) -> tir.Stmt:
     kk = tir.Var("kk", "int32")
     k_var = tir.Var("k", "int32")
     compute_tid = tir.Var("fp8_compute_tid", "int32")
+    simd_lane_var = tir.Var("simd_lane", "int32")
     a_val_var = tir.Var("a_val", "float32")
     sa_var = tir.Var("sa", "float32")
     cols_per_group_i = 4
@@ -697,9 +719,23 @@ def _lower_m1_simd_scalar(marker: _Marker, target) -> tir.Stmt:
         tir.decl_buffer((1,), "float32", name=f"dot{idx}", scope="local.var")
         for idx in range(cols_per_group_i)
     ]
+    reduced_buffers = [
+        tir.decl_buffer((1,), "float32", name=f"reduced{idx}", scope="local.var")
+        for idx in range(cols_per_group_i)
+    ]
 
-    local_tid = tir.call_intrin("int32", "tir.metal.thread_position_in_threadgroup_x")
-    simd_lane = tir.call_intrin("int32", "tir.metal.thread_index_in_simdgroup")
+    tx_info = thread_vars.get("threadIdx.x") if thread_vars is not None else None
+    tx_var = tx_info[0] if tx_info is not None else None
+    local_tid = (
+        tx_var
+        if tx_var is not None
+        else tir.call_intrin("int32", "tir.metal.thread_position_in_threadgroup_x")
+    )
+    simd_lane = (
+        tx_var % tir.IntImm("int32", sgw)
+        if tx_var is not None
+        else tir.call_intrin("int32", "tir.metal.thread_index_in_simdgroup")
+    )
     a_row = marker.c_row_offset if a.buffer.scope() == "global" else tir.IntImm("int32", 0)
     c_row = marker.c_row_offset if c.buffer.scope() == "global" else tir.IntImm("int32", 0)
     a_load = tir.Cast(
@@ -745,7 +781,7 @@ def _lower_m1_simd_scalar(marker: _Marker, target) -> tir.Stmt:
         dot_acc_body = _if(k_var < k_extent, dot_acc_body)
 
     kk_body = _seq([
-        Bind(k_var, kk * tir.IntImm("int32", sgw) + simd_lane),
+        Bind(k_var, kk * tir.IntImm("int32", sgw) + simd_lane_var),
         Bind(a_val_var, a_load),
         dot_acc_body,
     ])
@@ -766,7 +802,7 @@ def _lower_m1_simd_scalar(marker: _Marker, target) -> tir.Stmt:
         for dot_buf in dot_buffers
     ]
     store_stmts: list[tir.Stmt] = []
-    for r_idx, dot_buf in enumerate(dot_buffers):
+    for r_idx, (dot_buf, reduced_buf) in enumerate(zip(dot_buffers, reduced_buffers)):
         base_var = tir.Var(f"base{r_idx}", "float32")
         reduced_var = tir.Var(f"reduced{r_idx}", "float32")
         sb_var = tir.Var(f"sb{r_idx}", "float32")
@@ -780,14 +816,17 @@ def _lower_m1_simd_scalar(marker: _Marker, target) -> tir.Stmt:
             idx,
         )
         if c.buffer.scope() == "global":
-            store = _if(simd_lane == tir.IntImm("int32", 0), store)
+            store = _if(simd_lane_var == tir.IntImm("int32", 0), store)
         lane_store_stmts = []
         if marker.accumulate:
             lane_store_stmts.append(Bind(base_var, _load_as_float32(c.buffer, idx)))
         lane_store_stmts.extend([
-            Bind(reduced_var, tir.call_intrin(
-                "float32", "tir.metal.simd_sum", tir.BufferLoad(dot_buf, [0])
-            )),
+            _thread_allreduce_sum(
+                tir.BufferLoad(dot_buf, [0]),
+                tir.BufferLoad(reduced_buf, [0]),
+                simd_lane_var,
+            ),
+            Bind(reduced_var, tir.BufferLoad(reduced_buf, [0])),
             Bind(sb_var, tir.Cast("float32", sb)),
             store,
         ])
@@ -811,7 +850,9 @@ def _lower_m1_simd_scalar(marker: _Marker, target) -> tir.Stmt:
         j_body,
         tir.ForKind.SERIAL,
     )
-    body = _seq([Bind(compute_tid, local_tid), body])
+    body = _seq([Bind(compute_tid, local_tid), Bind(simd_lane_var, simd_lane), body])
+    for reduced_buf in reversed(reduced_buffers):
+        body = tir.Allocate(reduced_buf.data, "float32", [1], tir.IntImm("bool", 1), body)
     for dot_buf in reversed(dot_buffers):
         body = tir.Allocate(dot_buf.data, "float32", [1], tir.IntImm("bool", 1), body)
     return body
@@ -858,7 +899,7 @@ def _lower_marker(
         and target.kind.name == "metal"
         and _m1_simd_scalar_legal(marker)
     ):
-        return _lower_m1_simd_scalar(marker, target)
+        return _lower_m1_simd_scalar(marker, target, thread_vars)
     return _lower_scalar(marker)
 
 

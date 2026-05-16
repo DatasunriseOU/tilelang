@@ -100,7 +100,7 @@ Public attribution
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Iterable, Optional
 
 from tilelang import tvm as _tvm  # noqa: F401
 import tilelang.language as T
@@ -132,6 +132,7 @@ from tilelang.utils.language import to_buffer_region
 __all__ = [
     "fp8_scaled_matmul",
     "metal_fp8_e4m3_dot4",
+    "assert_metal_fp8_intrinsics_registered",
     "FP8_DTYPES",
 ]
 
@@ -142,6 +143,48 @@ __all__ = [
 # carried by the sf_a / sf_b operands of the block-scaled GEMM, not by A / B.
 FP8_DTYPES: tuple[str, ...] = ("float8_e4m3", "float8_e5m2", "float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2fnuz")
 FP8_SCALED_MATMUL_MARKER = "tl.fp8_scaled_matmul.marker"
+METAL_FP8_INTRINSIC_OPS: tuple[str, ...] = (
+    "tirx.metal.simd_sum",
+    "tirx.metal.fp8_e4m3_dot4",
+    "tirx.metal.fp8_load_u32",
+    "tirx.metal.fp8_e4m3_dot4_words",
+    "tirx.metal.thread_position_in_grid_x",
+    "tirx.metal.thread_position_in_threadgroup_x",
+    "tirx.metal.thread_index_in_simdgroup",
+)
+
+
+def assert_metal_fp8_intrinsics_registered(
+    required_ops: Optional[Iterable[str]] = None,
+) -> None:
+    """Raise if the C++ Metal FP8 intrinsic registry is not loaded.
+
+    Registration belongs to TileLang's Metal backend (`intrin_rule_metal.cc`).
+    Consumers should call this as a contract check instead of registering
+    backend ops themselves.
+    """
+
+    try:
+        from tvm.ir import Op  # type: ignore
+    except Exception:
+        try:
+            from tilelang.tvm.ir import Op  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "Metal FP8 intrinsic check requires TVM, but TVM is not importable"
+            ) from exc
+
+    missing: list[str] = []
+    for name in tuple(required_ops or METAL_FP8_INTRINSIC_OPS):
+        try:
+            Op.get(name)
+        except Exception:
+            missing.append(name)
+    if missing:
+        raise RuntimeError(
+            "TileLang Metal FP8 intrinsics are not registered by the backend: "
+            + ", ".join(missing)
+        )
 
 
 def metal_fp8_e4m3_dot4(a_ptr, b_ptr, a_word_idx, b_word_idx):
@@ -1016,17 +1059,17 @@ def _fp8_scaled_matmul_m1_vecmat_metal_direct_macro(
     sa_size = A_scale.shape[0]
     sb_size = B_scale.shape[0]
     grid_tid = T.call_intrin("int32", "tir.metal.thread_position_in_grid_x")
-    simd_lane = T.call_intrin("int32", "tir.metal.thread_index_in_simdgroup")
+    thread_lane = T.get_thread_binding(0)
+    simd_lane = T.floormod(thread_lane, simd_group_width)
     col = T.floordiv(grid_tid, simd_group_width)
     k_words = K_dim // 4
     dot = T.alloc_var(T.float32)
+    reduced = T.alloc_local((1,), T.float32)
 
     if col < N_dim:
-        for kk in T.unroll(
+        for kk in T.serial(
             0,
             T.ceildiv(k_words, simd_group_width),
-            explicit=False,
-            unroll_factor=4,
         ):
             word_i = kk * simd_group_width + simd_lane
             # CPPMEGA pull hybrid: tl_pr_c structure + stack-c indexing
@@ -1046,11 +1089,11 @@ def _fp8_scaled_matmul_m1_vecmat_metal_direct_macro(
                         word_i,
                     )
 
-        reduced = T.call_intrin("float32", "tir.metal.simd_sum", dot)
+        T.thread_allreduce_sum(dot, reduced[0], simd_lane)
         if simd_lane == 0:
             sa = A_scale[0] if sa_size == 1 else A_scale[a_scale_offset]
             sb = B_scale[0] if sb_size == 1 else B_scale[col]
-            C_local[0, col] = reduced * sa * sb
+            C_local[0, col] = reduced[0] * sa * sb
 
 
 @T.macro
@@ -1072,21 +1115,21 @@ def _fp8_scaled_matmul_m1_vecmat_metal_macro(
     sa_size = A_scale.shape[0]
     sb_size = B_scale.shape[0]
     grid_tid = T.call_intrin("int32", "tir.metal.thread_position_in_grid_x")
-    simd_lane = T.call_intrin("int32", "tir.metal.thread_index_in_simdgroup")
+    thread_lane = T.get_thread_binding(0)
+    simd_lane = T.floormod(thread_lane, simd_group_width)
     local_simd_row = T.floordiv(T.cast(grid_tid, "int32"), simd_group_width) - c_col_offset
     j = local_simd_row
     col = j
     k_words = K_dim // 4
     dot = T.alloc_var(T.float32)
+    reduced = T.alloc_local((1,), T.float32)
 
     if j < outputs_per_block:
         if col < N_dim:
             base = C_local[0, j]
-            for kk in T.unroll(
+            for kk in T.serial(
                 0,
                 T.ceildiv(k_words, simd_group_width),
-                explicit=False,
-                unroll_factor=4,
             ):
                 word_i = kk * simd_group_width + simd_lane
                 # CPPMEGA pull hybrid: tl_pr_c structure + stack-c indexing
@@ -1106,11 +1149,11 @@ def _fp8_scaled_matmul_m1_vecmat_metal_macro(
                             word_i,
                         )
 
-            reduced = T.call_intrin("float32", "tir.metal.simd_sum", dot)
+            T.thread_allreduce_sum(dot, reduced[0], simd_lane)
             if simd_lane == 0:
                 sa = A_scale[0] if sa_size == 1 else A_scale[a_scale_offset]
                 sb = B_scale[0] if sb_size == 1 else B_scale[b_scale_offset + j]
-                C_local[0, j] = base + reduced * sa * sb
+                C_local[0, j] = base + reduced[0] * sa * sb
 
 
 @T.macro
@@ -1161,10 +1204,9 @@ def _fp8_scaled_matmul_trans_b_direct_metal_macro(
 
 # CPPMEGA: legacy swap vecmat macro retained for local-fragment dispatch.
 # The stack-c m1_vecmat macro requires Metal intrinsics
-# `tir.metal.thread_index_in_simdgroup` and `tir.metal.fp8_e4m3_dot4`
-# which are not registered in apache TVM; this legacy macro uses only
-# `tirx.metal.simd_sum`, which IS registered, and is what the existing
-# `test_m1_transposed_b_vecmat_lowers_to_simd_sum` regression-pins.
+# `tir.metal.thread_index_in_simdgroup` and `tir.metal.fp8_e4m3_dot4`.
+# The legacy macro now emits semantic `thread_allreduce_sum`; the Metal backend
+# lowers that reduction to `simd_sum` during final codegen.
 @T.macro
 def _fp8_scaled_matmul_m1_vecmat_metal_macro_legacy(
     A_fp8, A_scale, B_fp8, B_scale, C_local
@@ -1184,6 +1226,7 @@ def _fp8_scaled_matmul_m1_vecmat_metal_macro_legacy(
     for j in T.serial(N_dim):
         base = C_local[0, j]
         dot = T.alloc_var("float32", init=0.0)
+        reduced = T.alloc_local((1,), "float32")
         for kk in T.unroll(0, T.ceildiv(K_dim, 32), explicit=False, unroll_factor=4):
             k = kk * 32 + tx
             with T.If(k < K_dim), T.Then():
@@ -1191,14 +1234,14 @@ def _fp8_scaled_matmul_m1_vecmat_metal_macro_legacy(
                 b_val = T.cast(B_fp8[j, k], "float32")
                 dot += a_val * b_val
 
-        reduced = T.call_intrin("float32", "tir.metal.simd_sum", dot)
+        T.thread_allreduce_sum(dot, reduced[0], tx)
         with T.If(tx == 0), T.Then():
             # BUG-FP8-1 fix: M_dim == 1 in this macro (dispatcher guarantees
             # it), so A_scale[0] is correct for both per-tensor AND per-row.
             # The per-row index would be A_scale[i] but i is always 0 here.
             sa = A_scale[0]
             sb = B_scale[0] if sb_size == 1 else B_scale[j]
-            C_local[0, j] = base + reduced * sa * sb
+            C_local[0, j] = base + reduced[0] * sa * sb
 
 
 def fp8_scaled_matmul(

@@ -7,6 +7,7 @@ from .layout_visual import LayoutVisual  # noqa: F401
 from .reduction_plan import (  # noqa: F401
     ReductionAxisPlan,
     ReductionPlan,
+    ReductionPlanError,
     BufferRegion,
     attach_reduction_plan_metadata,
     extract_reduction_plans,

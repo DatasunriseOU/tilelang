@@ -14,6 +14,7 @@ from tilelang.analysis.metal_graph_sync import (
     has_mlx_tvm_ffi_producer,
     make_tvm_ffi_metal_dependency_metadata,
     plan_mlx_tvm_ffi_launch,
+    register_mlx_tvm_ffi_output,
     register_mlx_tvm_ffi_outputs,
 )
 
@@ -253,6 +254,148 @@ def prepared_metal_call(
         command_buffer_domain=command_buffer_domain,
     )
     return output_list
+
+
+def prepared_metal_call_args(
+    prepared: Any,
+    *args: Any,
+    owner_output_count: int = 0,
+    command_buffer_domain: Any | None = None,
+    dependency_metadata: MetalLaunchDependencyMetadata | None = None,
+):
+    """Create MLX graph outputs from positional prepared-call arrays.
+
+    The common full-ABI owner-output path already has arrays in argument
+    order. Passing them directly avoids allocating Python input/output lists
+    and lets the native bridge parse nanobind varargs instead of iterating a
+    Python sequence on every tiny launch.
+    """
+
+    native = _load_native_module()
+    fast_result = native.prepared_metal_call_borrowed_no_wait_args(
+        prepared,
+        int(owner_output_count),
+        *args,
+    )
+    if fast_result is not None:
+        outputs, launch_sync_state = fast_result
+        output_list = list(outputs)
+        register_mlx_tvm_ffi_outputs(
+            output_list,
+            launch_sync_state,
+            dependency_metadata=dependency_metadata,
+            command_buffer_domain=command_buffer_domain,
+        )
+        return output_list
+
+    if owner_output_count:
+        split = len(args) - int(owner_output_count)
+        return prepared_metal_call(
+            prepared,
+            inputs=args[:split],
+            owner_outputs=args[split:],
+            command_buffer_domain=command_buffer_domain,
+            dependency_metadata=dependency_metadata,
+        )
+    return prepared_metal_call(
+        prepared,
+        inputs=args,
+        command_buffer_domain=command_buffer_domain,
+        dependency_metadata=dependency_metadata,
+    )
+
+
+def prepared_metal_call_single_arg(
+    prepared: Any,
+    *args: Any,
+    owner_output_count: int = 0,
+    command_buffer_domain: Any | None = None,
+    dependency_metadata: MetalLaunchDependencyMetadata | None = None,
+):
+    """Create one MLX graph output from positional prepared-call arrays."""
+
+    native = _load_native_module()
+    owner_output_count_int = int(owner_output_count)
+    if owner_output_count_int == 1 and len(args) == 5:
+        fast_result = native.prepared_metal_call_borrowed_no_wait_4in1out_single(
+            prepared,
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+        )
+    else:
+        fast_result = native.prepared_metal_call_borrowed_no_wait_args_single(
+            prepared,
+            owner_output_count_int,
+            *args,
+        )
+    if fast_result is not None:
+        output, launch_sync_state = fast_result
+        register_mlx_tvm_ffi_output(
+            output,
+            launch_sync_state,
+            dependency_metadata=dependency_metadata,
+            command_buffer_domain=command_buffer_domain,
+        )
+        return output
+
+    outputs = prepared_metal_call_args(
+        prepared,
+        *args,
+        owner_output_count=owner_output_count_int,
+        command_buffer_domain=command_buffer_domain,
+        dependency_metadata=dependency_metadata,
+    )
+    if len(outputs) != 1:
+        raise RuntimeError("single-output prepared native call returned multiple outputs")
+    return outputs[0]
+
+
+def prepared_metal_call_4in1out_single(
+    prepared: Any,
+    a0: Any,
+    a1: Any,
+    a2: Any,
+    a3: Any,
+    owner_output: Any,
+    *,
+    command_buffer_domain: Any | None = None,
+    dependency_metadata: MetalLaunchDependencyMetadata | None = None,
+):
+    """Create one MLX graph output for the hot 4-input/1-owner-output ABI."""
+
+    native = _load_native_module()
+    fast_result = native.prepared_metal_call_borrowed_no_wait_4in1out_single(
+        prepared,
+        a0,
+        a1,
+        a2,
+        a3,
+        owner_output,
+    )
+    if fast_result is not None:
+        output, launch_sync_state = fast_result
+        register_mlx_tvm_ffi_output(
+            output,
+            launch_sync_state,
+            dependency_metadata=dependency_metadata,
+            command_buffer_domain=command_buffer_domain,
+        )
+        return output
+
+    return prepared_metal_call_single_arg(
+        prepared,
+        a0,
+        a1,
+        a2,
+        a3,
+        owner_output,
+        owner_output_count=1,
+        command_buffer_domain=command_buffer_domain,
+        dependency_metadata=dependency_metadata,
+    )
 
 
 def metal_call(

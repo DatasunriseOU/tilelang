@@ -46,6 +46,28 @@ def _has_e4m3_dot4_helper(body: str) -> bool:
     )
 
 
+def _has_metal_simd_reduction(body: str) -> bool:
+    return (
+        "simd_sum(" in body
+        or "simd_shuffle_down(" in body
+        or "simd_shuffle(" in body
+    )
+
+
+def _first_metal_simd_reduction_pos(body: str) -> int:
+    positions = [
+        pos
+        for pos in (
+            body.find("simd_sum("),
+            body.find("simd_shuffle_down("),
+            body.find("simd_shuffle("),
+        )
+        if pos >= 0
+    ]
+    assert positions, "expected a Metal SIMD reduction in generated MSL"
+    return min(positions)
+
+
 def _make_kernel(
     M: int,
     N: int,
@@ -396,9 +418,10 @@ def test_m1_transposed_b_vecmat_explicit_metal_target_lowers_to_dot4_simd_sum():
     body = src[src.find("kernel void"):]
 
     assert _has_e4m3_dot4_helper(body)
-    assert "simd_sum(" in body
-    assert "#pragma unroll 4" in body
-    simd_pos = body.find("simd_sum(")
+    assert _has_metal_simd_reduction(body)
+    assert "__tvm_fp8_e4m3_to_half(A_shared" not in body
+    assert "__tvm_fp8_e4m3_to_half(B_shared" not in body
+    simd_pos = _first_metal_simd_reduction_pos(body)
     scale_pos = min(
         pos for pos in (body.find("A_scale", simd_pos), body.find("B_scale", simd_pos))
         if pos >= 0
@@ -406,8 +429,8 @@ def test_m1_transposed_b_vecmat_explicit_metal_target_lowers_to_dot4_simd_sum():
     assert scale_pos > simd_pos, "scale must be applied after the SIMD dot reduction"
 
 
-def test_m1_transposed_b_vecmat_keeps_metal_intrinsics_until_codegen():
-    """The Metal fast path stays as TIR intrinsics before final MSL emission."""
+def test_m1_transposed_b_vecmat_keeps_semantic_reduce_until_codegen():
+    """The Metal fast path keeps semantic reduction IR before final MSL emission."""
     fn = _make_vecmat_m1_kernel(
         N=64,
         K=96,
@@ -418,7 +441,9 @@ def test_m1_transposed_b_vecmat_keeps_metal_intrinsics_until_codegen():
     tir_text = str(fn)
 
     assert "T.metal_fp8_e4m3_dot4" in tir_text
-    assert "T.tirx.metal.simd_sum" in tir_text
+    assert "T.tvm_thread_allreduce" in tir_text
+    assert "reduce_scope" in tir_text
+    assert "T.tirx.metal.simd_sum" not in tir_text
     assert not _has_e4m3_dot4_helper(tir_text)
 
     artifact = tilelang.lower(fn, target=Target("metal"))
@@ -428,7 +453,7 @@ def test_m1_transposed_b_vecmat_keeps_metal_intrinsics_until_codegen():
     assert "T.metal_fp8_e4m3_dot4" not in body
     assert "T.tirx.metal.simd_sum" not in body
     assert _has_e4m3_dot4_helper(body)
-    assert "simd_sum(" in body
+    assert _has_metal_simd_reduction(body)
 
 
 def test_m1_transposed_b_vecmat_without_macro_target_uses_late_scalar_lowering():
@@ -441,8 +466,7 @@ def test_m1_transposed_b_vecmat_without_macro_target_uses_late_scalar_lowering()
 
     assert not _has_e4m3_dot4_helper(body)
     assert "tl.fp8_scaled_matmul.marker" not in body
-    assert "thread_index_in_simdgroup" in body
-    assert "simd_sum(" in body
+    assert _has_metal_simd_reduction(body)
     assert "__tvm_fp8_e4m3_to_half" in body
 
 
@@ -455,8 +479,7 @@ def test_m1_non_transposed_b_vecmat_late_lowers_to_simd_sum():
 
     assert "tl.fp8_scaled_matmul.marker" not in body
     assert not _has_e4m3_dot4_helper(body)
-    assert "thread_index_in_simdgroup" in body
-    assert "simd_sum(" in body
+    assert _has_metal_simd_reduction(body)
     assert re.search(
         r"if \(\(j_outer >> 3\) == "
         r"\((?:\(\(int\)threadIdx\.x\)|threadgroup_tid) >> 5\)\)",
@@ -484,7 +507,7 @@ def test_m1_transposed_b_vecmat_unsafe_dot4_marker_uses_scalar_fallback():
 
     assert "tl.fp8_scaled_matmul.marker" not in body
     assert not _has_e4m3_dot4_helper(body)
-    assert "simd_sum(" in body
+    assert _has_metal_simd_reduction(body)
     assert "__tvm_fp8_e5m2_to_half" in body
 
 
@@ -502,7 +525,7 @@ def test_m1_transposed_b_vecmat_jit_metal_target_uses_marker_late_lowering():
     body = src[src.find("kernel void"):]
 
     assert "tl.fp8_scaled_matmul.marker" not in body
-    assert "simd_sum(" in body
+    assert _has_metal_simd_reduction(body)
     assert "__tvm_fp8_e4m3_to_half" in body
 
 
@@ -520,7 +543,7 @@ def test_m1_transposed_b_vecmat_explicit_non_metal_target_uses_scalar_fallback()
     body = src[src.find("kernel void"):]
 
     assert not _has_e4m3_dot4_helper(body)
-    assert "simd_sum(" not in body
+    assert not _has_metal_simd_reduction(body)
     assert "a_val" in body and "b_val" in body
 
 
@@ -532,7 +555,7 @@ def test_m1_transposed_b_direct_explicit_metal_target_lowers_to_dot4():
     body = src[src.find("kernel void"):]
 
     assert _has_e4m3_dot4_helper(body)
-    assert "simd_sum(" in body
+    assert _has_metal_simd_reduction(body)
     assert "a_val" not in body and "b_val" not in body
 
 
@@ -546,7 +569,7 @@ def test_m1_transposed_b_direct_without_macro_target_late_lowers_to_dot4():
 
     assert "tl.fp8_scaled_matmul.marker" not in body
     assert _has_e4m3_dot4_helper(body)
-    assert "simd_sum(" in body
+    assert _has_metal_simd_reduction(body)
 
 
 def test_m1_transposed_b_direct_marker_stores_global_column_index():
@@ -558,7 +581,7 @@ def test_m1_transposed_b_direct_marker_stores_global_column_index():
     c_access_lines = [line.strip() for line in body.splitlines() if "C[" in line]
 
     assert _has_e4m3_dot4_helper(body)
-    assert "simd_sum(" in body
+    assert _has_metal_simd_reduction(body)
     assert any(
         "C[(gridThreadIdx >> 5)]" in line or "C[(grid_tid >> 5)]" in line
         for line in c_access_lines
@@ -591,7 +614,7 @@ def test_full_transposed_b_direct_marker_late_lowers_to_dot4():
 
     assert "tl.fp8_scaled_matmul.marker" not in body
     assert _has_e4m3_dot4_helper(body)
-    assert "simd_sum(" not in body
+    assert not _has_metal_simd_reduction(body)
     assert "__tvm_fp8_e4m3_to_half(" not in body
     assert re.search(r"threadIdx\.x\).*>> 4", body)
     assert re.search(r"threadIdx\.x\).*& 15", body)

@@ -22,7 +22,9 @@
  * \file lower_thread_allreduce.cc
  */
 #include <tvm/arith/analyzer.h>
+#include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/ir/op.h>
 #include <tvm/target/target.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/expr.h>
@@ -477,24 +479,31 @@ private:
       PrimExpr mask = Call(mask_dtype, builtin::tvm_warp_activemask(), {});
 
       if (reduce_extent <= warp_size_) {
+        bool native_metal_simd_sum =
+            target_->kind->name == "metal" && reduce_extent == warp_size_ &&
+            IsSumCombiner(combiner);
         std::tie(reduce_results, new_alloc_bufs) = MakeWarpAllreduce(
             values, types, combiner, reduce_index, reduce_extent, group_index,
             mask, std::nullopt, &seq);
 
-        // Broadcast the reduction result from lane 0 to all other lanes.
-        // This avoids to emit predicated stores, as all threads are
-        // uniformly writing the same result.
         for (size_t i = 0; i < size; ++i) {
           Buffer buf = Downcast<BufferLoad>(reduce_results[i])->buffer;
           new_alloc_bufs.push_back(buf);
-          PrimExpr val = BufferLoad(buf, {zero_index});
-          ICHECK_EQ(val->dtype, types[i]);
-          PrimExpr broadcast_lane =
-              WarpBroadcastLane(group_index, reduce_extent);
-          PrimExpr splat =
-              WarpShuffle(builtin::tvm_warp_shuffle(), new_alloc_bufs.back(),
-                          val, broadcast_lane);
-          seq.push_back(BufferStore(buf, splat, {zero_index}));
+          if (!native_metal_simd_sum) {
+            // Broadcast the reduction result from lane 0 to all other lanes.
+            // This avoids to emit predicated stores, as all threads are
+            // uniformly writing the same result. Metal native simd_sum already
+            // returns the subgroup sum to every lane, so it must skip this
+            // extra shuffle.
+            PrimExpr val = BufferLoad(buf, {zero_index});
+            ICHECK_EQ(val->dtype, types[i]);
+            PrimExpr broadcast_lane =
+                WarpBroadcastLane(group_index, reduce_extent);
+            PrimExpr splat =
+                WarpShuffle(builtin::tvm_warp_shuffle(), new_alloc_bufs.back(),
+                            val, broadcast_lane);
+            seq.push_back(BufferStore(buf, splat, {zero_index}));
+          }
         }
       } else {
         int n_warps = reduce_extent / warp_size_;
@@ -645,6 +654,12 @@ private:
                     const Optional<PrimExpr> &predicate, //
                     std::vector<Stmt> *seq) {
     int n_buffers = src_values.size();
+
+    if (target_->kind->name == "metal" && reduce_extent == warp_size_ &&
+        IsSumCombiner(combiner)) {
+      return MakeMetalNativeSimdSumAllreduce(src_values, dtypes, combiner,
+                                             predicate, seq);
+    }
 
     std::vector<Buffer> shared_bufs;
     std::vector<Buffer> local_bufs;
@@ -957,6 +972,65 @@ private:
     PrimExpr group_in_warp = floormod(
         group_index, make_const(group_index.dtype(), groups_per_warp));
     return group_in_warp * make_const(group_index.dtype(), reduce_extent);
+  }
+
+  bool IsSumCombiner(const CommReducerNode *combiner) const {
+    if (combiner->result.size() != 1 || combiner->lhs.size() != 1 ||
+        combiner->rhs.size() != 1 || combiner->identity_element.size() != 1) {
+      return false;
+    }
+    const auto *add = combiner->result[0].as<AddNode>();
+    if (add == nullptr) {
+      return false;
+    }
+    auto same_expr = [](const PrimExpr &lhs, const PrimExpr &rhs) {
+      return tvm::ffi::StructuralEqual::Equal(
+          lhs, rhs, /*map_free_vars=*/true, /*skip_tensor_content=*/true);
+    };
+    bool lhs_rhs = same_expr(add->a, combiner->lhs[0]) &&
+                   same_expr(add->b, combiner->rhs[0]);
+    bool rhs_lhs = same_expr(add->a, combiner->rhs[0]) &&
+                   same_expr(add->b, combiner->lhs[0]);
+    return (lhs_rhs || rhs_lhs) &&
+           IsAdditiveZero(combiner->identity_element[0]);
+  }
+
+  bool IsAdditiveZero(const PrimExpr &expr) const {
+    if (is_zero(expr)) {
+      return true;
+    }
+    if (const auto *imm = expr.as<FloatImmNode>()) {
+      return imm->value == 0.0;
+    }
+    return false;
+  }
+
+  std::pair<std::vector<PrimExpr>, std::vector<Buffer>>
+  MakeMetalNativeSimdSumAllreduce(std::vector<PrimExpr> src_values,
+                                  std::vector<DataType> dtypes,
+                                  const CommReducerNode *combiner,
+                                  const Optional<PrimExpr> &predicate,
+                                  std::vector<Stmt> *seq) {
+    int n_buffers = src_values.size();
+    std::vector<PrimExpr> results;
+    std::vector<Buffer> local_bufs;
+    results.reserve(n_buffers);
+    local_bufs.reserve(n_buffers);
+    Array<PrimExpr> zero_indices = {0};
+    Array<PrimExpr> shape = {1};
+    Op simd_sum_op = Op::Get("tirx.metal.simd_sum");
+    for (int idx = 0; idx < n_buffers; ++idx) {
+      Buffer buf = decl_buffer(shape, dtypes[idx], "red_buf" + std::to_string(idx),
+                               "local");
+      PrimExpr value = src_values[idx];
+      if (predicate.defined()) {
+        value = Select(predicate.value(), value, combiner->identity_element[idx]);
+      }
+      seq->push_back(BufferStore(
+          buf, Call(dtypes[idx], simd_sum_op, {value}), zero_indices));
+      results.push_back(BufferLoad(buf, zero_indices));
+    }
+    return {results, local_bufs};
   }
 
   // Check if we can use warp level reduction.
