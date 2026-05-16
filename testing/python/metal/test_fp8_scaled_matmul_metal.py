@@ -43,6 +43,7 @@ def _has_e4m3_dot4_helper(body: str) -> bool:
     return (
         "__tvm_fp8_e4m3_dot4_packed" in body
         or "__tvm_fp8_e4m3_dot4_words" in body
+        or "__tvm_fp8_e4m3fn_lut[" in body
     )
 
 
@@ -66,6 +67,16 @@ def _first_metal_simd_reduction_pos(body: str) -> int:
     ]
     assert positions, "expected a Metal SIMD reduction in generated MSL"
     return min(positions)
+
+
+def _scale_applied_after_simd_reduction(body: str, simd_pos: int) -> bool:
+    scale_after_simd = [
+        pos for pos in (body.find("A_scale", simd_pos), body.find("B_scale", simd_pos))
+        if pos >= 0
+    ]
+    if scale_after_simd and min(scale_after_simd) > simd_pos:
+        return True
+    return re.search(r"simd_sum\([^)]*\).*?\*\s*sa.*?\*\s*sb", body, re.S) is not None
 
 
 def _make_kernel(
@@ -422,11 +433,9 @@ def test_m1_transposed_b_vecmat_explicit_metal_target_lowers_to_dot4_simd_sum():
     assert "__tvm_fp8_e4m3_to_half(A_shared" not in body
     assert "__tvm_fp8_e4m3_to_half(B_shared" not in body
     simd_pos = _first_metal_simd_reduction_pos(body)
-    scale_pos = min(
-        pos for pos in (body.find("A_scale", simd_pos), body.find("B_scale", simd_pos))
-        if pos >= 0
+    assert _scale_applied_after_simd_reduction(body, simd_pos), (
+        "scale must be applied after the SIMD dot reduction"
     )
-    assert scale_pos > simd_pos, "scale must be applied after the SIMD dot reduction"
 
 
 def test_m1_transposed_b_vecmat_keeps_semantic_reduce_until_codegen():

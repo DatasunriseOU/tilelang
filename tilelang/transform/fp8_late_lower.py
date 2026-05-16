@@ -474,7 +474,11 @@ def _lower_m1_dot4(
         kk,
         tir.ceildiv(k_words, tir.IntImm("int32", sgw)),
         kk_body,
-        tir.ForKind.SERIAL,
+        tir.ForKind.UNROLLED,
+        {
+            "pragma_unroll_explicit": False,
+            "pragma_unroll_factor": 4,
+        },
     )
     c_idx = [
         _region_min(c, 0) + marker.c_row_offset,

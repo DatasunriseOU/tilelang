@@ -1911,8 +1911,19 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
     ICHECK_EQ(op->args.size(), 2)
         << "tir[x].metal.fp8_e4m3_dot4_words expects 2 args (a_word, "
         << "b_word), got " << op->args.size();
-    os << "__tvm_fp8_e4m3_dot4_words(" << PrintExpr(op->args[0]) << ", "
-       << PrintExpr(op->args[1]) << ")";
+    std::string pa = PrintExpr(op->args[0]);
+    std::string pb = PrintExpr(op->args[1]);
+    os << "(__tvm_fp8_e4m3fn_lut[" << pa << " & 0xFFu] * __tvm_fp8_e4m3fn_lut["
+       << pb << " & 0xFFu]"
+       << " + __tvm_fp8_e4m3fn_lut[(" << pa
+       << " >> 8) & 0xFFu] * __tvm_fp8_e4m3fn_lut[(" << pb
+       << " >> 8) & 0xFFu]"
+       << " + __tvm_fp8_e4m3fn_lut[(" << pa
+       << " >> 16) & 0xFFu] * __tvm_fp8_e4m3fn_lut[(" << pb
+       << " >> 16) & 0xFFu]"
+       << " + __tvm_fp8_e4m3fn_lut[(" << pa
+       << " >> 24) & 0xFFu] * __tvm_fp8_e4m3fn_lut[(" << pb
+       << " >> 24) & 0xFFu])";
   } else if (auto *opn = op->op.as<OpNode>();
              opn != nullptr &&
              MetalFp8DTypeCollector::IsGridTidXIntrin(opn->name)) {
