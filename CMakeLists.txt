@@ -204,7 +204,7 @@ list(APPEND TILE_LANG_SRCS
   src/runtime/error_helpers.cc
 )
 
-set(TILELANG_OUTPUT_TARGETS tilelang tvm_compiler)
+set(TILELANG_OUTPUT_TARGETS tilelang tvm_runtime tvm_compiler)
 
 # Track if the user explicitly selected a backend via cache options.
 set(TILELANG_BACKEND_USER_SELECTED OFF)

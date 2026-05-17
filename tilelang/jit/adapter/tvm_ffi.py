@@ -54,6 +54,11 @@ if sys.platform == "darwin":
     from torch.utils import cpp_extension
 
     include_paths = list(cpp_extension.include_paths())
+
+    def _append_include(path: str | None) -> None:
+        if path and os.path.isdir(path) and path not in include_paths:
+            include_paths.append(path)
+
     tvm_ffi_include = os.environ.get("TVM_FFI_INCLUDE_PATH")
     if not tvm_ffi_include:
         tvm_home = os.environ.get("TVM_HOME")
@@ -61,16 +66,22 @@ if sys.platform == "darwin":
             candidate = os.path.join(tvm_home, "3rdparty", "tvm-ffi", "include")
             if os.path.isdir(candidate):
                 tvm_ffi_include = candidate
-    if tvm_ffi_include and os.path.isdir(tvm_ffi_include):
-        include_paths.append(tvm_ffi_include)
+    if tvm_ffi_include:
+        _append_include(tvm_ffi_include)
         tvm_ffi_root = os.path.dirname(tvm_ffi_include)
         dlpack_include = os.environ.get("TVM_FFI_DLPACK_INCLUDE_PATH")
         if not dlpack_include:
             candidate = os.path.join(tvm_ffi_root, "3rdparty", "dlpack", "include")
             if os.path.isdir(candidate):
                 dlpack_include = candidate
-        if dlpack_include and os.path.isdir(dlpack_include):
-            include_paths.append(dlpack_include)
+        _append_include(dlpack_include)
+    try:
+        import tvm_ffi.libinfo as tvm_ffi_libinfo  # pylint: disable=import-outside-toplevel
+
+        for include_path in tvm_ffi_libinfo.include_paths():
+            _append_include(include_path)
+    except Exception:
+        pass
 
     COMPILE_ARGS["options"] = ["-x", "objective-c++", "-g", "-std=gnu++17"] + ["-I" + i for i in include_paths]
 

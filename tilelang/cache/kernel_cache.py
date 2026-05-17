@@ -58,7 +58,17 @@ class KernelCache:
 
         from torch.utils import cpp_extension
 
-        return {"options": ["-x", "objective-c++", "-g", "-std=gnu++17"] + ["-I" + i for i in cpp_extension.include_paths()]}
+        include_paths = list(cpp_extension.include_paths())
+        try:
+            import tvm_ffi.libinfo as tvm_ffi_libinfo  # pylint: disable=import-outside-toplevel
+
+            for include_path in tvm_ffi_libinfo.include_paths():
+                if os.path.isdir(include_path) and include_path not in include_paths:
+                    include_paths.append(include_path)
+        except Exception:
+            pass
+
+        return {"options": ["-x", "objective-c++", "-g", "-std=gnu++17"] + ["-I" + i for i in include_paths]}
 
     @staticmethod
     @functools.cache

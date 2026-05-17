@@ -504,12 +504,12 @@ std::string python_type_name(nb::handle item) {
     PyErr_Clear();
     qualname = nb::str("<unknown>");
   }
-  const char* module_c = PyUnicode_AsUTF8(module.ptr());
+  const char* module_c = PyUnicode_AsUTF8AndSize(module.ptr(), nullptr);
   if (module_c == nullptr) {
     PyErr_Clear();
     module_c = "<unknown>";
   }
-  const char* qualname_c = PyUnicode_AsUTF8(qualname.ptr());
+  const char* qualname_c = PyUnicode_AsUTF8AndSize(qualname.ptr(), nullptr);
   if (qualname_c == nullptr) {
     PyErr_Clear();
     qualname_c = "<unknown>";
