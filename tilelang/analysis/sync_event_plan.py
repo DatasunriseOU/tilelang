@@ -12,7 +12,7 @@ from tilelang.analysis.reduction_legality import (
     ReductionLegalityProof,
     prove_reduction_plans,
 )
-from tilelang.analysis.reduction_plan import extract_reduction_plans
+from tilelang.analysis.reduction_plan import ReductionPlan, extract_reduction_plans
 
 
 SyncEventAction = Literal[
@@ -36,6 +36,9 @@ class SyncEventDecision:
     two_pass_required: bool
     internal_scratch_required: bool
     external_materialization_required: bool
+    selected_strategy: str
+    memory_visibility_scope: str
+    scratch_scope: str | None
     z3_proved: bool
 
     def to_json(self) -> dict[str, Any]:
@@ -49,17 +52,22 @@ class SyncEventDecision:
             "two_pass_required": self.two_pass_required,
             "internal_scratch_required": self.internal_scratch_required,
             "external_materialization_required": self.external_materialization_required,
+            "selected_strategy": self.selected_strategy,
+            "memory_visibility_scope": self.memory_visibility_scope,
+            "scratch_scope": self.scratch_scope,
             "z3_proved": self.z3_proved,
         }
 
 
 def sync_event_decision_for_reduction(
+    plan: ReductionPlan,
     proof: ReductionLegalityProof,
     *,
     source: str,
 ) -> SyncEventDecision:
     """Map one reduction proof to the narrowest required sync action."""
 
+    memory_plan = plan.memory_plan
     if proof.cannot_parallelize_reason is not None:
         return SyncEventDecision(
             source=source,
@@ -71,6 +79,9 @@ def sync_event_decision_for_reduction(
             two_pass_required=False,
             internal_scratch_required=False,
             external_materialization_required=False,
+            selected_strategy=plan.selected_strategy,
+            memory_visibility_scope=memory_plan.visibility_scope,
+            scratch_scope=memory_plan.scratch_scope,
             z3_proved=proof.z3_proved,
         )
     if proof.proved_no_sync:
@@ -84,6 +95,9 @@ def sync_event_decision_for_reduction(
             two_pass_required=False,
             internal_scratch_required=False,
             external_materialization_required=False,
+            selected_strategy=plan.selected_strategy,
+            memory_visibility_scope=memory_plan.visibility_scope,
+            scratch_scope=memory_plan.scratch_scope,
             z3_proved=proof.z3_proved,
         )
     if proof.requires_threadgroup_barrier:
@@ -95,8 +109,11 @@ def sync_event_decision_for_reduction(
             threadgroup_barrier_required=True,
             device_event_required=False,
             two_pass_required=False,
-            internal_scratch_required=False,
-            external_materialization_required=False,
+            internal_scratch_required=memory_plan.internal_scratch_required,
+            external_materialization_required=memory_plan.external_materialization_required,
+            selected_strategy=plan.selected_strategy,
+            memory_visibility_scope=memory_plan.visibility_scope,
+            scratch_scope=memory_plan.scratch_scope,
             z3_proved=proof.z3_proved,
         )
     if proof.requires_device_event:
@@ -108,8 +125,11 @@ def sync_event_decision_for_reduction(
             threadgroup_barrier_required=False,
             device_event_required=True,
             two_pass_required=proof.requires_two_pass,
-            internal_scratch_required=proof.requires_two_pass,
-            external_materialization_required=False,
+            internal_scratch_required=memory_plan.internal_scratch_required,
+            external_materialization_required=memory_plan.external_materialization_required,
+            selected_strategy=plan.selected_strategy,
+            memory_visibility_scope=memory_plan.visibility_scope,
+            scratch_scope=memory_plan.scratch_scope,
             z3_proved=proof.z3_proved,
         )
     return SyncEventDecision(
@@ -122,6 +142,9 @@ def sync_event_decision_for_reduction(
         two_pass_required=False,
         internal_scratch_required=False,
         external_materialization_required=False,
+        selected_strategy=plan.selected_strategy,
+        memory_visibility_scope=memory_plan.visibility_scope,
+        scratch_scope=memory_plan.scratch_scope,
         z3_proved=proof.z3_proved,
     )
 
@@ -135,6 +158,7 @@ def build_reduction_sync_event_plan(
     proofs = prove_reduction_plans(plans)
     return tuple(
         sync_event_decision_for_reduction(
+            plan,
             proof,
             source=f"reduction:{idx}:{plan.op}",
         )

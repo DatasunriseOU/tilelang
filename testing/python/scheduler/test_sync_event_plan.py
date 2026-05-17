@@ -58,6 +58,10 @@ def test_same_simdgroup_reduction_requires_no_sync_or_materialization():
     assert decision.host_sync_required is False
     assert decision.threadgroup_barrier_required is False
     assert decision.device_event_required is False
+    assert decision.selected_strategy == "same-simdgroup"
+    assert decision.memory_visibility_scope == "simdgroup"
+    assert decision.scratch_scope is None
+    assert decision.internal_scratch_required is False
     assert decision.external_materialization_required is False
 
 
@@ -67,6 +71,10 @@ def test_split_reduction_requires_threadgroup_barrier_only():
     assert decision.threadgroup_barrier_required is True
     assert decision.device_event_required is False
     assert decision.host_sync_required is False
+    assert decision.selected_strategy == "split-simdgroup"
+    assert decision.memory_visibility_scope == "threadgroup"
+    assert decision.scratch_scope == "threadgroup"
+    assert decision.internal_scratch_required is True
     assert decision.external_materialization_required is False
 
 
@@ -75,6 +83,9 @@ def test_large_reduction_requires_internal_two_pass_device_event():
     assert decision.action == "device_event"
     assert decision.device_event_required is True
     assert decision.two_pass_required is True
+    assert decision.selected_strategy == "two-pass-global"
+    assert decision.memory_visibility_scope == "device"
+    assert decision.scratch_scope == "device"
     assert decision.internal_scratch_required is True
     assert decision.external_materialization_required is False
 
@@ -93,5 +104,9 @@ def test_sync_event_plan_metadata_is_inspectable_json():
     payload = json.loads(func.attrs["tl.sync_event_plan"].value)
     assert payload[0]["source"] == "reduction:0:sum"
     assert payload[0]["action"] == "threadgroup_barrier"
+    assert payload[0]["selected_strategy"] == "split-simdgroup"
+    assert payload[0]["memory_visibility_scope"] == "threadgroup"
+    assert payload[0]["scratch_scope"] == "threadgroup"
     assert payload[0]["threadgroup_barrier_required"] is True
+    assert payload[0]["internal_scratch_required"] is True
     assert payload[0]["external_materialization_required"] is False

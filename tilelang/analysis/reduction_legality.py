@@ -91,8 +91,24 @@ def _prove_static_extent(extent: int, timeout_ms: int) -> tuple[bool, str]:
 
 
 def _buffers_may_alias(plan: ReductionPlan) -> bool:
-    output_name = plan.output_region.name
-    return any(region.name == output_name for region in plan.input_regions)
+    return plan.alias_constraints.may_alias
+
+
+def _tail_broadcast_legal(plan: ReductionPlan, extent: int) -> bool:
+    mapping = plan.thread_mapping
+    threads = mapping.threads_per_threadgroup
+    blocks = mapping.blocks_per_output
+    if threads is None or blocks is None:
+        return False
+    if extent <= 0:
+        return False
+    if plan.selected_strategy == "same-simdgroup":
+        return extent <= mapping.simdgroup_size
+    if plan.selected_strategy in {"split-simdgroup", "threadgroup-staging", "row-reduce"}:
+        return extent <= threads
+    if plan.selected_strategy == "two-pass-global":
+        return blocks * threads >= extent
+    return False
 
 
 def prove_reduction_plan_legality(
@@ -124,9 +140,13 @@ def prove_reduction_plan_legality(
 
     proved_extent, query = _prove_static_extent(int(extent), timeout_ms)
     may_alias = _buffers_may_alias(plan)
-    requires_two_pass = "two-pass-global" in plan.candidate_strategies
-    first_strategy = plan.candidate_strategies[0] if plan.candidate_strategies else ""
-    requires_threadgroup_barrier = first_strategy in {"split-simdgroup", "threadgroup"}
+    tail_broadcast_legal = proved_extent and _tail_broadcast_legal(plan, int(extent))
+    requires_two_pass = plan.selected_strategy == "two-pass-global"
+    requires_threadgroup_barrier = plan.selected_strategy in {
+        "split-simdgroup",
+        "threadgroup-staging",
+        "row-reduce",
+    }
     requires_device_event = requires_two_pass
     cannot_parallelize_reason = None
     if not proved_extent:
@@ -141,9 +161,9 @@ def prove_reduction_plan_legality(
         proved_no_write_write_race=proof_ok,
         proved_no_read_after_write_hazard=proof_ok,
         proved_in_place_legal=not may_alias or plan.in_place,
-        proved_tail_broadcast_legal=proof_ok,
+        proved_tail_broadcast_legal=proof_ok and tail_broadcast_legal,
         proved_index_width_safe=proved_extent,
-        proved_no_sync=proof_ok and first_strategy == "same-simdgroup",
+        proved_no_sync=proof_ok and plan.selected_strategy == "same-simdgroup",
         requires_threadgroup_barrier=proof_ok and requires_threadgroup_barrier,
         requires_device_event=proof_ok and requires_device_event,
         requires_two_pass=proof_ok and requires_two_pass,
@@ -190,4 +210,3 @@ __all__ = [
     "serialize_reduction_legality",
     "_Z3_AVAILABLE",
 ]
-

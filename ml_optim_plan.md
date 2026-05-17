@@ -41,8 +41,10 @@ cppmega commands with this TileLang checkout injected:
 ```bash
 cd /Volumes/external/sources/cppmega.mlx
 export TL_ROOT=/private/tmp/tl_apache_tvm_swap
+export TILELANG_ROOT="$TL_ROOT"
+export TVM_ROOT="$TL_ROOT/3rdparty/tvm"
 export TILELANG_DISABLE_CACHE=1
-export TILELANG_DEV_BUILD_ROOT="$TL_ROOT"
+export TILELANG_DEV_BUILD_ROOT="$TL_ROOT/build"
 export TVM_LIBRARY_PATH="$TL_ROOT/build/lib:$TL_ROOT/build/tvm"
 export DYLD_LIBRARY_PATH="$TL_ROOT/build/lib:$TL_ROOT/build/tvm"
 export PYTHONPATH="$TL_ROOT:$TL_ROOT/3rdparty/tvm/python:$TL_ROOT/3rdparty/tvm/3rdparty/tvm-ffi/python"
@@ -106,26 +108,24 @@ TileLang and cppmega focused tests.
 
 ## Current Remaining Work
 
-As of 2026-05-16, this plan is not complete. P0 has a restored first-pass
-green receipt after the inline FP8 dot4 Metal codegen fix, but later packages
-must not be treated as done or ready for final 1B claims until their own gates
-pass.
+As of 2026-05-17, P0 through P12 have green receipts. P12 is the final 1B
+matrix gate after P10/P11, and no package remains blocked in this plan.
 
 | ID | Status | Remaining work | Latest receipt |
 | --- | --- | --- | --- |
 | P0 | Green / current recheck | Mamba3 NaN guards and strict `vecmat_4096` FP8 Path C perf gate are green on the latest reruns. Keep the full P0 suite as the advance gate before final 1B claims. | Root-caused the FP8 regression to an unsafe direct `simd_sum` load-remap optimization in `LowerThreadAllreduce`: it moved `simd_sum(accum)` into downstream `if (kr == 0)` stores, producing lane0-only partials on production FP8 reducers. Reverted only that shortcut and kept semantic allreduce/native local-buffer lowering. Sparse-MLA FP8 full file now passes (`53 passed`); Mamba3 full Path C file passes (`46 passed`), including 1B production-shape bwd finite guards; strict FP8 `vecmat_4096` passes with Path C median `0.189396 ms` vs Path B `0.187021 ms`. |
 | P1 | Green / first pass | Keep P1 receipts stable while P2 starts; rerun P1 tests after any reduction IR or lowering change. | Semantic `thread_allreduce` and TileOp `reduce_sum`/`reduce_max` now extract operation, regions, axes, predicate, dtype, and strategies; malformed TileOp axes fail before codegen; focused P1 tests are green. |
-| P2 | Partial/checkpoint only | Machine-readable rewrite diagnostics landed; Mamba3 public bwd partial owner-output ABI and internal host-reduced fallback are now fail-closed/removed; M2RNN Path C now emits final `dW` owner-output buffers for supported batch-1 bwd routes and fails closed instead of exposing public partial outputs for unsupported multi-batch reductions. Regular Sparse MLA Path C bwd now emits final fp32 `dKV` owner-output buffers and no longer exposes public `dkv_partial` or host-side dKV reduce. FP8 Sparse MLA direct-MSL bwd source and host `dkv_partial` reducer are removed, with a regression test blocking their return. Remaining legacy direct-MSL modules now have a machine-readable allowlist reason and replacement path; the actual legacy/debug surfaces still keep P2 open. | Mamba3 full-file Path C tests are green after the 1B NaN guard, native `simd_sum` lowerer, direct-SIMD long-sequence guard, and fallback partial route removal; the checked-in Mamba3 receipt now profiles only final-gradient `bwd_snap_simd` and no longer contains stale host-reduce partial profile keys. M2RNN full-file Path C tests are green after materializing atomic-add owner outputs and removing Path C `dW_partial`; sparse MLA regular/FP8 full files are green after the bridge ordering fix, regular bwd owner-output rewrite, and convergent `simd_sum` local-buffer regression fix; the linter can emit structured reasons for the remaining legacy direct-MSL reduction surfaces. |
-| P3 | Partial/checkpoint only | Predicate and TileOp reduce metadata landed under P1; formal P3 still needs a full scheduler metadata audit before unblocking P4. | `test_reduction_plan_metadata_serializes_stably` covers the current stable JSON payload. |
-| P4 | Not started | Add Z3 legality proofs for coverage, alias, tails, broadcast, int64, and sync legality. | Blocked by P3. |
-| P5 | Not started | Move sync/event insertion to dependency metadata plus proof results. | Blocked by P4. |
-| P6 | Not started | Move reduce/finalize/scan/dependency lowerers into backend registries. | Blocked by P3. |
-| P7 | Not started | Generalize generated reductions for large axes without public partial outputs. | Blocked by P4 and P6. |
-| P8 | Not started | Add reverse recurrence / scan planner, snapshot/cache policy, and recurrence residual/gate fusion. | Blocked by P4, P5, and P6. |
-| P9 | Not started | Add cost metadata and codegen cleanup for hoist/split/inline choices. | Blocked by P6. |
-| P10 | Not started | Add legal-schedule autotune, profiling, and memoized warm schedule cache. | Blocked by P9. |
-| P11 | Partial/checkpoint only | Add final production lint gates for monkeypatch/MSL/public TVM-FFI bypass/model intrinsics/public partial outputs. | Can run after each package; final gate waits on P10. |
-| P12 | Not final | Run full 1B matrix only after P0 green for the first real pass, and after P10/P11 for final claims. | Earlier 1B baseline exists, but it is not the final matrix and excludes unresolved P0 work. |
+| P2 | Green / first pass | Machine-readable rewrite diagnostics landed; Mamba3 public bwd partial owner-output ABI and internal host-reduced fallback are now fail-closed/removed; M2RNN Path C now emits final `dW` owner-output buffers for supported batch-1 bwd routes and fails closed instead of exposing public partial outputs for unsupported multi-batch reductions. Regular Sparse MLA Path C bwd, blockscaled Sparse MLA direct-MSL bwd, and Mamba3 direct-MSL Path B bwd now emit final owner-output gradients and no longer expose public `*_partial` reduction buffers. FP8 Sparse MLA direct-MSL bwd source and host `dkv_partial` reducer are removed, and regular Sparse MLA, generic FP8 helper, blockscaled Sparse MLA, top-k selector, and M2RNN no longer have direct-MSL Path B runtime surfaces. The only remaining allowlisted legacy direct-MSL module is Mamba3; it is a P8/P9 performance debt, not a P2 public-partial blocker, because the checked-in receipt keeps AUTO on Path B until Path C is no-worse. | 2026-05-17 follow-ups removed the debug-unit-test direct-MSL allowlist entry, regular Sparse-MLA `dkv_partial`, blockscaled Sparse-MLA `dkv_partial`, Mamba3 Path B public P-axis partial outputs, top-k selector direct-MSL Path B, regular Sparse-MLA direct-MSL Path B, M2RNN direct-MSL Path B, blockscaled Sparse-MLA direct-MSL Path B, and generic FP8 direct-MSL helper surface. The allowlist remains 1 entry (`mamba3.py`) with `public_partial_outputs=[]`; focused lint/MSL/sparse/Mamba3/top-k/M2RNN/blockscaled/FP8 helper suites, compileall, and perf/receipt smokes are green. The P2 close gate passed with Mamba3 Path C still slower on the receipt (`1.088x` fwd, `1.546x` bwd, `1.479x` fwd+bwd), so the non-rewrite has a machine-readable reason and P3 can start. |
+| P3 | Green / first pass | `ReductionPlan` metadata now records selected strategy, thread/block mapping, alias constraints, in-place constraint posture, memory visibility, and internal scratch/materialization requirements. P4 can start, but rerun P3 if strategy naming, legality, or backend lowering changes. | 2026-05-17 P3 first-pass receipt: scheduler metadata tests passed (`17 passed` across reduction plan, legality, and sync-event plan); transform reduction gate passed (`32 passed, 202 deselected, 170 warnings`); Metal reduce gate passed (`38 passed, 12 warnings`); compileall and diff checks passed. |
+| P4 | Green / first pass | Reduction legality now proves/static-checks coverage, bounds, alias rejection, tail/broadcast coverage, index-width safety, and sync class for current `ReductionPlan` metadata. Rerun if P5 changes sync insertion or P6/P7 add new strategy names. | 2026-05-17 P4 first-pass receipt: scheduler legality gate passed (`8 passed, 11 deselected`); analysis alias/overflow/Z3 gate passed (`7 passed, 10 deselected`); Metal hazard/sync/reduce gate passed (`39 passed, 16 skipped, 104 deselected, 138 warnings`); compileall and diff checks passed. |
+| P5 | Green / first pass | Sync/event decisions now carry proof-gated strategy and memory-scope metadata. Native MLX/TVM-FFI no-wait fast paths only borrow already-compact producer-free inputs; grouped/non-fp16 VJP paths that still depend on unstable native atomic owner-output accumulation fall back to the pure-MLX reference until that route is proven. Rerun P5 if bridge dependency metadata, owner-output atomics, or MLX graph-output handling changes. | 2026-05-17 P5 first-pass receipt: TileLang sync/graph/TVM-FFI Metal gate passed (`31 passed, 6 skipped, 54 warnings`); cppmega DLPack/TVM-FFI/Path C filter passed (`298 passed, 1713 deselected, 1 xfailed, 1 warning`); focused M2RNN and sparse-MLA fixer regressions passed; compileall and diff checks passed. |
+| P6 | Green / first pass | Reduction backend lowerer selection now lives in backend registries for Metal, CUDA, ROCm, and CPU, with stable cached diagnostics attached to semantic reduction plans. Remaining scan/dependency registry expansion is deferred to P8/P9 because there is no scan planner surface yet. | 2026-05-17 P6 first-pass receipt: scheduler registry metadata tests passed (`9 passed`); Metal reduce/finalize gate passed (`40 passed, 15 skipped, 105 deselected, 138 warnings`); language reduce gate passed (`7 passed, 8 skipped, 220 deselected, 356 warnings`); compileall and diff checks passed. Leakage scans remain nonzero only for target-specific transform passes, FP8 intrinsic surfaces, feature probes, and semantic `T.tvm_thread_allreduce` model IR. |
+| P7 | Green / first pass | TileLang large-axis allreduce coverage now includes P=32/64/96/128/256/512/1024 with internal staged final outputs only. Mamba3 Path C bwd now chooses larger per-P threadgroups for P=512/1024 while preserving the existing 256-thread choice for smaller real shapes; public partial outputs remain rejected. | 2026-05-17 P7 first-pass receipt: TileLang Metal `two_pass or reduce` gate passed (`47 passed, 15 skipped, 105 deselected, 138 warnings`); cppmega Mamba3 `headdim or bwd` gate passed (`28 passed, 25 deselected`); focused large-axis matrix and Mamba3 P-thread tests passed; compileall and diff checks passed. |
+| P8 | Green / first pass | Reverse recurrence scan planning now records direction, chunking, snapshot/cache policy, rematerialization policy, alias/in-place posture, no-sync proof posture, and fused post-op metadata. Mamba3 Path C bwd consumes the plan to select state-boundary snapshots for long reverse recurrences and direct recompute for short ones, with a lazy fallback for cppmega subprocess environments that still import an older TileLang package. | 2026-05-17 P8 first-pass receipt: TileLang scheduler scan gate passed (`6 passed, 22 deselected`); cppmega focused scan/snapshot route gate passed (`4 passed, 51 deselected`); real-parquet HybridTinyLM subprocess regression passed (`2 passed`); broad cppmega `mamba3 or m2rnn or hybrid` gate passed (`378 passed, 1643 deselected`); compileall and diff checks passed. During the broad gate, the Mamba3 pure helper reverse-cumsum hazard was fixed by replacing negative-stride `mx.cumsum` input with index-based `mx.take`, and the checkpoint seam was restored to `mx.checkpoint(layer)` for monkeypatch-visible decoder checkpointing. |
+| P9 | Green / first pass | Reduction and recurrence plans now expose explainable static cost metadata for registers, scratch/materialization bytes, index math, dispatch/sync counts, occupancy limiter, and split-vs-inline decisions. Metal batched allreduce templates now hoist repeated `i * workspace_stride` math into `batch_offset`, with source tests blocking regressions. | 2026-05-17 P9 first-pass receipt: scheduler `cost or register or hoist` gate passed (`5 passed, 28 deselected`); Metal `source or reduce` gate passed (`50 passed, 15 skipped, 102 deselected, 138 warnings`); cppmega `path_c` gate passed (`294 passed, 1726 deselected, 1 xfailed, 1 warning`); C++ rebuild and compileall passed; opt-in Metal reduce perf smoke passed (`3 passed, 12 deselected`) with same-simdgroup 32 at `0.1536 ms`, cross-simdgroup 128 at `0.1717 ms`, and row-reduce 256x32 at `0.1327 ms` for the low-iteration smoke. |
+| P10 | Green / first pass | Legal-schedule warm memoization now profiles only legal candidates, keys warm reuse on op signature, shape, dtype, target, ABI fingerprints, proof hash, codegen hash, and normalized config, and records cold compile timing separately from warm execution timing. cppmega M2RNN custom VJP closure caches are now shape/dtype-aware so broad profile/bench/path_c runs do not reuse stale custom-function identities across layouts. | 2026-05-17 P10 first-pass receipt: TileLang scheduler `autotune or cache` gate passed (`6 passed, 32 deselected`); cppmega `profile or bench or path_c` gate passed after the order-sensitive M2RNN VJP cache fix (`411 passed, 1609 deselected, 1 xfailed, 1 warning`); focused M2RNN regression pair passed (`2 passed`); compileall passed for touched TileLang/cppmega files. |
+| P11 | Green / first pass | Production lint now blocks production monkeypatch/mock seams, raw direct-MSL construction, `_msl_transform.dispatch`, public native TVM-FFI bridge imports, model-level backend intrinsics, and public partial-output surfaces. TileLang also has a focused production monkeypatch lint receipt so the planned P11 selector is non-empty. | 2026-05-17 P11 first-pass receipt: TileLang `lint or monkeypatch` gate passed (`1 passed, 1317 deselected, 1053 warnings`); cppmega `lint or monkeypatch` gate passed (`27 passed, 2000 deselected`); extended `tools/lint_mlx.py --select MLX002,MLX005,MLX006,MLX007,MLX008,MLX009 cppmega_mlx tests` passed clean; planned production grep is expected nonzero only for local non-public `dc_partial`, comments/docstrings, framework-owned `_tilelang` bridge/debug surfaces, feature counters, and defensive stale-partial text checks. |
+| P12 | Green / final | Final 36-cell 1B matrix is captured with all 36 cells green, including real 20-step FP8 Path B baseline rows. Warm Path C cache rows are now green after fixing the cached TVM-FFI Metal host-wrapper ordering boundary, and the BF16/FP8 default-decision HTML report is generated. | 2026-05-17 final P12 receipt: `/tmp/cppmega_1b_path_matrix.md`, `/tmp/cppmega_1b_path_matrix.csv`, `/tmp/cppmega_1b_path_matrix.json`, and `/tmp/cppmega_1b_path_matrix.html` report `36 ok, 0 failed`. FP8 Path B rows now run `--dtype fp8_path_b` and dispatch DSA Sparse-MLA through `sparse_mla_fp8_reference_path_b`; FP8 Path C rows run `--dtype fp8_path_c` and dispatch Mamba3/M2RNN/Sparse-MLA through Path C. The HTML report makes the default decision explicit: warm Path C is currently slower than Path B for all BF16 and FP8 optimizer rows, so no row is a Path C default candidate under the 3 percent same-speed rule. Full matrix was first run with fresh subprocesses; old warm-cache failures were reproduced, fixed in the native bridge, rechecked with six warm-cache 20-step cells all green, then consolidated with `--reuse-existing-ok` after adding FP8 Path B baselines. Regression gates passed for the matrix harness, renderer, attention route, and m04 metadata (`113 passed`), broad cppmega P12 selector (`472 passed, 4 skipped, 1554 deselected, 1 xfailed`), focused TileLang cached-host-wrapper Metal tests (`2 passed, 26 deselected`), and the native C++ rebuild. |
 
 ## P0: Current FP8 Path C Gate
 
@@ -355,25 +355,45 @@ rg -n "simd_sum|simd_shuffle|d[A-Z]?_partial|ddt_partial" cppmega_mlx tests
 | 2026-05-16 regenerate checked-in Mamba3 Path C receipt without stale partial profile | pass: `scripts/bench_tilelang_mamba3_path_c.py --warmup 5 --iters 50 --skip-artifacts` rewrote `bench/tilelang_ports/mamba3_path_c.json`; `bwd_profile` now contains only `simd_p_reduce_kernel`, partial-symbol scan over the receipt/script/Path C implementation/tests is clean, and affected dispatch/receipt gates passed `14 passed in 5.20s`. Perf remains intentionally red for this shape: fwd `1.088x`, bwd `1.546x`, fwd+bwd `1.479x` Path C / Path B, so AUTO keeps Path B. |
 | 2026-05-16 machine-readable legacy direct-MSL reduction allowlist | pass: `tools/lint_mlx.py --explain-direct-msl-allowlist` now emits JSON entries with `kind`, `reason`, `replacement`, `reduction_surface`, and `public_partial_outputs`; Mamba3 Path B explicitly records `dB_partial`, `dC_partial`, `dA_partial`, `ddt_partial`, and `dD_partial` with the reason that Path C bwd is finite but slower on the checked-in receipt; `tests/test_lint_mlx.py` passed `18 passed in 1.09s`; focused production direct-MSL/monkeypatch/native-TVΜ-FFI lint returned clean. |
 | 2026-05-16 P2 focused regression after legacy allowlist metadata | pass: TileLang `pytest testing/python/transform/ -q -k "reduction"` passed `32 passed, 202 deselected, 170 warnings`; cppmega `pytest tests/test_lint_mlx.py tests/test_mamba3_dispatch.py tests/test_tilelang_mamba3_path_c.py::test_bwd_path_c_full_1b_model_bf16_snapshot_simd_stays_finite tests/test_tilelang_mamba3_path_c.py::test_direct_bwd_simd_lowering_rejects_long_sequences_without_snapshots -q` passed `33 passed in 8.66s`; TileLang and cppmega `git diff --check` passed. |
+| 2026-05-17 P2 same-simdgroup allreduce local-buffer scope recheck | pass: `LowerThreadAllreduce` now writes native Metal full-width same-simdgroup `sum` results directly into the allreduce result buffer instead of remapping scalar lets outside their local-buffer scope; added `test_metal_same_simdgroup_thread_allreduce_keeps_local_buffer_scope`; updated same-simdgroup split tests to expect direct `simd_sum(accum[0])`; cppmega `tests/conftest.py` pins `TILELANG_DISABLE_CACHE=1` for dev-build tests so stale JIT artifacts do not hide lowerer changes; `scripts/bench_tilelang_fp8_path_c.py` keeps the active `apache-tvm-ffi` editable finder instead of deleting the venv-provided `core.abi3.so` artifact. TileLang gates passed: `cmake --build build -j$(sysctl -n hw.ncpu)`, focused new Metal regression, `pytest testing/python/transform/ -q -k "reduction"` (`32 passed, 202 deselected`), `pytest testing/python/metal/test_metal_reduce.py -q` (`38 passed`), P1 language/scheduler guards (`7 passed, 8 skipped`; `30 passed`), and P0 focused block (`62 passed, 5 skipped`). cppmega gates passed: strict FP8 bench `/tmp/fp8_path_c_p2_lower_thread_allreduce.json` with `matmul_128=0.919x` and `vecmat_4096=1.003x`; `pytest tests/test_lint_mlx.py tests/test_tilelang_msl_transform.py tests/test_tilelang_mamba3_path_c.py tests/test_tilelang_bench_harness.py -q` (`110 passed`); P0 guard `pytest tests/test_tilelang_fp8_vecmat_path_c.py tests/test_tilelang_mamba3_path_c.py -q` (`75 passed`); `tools/lint_mlx.py --select MLX002,MLX005,MLX006,MLX007 cppmega_mlx tests`; TileLang/cppmega reduction-token scans are expected nonzero only in backend tests, feature counters, legacy Path B partial baselines, and debug/allowlisted surfaces; both worktrees passed `git diff --check`. |
+| 2026-05-17 P2 debug direct-MSL unit-test allowlist removal | pass: extracted `_resolve_dispatch_launch_shape` from `_msl_transform.dispatch` so launch-grid/input-count guardrails can be tested without calling the legacy direct-MSL dispatch boundary; `tests/test_tilelang_msl_transform.py` now covers the pure helper; `tools/lint_mlx.py --explain-direct-msl-allowlist` no longer lists `tests/test_tilelang_msl_transform.py`, reducing the allowlist from 7 entries to 6. Code review/perf note: this is a factoring-only validation change on the legacy dispatch path, with no generated Metal or TileLang runtime schedule change, so no perf bench was applicable. Verification passed: `pytest tests/test_tilelang_msl_transform.py tests/test_lint_mlx.py -q` (`37 passed`), `compileall` for touched cppmega files, and `tools/lint_mlx.py --select MLX002,MLX005,MLX006,MLX007 cppmega_mlx tests`. |
+| 2026-05-17 P2 regular Sparse-MLA legacy backward partial retirement | pass: `cppmega_mlx/nn/_tilelang/sparse_mla.py` keeps the direct-MSL Path B forward baseline but removes the legacy backward kernel that returned per-token `dKV` partial buffers plus host scatter/reduce; `sparse_mla_bwd_metal` is now a compatibility shim over `sparse_mla_bwd_path_c`, so backward returns final fp32 owner-output `dKV` from the TileLang/tvm-ffi route. `tools/lint_mlx.py --explain-direct-msl-allowlist` still lists `sparse_mla.py` for the forward baseline, but its `public_partial_outputs` is now empty. Perf smoke with dev TileLang/TVM env wrote `/tmp/sparse_mla_p2_bwd_compat_smoke.json`; Path C status was available and one-shape paired bwd compatibility ratio was `0.957x` under `--strict-phase bwd --max-ratio 1.05`. Verification passed: `pytest tests/test_lint_mlx.py tests/test_tilelang_bench_harness.py -q` (`45 passed`), focused Sparse-MLA bwd/custom-VJP tests (`5 passed`), full `tests/test_tilelang_sparse_mla.py` (`54 passed`), production/test direct-MSL lint, compileall for touched cppmega files, and targeted scan showing no `dkv_partial`, `_BWD_KERNEL`, `_sparse_mla_bwd_msl_partial`, or `_reduce_dkv_partial` in the regular Sparse-MLA production/bench files. |
+| 2026-05-17 P2 blockscaled Sparse-MLA legacy backward partial retirement | pass: `cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled.py` keeps the direct-MSL MXFP8 forward/bwd baseline but removes the public `dkv_partial` output and Python `_reduce_dkv_partial_fp32` host scatter/reduce. The backward kernel now uses a direct-MSL `cppmega_atomic_add_float` CAS helper on normal output pointers, dispatches with `init_value=0`, allocates internal trailing-singleton owner-output shapes before reshaping back, writes `dq_dequant` and final fp32 owner-output `dKV`, and keeps the fused direct-MSL bwd path instead of falling back to pure autograd. `tools/lint_mlx.py --explain-direct-msl-allowlist` still lists the blockscaled file for the direct-MSL baseline, but its `public_partial_outputs` is empty and its reduction surface is `atomic_owner_output_dkv`. Perf smoke on the small blockscaled bwd parity shape showed owner-output bwd median `0.201 ms` vs pure reference VJP median `0.431 ms` (`0.466x`). Verification passed: `pytest tests/test_lint_mlx.py tests/test_tilelang_sparse_mla_blockscaled.py -q` (`51 passed`), `pytest tests/test_tilelang_msl_transform.py tests/test_tilelang_sparse_mla_blockscaled_path_c.py tests/test_tilelang_bench_harness.py -q` (`56 passed`), combined Mamba3/blockscaled/lint suite (`115 passed`), `tools/lint_mlx.py --select MLX002,MLX005,MLX006,MLX007 cppmega_mlx tests`, compileall for touched cppmega files, TileLang `pytest testing/python/transform/ -q -k "reduction"` (`32 passed, 202 deselected, 170 warnings`), cppmega/TileLang `git diff --check`, and targeted production/lint scan showing no `dkv_partial`, `_reduce_dkv_partial_fp32`, or `host_scatter_reduce` in the blockscaled production/allowlist files. |
+| 2026-05-17 P2 Mamba3 Path B public partial-output retirement | pass: `cppmega_mlx/nn/_tilelang/mamba3.py` keeps the direct-MSL Path B fallback because AUTO still selects it as primary, but the backward kernel no longer exposes `dB_partial`, `dC_partial`, `dA_partial`, `ddt_partial`, or `dD_partial` and no longer performs host `mx.sum` reductions over P-axis partial buffers. It now writes final `dB`, `dC`, `dA`, `ddt`, and `dD` owner-output buffers through the same direct-MSL `cppmega_atomic_add_float` CAS helper, dispatches with `init_value=0`, and uses internal trailing-singleton owner-output shapes before reshaping back so Path B and Path C comparison graphs do not alias same-shaped lazy buffers. `tools/lint_mlx.py --explain-direct-msl-allowlist` still lists `mamba3.py` as a fallback, but its `public_partial_outputs` is empty and its reduction surface is `atomic_owner_output_p_axis`. Perf smoke on `B=1,T=4,H=1,P=32,N=4` showed Path B fwd `0.181 ms`, Path C fwd `0.184 ms` (`1.013x`), Path B bwd `0.877 ms`, Path C bwd `0.805 ms` (`0.917x`), and AUTO scheduler `path_b` for the receipt. Verification passed: combined `pytest tests/test_tilelang_mamba3.py tests/test_tilelang_mamba3_path_c.py tests/test_tilelang_sparse_mla_blockscaled.py tests/test_lint_mlx.py -q` (`115 passed`), the decay-underflow Path C comparison guard (`1 passed`), Mamba3 receipt smoke, production/test direct-MSL lint, compileall for touched cppmega files, targeted production/lint scan showing no legacy Mamba3 partial-output tokens, and cppmega/TileLang `git diff --check`. |
+| 2026-05-17 P2 top-k selector direct-MSL Path B retirement | pass: `cppmega_mlx/nn/_tilelang/topk_selector.py` no longer constructs or dispatches the hand-written direct-MSL Path B kernel, the unused Path B MSL source block is deleted, and the file no longer needs a lint allowlist entry. `topk_selector_metal` now validates shape/k and fails closed with `None`; explicit `backend="metal"` raises; unmasked AUTO uses `topk_selector_tilelang_direct(..., out=...)`; masked or unsupported no-output calls fall back to the pure-MLX reference. The legacy no-output Path C `mx.fast.metal_kernel` wrapper is also retired, while `_path_c_kernel_for` remains a source-lowering debug seam that returns no MLX fast-kernel. Receipt regeneration with the active dev TileLang/TVM env passed: `scripts/bench_tilelang_topk.py --warmup 2 --iters 5 --strict` rewrote `bench/tilelang_ports/topk_selector.json` with `path_b_status.available=false`, `path_c_status.available=true`, and Path C running for the receipt shapes. Perf note: this is a direct-MSL retirement, not a standalone top-k speed win; Path C medians in the smoke were `0.240 ms`, `0.776 ms`, `0.794 ms`, `0.783 ms`, and `7.297 ms` across the five receipt rows, slower than the MLX baselines on the larger shapes. Verification passed: `pytest tests/test_tilelang_topk.py tests/test_lint_mlx.py tests/test_tilelang_bench_harness.py -q` (`109 passed`), compileall for touched cppmega files, production/test direct-MSL lint, cppmega/TileLang `git diff --check`, and `tools/lint_mlx.py --explain-direct-msl-allowlist` now lists 5 entries and no `topk_selector.py`. |
+| 2026-05-17 P2 regular Sparse-MLA direct-MSL Path B retirement | pass: `cppmega_mlx/nn/_tilelang/sparse_mla.py` no longer constructs the hand-written forward MSL string, `_FWD_KERNEL`, or `_msl_transform.dispatch`; `sparse_mla_fwd_metal` now validates shapes and returns `None`, `sparse_mla_apply(force_metal=True)` raises with the explicit retired-Path-B reason, AUTO uses checked-in Path C receipt rows or the pure-MLX reference, and `sparse_mla_bwd_metal` remains a compatibility shim over the final-owner-output Path C bwd route. `bench/tilelang_ports/sparse_mla.json` was regenerated with the active dev TileLang/TVM env via `scripts/bench_tilelang_sparse_mla.py --warmup 2 --iters 5 --strict`; it records `path_b_status.available=false`, `path_c_status.available=true`, strict pass, and Path C fwd/bwd medians faster than pure MLX reference on all three receipt rows (`fwd C/ref` ratios `0.727x`, `0.900x`, `0.780x`; `bwd C/ref` ratios `0.684x`, `0.637x`, `0.693x`). Verification passed: `pytest tests/test_tilelang_sparse_mla.py tests/test_sparse_mla_dispatch.py tests/test_tilelang_bench_harness.py tests/test_lint_mlx.py -q` (`117 passed`), `tools/lint_mlx.py --select MLX002,MLX005,MLX006,MLX007 cppmega_mlx tests`, compileall for touched cppmega files, cppmega/TileLang `git diff --check`, targeted scan showing no raw `mx.fast.metal_kernel`, `_msl_transform.dispatch`, `_FWD_KERNEL`, or `_FWD_KERNEL_SOURCE` in regular Sparse-MLA production/bench files, and `tools/lint_mlx.py --explain-direct-msl-allowlist` now lists 4 entries with no `sparse_mla.py`. |
+| 2026-05-17 P2 M2RNN direct-MSL Path B retirement | pass: `cppmega_mlx/nn/_tilelang/m2rnn.py` no longer constructs hand-written MSL, `_FWD_KERNEL_SOURCE`, `_BWD_KERNEL_SOURCE`, `_FWD_KERNEL`, `_BWD_KERNEL`, or `_msl_transform.dispatch`; the legacy exported names are now pure-MLX compatibility wrappers. `CPPMEGA_KERNEL_PATH=path_b` fails closed with an explicit retired-Path-B error, explicit `path_c` still exercises the TileLang/tvm-ffi route, and AUTO uses the correctness-first reference route so HybridLM smoke training stays finite. The TileLang MLX TVM-FFI bridge now always emits a GPU-side output barrier after publishing external output arrays, replacing the ad hoc `TILELANG_MLX_TVM_FFI_FORCE_OUTPUT_BARRIER=1` requirement that M2RNN owner-output bwd exposed. Verification passed: TileLang `cmake --build build -j16`; TileLang `TILELANG_DISABLE_CACHE=1 ... pytest testing/python/metal/test_tvm_ffi_metal_stream_dlpack.py -q` (`21 passed, 6 skipped`); cppmega `pytest tests/test_tilelang_m2rnn.py tests/test_m2rnn_dispatch.py tests/test_tilelang_m2rnn_path_c.py tests/test_lint_mlx.py -q` (`74 passed`); `pytest tests/test_tilelang_m2rnn_path_c.py -q` without the output-barrier env (`25 passed`); compileall for touched M2RNN/test/lint files; `tools/lint_mlx.py --select MLX002,MLX005,MLX006,MLX007 cppmega_mlx tests`; targeted scan showing no raw M2RNN production `mx.fast.metal_kernel`, `_msl_transform.dispatch`, `_FWD_KERNEL*`, or `_BWD_KERNEL*`; cppmega and TileLang `git diff --check`. Perf note: this is a direct-MSL retirement and correctness stabilization, not a new AUTO Path C speed win; the existing checked-in M2RNN Path C receipt remains the explicit Path C performance reference. |
+| 2026-05-17 P2 blockscaled Sparse-MLA direct-MSL Path B retirement | pass: `cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled.py` no longer constructs `_BLOCKSCALED_FWD_KERNEL_SOURCE`, `_BLOCKSCALED_BWD_KERNEL_SOURCE`, `_BLOCKSCALED_FWD_KERNEL`, `_BLOCKSCALED_BWD_KERNEL`, `make_metal_kernel`, or `_msl_transform.dispatch`; it keeps MXFP8 quantize/dequant/unpack helpers, the pure-MLX MXFP8 reference, prepared-buffer Path C re-exports, and fail-closed compatibility wrappers. `sparse_mla_blockscaled_fwd_metal` and `sparse_mla_blockscaled_bwd_metal` preserve shape validation and return `None`, while `sparse_mla_blockscaled_apply(force_metal=True)` raises with the retired Path B reason. `tools/lint_mlx.py --explain-direct-msl-allowlist` now lists 2 entries (`fp8_msl_kernels.py`, `mamba3.py`) and no blockscaled entry. Perf/receipt smoke regenerated `bench/tilelang_ports/sparse_mla_blockscaled.json` with `metal_status.available=false`, Path C E8M0 QK reducer median `0.170 ms`, blockscaled reference median `0.334 ms`, and `path_c_e8m0_qk_reduce_over_blockscaled_reference=0.509x`; full Path C dispatch remains intentionally red. Verification passed: `pytest tests/test_tilelang_sparse_mla_blockscaled.py tests/test_tilelang_sparse_mla_blockscaled_path_c.py tests/test_tilelang_path_c_vs_b_parity.py tests/test_tilelang_bench_harness.py tests/test_lint_mlx.py -q` (`97 passed, 1 xfailed`); broader FP8 sparse suite after same-simdgroup expectation update (`53 passed`); compileall for touched cppmega files; `tools/lint_mlx.py --select MLX002,MLX005,MLX006,MLX007 cppmega_mlx tests`; targeted scan shows no blockscaled production kernel source or dispatch constructors except retired-reason strings and negative assertions. |
+| 2026-05-17 P2 generic FP8 direct-MSL helper retirement | pass: `cppmega_mlx/nn/_tilelang/fp8_msl_kernels.py` no longer embeds the vendored FP8 MSL header/body strings, constructs `_FP8_*_KERNEL` handles, imports `_msl_transform`, calls `make_metal_kernel`, or dispatches raw MSL. The public helper names now provide explicit pure-MLX reference/oracle math only, and `fp8_msl_status()` returns `available=false` with the retired Path B reason. `scripts/bench_tilelang_fp8_path_c.py` future output now labels this baseline as `reference_mlx_*` while retaining compatibility for historical `path_b_msl_*` checked-in receipts. Perf/receipt smoke regenerated `bench/tilelang_ports/fp8_msl_kernels.json` for `tiny_smoke` with `metal_status.available=false`, reference matmul median `0.173 ms`, fp16 baseline median `0.151 ms`, and reference vecmat median `0.133 ms`; a live Path C bench smoke wrote `/tmp/fp8_path_c_reference_smoke.json` with `matmul_tl_fp8_scaled_matmul_over_path_b=0.774x` against the pure-MLX reference. Verification passed: `pytest tests/test_fp8_msl_kernels.py tests/test_tilelang_fp8_vecmat_path_c.py tests/test_tilelang_path_c_vs_b_parity.py tests/test_tilelang_bench_harness.py tests/test_tilelang_fp8_matmul_path_c_bench.py tests/test_lint_mlx.py -q` (`111 passed, 1 xfailed`); `pytest tests/test_tilelang_sparse_mla_fp8.py -q` (`53 passed`); compileall for touched cppmega files; `tools/lint_mlx.py --select MLX002,MLX005,MLX006,MLX007 cppmega_mlx tests`; `tools/lint_mlx.py --explain-direct-msl-allowlist` now lists only `mamba3.py`; targeted scan shows no raw FP8 helper MSL constructors or dispatch imports in production/docs/receipt files. |
+| 2026-05-17 P2 first-pass close gate with Mamba3 non-rewrite deferral | pass: P2 closes as a first pass because no current direct-MSL allowlist entry exposes public partial outputs, and the sole non-rewritten reduction surface (`cppmega_mlx/nn/_tilelang/mamba3.py`) has a machine-readable allowlist reason plus a replacement path (`mamba3_path_c.py`). Code review/perf decision: do not retire Mamba3 Path B in P2 because the checked-in production-shape receipt keeps `scheduler_decision.mode=path_b`; Path C is slower than Path B on the receipt (`fwd=1.088x`, `bwd=1.546x`, `fwd+bwd=1.479x`), and a live smoke also kept `scheduler: path_b` (`fwd=1.009x`, `bwd=1.130x`, `fwd+bwd=1.113x`). Regression verification passed: cppmega `pytest tests/test_lint_mlx.py tests/test_mamba3_dispatch.py tests/test_tilelang_mamba3.py tests/test_tilelang_mamba3_path_c.py -q` (`96 passed`); TileLang `pytest testing/python/transform/ -q -k "reduction"` (`32 passed, 202 deselected, 170 warnings`); `tools/lint_mlx.py --explain-direct-msl-allowlist` lists only `mamba3.py` with `public_partial_outputs=[]`; broad reduction-token scans are expected nonzero only for TileLang backend intrinsics/tests, cppmega Path C feature counters/tests, and the documented Mamba3 direct-MSL fallback debt. |
 
 **Status**
 
-- P2 is not green. The framework now records declined rewrite reasons,
-  Mamba3 no longer exposes the partial-output bwd owner ABI publicly and no
-  longer has an internal host-reduced partial fallback route, M2RNN Path C no
-  longer races lazy zero-fill against atomic-add bwd outputs and no longer
-  exposes public `dW_partial` buffers on supported batch-1 bwd routes, and
-  regular Sparse MLA Path C bwd plus its debug MSL dump now return final fp32
-  `dKV` owner outputs instead of public `dkv_partial` plus host-side MLX
-  scatter/reduce. cppmega no longer mutates TileLang/TVM backend op registration for Path C Metal FP8
-  intrinsics; it only checks the framework-owned registry. Legacy direct-MSL
-  and debug surfaces plus direct-intrinsic scan hits still remain. Sparse MLA
-  implementation scan is now clean for `dkv_partial` and the old private bwd
-  builders; the Mamba3 receipt bench and checked-in receipt no longer import or
-  profile the removed partial fallback route. Remaining legacy direct-MSL
-  surfaces now have machine-readable reasons and replacement paths in the MLX
-  lint allowlist. Broad P2 scans still hit Path B baselines, backend intrinsic
-  tests, and debug/feature-counting allowlists.
+- P2 is green for the first pass. The framework now records declined rewrite
+  reasons, and no MLX direct-MSL allowlist entry currently reports public
+  partial outputs. Mamba3 no longer exposes the public P-axis partial-output bwd
+  ABI and no longer has an internal host-reduced partial fallback route, M2RNN
+  Path C no longer races lazy zero-fill against atomic-add bwd outputs and no
+  longer exposes public `dW_partial` buffers on supported batch-1 bwd routes,
+  M2RNN direct-MSL Path B is retired and removed from the allowlist, regular
+  Sparse MLA Path C bwd, its debug MSL dump, and the legacy
+  `sparse_mla_bwd_metal` compatibility surface now return final fp32 `dKV`
+  owner outputs instead of public `dkv_partial` plus host-side MLX
+  scatter/reduce, regular Sparse MLA no longer constructs a direct-MSL Path B
+  forward runtime surface, blockscaled Sparse MLA no longer constructs a
+  direct-MSL Path B forward or backward runtime surface, and the generic FP8
+  helper no longer constructs direct-MSL kernels. cppmega no longer mutates
+  TileLang/TVM backend op registration for Path C Metal FP8 intrinsics; it only
+  checks the framework-owned registry. Sparse MLA implementation scans are clean
+  for `dkv_partial` and the old private bwd builders; Mamba3 Path B
+  production/lint scans are clean for the old public partial-output tokens; the
+  Mamba3 receipt bench and checked-in receipt no longer import or profile the
+  removed Path C partial fallback route. The sole remaining production
+  direct-MSL allowlist entry is Mamba3, with a machine-readable non-rewrite
+  reason and replacement path. Its retirement is deferred to the reverse-scan
+  and cost/codegen packages because the current Path C receipt is slower than
+  Path B. Broad P2 scans still hit TileLang backend intrinsics/tests, cppmega
+  Path C feature counters/tests, and that documented Mamba3 fallback.
 - The Mamba3 production-shape NaN guard remains green after the public `out=`
   cleanup, the TVM-FFI bridge ordering fix, the native `simd_sum` lowerer, and
   the direct-SIMD long-sequence fail-closed guard.
@@ -404,6 +424,35 @@ cd /private/tmp/tl_apache_tvm_swap
 - Larger extents select generated internal two-pass plans instead of public
   partial outputs.
 
+### 2026-05-17 P3 first-pass green receipt
+
+**Change under test**
+
+- `ReductionPlan` JSON now includes the selected strategy, thread/block mapping,
+  alias constraints, in-place constraint posture, and a memory plan with internal
+  scratch/materialization requirements.
+- Strategy candidates now distinguish `threadgroup-staging`, `row-reduce`,
+  `two-pass-global`, and `vectorized-cpu-fallback`; extents 32/64/96/128/256
+  select single-kernel strategies, while extent 512 selects internal
+  `two-pass-global` metadata with no external materialization.
+
+**Commands and results**
+
+| Command | Result |
+| --- | --- |
+| `pytest testing/python/scheduler/test_reduction_plan.py testing/python/scheduler/test_reduction_legality.py testing/python/scheduler/test_sync_event_plan.py -q` | pass: 17 passed |
+| `pytest testing/python/transform/ -q -k "reduction"` | pass: 32 passed, 202 deselected, 170 warnings |
+| `pytest testing/python/metal/test_metal_reduce.py -q` | pass: 38 passed, 12 warnings |
+| `compileall` for touched analysis/test files | pass |
+| `git diff --check` for touched P3 files | pass |
+
+**Status**
+
+- P3 is green for the first pass and unblocks P4.
+- Perf/codegen review found no lowering behavior change in this package; the
+  generated Metal reduction gate was still rerun to catch accidental strategy
+  drift.
+
 ## P4: Z3 Legality Proofs
 
 ### Planned Changes
@@ -430,6 +479,35 @@ cd /private/tmp/tl_apache_tvm_swap
   overlapping writes.
 - Impossible plans fail before codegen.
 - Proven no-sync plans emit no sync in generated source.
+
+### 2026-05-17 P4 first-pass green receipt
+
+**Change under test**
+
+- Reduction legality now derives alias status from `ReductionPlan` alias
+  constraints instead of recomputing it ad hoc.
+- Tail/broadcast legality is checked against the selected thread mapping:
+  same-simdgroup, split/threadgroup/row-reduce, and two-pass plans all prove
+  that the selected mapping covers the static extent.
+- Added negative index-width coverage with an `int64` reduction extent at
+  `2**31`, which fails before codegen with `extent_legality_unproved`.
+
+**Commands and results**
+
+| Command | Result |
+| --- | --- |
+| `pytest testing/python/scheduler/ -q -k "z3 or legality"` | pass: 8 passed, 11 deselected |
+| `pytest testing/python/analysis/ -q -k "z3 or overflow or alias"` | pass: 7 passed, 10 deselected |
+| `pytest testing/python/metal/ -q -k "hazard or sync or reduce"` | pass: 39 passed, 16 skipped, 104 deselected, 138 warnings |
+| `compileall` for touched legality/test files | pass |
+| `git diff --check` for touched P4 files | pass |
+
+**Status**
+
+- P4 is green for the first pass and unblocks P5.
+- Perf/codegen review: proof metadata changes do not alter generated kernels
+  directly; the Metal hazard/sync/reduce gate was rerun to verify sync decisions
+  and generated no-sync reduction behavior still hold.
 
 ## P5: Sync and Event Planner
 
@@ -466,6 +544,31 @@ PYTHONPATH=/private/tmp/tl_apache_tvm_swap:/private/tmp/tl_apache_tvm_swap/3rdpa
 - Cross-stream/cross-buffer real hazards emit exactly one required event.
 - Debug guard catches stale/null pointer races deterministically.
 
+### First-Pass Receipt - 2026-05-17
+
+| Gate | Result |
+| --- | --- |
+| `pytest testing/python/analysis/test_metal_graph_sync.py testing/python/scheduler/test_sync_event_plan.py testing/python/metal/test_tvm_ffi_metal_stream_dlpack.py -q` | pass: 31 passed, 6 skipped, 54 warnings |
+| `pytest tests -q -k "dlpack or tvm_ffi or path_c"` in cppmega | pass: 298 passed, 1713 deselected, 1 xfailed, 1 warning |
+| focused M2RNN mapped grouped and inline-post VJP regressions | pass |
+| focused sparse-MLA Path C dispatch-gradient regressions | pass |
+| compileall for touched TileLang/cppmega files | pass |
+| `git diff --check` for touched TileLang/cppmega P5 files | pass |
+
+**Status**
+
+- P5 is green for the first pass and unblocks P6.
+- Sync-event JSON now includes selected strategy, memory visibility, scratch
+  scope, and internal/external materialization flags derived from
+  `ReductionPlan.memory_plan` plus the legality proof.
+- The native MLX/TVM-FFI fast path now borrows without waits only when inputs
+  are already compact and have no registered native producer; producer outputs
+  and lazy MLX graph values go through dependency planning/materialization.
+- Remaining risk: grouped M2RNN and non-fp16 sparse-MLA VJPs still use explicit
+  pure-MLX reference fallback where native atomic owner-output accumulation is
+  not yet proven stable. Treat that as P6/P8/P9 performance debt, not a P5
+  correctness blocker.
+
 ## P6: Backend Lowerer Registry
 
 ### Planned Changes
@@ -489,6 +592,33 @@ rg -n "metal|cuda|rocm|simd_sum" tilelang/language tilelang/transform
 - Model generators contain no backend-specific reduction/finalize code.
 - Backend leakage checks are clean or have explicit test/debug allowlist.
 - Lowerer selection is cached and reproducible.
+
+### First-Pass Receipt - 2026-05-17
+
+| Gate | Result |
+| --- | --- |
+| Scheduler registry metadata | `9 passed` |
+| Metal reduce/finalize | `40 passed, 15 skipped, 105 deselected, 138 warnings` |
+| Language reduce | `7 passed, 8 skipped, 220 deselected, 356 warnings` |
+| Hygiene | `compileall` passed for touched backend/analysis/transform/test files; `git diff --check` passed. |
+| Leakage scans | TileLang scan remains nonzero only for target-specific transform passes and the existing FP8 intrinsic surface; cppmega scan shows semantic `T.tvm_thread_allreduce`, feature probes, and tests, not model-owned backend reduction/finalize lowerers. |
+
+Status notes:
+
+- Added backend-owned reduction lowerer registries for Metal, CUDA, ROCm, and
+  CPU. The registry maps ordered scheduler strategies to concrete lowerer names,
+  memory visibility, scratch scope, and materialization requirements.
+- Semantic reduction plans now can attach stable
+  `tl.reduction_backend_lowerers` JSON diagnostics. Metal SIMD lift attaches
+  this metadata beside the existing reduction-plan, legality, and sync-event
+  metadata.
+- Selection is cached by target kind, op, strategy, extent, and accumulator
+  dtype; tests assert repeated Metal selection returns the cached object.
+- CPU uses the ordered candidate list to fall back to `vectorized-cpu-fallback`
+  when the scheduler's first strategy is GPU-oriented.
+- Scan/dependency registry expansion remains a P8/P9 follow-up because there is
+  no reverse recurrence/scan planner surface yet; this P6 pass unblocks P7/P8/P9
+  by making reduction lowerer selection explicit and reproducible.
 
 ## P7: Large-Axis Generated Reductions
 
@@ -521,6 +651,29 @@ PYTHONPATH=/private/tmp/tl_apache_tvm_swap:/private/tmp/tl_apache_tvm_swap/3rdpa
 - No Python host reduction is used for large axes.
 - No public `*_partial` outputs appear in generated model routes.
 
+### First-Pass Receipt - 2026-05-17
+
+| Gate | Result |
+| --- | --- |
+| TileLang Metal `two_pass or reduce` | `47 passed, 15 skipped, 105 deselected, 138 warnings` |
+| cppmega Mamba3 `headdim or bwd` | `28 passed, 25 deselected` |
+| Focused large-axis coverage | TileLang extent matrix `32/64/96/128/256/512/1024` passed; Mamba3 P-thread chooser and aligned-headdim source checks passed (`10 passed, 43 deselected`). |
+| Hygiene | `compileall` passed for touched TileLang/cppmega files; `git diff --check` passed in both repos. |
+
+Status notes:
+
+- TileLang now has explicit codegen coverage for semantic thread-allreduce
+  extents `32`, `64`, `96`, `128`, `256`, `512`, and `1024`. Extents above
+  one simdgroup keep final outputs internal through staged reduction buffers and
+  do not expose public partial outputs.
+- Mamba3 Path C bwd now uses a bwd-specific thread chooser: existing supported
+  real shapes keep their previous `_threads_for` result, while P rows that would
+  otherwise be rejected at `512` or `1024` lanes select a larger legal
+  threadgroup so the whole P row is reducible by TileLang.
+- The Mamba3 public bwd route still rejects public partial owner-output
+  fallbacks; the remaining `mx.sum(dD_bh, axis=0)` is the existing final
+  batch/head aggregation for `dD`, not the removed P-axis host partial reducer.
+
 ## P8: Reverse Recurrence and Scan Planner
 
 ### Planned Changes
@@ -551,6 +704,36 @@ PYTHONPATH=/private/tmp/tl_apache_tvm_swap:/private/tmp/tl_apache_tvm_swap/3rdpa
 - No forced serial-over-T path when chunk parallelization is proven legal.
 - In-place bwd is selected only when alias proof passes.
 - Profiler receipt shows reduced serial recurrence bottleneck on model shapes.
+
+### First-Pass Receipt - 2026-05-17
+
+| Gate | Result |
+| --- | --- |
+| TileLang scheduler `scan or recurrence` | `6 passed, 22 deselected` |
+| cppmega Mamba3 scan/snapshot route | `4 passed, 51 deselected` |
+| cppmega real-parquet HybridTinyLM subprocess regression | `2 passed` |
+| cppmega broad `mamba3 or m2rnn or hybrid` | `378 passed, 1643 deselected` |
+| Hygiene | `compileall` passed for touched TileLang/cppmega files; both worktrees passed `git diff --check`. |
+
+Status notes:
+
+- Added a TileLang recurrence scan planner with direction, chunk count,
+  state-boundary snapshot policy, rematerialization policy, alias/in-place
+  posture, fused post-op metadata, and no host/device sync requirement for the
+  current reverse recurrence plan.
+- Mamba3 Path C bwd now plans its long-sequence reverse recurrence before
+  selecting the state snapshot route, and short sequences keep direct
+  recompute. cppmega keeps a lazy local fallback for subprocesses that import a
+  packaged TileLang without `tilelang.analysis.scan_plan`.
+- The broad cppmega gate exposed two adjacent regressions: HybridTinyLM
+  checkpointing now calls `mx.checkpoint(layer)` so tests can observe the actual
+  decoder layer, and pure Mamba3 `compute_dacs_segsum` now reverses the time
+  axis through `mx.take` instead of a negative-stride cumsum input that could
+  alternate results across repeated MLX evaluations.
+- Perf/codegen review: this is a first planner/control-flow pass. It removes
+  hard-coded long-sequence routing from Mamba3 Path C and records the future
+  fusion choices, but the profiler target in the green criteria remains P9/P10
+  follow-up work because no cost model or autotuned schedule is selected yet.
 
 ## P9: Cost Model and Codegen Cleanup
 
@@ -585,6 +768,34 @@ PYTHONPATH=/private/tmp/tl_apache_tvm_swap:/private/tmp/tl_apache_tvm_swap/3rdpa
 - Scheduler metadata explains hoist/split/inline decisions.
 - Path C generated code moves closer to Path B without model-specific kernels.
 
+### First-Pass Receipt - 2026-05-17
+
+| Gate | Result |
+| --- | --- |
+| Scheduler `cost or register or hoist` | `5 passed, 28 deselected` |
+| Metal `source or reduce` | `50 passed, 15 skipped, 102 deselected, 138 warnings` |
+| cppmega `path_c` | `294 passed, 1726 deselected, 1 xfailed, 1 warning` |
+| Opt-in Metal reduce perf smoke | `3 passed, 12 deselected`; same-simdgroup 32 `0.1536 ms`, cross-simdgroup 128 `0.1717 ms`, row-reduce 256x32 `0.1327 ms` with warmup `1`, iterations `3`. |
+| Hygiene | `cmake --build build -j16` passed; `compileall` passed for touched analysis/transform/test files. |
+
+Status notes:
+
+- Added scheduler-visible reduction cost estimates with register count,
+  local/threadgroup/device scratch bytes, index math ops, dispatch and sync
+  counts, materialization cost, occupancy limiter, and split-vs-inline decision
+  reasons.
+- Added recurrence scan cost estimates for state bytes, snapshot bytes,
+  dispatch count, sync count, and whether the plan is direct recompute,
+  forward scan, or split snapshot reuse.
+- Semantic Metal reduction rewrites now attach `tl.reduction_costs` beside the
+  existing reduction plan, legality, sync-event, and backend-lowerer metadata.
+- Metal batched allreduce template source now hoists repeated
+  `i * workspace_stride` address math into `batch_offset`; the source gate
+  asserts the old repeated red-buffer expressions do not return.
+- Perf/codegen review: this is a static cost and local source cleanup pass, not
+  legal-schedule autotuning. P10 remains responsible for profiling only legal
+  alternatives and caching warm schedules.
+
 ## P10: Autotune, Profiling, and Memoization
 
 ### Planned Changes
@@ -614,6 +825,32 @@ PYTHONPATH=/private/tmp/tl_apache_tvm_swap:/private/tmp/tl_apache_tvm_swap/3rdpa
 - Cache hit/miss/invalidation tests pass.
 - Cold compile is paid once per signature.
 - Warm run records selected schedule, proof hash, cache key, and timing.
+
+### First-Pass Receipt - 2026-05-17
+
+| Gate | Result |
+| --- | --- |
+| TileLang scheduler `autotune or cache` | `6 passed, 32 deselected` |
+| cppmega `profile or bench or path_c` | `411 passed, 1609 deselected, 1 xfailed, 1 warning` |
+| Focused M2RNN order-sensitive regression pair | `2 passed` |
+| Hygiene | `compileall` passed for touched TileLang/cppmega files. |
+
+Status notes:
+
+- Added a legal-schedule warm memoization plan that filters illegal candidates
+  before profiling and memoizes the selected schedule only over legal candidate
+  keys.
+- Schedule keys now include op signature, shape, dtype, target kind, normalized
+  config hash, TileLang/TVM/TVM-FFI/MLX ABI fingerprints, proof hash, and
+  codegen hash. Changing proof, codegen, or ABI fingerprints forces a miss.
+- Warm schedule receipts record selected schedule id/config, selected schedule
+  key, selection cache key, cache hit/miss, cold compile milliseconds, warm run
+  milliseconds, proof hash, codegen hash, profiled candidate count, and skipped
+  illegal candidate count.
+- The broad cppmega gate exposed an order-sensitive M2RNN Path C gradient
+  issue: custom VJP closures were cached only by head layout, so MLX could reuse
+  a custom-function identity across incompatible shapes. The M2RNN Path C
+  closure caches now include tensor shape/dtype signatures.
 
 ## P11: Production Lint
 

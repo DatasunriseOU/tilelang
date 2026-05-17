@@ -13,6 +13,10 @@ import tilelang.language as T
 from tilelang.engine.lower import device_codegen_without_compile, get_device_call
 from tilelang.engine.phase import OptimizeForTarget
 from tilelang.layout import Fragment
+from tilelang.analysis.backend_lowerer_selection import (
+    build_reduction_backend_lowerer_diagnostics,
+)
+from tilelang.backend.reduction import select_reduction_lowerer
 import tilelang.testing
 from tilelang.utils.language import to_buffer_region
 
@@ -317,6 +321,23 @@ def _make_split_thread_allreduce_parallel_kernel(
     return split_thread_allreduce_parallel
 
 
+def _make_nested_same_simdgroup_thread_allreduce_kernel(*, cols=5):
+    @T.prim_func
+    def nested_thread_allreduce(
+        A: T.Tensor((32, cols), T.float32),
+        B: T.Tensor((cols,), T.float32),
+    ):
+        with T.Kernel(1, threads=32):
+            lane = T.get_thread_binding(0)
+            for col in T.serial(cols):
+                reduced = T.alloc_local((1,), T.float32)
+                T.thread_allreduce_sum(A[lane, col], reduced[0], lane)
+                if lane == 0:
+                    B[col] = reduced[0]
+
+    return nested_thread_allreduce
+
+
 def _make_finalize_reducer_kernel(*, rows=4, dtype=T.float32, threads=32):
     layout = Fragment((rows,), forward_fn=lambda i, rep: (rep, i), replicate=threads)
 
@@ -470,6 +491,10 @@ def test_metal_reduce_1024_codegen_uses_simdgroup_cross_fast_path():
     assert "red_buf[final_slot] = result;" in helper_src
     assert "red_buf[local_tid]" not in helper_src
     assert helper_src.count("Barrier::template sync<") == 6
+    assert "const int batch_offset = i * workspace_stride;" in helper_src
+    assert "red_buf[simdgroup_id + i * workspace_stride]" not in helper_src
+    assert "red_buf[lane + i * workspace_stride]" not in helper_src
+    assert "red_buf[final_slot + i * workspace_stride]" not in helper_src
 
 
 def test_metal_template_row_reduce_1024_uses_one_simdgroup_per_row_fast_path():
@@ -559,9 +584,46 @@ def test_metal_lower_thread_allreduce_accepts_split_simdgroup_index():
     src = _lower_source(_make_split_thread_allreduce_kernel())
 
     _assert_no_cuda_reduce_leakage(src)
-    assert "simd_shuffle_down" in src, src
-    assert "simd_shuffle(red_buf0[0], 0)" in src, src
+    assert "simd_sum(accum[0])" in src, src
     assert "red_result[" not in src, src
+
+
+def test_metal_reduction_backend_registry_names_selected_lowerer_and_cache():
+    diagnostics = build_reduction_backend_lowerer_diagnostics(
+        _make_split_thread_allreduce_kernel(reduce_extent=32, groups=1),
+        tvm.target.Target("metal"),
+    )
+    assert len(diagnostics) == 1
+    diagnostic = diagnostics[0]
+    assert diagnostic.lowerer_name == "metal.same-simdgroup.sum"
+    assert diagnostic.lowerer == "tirx.metal.simd_sum"
+    assert diagnostic.selected_strategy == "same-simdgroup"
+    assert diagnostic.memory_visibility_scope == "simdgroup"
+    assert diagnostic.scratch_scope is None
+
+    first = select_reduction_lowerer(
+        tvm.target.Target("metal"),
+        op="sum",
+        strategy="same-simdgroup",
+        reduction_extent=32,
+        accumulator_dtype="float32",
+    )
+    second = select_reduction_lowerer(
+        tvm.target.Target("metal"),
+        op="sum",
+        strategy="same-simdgroup",
+        reduction_extent=32,
+        accumulator_dtype="float32",
+    )
+    assert first is second
+
+
+def test_metal_same_simdgroup_thread_allreduce_keeps_local_buffer_scope():
+    src = _lower_source(_make_nested_same_simdgroup_thread_allreduce_kernel())
+
+    _assert_no_cuda_reduce_leakage(src)
+    assert "simd_sum" in src, src
+    assert "reduced_" not in src, src
 
 
 def test_metal_lower_thread_allreduce_split_cross_simdgroup_reuses_staging_result():
@@ -573,6 +635,23 @@ def test_metal_lower_thread_allreduce_split_cross_simdgroup_reuses_staging_resul
     assert "simd_shuffle_down" in src, src
     assert "red_result[" not in src, src
     assert "red_buf_staging[" in src, src
+
+
+@pytest.mark.parametrize("reduce_extent", [32, 64, 96, 128, 256, 512, 1024])
+def test_metal_thread_allreduce_extent_matrix_keeps_final_outputs_internal(
+    reduce_extent: int,
+):
+    src = _lower_source(
+        _make_split_thread_allreduce_kernel(reduce_extent=reduce_extent, groups=1)
+    )
+
+    _assert_no_cuda_reduce_leakage(src)
+    assert "red_result[" not in src, src
+    if reduce_extent <= 32:
+        assert "simd_sum(accum[0])" in src, src
+        assert "red_buf_staging[" not in src, src
+    else:
+        assert "red_buf_staging[" in src, src
 
 
 def test_metal_lower_thread_allreduce_split_subgroups_broadcast_local_lane():
@@ -601,7 +680,7 @@ def test_metal_lower_thread_allreduce_split_allows_parallel_axis():
     src = _lower_source(_make_split_thread_allreduce_parallel_kernel())
 
     _assert_no_cuda_reduce_leakage(src)
-    assert "simd_shuffle_down" in src, src
+    assert "simd_sum(accum[0])" in src, src
     assert "red_result[" not in src, src
 
 

@@ -470,6 +470,54 @@ def test_tvm_ffi_metal_mlx_owner_output_can_return_graph_alias_without_sync():
 
 
 @tilelang.testing.requires_metal
+def test_tvm_ffi_metal_mlx_owner_output_alias_is_visible_to_downstream_consumer():
+    mx = pytest.importorskip("mlx.core")
+    from tilelang.contrib.mlx_tvm_ffi import (
+        debug_state,
+        is_available as native_bridge_is_available,
+        reset_debug_state,
+    )
+
+    if not native_bridge_is_available():
+        pytest.skip("native MLX TVM-FFI bridge is not built")
+    if not hasattr(mx, "metal") or not hasattr(mx.metal, "_current_command_buffer"):
+        pytest.skip("MLX build does not expose Metal command buffer interop hook")
+
+    previous_output_barrier = os.environ.pop("TILELANG_MLX_TVM_FFI_FORCE_OUTPUT_BARRIER", None)
+    try:
+        with _temporary_env(_ACTIVE_COMPUTE_ENCODER_ENV, "0"):
+            reset_debug_state()
+            size = 65536
+            kernel = tilelang.compile(
+                _make_large_parallel_add_1d_kernel(size=size),
+                target="metal",
+                execution_backend="tvm_ffi",
+                out_idx=-1,
+            )
+
+            source = mx.arange(size, dtype=mx.float32)
+            owner = mx.zeros((size,), dtype=mx.float32)
+            mx.eval(source, owner)
+            returned = kernel(source, owner, _tilelang_mlx_async_owner_outputs=True)
+            consumed = returned * mx.array(2.0, dtype=mx.float32) + source
+            mx.eval(consumed)
+            state = debug_state()
+    finally:
+        if previous_output_barrier is not None:
+            os.environ["TILELANG_MLX_TVM_FFI_FORCE_OUTPUT_BARRIER"] = previous_output_barrier
+
+    assert state["use_active_compute_encoder_enabled"] is False
+    assert state["force_output_barrier_enabled"] is False
+    assert state["direct_device_launches"] >= 1
+    assert state["direct_compute_encoder_launches"] == 0
+    assert state["command_buffers_checked"] >= 1
+    assert _capsule_data_ptr(returned.__dlpack__()) == _capsule_data_ptr(owner.__dlpack__())
+    expected_source = np.arange(size, dtype=np.float32)
+    expected = (expected_source + 1.0) * 2.0 + expected_source
+    np.testing.assert_allclose(np.array(consumed), expected, rtol=1e-6, atol=1e-6)
+
+
+@tilelang.testing.requires_metal
 def test_tvm_ffi_metal_mlx_compact_result_idx_allocates_mlx_output():
     mx = pytest.importorskip("mlx.core")
     if not hasattr(mx, "metal") or not hasattr(mx.metal, "_current_command_buffer"):
@@ -895,3 +943,58 @@ def test_tvm_ffi_metal_cached_host_source_restores_launch_config():
     kernel.adapter.device_mod = None
 
     assert kernel.adapter._metal_launch_config() == ((1, 1, 1), (8, 1, 1))
+
+
+@tilelang.testing.requires_metal
+def test_tvm_ffi_metal_cached_host_wrapper_path_is_graph_ordered():
+    mx = pytest.importorskip("mlx.core")
+    from tilelang.contrib.mlx_tvm_ffi import (
+        debug_state,
+        is_available as native_bridge_is_available,
+        reset_debug_state,
+    )
+
+    if not native_bridge_is_available():
+        pytest.skip("native MLX TVM-FFI bridge is not built")
+
+    previous_boundary = os.environ.pop(
+        "TILELANG_MLX_TVM_FFI_FORCE_COMMAND_BUFFER_BOUNDARY",
+        None,
+    )
+    try:
+        reset_debug_state()
+        kernel = tilelang.compile(
+            _make_large_parallel_add_1d_kernel(size=65536),
+            target="metal",
+            execution_backend="tvm_ffi",
+            out_idx=-1,
+        )
+
+        kernel.adapter.rt_mod = None
+        kernel.adapter.device_mod = None
+        kernel.adapter._post_init()
+
+        source = mx.arange(65536, dtype=mx.float32) * mx.array(
+            1.25,
+            dtype=mx.float32,
+        )
+        mid = kernel.adapter(source)
+        returned = kernel.adapter(mid)
+        mx.eval(returned)
+        state = debug_state()
+    finally:
+        if previous_boundary is not None:
+            os.environ["TILELANG_MLX_TVM_FFI_FORCE_COMMAND_BUFFER_BOUNDARY"] = (
+                previous_boundary
+            )
+
+    assert state["force_command_buffer_boundary_enabled"] is False
+    assert state["direct_device_launches"] == 0
+    assert state["command_buffers_checked"] >= 1
+    expected_source = np.arange(65536, dtype=np.float32) * 1.25
+    np.testing.assert_allclose(
+        np.array(returned),
+        expected_source + 2.0,
+        rtol=1e-6,
+        atol=1e-6,
+    )

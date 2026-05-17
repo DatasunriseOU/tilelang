@@ -172,8 +172,8 @@ class PassConfigKey(str, Enum):
       maps to ``lane_id`` within a single simdgroup), the threadgroup-mem
       reduction is replaced by ``tir.tvm_thread_allreduce`` plus
       ``tl.reduction_plans`` metadata. Backend lowerers then choose whether
-      to emit same-simdgroup, split-simdgroup, threadgroup, or two-pass
-      code. The annotation is required because a
+      to emit same-simdgroup, split-simdgroup, threadgroup-staging, row-reduce,
+      or two-pass code. The annotation is required because a
       bare serial reduction loop does not carry lane-mapping information,
       and rewriting blindly would change semantics.
 

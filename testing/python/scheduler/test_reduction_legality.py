@@ -28,11 +28,12 @@ def _make_thread_allreduce_func(
     *,
     static_extent: bool = True,
     alias_output: bool = False,
+    extent_dtype: str = "int32",
 ) -> tir.PrimFunc:
     src = tir.decl_buffer((max(extent, 1),), "float32", name="src")
     dst = tir.decl_buffer((1,), "float32", name="dst")
     lane = tir.Var("lane", "int32")
-    reduce_index = lane % tir.IntImm("int32", extent) if static_extent else lane
+    reduce_index = lane % tir.IntImm(extent_dtype, extent) if static_extent else lane
     input_load = tir.BufferLoad(dst if alias_output else src, [0 if alias_output else lane])
     reducer = tir.comm_reducer(
         lambda x, y: x + y,
@@ -82,10 +83,24 @@ def test_split_simdgroup_reduction_requires_threadgroup_barrier_only():
         _first_plan(_make_thread_allreduce_func(128))
     )
     assert proof.proved_exact_coverage is True
+    assert proof.proved_tail_broadcast_legal is True
     assert proof.proved_no_sync is False
     assert proof.requires_threadgroup_barrier is True
     assert proof.requires_device_event is False
     assert proof.requires_two_pass is False
+
+
+def test_tail_extent_between_simdgroups_proves_bounds_with_barrier():
+    proof = prove_reduction_plan_legality(
+        _first_plan(_make_thread_allreduce_func(33))
+    )
+    assert proof.proved_exact_coverage is True
+    assert proof.proved_no_oob is True
+    assert proof.proved_tail_broadcast_legal is True
+    assert proof.proved_index_width_safe is True
+    assert proof.requires_threadgroup_barrier is True
+    assert proof.requires_device_event is False
+    assert proof.cannot_parallelize_reason is None
 
 
 def test_large_reduction_requires_two_pass_device_edge():
@@ -93,9 +108,22 @@ def test_large_reduction_requires_two_pass_device_edge():
         _first_plan(_make_thread_allreduce_func(512))
     )
     assert proof.proved_exact_coverage is True
+    assert proof.proved_tail_broadcast_legal is True
     assert proof.requires_threadgroup_barrier is False
     assert proof.requires_device_event is True
     assert proof.requires_two_pass is True
+
+
+def test_extent_over_int32_blocks_index_width_proof():
+    proof = prove_reduction_plan_legality(
+        _first_plan(_make_thread_allreduce_func(1 << 31, extent_dtype="int64"))
+    )
+    assert proof.proved_exact_coverage is False
+    assert proof.proved_no_oob is False
+    assert proof.proved_index_width_safe is False
+    assert proof.proved_tail_broadcast_legal is False
+    assert proof.cannot_parallelize_reason == "extent_legality_unproved"
+    assert "exceeds int32 index limit" in proof.query
 
 
 def test_missing_static_extent_blocks_parallel_proof():
@@ -112,6 +140,7 @@ def test_input_output_alias_requires_explicit_in_place_plan():
         _first_plan(_make_thread_allreduce_func(32, alias_output=True))
     )
     assert proof.proved_exact_coverage is False
+    assert proof.proved_no_read_after_write_hazard is False
     assert proof.proved_in_place_legal is False
     assert proof.cannot_parallelize_reason == "input_output_alias_without_in_place_plan"
 

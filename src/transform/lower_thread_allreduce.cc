@@ -145,10 +145,6 @@ public:
   }
   Stmt VisitStmt_(const AllocateNode *op) {
     Stmt body = this->VisitStmt(op->body);
-    if (auto it = let_remap_.find(op->buffer_var.get());
-        it != let_remap_.end()) {
-      return LetStmt(it->second.first, it->second.second, body);
-    }
     Allocate node(op->buffer_var, op->dtype, op->extents, op->condition, body,
                   op->annotations);
 
@@ -481,16 +477,19 @@ private:
       std::vector<PrimExpr> reduce_results;
       DataType mask_dtype = DataType::UInt(32);
       PrimExpr mask = Call(mask_dtype, builtin::tvm_warp_activemask(), {});
-      bool direct_native_metal_simd_sum_results = false;
 
       if (reduce_extent <= warp_size_) {
         bool native_metal_simd_sum =
             target_->kind->name == "metal" && reduce_extent == warp_size_ &&
             IsSumCombiner(combiner);
-        direct_native_metal_simd_sum_results = native_metal_simd_sum;
         if (native_metal_simd_sum) {
-          reduce_results = MakeMetalNativeSimdSumExprAllreduce(
-              values, types, combiner, std::nullopt);
+          Op simd_sum_op = Op::Get("tirx.metal.simd_sum");
+          for (size_t i = 0; i < size; ++i) {
+            seq.push_back(BufferStore(
+                buffers[i], Call(types[i], simd_sum_op, {values[i]}),
+                {zero_index}));
+          }
+          return SeqStmt::Flatten(seq);
         } else {
           std::tie(reduce_results, new_alloc_bufs) = MakeWarpAllreduce(
               values, types, combiner, reduce_index, reduce_extent, group_index,
@@ -592,16 +591,6 @@ private:
       for (size_t i = 0; i < size; ++i) {
         ICHECK(!load_remap_.count(buffers[i]->data.get()));
         PrimExpr pred = const_true(types[i].lanes());
-        if (direct_native_metal_simd_sum_results) {
-          ICHECK_EQ(reduce_results[i]->dtype, types[i]);
-          Var result_var("reduced_" +
-                             std::to_string(native_simd_sum_counter_++),
-                         types[i]);
-          let_remap_[buffers[i]->data.get()] =
-              std::make_pair(result_var, reduce_results[i]);
-          load_remap_[buffers[i]->data.get()] = result_var;
-          continue;
-        }
         Buffer buf = Downcast<BufferLoad>(reduce_results[i])->buffer;
         ICHECK_EQ(reduce_results[i]->dtype, types[i]);
         load_remap_[buffers[i]->data.get()] = reduce_results[i];
@@ -1024,23 +1013,6 @@ private:
     return false;
   }
 
-  std::vector<PrimExpr> MakeMetalNativeSimdSumExprAllreduce(
-      const std::vector<PrimExpr> &src_values, std::vector<DataType> dtypes,
-      const CommReducerNode *combiner, const Optional<PrimExpr> &predicate) {
-    int n_buffers = src_values.size();
-    std::vector<PrimExpr> results;
-    results.reserve(n_buffers);
-    Op simd_sum_op = Op::Get("tirx.metal.simd_sum");
-    for (int idx = 0; idx < n_buffers; ++idx) {
-      PrimExpr value = src_values[idx];
-      if (predicate.defined()) {
-        value = Select(predicate.value(), value, combiner->identity_element[idx]);
-      }
-      results.push_back(Call(dtypes[idx], simd_sum_op, {value}));
-    }
-    return results;
-  }
-
   std::pair<std::vector<PrimExpr>, std::vector<Buffer>>
   MakeMetalNativeSimdSumAllreduce(std::vector<PrimExpr> src_values,
                                   std::vector<DataType> dtypes,
@@ -1149,17 +1121,12 @@ private:
   std::vector<const CommReducerNode *> reduce_combiner_;
   // The load remap
   std::unordered_map<const VarNode *, PrimExpr> load_remap_;
-  // Replace a single-element allreduce output buffer with a dominating scalar
-  // binding when the backend intrinsic already returns the result to every
-  // lane. This keeps Metal simdgroup collectives outside lane-zero stores.
-  std::unordered_map<const VarNode *, std::pair<Var, PrimExpr>> let_remap_;
   // Allocate remap
   std::unordered_map<const VarNode *, Buffer> alloc_remap_;
   // BufferVar remap
   std::unordered_map<const VarNode *, Var> var_remap_;
   // Buffer remap
   std::unordered_map<const BufferNode *, Buffer> buf_remap_;
-  int native_simd_sum_counter_{0};
   // Internal analyzer
   arith::Analyzer analyzer_;
 };

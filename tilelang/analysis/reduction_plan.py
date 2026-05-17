@@ -11,6 +11,7 @@ from tvm import tir
 
 SAME_SIMDGROUP_MAX = 32
 SINGLE_KERNEL_THREADGROUP_MAX = 256
+METAL_SIMDGROUP_SIZE = 32
 
 
 class ReductionPlanError(ValueError):
@@ -54,6 +55,68 @@ class ReductionAxisPlan:
 
 
 @dataclass(frozen=True)
+class ReductionThreadMapping:
+    """Backend-neutral launch-shape summary for one reduction output."""
+
+    axis: str
+    reduction_extent: int | None
+    simdgroup_size: int
+    threads_per_threadgroup: int | None
+    simdgroups_per_threadgroup: int | None
+    blocks_per_output: int | None
+    selected_strategy: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "axis": self.axis,
+            "reduction_extent": self.reduction_extent,
+            "simdgroup_size": self.simdgroup_size,
+            "threads_per_threadgroup": self.threads_per_threadgroup,
+            "simdgroups_per_threadgroup": self.simdgroups_per_threadgroup,
+            "blocks_per_output": self.blocks_per_output,
+            "selected_strategy": self.selected_strategy,
+        }
+
+
+@dataclass(frozen=True)
+class ReductionAliasConstraints:
+    """Input/output aliasing contract attached before codegen."""
+
+    input_buffer_names: tuple[str, ...]
+    output_buffer_name: str
+    may_alias: bool
+    in_place_allowed: bool
+    constraint: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "input_buffer_names": list(self.input_buffer_names),
+            "output_buffer_name": self.output_buffer_name,
+            "may_alias": self.may_alias,
+            "in_place_allowed": self.in_place_allowed,
+            "constraint": self.constraint,
+        }
+
+
+@dataclass(frozen=True)
+class ReductionMemoryPlan:
+    """Scratch/materialization requirements implied by the selected strategy."""
+
+    visibility_scope: str
+    scratch_scope: str | None
+    internal_scratch_required: bool
+    external_materialization_required: bool
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "visibility_scope": self.visibility_scope,
+            "scratch_scope": self.scratch_scope,
+            "internal_scratch_required": self.internal_scratch_required,
+            "external_materialization_required": self.external_materialization_required,
+        }
+
+
+@dataclass(frozen=True)
 class ReductionPlan:
     """Scheduler-level reduction plan candidates before backend lowering."""
 
@@ -64,6 +127,10 @@ class ReductionPlan:
     predicate: str
     accumulator_dtype: str
     candidate_strategies: tuple[str, ...]
+    selected_strategy: str
+    thread_mapping: ReductionThreadMapping
+    alias_constraints: ReductionAliasConstraints
+    memory_plan: ReductionMemoryPlan
     memory_visibility_scope: str
     aliasing_allowed: bool = False
     in_place: bool = False
@@ -77,6 +144,10 @@ class ReductionPlan:
             "predicate": self.predicate,
             "accumulator_dtype": self.accumulator_dtype,
             "candidate_strategies": list(self.candidate_strategies),
+            "selected_strategy": self.selected_strategy,
+            "thread_mapping": self.thread_mapping.to_json(),
+            "alias_constraints": self.alias_constraints.to_json(),
+            "memory_plan": self.memory_plan.to_json(),
             "memory_visibility_scope": self.memory_visibility_scope,
             "aliasing_allowed": self.aliasing_allowed,
             "in_place": self.in_place,
@@ -145,23 +216,164 @@ def candidate_strategies_for_extent(extent: int | None) -> tuple[str, ...]:
         return (
             "same-simdgroup",
             "split-simdgroup",
-            "threadgroup",
+            "threadgroup-staging",
+            "row-reduce",
             "two-pass-global",
             "vectorized-cpu-fallback",
         )
     if extent <= SAME_SIMDGROUP_MAX:
-        return ("same-simdgroup", "split-simdgroup", "threadgroup")
+        return (
+            "same-simdgroup",
+            "split-simdgroup",
+            "threadgroup-staging",
+            "row-reduce",
+            "vectorized-cpu-fallback",
+        )
     if extent <= SINGLE_KERNEL_THREADGROUP_MAX:
-        return ("split-simdgroup", "threadgroup")
+        return (
+            "split-simdgroup",
+            "threadgroup-staging",
+            "row-reduce",
+            "vectorized-cpu-fallback",
+        )
     return ("two-pass-global", "vectorized-cpu-fallback")
 
 
-def _visibility_scope(strategies: tuple[str, ...]) -> str:
-    if strategies == ("same-simdgroup", "split-simdgroup", "threadgroup"):
+def selected_strategy_for_extent(extent: int | None) -> str:
+    """Return the current scheduler-selected strategy for a reduction extent."""
+
+    if extent is None:
+        return "unresolved"
+    strategies = candidate_strategies_for_extent(extent)
+    return strategies[0] if strategies else "unknown"
+
+
+def _ceildiv(lhs: int, rhs: int) -> int:
+    return (lhs + rhs - 1) // rhs
+
+
+def _visibility_scope(selected_strategy: str) -> str:
+    if selected_strategy == "same-simdgroup":
         return "simdgroup"
-    if "threadgroup" in strategies:
+    if selected_strategy in {"split-simdgroup", "threadgroup-staging", "row-reduce"}:
         return "threadgroup"
     return "device"
+
+
+def _thread_mapping(
+    *,
+    axis: ReductionAxisPlan,
+    selected_strategy: str,
+) -> ReductionThreadMapping:
+    extent = axis.extent
+    if extent is None:
+        threads_per_threadgroup = None
+        simdgroups_per_threadgroup = None
+        blocks_per_output = None
+    else:
+        if selected_strategy == "same-simdgroup":
+            threads_per_threadgroup = METAL_SIMDGROUP_SIZE
+        else:
+            threads_per_threadgroup = min(
+                SINGLE_KERNEL_THREADGROUP_MAX,
+                max(METAL_SIMDGROUP_SIZE, int(extent)),
+            )
+        simdgroups_per_threadgroup = _ceildiv(
+            threads_per_threadgroup,
+            METAL_SIMDGROUP_SIZE,
+        )
+        if selected_strategy == "two-pass-global":
+            blocks_per_output = _ceildiv(int(extent), SINGLE_KERNEL_THREADGROUP_MAX)
+        else:
+            blocks_per_output = 1
+    return ReductionThreadMapping(
+        axis=axis.name,
+        reduction_extent=extent,
+        simdgroup_size=METAL_SIMDGROUP_SIZE,
+        threads_per_threadgroup=threads_per_threadgroup,
+        simdgroups_per_threadgroup=simdgroups_per_threadgroup,
+        blocks_per_output=blocks_per_output,
+        selected_strategy=selected_strategy,
+    )
+
+
+def _alias_constraints(
+    *,
+    input_regions: tuple[BufferRegion, ...],
+    output_region: BufferRegion,
+    in_place: bool,
+) -> ReductionAliasConstraints:
+    input_names = tuple(region.name for region in input_regions)
+    may_alias = any(name == output_region.name for name in input_names)
+    if may_alias and in_place:
+        constraint = "explicit_in_place_plan_required"
+    elif may_alias:
+        constraint = "reject_without_in_place_plan"
+    else:
+        constraint = "distinct_input_output_buffers"
+    return ReductionAliasConstraints(
+        input_buffer_names=input_names,
+        output_buffer_name=output_region.name,
+        may_alias=may_alias,
+        in_place_allowed=in_place,
+        constraint=constraint,
+    )
+
+
+def _memory_plan(selected_strategy: str) -> ReductionMemoryPlan:
+    visibility_scope = _visibility_scope(selected_strategy)
+    if selected_strategy in {"split-simdgroup", "threadgroup-staging", "row-reduce"}:
+        scratch_scope = "threadgroup"
+        internal_scratch_required = True
+    elif selected_strategy == "two-pass-global":
+        scratch_scope = "device"
+        internal_scratch_required = True
+    else:
+        scratch_scope = None
+        internal_scratch_required = False
+    return ReductionMemoryPlan(
+        visibility_scope=visibility_scope,
+        scratch_scope=scratch_scope,
+        internal_scratch_required=internal_scratch_required,
+        external_materialization_required=False,
+    )
+
+
+def _make_plan(
+    *,
+    op: str,
+    input_regions: tuple[BufferRegion, ...],
+    output_region: BufferRegion,
+    axes: tuple[ReductionAxisPlan, ...],
+    predicate: str,
+    accumulator_dtype: str,
+    aliasing_allowed: bool = False,
+    in_place: bool = False,
+) -> ReductionPlan:
+    extent = axes[0].extent if axes else None
+    strategies = candidate_strategies_for_extent(extent)
+    selected_strategy = selected_strategy_for_extent(extent)
+    memory_plan = _memory_plan(selected_strategy)
+    return ReductionPlan(
+        op=op,
+        input_regions=input_regions,
+        output_region=output_region,
+        axes=axes,
+        predicate=predicate,
+        accumulator_dtype=accumulator_dtype,
+        candidate_strategies=strategies,
+        selected_strategy=selected_strategy,
+        thread_mapping=_thread_mapping(axis=axes[0], selected_strategy=selected_strategy),
+        alias_constraints=_alias_constraints(
+            input_regions=input_regions,
+            output_region=output_region,
+            in_place=in_place,
+        ),
+        memory_plan=memory_plan,
+        memory_visibility_scope=memory_plan.visibility_scope,
+        aliasing_allowed=aliasing_allowed,
+        in_place=in_place,
+    )
 
 
 def _region_load(call: tir.Call) -> tir.BufferLoad | None:
@@ -212,16 +424,13 @@ def _plan_from_thread_allreduce_call(call: tir.Call) -> ReductionPlan | None:
         expr=str(reduce_index),
         extent=extent,
     )
-    strategies = candidate_strategies_for_extent(extent)
-    return ReductionPlan(
+    return _make_plan(
         op="sum",
         input_regions=_collect_buffer_loads(value),
         output_region=_buffer_region(out, "write"),
         axes=(axis,),
         predicate=str(predicate),
         accumulator_dtype=str(value.dtype),
-        candidate_strategies=strategies,
-        memory_visibility_scope=_visibility_scope(strategies),
         aliasing_allowed=False,
         in_place=False,
     )
@@ -254,16 +463,13 @@ def _plan_from_tileop_reduce_call(call: tir.Call) -> ReductionPlan | None:
         extent=extent,
         role="block",
     )
-    strategies = candidate_strategies_for_extent(extent)
-    return ReductionPlan(
+    return _make_plan(
         op=_string_value(reduce_kind),
         input_regions=(input_region,),
         output_region=output_region,
         axes=(axis,),
         predicate="T.bool(True)",
         accumulator_dtype=input_region.dtype,
-        candidate_strategies=strategies,
-        memory_visibility_scope=_visibility_scope(strategies),
         aliasing_allowed=False,
         in_place=False,
     )

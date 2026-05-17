@@ -847,6 +847,20 @@ void maybe_encode_command_buffer_boundary(MTL::CommandBuffer* command_buffer, mx
   encode_command_buffer_boundary(command_buffer, stream);
 }
 
+void encode_host_wrapper_command_buffer_boundary(
+    MTL::CommandBuffer* command_buffer,
+    mx::Stream stream,
+    bool direct_device_launch) {
+  if (direct_device_launch) {
+    maybe_encode_command_buffer_boundary(command_buffer, stream);
+    return;
+  }
+  // Disk-cached Metal kernels rehydrate through the TVM host wrapper, which is
+  // opaque to MLX's active compute encoder path. Keep an in-buffer GPU event
+  // boundary around that call so downstream MLX work observes the writes.
+  encode_command_buffer_boundary(command_buffer, stream);
+}
+
 mx::metal::CommandEncoder* get_command_encoder(mx::Stream stream) {
   return &mx::metal::get_command_encoder(stream);
 }
@@ -869,8 +883,7 @@ void register_external_inputs_ptr(
 
 void publish_external_outputs(
     mx::Stream stream,
-    const std::vector<mx::array>& outputs,
-    bool external_dispatch_on_active_encoder = false) {
+    const std::vector<mx::array>& outputs) {
   if (outputs.empty()) {
     return;
   }
@@ -878,14 +891,12 @@ void publish_external_outputs(
   for (const auto& out : outputs) {
     encoder->register_output_array(out);
   }
-  if (external_dispatch_on_active_encoder || env_flag_enabled(kForceOutputBarrierEnv)) {
-    // TVM direct launches borrow MLX's active compute encoder but write through
-    // opaque pointers outside MLX's normal kernel metadata. A GPU-side barrier
-    // makes those writes visible to ordinary downstream MLX consumers in the
-    // same graph without forcing a host sync or command-buffer boundary.
-    encoder->barrier();
-    encoder->end_encoding();
-  }
+  // TVM-FFI Metal launches write through opaque pointers outside MLX's normal
+  // kernel metadata. A GPU-side barrier makes those writes visible to ordinary
+  // downstream MLX consumers in the same graph without forcing a host sync or
+  // command-buffer boundary.
+  encoder->barrier();
+  encoder->end_encoding();
 }
 
 struct PreparedMetalCall : public std::enable_shared_from_this<PreparedMetalCall> {
@@ -1194,7 +1205,7 @@ class TVMFFIMetalCall : public mx::Primitive {
           debug_counters().direct_compute_encoder_launches.fetch_add(1, std::memory_order_relaxed);
           call_direct();
         }
-        publish_external_outputs(stream(), outputs, outputs.size() > 1);
+        publish_external_outputs(stream(), outputs);
         return;
       }
 
@@ -1418,24 +1429,27 @@ class TVMFFIMetalCall : public mx::Primitive {
         debug_counters().direct_compute_encoder_launches.fetch_add(1, std::memory_order_relaxed);
         call_tvm();
       }
-      publish_external_outputs(stream(), outputs, outputs.size() > 1);
+      publish_external_outputs(stream(), outputs);
       release_result();
       return;
     }
     auto* command_buffer = finish_encoding_and_get_command_buffer(stream());
-    maybe_encode_command_buffer_boundary(command_buffer, stream());
+    encode_host_wrapper_command_buffer_boundary(
+        command_buffer, stream(), direct_device_launch);
     encode_device_event_waits(command_buffer, stream(), wait_edges_);
     for (int64_t output_pos : zero_init_output_positions) {
       zero_output_buffer(command_buffer, outputs.at(static_cast<size_t>(output_pos)));
     }
-    maybe_encode_command_buffer_boundary(command_buffer, stream());
+    encode_host_wrapper_command_buffer_boundary(
+        command_buffer, stream(), direct_device_launch);
 
     {
       ExternalCommandBufferScope external(command_buffer);
       call_tvm();
     }
     encode_device_event_signals(command_buffer, stream(), signal_edges);
-    maybe_encode_command_buffer_boundary(command_buffer, stream());
+    encode_host_wrapper_command_buffer_boundary(
+        command_buffer, stream(), direct_device_launch);
     publish_external_outputs(stream(), outputs);
     release_result();
     if (env_flag_enabled(kDebugCompletionEnv)) {

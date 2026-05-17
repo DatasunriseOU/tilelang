@@ -143,6 +143,18 @@ def _contiguous_mlx_input(value: Any) -> Any:
     return native.compact_input(value)
 
 
+def _can_use_borrowed_no_wait(values: Iterable[Any]) -> bool:
+    native = _load_native_module()
+    for value in values:
+        if not _is_mlx_array(value):
+            continue
+        if has_mlx_tvm_ffi_producer(value):
+            return False
+        if not native.can_borrow_compact_input(value):
+            return False
+    return True
+
+
 def prepare_metal_call(
     func: Any,
     *,
@@ -208,21 +220,22 @@ def prepared_metal_call(
     native = _load_native_module()
     raw_input_list = list(inputs)
     owner_output_list = None if owner_outputs is None else list(owner_outputs)
-    fast_result = native.prepared_metal_call_borrowed_no_wait(
-        prepared,
-        raw_input_list,
-        owner_output_list,
-    )
-    if fast_result is not None:
-        outputs, launch_sync_state = fast_result
-        output_list = list(outputs)
-        register_mlx_tvm_ffi_outputs(
-            output_list,
-            launch_sync_state,
-            dependency_metadata=dependency_metadata,
-            command_buffer_domain=command_buffer_domain,
+    if _can_use_borrowed_no_wait(raw_input_list):
+        fast_result = native.prepared_metal_call_borrowed_no_wait(
+            prepared,
+            raw_input_list,
+            owner_output_list,
         )
-        return output_list
+        if fast_result is not None:
+            outputs, launch_sync_state = fast_result
+            output_list = list(outputs)
+            register_mlx_tvm_ffi_outputs(
+                output_list,
+                launch_sync_state,
+                dependency_metadata=dependency_metadata,
+                command_buffer_domain=command_buffer_domain,
+            )
+            return output_list
 
     input_list = [_contiguous_mlx_input(value) for value in raw_input_list]
     launch_sync_state, wait_edges = plan_mlx_tvm_ffi_launch(
@@ -272,24 +285,27 @@ def prepared_metal_call_args(
     """
 
     native = _load_native_module()
-    fast_result = native.prepared_metal_call_borrowed_no_wait_args(
-        prepared,
-        int(owner_output_count),
-        *args,
-    )
-    if fast_result is not None:
-        outputs, launch_sync_state = fast_result
-        output_list = list(outputs)
-        register_mlx_tvm_ffi_outputs(
-            output_list,
-            launch_sync_state,
-            dependency_metadata=dependency_metadata,
-            command_buffer_domain=command_buffer_domain,
+    owner_output_count_int = int(owner_output_count)
+    input_args = args[: len(args) - owner_output_count_int] if owner_output_count_int else args
+    if _can_use_borrowed_no_wait(input_args):
+        fast_result = native.prepared_metal_call_borrowed_no_wait_args(
+            prepared,
+            owner_output_count_int,
+            *args,
         )
-        return output_list
+        if fast_result is not None:
+            outputs, launch_sync_state = fast_result
+            output_list = list(outputs)
+            register_mlx_tvm_ffi_outputs(
+                output_list,
+                launch_sync_state,
+                dependency_metadata=dependency_metadata,
+                command_buffer_domain=command_buffer_domain,
+            )
+            return output_list
 
-    if owner_output_count:
-        split = len(args) - int(owner_output_count)
+    if owner_output_count_int:
+        split = len(args) - owner_output_count_int
         return prepared_metal_call(
             prepared,
             inputs=args[:split],
@@ -316,30 +332,32 @@ def prepared_metal_call_single_arg(
 
     native = _load_native_module()
     owner_output_count_int = int(owner_output_count)
-    if owner_output_count_int == 1 and len(args) == 5:
-        fast_result = native.prepared_metal_call_borrowed_no_wait_4in1out_single(
-            prepared,
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-        )
-    else:
-        fast_result = native.prepared_metal_call_borrowed_no_wait_args_single(
-            prepared,
-            owner_output_count_int,
-            *args,
-        )
-    if fast_result is not None:
-        output, launch_sync_state = fast_result
-        register_mlx_tvm_ffi_output(
-            output,
-            launch_sync_state,
-            dependency_metadata=dependency_metadata,
-            command_buffer_domain=command_buffer_domain,
-        )
-        return output
+    input_args = args[: len(args) - owner_output_count_int] if owner_output_count_int else args
+    if _can_use_borrowed_no_wait(input_args):
+        if owner_output_count_int == 1 and len(args) == 5:
+            fast_result = native.prepared_metal_call_borrowed_no_wait_4in1out_single(
+                prepared,
+                args[0],
+                args[1],
+                args[2],
+                args[3],
+                args[4],
+            )
+        else:
+            fast_result = native.prepared_metal_call_borrowed_no_wait_args_single(
+                prepared,
+                owner_output_count_int,
+                *args,
+            )
+        if fast_result is not None:
+            output, launch_sync_state = fast_result
+            register_mlx_tvm_ffi_output(
+                output,
+                launch_sync_state,
+                dependency_metadata=dependency_metadata,
+                command_buffer_domain=command_buffer_domain,
+            )
+            return output
 
     outputs = prepared_metal_call_args(
         prepared,
@@ -367,23 +385,24 @@ def prepared_metal_call_4in1out_single(
     """Create one MLX graph output for the hot 4-input/1-owner-output ABI."""
 
     native = _load_native_module()
-    fast_result = native.prepared_metal_call_borrowed_no_wait_4in1out_single(
-        prepared,
-        a0,
-        a1,
-        a2,
-        a3,
-        owner_output,
-    )
-    if fast_result is not None:
-        output, launch_sync_state = fast_result
-        register_mlx_tvm_ffi_output(
-            output,
-            launch_sync_state,
-            dependency_metadata=dependency_metadata,
-            command_buffer_domain=command_buffer_domain,
+    if _can_use_borrowed_no_wait((a0, a1, a2, a3)):
+        fast_result = native.prepared_metal_call_borrowed_no_wait_4in1out_single(
+            prepared,
+            a0,
+            a1,
+            a2,
+            a3,
+            owner_output,
         )
-        return output
+        if fast_result is not None:
+            output, launch_sync_state = fast_result
+            register_mlx_tvm_ffi_output(
+                output,
+                launch_sync_state,
+                dependency_metadata=dependency_metadata,
+                command_buffer_domain=command_buffer_domain,
+            )
+            return output
 
     return prepared_metal_call_single_arg(
         prepared,
