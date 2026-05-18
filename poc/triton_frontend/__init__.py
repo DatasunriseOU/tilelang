@@ -692,6 +692,10 @@ def _compile_to_ttir(
 
     try:
         return triton_jit_to_ttir(fn, constexprs=constexprs, target=target)
+    except ValueError:
+        # Harness raises ValueError when LLVM / backends are missing
+        # locally — the xfail-marked test relies on this. Propagate.
+        raise
     except (TTIRCaptureError, TritonUnavailable) as exc:
         raise RuntimeError(
             f"Could not stop Triton compilation at the TTIR stage: {exc}"
