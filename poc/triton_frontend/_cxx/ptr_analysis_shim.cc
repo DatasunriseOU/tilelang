@@ -434,6 +434,40 @@ const char* tl_pa_extract_states_json(TLPtrAnalysisModule* mod) {
 
     arr.push_back(std::move(entry));
   });
+  // Also surface tt.load / tt.store memory ops so the Python ptr_analysis
+  // wrapper can correlate the recovered PtrState with the actual mem-op
+  // it feeds. These records have op_kind = "tt.load" / "tt.store" and a
+  // smaller field set than MakeTensorPtrOp records: only ``ptr``, optional
+  // ``mask``, the printed ``offsets`` (the static offsets attribute, when
+  // present), and the ``boundary_check`` attribute list.
+  auto pushMemOp = [&](mlir::Operation* op,
+                       const char* kind,
+                       mlir::Value ptr,
+                       mlir::Value mask) {
+    std::string opStr;
+    {
+      llvm::raw_string_ostream s(opStr);
+      op->print(s);
+    }
+    nlohmann::ordered_json entry;
+    entry["op"] = opStr;
+    entry["op_kind"] = kind;
+    entry["ptr"] = fmtValueAsOperand(ptr, asmState);
+    if (mask) entry["mask"] = fmtValueAsOperand(mask, asmState);
+    nlohmann::ordered_json bcArr = nlohmann::ordered_json::array();
+    if (auto bcAttr = op->getAttrOfType<mlir::DenseI32ArrayAttr>(
+            "boundary_check")) {
+      for (int32_t v : bcAttr.asArrayRef()) bcArr.push_back(v);
+    }
+    entry["boundary_check"] = std::move(bcArr);
+    arr.push_back(std::move(entry));
+  };
+  moduleOp.walk([&](mlir::triton::LoadOp op) {
+    pushMemOp(op, "tt.load", op.getPtr(), op.getMask());
+  });
+  moduleOp.walk([&](mlir::triton::StoreOp op) {
+    pushMemOp(op, "tt.store", op.getPtr(), op.getMask());
+  });
   m->statesJson = arr.dump();
 #  else
   // ---- hand-rolled RFC-8259 encoder ---------------------------------------
@@ -485,6 +519,47 @@ const char* tl_pa_extract_states_json(TLPtrAnalysisModule* mod) {
     os << "]";
 
     os << "}";
+  });
+  // Parallel emission of tt.load / tt.store records in the hand-rolled
+  // path. Schema matches the nlohmann encoder above: op, op_kind, ptr,
+  // optional mask, boundary_check.
+  auto emitMemOp = [&](mlir::Operation* op,
+                       const char* kind,
+                       mlir::Value ptr,
+                       mlir::Value mask) {
+    if (!first) os << ",";
+    first = false;
+    std::string opStr;
+    {
+      llvm::raw_string_ostream s(opStr);
+      op->print(s);
+    }
+    os << "{\"op\":\"" << jsonEscape(opStr) << "\"";
+    os << ",\"op_kind\":\"" << kind << "\"";
+    os << ",\"ptr\":\""
+       << jsonEscape(fmtValueAsOperand(ptr, asmState)) << "\"";
+    if (mask) {
+      os << ",\"mask\":\""
+         << jsonEscape(fmtValueAsOperand(mask, asmState)) << "\"";
+    }
+    os << ",\"boundary_check\":[";
+    if (auto bcAttr = op->getAttrOfType<mlir::DenseI32ArrayAttr>(
+            "boundary_check")) {
+      bool firstBc = true;
+      for (int32_t v : bcAttr.asArrayRef()) {
+        if (!firstBc) os << ",";
+        firstBc = false;
+        os << v;
+      }
+    }
+    os << "]";
+    os << "}";
+  };
+  moduleOp.walk([&](mlir::triton::LoadOp op) {
+    emitMemOp(op, "tt.load", op.getPtr(), op.getMask());
+  });
+  moduleOp.walk([&](mlir::triton::StoreOp op) {
+    emitMemOp(op, "tt.store", op.getPtr(), op.getMask());
   });
   os << "]";
   m->statesJson = os.str();

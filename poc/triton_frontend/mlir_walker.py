@@ -182,13 +182,19 @@ def try_import_mlir() -> Optional[ModuleType]:
     _augment_sys_path_from_env()
     try:
         from mlir import ir  # type: ignore  # noqa: WPS433
-        from mlir.dialects import func, arith, scf, tensor, math  # type: ignore # noqa: F401
-        return ir
     except Exception:  # ImportError or platform-specific dynload failure
         if not _WARNED_ONCE:
             _WARNED_ONCE = True
             warnings.warn(DEGRADED_WARNING_MESSAGE, UserWarning, stacklevel=2)
         return None
+    # Dialect Python wrappers (``mlir.dialects.func`` etc.) are NOT
+    # required: the walker dispatches via OP_TABLE on string op names
+    # and never instantiates dialect-Python classes. Pre-loading dialect
+    # C-extensions here can also conflict with later ``triton._C`` loads
+    # on macOS (LLVM CommandLine option re-registration). Skip the
+    # dialect probe entirely and let downstream tests pay for whatever
+    # dialects they actually need.
+    return ir
 
 
 def parse_ttir(text: str) -> Optional[Any]:
@@ -210,12 +216,25 @@ def parse_ttir(text: str) -> Optional[Any]:
         return None
 
     register_dialects = None
+    # Skip loading the C++ shim's MLIR context registration when the
+    # active ``mlir.ir`` provider is a foreign-LLVM alias (jaxlib, IREE).
+    # Loading the shim's .so in-process registers a *second* set of MLIR
+    # types under the same nanobind enumeration names and aborts with
+    # "type was already registered". We don't need the shim's dialect
+    # registration to parse TTIR because we set
+    # ``allow_unregistered_dialects = True`` below.
     try:
-        from poc.triton_frontend.ptr_analysis import shim_available, _load_shim
-        if shim_available():
-            register_dialects = _load_shim().register_dialects
-    except ImportError:
-        pass
+        from poc.triton_frontend import _mlir_path_setup as _setup
+        _foreign_alias = _setup.SELECTED_SOURCE in {"jaxlib", "iree"}
+    except Exception:
+        _foreign_alias = False
+    if not _foreign_alias:
+        try:
+            from poc.triton_frontend.ptr_analysis import shim_available, _load_shim
+            if shim_available():
+                register_dialects = _load_shim().register_dialects
+        except ImportError:
+            pass
 
     try:
         ctx = ir.Context()
@@ -530,19 +549,7 @@ def wrap_module_for_walker(module: Any) -> Any:
 
 
 def _bootstrap_and_probe() -> bool:
-    """Run :func:`bootstrap_jaxlib_alias` then probe ``mlir.ir``.
-
-    Imported lazily to avoid a circular import: ``_mlir_path_setup`` is
-    a sibling module, and the package ``__init__`` already imports it
-    before us, so by now its attributes are reachable.
-    """
-    try:
-        from ._mlir_path_setup import bootstrap_jaxlib_alias  # noqa: WPS433
-        bootstrap_jaxlib_alias()
-    except Exception:
-        # Don't let the bootstrap failure mask the underlying probe;
-        # ``try_import_mlir`` will surface the degraded-mode warning.
-        pass
+    """Probe ``mlir.ir`` after :mod:`_mlir_path_setup` ran its safe probes."""
     return try_import_mlir() is not None
 
 

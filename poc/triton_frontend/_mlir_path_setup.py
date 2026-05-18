@@ -181,6 +181,16 @@ def bootstrap_jaxlib_alias() -> bool:
     sys.modules.setdefault("mlir.ir", jaxlib_mlir_ir)
 
     # Forward optional sub-modules if jaxlib exposes them (best-effort).
+    # We deliberately do NOT pre-load dialect C-extensions
+    # (``jaxlib.mlir.dialects.func`` etc.) here: each generated dialect
+    # module is a distinct shared object that links its own LLVM, and on
+    # macOS LLVM's CommandLine option registry is process-global, so
+    # pre-loading the dialect extensions can race with later
+    # ``triton._C`` / C++ shim loads and surface as
+    # ``LLVM ERROR: Option 'basic' already exists!``. The walker only
+    # needs ``mlir.ir`` to parse TTIR + dispatch via OP_TABLE; dialect-
+    # specific introspection (test_op_emitters_memory) is handled lazily
+    # via ``pytest.importorskip("jaxlib.mlir.ir")`` in those tests.
     for sub in ("passmanager", "dialects"):
         try:
             import importlib
@@ -241,11 +251,17 @@ def probe_and_wire_mlir() -> Optional[str]:
         SELECTED_SOURCE = "iree"
         return iree_path
 
-    # Probe 4: jaxlib's bundled mlir bindings (jaxlib.mlir.*). On the
-    # venv313 host this is the only path that lights up; aliased into
-    # ``sys.modules['mlir']`` without touching sys.path so the bundled
-    # ``jaxlib/triton/`` subpackage does not shadow the real Triton.
-    if bootstrap_jaxlib_alias():
+    # Probe 4: jaxlib's bundled mlir bindings (jaxlib.mlir.*). Do not do
+    # this before Triton is loaded: pre-aliasing jaxlib's MLIR dialect
+    # extension and then importing Triton's native bindings can trigger
+    # nanobind duplicate-registration aborts. Numeric harnesses load Triton
+    # first, then call ``bootstrap_jaxlib_alias`` just before MLIR parsing.
+    triton_already_loaded = any(
+        name == "triton" or name.startswith("triton.")
+        for name in sys.modules
+    )
+    eager_jaxlib = os.environ.get("TRITON_FRONTEND_EAGER_JAXLIB_MLIR") == "1"
+    if (triton_already_loaded or eager_jaxlib) and bootstrap_jaxlib_alias():
         try:
             import jaxlib.mlir  # type: ignore  # noqa: WPS433
             jaxlib_path = os.path.dirname(jaxlib.mlir.__file__)

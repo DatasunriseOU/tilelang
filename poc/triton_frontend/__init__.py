@@ -45,6 +45,15 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # its existing one-shot UserWarning unchanged.
 from . import _mlir_path_setup  # noqa: F401  (import-time side effect)
 
+# Explicit second probe: ``_mlir_path_setup`` runs ``probe_and_wire_mlir()``
+# at module load, but jaxlib aliasing is deferred unless Triton is already
+# loaded (to avoid nanobind / LLVM CL conflicts when Triton subsequently
+# loads its own ``_C`` bindings). When the caller has pre-loaded Triton
+# (e.g. via the numeric harness) the import-time probe missed; calling it
+# again here picks up the jaxlib alias before downstream callers consult
+# ``MLIR_WALKER_AVAILABLE``. The call is idempotent and cheap.
+_mlir_path_setup.probe_and_wire_mlir()
+
 from .mlir_walker import (
     DEGRADED_WARNING_MESSAGE as _DEGRADED_WARNING_MESSAGE,
     MLIR_WALKER_AVAILABLE,
@@ -1004,6 +1013,15 @@ def from_ttir(
         A TileLang ``PrimFunc`` ready for :mod:`pipeline` lowering.
     """
     global _FALLBACK_WARNED
+    # Re-probe MLIR bindings: by the time ``from_ttir`` is invoked the
+    # caller has typically loaded Triton (to obtain TTIR), so the jaxlib
+    # alias path that was deferred at package import time is now safe.
+    # ``probe_and_wire_mlir`` is idempotent; the second call is a cheap
+    # ``mlir.ir in sys.modules`` check when the first probe already won.
+    try:
+        _mlir_path_setup.probe_and_wire_mlir()
+    except Exception:
+        pass
     ctx = WalkerCtx()
     # Plumb optional ``num_warps`` / ``num_stages`` overrides supplied by
     # the harness (which captures them from Triton's compile options) so
@@ -1020,7 +1038,12 @@ def from_ttir(
         # mlir.ir bindings aren't available we degrade to the regex
         # walker, but only with explicit opt-in (_allow_text_ttir) and
         # a one-shot UserWarning.
-        parsed = parse_ttir(ttir_module) if MLIR_WALKER_AVAILABLE else None
+        # Re-probe MLIR availability at call-time (rather than relying on
+        # the module-load snapshot ``MLIR_WALKER_AVAILABLE``) so the
+        # jaxlib alias wired by ``probe_and_wire_mlir()`` above is picked
+        # up even on the first invocation.
+        _mlir_now_available = try_import_mlir() is not None
+        parsed = parse_ttir(ttir_module) if _mlir_now_available else None
         if parsed is not None:
             _walk_mlir_module(parsed, ctx)
             return getattr(ctx, "prim_func", None)
