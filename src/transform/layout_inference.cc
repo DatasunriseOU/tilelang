@@ -48,6 +48,64 @@ using namespace tirx;
 
 namespace {
 
+// PR #2140 (Copilot review comment #2): mirror the Python
+// ``is_simdgroup_eligible`` predicate from
+// ``tilelang/transform/metal_fragment_to_simdgroup.py`` so the inference site
+// below can distinguish fragments that will be promoted to
+// ``metal.simdgroup`` from those that must still carry an inferred layout.
+//
+// The Python predicate is the SOURCE OF TRUTH; this is the static branch only
+// (the Python Z3 fallback is detection-only and never flips the rewrite, so
+// the static check matches the actual IR rewrite gate). It accepts:
+//   * dtype in {f16, bf16, fp8 (e4m3*, e5m2*), int8, uint8}
+//   * rank >= 2
+//   * last two dims are constant positive multiples of 8
+bool IsSimdgroupEligibleDType(const DataType &dtype) {
+  if (dtype.lanes() != 1) {
+    return false;
+  }
+  if (dtype.is_float16() || dtype.is_bfloat16()) {
+    return true;
+  }
+  if (dtype.is_float8()) {
+    // covers e4m3, e4m3fn, e4m3fnuz, e4m3b11fnuz, e5m2, e5m2fnuz, e8m0fnu,
+    // e3m4 — matches the Python startswith("e4m3"|"e5m2") plus the broader
+    // "fp8" set the Python helper accepts.
+    return true;
+  }
+  if (dtype.code() == DataType::kInt && dtype.bits() == 8) {
+    return true;
+  }
+  if (dtype.code() == DataType::kUInt && dtype.bits() == 8) {
+    return true;
+  }
+  return false;
+}
+
+bool IsSimdgroupEligible(const Buffer &buffer) {
+  if (!buffer.defined()) {
+    return false;
+  }
+  if (!IsSimdgroupEligibleDType(buffer->dtype)) {
+    return false;
+  }
+  const auto &shape = buffer->shape;
+  if (shape.size() < 2) {
+    return false;
+  }
+  for (size_t i = shape.size() - 2; i < shape.size(); ++i) {
+    const auto *imm = shape[i].as<IntImmNode>();
+    if (imm == nullptr) {
+      return false;  // conservative: Python rejects symbolic shapes
+    }
+    int64_t v = imm->value;
+    if (v <= 0 || (v % 8) != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 int64_t GetElementStorageBits(DataType dtype) {
   // Layout aliasing must be reasoned about in logical storage bits per element,
   // not in bytes.  For sub-byte dtypes such as fp4, `dtype.bytes()` rounds up
@@ -447,19 +505,16 @@ public:
     // (MetalFragmentToSimdgroup) and have no explicit thread-level layout
     // here. PR #2140 review (Copilot #2) flagged the blanket Metal skip as
     // too broad: ideally only the GEMM-accumulator fragments would be
-    // whitelisted, while other fragment buffers on Metal would still
-    // require an inferred layout. We attempted to narrow to
-    // ``buffer.scope() == "metal.simdgroup"`` but at this point in the
-    // pipeline fragments have not yet been remapped, so the whitelist is
-    // empty and the check ICHECKs on real Metal GEMMs (see
-    // testing/python/metal/test_tvm_ffi_metal_stream_dlpack.py). A precise
-    // classifier needs either (a) re-running ``is_simdgroup_eligible``
-    // from C++ here, or (b) carrying the future scope through buffer
-    // metadata before layout inference runs.
-    // TODO(copilot-#2): wire (a) or (b) instead of the blanket Metal skip.
+    // whitelisted. We now re-run the Python ``is_simdgroup_eligible``
+    // predicate from C++ (see ``IsSimdgroupEligible`` above) so that only
+    // fragments the downstream rewrite WILL actually promote are exempted;
+    // every other Metal fragment still has to carry a fully inferred layout
+    // and trips the invariant when it does not.
     for (const auto &[buffer, _] : use_list_) {
       if (IsFragmentBuffer(buffer)) {
-        if (!TargetIsMetal(target_) && layout_map.count(buffer) == 0) {
+        const bool metal_eligible =
+            TargetIsMetal(target_) && IsSimdgroupEligible(buffer);
+        if (!metal_eligible && layout_map.count(buffer) == 0) {
           ICHECK(false) << "The layout for fragment " << buffer
                         << " can not be inferred correctly.";
         }
