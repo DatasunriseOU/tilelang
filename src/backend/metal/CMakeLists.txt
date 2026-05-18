@@ -3,6 +3,11 @@
 # Metal codegen is pure C++ and can generate Metal shader source on any
 # platform. Always compile it so target.build.tilelang_metal is available for
 # cross-compilation and source-level tests on non-Apple hosts.
+#
+# Note (PR #2140 Copilot review comment #6): codegen_metal.cc must NOT
+# unconditionally include ``runtime/metal/metal_module.h`` (an Apple-only
+# header). Verified: the current file pulls in no Metal runtime headers,
+# so listing it for every build is safe on Linux/Windows as well.
 list(APPEND TILE_LANG_SRCS
   src/target/codegen_metal.cc
 )
