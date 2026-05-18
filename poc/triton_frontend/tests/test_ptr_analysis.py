@@ -231,19 +231,29 @@ def test_rewrite_error_is_cached_and_re_raised() -> None:
 def test_run_ptr_analysis_with_states_is_cached() -> None:
     from poc.triton_frontend.ptr_analysis import run_ptr_analysis_with_states, _load_shim
     from unittest.mock import patch
-    
+
     run_ptr_analysis_with_states.cache_clear()
-    
+
     with patch("poc.triton_frontend.ptr_analysis._load_shim") as mock_load_shim:
         class DummyShim:
             def run_ptr_analysis_with_states(self, text):
+                # Intentionally returns the minimal `{"op": ...}` schema so the
+                # parser exercises Path B (printed-op regex fallback). Filter the
+                # one-shot RuntimeWarning emitted by that path; this test is
+                # about LRU caching, not the JSON shape.
                 return text + "_rewritten", '[{"op": "dummy"}]'
-        
+
         mock_load_shim.return_value = DummyShim()
-        
-        res1 = run_ptr_analysis_with_states("test_module_1")
-        res2 = run_ptr_analysis_with_states("test_module_1")
-        
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r".*missing fields.*",
+                category=RuntimeWarning,
+            )
+            res1 = run_ptr_analysis_with_states("test_module_1")
+            res2 = run_ptr_analysis_with_states("test_module_1")
+
         assert res1 == res2
         # The shim should only be requested and called once
         mock_load_shim.assert_called_once()

@@ -43,6 +43,8 @@
 #include <string>
 #include <unordered_set>
 
+#include "mlir/IR/AsmState.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
@@ -287,74 +289,202 @@ TLPtrAnalysisStatus tl_pa_run_structured_to_memref(TLPtrAnalysisModule* mod) {
   return TL_PA_OK;
 }
 
+}  // extern "C"
+
+namespace {
+
+// Pretty-print a single OpFoldResult to a compact string suitable for the
+// JSON value inside an `offsets`/`sizes`/`strides`/`shape` array.
+//
+//   - Static IntegerAttr  -> the bare integer literal ("0", "16", "-1")
+//   - Dynamic Value       -> the SSA name without type ("%c5", "%arg2")
+//   - Anything else       -> fall back to `operator<<`
+//
+// We deliberately strip the leading whitespace `operator<<` adds for Values
+// (Value::print emits "%name : type" with surrounding spaces) so the JSON
+// stays consistent with the existing regex-based fallback in
+// `ptr_analysis.py::_TPTR_RE`, which expects bare SSA names like `%2`.
+std::string fmtOpFoldResult(mlir::OpFoldResult ofr, mlir::AsmState& asmState) {
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  if (auto attr = llvm::dyn_cast_if_present<mlir::Attribute>(ofr)) {
+    if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr)) {
+      // getInt() handles signed; use APInt to be safe across widths.
+      intAttr.getValue().print(os, /*isSigned=*/true);
+    } else {
+      attr.print(os);
+    }
+  } else if (auto val = llvm::dyn_cast_if_present<mlir::Value>(ofr)) {
+    val.printAsOperand(os, asmState);
+  } else {
+    os << "<null>";
+  }
+  os.flush();
+  return out;
+}
+
+// Pretty-print an MLIR Value as its SSA operand name only (no type suffix).
+std::string fmtValueAsOperand(mlir::Value v, mlir::AsmState& asmState) {
+  if (!v) return {};
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  v.printAsOperand(os, asmState);
+  os.flush();
+  return out;
+}
+
+// RFC-8259 escape a UTF-8 string for embedding inside JSON quotes. This must
+// stay byte-identical to nlohmann::json::dump()'s default escaping so the two
+// encoder branches agree (regression-tested in test_ptr_analysis.py).
+std::string jsonEscape(llvm::StringRef in) {
+  std::string esc;
+  esc.reserve(in.size() + 2);
+  for (unsigned char uc : in) {
+    switch (uc) {
+      case '\\': esc += "\\\\"; break;
+      case '"':  esc += "\\\""; break;
+      case '\b': esc += "\\b";  break;
+      case '\f': esc += "\\f";  break;
+      case '\n': esc += "\\n";  break;
+      case '\r': esc += "\\r";  break;
+      case '\t': esc += "\\t";  break;
+      default:
+        if (uc < 0x20) {
+          static const char kHex[] = "0123456789abcdef";
+          char buf[7] = {'\\', 'u', '0', '0',
+                         kHex[(uc >> 4) & 0xF], kHex[uc & 0xF], '\0'};
+          esc += buf;
+        } else {
+          esc += static_cast<char>(uc);
+        }
+        break;
+    }
+  }
+  return esc;
+}
+
+}  // namespace
+
+extern "C" {
+
 const char* tl_pa_extract_states_json(TLPtrAnalysisModule* mod) {
   if (!mod) return "";
   auto* m = reinterpret_cast<ModuleImpl*>(mod);
-  // Walk tts.make_tptr ops and serialize their printed form. Two encoders are
-  // supported and are REQUIRED to emit byte-identical output for the current
-  // minimal schema -- the regression test in tests/test_ptr_analysis.py
-  // guards the contract:
-  //   `[]`                        -> empty
-  //   `[{"op":"<escaped>"}]`      -> compact, no spaces, no trailing newline
+  // Walk tts.make_tptr ops and serialize the recovered PtrState fields. Two
+  // encoders are supported and are REQUIRED to emit byte-identical output
+  // for the schema below -- the regression test in
+  // tests/test_ptr_analysis.py guards the contract:
+  //
+  //   `[]` when there are no make_tptr ops; otherwise an array of objects
+  //   whose keys appear in this fixed order so both encoder branches agree
+  //   byte-for-byte:
+  //
+  //     {"op": "<escaped printed op>",
+  //      "result_ssa": "%2",
+  //      "source": "%arg0",
+  //      "offsets": ["0", "%c5"],
+  //      "sizes":   ["4", "256"],
+  //      "strides": ["1", "256"],
+  //      "shape":   ["0", "0"],
+  //      "order":   [0, 1]}
+  //
+  // Empty arrays / null source are still emitted explicitly so Python's
+  // Path-A parser (see _parse_states_json) picks them up without needing
+  // to fall back to printed-op regex parsing.
   //
   // The default is a hand-rolled RFC-8259 escaper (no third-party deps);
   // -DTRITON_FRONTEND_USE_NLOHMANN_JSON=ON swaps it for nlohmann::json.
+  mlir::ModuleOp moduleOp = m->module.get();
+  // Build one AsmState per module so SSA numbering matches what the module
+  // printer would use -- this keeps the source/offsets/sizes/strides strings
+  // consistent with the `op` field's printed form.
+  mlir::AsmState asmState(moduleOp);
+
 #  ifdef TL_PA_USE_NLOHMANN_JSON
   // ---- nlohmann::json encoder ---------------------------------------------
-  nlohmann::json arr = nlohmann::json::array();
-  m->module.get().walk([&](mlir::tts::MakeTensorPtrOp op) {
+  // nlohmann::json's default object is an unordered map; to match the
+  // hand-rolled encoder byte-for-byte we build an ordered_json instead, which
+  // preserves insertion order on dump().
+  nlohmann::ordered_json arr = nlohmann::ordered_json::array();
+  moduleOp.walk([&](mlir::tts::MakeTensorPtrOp op) {
     std::string opStr;
     {
       llvm::raw_string_ostream s(opStr);
       op->print(s);
     }
-    arr.push_back({{"op", opStr}});
+    nlohmann::ordered_json entry;
+    entry["op"] = opStr;
+    entry["result_ssa"] = fmtValueAsOperand(op.getResult(), asmState);
+    entry["source"] = fmtValueAsOperand(op.getBase(), asmState);
+
+    auto pushList = [&](const char* key,
+                        mlir::SmallVector<mlir::OpFoldResult> vals) {
+      nlohmann::ordered_json arr2 = nlohmann::ordered_json::array();
+      for (auto v : vals) arr2.push_back(fmtOpFoldResult(v, asmState));
+      entry[key] = std::move(arr2);
+    };
+    pushList("offsets", op.getMixedOffsets());
+    pushList("sizes",   op.getMixedSizes());
+    pushList("strides", op.getMixedStrides());
+    pushList("shape",   op.getMixedShape());
+
+    nlohmann::ordered_json orderArr = nlohmann::ordered_json::array();
+    for (int32_t o : op.getOrder()) orderArr.push_back(o);
+    entry["order"] = std::move(orderArr);
+
+    arr.push_back(std::move(entry));
   });
-  // dump() with no indent matches the hand-rolled compact form. Note:
-  // nlohmann::json by default escapes the same RFC-8259 set the manual path
-  // emits (control chars via \uXXXX, ", and \). UTF-8 continuation bytes pass
-  // through unescaped because we leave ensure_ascii at default.
   m->statesJson = arr.dump();
 #  else
   // ---- hand-rolled RFC-8259 encoder ---------------------------------------
   std::ostringstream os;
   os << "[";
   bool first = true;
-  m->module.get().walk([&](mlir::tts::MakeTensorPtrOp op) {
+  moduleOp.walk([&](mlir::tts::MakeTensorPtrOp op) {
     if (!first) os << ",";
     first = false;
+
     std::string opStr;
     {
       llvm::raw_string_ostream s(opStr);
       op->print(s);
     }
-    // Full RFC-8259 escaping for strings: backslash, quote, the named control
-    // chars (\b \f \n \r \t), and \uXXXX for everything else in U+0000..U+001F.
-    // Bytes >= 0x20 (including UTF-8 continuation bytes) pass through verbatim.
-    std::string esc;
-    esc.reserve(opStr.size());
-    for (unsigned char uc : opStr) {
-      switch (uc) {
-        case '\\': esc += "\\\\"; break;
-        case '"':  esc += "\\\""; break;
-        case '\b': esc += "\\b";  break;
-        case '\f': esc += "\\f";  break;
-        case '\n': esc += "\\n";  break;
-        case '\r': esc += "\\r";  break;
-        case '\t': esc += "\\t";  break;
-        default:
-          if (uc < 0x20) {
-            static const char kHex[] = "0123456789abcdef";
-            char buf[7] = {'\\', 'u', '0', '0',
-                           kHex[(uc >> 4) & 0xF], kHex[uc & 0xF], '\0'};
-            esc += buf;
-          } else {
-            esc += static_cast<char>(uc);
-          }
-          break;
+    std::string resultStr = fmtValueAsOperand(op.getResult(), asmState);
+    std::string sourceStr = fmtValueAsOperand(op.getBase(), asmState);
+
+    auto emitList = [&](const char* key,
+                        mlir::SmallVector<mlir::OpFoldResult> vals) {
+      os << ",\"" << key << "\":[";
+      bool firstV = true;
+      for (auto v : vals) {
+        if (!firstV) os << ",";
+        firstV = false;
+        os << "\"" << jsonEscape(fmtOpFoldResult(v, asmState)) << "\"";
       }
+      os << "]";
+    };
+
+    // Keys must be emitted in the same order as the nlohmann path above
+    // (op, result_ssa, source, offsets, sizes, strides, shape, order) so
+    // the two encoders stay byte-identical.
+    os << "{\"op\":\"" << jsonEscape(opStr) << "\"";
+    os << ",\"result_ssa\":\"" << jsonEscape(resultStr) << "\"";
+    os << ",\"source\":\"" << jsonEscape(sourceStr) << "\"";
+    emitList("offsets", op.getMixedOffsets());
+    emitList("sizes",   op.getMixedSizes());
+    emitList("strides", op.getMixedStrides());
+    emitList("shape",   op.getMixedShape());
+
+    os << ",\"order\":[";
+    bool firstO = true;
+    for (int32_t o : op.getOrder()) {
+      if (!firstO) os << ",";
+      firstO = false;
+      os << o;
     }
-    os << "{\"op\":\"" << esc << "\"}";
+    os << "]";
+
+    os << "}";
   });
   os << "]";
   m->statesJson = os.str();
