@@ -189,6 +189,28 @@ Stmt FillNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         analyzer->CanProveEqual(FloorMod(element_offset, matrix_elements), 0))
         << "simdgroup fill region must start on an 8x8 matrix boundary";
     PrimExpr matrix_index_base = FloorDiv(element_offset, matrix_elements);
+    // Verify that the region truly spans `num_matrices` consecutive 8x8
+    // simdgroup matrices. If the symbolic region end does not coincide with
+    // matrix_index_base + num_matrices - 1, the indices may overlap or skip
+    // matrices; in that case fall back to a dense per-lane emission instead
+    // of emitting consecutive simdgroup writes that could be unsound.
+    PrimExpr last_element_offset = element_offset +
+                                   IntImm(element_offset.dtype(),
+                                          total_elements - 1);
+    PrimExpr last_matrix_index = FloorDiv(last_element_offset, matrix_elements);
+    PrimExpr expected_last = matrix_index_base +
+                             IntImm(matrix_index_base.dtype(),
+                                    num_matrices - 1);
+    bool consecutive_provable =
+        analyzer->CanProveEqual(last_matrix_index, expected_last);
+    if (!consecutive_provable) {
+      // Fall back: cannot prove the simdgroup matrix span is contiguous, so
+      // emit a dense per-lane SIMT fill instead of the simdgroup intrinsic.
+      auto init_loop = MakeSIMTLoop(analyzer);
+      auto vectorized_loop = VectorizeLoop(init_loop, analyzer, T.layout_map);
+      auto unrolled_loop = PragmaUnrollLoop(vectorized_loop);
+      return unrolled_loop;
+    }
     Array<Stmt> stmts;
     for (int i = 0; i < num_matrices; i++) {
       stmts.push_back(Evaluate(
