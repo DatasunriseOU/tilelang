@@ -546,6 +546,66 @@ def _emit_remui(op: Any, ctx: EmitContext) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Bitwise / logical (arith.andi / arith.ori / arith.xori)
+# ---------------------------------------------------------------------------
+#
+# In MLIR ``arith.andi`` is the canonical spelling for both bitwise AND on
+# integer tensors and logical AND on ``i1`` boolean tensors (Triton's TTIR
+# emits this for compound boundary masks such as
+# ``mask_row_lt_T & mask_col_lt_K`` produced by ``tt.make_block_ptr`` +
+# ``tl.load(..., boundary_check=(0, 1))``). FLA's
+# ``chunk_gated_delta_rule_fwd_kernel_h_blockdim64`` lowers each boundary
+# check into a chain of ``arith.andi : tensor<...xi1>`` ops; without this
+# emitter the reducer stalls at FAILED_OPS on ``arith.andi``.
+#
+# TVM's ``tir.bitwise_and`` covers both the integer-bitwise and
+# i1-logical paths (TIR boolean ops are represented as 8-bit ints and
+# bitwise-AND on an i1 tile is semantically logical-AND).
+
+
+def _emit_andi(op: Any, ctx: EmitContext) -> Any:
+    a, b = _resolve_two(op, ctx)
+    dt = _tile_dtype(ctx, a)
+    if _is_float_dtype(dt):
+        raise EmitError(f"arith.andi on float type {dt!r}")
+    tir = ctx.tir()
+    tile = _maybe_tile_binop(op, ctx, a, b,
+                             lambda x, y: tir.bitwise_and(x, y),
+                             "arith.andi", dt)
+    if tile is not None:
+        return tile
+    return _bind_result(op, ctx, tir.bitwise_and(a, b))
+
+
+def _emit_ori(op: Any, ctx: EmitContext) -> Any:
+    a, b = _resolve_two(op, ctx)
+    dt = _tile_dtype(ctx, a)
+    if _is_float_dtype(dt):
+        raise EmitError(f"arith.ori on float type {dt!r}")
+    tir = ctx.tir()
+    tile = _maybe_tile_binop(op, ctx, a, b,
+                             lambda x, y: tir.bitwise_or(x, y),
+                             "arith.ori", dt)
+    if tile is not None:
+        return tile
+    return _bind_result(op, ctx, tir.bitwise_or(a, b))
+
+
+def _emit_xori(op: Any, ctx: EmitContext) -> Any:
+    a, b = _resolve_two(op, ctx)
+    dt = _tile_dtype(ctx, a)
+    if _is_float_dtype(dt):
+        raise EmitError(f"arith.xori on float type {dt!r}")
+    tir = ctx.tir()
+    tile = _maybe_tile_binop(op, ctx, a, b,
+                             lambda x, y: tir.bitwise_xor(x, y),
+                             "arith.xori", dt)
+    if tile is not None:
+        return tile
+    return _bind_result(op, ctx, tir.bitwise_xor(a, b))
+
+
+# ---------------------------------------------------------------------------
 # Min / max
 # ---------------------------------------------------------------------------
 
@@ -858,6 +918,10 @@ ARITH_EMITTERS: Dict[str, Callable[[Any, EmitContext], Any]] = {
     "arith.divui": _emit_divui,
     "arith.remsi": _emit_remsi,
     "arith.remui": _emit_remui,
+    # Bitwise / logical (i1 boolean masks + integer bitops)
+    "arith.andi": _emit_andi,
+    "arith.ori": _emit_ori,
+    "arith.xori": _emit_xori,
     # Min / max
     "arith.minimumf": _emit_minimumf,
     "arith.maximumf": _emit_maximumf,

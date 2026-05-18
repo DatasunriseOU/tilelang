@@ -378,7 +378,14 @@ def test_op_table_has_expected_size() -> None:
     # ``ARITH_EMITTERS`` so the gated-delta-rule kernel's ``exp2`` lane
     # (and the LayerNorm/RMSNorm rsqrt lane that came along for free)
     # lower without FAILED_OPS.
-    EXPECTED = 95
+    #
+    # Bumped 95 -> 98 by the FLA Path D end-to-end seam: capturing real
+    # ``chunk_gated_delta_rule_fwd_kernel_h_blockdim64`` TTIR surfaced
+    # ``arith.andi`` (boundary-check mask chains from
+    # ``tl.load(..., boundary_check=(0, 1))``). Added the bitwise/logical
+    # cohort ``arith.{andi,ori,xori}`` for consistency -- all three lower
+    # via ``tir.bitwise_{and,or,xor}``.
+    EXPECTED = 98
     assert len(OP_TABLE) == EXPECTED, (
         f"OP_TABLE size changed from {EXPECTED} to {len(OP_TABLE)}; "
         f"if intentional, update this constant + the three README "

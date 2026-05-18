@@ -28,10 +28,25 @@ Adding a new kernel
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
 __all__ = ["CannedKernel", "CANNED_TTIR_FIXTURES"]
+
+
+def _read_capture(name: str) -> str:
+    """Load a real captured TTIR text from the ``ttir_captures/`` dir.
+
+    Files in ``poc/triton_frontend/_test_harness/ttir_captures/`` are the
+    canonical place for *real* (Triton-compiler emitted) TTIR fixtures. We
+    keep them on disk rather than as Python string literals because the
+    upstream Triton TTIR printer wraps locations / debug info that bloats
+    multi-line string escapes (the FLA chunk-delta-h TTIR is ~29 KB).
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, "ttir_captures", name), "r", encoding="utf-8") as fh:
+        return fh.read()
 
 
 @dataclass(frozen=True)
@@ -303,5 +318,34 @@ CANNED_TTIR_FIXTURES: List[CannedKernel] = [
         source="~/sources/rent_kernels/flash-linear-attention/fla/ops/common/chunk_delta_h.py",
         ttir_text=_FLA_DOT_EXP2_TTIR,
         constexprs={"BT": 32, "BV": 32, "K": 32},
+    ),
+    # ---- Real captured TTIR (not hand-written) ----------------------------
+    # ``fla_chunk_delta_h_real_ttir`` is the *actual* Triton-3.6 TTIR text
+    # produced by capturing ``chunk_gated_delta_rule_fwd_kernel_h_blockdim64``
+    # with constexprs {H=1, HV=1, K=64, V=32, BT=16, BV=32, USE_G=False,
+    # USE_GK=False, USE_INITIAL_STATE=False, STORE_FINAL_STATE=False,
+    # SAVE_NEW_VALUE=False, TRANSPOSE_STATE=False, IS_VARLEN=False} via
+    # ``triton_jit_to_ttir``. Captures the full ``scf.for`` recurrence,
+    # ``tt.make_block_ptr`` lowering, masked load/store boundary checks
+    # (``arith.andi`` chains over ``tensor<...xi1>``), and the
+    # ``tt.dot`` accumulator chain. This is what the reducer must handle
+    # end-to-end for the FLA Path D wiring -- the hand-written
+    # ``fla_dot_exp2`` motif above is the toy cousin.
+    CannedKernel(
+        name="fla_chunk_delta_h_real_ttir",
+        description=(
+            "Real captured TTIR for FLA "
+            "chunk_gated_delta_rule_fwd_kernel_h_blockdim64 "
+            "(K=64 single-block, no gates, no varlen)."
+        ),
+        source="~/sources/rent_kernels/flash-linear-attention/fla/ops/common/chunk_delta_h.py:41 (captured via triton_jit_to_ttir, apple/mps backend, triton-pr9701)",
+        ttir_text=_read_capture("fla_chunk_delta_h_real_ttir.mlir"),
+        constexprs={
+            "H": 1, "HV": 1, "K": 64, "V": 32, "BT": 16, "BV": 32,
+            "USE_G": False, "USE_GK": False,
+            "USE_INITIAL_STATE": False, "STORE_FINAL_STATE": False,
+            "SAVE_NEW_VALUE": False, "TRANSPOSE_STATE": False,
+            "IS_VARLEN": False,
+        },
     ),
 ]

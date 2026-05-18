@@ -28,7 +28,7 @@ extern intrinsic mechanism).
         v                            v                            v
    triton.compile             walker over tt.* ops          TileLang TIR passes
    -> ttir module             dispatch via op_mapping       (LayoutInference,
-   (Triton 3.6: capture       (95 entries in OP_TABLE)       LowerTileOp, ...)
+   (Triton 3.6: capture       (98 entries in OP_TABLE)       LowerTileOp, ...)
     via make_ir(target,                |
     options, codegen,                  v
     module_map, ctx))         +----------------------+
@@ -63,7 +63,7 @@ extern intrinsic mechanism).
 | File                                  | Purpose                                                                   | RFC ref       |
 |---------------------------------------|---------------------------------------------------------------------------|---------------|
 | `__init__.py`                         | Public API: `from_triton_kernel`, `from_ttir`.                            | section 5     |
-| `op_mapping.py`                       | Dispatch table: TTIR op name -> emitter. **95 entries** (post FLA-enable). | section 5.1   |
+| `op_mapping.py`                       | Dispatch table: TTIR op name -> emitter. **98 entries** (post FLA Path D + bitwise/logical enable). | section 5.1   |
 | `op_emitters/arith.py`                | Float/int/math arithmetic + comparison emitters.                          | section 5.1   |
 | `op_emitters/memory.py`               | `tt.load`/`tt.store`/`tt.addptr`/range/splat/broadcast emitters.          | section 5.1   |
 | `op_emitters/reduction.py`            | `tt.dot`, `tt.reduce`, `tt.atomic_*` emitters.                            | section 5.1   |
@@ -82,7 +82,7 @@ extern intrinsic mechanism).
 
 ## Capabilities (post-Wave-3)
 
-* **Op coverage**: 95 entries in `OP_TABLE` covering memory, arith,
+* **Op coverage**: 98 entries in `OP_TABLE` covering memory, arith,
   reduction, control, async/barrier, TMA, and grid/launch ops.
 * **Triton 3.6 capture**: TTIR is captured via
   `make_ir(target, options, codegen, module_map, ctx)` so the captured
