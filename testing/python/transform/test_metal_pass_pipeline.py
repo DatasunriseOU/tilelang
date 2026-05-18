@@ -98,6 +98,22 @@ def _mamba_like_metal_scalar_kernel():
     return main
 
 
+def _non_power_lane_decompose_kernel():
+    @T.prim_func
+    def main(
+        x: T.Tensor((8192,), T.float32),
+        y: T.Tensor((8192,), T.float32),
+    ):
+        with T.Kernel(32, threads=256):
+            grid_tid = T.call_intrin("int32", "tir.metal.thread_position_in_grid_x")
+            lane = grid_tid % 7168
+            head = lane // 64
+            if grid_tid < 7168:
+                y[lane] = x[head] + x[lane]
+
+    return main
+
+
 def test_mamba_like_metal_source_has_grid_tid_and_scalar_cse():
     src = _lower_metal_source(_mamba_like_metal_scalar_kernel()).kernel_source
 
@@ -114,6 +130,26 @@ def test_mamba_like_metal_source_has_grid_tid_and_scalar_cse():
         r"x\[(?P<idx>cse_v\d+(?:_\d+)?)\] \+ x\[(?P=idx)\]",
         kernel_body,
     ), src
+
+
+def test_metal_grid_position_keeps_builtin_in_hot_indices():
+    src = _lower_metal_source(_mamba_like_metal_scalar_kernel()).kernel_source
+    kernel_body = src.split("kernel void", 1)[1]
+
+    assert re.search(r"\bint grid_tid = gridThreadIdx\.x;", kernel_body), src
+    assert re.search(r"\bgridThreadIdx\.x < (?:arg\.)?n(?:\[0\])?", kernel_body), src
+    assert re.search(r"y\[[^\]]*gridThreadIdx\.x[^\]]*\]", kernel_body), src
+
+
+def test_grid_position_non_power_decompose_uses_unsigned_mod_div():
+    src = _lower_metal_source(_non_power_lane_decompose_kernel()).kernel_source
+    kernel_body = src.split("kernel void", 1)[1]
+
+    assert "[[thread_position_in_grid]]" in src
+    assert "gridThreadIdx" in kernel_body
+    assert ">> 31" not in kernel_body
+    assert ">>31" not in kernel_body
+    assert not re.search(r"\b7168\s*&\s*\(", kernel_body), src
 
 
 def test_metal_scalar_bind_canonicalizer_reuses_cse_address_binds():

@@ -231,6 +231,64 @@ class MetalIndexCastNormalizer : public ExprMutator {
     return dtype.is_scalar() && (dtype.is_int() || dtype.is_uint());
   }
 
+  static bool IsPositiveIntImm(const PrimExpr &expr) {
+    const auto *imm = expr.as<IntImmNode>();
+    return imm != nullptr && imm->value > 0;
+  }
+
+  static bool IsKnownNonNegativeMetalIndex(const PrimExpr &expr) {
+    if (!expr.defined() || !IsScalarInteger(expr.dtype())) {
+      return false;
+    }
+    if (expr.dtype().is_uint()) {
+      return true;
+    }
+    if (const auto *imm = expr.as<IntImmNode>()) {
+      return imm->value >= 0;
+    }
+    if (const auto *var = expr.as<VarNode>()) {
+      return IsMetalThreadIndexVar(var) ||
+             MetalScalarIntrinsicPrefixFromVarName(var->name_hint);
+    }
+    if (const auto *call = expr.as<CallNode>()) {
+      std::string prefix;
+      return MetalScalarIntrinsicPrefix(call, &prefix);
+    }
+    if (const auto *cast = expr.as<CastNode>()) {
+      return IsKnownNonNegativeMetalIndex(cast->value);
+    }
+    if (const auto *add = expr.as<AddNode>()) {
+      return IsKnownNonNegativeMetalIndex(add->a) &&
+             IsKnownNonNegativeMetalIndex(add->b);
+    }
+    if (const auto *mul = expr.as<MulNode>()) {
+      return IsKnownNonNegativeMetalIndex(mul->a) &&
+             IsKnownNonNegativeMetalIndex(mul->b);
+    }
+    if (const auto *div = expr.as<DivNode>()) {
+      return IsKnownNonNegativeMetalIndex(div->a) && IsPositiveIntImm(div->b);
+    }
+    if (const auto *mod = expr.as<ModNode>()) {
+      return IsKnownNonNegativeMetalIndex(mod->a) && IsPositiveIntImm(mod->b);
+    }
+    if (const auto *floordiv = expr.as<FloorDivNode>()) {
+      return IsKnownNonNegativeMetalIndex(floordiv->a) &&
+             IsPositiveIntImm(floordiv->b);
+    }
+    if (const auto *floormod = expr.as<FloorModNode>()) {
+      return IsKnownNonNegativeMetalIndex(floormod->a) &&
+             IsPositiveIntImm(floormod->b);
+    }
+    return false;
+  }
+
+  static bool MetalScalarIntrinsicPrefixFromVarName(const std::string &name) {
+    return name == "grid_tid" || name.rfind("grid_tid_", 0) == 0 ||
+           name == "threadgroup_tid" ||
+           name.rfind("threadgroup_tid_", 0) == 0 ||
+           name == "simd_lane" || name.rfind("simd_lane_", 0) == 0;
+  }
+
   static DataType CommonIntegerDType(DataType lhs, DataType rhs) {
     ICHECK(IsScalarInteger(lhs));
     ICHECK(IsScalarInteger(rhs));
@@ -313,6 +371,9 @@ class MetalIndexCastNormalizer : public ExprMutator {
     PrimExpr lhs = VisitExpr(op->a);
     PrimExpr rhs = VisitExpr(op->b);
     NormalizeIntegerOperands(&lhs, &rhs);
+    if (IsKnownNonNegativeMetalIndex(lhs) && IsPositiveIntImm(rhs)) {
+      return Div(lhs, rhs, op->span);
+    }
     if (lhs.same_as(op->a) && rhs.same_as(op->b)) {
       return ffi::GetRef<PrimExpr>(op);
     }
@@ -333,6 +394,9 @@ class MetalIndexCastNormalizer : public ExprMutator {
     PrimExpr lhs = VisitExpr(op->a);
     PrimExpr rhs = VisitExpr(op->b);
     NormalizeIntegerOperands(&lhs, &rhs);
+    if (IsKnownNonNegativeMetalIndex(lhs) && IsPositiveIntImm(rhs)) {
+      return Mod(lhs, rhs, op->span);
+    }
     if (lhs.same_as(op->a) && rhs.same_as(op->b)) {
       return ffi::GetRef<PrimExpr>(op);
     }
