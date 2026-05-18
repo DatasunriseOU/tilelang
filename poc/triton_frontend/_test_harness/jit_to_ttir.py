@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Optional
 
+from .native_import_guard import triton_import_block_reason
+
 
 class TritonUnavailable(RuntimeError):
     """Raised when triton is not importable in the current env."""
@@ -31,6 +33,9 @@ class TTIRCaptureError(RuntimeError):
 
 
 def _import_triton():
+    block_reason = triton_import_block_reason()
+    if block_reason is not None:
+        raise TritonUnavailable(block_reason)
     try:
         import triton  # noqa: F401
         return triton
@@ -41,7 +46,14 @@ def _import_triton():
 
 
 def triton_available() -> bool:
-    """Return True if triton is importable. Used as a feature-detect guard."""
+    """Return True if triton is importable. Used as a feature-detect guard.
+
+    Returns False when a TileLang/TVM native peer is already loaded in this
+    process: importing triton there can abort the interpreter because both
+    sides statically register LLVM command-line options.
+    """
+    if triton_import_block_reason() is not None:
+        return False
     try:
         import triton  # noqa: F401
         return True
@@ -51,6 +63,8 @@ def triton_available() -> bool:
 
 def triton_version() -> Optional[str]:
     """Return installed triton version, or None if not importable."""
+    if triton_import_block_reason() is not None:
+        return None
     try:
         import triton
         return getattr(triton, "__version__", None)

@@ -115,6 +115,55 @@ def _shim_unavailable_warn_once() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Cross-extension LLVM/MLIR conflict guard
+# ---------------------------------------------------------------------------
+# Both the ``_triton_frontend_cxx`` shim and upstream ``triton._C.libtriton``
+# statically link their own copy of LLVM. Loading both into one Python process
+# triggers ``LLVM ERROR: Option '<name>' already exists!`` (cl::opt duplicate
+# registration) and aborts with SIGABRT mid-collection. Until the shim is
+# rebuilt against a shared LLVM, we refuse to load the second of the two and
+# emit a clean skip-warning instead of crashing the interpreter.
+#
+# Tests that depend on the shim are wired through ``dialects_available()`` /
+# ``shim_available()``, so returning ``False`` here makes pytest skip the
+# affected tests cleanly. Callers that go through ``_load_shim()`` directly
+# (i.e. the runtime ``PtrAnalysis`` rewrite path) get a ``NotImplementedError``
+# with a diagnostic instead of a hard abort.
+_LLVM_CONFLICT_WARNED = False
+
+
+def _triton_already_loaded() -> bool:
+    """Return True iff Triton's native C extension is already in this process.
+
+    We check for the LLVM-bearing C extension specifically (``triton._C`` /
+    ``triton._C.libtriton``) rather than the pure-Python ``triton`` shell,
+    because importing ``triton`` does not by itself pull in the conflicting
+    LLVM static-init -- that only happens once ``libtriton`` is touched.
+    """
+    for mod_name in ("triton._C.libtriton", "triton._C"):
+        if mod_name in sys.modules:
+            return True
+    return False
+
+
+def _shim_conflict_warn_once() -> None:
+    global _LLVM_CONFLICT_WARNED
+    if _LLVM_CONFLICT_WARNED:
+        return
+    _LLVM_CONFLICT_WARNED = True
+    warnings.warn(
+        "PtrAnalysis C++ shim disabled in this process: "
+        "Triton's libtriton (with its own LLVM) is already loaded. "
+        "Both link LLVM statically and registering cl::opts twice aborts "
+        "the interpreter, so the shim is skipped here. Run shim-dependent "
+        "tests in a fresh Python process (or via pytest-forked / a "
+        "subprocess wrapper) to exercise them.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 def shim_available() -> bool:
     """Return True if the C++ shim is importable from ``sys.path``.
 
@@ -126,7 +175,18 @@ def shim_available() -> bool:
     Emits a one-shot :class:`RuntimeWarning` when the shim is missing so the
     fallback to the MVP scalar path is observable in test logs without
     drowning them in repeated messages.
+
+    When upstream Triton's ``libtriton`` is already loaded in this process
+    we return ``False`` (with a one-shot warning) instead of letting the
+    duplicate LLVM static-init abort the interpreter; the shim is still
+    physically present on disk, just unsafe to import here.
     """
+    # If the shim itself is already loaded we are safe regardless of triton.
+    if SHIM_MODULE_NAME in sys.modules:
+        return True
+    if _triton_already_loaded():
+        _shim_conflict_warn_once()
+        return False
     if importlib.util.find_spec(SHIM_MODULE_NAME) is not None:
         return True
     # First try our local build-dir candidates (build-port, build).
@@ -167,6 +227,14 @@ def _load_shim() -> Any:
     # that go straight through the load helper don't trip over a stale
     # negative cache from an early ``find_spec`` miss.
     _ensure_shim_on_syspath()
+    if SHIM_MODULE_NAME not in sys.modules and _triton_already_loaded():
+        _shim_conflict_warn_once()
+        raise NotImplementedError(
+            "PtrAnalysis C++ shim cannot be loaded in this process: "
+            "Triton's libtriton (with its own LLVM) is already loaded and "
+            "registering cl::opts twice would abort the interpreter. "
+            "Run shim-dependent tests in a fresh Python process."
+        )
     try:
         return importlib.import_module(SHIM_MODULE_NAME)
     except ImportError as exc:  # pragma: no cover - exercised only when unbuilt

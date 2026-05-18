@@ -19,7 +19,30 @@ do not delete or modify any reducer state from the tests.
 """
 from __future__ import annotations
 
+import builtins
+import sys
+
 from poc.triton_frontend._test_harness import canned_ttir, run_corpus
+from poc.triton_frontend._test_harness import jit_to_ttir
+
+
+def test_triton_available_blocks_after_tilelang_native_load(monkeypatch) -> None:
+    """Feature detection must not import Triton into a TileLang-native process."""
+    monkeypatch.setitem(sys.modules, "tilelang_cython_wrapper", object())
+    calls: list[str] = []
+    real_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "triton":
+            calls.append(name)
+            raise AssertionError("triton import must be blocked before import")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    assert jit_to_ttir.triton_available() is False
+    assert jit_to_ttir.triton_version() is None
+    assert "triton" not in calls
 
 
 def test_vector_add_at_least_degraded() -> None:

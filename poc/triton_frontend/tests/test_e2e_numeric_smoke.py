@@ -18,6 +18,8 @@ can grep for cross-kernel patterns even when one kernel hard-fails.
 """
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from poc.triton_frontend._test_harness import numeric_kernels
@@ -25,15 +27,43 @@ from poc.triton_frontend._test_harness import numeric_smoke
 from poc.triton_frontend._test_harness.numeric_smoke import Verdict
 
 
-# Probed once at module import; ``run_one`` re-uses the same dict so
-# we don't pay the import cost per parametrize case.
-_DEPS = numeric_smoke._probe_deps()
+# Probed lazily on first test execution (not at module import) so that
+# collecting this file does NOT pull in Triton's libtriton. That static-init
+# loads its own LLVM and conflicts with the ``_triton_frontend_cxx`` shim
+# loaded later when ``test_ptr_analysis.py`` is collected; doing the probe
+# at import time used to abort pytest collection with SIGABRT (LLVM cl::opt
+# already exists). Deferring to the fixture moves the load into individual
+# tests where it can be process-isolated or simply not exercised.
+_DEPS: dict | None = None
 
 
 @pytest.fixture(scope="module")
 def deps_dict():
     """Module-scoped dep probe so each test sees the same component map."""
+    global _DEPS
+    if _DEPS is None:
+        _DEPS = numeric_smoke._probe_deps()
     return _DEPS
+
+
+def test_probe_deps_blocks_triton_after_tilelang_native_load(monkeypatch) -> None:
+    """Dep probing must not import Triton into a TileLang-native process."""
+    monkeypatch.setitem(sys.modules, "tilelang_cython_wrapper", object())
+    calls: list[str] = []
+
+    def fake_import_module(name: str):
+        calls.append(name)
+        if name == "triton":
+            raise AssertionError("triton import must be blocked before import")
+        return object()
+
+    monkeypatch.setattr(numeric_smoke.importlib, "import_module", fake_import_module)
+
+    deps = numeric_smoke._probe_deps()
+
+    assert deps["triton"] is not None
+    assert "triton import blocked" in deps["triton"]
+    assert "triton" not in calls
 
 
 @pytest.mark.parametrize("kernel_module", numeric_kernels.KERNEL_MODULES)

@@ -45,18 +45,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 
-# Bootstrap jaxlib's mlir bindings as ``mlir`` BEFORE we import the
-# reducer (which probes ``mlir.ir`` at module load and caches the
-# result). The lifted helper :func:`bootstrap_jaxlib_alias` lives in
-# :mod:`poc.triton_frontend._mlir_path_setup` so other entry points
-# (e.g. the user-facing ``triton_to_tilelang_prim`` API) can call it
-# without depending on the e2e harness.
-from poc.triton_frontend._mlir_path_setup import bootstrap_jaxlib_alias  # noqa: E402
-
-bootstrap_jaxlib_alias()
-
-
-from . import numeric_kernels  # noqa: E402  -- after bootstrap_jaxlib_alias
+from . import numeric_kernels  # noqa: E402
+from .native_import_guard import triton_import_block_reason
 
 
 __all__ = [
@@ -135,6 +125,11 @@ def _probe_deps() -> Dict[str, Optional[str]]:
         "cppmega_mlx": None,
     }
     for name in deps:
+        if name == "triton":
+            block_reason = triton_import_block_reason()
+            if block_reason is not None:
+                deps[name] = f"RuntimeError: {block_reason}"
+                continue
         try:
             module_name = "mlx.core" if name == "mlx" else name
             if name == "cppmega_mlx":
@@ -380,6 +375,7 @@ def _lower_ttir(
     """
     try:
         from poc.triton_frontend import from_ttir  # type: ignore
+        from poc.triton_frontend._mlir_path_setup import bootstrap_jaxlib_alias  # type: ignore
         from poc.triton_frontend.mlir_walker import wrap_module_for_walker  # type: ignore
         from poc.triton_frontend.pipeline import (  # type: ignore
             is_custom_form_ttir,
@@ -389,8 +385,11 @@ def _lower_ttir(
         return None, f"poc.triton_frontend import failed: {type(exc).__name__}: {exc}"
 
     # Locate the C++ shim before we try the real MLIR walker. The mlir.ir
-    # alias was already wired up at module load via bootstrap_jaxlib_alias().
+    # alias is wired up lazily after Triton captured TTIR. Importing jaxlib's
+    # MLIR dialect extension before Triton can abort the interpreter due to
+    # process-global nanobind registrations.
     _ensure_cxx_shim_on_syspath()
+    bootstrap_jaxlib_alias()
 
     # Try the real MLIR path first. Convert via the C++ shim's
     # ``to_generic()`` when input is custom-form so a vanilla ``mlir.ir``
