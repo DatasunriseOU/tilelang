@@ -43,52 +43,6 @@ def test_kernel_numeric_pass(kernel_module: str, deps_dict) -> None:
     SKIP -> pytest.skip; NUMERIC_PASS -> assert; everything else fails
     with the harness detail string so CI logs surface the cause.
     """
-    # Real bug: matmul currently fails Metal GEMM lowering. The original
-    # blocker was ``"Metal GEMM requires C in local.fragment, metal.simdgroup,
-    # or shared scope, got local"`` — the C accumulator was declared with
-    # plain ``local`` scope instead of ``local.fragment``. The accumulator
-    # scope fix in ``op_emitters/reduction.py:map_tt_dot`` resolved that and
-    # advances the matmul path to a new downstream blocker:
-    # ``"Unsupported gemm combination, A: local, B: local"`` — the A and B
-    # operand tile buffers materialised by ``tt.load`` end up in plain
-    # ``local`` scope, but Metal's ``gemm_metal.py`` only accepts the
-    # ``shared, shared`` (and a few simdgroup) combinations. Tightening
-    # ``tt.load`` tile-destination scope to ``shared`` is a separate fix
-    # wave; we xfail BOTH diagnostics here so the regression band stays
-    # narrow enough to flag a true regression but wide enough to record
-    # the incremental progress.
-    if kernel_module == "matmul":
-        result = numeric_smoke.run_one(kernel_module, deps_dict)
-        if result.verdict == Verdict.SKIP:
-            pytest.skip(result.detail or "<no detail>")
-        if result.verdict == Verdict.NUMERIC_PASS:
-            return  # the real fix landed elsewhere -- great, treat as pass
-        if result.verdict in (Verdict.COMPILE_FAIL, Verdict.RUNTIME_FAIL) and result.detail:
-            # Known blockers (in order of the pipeline):
-            # 1. COMPILE_FAIL: "Metal GEMM requires C in local.fragment" (fixed)
-            # 2. COMPILE_FAIL: "Unsupported gemm combination" (fixed for A,B in shared)
-            # 3. RUNTIME_FAIL: Metal compiler rejects float+simdgroup_matrix add
-            #    in the accumulator readback path (tile_57 = const_1 + dot_c_frag)
-            # 4. RUNTIME_FAIL: arg struct field not inlined (needs KERNEL_SCALAR_ARGS)
-            xfail_patterns = (
-                "Metal GEMM requires C in local.fragment",
-                "Unsupported gemm combination",
-                "Unable to build metal library",
-                "use of undeclared identifier",
-                "operator+",
-                "undefined.size() == 0",
-                "elem_offset",
-            )
-            if any(p in result.detail for p in xfail_patterns):
-                pytest.xfail(
-                    f"matmul Metal codegen known blocker; verdict={result.verdict} "
-                    f"(see metal_fragment_to_simdgroup.py TODO)"
-                )
-        # Any other verdict is an unexpected regression and must surface.
-        pytest.fail(
-            f"matmul: unexpected verdict={result.verdict} detail={result.detail!r}"
-        )
-
     if kernel_module == "layer_norm":
         result = numeric_smoke.run_one(kernel_module, deps_dict)
         if result.verdict == Verdict.SKIP:

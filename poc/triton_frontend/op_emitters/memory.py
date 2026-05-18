@@ -1201,19 +1201,24 @@ def _coerce_lanes_to_int(lanes: Any) -> int:
 
 
 def _materialise_vector_into_buffer(
-    ctx: WalkerCtx, src: Any, out_shape: Sequence[int], dtype: str
+    ctx: WalkerCtx,
+    src: Any,
+    out_shape: Sequence[int],
+    dtype: str,
+    *,
+    lane_axis: Optional[int] = None,
 ) -> Any:
     """Lower a vector PrimExpr / Buffer source into a fresh tile Buffer.
 
-    Emits a serial ``tir.For`` nest over ``out_shape`` whose innermost body
-    is ``BufferStore(dst, _read_vector_lane(src, lane_idx), [outer..., lane_idx])``.
+    Emits a serial ``tir.For`` nest over ``out_shape`` whose body reads one
+    scalar vector lane from ``src`` and stores it into the destination tile.
     Returns the freshly allocated ``tir.Buffer``. The store nest is appended
     to ``ctx.stmts`` via ``ctx.emit``.
 
-    The convention matches the broadcast semantics used by
-    ``_emit_tile_binop`` in ``op_emitters/arith.py``: outer (rank-promoted)
-    axes drive the splat, the innermost axis indexes the source vector
-    lane-for-lane.
+    By default the innermost axis indexes the source vector, matching
+    broadcast semantics. ``tt.expand_dims`` overrides ``lane_axis`` because
+    inserting a trailing singleton dimension, e.g. ``(64,) -> (64, 1)``,
+    means the source vector maps to axis 0, not the innermost axis.
     """
     tir = ctx.tir()
     out_shape_list = [int(s) for s in out_shape]
@@ -1222,7 +1227,16 @@ def _materialise_vector_into_buffer(
     dst = _alloc_tile_buffer(ctx, out_shape_list, dtype, ctx.fresh("vec"))
 
     loop_vars = [tir.Var(ctx.fresh(f"v{axis}"), "int32") for axis in range(len(out_shape_list))]
-    lane_idx = loop_vars[-1]
+    if lane_axis is None:
+        lane_axis = len(loop_vars) - 1
+    if lane_axis < 0:
+        lane_axis += len(loop_vars)
+    if not 0 <= lane_axis < len(loop_vars):
+        raise ValueError(
+            f"_materialise_vector_into_buffer: lane_axis {lane_axis} out of "
+            f"range for shape {out_shape_list}"
+        )
+    lane_idx = loop_vars[lane_axis]
     # Per-lane scalar read from the vector source.
     rhs = _read_vector_lane(ctx, src, lane_idx)
     body: Any = tir.BufferStore(dst, rhs, list(loop_vars))
@@ -1291,11 +1305,27 @@ def emit_tt_expand_dims(op: Any, ctx: WalkerCtx) -> Any:
     src_vec_lanes = _vector_lanes(src)
 
     # Vector PrimExpr path: emit a For nest over out_shape, NOT tir.Broadcast
-    # (which only accepts scalar ``value``). The innermost lane axis pulls
-    # per-lane scalars out of the source vector via ``_read_vector_lane``.
+    # (which only accepts scalar ``value``). The inserted dimension is a
+    # singleton/broadcast axis; the source vector maps to the remaining axis.
     if src_vec_lanes > 1 and out_shape:
         dtype = _dtype_of(result_value) if result_value is not None else _vector_scalar_dtype(src)
-        dst = _materialise_vector_into_buffer(ctx, src, out_shape, dtype)
+        attrs = _attrs_with_properties_shared(op)
+        raw_axis = attrs.get("axis", len(out_shape) - 1)
+        axis = int(raw_axis)
+        if axis < 0:
+            axis += len(out_shape)
+        if not 0 <= axis < len(out_shape):
+            raise ValueError(
+                f"tt.expand_dims: axis {raw_axis!r} out of range for "
+                f"result shape {out_shape}"
+            )
+        lane_axis = next(
+            (i for i in range(len(out_shape)) if i != axis),
+            len(out_shape) - 1,
+        )
+        dst = _materialise_vector_into_buffer(
+            ctx, src, out_shape, dtype, lane_axis=lane_axis
+        )
         if result_value is not None:
             ctx.bind(result_value, dst)
         return dst
@@ -1402,8 +1432,18 @@ def emit_tt_broadcast(op: Any, ctx: WalkerCtx) -> Any:
         # Index the source with the trailing dims that map into the source
         # shape (the broadcast convention is to match trailing dims).
         if src_is_buffer:
-            tail = loop_vars[-len(src_shape):] if src_shape else []
-            rhs = tir.BufferLoad(src, tail or [tir.const(0, "int32")])
+            if src_shape:
+                tail = loop_vars[-len(src_shape):]
+                src_indices = []
+                for dim, idx in zip(src_shape, tail):
+                    try:
+                        dim_i = int(dim)
+                    except (TypeError, ValueError):
+                        dim_i = None
+                    src_indices.append(tir.const(0, "int32") if dim_i == 1 else idx)
+            else:
+                src_indices = [tir.const(0, "int32")]
+            rhs = tir.BufferLoad(src, src_indices)
         elif src_vec_lanes > 1:
             # Vector PrimExpr: index the lane via the innermost loop var.
             rhs = _read_vector_lane(ctx, src, loop_vars[-1])
@@ -1685,11 +1725,30 @@ def emit_tt_addptr(op: Any, ctx: WalkerCtx) -> Any:
         raise ValueError("tt.addptr: expected (ptr, offset) operands")
     ptr_ssa, off_ssa = operands[0], operands[1]
     base = _resolved_or_none(ctx, ptr_ssa)
-    off = ctx.get(off_ssa)
 
     result_value = _results(op)[0] if _results(op) else None
 
     if has_cxx_shim():
+        state = None
+        states_map = getattr(ctx, "ptr_states", None) or {}
+        if result_value is not None:
+            rname = _ssa_name(result_value)
+            if rname:
+                state = states_map.get(rname)
+        if state is not None:
+            value = {
+                "_ptrstate": state,
+                "source": state.source,
+                "offsets": list(state.offsets),
+                "sizes": list(state.sizes),
+                "strides": list(state.strides),
+                "shape": list(state.shape) if state.shape is not None else None,
+            }
+            if result_value is not None:
+                ctx.bind(result_value, value)
+            return value
+
+        off = ctx.get(off_ssa)
         # Shim is built -- the PtrAnalysis pass should already have folded
         # this op away in the rewritten module. If we still see it here we
         # respect whatever PtrState the walker has stashed and just
@@ -1720,6 +1779,8 @@ def emit_tt_addptr(op: Any, ctx: WalkerCtx) -> Any:
             if result_value is not None:
                 ctx.bind(result_value, value)
             return value
+
+    off = ctx.get(off_ssa)
 
     # Degraded path: scalar offset add on the underlying var/value.
     # Wrap the result in a pragma_comment AttrStmt so reviewers can see

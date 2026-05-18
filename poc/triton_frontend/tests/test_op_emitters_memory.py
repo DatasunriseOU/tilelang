@@ -190,6 +190,27 @@ def test_broadcast_scalar_to_tile_emits_broadcast() -> None:
     assert int(bcast.lanes) == 16
 
 
+def test_broadcast_buffer_with_singleton_axis_uses_zero_index() -> None:
+    """Rank-preserving broadcast must index singleton source axes at zero."""
+    ctx = WalkerCtx()
+    src_ssa = _ssa("src", shape=[64, 1], dtype="int32")
+    out_ssa = _ssa("out", shape=[64, 64], dtype="int32")
+    src = tvm.tir.decl_buffer((64, 1), "int32", name="src", scope="local")
+    ctx.bind(src_ssa, src)
+
+    op = {
+        "name": "tt.broadcast",
+        "operands": [src_ssa],
+        "results": [out_ssa],
+        "attrs": {},
+    }
+    out = emit_tt_broadcast(op, ctx)
+
+    assert isinstance(out, tvm.tir.Buffer)
+    text = _stringify(ctx.stmts)
+    assert "src[b0_" in text and ", 0]" in text, text
+
+
 # ---------------------------------------------------------------------------
 # tt.load / tt.store -- masked round-trip on a 1-D buffer
 # ---------------------------------------------------------------------------
@@ -321,6 +342,54 @@ def test_addptr_without_shim_emits_degraded_marker(monkeypatch: pytest.MonkeyPat
     assert "DEGRADED" in text, (
         f"expected '# DEGRADED:' breadcrumb for shim-less tt.addptr; got:\n{text}"
     )
+
+
+def test_addptr_uses_only_exact_ptr_state_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Source-keyed PtrState must not hijack an earlier scalar addptr.
+
+    PtrAnalysis also keys tile states by their source pointer (``%arg0``)
+    for load/store lookup. ``tt.addptr`` itself can only consume an exact
+    result-key match; otherwise a scalar row-pointer addptr may accidentally
+    become a tile descriptor for a later load.
+    """
+    from poc.triton_frontend.ptr_analysis import PtrState  # noqa: WPS433
+
+    monkeypatch.setattr(
+        "poc.triton_frontend.op_emitters.memory.has_cxx_shim",
+        lambda: True,
+    )
+    ctx = WalkerCtx()
+    ptr_ssa = _ssa("%arg0", shape=[], dtype="float32")
+    off_ssa = _ssa("%row_offset", shape=[], dtype="int32")
+    out_ssa = _ssa("%row_ptr", shape=[], dtype="float32")
+    base_buf = tvm.tir.decl_buffer([1024], "float32", name="X")
+    ctx.bind(ptr_ssa, (base_buf, [tvm.tir.const(0, "int32")]))
+    ctx.bind(off_ssa, tvm.tir.const(7, "int32"))
+    ctx.ptr_states = {
+        "%arg0": PtrState(
+            offsets=("%later_tile_offset",),
+            sizes=("128",),
+            strides=("1",),
+            source="%arg0",
+            result_ssa="%later_tile",
+        )
+    }
+
+    result = emit_tt_addptr(
+        {
+            "name": "tt.addptr",
+            "operands": [ptr_ssa, off_ssa],
+            "results": [out_ssa],
+            "attrs": {},
+        },
+        ctx,
+    )
+
+    assert isinstance(result, tuple), result
+    assert result[0] is base_buf
+    assert "later_tile" not in str(result)
 
 
 # ---------------------------------------------------------------------------
@@ -809,6 +878,35 @@ def test_expand_dims_on_vector_primexpr_emits_for_nest() -> None:
     assert tuple(int(s) for s in out.shape) == (1, 64)
     text = _stringify(ctx.stmts)
     assert "for" in text.lower(), f"expected For-nest in stmts; got:\n{text}"
+    assert "v1" in text, f"axis=0 should index vector lanes via output axis 1:\n{text}"
+
+
+def test_expand_dims_axis_one_reads_vector_from_outer_axis() -> None:
+    """``(N,) -> (N, 1)`` must read lane ``i0``, not singleton ``i1``.
+
+    Matmul's B tile uses ``tt.expand_dims(offs_k, axis=1)``. Reading the
+    vector lane from the innermost axis makes every row use lane 0, so
+    ``tl.dot`` sees B row 0 repeated across K.
+    """
+    ctx = WalkerCtx()
+    src_ssa = _ssa("offsets", shape=[64], dtype="int32")
+    out_ssa = _ssa("offsets_2d", shape=[64, 1], dtype="int32")
+
+    ramp = tvm.tir.Ramp(tvm.tir.const(0, "int32"), tvm.tir.const(1, "int32"), 64)
+    ctx.bind(src_ssa, ramp)
+
+    op = {
+        "name": "tt.expand_dims",
+        "operands": [src_ssa],
+        "results": [out_ssa],
+        "attrs": {"axis": 1},
+    }
+    out = emit_tt_expand_dims(op, ctx)
+
+    assert isinstance(out, tvm.tir.Buffer)
+    assert tuple(int(s) for s in out.shape) == (64, 1)
+    text = _stringify(ctx.stmts)
+    assert "v0" in text, f"axis=1 should index vector lanes via output axis 0:\n{text}"
 
 
 def test_broadcast_vector_to_tile_emits_for_nest() -> None:

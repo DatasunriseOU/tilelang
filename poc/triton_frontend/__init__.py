@@ -45,8 +45,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # its existing one-shot UserWarning unchanged.
 from . import _mlir_path_setup  # noqa: F401  (import-time side effect)
 
-import tilelang  # noqa: F401  (setup TVM environment)
-
 from .mlir_walker import (
     DEGRADED_WARNING_MESSAGE as _DEGRADED_WARNING_MESSAGE,
     MLIR_WALKER_AVAILABLE,
@@ -501,6 +499,23 @@ def _emit_tile_store_to_input_buffer(
     tir = ctx.tir()
     tvm_mod = ctx.tvm()
     from .op_emitters.memory import _resolve_lane_operand, _read_vector_lane, _vector_lanes
+
+    scope_fn = getattr(val_expr, "scope", None)
+    try:
+        val_scope = scope_fn() if callable(scope_fn) else scope_fn
+    except Exception:
+        val_scope = None
+    if val_scope in {"local.fragment", "metal.simdgroup"}:
+        import tilelang.language as T  # type: ignore
+
+        handle = T.copy(val_expr, dst_buf)
+        if isinstance(handle, tvm_mod.tir.PrimExpr):
+            stmt = tir.Evaluate(handle)
+            ctx.emit(stmt)
+            return stmt
+        if handle is not None:
+            ctx.emit(handle)
+        return handle
 
     loop_vars: List[Any] = []
     for axis, _extent in enumerate(val_shape or [1]):
@@ -1035,7 +1050,31 @@ def from_ttir(
         # Skipped silently when the C++ shim is unavailable so the walker
         # falls back to the MVP scalar path (op_mapping seeds placeholder
         # buffers in that case).
-        if shim_available():
+        try:
+            from .pipeline import _libtriton_loaded as _triton_native_loaded  # noqa: WPS433
+        except Exception:
+            _triton_native_loaded = lambda: False  # type: ignore[assignment]
+
+        if shim_available() and _triton_native_loaded():
+            try:
+                from .pipeline import (  # noqa: WPS433
+                    run_ptr_analysis_pre_pass_subprocess,
+                    seed_ptr_states,
+                )
+
+                _rewritten, state_map = run_ptr_analysis_pre_pass_subprocess(
+                    str(ttir_module)
+                )
+                seed_ptr_states(ctx, state_map)
+            except Exception as exc:  # pragma: no cover -- shim build issues
+                warnings.warn(
+                    "triton_frontend: isolated PtrAnalysis pre-pass failed; "
+                    "falling back to MVP scalar path. "
+                    f"cause={exc!r}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        elif shim_available():
             try:
                 pa = PtrAnalysis(ttir_module)
                 pa.rewrite()

@@ -892,7 +892,24 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
             return s in ("local.fragment", "metal.simdgroup", "shared",
                          "shared.dyn")
 
+        def _is_zero_constant_tile(buf: Any) -> bool:
+            const_tiles = getattr(ctx, "constant_tile_values", {}) or {}
+            keys = (
+                str(getattr(buf, "data", "")),
+                str(getattr(buf, "name", "")),
+                str(buf),
+            )
+            for key in keys:
+                if not key or key not in const_tiles:
+                    continue
+                try:
+                    return float(const_tiles[key]) == 0.0
+                except Exception:
+                    return False
+            return False
+
         tir_mod = ctx.tir()
+        clear_accum = False
         if c is None:
             # Allocate the C accumulator as a ``local.fragment`` buffer via
             # ``_alloc_tile_buffer`` (registers in ``ctx.local_buffers``);
@@ -904,35 +921,51 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
                 name=ctx.fresh("dot_c_frag"),
                 scope="local.fragment",
             )
+            clear_accum = True
         elif not _is_fragment_scope(c):
-            # The bound C buffer was allocated in plain ``local`` scope
-            # (typically by ``arith.constant`` materialising a zero tile).
-            # ``tilelang.tileop.gemm`` rejects that scope on Metal:
-            #   "Metal GEMM requires C in local.fragment, metal.simdgroup,
-            #    or shared scope, got local"
-            # Allocate a fresh fragment and seed it from the original tile via
-            # ``T.copy`` (a TileLang surface call lowered through the proper
-            # tile-op pipeline), so the new accumulator carries any
-            # pre-loaded values into the gemm. We avoid hand-built
-            # ``tir.BufferStore`` here because ``MetalFragmentToSimdgroup``
-            # accesses ``node.span`` on rewritten fragment-targeting stores,
-            # and Python-built ``BufferStore`` nodes don't expose ``.span``.
-            c_orig = c
-            c = _alloc_tile_buffer(
-                ctx, [M, N], acc_dtype,
-                name=ctx.fresh("dot_c_frag"),
-                scope="local.fragment",
-            )
-            try:
-                copy_handle = T.copy(c_orig, c)  # type: ignore[union-attr]
-                if isinstance(copy_handle, tir_mod.PrimExpr):
-                    ctx.emit(tir_mod.Evaluate(copy_handle))
-                else:
-                    ctx.emit(copy_handle)
-            except Exception as e:
-                raise EmitError(f"T.copy(c_orig, c) failed: {e}") from e
+            if _is_zero_constant_tile(c):
+                c = _alloc_tile_buffer(
+                    ctx, [M, N], acc_dtype,
+                    name=ctx.fresh("dot_c_frag"),
+                    scope="local.fragment",
+                )
+                clear_accum = True
+            else:
+                # The bound C buffer was allocated in plain ``local`` scope
+                # (typically by ``arith.constant`` materialising a zero tile).
+                # ``tilelang.tileop.gemm`` rejects that scope on Metal:
+                #   "Metal GEMM requires C in local.fragment, metal.simdgroup,
+                #    or shared scope, got local"
+                # Allocate a fresh fragment and seed it from the original tile via
+                # ``T.copy`` (a TileLang surface call lowered through the proper
+                # tile-op pipeline), so the new accumulator carries any
+                # pre-loaded values into the gemm. We avoid hand-built
+                # ``tir.BufferStore`` here because ``MetalFragmentToSimdgroup``
+                # accesses ``node.span`` on rewritten fragment-targeting stores,
+                # and Python-built ``BufferStore`` nodes don't expose ``.span``.
+                c_orig = c
+                c = _alloc_tile_buffer(
+                    ctx, [M, N], acc_dtype,
+                    name=ctx.fresh("dot_c_frag"),
+                    scope="local.fragment",
+                )
+                try:
+                    copy_handle = T.copy(c_orig, c)  # type: ignore[union-attr]
+                    if isinstance(copy_handle, tir_mod.PrimExpr):
+                        ctx.emit(tir_mod.Evaluate(copy_handle))
+                    else:
+                        ctx.emit(copy_handle)
+                except Exception as e:
+                    raise EmitError(f"T.copy(c_orig, c) failed: {e}") from e
 
-        handle = gemm(a, b, c, transpose_A=transpose_A, transpose_B=transpose_B)
+        handle = gemm(
+            a,
+            b,
+            c,
+            transpose_A=transpose_A,
+            transpose_B=transpose_B,
+            clear_accum=clear_accum,
+        )
         # ``tilelang.language.gemm`` returns a ``tir.Call`` (a PrimExpr).
         # ``ctx.stmts`` is consumed by ``tir.SeqStmt(stmts: Array<Stmt>)`` in
         # the walker -- a PrimExpr inserted directly there triggers

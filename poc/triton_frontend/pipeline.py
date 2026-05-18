@@ -21,7 +21,11 @@ pass to one of the Tier-1 stages from the RFC:
 """
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
+import sys
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -36,6 +40,7 @@ __all__ = [
     "build_pipeline",
     "run",
     "run_ptr_analysis_pre_pass",
+    "run_ptr_analysis_pre_pass_subprocess",
     "seed_ptr_states",
     "is_custom_form_ttir",
     "round_trip_through_cxx_shim",
@@ -341,6 +346,19 @@ def run(prim_func: Any, target: Optional[str] = None, **kwargs: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _ptr_states_to_map(states: List[Any]) -> dict:
+    state_map: dict = {}
+    for s in states:
+        if s.result_ssa is not None:
+            state_map[s.result_ssa] = s
+        # Also key by source SSA so load/store emitters can find the
+        # underlying base pointer state. Don't overwrite an existing
+        # result-keyed entry.
+        if s.source is not None and s.source not in state_map:
+            state_map[s.source] = s
+    return state_map
+
+
 def run_ptr_analysis_pre_pass(
     ttir_text: str,
 ) -> Tuple[str, dict]:
@@ -370,16 +388,84 @@ def run_ptr_analysis_pre_pass(
             "or rebuild poc/triton_frontend/_cxx."
         ) from exc
 
-    state_map: dict = {}
-    for s in states:
-        if s.result_ssa is not None:
-            state_map[s.result_ssa] = s
-        # Also key by source SSA so emitters that look up by the underlying
-        # base pointer (the common ``tt.addptr`` -> source case) still find it.
-        # Don't overwrite an existing result-keyed entry.
-        if s.source is not None and s.source not in state_map:
-            state_map[s.source] = s
-    return rewritten, state_map
+    return rewritten, _ptr_states_to_map(states)
+
+
+def run_ptr_analysis_pre_pass_subprocess(ttir_text: str) -> Tuple[str, dict]:
+    """Run PtrAnalysis in an isolated Python process.
+
+    Triton's native ``libtriton`` and the local PtrAnalysis shim both touch
+    LLVM's process-global option registry. If Triton already loaded
+    ``libtriton`` in this interpreter, importing the shim in-process can
+    abort before Python sees an exception. The subprocess keeps that native
+    state isolated while preserving PtrAnalysis metadata for the walker.
+    """
+    from .ptr_analysis import PtrState
+
+    payload = json.dumps({"sys_path": sys.path, "ttir": ttir_text})
+    code = r"""
+import json
+import sys
+
+payload = json.loads(sys.stdin.read())
+for path in reversed(payload.get("sys_path") or []):
+    if path and path not in sys.path:
+        sys.path.insert(0, path)
+
+from poc.triton_frontend.ptr_analysis import run_ptr_analysis_with_states
+
+rewritten, states = run_ptr_analysis_with_states(payload["ttir"])
+sys.stdout.write(json.dumps({
+    "rewritten": rewritten,
+    "states": [state.__dict__ for state in states],
+}))
+"""
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            input=payload,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            env=os.environ.copy(),
+        )
+    except Exception as exc:
+        raise PipelineError(
+            f"PtrAnalysis subprocess failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    if proc.returncode != 0:
+        raise PipelineError(
+            "PtrAnalysis subprocess failed with exit "
+            f"{proc.returncode}: {proc.stderr.strip()}"
+        )
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise PipelineError(
+            f"PtrAnalysis subprocess returned invalid JSON: {proc.stdout[:500]!r}"
+        ) from exc
+
+    states = []
+    for item in data.get("states") or []:
+        if not isinstance(item, dict):
+            continue
+        states.append(
+            PtrState(
+                offsets=tuple(item.get("offsets") or ()),
+                sizes=tuple(item.get("sizes") or ()),
+                strides=tuple(item.get("strides") or ()),
+                source=item.get("source"),
+                modulos=tuple(item.get("modulos") or ()),
+                shape=(
+                    tuple(item.get("shape"))
+                    if item.get("shape") is not None else None
+                ),
+                op=item.get("op"),
+                result_ssa=item.get("result_ssa"),
+            )
+        )
+    return str(data.get("rewritten") or ttir_text), _ptr_states_to_map(states)
 
 
 def seed_ptr_states(ctx: Any, state_map: dict) -> int:
@@ -469,6 +555,52 @@ def is_custom_form_ttir(ttir_text: str) -> bool:
     return any(hint in ttir_text for hint in _CUSTOM_FORM_HINTS)
 
 
+def _libtriton_loaded() -> bool:
+    """Whether Triton's native libtriton module is already live."""
+    return any(name.startswith("triton._C.libtriton") for name in sys.modules)
+
+
+def _round_trip_through_cxx_shim_subprocess(ttir_text: str) -> Optional[str]:
+    """Run the C++ shim in a clean Python process.
+
+    Triton's libtriton and the local C++ shim both touch LLVM's global
+    option registry. Loading both into one process can abort the
+    interpreter with a duplicate option registration before Python can
+    catch anything. The subprocess keeps that native state isolated.
+    """
+    payload = json.dumps({"sys_path": sys.path, "ttir": ttir_text})
+    code = r"""
+import json
+import sys
+
+payload = json.loads(sys.stdin.read())
+for path in reversed(payload.get("sys_path") or []):
+    if path and path not in sys.path:
+        sys.path.insert(0, path)
+
+import _triton_frontend_cxx as _cxx
+
+ctx = _cxx.Context()
+mod = _cxx.Module(ctx, payload["ttir"])
+sys.stdout.write(mod.to_generic())
+"""
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            input=payload,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            env=os.environ.copy(),
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
 def round_trip_through_cxx_shim(ttir_text: str) -> str:
     """Re-print custom-form TTIR as generic form via the C++ shim.
 
@@ -481,6 +613,12 @@ def round_trip_through_cxx_shim(ttir_text: str) -> str:
     Use the heuristic :func:`is_custom_form_ttir` to decide whether to
     invoke this helper.
     """
+    if _libtriton_loaded():
+        converted = _round_trip_through_cxx_shim_subprocess(ttir_text)
+        if converted:
+            return converted
+        return ttir_text
+
     try:
         import _triton_frontend_cxx as _cxx  # type: ignore  # noqa: WPS433
     except Exception:

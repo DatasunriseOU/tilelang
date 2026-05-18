@@ -769,7 +769,8 @@ def _ptrstate_sizes_int(resolved: Dict[str, Any]) -> List[int]:
 
 def _ptrstate_buffer(ctx: "WalkerCtx", resolved: Dict[str, Any], dtype: str) -> Any:
     """Return (or create) the global buffer that the PtrState aliases."""
-    name = resolved.get("source") or ctx.fresh("ptr")
+    raw_name = resolved.get("source") or ctx.fresh("ptr")
+    name = str(raw_name).lstrip("%") or ctx.fresh("ptr")
     if name not in ctx.buffers:
         tir = ctx.tir()
         ctx.buffers[name] = tir.decl_buffer(
@@ -972,6 +973,11 @@ def _emit_store_copy(op: Any, ctx: "WalkerCtx", resolved: Dict[str, Any],
             return handle
         except KeyError:
             pass
+    if isinstance(handle, tir.PrimExpr):
+        stmt = tir.Evaluate(handle)
+        ctx.emit(stmt)
+        return stmt
+    ctx.emit(handle)
     return handle
 
 
@@ -1546,7 +1552,7 @@ def map_tt_print(op: Any, ctx: WalkerCtx) -> Any:
       portable surface across CUDA / HIP / Metal codegens.
     """
     operands = _operands(op)
-    attrs = _attrs(op)
+    attrs = _attrs_with_properties_shared(op)
     prefix = str(attrs.get("prefix", attrs.get("msg", "")))
 
     tir = ctx.tir()
@@ -1620,7 +1626,7 @@ def map_tt_program_id(op: Any, ctx: WalkerCtx) -> Any:
     fakes) we fall back to allocating a fresh ``int32`` Var so the walker
     keeps going; downstream codegen replaces it with the real binding.
     """
-    attrs = _attrs(op)
+    attrs = _attrs_with_properties_shared(op)
     axis = int(attrs.get("axis", 0))
     if axis < 0 or axis > 2:
         raise EmitError(

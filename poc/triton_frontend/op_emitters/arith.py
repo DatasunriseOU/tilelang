@@ -279,6 +279,24 @@ def _read_lane(ctx: EmitContext, value: Any, indices: Tuple[Any, ...]) -> Any:
     return value
 
 
+def _is_zero_constant_tile(ctx: EmitContext, value: Any) -> bool:
+    """True when ``value`` is a dense splat-zero tile materialized earlier."""
+    const_tiles = getattr(ctx, "constant_tile_values", {}) or {}
+    keys = (
+        str(getattr(value, "data", "")),
+        str(getattr(value, "name", "")),
+        str(value),
+    )
+    for key in keys:
+        if not key or key not in const_tiles:
+            continue
+        try:
+            return float(const_tiles[key]) == 0.0
+        except Exception:
+            return False
+    return False
+
+
 def _emit_tile_binop(
     op: Any,
     ctx: EmitContext,
@@ -395,6 +413,10 @@ def _emit_addf(op: Any, ctx: EmitContext) -> Any:
     dt = _tile_dtype(ctx, a)
     if not _is_float_dtype(dt):
         raise EmitError(f"arith.addf on non-float type {dt!r}; use arith.addi")
+    if _is_zero_constant_tile(ctx, a):
+        return _bind_result(op, ctx, b)
+    if _is_zero_constant_tile(ctx, b):
+        return _bind_result(op, ctx, a)
     tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: ctx.tir().Add(x, y),
                              "arith.addf", dt)
     if tile is not None:

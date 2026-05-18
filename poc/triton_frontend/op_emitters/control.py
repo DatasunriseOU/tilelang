@@ -1062,6 +1062,18 @@ def map_arith_constant(op: Any, ctx: _om.WalkerCtx) -> Any:
         buf = _om._alloc_tile_buffer(
             ctx, list(shape) if shape else [1], dtype, buf_name
         )
+        if is_splat:
+            const_tiles = getattr(ctx, "constant_tile_values", None)
+            if const_tiles is None:
+                const_tiles = {}
+                ctx.constant_tile_values = const_tiles
+            for key in (
+                str(getattr(buf, "data", "")),
+                str(getattr(buf, "name", "")),
+                str(buf),
+            ):
+                if key:
+                    const_tiles[key] = payload
 
         # Build a serial tir.For nest writing the constant(s) into ``buf``.
         # All shapes from MLIR DenseElementsAttr are static (RankedTensorType
@@ -1198,6 +1210,8 @@ def _emit_region(
     child.value_map = dict(ctx.value_map)
     child.buffers = ctx.buffers  # share kernel-level buffer registry
     child.transposed_views = dict(ctx.transposed_views)
+    child.ptr_states = getattr(ctx, "ptr_states", {})
+    child.constant_tile_values = getattr(ctx, "constant_tile_values", {})
     child._tmp_counter = ctx._tmp_counter
     child._tvm = ctx._tvm
     child._T = ctx._T
@@ -1252,7 +1266,6 @@ def _emit_region(
 
     # Bubble counter back so fresh names stay unique across siblings.
     ctx._tmp_counter = child._tmp_counter
-
     # Propagate tile-scoped buffers allocated inside the region back to the
     # parent context. ``_alloc_tile_buffer`` registers each buffer in
     # ``ctx.local_buffers``; when ``ctx`` is the child, those buffers are

@@ -323,11 +323,8 @@ def _ensure_cxx_shim_on_syspath() -> None:
     import sys
     from pathlib import Path
 
-    try:
-        importlib.import_module("_triton_frontend_cxx")
+    if importlib.util.find_spec("_triton_frontend_cxx") is not None:
         return
-    except Exception:
-        pass
 
     # Run the canonical locator first (handles the "build/" case).
     try:
@@ -351,12 +348,14 @@ def _ensure_cxx_shim_on_syspath() -> None:
         path_str = str(cand.parent)
         if path_str not in sys.path:
             sys.path.insert(0, path_str)
-        try:
-            importlib.invalidate_caches()
-            importlib.import_module("_triton_frontend_cxx")
+        importlib.invalidate_caches()
+        if importlib.util.find_spec("_triton_frontend_cxx") is not None:
             return
-        except Exception:
-            continue
+        # Do not import the shim here. Triton's native libtriton and the
+        # local C++ shim both register LLVM options process-globally; after
+        # Triton has been loaded, importing the shim in-process can abort the
+        # interpreter before Python can catch an exception. The lowering path
+        # calls the shim through an isolated subprocess when needed.
 
 
 def _lower_ttir(
@@ -480,6 +479,58 @@ def _compile_metal(prim: Any) -> Tuple[Any, Optional[str]]:
         return None, f"tilelang.lower raised: {type(exc).__name__}: {exc}\n{tb}"
 
 
+def _positive_int_or_none(value: Any) -> Optional[int]:
+    """Best-effort conversion for TVM IntImm / Python ints."""
+    if value is None:
+        return None
+    raw = getattr(value, "value", value)
+    try:
+        out = int(raw)
+    except Exception:
+        s = str(value)
+        if not s.isdigit():
+            return None
+        out = int(s)
+    return out if out > 0 else None
+
+
+def _threadgroup_from_artifact(artifact: Any, kernel_mod: Any) -> Tuple[int, int, int]:
+    """Infer the Metal threadgroup shape TileLang encoded on the device func."""
+    explicit = getattr(kernel_mod, "THREADGROUP", None)
+    if explicit is not None:
+        dims = tuple(int(x) for x in explicit)
+        while len(dims) < 3:
+            dims = dims + (1,)
+        return dims[:3]
+
+    dims = [1, 1, 1]
+    device_mod = getattr(artifact, "device_mod", None)
+    funcs = getattr(device_mod, "functions", {}) if device_mod is not None else {}
+    for _gv, func in getattr(funcs, "items", lambda: [])():
+        attrs = getattr(func, "attrs", None)
+        if attrs is None:
+            continue
+        try:
+            thread_extent = attrs.get("thread_extent")
+        except Exception:
+            thread_extent = None
+        if not thread_extent:
+            continue
+        for axis, key in enumerate(("threadIdx.x", "threadIdx.y", "threadIdx.z")):
+            try:
+                raw = thread_extent.get(key)
+            except Exception:
+                raw = None
+                for k, v in getattr(thread_extent, "items", lambda: [])():
+                    if str(k) == key:
+                        raw = v
+                        break
+            val = _positive_int_or_none(raw)
+            if val is not None:
+                dims[axis] = max(dims[axis], val)
+    return tuple(dims)
+
+
 # ---------------------------------------------------------------------------
 # Stage 4 + 5: MLX wrap + run
 # ---------------------------------------------------------------------------
@@ -589,12 +640,17 @@ def _run_mlx(
         # Pad grid to 3D as mx.fast.metal_kernel requires.
         while len(grid) < 3:
             grid = grid + (1,)
-        threadgroup = (1, 1, 1)
+        threadgroup = _threadgroup_from_artifact(artifact, kernel_mod)
+        # MLX's ``grid`` is a total thread grid, while TileLang's
+        # ``LAUNCH_GRID`` metadata is a block/threadgroup grid.
+        dispatch_grid = tuple(
+            max(1, int(grid[i]) * int(threadgroup[i])) for i in range(3)
+        )
         out_arrays = adapter(
             inputs=mx_inputs,
             output_shapes=[output_np.shape],
             output_dtypes=[_np_to_mx_dtype(mx, output_np.dtype)],
-            grid=grid,
+            grid=dispatch_grid,
             threadgroup=threadgroup,
         )
         mx.eval(out_arrays)

@@ -39,6 +39,7 @@ from poc.triton_frontend.op_mapping import (  # noqa: E402
     _is_tensor_type,
     _normalize_mlir_dtype,
     _parse_tensor_type,
+    map_tt_program_id,
     map_tt_trans,
 )
 
@@ -128,6 +129,32 @@ def test_tt_reduce_axis_from_properties_block() -> None:
     )
     attrs = _attrs_with_properties_shared(op)
     assert attrs.get("axis") == 1
+
+
+def test_tt_program_id_axis_from_properties_block() -> None:
+    """``tt.get_program_id`` must preserve non-zero axes from Properties.
+
+    Triton 3.6 prints ``axis`` inside ``<{...}>`` for custom-form ops. If
+    the emitter falls back to the bare attribute accessor, every
+    ``tl.program_id(axis=1)`` silently becomes ``blockIdx.x``.
+    """
+    result = _ssa("pid", dtype="int32")
+    printed = '%pid = "tt.get_program_id"() <{axis = 1 : i32}> : () -> i32'
+    op = _FakeMlirOp(
+        name="tt.get_program_id",
+        operands=[],
+        results=[result],
+        printed=printed,
+    )
+    ctx = WalkerCtx()
+
+    pid_var = map_tt_program_id(op, ctx)
+
+    assert ctx.get(result) is pid_var
+    assert len(ctx.program_id_vars) == 1
+    _var, axis, extent = ctx.program_id_vars[0]
+    assert axis == 1
+    assert str(extent) == "gridDim_1"
 
 
 # ---------------------------------------------------------------------------
