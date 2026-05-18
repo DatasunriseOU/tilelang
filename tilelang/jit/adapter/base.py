@@ -70,16 +70,33 @@ class BaseKernelAdapter(ABC):
         """Return a callable that yields Torch's current device.
 
         Similar to the stream functor, we capture a callable that, when called,
-        fetches the current device according to PyTorch. On CPU or when CUDA is
-        unavailable, returns ``torch.device('cpu')``.
+        fetches the current device according to PyTorch. The CUDA runtime probe
+        is deferred to call time inside the returned closure so transient or
+        environment-level failures (e.g. CUDA driver missing on Mac/ROCm hosts
+        even when ``torch.cuda.is_available()`` returned True at construction)
+        can be caught and gracefully degraded by callers. On CPU or when CUDA
+        is unavailable, returns ``torch.device('cpu')``.
         """
         if torch.cuda.is_available():
             try:
                 torch.cuda._lazy_init()
                 current_device = torch._C._cuda_getDevice
-                return lambda: torch.device("cuda", current_device())
             except Exception:
-                pass
+                current_device = None
+
+            if current_device is not None:
+
+                def _cuda_device_functor() -> torch.device:
+                    try:
+                        return torch.device("cuda", current_device())
+                    except Exception:
+                        # Fallback to Python API if internal handle fails at call time
+                        try:
+                            return torch.device("cuda", torch.cuda.current_device())
+                        except Exception:
+                            return torch.device("cpu")
+
+                return _cuda_device_functor
         if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
             return lambda: torch.device("mps")
         # CPU fallback
