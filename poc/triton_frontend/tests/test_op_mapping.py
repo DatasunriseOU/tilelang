@@ -412,7 +412,16 @@ def test_op_table_has_expected_size() -> None:
     # ``tl.load(..., boundary_check=(0, 1))``). Added the bitwise/logical
     # cohort ``arith.{andi,ori,xori}`` for consistency -- all three lower
     # via ``tir.bitwise_{and,or,xor}``.
-    EXPECTED = 98
+    #
+    # Bumped 98 -> 100 by the flash-attention combine-function seam:
+    # Triton 3.6 emits ``arith.maxnumf`` / ``arith.minnumf`` in private
+    # reducer callees; both route to the same float min/max TIR emitters
+    # as ``arith.maximumf`` / ``arith.minimumf``.
+    #
+    # Bumped 100 -> 101 by the PtrAnalysis/text-TTIR performance seam:
+    # the C++ shim rewrites structured pointer paths through
+    # ``arith.index_cast``.
+    EXPECTED = 101
     assert len(OP_TABLE) == EXPECTED, (
         f"OP_TABLE size changed from {EXPECTED} to {len(OP_TABLE)}; "
         f"if intentional, update this constant + the three README "

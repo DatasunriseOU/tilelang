@@ -1,8 +1,10 @@
 """flash_attention: simplified Flash Attention v2 forward kernel.
 
 Smallest flash attention tile that exercises the loop, scaling, maximum,
-exp, sum and inner dot products. We use SEQ_Q = SEQ_K = 128 and
-BLOCK_M = BLOCK_N = BLOCK_K = 64 so the kernel runs a couple of tiles.
+exp, sum and inner dot products while staying inside Metal's 32KiB
+threadgroup-memory budget. We use 32-wide block tiles and a 32-wide head
+dimension; this keeps the POC small but still exercises the same TTIR op
+families as the 64-wide tutorial shape.
 
 Source: synthetic, modeled on Triton's tutorial ``06-fused-attention.py``.
 """
@@ -22,10 +24,11 @@ except ImportError:  # pragma: no cover -- triton optional
 
 SEQ_Q = 128
 SEQ_K = 128
-HEAD_DIM = 64
-BLOCK_M = 64
-BLOCK_N = 64
-BLOCK_DMODEL = 64
+HEAD_DIM = 32
+BLOCK_M = 32
+BLOCK_N = 32
+BLOCK_DMODEL = 32
+SM_SCALE = 0.17677669529663687  # 1.0 / sqrt(32)
 
 LAUNCH_GRID: Tuple[int, ...] = (SEQ_Q // BLOCK_M,)
 META_ARGS: dict = {
@@ -88,7 +91,7 @@ if triton is not None:
 
             qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
             qk += tl.dot(q, tl.trans(k))
-            qk = qk * 0.125  # sm_scale = 1.0 / sqrt(64)
+            qk = qk * 0.17677669529663687  # sm_scale = 1.0 / sqrt(32)
 
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             p = tl.exp(qk - m_ij[:, None])
@@ -125,7 +128,7 @@ def make_inputs(
 
 def numpy_reference(args: List[np.ndarray]) -> np.ndarray:
     q, k, v, _out = args
-    qk = (q @ k.T) * 0.125
+    qk = (q @ k.T) * SM_SCALE
     # Numerically stable softmax
     m = np.max(qk, axis=-1, keepdims=True)
     p = np.exp(qk - m)

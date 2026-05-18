@@ -78,6 +78,13 @@ def _force_no_shim(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def _force_shim(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "poc.triton_frontend.op_emitters.memory.has_cxx_shim",
+        lambda: True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # tt.make_range -> tir.Ramp
 # ---------------------------------------------------------------------------
@@ -507,6 +514,165 @@ def test_arith_addf_handles_two_buffer_tile_operands() -> None:
     )
 
 
+def test_arith_addf_on_loop_carried_tile_keeps_ssa_result_distinct() -> None:
+    from poc.triton_frontend.op_emitters.arith import _emit_addf  # noqa: WPS433
+
+    ctx = WalkerCtx()
+    acc_ssa = _ssa("acc", shape=[32, 32], dtype="float32")
+    rhs_ssa = _ssa("rhs", shape=[32, 32], dtype="float32")
+    out_ssa = _ssa("out", shape=[32, 32], dtype="float32")
+    acc_buf = tvm.tir.decl_buffer([32, 32], "float32", name="ACC")
+    rhs_buf = tvm.tir.decl_buffer([32, 32], "float32", name="RHS")
+    ctx.bind(acc_ssa, acc_buf)
+    ctx.bind(rhs_ssa, rhs_buf)
+    ctx.loop_carry_buffers = {acc_ssa: acc_buf}
+
+    op = {
+        "name": "arith.addf",
+        "operands": [acc_ssa, rhs_ssa],
+        "results": [out_ssa],
+        "attrs": {},
+    }
+    result = _emit_addf(op, ctx)
+
+    assert isinstance(result, tvm.tir.Buffer)
+    assert not result.same_as(acc_buf)
+    stores = []
+
+    def _collect(node: Any) -> None:
+        if isinstance(node, tvm.tir.BufferStore):
+            stores.append(node)
+
+    for stmt in ctx.stmts:
+        tvm.tir.stmt_functor.post_order_visit(stmt, _collect)
+    assert any(store.buffer.same_as(result) for store in stores)
+    assert not any(store.buffer.same_as(acc_buf) for store in stores)
+
+
+def test_addptr_mutates_loop_carried_pointer_index_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Loop-carried pointer tiles must update the carried index buffer."""
+    _force_no_shim(monkeypatch)
+    ctx = WalkerCtx()
+    ptr_ssa = _ssa("a_ptrs", shape=[32, 32], dtype="float32")
+    off_ssa = _ssa("k_step", shape=[32, 32], dtype="int32")
+    out_ssa = _ssa("a_ptrs_next", shape=[32, 32], dtype="float32")
+
+    base_buf = tvm.tir.decl_buffer([4096], "float32", name="A")
+    carried_index = tvm.tir.decl_buffer([32, 32], "int32", name="A_IDX")
+    step_buf = tvm.tir.decl_buffer([32, 32], "int32", name="STEP")
+    descriptor = (base_buf, [carried_index])
+    ctx.bind(ptr_ssa, descriptor)
+    ctx.bind(off_ssa, step_buf)
+    ctx.loop_carry_buffers = {ptr_ssa: descriptor, "a_ptrs": descriptor}
+
+    result = emit_tt_addptr(
+        {
+            "name": "tt.addptr",
+            "operands": [ptr_ssa, off_ssa],
+            "results": [out_ssa],
+            "attrs": {},
+        },
+        ctx,
+    )
+
+    assert isinstance(result, tuple)
+    assert result[1][-1].same_as(carried_index)
+    stores = []
+
+    def _collect(node: Any) -> None:
+        if isinstance(node, tvm.tir.BufferStore):
+            stores.append(node)
+
+    for stmt in ctx.stmts:
+        tvm.tir.stmt_functor.post_order_visit(stmt, _collect)
+    assert any(store.buffer.same_as(carried_index) for store in stores)
+
+
+def test_addptr_ignores_result_ptrstate_when_source_mismatches_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale/colliding PtrState result must not hijack a tuple descriptor."""
+    from poc.triton_frontend.ptr_analysis import PtrState  # noqa: WPS433
+
+    _force_shim(monkeypatch)
+    ctx = WalkerCtx()
+    ptr_ssa = _ssa("a_ptrs", shape=[32, 32], dtype="float32")
+    off_ssa = _ssa("k_step", shape=[32, 32], dtype="int32")
+    out_ssa = _ssa("%66", shape=[32, 32], dtype="float32")
+
+    a_buf = tvm.tir.decl_buffer([4096], "float32", name="arg0")
+    c_buf = tvm.tir.decl_buffer([4096], "float32", name="arg2")
+    carried_index = tvm.tir.decl_buffer([32, 32], "int32", name="A_IDX")
+    step_buf = tvm.tir.decl_buffer([32, 32], "int32", name="STEP")
+    descriptor = (a_buf, [carried_index])
+    ctx.bind("%arg0", a_buf)
+    ctx.bind("%arg2", c_buf)
+    ctx.bind(ptr_ssa, descriptor)
+    ctx.bind(off_ssa, step_buf)
+    ctx.loop_carry_buffers = {ptr_ssa: descriptor}
+    ctx.ptr_states = {
+        "%66": PtrState(
+            offsets=("%56", "%65"),
+            sizes=("32", "32"),
+            strides=("%55", "%64"),
+            source="%arg2",
+            result_ssa="%66",
+        )
+    }
+
+    result = emit_tt_addptr(
+        {
+            "name": "tt.addptr",
+            "operands": [ptr_ssa, off_ssa],
+            "results": [out_ssa],
+            "attrs": {},
+        },
+        ctx,
+    )
+
+    assert isinstance(result, tuple)
+    assert result[0].same_as(a_buf)
+    assert result[1][-1].same_as(carried_index)
+
+
+def test_arith_maxnumf_and_minnumf_route_to_float_minmax_emitters() -> None:
+    from poc.triton_frontend.op_emitters.arith import ARITH_EMITTERS  # noqa: WPS433
+
+    ctx = WalkerCtx()
+    x_ssa = _ssa("x", dtype="float32")
+    y_ssa = _ssa("y", dtype="float32")
+    max_out = _ssa("max", dtype="float32")
+    min_out = _ssa("min", dtype="float32")
+    x = tvm.tir.Var("x", "float32")
+    y = tvm.tir.Var("y", "float32")
+    ctx.bind(x_ssa, x)
+    ctx.bind(y_ssa, y)
+
+    max_result = ARITH_EMITTERS["arith.maxnumf"](
+        {
+            "name": "arith.maxnumf",
+            "operands": [x_ssa, y_ssa],
+            "results": [max_out],
+            "attrs": {},
+        },
+        ctx,
+    )
+    min_result = ARITH_EMITTERS["arith.minnumf"](
+        {
+            "name": "arith.minnumf",
+            "operands": [x_ssa, y_ssa],
+            "results": [min_out],
+            "attrs": {},
+        },
+        ctx,
+    )
+
+    assert isinstance(max_result, tvm.tir.Max)
+    assert isinstance(min_result, tvm.tir.Min)
+
+
 # ---------------------------------------------------------------------------
 # tt.addptr in-loop pointer increment (matmul scf.for body)
 # ---------------------------------------------------------------------------
@@ -574,6 +740,40 @@ def test_addptr_buffer_offset_emits_per_lane_for_loop(
     # The new tile buffer must be different from either input tile.
     assert out_indices[0] is not prev_off
     assert out_indices[0] is not step_buf
+
+
+def test_addptr_buffer_offsets_use_broadcast_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Composed row/column offset tiles must expand singleton dimensions."""
+    _force_no_shim(monkeypatch)
+    ctx = WalkerCtx()
+    ptr_ssa = _ssa("c_rows", shape=[32, 1], dtype="float32")
+    off_ssa = _ssa("c_cols", shape=[32, 32], dtype="int32")
+    out_ssa = _ssa("c_ptrs", shape=[32, 32], dtype="float32")
+
+    base_buf = tvm.tir.decl_buffer([4096], "float32", name="C")
+    row_offsets = tvm.tir.decl_buffer([32, 1], "int32", name="ROW")
+    col_offsets = tvm.tir.decl_buffer([32, 32], "int32", name="COL")
+    ctx.bind(ptr_ssa, (base_buf, [row_offsets]))
+    ctx.bind(off_ssa, col_offsets)
+
+    result = emit_tt_addptr(
+        {
+            "name": "tt.addptr",
+            "operands": [ptr_ssa, off_ssa],
+            "results": [out_ssa],
+            "attrs": {},
+        },
+        ctx,
+    )
+
+    assert isinstance(result, tuple)
+    index_tile = result[1][-1]
+    assert isinstance(index_tile, tvm.tir.Buffer)
+    assert [int(dim) for dim in index_tile.shape] == [32, 32]
+    text = _stringify(ctx.stmts)
+    assert "ROW[" in text and ", 0]" in text
 
 
 def test_addptr_scalar_offset_keeps_scalar_fast_path(
@@ -1311,6 +1511,59 @@ def test_addptr_compose_handles_buffer_plus_vector_primexpr_offset(
     assert tuple(int(d) for d in out_indices[0].shape) == (64, 64)
 
 
+def test_addptr_compose_coerces_ptrstate_string_zero_before_vector_add(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PtrAnalysis JSON offsets use strings; ``"0" + vector`` is invalid."""
+    _force_shim(monkeypatch)
+    ctx = WalkerCtx()
+    ptr_ssa = _ssa("ptrs", shape=[64, 64], dtype="float32")
+    off_ssa = _ssa("off", shape=[64, 64], dtype="int32")
+    out_ssa = _ssa("ptrs_new", shape=[64, 64], dtype="float32")
+
+    vec_off = tvm.tir.Broadcast(tvm.tir.const(7, "int32"), 64 * 64)
+    ctx.bind(ptr_ssa, {
+        "_ptrstate": object(),
+        "source": "%arg0",
+        "offsets": ["0"],
+        "sizes": ["64", "64"],
+        "strides": [],
+    })
+    ctx.bind(off_ssa, vec_off)
+
+    result = emit_tt_addptr({
+        "name": "tt.addptr",
+        "operands": [ptr_ssa, off_ssa],
+        "results": [out_ssa],
+        "attrs": {},
+    }, ctx)
+
+    assert isinstance(result, dict)
+    new_offset = result["offsets"][0]
+    assert not isinstance(new_offset, str)
+    assert "handle" not in str(getattr(new_offset, "dtype", ""))
+
+
+def test_tile_copy_scalarizes_vector_base_index_per_lane() -> None:
+    from poc.triton_frontend.op_emitters.memory import _emit_tile_copy_tir
+
+    ctx = WalkerCtx()
+    src = tvm.tir.decl_buffer([64, 64], "float32", name="src")
+    vec_base = tvm.tir.Broadcast(tvm.tir.const(0, "int32"), 64 * 64)
+    out_ssa = _ssa("out", shape=[64, 64], dtype="float32")
+
+    _emit_tile_copy_tir({
+        "name": "tt.load",
+        "operands": [],
+        "results": [out_ssa],
+        "attrs": {},
+    }, ctx, src, [vec_base, 0], [64, 64], "float32", None, None)
+
+    text = _stringify(ctx.stmts)
+    assert "Broadcast" not in text
+    assert "T.Broadcast" not in text
+
+
 def test_tt_load_scalarizes_buffer_typed_index_per_lane() -> None:
     """``emit_tt_load`` scalar path must scalarise a Buffer-typed index.
 
@@ -1450,6 +1703,100 @@ def test_tt_store_threads_row_base_into_flat_index() -> None:
     )
     assert "gridDim_0" in new_shape_text and "arg3" in new_shape_text, (
         f"redecl shape must thread row base + stride; got {new_shape_text!r}"
+    )
+
+
+def test_tt_store_redecl_bounds_ranked_offset_buffer_by_launch_grid() -> None:
+    """Materialised offset tiles must still size the backing pointer buffer.
+
+    Matmul's C-store pointer expression is lowered into one rank-2 int32
+    offset buffer before ``tt.store`` sees it. The previous fallback treated
+    that local offset buffer as opaque and redeclared the destination pointer
+    as only one tile (32 * 32 = 1024 elements), so TileLang emitted
+    ``if index < 1024`` and dropped rows outside the first 16 of a 64x64 C.
+    """
+    from poc.triton_frontend import (  # noqa: WPS433
+        _flat_extent_for_indices,
+        _redecl_input_buffer,
+    )
+
+    ctx = WalkerCtx()
+    arg2 = tvm.tir.decl_buffer([1], "float32", name="arg2")
+    ctx.buffers["arg2"] = arg2
+    pid0 = tvm.tir.Var("pid0", "int32")
+    pid1 = tvm.tir.Var("pid1", "int32")
+    grid_dim_0 = tvm.tir.Var("gridDim_0", "int32")
+    grid_dim_1 = tvm.tir.Var("gridDim_1", "int32")
+    ctx.program_id_vars.extend(
+        [(pid0, 0, grid_dim_0), (pid1, 1, grid_dim_1)]
+    )
+
+    offset_tile = tvm.tir.decl_buffer([32, 32], "int32", name="C_OFFS")
+    extent_shape = _flat_extent_for_indices(ctx, [offset_tile], [32, 32])
+    assert len(extent_shape) == 1
+    extent_text = str(extent_shape[0])
+    assert "gridDim_0" in extent_text and "gridDim_1" in extent_text, (
+        f"ranked offset-buffer extent must include both grid dims; got {extent_text!r}"
+    )
+    assert "1024" in extent_text or "32 * 32" in extent_text, (
+        f"ranked offset-buffer extent must include the tile footprint; got {extent_text!r}"
+    )
+
+    new_buf = _redecl_input_buffer(
+        ctx, arg2, [32, 32], "float32",
+        offset_indices=[offset_tile],
+    )
+    assert isinstance(new_buf, tvm.tir.Buffer)
+    new_shape_text = str(new_buf.shape[0])
+    assert new_shape_text != "1024", (
+        "redecl returned only one 32x32 tile; launch-grid extent was lost"
+    )
+    assert "gridDim_0" in new_shape_text and "gridDim_1" in new_shape_text, (
+        f"redecl shape must cover every matmul launch tile; got {new_shape_text!r}"
+    )
+
+
+def test_ranked_offset_store_does_not_shrink_pid_aware_buffer() -> None:
+    """The single-offset-buffer store path must not undo pid-aware redecl."""
+    from poc.triton_frontend import (  # noqa: WPS433
+        _emit_tile_store_to_input_buffer,
+        _redecl_input_buffer,
+    )
+
+    ctx = WalkerCtx()
+    arg2 = tvm.tir.decl_buffer([1], "float32", name="arg2")
+    ctx.buffers["arg2"] = arg2
+    pid0 = tvm.tir.Var("pid0", "int32")
+    pid1 = tvm.tir.Var("pid1", "int32")
+    grid_dim_0 = tvm.tir.Var("gridDim_0", "int32")
+    grid_dim_1 = tvm.tir.Var("gridDim_1", "int32")
+    ctx.program_id_vars.extend(
+        [(pid0, 0, grid_dim_0), (pid1, 1, grid_dim_1)]
+    )
+    offset_tile = tvm.tir.decl_buffer([32, 32], "int32", name="C_OFFS")
+    value_tile = tvm.tir.decl_buffer([32, 32], "float32", name="C_TILE")
+
+    wide_buf = _redecl_input_buffer(
+        ctx, arg2, [32, 32], "float32",
+        offset_indices=[offset_tile],
+    )
+    wide_shape = str(wide_buf.shape[0])
+    assert wide_shape != "1024"
+
+    _emit_tile_store_to_input_buffer(
+        {"name": "tt.store"},
+        ctx,
+        wide_buf,
+        [offset_tile],
+        value_tile,
+        [32, 32],
+        None,
+    )
+
+    final_shape = str(ctx.buffers["arg2"].shape[0])
+    assert final_shape == wide_shape, (
+        "single-offset-buffer store path narrowed the destination buffer "
+        f"from {wide_shape!r} to {final_shape!r}"
     )
 
 

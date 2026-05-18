@@ -1,9 +1,10 @@
 """matmul: ``c = a @ b`` for square fp32 with M = N = K = 64.
 
-Smallest matmul tile that still exercises ``tt.dot`` end-to-end. We use
-BLOCK_M = BLOCK_N = BLOCK_K = 64 so the kernel runs a SINGLE block tile
-on a single program -- no inter-program reduction, no boundary masking
-on the K axis.
+Metal limits threadgroup memory to 32KiB on this smoke path. A 64x64 fp32
+A tile plus a 64x64 fp32 B tile already consumes that entire budget, so
+the smoke uses 32-wide blocks while keeping the full problem at 64x64.
+That still exercises ``tt.dot`` end-to-end, multiple program ids, and a
+two-step K loop.
 
 Source: synthetic, modeled on Triton's tutorial ``03-matrix-multiplication.py``
 collapsed to the single-tile case.
@@ -23,9 +24,9 @@ except ImportError:  # pragma: no cover -- triton optional
 
 
 M = N = K = 64
-BLOCK_M = BLOCK_N = BLOCK_K = 64
+BLOCK_M = BLOCK_N = BLOCK_K = 32
 
-LAUNCH_GRID: Tuple[int, ...] = (1, 1)
+LAUNCH_GRID: Tuple[int, ...] = (M // BLOCK_M, N // BLOCK_N)
 META_ARGS: dict = {
     "BLOCK_M": BLOCK_M,
     "BLOCK_N": BLOCK_N,

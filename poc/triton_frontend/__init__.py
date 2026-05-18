@@ -204,11 +204,20 @@ def _flat_extent_for_indices(
     # pid Vars for their max.
     expr = None
     for entry in offset_indices:
-        # Tile-buffer offsets are opaque to us here; fall back to the
-        # tile shape (those paths are exercised by the matmul ladder and
-        # already use explicit pid + iter Vars in their Ramp folds).
         if isinstance(entry, tvm_mod.tir.Buffer):
-            return list(tile_shape) or [1]
+            # A rank-N offset tile (matmul's C pointer tile, and similar
+            # block-pointer paths) has already materialised the flat address
+            # expression into a local buffer, so we cannot inspect the
+            # original pid/stride expression here. The sound conservative
+            # bound is the per-program tile footprint multiplied by every
+            # launch-grid extent. This is intentionally an upper bound:
+            # over-declaring a PrimFunc parameter shape only weakens
+            # LegalizeSafeMemoryAccess guards, while under-declaring drops
+            # valid stores outside the first tile.
+            extent_expr = tir.const(int(flat_tile_extent), "int32")
+            for _var, _axis, extent in program_id_vars:
+                extent_expr = extent_expr * extent
+            return [extent_expr]
         scalar = _scalar_form(entry)
         expr = scalar if expr is None else (expr + scalar)
 
@@ -371,10 +380,11 @@ def _emit_tile_load_from_input_buffer(
         # rank-mismatch check below. ``_redecl_input_buffer`` updates
         # ctx.buffers / value_map in place, so subsequent emitters see the
         # 1D shape consistently.
-        flat_extent = 1
-        for _e in out_shape:
-            flat_extent *= int(_e)
-        src_buf = _redecl_input_buffer(ctx, src_buf, [flat_extent], out_dtype)
+        if len(getattr(src_buf, "shape", []) or []) != 1:
+            flat_extent = 1
+            for _e in out_shape:
+                flat_extent *= int(_e)
+            src_buf = _redecl_input_buffer(ctx, src_buf, [flat_extent], out_dtype)
         src_indices.append(tir.BufferLoad(single_offset_buf, list(loop_vars)))
     else:
         for axis, lv in enumerate(loop_vars):
@@ -546,11 +556,12 @@ def _emit_tile_store_to_input_buffer(
 
     dst_indices: List[Any] = []
     if single_offset_buf is not None:
-        flat_extent = 1
-        for _e in val_shape:
-            flat_extent *= int(_e)
-        dst_dtype = str(getattr(dst_buf, "dtype", "float32"))
-        dst_buf = _redecl_input_buffer(ctx, dst_buf, [flat_extent], dst_dtype)
+        if len(getattr(dst_buf, "shape", []) or []) != 1:
+            flat_extent = 1
+            for _e in val_shape:
+                flat_extent *= int(_e)
+            dst_dtype = str(getattr(dst_buf, "dtype", "float32"))
+            dst_buf = _redecl_input_buffer(ctx, dst_buf, [flat_extent], dst_dtype)
         dst_indices.append(tir.BufferLoad(single_offset_buf, list(loop_vars)))
     else:
         for axis, lv in enumerate(loop_vars):
@@ -853,10 +864,34 @@ def _walk_mlir_module(
     # sites; re-walking them at module level would double-emit and
     # KeyError on unbound block-args).
     if ctx is not None:
+        def _ssa_name(value: Any) -> str:
+            try:
+                getter = getattr(value, "get_name", None)
+                if callable(getter):
+                    name = getter()
+                    if name:
+                        return str(name)
+            except Exception:
+                pass
+            try:
+                name = getattr(value, "name", None)
+                if name:
+                    return str(name)
+            except Exception:
+                pass
+            if isinstance(value, dict):
+                name = value.get("name")
+                if name:
+                    return str(name)
+            return ""
+
         def _prepass(op: Any) -> None:
             name = _op_name(op)
+            for operand in getattr(op, "operands", ()) or ():
+                operand_name = _ssa_name(operand)
+                if operand_name:
+                    ctx.ssa_users.setdefault(operand_name, set()).add(name)
             if name == "tt.func":
-                print(f"_prepass tt.func: str(op)={str(op)[:200]}")
                 sym = _func_sym_name(op)
                 if sym:
                     ctx.callees[sym] = op
@@ -1042,8 +1077,32 @@ def from_ttir(
         # the module-load snapshot ``MLIR_WALKER_AVAILABLE``) so the
         # jaxlib alias wired by ``probe_and_wire_mlir()`` above is picked
         # up even on the first invocation.
-        _mlir_now_available = try_import_mlir() is not None
-        parsed = parse_ttir(ttir_module) if _mlir_now_available else None
+        ttir_text_for_parse = ttir_module
+        try:
+            from .pipeline import (  # noqa: WPS433
+                _libtriton_loaded,
+                run_ptr_analysis_pre_pass,
+                run_ptr_analysis_pre_pass_subprocess,
+                seed_ptr_states,
+            )
+
+            if _libtriton_loaded():
+                ttir_text_for_parse, state_map = run_ptr_analysis_pre_pass_subprocess(
+                    ttir_module
+                )
+            else:
+                ttir_text_for_parse, state_map = run_ptr_analysis_pre_pass(ttir_module)
+            seed_ptr_states(ctx, state_map)
+        except Exception as exc:
+            warnings.warn(
+                "triton_frontend: PtrAnalysis pre-pass for textual TTIR failed; "
+                "continuing with MLIR walker without pointer-state metadata. "
+                f"cause={exc!r}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        parsed = parse_ttir(ttir_text_for_parse)
         if parsed is not None:
             _walk_mlir_module(parsed, ctx)
             return getattr(ctx, "prim_func", None)

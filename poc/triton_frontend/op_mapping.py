@@ -201,6 +201,12 @@ class WalkerCtx:
         # options or kernel autotune-config when available.
         self.num_warps: int = 4
         self.num_stages: int = 2
+        # Printed SSA name -> op names that consume it. Seeded by the MLIR
+        # module pre-pass when available. Emitters use this only for layout
+        # choices where downstream composability matters (for example
+        # ``tt.dot`` can keep a direct store result in local.fragment but must
+        # use shared scope when a later arith op indexes the dot result).
+        self.ssa_users: Dict[str, set] = {}
 
     # ---- helpers --------------------------------------------------------
 
@@ -282,6 +288,16 @@ class WalkerCtx:
     def bind(self, ssa_value: Any, tir_value: Any) -> None:
         """Record the TIR value produced by an emitter for ``ssa_value``."""
         self.value_map[ssa_value] = tir_value
+        # PtrAnalysis reports symbolic references as printed SSA names
+        # (e.g. "%29"). Keep a string alias so memory emitters can resolve
+        # offsets/strides back to the TIR value produced by earlier ops.
+        try:
+            getter = getattr(ssa_value, "get_name", None)
+            name = getter() if callable(getter) else getattr(ssa_value, "name", None)
+            if name:
+                self.value_map[str(name)] = tir_value
+        except Exception:
+            pass
 
     def emit(self, stmt: Any) -> None:
         """Append a TIR statement to the current function body.

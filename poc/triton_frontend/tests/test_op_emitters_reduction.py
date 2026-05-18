@@ -200,6 +200,21 @@ def test_tt_reduce_maximumf_emits_neg_inf_init():
     )
 
 
+def test_tt_reduce_maximumf_accepts_mlir_short_f32_dtype():
+    ctx = WalkerCtx()
+    src_ssa = _ssa("buf", shape=[16], dtype="f32")
+    out_ssa = _ssa("max", shape=[], dtype="f32")
+    src_buf = tvm.tir.decl_buffer([16], "float32", name="buf")
+    ctx.bind(src_ssa, src_buf)
+
+    op = _op("tt.reduce", [src_ssa], [out_ssa], combiner="maximumf", axis=0)
+    REDUCTION_EMITTERS["tt.reduce"](op, ctx)
+
+    stores = _walk_buffer_stores(_seq_or_single(ctx.stmts))
+    expected_init = tvm.tir.min_value("float32")
+    assert tvm.ir.structural_equal(stores[0].value, expected_init)
+
+
 def test_tt_reduce_minimumf_emits_pos_inf_init():
     ctx = WalkerCtx()
     src_ssa = _ssa("buf", shape=[16], dtype="float32")
@@ -276,6 +291,38 @@ def test_tt_reduce_accum_buffer_registered_in_local_buffers():
     )
 
 
+def test_tt_reduce_welford_binds_three_scalar_results():
+    """LayerNorm's Welford reducer returns mean, m2, and weight."""
+    ctx = WalkerCtx()
+    x_ssa = _ssa("x", shape=[4], dtype="float32")
+    m2_ssa = _ssa("m2", shape=[4], dtype="float32")
+    w_ssa = _ssa("w", shape=[4], dtype="float32")
+    mean_out = _ssa("mean_out", shape=[], dtype="float32")
+    m2_out = _ssa("m2_out", shape=[], dtype="float32")
+    w_out = _ssa("w_out", shape=[], dtype="float32")
+
+    ctx.bind(x_ssa, tvm.tir.decl_buffer([4], "float32", name="x"))
+    ctx.bind(m2_ssa, tvm.tir.decl_buffer([4], "float32", name="m2"))
+    ctx.bind(w_ssa, tvm.tir.decl_buffer([4], "float32", name="w"))
+
+    op = _op(
+        "tt.reduce",
+        [x_ssa, m2_ssa, w_ssa],
+        [mean_out, m2_out, w_out],
+        combiner="welford",
+        axis=0,
+    )
+    REDUCTION_EMITTERS["tt.reduce"](op, ctx)
+
+    assert isinstance(ctx.get(mean_out), tvm.tir.BufferLoad)
+    assert isinstance(ctx.get(m2_out), tvm.tir.BufferLoad)
+    assert isinstance(ctx.get(w_out), tvm.tir.BufferLoad)
+    new_names = [str(getattr(b, "name", "")) for b in ctx.local_buffers]
+    assert any(n.startswith("welford_mean_accum") for n in new_names)
+    assert any(n.startswith("welford_m2_accum") for n in new_names)
+    assert any(n.startswith("welford_weight_accum") for n in new_names)
+
+
 # ---------------------------------------------------------------------------
 # tt.scan
 # ---------------------------------------------------------------------------
@@ -299,6 +346,21 @@ def test_tt_scan_addf_emits_for_loop_with_running_accumulator():
     # init + (accum-update + dst-write per iter): >= 3 stores.
     assert len(stores) >= 3
     # First store should be the identity (0).
+    zero = tvm.tir.const(0, "float32")
+    assert tvm.ir.structural_equal(stores[0].value, zero)
+
+
+def test_tt_scan_addf_accepts_mlir_short_f32_dtype():
+    ctx = WalkerCtx()
+    src_ssa = _ssa("buf", shape=[8], dtype="f32")
+    out_ssa = _ssa("scan", shape=[8], dtype="f32")
+    src_buf = tvm.tir.decl_buffer([8], "float32", name="buf")
+    ctx.bind(src_ssa, src_buf)
+
+    op = _op("tt.scan", [src_ssa], [out_ssa], combiner="addf", axis=0)
+    REDUCTION_EMITTERS["tt.scan"](op, ctx)
+
+    stores = _walk_buffer_stores(_seq_or_single(ctx.stmts))
     zero = tvm.tir.const(0, "float32")
     assert tvm.ir.structural_equal(stores[0].value, zero)
 
@@ -396,22 +458,19 @@ def test_tt_dot_emits_gemm_or_3loop_with_mul_add():
     )
 
 
-def test_tt_dot_uses_local_fragment_scope_for_C_accumulator():
-    """tt.dot must place the C accumulator in ``local.fragment`` scope.
+def test_tt_dot_uses_shared_scope_for_C_result():
+    """tt.dot must place a fresh C result in tile-local shared scope.
 
     Metal's GEMM lowering rejects the generic ``local`` scope:
         ``ValueError: Metal GEMM requires C in local.fragment,
         metal.simdgroup, or shared scope, got local``
-    The Triton matmul kernel binds C from a ``tl.zeros`` accumulator
-    that ``arith.constant`` materialises in plain ``local`` scope, so
-    the gemm-path emitter has to allocate a fresh ``local.fragment``
-    buffer (and seed it from the original C tile via ``T.copy``) instead
-    of forwarding the ``local`` buffer untouched.
+    A ``local.fragment`` C is legal for the GEMM itself, but on Metal it
+    materialises as a simdgroup_matrix; follow-up scalar/tile ops such as
+    ``dot * scale`` cannot index that as an ordinary tile. Shared C keeps
+    the result composable.
 
-    This test asserts that *some* buffer with a ``local.fragment`` scope
-    appears among the locally-allocated buffers AND, when the
-    ``tilelang.language.gemm`` path fires, that the gemm call's third
-    region (the C operand) targets a fragment buffer.
+    This test asserts that *some* ``dot_c_shared_*`` buffer with shared
+    scope appears among the locally-allocated buffers.
     """
     try:
         import tilelang.language as T  # noqa: F401
@@ -436,18 +495,80 @@ def test_tt_dot_uses_local_fragment_scope_for_C_accumulator():
 
     REDUCTION_EMITTERS["tt.dot"](op, ctx)
 
-    # Look for at least one local.fragment-scoped buffer in the local
-    # buffers list — that's the freshly allocated C fragment.
-    fragment_bufs = [
+    # Look for the freshly allocated shared C result.
+    shared_c_bufs = [
         b for b in ctx.local_buffers
+        if hasattr(b, "scope") and callable(b.scope)
+        and b.scope() == "shared"
+        and str(getattr(b, "name", "")).startswith("dot_c_shared")
+    ]
+    assert shared_c_bufs, (
+        "tt.dot must allocate a shared ``dot_c_shared_*`` buffer for the C "
+        "result when the bound C operand has plain ``local`` scope; "
+        f"local_buffers carry scopes "
+        f"{[b.scope() for b in ctx.local_buffers if hasattr(b, 'scope') and callable(b.scope)]!r}")
+
+
+def test_tt_dot_direct_store_result_keeps_fragment_C_to_limit_shared_memory():
+    """Matmul's direct ``tt.dot -> tt.store`` path must not allocate shared C."""
+    try:
+        import tilelang.language as T  # noqa: F401
+    except ImportError:
+        pytest.skip("tilelang not importable; gemm path test cannot run")
+
+    ctx = WalkerCtx()
+    a_ssa = _ssa("A", shape=[64, 64], dtype="float32")
+    b_ssa = _ssa("B", shape=[64, 64], dtype="float32")
+    c_ssa = _ssa("C", shape=[64, 64], dtype="float32")
+    a_buf = tvm.tir.decl_buffer([64, 64], "float32", name="A", scope="shared")
+    b_buf = tvm.tir.decl_buffer([64, 64], "float32", name="B", scope="shared")
+    ctx.bind(a_ssa, a_buf)
+    ctx.bind(b_ssa, b_buf)
+    ctx.ssa_users["C"] = {"tt.store"}
+
+    op = _op("tt.dot", [a_ssa, b_ssa], [c_ssa])
+    REDUCTION_EMITTERS["tt.dot"](op, ctx)
+
+    fragment_names = [
+        str(getattr(b, "name", ""))
+        for b in ctx.local_buffers
         if hasattr(b, "scope") and callable(b.scope)
         and b.scope() == "local.fragment"
     ]
-    assert fragment_bufs, (
-        "tt.dot must allocate a ``local.fragment`` buffer for the C "
-        "accumulator when the bound C operand has plain ``local`` scope; "
-        f"local_buffers carry scopes "
-        f"{[b.scope() for b in ctx.local_buffers if hasattr(b, 'scope') and callable(b.scope)]!r}")
+    assert any(n.startswith("dot_c_frag") for n in fragment_names), (
+        "direct-store dot results should use local.fragment C so matmul "
+        "does not exceed Metal's 32KiB threadgroup-memory limit"
+    )
+
+
+def test_tt_dot_stages_non_shared_operand_to_shared_before_gemm():
+    """Metal GEMM only supports shared/shared A/B operands."""
+    try:
+        import tilelang.language as T  # noqa: F401
+    except ImportError:
+        pytest.skip("tilelang not importable; gemm path test cannot run")
+
+    ctx = WalkerCtx()
+    a_ssa = _ssa("A", shape=[64, 64], dtype="float32")
+    b_ssa = _ssa("B", shape=[64, 64], dtype="float32")
+    c_ssa = _ssa("C", shape=[64, 64], dtype="float32")
+    a_buf = tvm.tir.decl_buffer([64, 64], "float32", name="A", scope="local")
+    b_buf = tvm.tir.decl_buffer([64, 64], "float32", name="B", scope="shared")
+    ctx.bind(a_ssa, a_buf)
+    ctx.bind(b_ssa, b_buf)
+
+    op = _op("tt.dot", [a_ssa, b_ssa], [c_ssa])
+    REDUCTION_EMITTERS["tt.dot"](op, ctx)
+
+    shared_names = [
+        str(getattr(b, "name", ""))
+        for b in ctx.local_buffers
+        if hasattr(b, "scope") and callable(b.scope) and b.scope() == "shared"
+    ]
+    assert any(n.startswith("dot_a_shared") for n in shared_names), (
+        "tt.dot must stage a non-shared A operand into shared scope before "
+        f"calling T.gemm on Metal; shared buffers were {shared_names!r}"
+    )
 
 
 def test_tt_dot_fp16_requires_tilelang_or_raises():
@@ -1097,4 +1218,3 @@ def test_tt_histogram_with_mask():
 
     ifs = find_if(accum_for)
     assert len(ifs) >= 1
-

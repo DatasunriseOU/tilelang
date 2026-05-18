@@ -500,6 +500,157 @@ def detect_combiner_kind(op: Any, ctx: Any = None) -> str:
     return candidate
 
 
+def _reduce_callee_name(op: Any, ctx: Any = None) -> Optional[str]:
+    """Return the combiner ``tt.call`` callee name for a reduce-like op."""
+    if isinstance(op, dict):
+        explicit = op.get("combiner")
+        return str(explicit) if explicit is not None else None
+    try:
+        from .control import _parse_callee_attr
+    except ImportError:
+        return None
+    regions = getattr(op, "regions", None) or ()
+    for region in regions:
+        for block in getattr(region, "blocks", ()) or ():
+            for inner in getattr(block, "operations", ()) or ():
+                name = str(getattr(inner, "name", "")).lower()
+                if name == "tt.call":
+                    callee = _parse_callee_attr(inner)
+                    if callee:
+                        return callee
+    return None
+
+
+def _is_welford_reduce(op: Any, ctx: Any = None) -> bool:
+    operands = _operands(op)
+    results = _results(op)
+    if len(operands) != 3 or len(results) != 3:
+        return False
+    callee = (_reduce_callee_name(op, ctx) or "").lower()
+    return "welford" in callee
+
+
+def _read_reduce_operand_elem(
+    tir: Any,
+    value: Any,
+    indices: List[Any],
+) -> Any:
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        return tir.BufferLoad(value, list(indices))
+    return value
+
+
+def _map_tt_reduce_welford(op: Any, ctx: EmitContext) -> Any:
+    """Lower Triton's layer-norm Welford combiner to three scalar accums.
+
+    Triton emits Welford as a three-input / three-output ``tt.reduce``:
+
+        (mean, m2, weight) = reduce((x, zeros_like(x), weight), axis=0)
+
+    with a helper callee equivalent to:
+
+        delta = mean_2 - mean_1
+        new_weight = weight_1 + weight_2
+        w2_over_w = weight_2 / new_weight
+        mean = mean_1 + delta * w2_over_w
+        m2 = m2_1 + m2_2 + delta * delta * weight_1 * w2_over_w
+
+    This intentionally recognises only that concrete associative reducer
+    shape; arbitrary multi-result reducers still raise through
+    ``detect_combiner_kind``.
+    """
+    tir = ctx.tir()
+    operands = _operands(op)
+    results = _results(op)
+    attrs = _attrs(op)
+    axis = int(attrs.get("axis", -1))
+
+    src_ssa = operands[0]
+    src_shape = list(_shape_of(src_ssa))
+    if not src_shape:
+        src0 = ctx.get(src_ssa)
+        src_shape = list(getattr(src0, "shape", []) or [])
+    if not src_shape:
+        raise EmitError("tt.reduce(welford): source operand has unknown shape")
+
+    rank = len(src_shape)
+    ax = axis if axis >= 0 else rank + axis
+    if rank != 1 or ax != 0:
+        raise EmitError(
+            f"tt.reduce(welford): only rank-1 axis-0 reductions are supported "
+            f"today (got shape {src_shape}, axis={axis})"
+        )
+
+    values = [ctx.get(ssa) for ssa in operands]
+    dtypes = [
+        _normalize_mlir_dtype(_dtype_of(res) if res is not None else "float32")
+        for res in results
+    ]
+
+    mean_accum = _alloc_tile_buffer(
+        ctx, [1], dtypes[0], ctx.fresh("welford_mean_accum")
+    )
+    m2_accum = _alloc_tile_buffer(
+        ctx, [1], dtypes[1], ctx.fresh("welford_m2_accum")
+    )
+    weight_accum = _alloc_tile_buffer(
+        ctx, [1], dtypes[2], ctx.fresh("welford_weight_accum")
+    )
+
+    zero_mean = tir.const(0, dtypes[0])
+    zero_m2 = tir.const(0, dtypes[1])
+    zero_weight = tir.const(0, dtypes[2])
+    idx0 = [tir.const(0, "int32")]
+    init = tir.SeqStmt([
+        tir.BufferStore(mean_accum, zero_mean, idx0),
+        tir.BufferStore(m2_accum, zero_m2, idx0),
+        tir.BufferStore(weight_accum, zero_weight, idx0),
+    ])
+
+    r = tir.Var(ctx.fresh("r"), "int32")
+    lane_idx = [r]
+    mean_1 = tir.BufferLoad(mean_accum, idx0)
+    m2_1 = tir.BufferLoad(m2_accum, idx0)
+    weight_1 = tir.BufferLoad(weight_accum, idx0)
+    mean_2 = _read_reduce_operand_elem(tir, values[0], lane_idx)
+    m2_2 = _read_reduce_operand_elem(tir, values[1], lane_idx)
+    weight_2 = _read_reduce_operand_elem(tir, values[2], lane_idx)
+
+    new_weight = weight_1 + weight_2
+    weight_zero = tir.const(0, str(getattr(new_weight, "dtype", dtypes[2])))
+    w2_over_w = tir.if_then_else(
+        new_weight != weight_zero,
+        weight_2 / new_weight,
+        weight_zero,
+    )
+    delta = mean_2 - mean_1
+    new_mean = mean_1 + delta * w2_over_w
+    new_m2 = m2_1 + m2_2 + delta * delta * weight_1 * w2_over_w
+
+    # Keep m2 first: ``new_m2`` depends on the old mean/weight accumulators.
+    # TIR BufferLoad nodes are evaluated at the store site, so writing mean
+    # or weight before m2 would make this use the newly-updated values.
+    loop_body = tir.SeqStmt([
+        tir.BufferStore(m2_accum, new_m2, idx0),
+        tir.BufferStore(mean_accum, new_mean, idx0),
+        tir.BufferStore(weight_accum, new_weight, idx0),
+    ])
+    loop = tir.For(
+        r,
+        tir.const(0, "int32"),
+        tir.const(int(src_shape[0]), "int32"),
+        tir.ForKind.SERIAL,
+        loop_body,
+    )
+    body = tir.SeqStmt([init, loop])
+    ctx.emit(body)
+
+    ctx.bind(results[0], tir.BufferLoad(mean_accum, idx0))
+    ctx.bind(results[1], tir.BufferLoad(m2_accum, idx0))
+    ctx.bind(results[2], tir.BufferLoad(weight_accum, idx0))
+    return body
+
+
 # ---------------------------------------------------------------------------
 # tt.reduce  -- explicit tir.For + accumulator
 # ---------------------------------------------------------------------------
@@ -538,6 +689,8 @@ def map_tt_reduce(op: Any, ctx: EmitContext) -> Any:
     operands = _operands(op)
     if not operands:
         raise EmitError("tt.reduce: missing source operand")
+    if _is_welford_reduce(op, ctx):
+        return _map_tt_reduce_welford(op, ctx)
 
     src_ssa = operands[0]
     src = ctx.get(src_ssa)
@@ -560,7 +713,9 @@ def map_tt_reduce(op: Any, ctx: EmitContext) -> Any:
         )
 
     result_value = _results(op)[0] if _results(op) else None
-    out_dtype = _dtype_of(result_value) if result_value is not None else _dtype_of(src_ssa)
+    out_dtype = _normalize_mlir_dtype(
+        _dtype_of(result_value) if result_value is not None else _dtype_of(src_ssa)
+    )
 
     kind = detect_combiner_kind(op, ctx)
     binop_name, identity_fn = _COMBINER_TABLE[kind]
@@ -716,7 +871,9 @@ def map_tt_scan(op: Any, ctx: EmitContext) -> Any:
         )
 
     result_value = _results(op)[0] if _results(op) else None
-    out_dtype = _dtype_of(result_value) if result_value is not None else _dtype_of(src_ssa)
+    out_dtype = _normalize_mlir_dtype(
+        _dtype_of(result_value) if result_value is not None else _dtype_of(src_ssa)
+    )
     kind = detect_combiner_kind(op, ctx)
     binop_name, identity_fn = _COMBINER_TABLE[kind]
     BinOp = getattr(tir, binop_name)
@@ -870,17 +1027,14 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
         acc_dtype = (
             "float32" if a_dtype in {"float16", "f16", "bfloat16", "bf16"} else out_dtype
         )
-        # Metal GEMM (and CUDA/AMD WMMA paths) require the C accumulator buffer
-        # to live in ``local.fragment`` (or ``metal.simdgroup`` / ``shared``)
-        # scope. When ``c`` was resolved from an SSA upstream (typically an
-        # ``arith.constant`` zero tile bound through ``_alloc_tile_buffer``
-        # with the default ``scope="local"``), it carries the wrong scope and
-        # ``tilelang.tileop.gemm`` rejects it with
-        # ``"Metal GEMM requires C in local.fragment, metal.simdgroup, or
-        # shared scope, got local"``. Allocate a fresh fragment buffer and
-        # copy the original C tile's contents into it so we both (a) satisfy
-        # the scope contract and (b) preserve any pre-accumulated values
-        # carried in via the C operand.
+        # Metal GEMM accepts C in either simdgroup/fragment or shared scope.
+        # The result must keep composing with ordinary scalar/tile emitters
+        # after ``tt.dot`` (for example flash attention multiplies QK^T by a
+        # scale before softmax), so prefer shared C: GemmMetal accumulates in
+        # simdgroup registers internally and stores back to the shared tile.
+        # A local.fragment result would print as a Metal simdgroup_matrix and
+        # a follow-up scalar expression such as ``dot * scale`` would fail to
+        # compile.
         def _is_fragment_scope(buf: Any) -> bool:
             scope_fn = getattr(buf, "scope", None)
             if scope_fn is None:
@@ -891,6 +1045,77 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
                 return False
             return s in ("local.fragment", "metal.simdgroup", "shared",
                          "shared.dyn")
+
+        def _scope_of(buf: Any) -> str:
+            scope_fn = getattr(buf, "scope", None)
+            if scope_fn is None:
+                return ""
+            try:
+                return str(scope_fn() if callable(scope_fn) else scope_fn)
+            except Exception:
+                return ""
+
+        def _is_shared_scope(buf: Any) -> bool:
+            return _scope_of(buf) in ("shared", "shared.dyn")
+
+        def _emit_copy_stmt(src: Any, dst: Any, label: str) -> None:
+            try:
+                copy_handle = T.copy(src, dst)  # type: ignore[union-attr]
+                if isinstance(copy_handle, tir_mod.PrimExpr):
+                    ctx.emit(tir_mod.Evaluate(copy_handle))
+                else:
+                    ctx.emit(copy_handle)
+            except Exception as e:
+                raise EmitError(f"T.copy({label}) failed: {e}") from e
+
+        def _stage_operand_to_shared(
+            buf: Any,
+            shape: List[int],
+            dtype: str,
+            label: str,
+        ) -> Any:
+            if _is_shared_scope(buf):
+                return buf
+            if not hasattr(buf, "shape"):
+                return buf
+            staged = _alloc_tile_buffer(
+                ctx,
+                shape,
+                dtype,
+                name=ctx.fresh(f"dot_{label}_shared"),
+                scope="shared",
+            )
+            _emit_copy_stmt(buf, staged, f"{label}, staged shared operand")
+            return staged
+
+        def _ssa_name(value: Any) -> str:
+            try:
+                getter = getattr(value, "get_name", None)
+                if callable(getter):
+                    name = getter()
+                    if name:
+                        return str(name)
+            except Exception:
+                pass
+            if isinstance(value, dict):
+                name = value.get("name")
+                if name:
+                    return str(name)
+            try:
+                name = getattr(value, "name", None)
+                if name:
+                    return str(name)
+            except Exception:
+                pass
+            return ""
+
+        def _result_needs_shared_c() -> bool:
+            if result_value is None:
+                return True
+            users = (getattr(ctx, "ssa_users", {}) or {}).get(_ssa_name(result_value))
+            if not users:
+                return True
+            return bool(set(users) - {"tt.store", "tt.return"})
 
         def _is_zero_constant_tile(buf: Any) -> bool:
             const_tiles = getattr(ctx, "constant_tile_values", {}) or {}
@@ -910,24 +1135,43 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
 
         tir_mod = ctx.tir()
         clear_accum = False
+        prefer_shared_c = _result_needs_shared_c()
+        c_scope = "shared" if prefer_shared_c else "local.fragment"
+        c_prefix = "dot_c_shared" if prefer_shared_c else "dot_c_frag"
         if c is None:
-            # Allocate the C accumulator as a ``local.fragment`` buffer via
+            # Allocate the C result in the selected tile scope via
             # ``_alloc_tile_buffer`` (registers in ``ctx.local_buffers``);
-            # ``T.alloc_fragment`` cannot be used here because it relies on
+            # TileLang's T.alloc_* helpers cannot be used here because they rely on
             # an active TileLang ``T.Kernel`` builder, which the walker does
             # not establish.
             c = _alloc_tile_buffer(
                 ctx, [M, N], acc_dtype,
-                name=ctx.fresh("dot_c_frag"),
-                scope="local.fragment",
+                name=ctx.fresh(c_prefix),
+                scope=c_scope,
             )
             clear_accum = True
+        elif prefer_shared_c and not _is_shared_scope(c):
+            if _is_zero_constant_tile(c):
+                c = _alloc_tile_buffer(
+                    ctx, [M, N], acc_dtype,
+                    name=ctx.fresh(c_prefix),
+                    scope=c_scope,
+                )
+                clear_accum = True
+            else:
+                c_orig = c
+                c = _alloc_tile_buffer(
+                    ctx, [M, N], acc_dtype,
+                    name=ctx.fresh(c_prefix),
+                    scope=c_scope,
+                )
+                _emit_copy_stmt(c_orig, c, "c_orig, c")
         elif not _is_fragment_scope(c):
             if _is_zero_constant_tile(c):
                 c = _alloc_tile_buffer(
                     ctx, [M, N], acc_dtype,
-                    name=ctx.fresh("dot_c_frag"),
-                    scope="local.fragment",
+                    name=ctx.fresh(c_prefix),
+                    scope=c_scope,
                 )
                 clear_accum = True
             else:
@@ -936,27 +1180,22 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
                 # ``tilelang.tileop.gemm`` rejects that scope on Metal:
                 #   "Metal GEMM requires C in local.fragment, metal.simdgroup,
                 #    or shared scope, got local"
-                # Allocate a fresh fragment and seed it from the original tile via
+                # Allocate a fresh shared tile and seed it from the original tile via
                 # ``T.copy`` (a TileLang surface call lowered through the proper
-                # tile-op pipeline), so the new accumulator carries any
+                # tile-op pipeline), so the new C tile carries any
                 # pre-loaded values into the gemm. We avoid hand-built
-                # ``tir.BufferStore`` here because ``MetalFragmentToSimdgroup``
-                # accesses ``node.span`` on rewritten fragment-targeting stores,
-                # and Python-built ``BufferStore`` nodes don't expose ``.span``.
+                # ``tir.BufferStore`` here so copy lowering owns the layout
+                # transition instead of ad-hoc scalar indexing.
                 c_orig = c
                 c = _alloc_tile_buffer(
                     ctx, [M, N], acc_dtype,
-                    name=ctx.fresh("dot_c_frag"),
-                    scope="local.fragment",
+                    name=ctx.fresh(c_prefix),
+                    scope=c_scope,
                 )
-                try:
-                    copy_handle = T.copy(c_orig, c)  # type: ignore[union-attr]
-                    if isinstance(copy_handle, tir_mod.PrimExpr):
-                        ctx.emit(tir_mod.Evaluate(copy_handle))
-                    else:
-                        ctx.emit(copy_handle)
-                except Exception as e:
-                    raise EmitError(f"T.copy(c_orig, c) failed: {e}") from e
+                _emit_copy_stmt(c_orig, c, "c_orig, c")
+
+        a = _stage_operand_to_shared(a, [M, Ka], a_dtype, "a")
+        b = _stage_operand_to_shared(b, [Kb, N], b_dtype, "b")
 
         handle = gemm(
             a,
@@ -1002,12 +1241,11 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
         c = None
     if c is None:
         # Match the gemm-path scope contract: even the 3-loop fallback should
-        # leave a fragment-scoped C in place so downstream TileLang lowering
-        # (LowerTileOp, gemm-mock checks, layout inference) treats the result
-        # as a thread-local accumulator rather than host memory.
+        # leave a tile-scoped C in place so downstream TileLang lowering
+        # treats the result as an intermediate rather than host memory.
         c = _alloc_tile_buffer(
             ctx, [M, N], out_dtype, name=ctx.fresh("dot_c"),
-            scope="local.fragment",
+            scope="shared",
         )
 
     m_var = tir.Var(ctx.fresh("m"), "int32")

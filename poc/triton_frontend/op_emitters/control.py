@@ -23,7 +23,8 @@ Ops implemented
 * ``arith.fptosi`` / ``arith.sitofp`` / ``arith.uitofp`` / ``arith.fptoui``
   -> ``tir.Cast``.
 * ``arith.bitcast`` -> ``tir.reinterpret``.
-* ``arith.extsi`` / ``arith.extui`` / ``arith.trunci`` -> ``tir.Cast``.
+* ``arith.extsi`` / ``arith.extui`` / ``arith.trunci`` /
+  ``arith.index_cast`` -> ``tir.Cast``.
 * ``tt.advance`` -> structured TPtr offset update (BufferRegion
   rebind), analogous to ``tt.addptr``.
 * ``scf.for`` -> ``tir.For`` (serial) with materialised iter_args.
@@ -68,6 +69,7 @@ __all__ = [
     "map_arith_extsi",
     "map_arith_extui",
     "map_arith_trunci",
+    "map_arith_index_cast",
     "map_arith_constant",
     "map_tt_advance",
     "map_tt_func",
@@ -108,6 +110,23 @@ def _operand_dtype(op: Any, idx: int, fallback: str = "float32") -> str:
     if idx >= len(operands):
         return fallback
     return _om._dtype_of(operands[idx])
+
+
+def _primexpr_lanes(value: Any) -> int:
+    """Return vector lane count for a TVM PrimExpr, or 1 for scalar values."""
+    dt = str(getattr(value, "dtype", ""))
+    if "x" not in dt:
+        return 1
+    try:
+        return int(dt.rsplit("x", 1)[1])
+    except ValueError:
+        return 1
+
+
+def _with_lanes(dtype: str, lanes: int) -> str:
+    if lanes <= 1 or "x" in dtype:
+        return dtype
+    return f"{dtype}x{lanes}"
 
 
 def _is_int_dtype(dt: str) -> bool:
@@ -246,7 +265,22 @@ def _emit_cast(op: Any, ctx: _om.WalkerCtx, *, expect: str) -> Any:
         _validate_int_float_pair(src_dt, dst_dt, str(op_label))
 
     tir = ctx.tir()
-    cast = tir.Cast(dst_dt, src)
+    try:
+        from .arith import _emit_tile_unary, _is_tile_operand  # noqa: WPS433
+
+        if _is_tile_operand(ctx, src):
+            return _emit_tile_unary(
+                op,
+                ctx,
+                src,
+                lambda lane: tir.Cast(dst_dt, lane),
+                str(op_label),
+                dst_dt,
+            )
+    except ImportError:
+        pass
+
+    cast = tir.Cast(_with_lanes(dst_dt, _primexpr_lanes(src)), src)
     if _om._results(op):
         ctx.bind(_om._results(op)[0], cast)
     return cast
@@ -478,6 +512,11 @@ def map_arith_extui(op: Any, ctx: _om.WalkerCtx) -> Any:
 
 def map_arith_trunci(op: Any, ctx: _om.WalkerCtx) -> Any:
     """``arith.trunci`` (int narrow, e.g. i64 -> i32)."""
+    return _emit_cast(op, ctx, expect="i2i")
+
+
+def map_arith_index_cast(op: Any, ctx: _om.WalkerCtx) -> Any:
+    """``arith.index_cast`` (index <-> integer)."""
     return _emit_cast(op, ctx, expect="i2i")
 
 
@@ -801,7 +840,6 @@ def map_tt_func(op: Any, ctx: _om.WalkerCtx) -> Any:
             body_stmt = tir_mod.SeqStmt(alloc_stmts + [body_stmt])
 
     program_id_vars = list(getattr(ctx, "program_id_vars", []) or [])
-    print(f"map_tt_func: program_id_vars={program_id_vars}, type={type(program_id_vars)}")
     if program_id_vars:
         thread_tags = ("blockIdx.x", "blockIdx.y", "blockIdx.z")
         for var, axis, extent in program_id_vars:
@@ -935,6 +973,7 @@ def _normalize_dtype(dtype_str: str) -> str:
     aliases = {
         "i1": "bool",
         "bf16": "bfloat16",
+        "index": "int64",
     }
     if s in aliases:
         return aliases[s]
@@ -1211,7 +1250,9 @@ def _emit_region(
     child.buffers = ctx.buffers  # share kernel-level buffer registry
     child.transposed_views = dict(ctx.transposed_views)
     child.ptr_states = getattr(ctx, "ptr_states", {})
+    child.ssa_users = getattr(ctx, "ssa_users", {})
     child.constant_tile_values = getattr(ctx, "constant_tile_values", {})
+    child.loop_carry_buffers = dict(getattr(ctx, "loop_carry_buffers", {}))
     child._tmp_counter = ctx._tmp_counter
     child._tvm = ctx._tvm
     child._T = ctx._T
@@ -1236,6 +1277,29 @@ def _emit_region(
     if iter_arg_pairs:
         for ssa, tir_var in iter_arg_pairs:
             child.bind(ssa, tir_var)
+            if hasattr(tir_var, "shape") and hasattr(tir_var, "dtype"):
+                child.loop_carry_buffers[ssa] = tir_var
+                try:
+                    getter = getattr(ssa, "get_name", None)
+                    name = getter() if callable(getter) else getattr(ssa, "name", None)
+                    if name:
+                        child.loop_carry_buffers[str(name)] = tir_var
+                except Exception:
+                    pass
+            elif (
+                isinstance(tir_var, tuple)
+                and len(tir_var) == 2
+                and isinstance(tir_var[1], (list, tuple))
+                and tir_var[1]
+            ):
+                child.loop_carry_buffers[ssa] = tir_var
+                try:
+                    getter = getattr(ssa, "get_name", None)
+                    name = getter() if callable(getter) else getattr(ssa, "name", None)
+                    if name:
+                        child.loop_carry_buffers[str(name)] = tir_var
+                except Exception:
+                    pass
 
     # Dict-shaped fake: a region is ``{"ops": [op, op, ...]}`` and a yield
     # op surfaces its yielded SSAs via ``operands``.
@@ -1300,6 +1364,63 @@ def _scf_regions(op: Any) -> List[Any]:
             regs = [{"ops": op["body"]}]
         return list(regs)
     return list(getattr(op, "regions", ()) or ())
+
+
+def _same_tir_buffer(a: Any, b: Any) -> bool:
+    """Best-effort identity test for TIR buffers."""
+    if a is b:
+        return True
+    same_as = getattr(a, "same_as", None)
+    if callable(same_as):
+        try:
+            return bool(same_as(b))
+        except Exception:
+            return False
+    return False
+
+
+def _copy_buffer_stmt(ctx: _om.WalkerCtx, src: Any, dst: Any) -> Any:
+    """Build a serial elementwise copy from ``src`` into ``dst``."""
+    tir = ctx.tir()
+    shape = list(getattr(dst, "shape", []) or [])
+    loop_vars = [
+        tir.Var(ctx.fresh(f"carry_copy{axis}"), "int32")
+        for axis in range(len(shape))
+    ]
+    idx = list(loop_vars) or [tir.const(0, "int32")]
+    body: Any = tir.BufferStore(dst, tir.BufferLoad(src, idx), idx)
+    for axis in range(len(loop_vars) - 1, -1, -1):
+        body = tir.For(
+            loop_vars[axis],
+            tir.const(0, "int32"),
+            shape[axis],
+            tir.ForKind.SERIAL,
+            body,
+        )
+    return body
+
+
+def _append_loop_carry_copies(
+    ctx: _om.WalkerCtx,
+    body: Any,
+    iter_arg_pairs: List[Tuple[Any, Any]],
+    yielded: List[Any],
+) -> Any:
+    """Copy yielded tile values into carried buffers at loop-body end."""
+    if not yielded:
+        return body
+    tvm_mod = ctx.tvm()
+    Buffer = tvm_mod.tir.Buffer
+    copies: List[Any] = []
+    for (_blk_ssa, carry), yielded_value in zip(iter_arg_pairs, yielded):
+        if not isinstance(carry, Buffer) or not isinstance(yielded_value, Buffer):
+            continue
+        if _same_tir_buffer(carry, yielded_value):
+            continue
+        copies.append(_copy_buffer_stmt(ctx, yielded_value, carry))
+    if not copies:
+        return body
+    return ctx.tir().SeqStmt([body] + copies)
 
 
 def _scf_for_bounds(op: Any) -> Tuple[Any, Any, Any]:
@@ -1434,6 +1555,7 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
             induction_ssa=induction_ssa,
             iter_arg_pairs=iter_arg_pairs,
         )
+        body = _append_loop_carry_copies(ctx, body, iter_arg_pairs, yielded)
 
         # Wrap the body so each *scalar* iter_arg is visible via LetStmt. The
         # yielded values become the next-iteration values; full SSA-style
@@ -2332,6 +2454,7 @@ CONTROL_EMITTERS: Dict[str, Callable[..., Any]] = {
     "arith.extsi": map_arith_extsi,
     "arith.extui": map_arith_extui,
     "arith.trunci": map_arith_trunci,
+    "arith.index_cast": map_arith_index_cast,
     # arith.constant -- scalar literal (i32 / f32 / ...). Seeds value_map
     # so downstream uses of ``%c0`` resolve via ctx.get(); raises EmitError
     # on array (``dense<...>``) attrs rather than silently splatting.

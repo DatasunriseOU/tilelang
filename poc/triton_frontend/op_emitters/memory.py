@@ -60,6 +60,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 # Reuse the public surface of op_mapping (WalkerCtx, helpers) so this file
 # stays a thin overlay rather than a parallel implementation.
 from ..op_mapping import (
+    EmitError,
     WalkerCtx,
     _alloc_tile_buffer,
     _attrs,
@@ -71,6 +72,7 @@ from ..op_mapping import (
     _ptrstate_is_tile,
     _ptrstate_offsets_or_zero,
     _ptrstate_sizes_int,
+    _normalize_mlir_dtype,
     _results,
     _shape_of,
 )
@@ -217,6 +219,212 @@ def _resolve_lane_operand(
     )
 
 
+def _coerce_index_scalar(ctx: WalkerCtx, value: Any) -> Any:
+    """Coerce JSON/PtrAnalysis integer spellings into TIR scalar constants."""
+    tir = ctx.tir()
+    if isinstance(value, bool):
+        return tir.const(int(value), "int32")
+    if isinstance(value, int):
+        return tir.const(value, "int32")
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            return tir.const(int(text, 0), "int32")
+        except ValueError:
+            return value
+    return value
+
+
+def _flat_lane_index(ctx: WalkerCtx, loop_vars: Sequence[Any], shape: Sequence[int]) -> Any:
+    """Linearise a rank-N tile loop index into a flat vector lane index."""
+    tir = ctx.tir()
+    if not loop_vars:
+        return tir.const(0, "int32")
+    idx: Any = loop_vars[0]
+    for axis in range(1, len(loop_vars)):
+        extent = shape[axis] if axis < len(shape) else 1
+        idx = idx * tir.const(int(extent), "int32") + loop_vars[axis]
+    return idx
+
+
+def _scalarize_tile_index_base(
+    ctx: WalkerCtx,
+    base: Any,
+    loop_vars: Sequence[Any],
+    shape: Sequence[int],
+) -> Any:
+    """Return a scalar source/destination index base for the current lane."""
+    tvm_mod = ctx.tvm()
+    tir = ctx.tir()
+    base = _coerce_index_scalar(ctx, base)
+    if isinstance(base, tvm_mod.tir.Buffer):
+        rank = len(base.shape)
+        if rank == 0:
+            return tir.BufferLoad(base, [tir.const(0, "int32")])
+        if len(loop_vars) >= rank:
+            indices = list(loop_vars[-rank:])
+        else:
+            indices = [tir.const(0, "int32")] * (rank - len(loop_vars)) + list(loop_vars)
+        return tir.BufferLoad(base, indices)
+    if _vector_lanes(base) > 1:
+        return _read_vector_lane(ctx, base, _flat_lane_index(ctx, loop_vars, shape))
+    return base
+
+
+def _resolve_ptrstate_value(ctx: WalkerCtx, value: Any) -> Any:
+    """Resolve a PtrAnalysis JSON scalar/symbol into a TIR value."""
+    value = _coerce_index_scalar(ctx, value)
+    if not isinstance(value, str):
+        return value
+    candidates = (value, value.lstrip("%"), f"%{value.lstrip('%')}")
+    for key in candidates:
+        try:
+            if key in ctx.value_map:
+                return ctx.value_map[key]
+        except TypeError:
+            pass
+    raise EmitError(f"PtrState references unresolved SSA value {value!r}")
+
+
+def _resolve_ptrstate_values(ctx: WalkerCtx, values: Sequence[Any]) -> List[Any]:
+    return [_resolve_ptrstate_value(ctx, v) for v in values]
+
+
+def _compatible_ptr_state(
+    ctx: WalkerCtx,
+    base: Any,
+    result_value: Any,
+) -> Any:
+    """Find a same-source PtrState whose tile size matches result shape."""
+    if not (isinstance(base, dict) and "_ptrstate" in base):
+        return None
+    target_shape = list(_shape_of(result_value)) if result_value is not None else []
+    if not target_shape:
+        return None
+    source = base.get("source")
+    states_map = getattr(ctx, "ptr_states", None) or {}
+    for state in states_map.values():
+        if source is not None and getattr(state, "source", None) != source:
+            continue
+        try:
+            sizes = [int(s) for s in getattr(state, "sizes", ()) or ()]
+        except Exception:
+            continue
+        if sizes != target_shape:
+            continue
+        try:
+            _resolve_ptrstate_values(ctx, getattr(state, "offsets", ()) or ())
+            _resolve_ptrstate_values(ctx, getattr(state, "strides", ()) or ())
+        except Exception:
+            continue
+        return state
+    return None
+
+
+def _ptrstate_source_matches_base(ctx: WalkerCtx, state: Any, base: Any) -> bool:
+    """Return False when ``state.source`` resolves to a different base buffer."""
+    source = getattr(state, "source", None)
+    if source is None or base is None:
+        return True
+
+    def _base_buffer(value: Any) -> Any:
+        if isinstance(value, tuple) and len(value) == 2:
+            return value[0]
+        if isinstance(value, dict) and "_ptrstate" in value:
+            return None
+        try:
+            if isinstance(value, ctx.tvm().tir.Buffer):
+                return value
+        except Exception:
+            pass
+        return None
+
+    expected = _base_buffer(base)
+    if expected is None:
+        return True
+
+    resolved = None
+    for key in (source, str(source).lstrip("%"), f"%{str(source).lstrip('%')}"):
+        try:
+            if key in ctx.value_map:
+                resolved = ctx.value_map[key]
+                break
+        except TypeError:
+            continue
+    actual = _base_buffer(resolved)
+    if actual is None:
+        return True
+    try:
+        return bool(actual.same_as(expected))
+    except Exception:
+        return actual is expected
+
+
+def _redeclare_ctx_buffer_1d(
+    ctx: WalkerCtx,
+    buf: Any,
+    dtype: str,
+    min_extent: int,
+) -> Any:
+    """Replace a placeholder function-arg buffer with a 1D flat view."""
+    try:
+        rank = len(buf.shape)
+        current_extent = int(buf.shape[0]) if rank == 1 else 0
+    except Exception:
+        rank = 0
+        current_extent = 0
+    if rank == 1 and current_extent >= min_extent:
+        return buf
+    name = getattr(buf, "name", None) or "buf"
+    target_key: Any = None
+    for key, value in (getattr(ctx, "buffers", {}) or {}).items():
+        if value is buf:
+            target_key = key
+            break
+    if target_key is None:
+        return buf
+    new_buf = ctx.tir().decl_buffer(
+        [max(int(min_extent), 1)], dtype, name=str(name)
+    )
+    ctx.buffers[target_key] = new_buf
+    for key, value in list(getattr(ctx, "value_map", {}).items()):
+        if value is buf:
+            ctx.value_map[key] = new_buf
+        elif isinstance(value, tuple) and len(value) == 2 and value[0] is buf:
+            ctx.value_map[key] = (new_buf, value[1])
+    return new_buf
+
+
+def _ptrstate_flat_index(
+    ctx: WalkerCtx,
+    resolved: Dict[str, Any],
+    loop_vars: Sequence[Any],
+    shape: Sequence[int],
+) -> Any:
+    """Build flat address from PtrState offsets/strides for current lane."""
+    tir = ctx.tir()
+    offsets = _resolve_ptrstate_values(ctx, resolved.get("offsets") or [])
+    strides = _resolve_ptrstate_values(ctx, resolved.get("strides") or [])
+    flat: Any = tir.const(0, "int32")
+    for axis, lv in enumerate(loop_vars):
+        off = offsets[axis] if axis < len(offsets) else tir.const(0, "int32")
+        stride = strides[axis] if axis < len(strides) else tir.const(1, "int32")
+        off = _scalarize_tile_index_base(ctx, off, loop_vars, shape)
+        stride = _scalarize_tile_index_base(ctx, stride, loop_vars, shape)
+        flat = flat + (off + lv) * stride
+    return flat
+
+
+def _flat_min_extent(shape: Sequence[int]) -> int:
+    extent = 1
+    for dim in shape or [1]:
+        try:
+            extent *= int(dim)
+        except Exception:
+            extent *= 1024
+    return max(extent, 1024 * 1024)
+
+
 def _ssa_name(value: Any) -> Optional[str]:
     """Best-effort printed SSA name for a TTIR value (e.g. ``"%2"``).
 
@@ -344,6 +552,7 @@ def _emit_degraded_tile_load(
     src_indices: List[Any] = []
     for axis, lv in enumerate(loop_vars):
         base = body_indices[axis] if axis < len(body_indices) else tir.const(0, "int32")
+        base = _scalarize_tile_index_base(ctx, base, loop_vars, out_shape)
         src_indices.append(base + lv)
 
     load_expr: Any = tir.BufferLoad(buf, src_indices)
@@ -429,6 +638,7 @@ def _emit_degraded_tile_store(
             if axis < len(base_indices)
             else tir.const(0, "int32")
         )
+        base = _scalarize_tile_index_base(ctx, base, loop_vars, val_shape)
         dst_indices.append(base + lv)
 
     # The value being stored is a buffer; index it with the loop vars to
@@ -509,6 +719,7 @@ def _emit_tile_copy_tir(
     src_indices: List[Any] = []
     for axis, lv in enumerate(loop_vars):
         base = body_indices[axis] if axis < len(body_indices) else tir.const(0, "int32")
+        base = _scalarize_tile_index_base(ctx, base, loop_vars, out_shape)
         src_indices.append(base + lv)
 
     load_expr: Any = tir.BufferLoad(src_buf, src_indices)
@@ -593,6 +804,7 @@ def _emit_tile_store_tir(
             if axis < len(base_indices)
             else tir.const(0, "int32")
         )
+        base = _scalarize_tile_index_base(ctx, base, loop_vars, val_shape)
         dst_indices.append(base + lv)
 
     # The value being stored may be a buffer (per-lane BufferLoad) or a
@@ -624,6 +836,116 @@ def _emit_tile_store_tir(
 
     # No ``# DEGRADED:`` AttrStmt: the buffer rank is honoured rank-N, this
     # is just a non-T.copy fallback (e.g., shim present but no PtrState).
+    ctx.emit(body)
+    return body
+
+
+def _emit_ptrstate_tile_load_tir(
+    op: Any,
+    ctx: WalkerCtx,
+    src_buf: Any,
+    resolved: Dict[str, Any],
+    out_shape: Sequence[int],
+    out_dtype: str,
+    mask_ssa: Any,
+    other_ssa: Any,
+) -> Any:
+    """Load a PtrState tile from a flat function-arg buffer using strides."""
+    tir = ctx.tir()
+    result_value = _results(op)[0] if _results(op) else None
+    src_buf = _redeclare_ctx_buffer_1d(
+        ctx, src_buf, out_dtype, _flat_min_extent(out_shape)
+    )
+    tile_buf = _alloc_tile_buffer(
+        ctx,
+        list(out_shape) or [1],
+        out_dtype,
+        ctx.fresh("tile_load"),
+        scope="shared",
+    )
+    loop_vars = [
+        tir.Var(ctx.fresh(f"i{axis}"), "int32")
+        for axis, _extent in enumerate(out_shape or [1])
+    ]
+    flat_idx = _ptrstate_flat_index(ctx, resolved, loop_vars, out_shape)
+    load_expr: Any = tir.BufferLoad(src_buf, [flat_idx])
+    if mask_ssa is not None:
+        try:
+            mask_expr = ctx.get(mask_ssa)
+        except KeyError:
+            mask_expr = None
+        if mask_expr is not None:
+            if other_ssa is not None:
+                try:
+                    other_expr = ctx.get(other_ssa)
+                except KeyError:
+                    other_expr = tir.const(0, out_dtype)
+            else:
+                other_expr = tir.const(0, out_dtype)
+            mask_lane = _resolve_lane_operand(ctx, mask_expr, loop_vars, role="mask")
+            other_lane = _resolve_lane_operand(ctx, other_expr, loop_vars, role="other")
+            load_expr = tir.if_then_else(mask_lane, load_expr, other_lane)
+
+    body: Any = tir.BufferStore(
+        tile_buf, load_expr, list(loop_vars) or [tir.const(0, "int32")]
+    )
+    for axis in range(len(loop_vars) - 1, -1, -1):
+        body = tir.For(
+            loop_vars[axis],
+            tir.const(0, "int32"),
+            tir.const(int(out_shape[axis]), "int32"),
+            tir.ForKind.SERIAL,
+            body,
+        )
+    ctx.emit(body)
+    if result_value is not None:
+        ctx.bind(result_value, tile_buf)
+    return tile_buf
+
+
+def _emit_ptrstate_tile_store_tir(
+    op: Any,
+    ctx: WalkerCtx,
+    dst_buf: Any,
+    resolved: Dict[str, Any],
+    val_expr: Any,
+    val_shape: Sequence[int],
+    mask_ssa: Any,
+) -> Any:
+    """Store a PtrState tile to a flat function-arg buffer using strides."""
+    tir = ctx.tir()
+    dtype = _normalize_mlir_dtype(
+        str(getattr(val_expr, "dtype", _dtype_of(_operands(op)[1]) or "float32"))
+    )
+    dst_buf = _redeclare_ctx_buffer_1d(
+        ctx, dst_buf, dtype, _flat_min_extent(val_shape)
+    )
+    loop_vars = [
+        tir.Var(ctx.fresh(f"i{axis}"), "int32")
+        for axis, _extent in enumerate(val_shape or [1])
+    ]
+    flat_idx = _ptrstate_flat_index(ctx, resolved, loop_vars, val_shape)
+    if hasattr(val_expr, "shape"):
+        rhs = tir.BufferLoad(val_expr, list(loop_vars))
+    else:
+        rhs = val_expr
+    store: Any = tir.BufferStore(dst_buf, rhs, [flat_idx])
+    if mask_ssa is not None:
+        try:
+            mask_expr = ctx.get(mask_ssa)
+            mask_lane = _resolve_lane_operand(ctx, mask_expr, loop_vars, role="mask")
+            store = tir.IfThenElse(mask_lane, store, None)
+        except KeyError:
+            pass
+    body: Any = store
+    for axis in range(len(loop_vars) - 1, -1, -1):
+        body = tir.For(
+            loop_vars[axis],
+            tir.const(0, "int32"),
+            tir.const(int(val_shape[axis]), "int32"),
+            tir.ForKind.SERIAL,
+            body,
+        )
     ctx.emit(body)
     return body
 
@@ -673,6 +995,7 @@ def emit_tt_load(op: Any, ctx: WalkerCtx) -> Any:
     result_value = _results(op)[0] if _results(op) else None
     out_shape = list(_shape_of(result_value)) if result_value is not None else []
     out_dtype = _dtype_of(result_value) if result_value is not None else "float32"
+    out_dtype = _normalize_mlir_dtype(out_dtype)
 
     # Fallback: ``_shape_of`` only inspects MLIR ``RankedTensorType`` and
     # the dict-shaped fake; bare Python objects that expose ``.shape`` (e.g.
@@ -697,7 +1020,6 @@ def emit_tt_load(op: Any, ctx: WalkerCtx) -> Any:
         # outright with ``ValueError: unknown dtype 'f32'``.
         attr_dtype = getattr(result_value, "dtype", None)
         if isinstance(attr_dtype, str) and attr_dtype:
-            from ..op_mapping import _normalize_mlir_dtype  # local import
             out_dtype = _normalize_mlir_dtype(attr_dtype)
 
     # Pre-pass-seeded PtrState lookup (run_ptr_analysis_pre_pass populated
@@ -718,8 +1040,13 @@ def emit_tt_load(op: Any, ctx: WalkerCtx) -> Any:
     # Tile path (PtrState has explicit sizes > 1).
     if isinstance(resolved, dict) and "_ptrstate" in resolved and _ptrstate_is_tile(resolved):
         tile_shape = _ptrstate_sizes_int(resolved) or list(out_shape) or [1]
-        tile_offsets = _ptrstate_offsets_or_zero(resolved)
         tile_buf = _ptrstate_buffer(ctx, resolved, out_dtype)
+        if resolved.get("strides"):
+            return _emit_ptrstate_tile_load_tir(
+                op, ctx, tile_buf, resolved, tile_shape, out_dtype,
+                mask_ssa, other_ssa,
+            )
+        tile_offsets = [_coerce_index_scalar(ctx, v) for v in _ptrstate_offsets_or_zero(resolved)]
         if has_cxx_shim():
             # Defer to the legacy ``_emit_load_copy`` path which already
             # knows how to talk to ``T.copy`` once PtrAnalysis is in.
@@ -825,6 +1152,7 @@ def emit_tt_load(op: Any, ctx: WalkerCtx) -> Any:
     # caught by the rank/lane-count assertions below).
     indices = list(indices)
     for axis_i, idx_v in enumerate(indices):
+        idx_v = _coerce_index_scalar(ctx, idx_v)
         if isinstance(idx_v, ctx.tvm().tir.Buffer):
             buf_rank = len(idx_v.shape)
             if buf_rank == 0:
@@ -833,6 +1161,8 @@ def emit_tt_load(op: Any, ctx: WalkerCtx) -> Any:
                 indices[axis_i] = tir.BufferLoad(
                     idx_v, [tir.const(0, "int32")] * buf_rank,
                 )
+        else:
+            indices[axis_i] = idx_v
 
     load_expr: Any = tir.BufferLoad(buf, indices)
     if mask_ssa is not None:
@@ -883,9 +1213,13 @@ def emit_tt_store(op: Any, ctx: WalkerCtx) -> Any:
     # Tile path via PtrState.
     if isinstance(resolved, dict) and "_ptrstate" in resolved and _ptrstate_is_tile(resolved):
         tile_shape = _ptrstate_sizes_int(resolved) or list(val_shape) or [1]
-        tile_offsets = _ptrstate_offsets_or_zero(resolved)
-        dtype = _dtype_of(val_ssa) or "float32"
+        dtype = _normalize_mlir_dtype(_dtype_of(val_ssa) or "float32")
         tile_buf = _ptrstate_buffer(ctx, resolved, dtype)
+        if resolved.get("strides"):
+            return _emit_ptrstate_tile_store_tir(
+                op, ctx, tile_buf, resolved, val_expr, tile_shape, mask_ssa,
+            )
+        tile_offsets = [_coerce_index_scalar(ctx, v) for v in _ptrstate_offsets_or_zero(resolved)]
         if has_cxx_shim():
             from ..op_mapping import _emit_store_copy
             return _emit_store_copy(op, ctx, resolved, val_expr, mask_ssa)
@@ -896,6 +1230,7 @@ def emit_tt_store(op: Any, ctx: WalkerCtx) -> Any:
     # Tile path inferred from the value's shape.
     if _is_tile_shape(val_shape):
         dtype = _dtype_of(val_ssa) or "float32"
+        dtype = _normalize_mlir_dtype(dtype)
         buf_name = (
             getattr(ptr_ssa, "name", None)
             or (ptr_ssa.get("name") if isinstance(ptr_ssa, dict) else None)
@@ -952,6 +1287,7 @@ def emit_tt_store(op: Any, ctx: WalkerCtx) -> Any:
         buf, indices = resolved, [0]
     else:
         dtype = _dtype_of(val_ssa) or "float32"
+        dtype = _normalize_mlir_dtype(dtype)
         buf_name = (
             getattr(ptr_ssa, "name", None)
             or (ptr_ssa.get("name") if isinstance(ptr_ssa, dict) else None)
@@ -970,6 +1306,7 @@ def emit_tt_store(op: Any, ctx: WalkerCtx) -> Any:
     # consume directly because there is no surrounding per-lane For).
     indices = list(indices)
     for axis_i, idx_v in enumerate(indices):
+        idx_v = _coerce_index_scalar(ctx, idx_v)
         if isinstance(idx_v, ctx.tvm().tir.Buffer):
             buf_rank = len(idx_v.shape)
             if buf_rank == 0:
@@ -978,6 +1315,8 @@ def emit_tt_store(op: Any, ctx: WalkerCtx) -> Any:
                 indices[axis_i] = tir.BufferLoad(
                     idx_v, [tir.const(0, "int32")] * buf_rank,
                 )
+        else:
+            indices[axis_i] = idx_v
 
     store_stmt: Any = tir.BufferStore(buf, val_expr, indices)
     if mask_ssa is not None:
@@ -1575,7 +1914,13 @@ def emit_tt_reshape(op: Any, ctx: WalkerCtx) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def _compose_addptr_index(ctx: WalkerCtx, prev: Any, off: Any) -> Any:
+def _compose_addptr_index(
+    ctx: WalkerCtx,
+    prev: Any,
+    off: Any,
+    *,
+    target: Any = None,
+) -> Any:
     """Return a per-lane sum ``prev + off`` for an in-loop ``tt.addptr``.
 
     ``prev`` is the trailing entry of the previous-iteration index list and
@@ -1601,6 +1946,8 @@ def _compose_addptr_index(ctx: WalkerCtx, prev: Any, off: Any) -> Any:
     tvm_mod = ctx.tvm()
     tir = ctx.tir()
     Buffer = tvm_mod.tir.Buffer
+    prev = _coerce_index_scalar(ctx, prev)
+    off = _coerce_index_scalar(ctx, off)
 
     prev_is_buf = isinstance(prev, Buffer)
     off_is_buf = isinstance(off, Buffer)
@@ -1609,14 +1956,33 @@ def _compose_addptr_index(ctx: WalkerCtx, prev: Any, off: Any) -> Any:
     if not prev_is_buf and not off_is_buf:
         return prev + off
 
-    # Pick the result tile shape: whichever operand is a Buffer wins; if
-    # both, pick the higher-rank shape (matmul's case where the prev
-    # offsets are themselves a 2-D tile).
+    def _broadcast_shape(lhs: Sequence[Any], rhs: Sequence[Any]) -> List[int]:
+        left = [int(s) for s in lhs]
+        right = [int(s) for s in rhs]
+        rank = max(len(left), len(right))
+        left = [1] * (rank - len(left)) + left
+        right = [1] * (rank - len(right)) + right
+        out = []
+        for a_dim, b_dim in zip(left, right):
+            if a_dim == b_dim:
+                out.append(a_dim)
+            elif a_dim == 1:
+                out.append(b_dim)
+            elif b_dim == 1:
+                out.append(a_dim)
+            else:
+                raise EmitError(
+                    "tt.addptr: cannot broadcast offset shapes "
+                    f"{list(lhs)} and {list(rhs)}"
+                )
+        return out
+
+    # Pick the result tile shape using normal broadcast rules. This matters for
+    # matmul C stores: row offsets are shaped (BLOCK_M, 1), column offsets are
+    # shaped (BLOCK_M, BLOCK_N), and the composed flat index tile must be
+    # (BLOCK_M, BLOCK_N), not the first operand's shape.
     if prev_is_buf and off_is_buf:
-        if len(prev.shape) >= len(off.shape):
-            out_shape = list(prev.shape)
-        else:
-            out_shape = list(off.shape)
+        out_shape = _broadcast_shape(prev.shape, off.shape)
         out_dtype = str(prev.dtype)
     elif prev_is_buf:
         out_shape = list(prev.shape)
@@ -1625,7 +1991,21 @@ def _compose_addptr_index(ctx: WalkerCtx, prev: Any, off: Any) -> Any:
         out_shape = list(off.shape)
         out_dtype = str(off.dtype)
 
-    out_buf = _alloc_tile_buffer(ctx, out_shape, out_dtype, ctx.fresh("addptr_acc"))
+    if target is not None and isinstance(target, Buffer):
+        try:
+            target_shape = [int(s) for s in target.shape]
+            out_shape_int = [int(s) for s in out_shape]
+        except Exception:
+            target_shape = []
+            out_shape_int = []
+        if target_shape == out_shape_int:
+            out_buf = target
+        else:
+            out_buf = _alloc_tile_buffer(
+                ctx, out_shape, out_dtype, ctx.fresh("addptr_acc")
+            )
+    else:
+        out_buf = _alloc_tile_buffer(ctx, out_shape, out_dtype, ctx.fresh("addptr_acc"))
     loop_vars = [tir.Var(ctx.fresh(f"a{axis}"), "int32") for axis in range(len(out_shape))]
 
     def _flat_lane_idx() -> Any:
@@ -1656,6 +2036,12 @@ def _compose_addptr_index(ctx: WalkerCtx, prev: Any, off: Any) -> Any:
                 idx = list(loop_vars[-rank:])
             else:
                 idx = [tir.const(0, "int32")] * (rank - len(loop_vars)) + list(loop_vars)
+            for axis, extent in enumerate(operand.shape):
+                try:
+                    if int(extent) == 1:
+                        idx[axis] = tir.const(0, "int32")
+                except Exception:
+                    pass
             return tir.BufferLoad(operand, idx)
         # Vector PrimExpr (e.g. ``Broadcast(scalar, N)`` or
         # ``Ramp(base, 1, N) + Broadcast(...)``): read a single scalar lane
@@ -1678,6 +2064,51 @@ def _compose_addptr_index(ctx: WalkerCtx, prev: Any, off: Any) -> Any:
         )
     ctx.emit(body)
     return out_buf
+
+
+def _loop_carry_addptr_target(ctx: WalkerCtx, ptr_ssa: Any, base: Any) -> Any:
+    """Return the carried index buffer for ``ptr_ssa`` when it is loop-carried."""
+    carries = getattr(ctx, "loop_carry_buffers", {}) or {}
+
+    def _descriptor_index_buffer(value: Any) -> Any:
+        if (
+            isinstance(value, tuple)
+            and len(value) == 2
+            and isinstance(value[1], (list, tuple))
+            and value[1]
+        ):
+            candidate = value[1][-1]
+            try:
+                if isinstance(candidate, ctx.tvm().tir.Buffer):
+                    return candidate
+            except Exception:
+                return None
+        try:
+            if isinstance(value, ctx.tvm().tir.Buffer):
+                return value
+        except Exception:
+            pass
+        return None
+
+    if ptr_ssa in carries:
+        target = _descriptor_index_buffer(carries[ptr_ssa])
+        if target is not None:
+            return target
+    try:
+        name = _ssa_name(ptr_ssa)
+    except Exception:
+        name = None
+    if name and name in carries:
+        target = _descriptor_index_buffer(carries[name])
+        if target is not None:
+            return target
+    if isinstance(base, tuple):
+        base_target = _descriptor_index_buffer(base)
+        for carried in carries.values():
+            target = _descriptor_index_buffer(carried)
+            if target is not None and target is base_target:
+                return target
+    return None
 
 
 def emit_tt_addptr(op: Any, ctx: WalkerCtx) -> Any:
@@ -1735,7 +2166,7 @@ def emit_tt_addptr(op: Any, ctx: WalkerCtx) -> Any:
             rname = _ssa_name(result_value)
             if rname:
                 state = states_map.get(rname)
-        if state is not None:
+        if state is not None and _ptrstate_source_matches_base(ctx, state, base):
             value = {
                 "_ptrstate": state,
                 "source": state.source,
@@ -1749,6 +2180,19 @@ def emit_tt_addptr(op: Any, ctx: WalkerCtx) -> Any:
             return value
 
         off = ctx.get(off_ssa)
+        state = _compatible_ptr_state(ctx, base, result_value)
+        if state is not None:
+            value = {
+                "_ptrstate": state,
+                "source": state.source,
+                "offsets": list(state.offsets),
+                "sizes": list(state.sizes),
+                "strides": list(state.strides),
+                "shape": list(state.shape) if state.shape is not None else None,
+            }
+            if result_value is not None:
+                ctx.bind(result_value, value)
+            return value
         # Shim is built -- the PtrAnalysis pass should already have folded
         # this op away in the rewritten module. If we still see it here we
         # respect whatever PtrState the walker has stashed and just
@@ -1774,7 +2218,12 @@ def emit_tt_addptr(op: Any, ctx: WalkerCtx) -> Any:
         if isinstance(base, tuple) and len(base) == 2:
             buf, indices = base
             new_indices = list(indices) or [tir.const(0, "int32")]
-            new_indices[-1] = _compose_addptr_index(ctx, new_indices[-1], off)
+            new_indices[-1] = _compose_addptr_index(
+                ctx,
+                new_indices[-1],
+                off,
+                target=_loop_carry_addptr_target(ctx, ptr_ssa, base),
+            )
             value = (buf, new_indices)
             if result_value is not None:
                 ctx.bind(result_value, value)
@@ -1788,7 +2237,12 @@ def emit_tt_addptr(op: Any, ctx: WalkerCtx) -> Any:
     if isinstance(base, tuple) and len(base) == 2:
         buf, indices = base
         new_indices = list(indices) or [tir.const(0, "int32")]
-        new_indices[-1] = _compose_addptr_index(ctx, new_indices[-1], off)
+        new_indices[-1] = _compose_addptr_index(
+            ctx,
+            new_indices[-1],
+            off,
+            target=_loop_carry_addptr_target(ctx, ptr_ssa, base),
+        )
         value = (buf, new_indices)
     elif base is None:
         # No prior binding: synthesise a flat scalar with the offset.
@@ -1837,7 +2291,7 @@ def emit_tts_make_tptr(op: Any, ctx: WalkerCtx) -> Any:
     try:
         import tilelang.language as T  # type: ignore
         frag = T.alloc_fragment(out_shape, out_dtype)
-    except ImportError:  # pragma: no cover -- TileLang absent
+    except Exception:  # pragma: no cover -- TileLang absent or no IRBuilder scope
         # Fragment fallback: tile-scoped buffer (see ``_alloc_tile_buffer``)
         # so VerifyMemory's host-memory check skips it.
         frag = _alloc_tile_buffer(ctx, out_shape, out_dtype, ctx.fresh("tptr"))

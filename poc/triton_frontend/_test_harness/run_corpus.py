@@ -164,8 +164,6 @@ def _try_mlir_walker(
         from poc.triton_frontend import mlir_walker  # noqa: WPS433
     except Exception as exc:
         return [], exc, None, None
-    if not getattr(mlir_walker, "MLIR_WALKER_AVAILABLE", False):
-        return [], RuntimeError("mlir.ir bindings unavailable"), None, None
 
     try:
         # Use the documented public from_ttir entry point so we exercise
@@ -173,7 +171,7 @@ def _try_mlir_walker(
         # shim is available) plus the MLIR walker.
         prim = from_ttir(ttir_text)
         kind = type(prim).__module__ + "." + type(prim).__name__
-        return [], None, kind, prim
+        return _enumerate_all_ops(ttir_text), None, kind, prim
     except Exception as exc:  # noqa: BLE001
         return [], exc, None, None
 
@@ -247,23 +245,20 @@ def run_one(kernel: _canned.CannedKernel) -> KernelResult:
     if ttir_text is None:
         ttir_text = kernel.ttir_text  # canned fallback
 
-    # --- Step 2: prefer the MLIR walker when its bindings are present. ---
-    if _has_mlir_walker():
-        ops, err, kind, _ctx = _try_mlir_walker(ttir_text)
-        if err is None:
-            result.status = (
-                Status.LOWERED_FULL if _has_tvm() else Status.LOWERED_DEGRADED
-            )
-            result.visited_ops = ops
-            result.primfunc_kind = kind
-            result.walker_used = "mlir"
-            return result
-        # MLIR walker failed -- fall through to the text walker so we can
-        # at least report op coverage. Capture the MLIR exception for the
-        # diagnostics column when the text path also fails.
-        mlir_err: Optional[BaseException] = err
-    else:
-        mlir_err = None
+    # --- Step 2: prefer the MLIR walker. ---
+    ops, err, kind, _ctx = _try_mlir_walker(ttir_text)
+    if err is None:
+        result.status = (
+            Status.LOWERED_FULL if _has_tvm() else Status.LOWERED_DEGRADED
+        )
+        result.visited_ops = ops
+        result.primfunc_kind = kind
+        result.walker_used = "mlir"
+        return result
+    # MLIR walker failed -- fall through to the text walker so we can
+    # at least report op coverage. Capture the MLIR exception for the
+    # diagnostics column when the text path also fails.
+    mlir_err: Optional[BaseException] = err
 
     # --- Step 3: text walker (degraded path, but always available). ---
     visited, exc = _try_text_walker(ttir_text)

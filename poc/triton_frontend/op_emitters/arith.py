@@ -275,6 +275,29 @@ def _read_lane(ctx: EmitContext, value: Any, indices: Tuple[Any, ...]) -> Any:
         # rank-1 Ramp; use the last (innermost) loop var.
         last = indices[-1] if indices else tir.const(0, "int32")
         return value.base + value.stride * last
+    dt = getattr(value, "dtype", None)
+    if dt is not None and "x" in str(dt):
+        last = indices[-1] if indices else tir.const(0, "int32")
+        binop_pyops = {
+            "Add": lambda x, y: x + y,
+            "Sub": lambda x, y: x - y,
+            "Mul": lambda x, y: x * y,
+            "Div": lambda x, y: x / y,
+            "Mod": lambda x, y: x % y,
+            "FloorDiv": lambda x, y: x // y,
+            "FloorMod": lambda x, y: x % y,
+        }
+        for cls_name, pyop in binop_pyops.items():
+            cls = getattr(tir, cls_name, None)
+            if cls is not None and isinstance(value, cls):
+                return pyop(
+                    _read_lane(ctx, value.a, (last,)),
+                    _read_lane(ctx, value.b, (last,)),
+                )
+        cast_cls = getattr(tir, "Cast", None)
+        if cast_cls is not None and isinstance(value, cast_cls):
+            scalar_dt = str(value.dtype).rsplit("x", 1)[0]
+            return tir.Cast(scalar_dt, _read_lane(ctx, value.value, (last,)))
     # Scalar PrimExpr: broadcast semantics.
     return value
 
@@ -295,6 +318,27 @@ def _is_zero_constant_tile(ctx: EmitContext, value: Any) -> bool:
         except Exception:
             return False
     return False
+
+
+def _loop_carry_target(ctx: EmitContext, op: Any, value: Any) -> Any:
+    """Return the loop-carried output buffer when ``value`` aliases one."""
+    carries = getattr(ctx, "loop_carry_buffers", {}) or {}
+    operands = _operands(op)
+    if operands:
+        first = operands[0]
+        if first in carries:
+            return carries[first]
+        try:
+            getter = getattr(first, "get_name", None)
+            name = getter() if callable(getter) else getattr(first, "name", None)
+            if name and str(name) in carries:
+                return carries[str(name)]
+        except Exception:
+            pass
+    for carried in carries.values():
+        if carried is value:
+            return carried
+    return None
 
 
 def _emit_tile_binop(
@@ -413,7 +457,7 @@ def _emit_addf(op: Any, ctx: EmitContext) -> Any:
     dt = _tile_dtype(ctx, a)
     if not _is_float_dtype(dt):
         raise EmitError(f"arith.addf on non-float type {dt!r}; use arith.addi")
-    if _is_zero_constant_tile(ctx, a):
+    if _loop_carry_target(ctx, op, a) is None and _is_zero_constant_tile(ctx, a):
         return _bind_result(op, ctx, b)
     if _is_zero_constant_tile(ctx, b):
         return _bind_result(op, ctx, a)
@@ -947,6 +991,8 @@ ARITH_EMITTERS: Dict[str, Callable[[Any, EmitContext], Any]] = {
     # Min / max
     "arith.minimumf": _emit_minimumf,
     "arith.maximumf": _emit_maximumf,
+    "arith.minnumf": _emit_minimumf,
+    "arith.maxnumf": _emit_maximumf,
     "arith.minsi": _emit_minsi,
     "arith.maxsi": _emit_maxsi,
     # Math intrinsics

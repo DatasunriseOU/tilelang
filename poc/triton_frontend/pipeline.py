@@ -578,6 +578,9 @@ for path in reversed(payload.get("sys_path") or []):
     if path and path not in sys.path:
         sys.path.insert(0, path)
 
+from poc.triton_frontend.ptr_analysis import shim_available
+
+shim_available()
 import _triton_frontend_cxx as _cxx
 
 ctx = _cxx.Context()
@@ -620,6 +623,9 @@ def round_trip_through_cxx_shim(ttir_text: str) -> str:
         return ttir_text
 
     try:
+        from .ptr_analysis import shim_available
+
+        shim_available()
         import _triton_frontend_cxx as _cxx  # type: ignore  # noqa: WPS433
     except Exception:
         return ttir_text

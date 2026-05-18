@@ -197,6 +197,16 @@ def try_import_mlir() -> Optional[ModuleType]:
     return ir
 
 
+def _try_import_mlir_quiet() -> Optional[ModuleType]:
+    """Return ``mlir.ir`` if importable without emitting the degraded warning."""
+    _augment_sys_path_from_env()
+    try:
+        from mlir import ir  # type: ignore  # noqa: WPS433
+        return ir
+    except Exception:
+        return None
+
+
 def parse_ttir(text: str) -> Optional[Any]:
     """Parse Triton TTIR text into an ``mlir.ir.Module`` (or None on failure).
 
@@ -211,7 +221,15 @@ def parse_ttir(text: str) -> Optional[Any]:
     fails (e.g. the text is malformed); callers fall back to the
     regex walker in either case.
     """
-    ir = try_import_mlir()
+    ir = _try_import_mlir_quiet()
+    if ir is None:
+        try:
+            from poc.triton_frontend._mlir_path_setup import bootstrap_jaxlib_alias
+
+            bootstrap_jaxlib_alias()
+            ir = _try_import_mlir_quiet()
+        except Exception:
+            ir = None
     if ir is None:
         return None
 
@@ -225,7 +243,11 @@ def parse_ttir(text: str) -> Optional[Any]:
     # ``allow_unregistered_dialects = True`` below.
     try:
         from poc.triton_frontend import _mlir_path_setup as _setup
-        _foreign_alias = _setup.SELECTED_SOURCE in {"jaxlib", "iree"}
+        ir_name = getattr(ir, "__name__", "")
+        _foreign_alias = (
+            _setup.SELECTED_SOURCE in {"jaxlib", "iree"}
+            or ir_name.startswith(("jaxlib.", "iree."))
+        )
     except Exception:
         _foreign_alias = False
     if not _foreign_alias:
@@ -251,12 +273,49 @@ def parse_ttir(text: str) -> Optional[Any]:
             module = ir.Module.parse(text, ctx)
         return module
     except Exception as exc:
-        warnings.warn(
-            f"mlir_walker.parse_ttir: parse failed -- {exc!r}",
-            UserWarning,
-            stacklevel=2,
-        )
-        return None
+        try:
+            from poc.triton_frontend._mlir_path_setup import bootstrap_jaxlib_alias
+            from poc.triton_frontend.pipeline import (
+                is_custom_form_ttir,
+                round_trip_through_cxx_shim,
+            )
+
+            if not is_custom_form_ttir(text):
+                warnings.warn(
+                    f"mlir_walker.parse_ttir: parse failed -- {exc!r}",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                return None
+            converted = round_trip_through_cxx_shim(text)
+            if converted == text:
+                warnings.warn(
+                    f"mlir_walker.parse_ttir: parse failed -- {exc!r}",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                return None
+            bootstrap_jaxlib_alias()
+            ir = _try_import_mlir_quiet()
+            if ir is None:
+                warnings.warn(
+                    f"mlir_walker.parse_ttir: parse failed -- {exc!r}",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                return None
+            ctx = ir.Context()
+            ctx.allow_unregistered_dialects = True
+            with ctx, ir.Location.unknown(ctx):
+                return ir.Module.parse(converted, ctx)
+        except Exception as generic_exc:
+            warnings.warn(
+                "mlir_walker.parse_ttir: generic-form fallback failed -- "
+                f"{generic_exc!r}",
+                UserWarning,
+                stacklevel=2,
+            )
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -550,7 +609,7 @@ def wrap_module_for_walker(module: Any) -> Any:
 
 def _bootstrap_and_probe() -> bool:
     """Probe ``mlir.ir`` after :mod:`_mlir_path_setup` ran its safe probes."""
-    return try_import_mlir() is not None
+    return _try_import_mlir_quiet() is not None
 
 
 # Probed once at import. Re-import in tests will re-run try_import_mlir
