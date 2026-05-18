@@ -73,32 +73,73 @@ def describe_triton_env() -> Dict[str, Any]:
     return info
 
 
+def _infer_signature(fn, constexprs) -> Dict[str, str]:
+    """Build a Triton signature dict from the JIT function's param spec.
+
+    Conservative: pointer params → *fp32, int params → i32. Constexpr-named
+    params are skipped (constexprs dict carries them separately).
+    """
+    sig: Dict[str, str] = {}
+    constexpr_keys = set((constexprs or {}).keys())
+    for name in fn.params if hasattr(fn, "params") else []:
+        pname = name.name if hasattr(name, "name") else str(name)
+        if pname in constexpr_keys:
+            continue
+        sig[pname] = "*fp32" if pname.endswith("_ptr") else "i32"
+    return sig
+
+
 def _try_triton_3_6(fn, constexprs, target):
-    """Triton 3.6+: ASTSource(constexprs=...) + make_ir."""
+    """Triton 3.6+: ASTSource(constexprs=...) + make_ir.
+
+    Stops at the TTIR stage — never invokes Metal/PTX codegen, so the
+    Apple metal-as / metal-ll quirks in our triton fork don't surface.
+    """
     try:
         from triton.compiler.compiler import ASTSource
         from triton.runtime.jit import JITFunction
+        from triton.backends import backends as _backends
+        from triton.backends.compiler import GPUTarget
+        from triton._C.libtriton import ir as _libir
     except ImportError as exc:
         raise TTIRCaptureError(f"3.6+ API not found: {exc}") from exc
     if not isinstance(fn, JITFunction):
         raise TTIRCaptureError(f"fn must be @triton.jit; got {type(fn).__name__}")
-    try:
-        src = ASTSource(fn=fn, signature={}, constexprs=constexprs or {})
-        # The make_ir entrypoint is what 3.6 uses; fall through to options
-        # path if missing.
-        if hasattr(src, "make_ir"):
-            from triton.backends import backend_for_target  # type: ignore
-            backend = backend_for_target(target or "cuda")
-            options = backend.parse_options({})
-            codegen = backend.codegen_for_target(target or "cuda")
-            from triton import language as tl  # noqa: F401
-            import triton._C.libtriton as _libtriton  # type: ignore
-            ctx = _libtriton.ir.context()
-            module = src.make_ir(target, options, codegen, {}, ctx)
+
+    # Pick the best available backend whose target we can describe.
+    # apple/mps is our own out-of-tree backend (triton-pr9701); fall back
+    # to nvidia or amd if mps isn't registered.
+    backend_to_gputarget = [
+        ("apple", GPUTarget("mps", "apple_m2", 32)),
+        ("nvidia", GPUTarget("cuda", 80, 32)),
+        ("amd", GPUTarget("hip", "gfx942", 64)),
+    ]
+    last_err: Optional[Exception] = None
+    for be_name, gpu_target in backend_to_gputarget:
+        backend_pkg = _backends.get(be_name)
+        if backend_pkg is None:
+            continue
+        try:
+            backend_inst = backend_pkg.compiler(gpu_target)
+        except Exception as exc:
+            last_err = exc
+            continue
+        try:
+            opts = backend_inst.parse_options({})
+            codegen = backend_inst.get_codegen_implementation(opts)
+            module_map = backend_inst.get_module_map()
+            ctx = _libir.context()
+            backend_inst.load_dialects(ctx)
+            sig = _infer_signature(fn, constexprs)
+            src = ASTSource(fn=fn, signature=sig, constexprs=constexprs or {})
+            module = src.make_ir(gpu_target, opts, codegen, module_map, ctx)
             return str(module)
-    except Exception as exc:
-        raise TTIRCaptureError(f"3.6+ make_ir failed: {exc}") from exc
-    raise TTIRCaptureError("3.6+ make_ir entrypoint not available")
+        except Exception as exc:
+            last_err = exc
+            continue
+    raise TTIRCaptureError(
+        f"3.6+ make_ir failed across {[b for b,_ in backend_to_gputarget]}: {last_err}"
+    )
 
 
 def _try_triton_3_0(fn, constexprs, target):
