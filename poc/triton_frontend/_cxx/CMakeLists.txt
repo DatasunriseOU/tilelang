@@ -78,7 +78,16 @@ find_package(pybind11 CONFIG REQUIRED)
 # returns TL_PA_ERR_INTERNAL because the `__has_include` gates in
 # ptr_analysis_shim.cc disable the rewrite path.
 set(TL_PA_LINK_LIBS "")
-set(TRITON_INSTALL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../vendored/triton")
+# Allow callers (typically build_cxx.py) to override TRITON_INSTALL_DIR via
+# `-DTRITON_INSTALL_DIR=...`. The vendored fallback path under
+# `_cxx/../vendored/triton` ships only stub archives (no architecture, empty
+# members) suitable for header-only configure-time use; for an actual link the
+# caller must supply a real Triton build/install dir whose `lib/` contains
+# native `libTritonIR.a` etc. `build_cxx.py::_stage_triton_install` does this
+# automatically by harvesting `.o` files from a local triton source checkout.
+if(NOT DEFINED TRITON_INSTALL_DIR OR TRITON_INSTALL_DIR STREQUAL "")
+  set(TRITON_INSTALL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../vendored/triton")
+endif()
 message(STATUS "Using TRITON_INSTALL_DIR = ${TRITON_INSTALL_DIR}")
 include_directories(${TRITON_INSTALL_DIR}/include)
 link_directories(${TRITON_INSTALL_DIR}/lib)

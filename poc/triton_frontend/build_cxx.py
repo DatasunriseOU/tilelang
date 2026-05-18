@@ -46,6 +46,15 @@ _THIS_DIR = Path(__file__).resolve().parent
 _CXX_DIR = _THIS_DIR / "_cxx"
 _BUILD_DIR = _CXX_DIR / "build"
 
+# Where we stage a "fake" Triton install with real native archives harvested
+# from a local Triton source build. The CMakeLists.txt reads
+# `TRITON_INSTALL_DIR` and links against `lib/lib{TritonIR,TritonAnalysis,
+# TritonGPUIR}.a` there. The vendored fallback under `_cxx/../vendored/triton`
+# only contains stub archives without a real architecture, so on a host with
+# Triton compiled in-tree we synthesize valid Mach-O / ELF archives here and
+# point CMake at this staging dir instead.
+_TRITON_STAGE_DIR = _BUILD_DIR / "_triton_stage"
+
 # Process-level latch so repeated ensure_built() calls don't keep poking
 # sys.path or shelling out to cmake. The value caches the last result.
 _ENSURE_RESULT: Optional[bool] = None
@@ -151,6 +160,152 @@ def _run(cmd: list, **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=False, **kwargs)
 
 
+def _detect_triton_source_build() -> Optional[Path]:
+    """Locate a Triton source-build dir whose objs we can re-archive.
+
+    Returns the path to a directory that looks like
+    ``<triton_src>/build/cmake.<plat>-cpython-<ver>/`` if one is found,
+    else None. The directory is expected to contain
+    ``lib/Dialect/Triton/IR/CMakeFiles/TritonIR.dir/*.o``.
+
+    The probe order is:
+      1. ``$TRITON_SRC_BUILD_DIR`` env var (explicit override)
+      2. The installed ``triton`` package's ``__file__`` -> walk up to
+         find a sibling ``build/cmake.*`` directory.
+    """
+    explicit = os.environ.get("TRITON_SRC_BUILD_DIR")
+    if explicit:
+        p = Path(explicit)
+        if (p / "lib" / "Dialect" / "Triton" / "IR" / "CMakeFiles" /
+                "TritonIR.dir").is_dir():
+            return p
+    try:
+        import triton  # type: ignore
+    except Exception:
+        return None
+    tri_file = Path(getattr(triton, "__file__", "") or "")
+    if not tri_file.exists():
+        return None
+    # triton/__init__.py -> triton/ -> python/ -> <src>/
+    src_root = tri_file.parent.parent.parent
+    build_root = src_root / "build"
+    if not build_root.is_dir():
+        return None
+    # Newest cmake.*-cpython-* dir wins.
+    candidates = sorted(
+        (p for p in build_root.iterdir()
+         if p.is_dir() and p.name.startswith("cmake.")),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for cand in candidates:
+        if (cand / "lib" / "Dialect" / "Triton" / "IR" / "CMakeFiles" /
+                "TritonIR.dir").is_dir():
+            return cand
+    return None
+
+
+def _stage_triton_install(verbose: bool = True) -> Optional[Path]:
+    """Materialize a synthetic Triton install dir for the cmake link step.
+
+    The vendored ``_cxx/../vendored/triton/lib/*.a`` archives committed to
+    the repo are stubs without a real architecture (they parse as ``current
+    ar archive`` but contain only a symbol table and no member objects),
+    so the macOS / Linux linker refuses them with "invalid control bits".
+    This helper finds a local Triton source build (see
+    :func:`_detect_triton_source_build`) and uses ``libtool`` / ``ar`` to
+    re-archive its ``.o`` files into ``_TRITON_STAGE_DIR/lib/``. The
+    ``include/`` symlink reuses the (header-only) vendored tree.
+
+    Returns the staging dir on success (suitable for
+    ``-DTRITON_INSTALL_DIR=...``), or None if we couldn't find a usable
+    Triton source build -- in which case the cmake step will fall back to
+    the vendored stub path and fail at link time with a clear message.
+    """
+    build = _detect_triton_source_build()
+    if build is None:
+        if verbose:
+            print(
+                "[build_cxx] no Triton source build found; cmake will fall "
+                "back to the vendored stub archives (link will likely fail). "
+                "Set TRITON_SRC_BUILD_DIR=<path>/build/cmake.<plat>-cpython-<v>",
+                file=sys.stderr,
+            )
+        return None
+
+    # Map archive name -> directory of .o files relative to the triton build.
+    components = {
+        "libTritonIR": build / "lib" / "Dialect" / "Triton" / "IR" /
+                       "CMakeFiles" / "TritonIR.dir",
+        "libTritonAnalysis": build / "lib" / "Analysis" / "CMakeFiles" /
+                             "TritonAnalysis.dir",
+        "libTritonGPUIR": build / "lib" / "Dialect" / "TritonGPU" / "IR" /
+                          "CMakeFiles" / "TritonGPUIR.dir",
+    }
+
+    stage_lib = _TRITON_STAGE_DIR / "lib"
+    stage_lib.mkdir(parents=True, exist_ok=True)
+
+    # Pick the archive tool. macOS prefers `libtool -static`; on Linux we
+    # fall back to `ar rcs`. Both produce the standard `ar`-format archives
+    # that `find_library` + the linker accept.
+    use_libtool = sys.platform == "darwin" and shutil.which("libtool") is not None
+    ar_tool = shutil.which("ar")
+    if not use_libtool and not ar_tool:
+        if verbose:
+            print(
+                "[build_cxx] neither libtool nor ar found; cannot stage Triton "
+                "archives. Install Xcode CLT or binutils.",
+                file=sys.stderr,
+            )
+        return None
+
+    for name, obj_dir in components.items():
+        out = stage_lib / f"{name}.a"
+        # Cache: skip if archive newer than every .o file.
+        objs = sorted(obj_dir.glob("*.o"))
+        if not objs:
+            if verbose:
+                print(f"[build_cxx] no .o files in {obj_dir}; skipping {name}",
+                      file=sys.stderr)
+            continue
+        if out.exists():
+            out_mtime = out.stat().st_mtime
+            if all(o.stat().st_mtime <= out_mtime for o in objs):
+                continue
+            out.unlink()
+        if use_libtool:
+            cmd = ["libtool", "-static", "-o", str(out)] + [str(o) for o in objs]
+        else:
+            cmd = [ar_tool, "rcs", str(out)] + [str(o) for o in objs]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            if verbose:
+                print(
+                    f"[build_cxx] failed to archive {name}: {res.stderr.strip()}",
+                    file=sys.stderr,
+                )
+            return None
+
+    # Header tree: symlink to the vendored copy (header-only, OK to share).
+    stage_inc = _TRITON_STAGE_DIR / "include"
+    vendored_inc = _CXX_DIR.parent / "vendored" / "triton" / "include"
+    if not stage_inc.exists() and vendored_inc.is_dir():
+        try:
+            stage_inc.symlink_to(vendored_inc)
+        except OSError:
+            # Fall back to copying if symlinks aren't allowed.
+            shutil.copytree(vendored_inc, stage_inc)
+
+    if verbose:
+        print(
+            f"[build_cxx] staged Triton install at {_TRITON_STAGE_DIR} "
+            f"(from {build})",
+            file=sys.stderr,
+        )
+    return _TRITON_STAGE_DIR
+
+
 def _build(verbose: bool = True) -> Tuple[bool, str]:
     """Run cmake + ninja. Returns ``(ok, stderr_summary)``.
 
@@ -184,6 +339,13 @@ def _build(verbose: bool = True) -> Tuple[bool, str]:
         f"-DPython3_EXECUTABLE={sys.executable}",
     ]
     triton_install = os.environ.get("TRITON_INSTALL_DIR")
+    if not triton_install:
+        # Try to stage a real Triton install from a local source build before
+        # cmake configures (so the find_library(TRITON_IR_LIB REQUIRED) step
+        # succeeds against valid archives instead of the vendored stubs).
+        staged = _stage_triton_install(verbose=verbose)
+        if staged is not None:
+            triton_install = str(staged)
     if triton_install:
         configure_cmd.append(f"-DTRITON_INSTALL_DIR={triton_install}")
     if os.environ.get("TRITON_FRONTEND_USE_NLOHMANN_JSON"):
