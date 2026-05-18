@@ -373,7 +373,12 @@ def test_op_table_has_expected_size() -> None:
     """
     from poc.triton_frontend.op_mapping import OP_TABLE
 
-    EXPECTED = 89
+    # Bumped from 89 -> 95 by the FLA chunk_gated_delta_rule enablement
+    # pass: ``math.{exp2,log2,rsqrt,erf,floor,ceil}`` were added to
+    # ``ARITH_EMITTERS`` so the gated-delta-rule kernel's ``exp2`` lane
+    # (and the LayerNorm/RMSNorm rsqrt lane that came along for free)
+    # lower without FAILED_OPS.
+    EXPECTED = 95
     assert len(OP_TABLE) == EXPECTED, (
         f"OP_TABLE size changed from {EXPECTED} to {len(OP_TABLE)}; "
         f"if intentional, update this constant + the three README "
@@ -443,6 +448,64 @@ def test_op_mapping_live_canonical_emitters_unmarked() -> None:
         f"never overwritten by an overlay) but carry the "
         f"'# DEAD-BUT-LOADED:' marker: {falsely_marked!r}. Remove the "
         f"marker -- a false-positive label hides real dead code."
+    )
+
+
+def test_fla_chunk_gated_delta_rule_op_coverage() -> None:
+    """Pin the OP_TABLE entries required by FLA's ``chunk_gated_delta_rule``
+    forward kernel (``fla/ops/common/chunk_delta_h.py``).
+
+    The kernel uses ``tl.dot`` (matmul) and ``tl.math.exp2`` (via the
+    ``fla.ops.utils.op.exp2`` shim that wraps ``tl.math.exp2``); on top
+    of the standard ``tt.load`` / ``tt.store`` / ``tt.broadcast`` /
+    ``tt.expand_dims`` / ``tt.trans`` / ``tt.where`` cohort.
+
+    Without ``math.exp2`` in OP_TABLE the reducer would mark the kernel
+    FAILED_OPS (the elementwise-only Tier-1 baseline only had
+    ``math.exp``).
+    """
+    from poc.triton_frontend.op_mapping import OP_TABLE
+
+    required = {
+        "tt.dot",
+        "tt.expand_dims",
+        "tt.broadcast",
+        "tt.trans",
+        "tt.where",
+        "tt.load",
+        "tt.store",
+        "tt.get_program_id",
+        "math.exp",
+        "math.exp2",
+        "math.log",
+        "math.log2",
+        "math.rsqrt",
+        "math.sqrt",
+    }
+    missing = required - set(OP_TABLE.keys())
+    assert not missing, (
+        f"FLA chunk_gated_delta_rule still needs these ops added to "
+        f"OP_TABLE: {sorted(missing)!r}"
+    )
+
+
+def test_math_exp2_emitter_is_distinct_from_exp() -> None:
+    """``math.exp2`` and ``math.exp`` must dispatch to different emitters --
+    a copy-paste bug that aliases them would silently compute exp(x) where
+    the user asked for 2**x (a 44 % numerical error for x=1).
+    """
+    from poc.triton_frontend.op_mapping import OP_TABLE
+
+    emit_exp = OP_TABLE["math.exp"]
+    emit_exp2 = OP_TABLE["math.exp2"]
+    assert emit_exp is not emit_exp2, (
+        f"math.exp and math.exp2 share the same emitter "
+        f"({emit_exp!r}); the exp2 path would silently compute exp(x)."
+    )
+    # Confirm name conveys identity (helps debug logs).
+    assert "exp2" in getattr(emit_exp2, "__name__", ""), (
+        f"math.exp2 emitter has misleading name "
+        f"{getattr(emit_exp2, '__name__', '?')!r}"
     )
 
 

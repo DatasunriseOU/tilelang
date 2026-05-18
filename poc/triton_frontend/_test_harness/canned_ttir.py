@@ -193,6 +193,30 @@ module {
 """
 
 
+# FLA gated-delta-rule motif: ``tl.dot`` accumulator chain followed by an
+# elementwise ``tl.math.exp2`` scaling lane (the
+# ``exp2(b_g_last - b_g)`` mask used in
+# ``chunk_gated_delta_rule_fwd_kernel_h_blockdim64``). The full FLA kernel
+# is several hundred lines of pipelined load/dot/scale; this fixture is
+# the structural minimum that exercises the same op cohort
+# (``tt.dot`` + ``math.exp2`` + ``tt.load`` / ``tt.store``) so the OP_TABLE
+# membership probe in ``run_corpus`` reports LOWERED_DEGRADED rather than
+# FAILED_OPS.
+_FLA_DOT_EXP2_TTIR = """\
+module {
+  tt.func @fla_dot_exp2(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %c: !tt.ptr<f32>) {
+    %0 = tt.get_program_id {axis = 0 : i32} : i32
+    %1 = tt.load %a : tensor<32x32xf16>
+    %2 = tt.load %b : tensor<32x32xf16>
+    %3 = tt.dot %1, %2 : tensor<32x32xf16> x tensor<32x32xf16> -> tensor<32x32xf32>
+    %4 = math.exp2 %3 : tensor<32x32xf32>
+    tt.store %c, %4 : tensor<32x32xf32>
+    tt.return
+  }
+}
+"""
+
+
 # Async copy + barrier sketch (Hopper / Ampere pipelined load). Probes
 # the async_copy + mbarrier OP_TABLE coverage.
 _ASYNC_PIPELINE_TTIR = """\
@@ -268,5 +292,16 @@ CANNED_TTIR_FIXTURES: List[CannedKernel] = [
         description="Async copy + mbarrier protocol skeleton (Hopper TMA-style).",
         source="hand-derived from RFC section 5.4 and tt.async_* coverage",
         ttir_text=_ASYNC_PIPELINE_TTIR,
+    ),
+    CannedKernel(
+        name="fla_dot_exp2",
+        description=(
+            "FLA gated-delta-rule motif: tt.dot accumulator + math.exp2 "
+            "scaling lane (chunk_gated_delta_rule_fwd_kernel_h_blockdim64 "
+            "headline op cohort)."
+        ),
+        source="~/sources/rent_kernels/flash-linear-attention/fla/ops/common/chunk_delta_h.py",
+        ttir_text=_FLA_DOT_EXP2_TTIR,
+        constexprs={"BT": 32, "BV": 32, "K": 32},
     ),
 ]

@@ -641,10 +641,27 @@ def _math_unary(name: str, tir_fn_name: str):
 
 _emit_math_sqrt = _math_unary("sqrt", "sqrt")
 _emit_math_exp = _math_unary("exp", "exp")
+# ``math.exp2`` / ``math.log2`` are emitted by Triton's frontend whenever the
+# user code calls ``tl.math.exp2`` / ``tl.exp2`` / ``tl.math.log2`` /
+# ``tl.log2``. flash-linear-attention's gated-delta-rule kernels (and the
+# ``fla.ops.utils.op.exp2`` shim that wraps ``tl.math.exp2``) lean on these
+# heavily; without the emitter the OP_TABLE-membership probe in
+# ``run_corpus`` reports the kernel as FAILED_OPS even though the upstream
+# ``math.exp`` / ``math.log`` cousins lower fine.
+_emit_math_exp2 = _math_unary("exp2", "exp2")
 _emit_math_log = _math_unary("log", "log")
+_emit_math_log2 = _math_unary("log2", "log2")
+# ``math.rsqrt`` shows up in normalisation kernels (LayerNorm, RMSNorm) and
+# is part of the same flash-linear-attention surface that needs ``exp2``.
+_emit_math_rsqrt = _math_unary("rsqrt", "rsqrt")
 _emit_math_sin = _math_unary("sin", "sin")
 _emit_math_cos = _math_unary("cos", "cos")
 _emit_math_tanh = _math_unary("tanh", "tanh")
+# ``math.erf`` is needed for the GELU-erf activation; ``math.floor`` /
+# ``math.ceil`` appear in indexing math after constant folding.
+_emit_math_erf = _math_unary("erf", "erf")
+_emit_math_floor = _math_unary("floor", "floor")
+_emit_math_ceil = _math_unary("ceil", "ceil")
 
 
 def _emit_math_absf(op: Any, ctx: EmitContext) -> Any:
@@ -848,11 +865,22 @@ ARITH_EMITTERS: Dict[str, Callable[[Any, EmitContext], Any]] = {
     "arith.maxsi": _emit_maxsi,
     # Math intrinsics
     "math.sqrt": _emit_math_sqrt,
+    "math.rsqrt": _emit_math_rsqrt,
     "math.exp": _emit_math_exp,
+    # ``math.exp2`` / ``math.log2`` cover the ``tl.math.exp2`` / ``tl.exp2``
+    # path used by flash-linear-attention's gated-delta-rule kernels
+    # (``fla.ops.utils.op.exp2``) -- enabling these unblocks the chunk-h
+    # forward kernel from FAILED_OPS to LOWERED_DEGRADED in the reducer
+    # corpus.
+    "math.exp2": _emit_math_exp2,
     "math.log": _emit_math_log,
+    "math.log2": _emit_math_log2,
     "math.sin": _emit_math_sin,
     "math.cos": _emit_math_cos,
     "math.tanh": _emit_math_tanh,
+    "math.erf": _emit_math_erf,
+    "math.floor": _emit_math_floor,
+    "math.ceil": _emit_math_ceil,
     "math.absf": _emit_math_absf,
     # Comparisons
     "arith.cmpf": _emit_cmpf,
