@@ -443,8 +443,20 @@ public:
 
     // Check that all local.fragment buffers have inferred layouts.
     // On Metal targets, fragment buffers used as GEMM accumulators are
-    // lowered to opaque simdgroup matrices, so they have no explicit
-    // thread-level layout and can be safely skipped.
+    // promoted to opaque simdgroup matrices by a downstream pass
+    // (MetalFragmentToSimdgroup) and have no explicit thread-level layout
+    // here. PR #2140 review (Copilot #2) flagged the blanket Metal skip as
+    // too broad: ideally only the GEMM-accumulator fragments would be
+    // whitelisted, while other fragment buffers on Metal would still
+    // require an inferred layout. We attempted to narrow to
+    // ``buffer.scope() == "metal.simdgroup"`` but at this point in the
+    // pipeline fragments have not yet been remapped, so the whitelist is
+    // empty and the check ICHECKs on real Metal GEMMs (see
+    // testing/python/metal/test_tvm_ffi_metal_stream_dlpack.py). A precise
+    // classifier needs either (a) re-running ``is_simdgroup_eligible``
+    // from C++ here, or (b) carrying the future scope through buffer
+    // metadata before layout inference runs.
+    // TODO(copilot-#2): wire (a) or (b) instead of the blanket Metal skip.
     for (const auto &[buffer, _] : use_list_) {
       if (IsFragmentBuffer(buffer)) {
         if (!TargetIsMetal(target_) && layout_map.count(buffer) == 0) {
