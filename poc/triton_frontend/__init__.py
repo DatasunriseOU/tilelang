@@ -62,7 +62,7 @@ from .mlir_walker import (
     try_import_mlir,
     walk_module,
 )
-from .op_mapping import OP_TABLE, WalkerCtx
+from .op_mapping import LazyTileExpr, OP_TABLE, WalkerCtx
 from .ptr_analysis import PtrAnalysis, shim_available
 
 __all__ = [
@@ -290,6 +290,9 @@ def _redecl_input_buffer(
             break
     if target_key is None:
         return buf
+    fixed_keys = getattr(ctx, "fixed_arg_buffer_keys", set()) or set()
+    if target_key in fixed_keys or str(name) in fixed_keys:
+        return buf
 
     if offset_indices is not None:
         decl_shape = _flat_extent_for_indices(ctx, offset_indices, shape)
@@ -338,12 +341,12 @@ def _emit_tile_load_from_input_buffer(
 
     result_value = _results(op)[0] if _results(op) else None
     out_buf_name = ctx.fresh("tile_load")
-    # Use ``scope="shared"`` so the tile buffer satisfies the scope contract
-    # of downstream GEMM consumers: Metal GEMM's ``is_gemm_ss()`` check
-    # requires both A and B operand tiles in shared scope; the default
-    # ``scope="local"`` produces ``"Unsupported gemm combination, A: local,
-    # B: local"`` at ``LowerTileOp`` time.
-    tile_buf = _alloc_tile_buffer(ctx, list(out_shape) or [1], out_dtype, out_buf_name, scope="shared")
+    # Rank-2+ operand tiles may feed GEMM and need shared scope; rank-1
+    # staging stays local to avoid unnecessary threadgroup memory.
+    tile_scope = "shared" if len(out_shape or []) >= 2 else "local"
+    tile_buf = _alloc_tile_buffer(
+        ctx, list(out_shape) or [1], out_dtype, out_buf_name, scope=tile_scope
+    )
 
     loop_vars: List[Any] = []
     for axis, _extent in enumerate(out_shape or [1]):
@@ -366,7 +369,7 @@ def _emit_tile_load_from_input_buffer(
     single_offset_buf: Any = None
     if (
         len(offset_indices) == 1
-        and isinstance(offset_indices[0], tvm_mod.tir.Buffer)
+        and isinstance(offset_indices[0], (LazyTileExpr, tvm_mod.tir.Buffer))
         and len(offset_indices[0].shape) == len(loop_vars)
         and len(loop_vars) >= 2
     ):
@@ -385,14 +388,23 @@ def _emit_tile_load_from_input_buffer(
             for _e in out_shape:
                 flat_extent *= int(_e)
             src_buf = _redecl_input_buffer(ctx, src_buf, [flat_extent], out_dtype)
-        src_indices.append(tir.BufferLoad(single_offset_buf, list(loop_vars)))
+        if isinstance(single_offset_buf, LazyTileExpr):
+            src_indices.append(single_offset_buf.read_lane(ctx, tuple(loop_vars)))
+        else:
+            src_indices.append(tir.BufferLoad(single_offset_buf, list(loop_vars)))
     else:
         for axis, lv in enumerate(loop_vars):
             if axis < len(offset_indices):
                 base = offset_indices[axis]
             else:
                 base = tir.const(0, "int32")
-            if isinstance(base, tvm_mod.tir.Buffer):
+            if isinstance(base, LazyTileExpr):
+                rank = len(base.shape)
+                if rank >= len(loop_vars):
+                    src_indices.append(base.read_lane(ctx, tuple(loop_vars[:rank])))
+                else:
+                    src_indices.append(base.read_lane(ctx, tuple(loop_vars[-rank:])))
+            elif isinstance(base, tvm_mod.tir.Buffer):
                 # Tile-buffer offset. Index it with as many of the surrounding
                 # loop_vars as the buffer's rank requires (matmul's a_ptrs
                 # tile is rank-N when broadcast across all axes; vector_add's
@@ -548,7 +560,7 @@ def _emit_tile_store_to_input_buffer(
     single_offset_buf: Any = None
     if (
         len(offset_indices) == 1
-        and isinstance(offset_indices[0], tvm_mod.tir.Buffer)
+        and isinstance(offset_indices[0], (LazyTileExpr, tvm_mod.tir.Buffer))
         and len(offset_indices[0].shape) == len(loop_vars)
         and len(loop_vars) >= 2
     ):
@@ -562,14 +574,23 @@ def _emit_tile_store_to_input_buffer(
                 flat_extent *= int(_e)
             dst_dtype = str(getattr(dst_buf, "dtype", "float32"))
             dst_buf = _redecl_input_buffer(ctx, dst_buf, [flat_extent], dst_dtype)
-        dst_indices.append(tir.BufferLoad(single_offset_buf, list(loop_vars)))
+        if isinstance(single_offset_buf, LazyTileExpr):
+            dst_indices.append(single_offset_buf.read_lane(ctx, tuple(loop_vars)))
+        else:
+            dst_indices.append(tir.BufferLoad(single_offset_buf, list(loop_vars)))
     else:
         for axis, lv in enumerate(loop_vars):
             if axis < len(offset_indices):
                 base = offset_indices[axis]
             else:
                 base = tir.const(0, "int32")
-            if isinstance(base, tvm_mod.tir.Buffer):
+            if isinstance(base, LazyTileExpr):
+                rank = len(base.shape)
+                if rank >= len(loop_vars):
+                    dst_indices.append(base.read_lane(ctx, tuple(loop_vars[:rank])))
+                else:
+                    dst_indices.append(base.read_lane(ctx, tuple(loop_vars[-rank:])))
+            elif isinstance(base, tvm_mod.tir.Buffer):
                 buf_rank = len(base.shape)
                 if buf_rank <= 0:
                     dst_indices.append(tir.BufferLoad(base, [tir.const(0, "int32")]))
@@ -803,6 +824,27 @@ def _walk_text_ttir(
     return visited
 
 
+def _op_name_generic(op: Any) -> str:
+    """Extract the dotted MLIR op name across binding shapes."""
+    name = getattr(op, "name", None)
+    if not name:
+        inner = getattr(op, "operation", None)
+        name = getattr(inner, "name", None) if inner is not None else None
+    if not name and isinstance(op, dict):
+        name = op.get("name")
+    return str(name) if name else ""
+
+
+def _op_results_generic(op: Any) -> Tuple[Any, ...]:
+    if isinstance(op, dict):
+        return tuple(op.get("results", ()))
+    results = getattr(op, "results", None)
+    if results is None:
+        inner = getattr(op, "operation", None)
+        results = getattr(inner, "results", None) if inner is not None else None
+    return tuple(results or ())
+
+
 def _walk_mlir_module(
     module: Any, ctx: Optional[WalkerCtx] = None
 ) -> List[str]:
@@ -812,17 +854,7 @@ def _walk_mlir_module(
     # We recurse into all regions and dispatch by op name.
 
     def _op_name(op: Any) -> str:
-        """Extract the dotted MLIR op name across binding shapes."""
-        # Real mlir.ir.Operation: ``op.name`` is the dotted op name; some
-        # builds expose it via ``op.operation.name``. We try both, then
-        # fall back to ``str(op.operation.opview)`` and dict-shaped fakes.
-        name = getattr(op, "name", None)
-        if not name:
-            inner = getattr(op, "operation", None)
-            name = getattr(inner, "name", None) if inner is not None else None
-        if not name and isinstance(op, dict):
-            name = op.get("name")
-        return str(name) if name else ""
+        return _op_name_generic(op)
 
     # Lazy import to avoid a top-of-file cycle with mlir_walker. We use the
     # per-emitter ``owns_regions`` attribute (H4 Wave-I) but keep the legacy
@@ -1005,9 +1037,15 @@ def from_triton_kernel(
                 ttir_module,
                 target=target,
                 name=getattr(fn, "__name__", "main"),
+                grid=grid,
                 _allow_text_ttir=True,
             )
-    return from_ttir(ttir_module, target=target, name=getattr(fn, "__name__", "main"))
+    return from_ttir(
+        ttir_module,
+        target=target,
+        name=getattr(fn, "__name__", "main"),
+        grid=grid,
+    )
 
 
 def from_ttir(
@@ -1015,6 +1053,8 @@ def from_ttir(
     *,
     target: Optional[str] = None,
     name: str = "main",
+    grid: Optional[Tuple[int, ...]] = None,
+    arg_buffer_shapes: Optional[Any] = None,
     num_warps: Optional[int] = None,
     num_stages: Optional[int] = None,
     _allow_text_ttir: bool = False,
@@ -1066,6 +1106,20 @@ def from_ttir(
         ctx.num_warps = int(num_warps)
     if num_stages is not None:
         ctx.num_stages = int(num_stages)
+    if grid is not None:
+        ctx.launch_grid = tuple(int(x) for x in grid)
+    if arg_buffer_shapes is not None:
+        if isinstance(arg_buffer_shapes, dict):
+            ctx.arg_buffer_shapes = {
+                key: tuple(int(dim) for dim in shape)
+                for key, shape in arg_buffer_shapes.items()
+            }
+        else:
+            ctx.arg_buffer_shapes = {
+                idx: tuple(int(dim) for dim in shape)
+                for idx, shape in enumerate(arg_buffer_shapes)
+                if shape is not None
+            }
     ctx.kernel_name = name  # Pass name so map_tt_func can use it
     if isinstance(ttir_module, str):
         # Preferred path: re-parse via mlir.ir and use the MLIR walker

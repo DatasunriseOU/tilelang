@@ -421,7 +421,11 @@ def test_op_table_has_expected_size() -> None:
     # Bumped 100 -> 101 by the PtrAnalysis/text-TTIR performance seam:
     # the C++ shim rewrites structured pointer paths through
     # ``arith.index_cast``.
-    EXPECTED = 101
+    #
+    # Bumped 101 -> 105 by the FLA structured-pointer/control seam:
+    # ``tts.{load,store}`` are now first-class emitters and ``cf.{br,cond_br}``
+    # are explicit region terminators rather than unmapped ops.
+    EXPECTED = 105
     assert len(OP_TABLE) == EXPECTED, (
         f"OP_TABLE size changed from {EXPECTED} to {len(OP_TABLE)}; "
         f"if intentional, update this constant + the three README "

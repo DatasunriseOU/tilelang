@@ -38,10 +38,12 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -78,6 +80,17 @@
 
 namespace {
 
+struct SerializedPtrState {
+  std::string op;
+  std::string resultSsa;
+  std::string source;
+  std::vector<std::string> offsets;
+  std::vector<std::string> sizes;
+  std::vector<std::string> strides;
+  std::vector<std::string> shape;
+  std::vector<int32_t> order;
+};
+
 struct ContextImpl {
   mlir::MLIRContext ctx;
   std::string lastError;
@@ -89,8 +102,16 @@ struct ContextImpl {
 struct ModuleImpl {
   ContextImpl* parent = nullptr;
   mlir::OwningOpRef<mlir::ModuleOp> module;
+  std::vector<SerializedPtrState> knownPtrStates;
   std::string statesJson;
 };
+
+std::string fmtOpFoldResult(mlir::OpFoldResult ofr, mlir::AsmState& asmState);
+std::string fmtValueAsOperand(mlir::Value v, mlir::AsmState& asmState);
+std::string jsonEscape(llvm::StringRef in);
+std::vector<SerializedPtrState>
+captureKnownPtrStates(mlir::ModuleOp moduleOp,
+                      const mlir::tts::PtrAnalysis& analysis);
 
 void setError(ContextImpl* ctx, std::string msg) {
   if (ctx) ctx->lastError = std::move(msg);
@@ -231,6 +252,7 @@ TLPtrAnalysisStatus tl_pa_run_rewrite(TLPtrAnalysisModule* mod,
   moduleOp.walk([&](mlir::tts::GetStructuredStateOp op) {
     (void)pa.rewriteGetStructuredStateOp(op);
   });
+  m->knownPtrStates = captureKnownPtrStates(moduleOp, pa);
   return TL_PA_OK;
 }
 
@@ -333,6 +355,56 @@ std::string fmtValueAsOperand(mlir::Value v, mlir::AsmState& asmState) {
   return out;
 }
 
+std::vector<SerializedPtrState>
+captureKnownPtrStates(mlir::ModuleOp moduleOp,
+                      const mlir::tts::PtrAnalysis& analysis) {
+  mlir::OpPrintingFlags flags;
+  flags.printGenericOpForm();
+  mlir::AsmState asmState(moduleOp, flags);
+  std::vector<SerializedPtrState> out;
+  for (const auto& it : analysis.knownPtrs) {
+    mlir::Value value = it.first;
+    const mlir::tts::PtrState& state = it.second;
+    if (!value || !state.source || state.isEmpty()) {
+      continue;
+    }
+    SerializedPtrState rec;
+    rec.resultSsa = fmtValueAsOperand(value, asmState);
+    rec.source = fmtValueAsOperand(state.source, asmState);
+    if (rec.resultSsa.empty() || rec.source.empty()) {
+      continue;
+    }
+
+    if (mlir::Operation* defOp = value.getDefiningOp()) {
+      llvm::raw_string_ostream s(rec.op);
+      defOp->print(s, asmState);
+    } else {
+      rec.op = "PtrAnalysis::knownPtrs";
+    }
+
+    auto captureList = [&](mlir::ArrayRef<mlir::OpFoldResult> vals)
+        -> std::vector<std::string> {
+      std::vector<std::string> items;
+      items.reserve(vals.size());
+      for (mlir::OpFoldResult v : vals) {
+        items.push_back(fmtOpFoldResult(v, asmState));
+      }
+      return items;
+    };
+    rec.offsets = captureList(state.offsets);
+    rec.sizes = captureList(state.sizes);
+    rec.strides = captureList(state.strides);
+    rec.shape = captureList(state.shape);
+    rec.order.assign(state.order.begin(), state.order.end());
+    out.push_back(std::move(rec));
+  }
+  std::sort(out.begin(), out.end(),
+            [](const SerializedPtrState& a, const SerializedPtrState& b) {
+              return a.resultSsa < b.resultSsa;
+            });
+  return out;
+}
+
 // RFC-8259 escape a UTF-8 string for embedding inside JSON quotes. This must
 // stay byte-identical to nlohmann::json::dump()'s default escaping so the two
 // encoder branches agree (regression-tested in test_ptr_analysis.py).
@@ -395,10 +467,13 @@ const char* tl_pa_extract_states_json(TLPtrAnalysisModule* mod) {
   // The default is a hand-rolled RFC-8259 escaper (no third-party deps);
   // -DTRITON_FRONTEND_USE_NLOHMANN_JSON=ON swaps it for nlohmann::json.
   mlir::ModuleOp moduleOp = m->module.get();
-  // Build one AsmState per module so SSA numbering matches what the module
-  // printer would use -- this keeps the source/offsets/sizes/strides strings
-  // consistent with the `op` field's printed form.
-  mlir::AsmState asmState(moduleOp);
+  // Build one generic-print AsmState per module so SSA numbering matches the
+  // generic module text consumed by Python's external MLIR parser. The custom
+  // and generic printers can assign different SSA names on large Triton IR, so
+  // PtrState strings must use the generic state.
+  mlir::OpPrintingFlags flags;
+  flags.printGenericOpForm();
+  mlir::AsmState asmState(moduleOp, flags);
 
 #  ifdef TL_PA_USE_NLOHMANN_JSON
   // ---- nlohmann::json encoder ---------------------------------------------
@@ -410,7 +485,7 @@ const char* tl_pa_extract_states_json(TLPtrAnalysisModule* mod) {
     std::string opStr;
     {
       llvm::raw_string_ostream s(opStr);
-      op->print(s);
+      op->print(s, asmState);
     }
     nlohmann::ordered_json entry;
     entry["op"] = opStr;
@@ -434,6 +509,32 @@ const char* tl_pa_extract_states_json(TLPtrAnalysisModule* mod) {
 
     arr.push_back(std::move(entry));
   });
+  auto pushSerializedPtrState = [&](const SerializedPtrState& rec) {
+    nlohmann::ordered_json entry;
+    entry["op"] = rec.op;
+    entry["result_ssa"] = rec.resultSsa;
+    entry["source"] = rec.source;
+
+    auto pushStringList = [&](const char* key,
+                              const std::vector<std::string>& vals) {
+      nlohmann::ordered_json arr2 = nlohmann::ordered_json::array();
+      for (const auto& v : vals) arr2.push_back(v);
+      entry[key] = std::move(arr2);
+    };
+    pushStringList("offsets", rec.offsets);
+    pushStringList("sizes",   rec.sizes);
+    pushStringList("strides", rec.strides);
+    pushStringList("shape",   rec.shape);
+
+    nlohmann::ordered_json orderArr = nlohmann::ordered_json::array();
+    for (int32_t o : rec.order) orderArr.push_back(o);
+    entry["order"] = std::move(orderArr);
+
+    arr.push_back(std::move(entry));
+  };
+  for (const auto& rec : m->knownPtrStates) {
+    pushSerializedPtrState(rec);
+  }
   // Also surface tt.load / tt.store memory ops so the Python ptr_analysis
   // wrapper can correlate the recovered PtrState with the actual mem-op
   // it feeds. These records have op_kind = "tt.load" / "tt.store" and a
@@ -447,7 +548,7 @@ const char* tl_pa_extract_states_json(TLPtrAnalysisModule* mod) {
     std::string opStr;
     {
       llvm::raw_string_ostream s(opStr);
-      op->print(s);
+      op->print(s, asmState);
     }
     nlohmann::ordered_json entry;
     entry["op"] = opStr;
@@ -481,7 +582,7 @@ const char* tl_pa_extract_states_json(TLPtrAnalysisModule* mod) {
     std::string opStr;
     {
       llvm::raw_string_ostream s(opStr);
-      op->print(s);
+      op->print(s, asmState);
     }
     std::string resultStr = fmtValueAsOperand(op.getResult(), asmState);
     std::string sourceStr = fmtValueAsOperand(op.getBase(), asmState);
@@ -520,6 +621,44 @@ const char* tl_pa_extract_states_json(TLPtrAnalysisModule* mod) {
 
     os << "}";
   });
+  auto emitSerializedPtrState = [&](const SerializedPtrState& rec) {
+    if (!first) os << ",";
+    first = false;
+
+    auto emitStringList = [&](const char* key,
+                              const std::vector<std::string>& vals) {
+      os << ",\"" << key << "\":[";
+      bool firstV = true;
+      for (const auto& v : vals) {
+        if (!firstV) os << ",";
+        firstV = false;
+        os << "\"" << jsonEscape(v) << "\"";
+      }
+      os << "]";
+    };
+
+    os << "{\"op\":\"" << jsonEscape(rec.op) << "\"";
+    os << ",\"result_ssa\":\"" << jsonEscape(rec.resultSsa) << "\"";
+    os << ",\"source\":\"" << jsonEscape(rec.source) << "\"";
+    emitStringList("offsets", rec.offsets);
+    emitStringList("sizes",   rec.sizes);
+    emitStringList("strides", rec.strides);
+    emitStringList("shape",   rec.shape);
+
+    os << ",\"order\":[";
+    bool firstO = true;
+    for (int32_t o : rec.order) {
+      if (!firstO) os << ",";
+      firstO = false;
+      os << o;
+    }
+    os << "]";
+
+    os << "}";
+  };
+  for (const auto& rec : m->knownPtrStates) {
+    emitSerializedPtrState(rec);
+  }
   // Parallel emission of tt.load / tt.store records in the hand-rolled
   // path. Schema matches the nlohmann encoder above: op, op_kind, ptr,
   // optional mask, boundary_check.
@@ -532,7 +671,7 @@ const char* tl_pa_extract_states_json(TLPtrAnalysisModule* mod) {
     std::string opStr;
     {
       llvm::raw_string_ostream s(opStr);
-      op->print(s);
+      op->print(s, asmState);
     }
     os << "{\"op\":\"" << jsonEscape(opStr) << "\"";
     os << ",\"op_kind\":\"" << kind << "\"";

@@ -16,6 +16,7 @@ Skip semantics
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List
 
 import pytest
@@ -154,6 +155,104 @@ def test_run_ptr_analysis_pre_pass_returns_state_keyed_by_ssa() -> None:
     assert tuple(s.strides) == ("1",), f"unexpected strides: {s.strides!r}"
 
 
+def test_pre_pass_keys_residual_addptr_results() -> None:
+    """Residual ``tt.addptr`` ops left after PtrAnalysis still need PtrState.
+
+    The FLA chunk kernels hit exactly this shape: PtrAnalysis inserts
+    ``tts.make_tptr`` and rewrites the consuming memory op, but the original
+    ``tt.addptr`` op remains in the module. The walker must be able to bind
+    that residual result without emitting a ``# DEGRADED`` breadcrumb.
+    """
+    if not shim_available():
+        pytest.skip("C++ PtrAnalysis shim not built")
+
+    rewritten, state_map = run_ptr_analysis_pre_pass(_TILE_LOAD_TTIR)
+    residual_addptrs = re.findall(
+        r"^\s*(%[\w]+)\s*=\s*(?:tt\.addptr|\"tt\.addptr\")(?=\s|\()",
+        rewritten,
+        re.M,
+    )
+    assert residual_addptrs, f"fixture no longer leaves residual tt.addptr:\n{rewritten}"
+
+    missing = [name for name in residual_addptrs if name not in state_map]
+    assert not missing, (
+        "residual tt.addptr results must be keyed in PtrState map; "
+        f"missing={missing}, keys={sorted(state_map)}"
+    )
+
+
+def test_walker_ctx_bind_aliases_printed_opresult_name() -> None:
+    """PtrState JSON references dynamic offsets by printed SSA names.
+
+    jaxlib's generic MLIR ``OpResult`` objects do not always expose
+    ``get_name()``, so ``WalkerCtx.bind`` must recover ``%name`` from the
+    printed object form for later PtrState resolution.
+    """
+
+    class _PrintedOpResult:
+        def __str__(self) -> str:
+            return 'OpResult(%164 = "arith.addi"(%1, %2) : (index, index) -> index)'
+
+    ctx = WalkerCtx()
+    value = object()
+    ctx.bind(_PrintedOpResult(), value)
+    assert ctx.value_map["%164"] is value
+
+
+def test_walker_ctx_bind_aliases_owner_printed_opresult_name() -> None:
+    """Some MLIR bindings print the SSA name only on the owner operation."""
+
+    class _Owner:
+        results: list = []
+
+        def __str__(self) -> str:
+            return '%164 = "arith.addi"(%1, %2) : (index, index) -> index'
+
+    class _OpResult:
+        def __init__(self, owner: _Owner) -> None:
+            self.owner = owner
+
+        def __str__(self) -> str:
+            return "OpResult(<opaque>)"
+
+    owner = _Owner()
+    result = _OpResult(owner)
+    owner.results = [result]
+
+    ctx = WalkerCtx()
+    value = object()
+    ctx.bind(result, value)
+    assert ctx.value_map["%164"] is value
+
+
+def test_walker_ctx_bind_aliases_owner_multi_result_name() -> None:
+    """Owner-op fallback should preserve MLIR ``%base#N`` result spelling."""
+
+    class _Owner:
+        results: list = []
+
+        def __str__(self) -> str:
+            return '%92:2 = "scf.for"() : () -> (tensor<1xf32>, tensor<1xf32>)'
+
+    class _OpResult:
+        def __init__(self, owner: _Owner, result_number: int) -> None:
+            self.owner = owner
+            self.result_number = result_number
+
+        def __str__(self) -> str:
+            return "OpResult(<opaque>)"
+
+    owner = _Owner()
+    result0 = _OpResult(owner, 0)
+    result1 = _OpResult(owner, 1)
+    owner.results = [result0, result1]
+
+    ctx = WalkerCtx()
+    value = object()
+    ctx.bind(result1, value)
+    assert ctx.value_map["%92#1"] is value
+
+
 # ---------------------------------------------------------------------------
 # Walker integration: tt.load with seeded PtrState elides ``# DEGRADED:``
 # ---------------------------------------------------------------------------
@@ -179,9 +278,8 @@ def test_tile_load_with_seeded_state_skips_degraded_marker() -> None:
     assert seeded == len(state_map)
     assert ctx.ptr_states, "ctx.ptr_states must be populated post-seed"
 
-    # Build a dict-shaped tt.load whose pointer operand carries the SSA
-    # name PtrAnalysis attached to the rewritten ``tts.make_tptr`` result.
-    # (state_map is keyed by both the result_ssa and the source SSA.)
+    # Build a dict-shaped tt.load whose pointer operand carries the SSA name
+    # PtrAnalysis attached to the rewritten pointer result.
     sample_state: PtrState = next(iter(state_map.values()))
     ptr_name = sample_state.result_ssa or "%2"
     out_name = "%load_result"

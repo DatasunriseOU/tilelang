@@ -639,8 +639,12 @@ public:
 
   Stmt Rewrite(Stmt stmt, bool detect_inplace, bool enable_reuse,
                bool reuse_require_exact_matched_dtype,
+               bool reuse_shared_memory,
+               bool reuse_large_plain_local,
                Map<Var, PrimExpr> local_var_init_map = {}) {
     detect_inplace_ = detect_inplace;
+    reuse_shared_memory_ = reuse_shared_memory;
+    reuse_large_plain_local_ = reuse_large_plain_local;
     local_var_init_map_ = std::move(local_var_init_map);
     // plan the rewrite
     LinearAccessPatternFinder finder;
@@ -1264,7 +1268,10 @@ private:
           dst_entry->allocs.emplace_back(alloc);
           alloc_map_[var] = dst_entry;
           non_reusable_alloc_vars_[var] =
-              IsUntaggedNonReusableAlloc(alloc, storage_scope);
+              (!reuse_shared_memory_ &&
+               storage_scope.rank == StorageRank::kShared) ||
+              IsUntaggedNonReusableAlloc(alloc, storage_scope,
+                                         reuse_large_plain_local_);
         }
       }
       // enter/exit new scope
@@ -1348,9 +1355,15 @@ private:
   }
 
   static bool IsUntaggedNonReusableAlloc(const AllocationRef &op,
-                                          const StorageScope &scope) {
+                                          const StorageScope &scope,
+                                          bool reuse_large_plain_local) {
     uint64_t const_nbits = ConstantAllocationNBits(op);
     bool is_known_size = (const_nbits != 0);
+    if (reuse_large_plain_local && scope.rank == StorageRank::kLocal &&
+        scope.tag.empty() && !op.dtype().is_handle() &&
+        is_known_size && const_nbits > 32) {
+      return false;
+    }
     return scope.tag.empty() &&
            (scope.rank >= StorageRank::kWarp || op.dtype().is_handle() ||
             (is_known_size && const_nbits <= 32));
@@ -1378,7 +1391,12 @@ private:
 
     // Disable reuse of untagged local/handle/small arrays; small arrays are
     // lowered to registers in LLVM.
-    bool is_non_reusable_untagged_alloc = IsUntaggedNonReusableAlloc(op, scope);
+    bool is_non_reusable_untagged_alloc =
+        IsUntaggedNonReusableAlloc(op, scope, reuse_large_plain_local_);
+
+    if (!reuse_shared_memory_ && scope.rank == StorageRank::kShared) {
+      return NewAlloc(op, attach_scope, scope, const_nbits);
+    }
 
     if (!enable_reuse || is_non_reusable_untagged_alloc ||
         !is_flat_memory_space) {
@@ -1499,6 +1517,13 @@ private:
   std::unordered_set<const BufferNode *> all_buffers_accessed_;
   // Initial values for local variable buffers.
   Map<Var, PrimExpr> local_var_init_map_;
+  // Static shared memory has its own target-aware merge pass. On Metal, keep
+  // shared buffers distinct here so that pass can pack by real liveness.
+  bool reuse_shared_memory_{true};
+  // Metal compilers materialize large plain-local arrays as stack memory.
+  // Let StorageRewrite reuse non-overlapping large local buffers there instead
+  // of relying on backend stack allocation cleanup.
+  bool reuse_large_plain_local_{false};
   // analyzer
   arith::Analyzer analyzer_;
 };
@@ -2348,6 +2373,13 @@ Pass StorageRewrite() {
     enable_reuse = false;
 
     Optional<Target> target = f->GetAttr<Target>("target");
+    bool reuse_shared_memory = true;
+    bool reuse_large_plain_local = false;
+    if (target.defined() && target.value()->kind->name == "metal") {
+      enable_reuse = true;
+      reuse_shared_memory = false;
+      reuse_large_plain_local = true;
+    }
     if (target.defined() && (target.value()->kind->name == "vulkan" ||
                              target.value()->kind->name == "webgpu")) {
       // Require exactly same-dtype matching in smem reuse for Vulkan and WebGPU
@@ -2362,7 +2394,9 @@ Pass StorageRewrite() {
     StoragePlanRewriter plan_rewriter;
     n->body = plan_rewriter.Rewrite(
         std::move(n->body), detect_inplace, enable_reuse,
-        reuse_require_exact_matched_dtype, std::move(local_var_init_map));
+        reuse_require_exact_matched_dtype, reuse_shared_memory,
+        reuse_large_plain_local,
+        std::move(local_var_init_map));
     // Parameters may not be rewritten, but internal allocations may.
     return PointerValueTypeRewrite(std::move(f), true, false, false, true,
                                    true, true, false);

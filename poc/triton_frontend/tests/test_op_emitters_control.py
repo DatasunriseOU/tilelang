@@ -5,9 +5,11 @@ import pytest
 tvm = pytest.importorskip("tvm")
 
 from poc.triton_frontend.op_emitters.control import (
+    CONTROL_EMITTERS,
     map_arith_extsi,
     map_arith_index_cast,
     map_arith_truncf,
+    map_tt_func,
 )
 from poc.triton_frontend.op_mapping import WalkerCtx
 
@@ -53,3 +55,32 @@ def test_index_cast_routes_as_integer_cast() -> None:
 
     assert str(out.dtype) == "int32"
     assert ctx.get(dst) is out
+
+
+def test_cf_branch_terminators_are_registered() -> None:
+    """FLA early-return diamonds use cf.* terminators inside regions."""
+    ctx = WalkerCtx()
+
+    assert CONTROL_EMITTERS["cf.br"](FakeMlirOp("cf.br", [], []), ctx) is None
+    assert CONTROL_EMITTERS["cf.cond_br"](
+        FakeMlirOp("cf.cond_br", [FakeSSA(name="cond", dtype="bool")], []),
+        ctx,
+    ) is None
+
+
+def test_tt_func_uses_caller_supplied_pointer_abi_shapes() -> None:
+    """Runtime-owned DLTensor ABIs can seed exact pointer buffer sizes."""
+    ctx = WalkerCtx()
+    ctx.arg_buffer_shapes = {0: (4096,), "beta": (64,)}
+    k = FakeSSA({"name": "%k", "dtype": "f16", "is_ptr": True})
+    beta = FakeSSA({"name": "%beta", "dtype": "f32", "is_ptr": True})
+    t = FakeSSA({"name": "%T", "dtype": "i32"})
+
+    # No regions: map_tt_func returns after binding block args, which is
+    # enough for this ABI-shape contract.
+    result = map_tt_func({"block_args": [k, beta, t]}, ctx)
+
+    assert result is None
+    assert [int(x) for x in ctx.buffers["k"].shape] == [4096]
+    assert [int(x) for x in ctx.buffers["beta"].shape] == [64]
+    assert {"k", "beta"}.issubset(ctx.fixed_arg_buffer_keys)

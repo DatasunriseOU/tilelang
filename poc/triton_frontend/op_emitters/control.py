@@ -27,6 +27,9 @@ Ops implemented
   ``arith.index_cast`` -> ``tir.Cast``.
 * ``tt.advance`` -> structured TPtr offset update (BufferRegion
   rebind), analogous to ``tt.addptr``.
+* ``cf.br`` / ``cf.cond_br`` -> CFG terminators accepted by the region
+  walker when Triton emits an early-return diamond before the structured
+  loop body.
 * ``scf.for`` -> ``tir.For`` (serial) with materialised iter_args.
 * ``scf.if`` -> ``tir.IfThenElse``.
 * ``scf.yield`` -> no-op handler that signals the parent op via the
@@ -72,6 +75,8 @@ __all__ = [
     "map_arith_index_cast",
     "map_arith_constant",
     "map_tt_advance",
+    "map_cf_br",
+    "map_cf_cond_br",
     "map_tt_func",
     "emit_tt_call",
     "map_scf_for",
@@ -328,6 +333,9 @@ def map_arith_select(op: Any, ctx: _om.WalkerCtx) -> Any:
         isinstance(cond, buffer_cls)
         or isinstance(t_val, buffer_cls)
         or isinstance(f_val, buffer_cls)
+        or isinstance(cond, _om.LazyTileExpr)
+        or isinstance(t_val, _om.LazyTileExpr)
+        or isinstance(f_val, _om.LazyTileExpr)
     )
     if has_buffer_operand:
         out_shape = _result_shape(op)
@@ -340,29 +348,29 @@ def map_arith_select(op: Any, ctx: _om.WalkerCtx) -> Any:
                 "expected a tile result shape (post-broadcast)."
             )
         out_dtype = _result_dtype(op)
-        out_buf_name = ctx.fresh("select_result")
-        out_buf = _om._alloc_tile_buffer(
-            ctx, list(out_shape), out_dtype, out_buf_name
-        )
-
-        # One ``tir.Var`` per axis -- innermost-last, matching ``BufferStore``
-        # / ``BufferLoad`` indexing convention used elsewhere in the emitter.
-        loop_vars: List[Any] = [
-            tir.Var(ctx.fresh(f"i{axis}"), "int32") for axis in range(len(out_shape))
-        ]
-
-        def _lane(value: Any, role: str) -> Any:
+        def _lane(read_ctx: _om.WalkerCtx, value: Any, indices: Tuple[Any, ...], role: str) -> Any:
             """Pull a scalar lane out of ``value`` for the current loop_vars."""
+            read_tir = read_ctx.tir()
+            if isinstance(value, _om.LazyTileExpr):
+                rank = len(value.shape)
+                if len(indices) >= rank:
+                    idx = list(indices[-rank:])
+                else:
+                    idx = [read_tir.const(0, "int32")] * (rank - len(indices)) + list(indices)
+                for axis, extent in enumerate(value.shape):
+                    if int(extent) == 1:
+                        idx[axis] = read_tir.const(0, "int32")
+                return value.read_lane(read_ctx, tuple(idx))
             if isinstance(value, buffer_cls):
                 rank = len(value.shape)
                 if rank == 0:
-                    return tir.BufferLoad(value, [tir.const(0, "int32")])
-                lv = list(loop_vars)
+                    return read_tir.BufferLoad(value, [read_tir.const(0, "int32")])
+                lv = list(indices)
                 if len(lv) >= rank:
-                    indices = lv[-rank:]
+                    load_indices = lv[-rank:]
                 else:
-                    indices = [tir.const(0, "int32")] * (rank - len(lv)) + lv
-                return tir.BufferLoad(value, indices)
+                    load_indices = [read_tir.const(0, "int32")] * (rank - len(lv)) + lv
+                return read_tir.BufferLoad(value, load_indices)
             # Scalar PrimExpr (or python int/float/bool) passes through;
             # ``tir.if_then_else`` will type-check it for us.
             if hasattr(value, "dtype") or isinstance(value, (int, float, bool)):
@@ -372,21 +380,16 @@ def map_arith_select(op: Any, ctx: _om.WalkerCtx) -> Any:
                 f"{type(value).__name__}; expected tir.PrimExpr or tir.Buffer"
             )
 
-        cond_lane = _lane(cond, "cond")
-        t_lane = _lane(t_val, "true")
-        f_lane = _lane(f_val, "false")
-        body_expr = tir.if_then_else(cond_lane, t_lane, f_lane)
-        body = tir.BufferStore(out_buf, body_expr, list(loop_vars))
-        for axis in range(len(loop_vars) - 1, -1, -1):
-            extent = out_shape[axis]
-            body = tir.For(
-                loop_vars[axis],
-                tir.const(0, "int32"),
-                tir.const(int(extent), "int32"),
-                tir.ForKind.SERIAL,
-                body,
-            )
-        ctx.emit(body)
+        out_buf = _om.LazyTileExpr(
+            out_shape,
+            out_dtype,
+            lambda read_ctx, indices: read_ctx.tir().if_then_else(
+                _lane(read_ctx, cond, tuple(indices), "cond"),
+                _lane(read_ctx, t_val, tuple(indices), "true"),
+                _lane(read_ctx, f_val, tuple(indices), "false"),
+            ),
+            name=ctx.fresh("select_expr"),
+        )
         if _om._results(op):
             ctx.bind(_om._results(op)[0], out_buf)
         return out_buf
@@ -703,6 +706,28 @@ def _ptr_element_dtype(type_str: str) -> str:
     return "float32"
 
 
+def _arg_buffer_shape(ctx: _om.WalkerCtx, idx: int, clean: str, ssa: str) -> Optional[List[int]]:
+    """Return caller-seeded flat ABI shape for a pointer block arg."""
+    shapes = getattr(ctx, "arg_buffer_shapes", None) or {}
+    keys = (
+        idx,
+        str(idx),
+        clean,
+        ssa,
+        str(ssa).lstrip("%"),
+        f"%{str(clean).lstrip('%')}",
+    )
+    for key in keys:
+        try:
+            shape = shapes.get(key)
+        except AttributeError:
+            shape = None
+        if shape is None:
+            continue
+        return [max(int(dim), 1) for dim in list(shape)]
+    return None
+
+
 def _func_block_args(op: Any) -> List[Any]:
     """Return the entry-block arguments of a ``tt.func`` op.
 
@@ -762,14 +787,22 @@ def map_tt_func(op: Any, ctx: _om.WalkerCtx) -> Any:
 
             if _is_ptr_type(type_str):
                 elt = _normalize_dtype(_ptr_element_dtype(type_str))
+                shape = _arg_buffer_shape(ctx, idx, clean, ssa) or [1]
                 if tir_mod is not None:
                     if clean not in ctx.buffers:
                         ctx.buffers[clean] = tir_mod.decl_buffer(
-                            shape=[1], dtype=elt, name=clean,
+                            shape=shape, dtype=elt, name=clean,
                         )
+                        if _arg_buffer_shape(ctx, idx, clean, ssa) is not None:
+                            getattr(ctx, "fixed_arg_buffer_keys", set()).add(clean)
                     bound = ctx.buffers[clean]
                 else:
-                    bound = {"_placeholder": True, "name": clean, "dtype": elt}
+                    bound = {
+                        "_placeholder": True,
+                        "name": clean,
+                        "dtype": elt,
+                        "shape": shape,
+                    }
                     ctx.buffers[clean] = bound
             elif _om._is_tensor_type(type_str):
                 try:
@@ -1095,6 +1128,36 @@ def map_arith_constant(op: Any, ctx: _om.WalkerCtx) -> Any:
         # Strip a leading '%' so the buffer name reads cleanly in dumps.
         ssa_clean = nm_for_buf.lstrip("%").replace(".", "_")
         buf_name = f"const_{ssa_clean}"
+
+        if not all(isinstance(s, int) for s in shape):  # pragma: no cover
+            raise EmitError(
+                f"arith.constant: dense attr with non-static shape {shape!r}"
+            )
+
+        if is_splat:
+            def _splat_expr(read_ctx: _om.WalkerCtx) -> Any:
+                read_tir = read_ctx.tir()
+                if dtype == "bool" or dtype.startswith("int") or dtype.startswith("uint"):
+                    return read_tir.IntImm(dtype, int(payload))
+                return read_tir.FloatImm(dtype, float(payload))
+
+            lazy = _om.LazyTileExpr(
+                shape if shape else (1,),
+                dtype,
+                lambda read_ctx, _indices: _splat_expr(read_ctx),
+                name=buf_name,
+                constant_value=payload,
+            )
+            if result is not None:
+                try:
+                    ctx.bind(result, lazy)
+                except Exception:
+                    pass
+                nm = _ssa_name(result)
+                if nm:
+                    ctx.value_map[nm] = lazy
+            return lazy
+
         # Tile-scoped allocation: see ``op_mapping._alloc_tile_buffer``.
         # The dense constant lives entirely inside the kernel body; making
         # it a PrimFunc parameter would trip ``VerifyMemory``.
@@ -1117,11 +1180,6 @@ def map_arith_constant(op: Any, ctx: _om.WalkerCtx) -> Any:
         # Build a serial tir.For nest writing the constant(s) into ``buf``.
         # All shapes from MLIR DenseElementsAttr are static (RankedTensorType
         # constants), so we can safely fold to integer extents.
-        if not all(isinstance(s, int) for s in shape):  # pragma: no cover
-            raise EmitError(
-                f"arith.constant: dense attr with non-static shape {shape!r}"
-            )
-
         if shape:
             # Allocate one induction var per axis.
             ivars = [tir.Var(ctx.fresh(f"i{a}"), "int32") for a in range(len(shape))]
@@ -1211,7 +1269,7 @@ def map_arith_constant(op: Any, ctx: _om.WalkerCtx) -> Any:
 # ---------------------------------------------------------------------------
 
 
-_MAX_ITER_ARGS = 4
+_MAX_ITER_ARGS = 16
 
 
 def _emit_region(
@@ -1251,11 +1309,15 @@ def _emit_region(
     child.transposed_views = dict(ctx.transposed_views)
     child.ptr_states = getattr(ctx, "ptr_states", {})
     child.ssa_users = getattr(ctx, "ssa_users", {})
+    child.arg_buffer_shapes = getattr(ctx, "arg_buffer_shapes", {})
+    child.fixed_arg_buffer_keys = getattr(ctx, "fixed_arg_buffer_keys", set())
     child.constant_tile_values = getattr(ctx, "constant_tile_values", {})
     child.loop_carry_buffers = dict(getattr(ctx, "loop_carry_buffers", {}))
     child._tmp_counter = ctx._tmp_counter
     child._tvm = ctx._tvm
     child._T = ctx._T
+    if hasattr(ctx, "launch_grid"):
+        child.launch_grid = ctx.launch_grid
 
     # Share mutable lists so inner ops surface to parent
     if not hasattr(ctx, "program_id_vars"):
@@ -1451,12 +1513,10 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
     * The block has a single argument list ``[ind_var, *iter_args]``; we
       bind each to a fresh ``tir.Var`` of the correct dtype and walk the
       region with those bindings.
-    * After the loop body is emitted, the ``scf.yield`` operands are used
-      to update the iter_arg SSA mappings for the next iteration. We
-      currently do this via ``tir.LetStmt`` wrappers per iter_arg; a
-      future revision may switch to ``tir.AllocateConst`` once the
-      pipeline pass tolerates it.
-    * iter_args > 4: raise :class:`EmitError`. The user should restructure
+    * Scalar iter_args are held in 1-element local buffers and updated from
+      ``scf.yield`` at the end of each body, so the next iteration observes
+      the carried value. Buffer/tuple carries continue to mutate in place.
+    * iter_args > 16: raise :class:`EmitError`. The user should restructure
       via TileLang's loop-carry pattern (allocate a fragment, mutate
       in-place inside the loop) instead.
     """
@@ -1530,17 +1590,23 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
     # buffer; mutation threads forward by in-place store, which is exactly
     # how matmul / reduce-into-tile loops are written in TTIR.
     iter_arg_pairs: List[Tuple[Any, Any]] = []
-    init_pairs: List[Tuple[Any, Any]] = []
-    for blk_ssa, init_ssa in zip(iter_arg_block_ssas, iter_arg_ssas):
+    scalar_carry_buffers: List[Tuple[int, Any]] = []
+    for idx, (blk_ssa, init_ssa) in enumerate(zip(iter_arg_block_ssas, iter_arg_ssas)):
         try:
             init_val = ctx.get(init_ssa)
         except KeyError:
             init_val = init_ssa
         if _is_scalar_primexpr(init_val):
-            dt = _om._dtype_of(blk_ssa) or _om._dtype_of(init_ssa) or "float32"
-            var = tir.Var(ctx.fresh("carry"), dt)
-            iter_arg_pairs.append((blk_ssa, var))
-            init_pairs.append((var, init_val))
+            dt = _om._normalize_mlir_dtype(
+                _om._dtype_of(blk_ssa) or _om._dtype_of(init_ssa) or "float32"
+            )
+            carry_buf = _om._alloc_tile_buffer(
+                ctx, [1], dt, ctx.fresh("carry"), scope="local"
+            )
+            zero = tir.const(0, "int32")
+            ctx.emit(tir.BufferStore(carry_buf, init_val, [zero]))
+            iter_arg_pairs.append((blk_ssa, tir.BufferLoad(carry_buf, [zero])))
+            scalar_carry_buffers.append((idx, carry_buf))
         else:
             # Buffer / tuple / ffi.Array carry: skip LetStmt; bind the
             # block-arg SSA directly to the descriptor so body emitters
@@ -1557,26 +1623,21 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
         )
         body = _append_loop_carry_copies(ctx, body, iter_arg_pairs, yielded)
 
-        # Wrap the body so each *scalar* iter_arg is visible via LetStmt. The
-        # yielded values become the next-iteration values; full SSA-style
-        # rotation requires a more involved transform pass, so for now we mark
-        # the loop kind as "serial" and record yielded values in ctx for the
-        # parent walker to consume (via ctx.value_map). This matches scf.for's
-        # forwarding semantics for the common pattern where iter_args carry an
-        # accumulator buffer that the body has *already* mutated in place.
-        for var, init_val in init_pairs:
-            if not _is_scalar_primexpr(init_val):
-                # Defence in depth: ctx.get(init_ssa) may have returned a
-                # non-scalar even after our triage above (e.g. an emitter
-                # rebound the SSA between collection time and now). Surface a
-                # clear EmitError instead of a cryptic tirx.Bind type error.
+        scalar_updates: List[Any] = []
+        for iter_idx, carry_buf in scalar_carry_buffers:
+            if iter_idx >= len(yielded):
+                continue
+            yielded_value = yielded[iter_idx]
+            if not _is_scalar_primexpr(yielded_value):
                 raise EmitError(
-                    f"map_scf_for: iter_arg init value for {var!r} is not a "
-                    f"scalar PrimExpr (got type={type(init_val).__name__}); "
-                    f"buffer-typed carries should be routed through the "
-                    f"non-LetStmt branch above."
+                    "map_scf_for: scalar iter_arg yielded a non-scalar "
+                    f"value of type {type(yielded_value).__name__}"
                 )
-            body = tir.LetStmt(var, init_val, body)
+            scalar_updates.append(
+                tir.BufferStore(carry_buf, yielded_value, [tir.const(0, "int32")])
+            )
+        if scalar_updates:
+            body = tir.SeqStmt([body] + scalar_updates)
         return body, yielded
 
     # Compute extent = ub - lb. step == 1 is the common case; for non-unit
@@ -1629,15 +1690,20 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
 
     ctx.emit(for_stmt)
 
-    # Bind the ``scf.for`` results: they are the final iter_arg values
-    # (which, in our serial-mutate model, are the same tir.Vars we already
-    # created — the body mutated their referenced buffers in place).
-    if yielded and _om._results(op):
-        for result_ssa, y in zip(_om._results(op), yielded):
-            ctx.bind(result_ssa, y)
-    elif _om._results(op) and iter_arg_pairs:
-        for result_ssa, (_, var) in zip(_om._results(op), iter_arg_pairs):
-            ctx.bind(result_ssa, var)
+    # Bind the ``scf.for`` results to the final carried values. Scalar
+    # carries live in local buffers; buffer/tuple carries mutate in place.
+    if _om._results(op):
+        scalar_by_idx = {idx: buf for idx, buf in scalar_carry_buffers}
+        for idx, result_ssa in enumerate(_om._results(op)):
+            if idx in scalar_by_idx:
+                ctx.bind(
+                    result_ssa,
+                    tir.BufferLoad(scalar_by_idx[idx], [tir.const(0, "int32")]),
+                )
+            elif yielded and idx < len(yielded):
+                ctx.bind(result_ssa, yielded[idx])
+            elif idx < len(iter_arg_pairs):
+                ctx.bind(result_ssa, iter_arg_pairs[idx][1])
     return for_stmt
 
 
@@ -1702,6 +1768,23 @@ def map_scf_yield(op: Any, ctx: _om.WalkerCtx) -> Any:
     to this emitter is normally unreachable. We still register it to keep
     the OP_TABLE coverage check in ``_walk_text_ttir`` happy when a
     yield-only line slips into the textual TTIR.
+    """
+    return None
+
+
+def map_cf_br(op: Any, ctx: _om.WalkerCtx) -> Any:
+    """Accept a bare CFG branch terminator in a linearised region walk."""
+    return None
+
+
+def map_cf_cond_br(op: Any, ctx: _om.WalkerCtx) -> Any:
+    """Accept Triton's early-return CFG branch terminator.
+
+    The unstructured ``cf.cond_br`` ops seen in FLA chunk kernels guard an
+    immediate ``tt.return`` block before the real body. The public runtime
+    adapter launches only valid program ids, so that early-return edge is not
+    taken for supported shapes; the walker only needs to ignore the CFG
+    terminator and continue into the body block.
     """
     return None
 
@@ -1895,9 +1978,13 @@ def map_scf_while(op: Any, ctx: _om.WalkerCtx) -> Any:
         child.value_map = dict(ctx.value_map)
         child.buffers = ctx.buffers
         child.transposed_views = dict(ctx.transposed_views)
+        child.arg_buffer_shapes = getattr(ctx, "arg_buffer_shapes", {})
+        child.fixed_arg_buffer_keys = getattr(ctx, "fixed_arg_buffer_keys", set())
         child._tmp_counter = ctx._tmp_counter
         child._tvm = ctx._tvm
         child._T = ctx._T
+        if hasattr(ctx, "launch_grid"):
+            child.launch_grid = ctx.launch_grid
         for ssa, var in iter_pairs:
             child.bind(ssa, var)
 
@@ -2467,6 +2554,10 @@ CONTROL_EMITTERS: Dict[str, Callable[..., Any]] = {
     "tt.func": map_tt_func,
     "tt.return": lambda op, ctx: None,
     "ub.poison": lambda op, ctx: ctx.tir().const(0, "int32"),
+    # CFG branch terminators appear after TritonStructured rewrites some
+    # early returns into basic-block diamonds.
+    "cf.br": map_cf_br,
+    "cf.cond_br": map_cf_cond_br,
     # tt.call -- inline-expand a helper tt.func at the call site.
     "tt.call": emit_tt_call,
     # scf

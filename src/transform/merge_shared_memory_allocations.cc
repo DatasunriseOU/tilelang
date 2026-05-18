@@ -1854,8 +1854,15 @@ Pass MergeSharedMemoryAllocations(bool enable_aggressive_merge = false,
                                   int align_bytes = 16) {
   auto pass_func = [enable_aggressive_merge, align_bytes](
                        PrimFunc f, const IRModule &m, PassContext ctx) {
+    bool default_merge_static_smem = false;
+    Optional<Target> target = f->GetAttr<Target>("target");
+    if (target.defined() && target.value()->kind->name == "metal") {
+      default_merge_static_smem = true;
+    }
     bool merge_static_smem =
-        ctx->GetConfig<Bool>("tir.merge_static_smem", Bool(false)).value();
+        ctx->GetConfig<Bool>("tirx.merge_static_smem",
+                             Bool(default_merge_static_smem))
+            .value();
     bool debug_merge_shared_memory_allocations =
         ctx->GetConfig<Bool>(kDebugMergeSharedMemoryAllocations, Bool(false))
             .value();

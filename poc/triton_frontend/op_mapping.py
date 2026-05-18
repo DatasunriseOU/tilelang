@@ -105,6 +105,117 @@ EmitFn = Callable[..., Any]
 """Type alias: ``(op: mlir.ir.Operation, ctx: WalkerCtx) -> tvm.tir.Stmt|Expr``."""
 
 
+class LazyTileExpr:
+    """Lane-indexable tile expression that avoids materializing temp buffers."""
+
+    def __init__(
+        self,
+        shape: Sequence[int],
+        dtype: str,
+        reader: Callable[[Any, Tuple[Any, ...]], Any],
+        *,
+        name: str = "",
+        constant_value: Any = None,
+    ) -> None:
+        self.shape = tuple(int(s) for s in shape) or (1,)
+        self.dtype = str(dtype)
+        self._reader = reader
+        self.name = name
+        self.constant_value = constant_value
+
+    def read_lane(self, ctx: Any, indices: Sequence[Any]) -> Any:
+        return self._reader(ctx, tuple(indices))
+
+
+_SSA_ASSIGN_RE = re.compile(r"(%[A-Za-z0-9_]+(?:#\d+)?)\s*=")
+_SSA_HEAD_RE = re.compile(r"(%[A-Za-z0-9_]+(?:#\d+)?)\b")
+_SSA_RESULT_GROUP_RE = re.compile(r"(%[A-Za-z0-9_]+)(?::(\d+))?\s*=")
+
+
+def _result_number(ssa_value: Any) -> Optional[int]:
+    """Best-effort result index for an MLIR OpResult-like object."""
+    for attr in ("result_number", "result_index", "index"):
+        value = getattr(ssa_value, attr, None)
+        if callable(value):
+            try:
+                value = value()
+            except Exception:
+                continue
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except Exception:
+            pass
+    owner = getattr(ssa_value, "owner", None)
+    results = getattr(owner, "results", None)
+    if results is not None:
+        try:
+            for idx, result in enumerate(results):
+                if result is ssa_value or result == ssa_value:
+                    return idx
+        except Exception:
+            pass
+    return None
+
+
+def _ssa_name_from_text(text: str, *, result_number: Optional[int] = None) -> Optional[str]:
+    """Extract a printed MLIR SSA name from a value or owner op string."""
+    text = text.strip()
+    if not text:
+        return None
+    match = _SSA_ASSIGN_RE.search(text)
+    if match is not None:
+        return match.group(1)
+    match = _SSA_RESULT_GROUP_RE.search(text)
+    if match is not None:
+        base = match.group(1)
+        count = match.group(2)
+        if count is not None and result_number is not None:
+            return f"{base}#{result_number}"
+        return base
+    if text.startswith("%"):
+        match = _SSA_HEAD_RE.match(text)
+        if match is not None:
+            return match.group(1)
+    return None
+
+
+def _printed_ssa_name(ssa_value: Any) -> Optional[str]:
+    """Best-effort printed SSA name for MLIR values used as PtrState refs."""
+    for attr in ("get_name", "name"):
+        getter = getattr(ssa_value, attr, None)
+        if callable(getter):
+            try:
+                name = getter()
+            except Exception:
+                continue
+            if name:
+                return str(name)
+        elif isinstance(getter, str) and getter:
+            return getter
+
+    try:
+        name = _ssa_name_from_text(str(ssa_value))
+        if name:
+            return name
+    except Exception:
+        pass
+
+    owner = getattr(ssa_value, "owner", None)
+    if owner is not None:
+        try:
+            name = _ssa_name_from_text(
+                str(owner),
+                result_number=_result_number(ssa_value),
+            )
+            if name:
+                return name
+        except Exception:
+            pass
+    return None
+
+
 class WalkerCtx:
     """State threaded through the TTIR walker.
 
@@ -207,6 +318,14 @@ class WalkerCtx:
         # ``tt.dot`` can keep a direct store result in local.fragment but must
         # use shared scope when a later arith op indexes the dot result).
         self.ssa_users: Dict[str, set] = {}
+        # Optional caller-provided ABI shapes for pointer block args.
+        # TTIR pointer types do not carry host tensor extents, but runtimes
+        # such as MLX validate the DLTensor size against PrimFunc buffer_map.
+        # Callers that know the public launch ABI can seed shapes by block
+        # argument index or SSA name; emitters then must not shrink them to a
+        # per-tile fallback.
+        self.arg_buffer_shapes: Dict[Any, Sequence[int]] = {}
+        self.fixed_arg_buffer_keys: set = set()
 
     # ---- helpers --------------------------------------------------------
 
@@ -292,8 +411,7 @@ class WalkerCtx:
         # (e.g. "%29"). Keep a string alias so memory emitters can resolve
         # offsets/strides back to the TIR value produced by earlier ops.
         try:
-            getter = getattr(ssa_value, "get_name", None)
-            name = getter() if callable(getter) else getattr(ssa_value, "name", None)
+            name = _printed_ssa_name(ssa_value)
             if name:
                 self.value_map[str(name)] = tir_value
         except Exception:
@@ -1676,7 +1794,11 @@ def map_tt_program_id(op: Any, ctx: WalkerCtx) -> Any:
         # symbolic ``tir.Var`` named ``gridDim_<axis>`` that the host
         # launcher fills in. Using a Var (rather than a numeric IntImm)
         # keeps the IR independent of a hard-coded block count.
-        extent = tir.Var(f"gridDim_{axis}", "int32")
+        launch_grid = getattr(ctx, "launch_grid", None)
+        if launch_grid is not None and axis < len(launch_grid):
+            extent = tir.const(int(launch_grid[axis]), "int32")
+        else:
+            extent = tir.Var(f"gridDim_{axis}", "int32")
         ctx.program_id_vars.append((var, axis, extent))
 
     if _results(op):

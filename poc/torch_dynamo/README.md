@@ -59,19 +59,19 @@ with TileLang's existing JIT cache (`tilelang/jit/__init__.py::cached`).
 
 ## Files
 
-| File | Role | Status |
-|---|---|---|
-| `__init__.py` | Registers `tilelang` with `torch._dynamo.register_backend`; validates FX graphs fail-fast | **done (forward)** |
-| `fx_to_tilelang.py` | FX walker + `ATEN_DISPATCH` table; emits a fused TileLang `PrimFunc` (matmul+relu pattern), eager FX replay otherwise | **partial (12 ops real / 10 documented stubs)** |
-| `custom_op_wrapper.py` | `torch.library.custom_op` registration with FakeTensor meta + autograd guard | **done (forward)** |
-| `aot_autograd_glue.py` | `aot_autograd` fw/bw compilers | **stub — integration #10** |
-| `examples/torch_compile_smoke.py` | End-to-end forward smoke; pytest auto-skips if torch / tilelang missing | **runnable, passing on host** |
+| File                              | Role                                                                                                                  | Status                                          |
+| --------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| `__init__.py`                     | Registers `tilelang` with `torch._dynamo.register_backend`; validates FX graphs fail-fast                             | **done (forward)**                              |
+| `fx_to_tilelang.py`               | FX walker + `ATEN_DISPATCH` table; emits a fused TileLang `PrimFunc` (matmul+relu pattern), eager FX replay otherwise | **partial (12 ops real / 10 documented stubs)** |
+| `custom_op_wrapper.py`            | `torch.library.custom_op` registration with FakeTensor meta + autograd guard                                          | **done (forward)**                              |
+| `aot_autograd_glue.py`            | `aot_autograd` fw/bw compilers                                                                                        | **stub — integration #10**                      |
+| `examples/torch_compile_smoke.py` | End-to-end forward smoke; pytest auto-skips if torch / tilelang missing                                               | **runnable, passing on host**                   |
 
 ## Op coverage (forward only)
 
-| Status | Ops |
-|---|---|
-| Real lowering | `add`, `sub`, `mul`, `div`, `relu`, `gelu`, `silu`, `matmul`, `mm`, `bmm`, `softmax` / `_softmax`, `layer_norm` / `native_layer_norm` |
+| Status                               | Ops                                                                                                                                                      |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Real lowering                        | `add`, `sub`, `mul`, `div`, `relu`, `gelu`, `silu`, `matmul`, `mm`, `bmm`, `softmax` / `_softmax`, `layer_norm` / `native_layer_norm`                    |
 | Documented stub (raises with recipe) | `addmm`, `tanh`, `rms_norm`, `log_softmax`, `sum`, `mean`, `where`, `masked_fill`, `_scaled_dot_product_flash_attention`, `scaled_dot_product_attention` |
 
 The "documented stub" emitters carry a 5-10 line recipe in their docstring

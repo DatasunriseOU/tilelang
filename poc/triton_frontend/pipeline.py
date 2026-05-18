@@ -351,11 +351,6 @@ def _ptr_states_to_map(states: List[Any]) -> dict:
     for s in states:
         if s.result_ssa is not None:
             state_map[s.result_ssa] = s
-        # Also key by source SSA so load/store emitters can find the
-        # underlying base pointer state. Don't overwrite an existing
-        # result-keyed entry.
-        if s.source is not None and s.source not in state_map:
-            state_map[s.source] = s
     return state_map
 
 
@@ -373,13 +368,13 @@ def run_ptr_analysis_pre_pass(
     extracting states, surface the exception as a :class:`PipelineError`
     with diagnostics. We never silently degrade in that case.
     """
-    from .ptr_analysis import shim_available, run_ptr_analysis_with_states
+    from .ptr_analysis import shim_available, run_ptr_analysis_with_states_generic
 
     if not shim_available():
         return ttir_text, {}
 
     try:
-        rewritten, states = run_ptr_analysis_with_states(ttir_text)
+        rewritten, states = run_ptr_analysis_with_states_generic(ttir_text)
     except BaseException as exc:  # noqa: BLE001
         raise PipelineError(
             f"PtrAnalysis pre-pass failed: {type(exc).__name__}: {exc}. "
@@ -412,9 +407,9 @@ for path in reversed(payload.get("sys_path") or []):
     if path and path not in sys.path:
         sys.path.insert(0, path)
 
-from poc.triton_frontend.ptr_analysis import run_ptr_analysis_with_states
+from poc.triton_frontend.ptr_analysis import run_ptr_analysis_with_states_generic
 
-rewritten, states = run_ptr_analysis_with_states(payload["ttir"])
+rewritten, states = run_ptr_analysis_with_states_generic(payload["ttir"])
 sys.stdout.write(json.dumps({
     "rewritten": rewritten,
     "states": [state.__dict__ for state in states],
@@ -471,7 +466,7 @@ sys.stdout.write(json.dumps({
 def seed_ptr_states(ctx: Any, state_map: dict) -> int:
     """Seed ``ctx.ptr_states`` (and ``ctx.value_map``) with PtrState entries.
 
-    Populates two surfaces so emitters can find state via either path:
+    Populates two result-SSA keyed surfaces so emitters can find state:
 
     1. ``ctx.ptr_states[ssa_name] = PtrState`` -- the new authoritative
        lookup table; emitters in ``op_emitters/memory.py`` consult it as

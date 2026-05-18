@@ -62,7 +62,11 @@ from typing import Any, Callable, Dict, Tuple
 # property-only attrs as an empty ``op.attributes`` dict, so we have to
 # fall back to parsing the printed op text. The same helper is used by
 # ``op_emitters/memory.py`` for ``tt.make_range`` (Wave C2 fix).
-from ..op_mapping import _alloc_tile_buffer, _attrs_with_properties_shared, EmitError
+from ..op_mapping import (
+    LazyTileExpr,
+    _attrs_with_properties_shared,
+    EmitError,
+)
 
 # We import op_mapping lazily inside emitters when we need to reach into
 # WalkerCtx machinery; the type alias below is just for static readers.
@@ -183,6 +187,8 @@ def _is_tile_operand(ctx: EmitContext, value: Any) -> bool:
     """True iff ``value`` is a tile (Buffer, Broadcast, or Ramp)."""
     tvm_mod = ctx.tvm()
     tir = tvm_mod.tir
+    if isinstance(value, LazyTileExpr):
+        return True
     if isinstance(value, tvm_mod.tir.Buffer):
         return True
     for cls_name in ("Broadcast", "Ramp"):
@@ -228,6 +234,8 @@ def _tile_lanes(ctx: EmitContext, value: Any) -> int:
 def _tile_shape(ctx: EmitContext, value: Any) -> Tuple[int, ...]:
     """Return the multi-dim shape for a tile operand (rank>=1)."""
     tvm_mod = ctx.tvm()
+    if isinstance(value, LazyTileExpr):
+        return value.shape
     if isinstance(value, tvm_mod.tir.Buffer):
         try:
             return tuple(int(s) for s in value.shape)
@@ -239,6 +247,8 @@ def _tile_shape(ctx: EmitContext, value: Any) -> Tuple[int, ...]:
 def _tile_dtype(ctx: EmitContext, value: Any) -> str:
     """Return the per-lane dtype for a tile/scalar operand."""
     tvm_mod = ctx.tvm()
+    if isinstance(value, LazyTileExpr):
+        return value.dtype
     if isinstance(value, tvm_mod.tir.Buffer):
         return str(value.dtype)
     dt = getattr(value, "dtype", None)
@@ -260,6 +270,8 @@ def _read_lane(ctx: EmitContext, value: Any, indices: Tuple[Any, ...]) -> Any:
     """
     tvm_mod = ctx.tvm()
     tir = tvm_mod.tir
+    if isinstance(value, LazyTileExpr):
+        return value.read_lane(ctx, indices)
     if isinstance(value, tvm_mod.tir.Buffer):
         # Truncate / pad indices to the buffer rank.
         rank = len(value.shape)
@@ -365,27 +377,16 @@ def _emit_tile_binop(
         raise EmitError(
             f"{op_label}: _emit_tile_binop called without tile operand"
         )
-    # Tile-scoped result buffer; see ``op_mapping._alloc_tile_buffer``.
-    # Must NOT go through ``ctx.buffers`` (PrimFunc params): that would
-    # trip ``tirx::analysis::VerifyMemory`` because the per-lane
-    # BufferStore happens at host scope (the surrounding T.Kernel is
-    # introduced by a later pipeline stage).
-    out_buf = _alloc_tile_buffer(ctx, list(out_shape), out_dtype, ctx.fresh("tile"))
-
-    loop_vars = [tir.Var(ctx.fresh(f"j{axis}"), "int32") for axis in range(len(out_shape))]
-    lhs = _read_lane(ctx, a, tuple(loop_vars))
-    rhs = _read_lane(ctx, b, tuple(loop_vars))
-    body: Any = tir.BufferStore(out_buf, scalar_combine(lhs, rhs), list(loop_vars))
-    for axis in range(len(loop_vars) - 1, -1, -1):
-        body = tir.For(
-            loop_vars[axis],
-            tir.const(0, "int32"),
-            tir.const(int(out_shape[axis]), "int32"),
-            tir.ForKind.SERIAL,
-            body,
-        )
-    ctx.emit(body)
-    return _bind_result(op, ctx, out_buf)
+    lazy = LazyTileExpr(
+        out_shape,
+        out_dtype,
+        lambda read_ctx, indices: scalar_combine(
+            _read_lane(read_ctx, a, tuple(indices)),
+            _read_lane(read_ctx, b, tuple(indices)),
+        ),
+        name=ctx.fresh("tile_expr"),
+    )
+    return _bind_result(op, ctx, lazy)
 
 
 def _emit_tile_unary(
@@ -410,21 +411,13 @@ def _emit_tile_unary(
         raise EmitError(
             f"{op_label}: _emit_tile_unary called without tile operand"
         )
-    out_buf = _alloc_tile_buffer(ctx, list(out_shape), out_dtype, ctx.fresh("tile"))
-
-    loop_vars = [tir.Var(ctx.fresh(f"j{axis}"), "int32") for axis in range(len(out_shape))]
-    lane = _read_lane(ctx, x, tuple(loop_vars))
-    body: Any = tir.BufferStore(out_buf, scalar_apply(lane), list(loop_vars))
-    for axis in range(len(loop_vars) - 1, -1, -1):
-        body = tir.For(
-            loop_vars[axis],
-            tir.const(0, "int32"),
-            tir.const(int(out_shape[axis]), "int32"),
-            tir.ForKind.SERIAL,
-            body,
-        )
-    ctx.emit(body)
-    return _bind_result(op, ctx, out_buf)
+    lazy = LazyTileExpr(
+        out_shape,
+        out_dtype,
+        lambda read_ctx, indices: scalar_apply(_read_lane(read_ctx, x, tuple(indices))),
+        name=ctx.fresh("tile_expr"),
+    )
+    return _bind_result(op, ctx, lazy)
 
 
 def _maybe_tile_binop(

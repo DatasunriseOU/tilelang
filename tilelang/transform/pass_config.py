@@ -334,7 +334,7 @@ class PassConfigKey(str, Enum):
     TIR_ENABLE_DEBUG = "tir.enable_debug"
     """Enable debug information in generated code. Default: False"""
 
-    TIR_MERGE_STATIC_SMEM = "tir.merge_static_smem"
+    TIR_MERGE_STATIC_SMEM = "tirx.merge_static_smem"
     """Merge static shared memory allocations. Default: True"""
 
     TIR_ADD_LOWER_PASS = "tir.add_lower_pass"

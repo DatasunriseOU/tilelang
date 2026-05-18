@@ -194,6 +194,26 @@ PYBIND11_MODULE(_triton_frontend_cxx, m) {
         py::arg("enable_make_gather_scatter_tensor_ptr") = false,
         py::arg("use_unsafe_mask") = false);
 
+  // Same as ``run_ptr_analysis_with_states`` but returns the rewritten module
+  // in generic op form. This is the safe external-parser seam: the walker
+  // consumes this exact text, and the PtrState JSON is extracted from the
+  // same rewritten Module lifetime instead of a second custom->generic
+  // re-print that can assign different SSA names.
+  m.def("run_ptr_analysis_with_states_generic",
+        [](const std::string& mlir_text,
+           bool enable_gs,
+           bool unsafe_mask) -> py::tuple {
+          Context ctx;
+          Module mod(ctx, mlir_text);
+          mod.run_rewrite(enable_gs, unsafe_mask);
+          std::string rewritten = moduleToGeneric(mod);
+          std::string states(tl_pa_extract_states_json(mod.get()));
+          return py::make_tuple(std::move(rewritten), std::move(states));
+        },
+        py::arg("mlir_text"),
+        py::arg("enable_make_gather_scatter_tensor_ptr") = false,
+        py::arg("use_unsafe_mask") = false);
+
   // Dialect registration via C++ shim
   m.def("register_dialects",
         [](py::object ctx_obj) {

@@ -34,9 +34,11 @@ from poc.triton_frontend.op_emitters.memory import (  # noqa: E402
     emit_tt_make_range,
     emit_tt_splat,
     emit_tt_store,
+    emit_tts_load,
+    emit_tts_make_tptr,
     has_cxx_shim,
 )
-from poc.triton_frontend.op_mapping import WalkerCtx  # noqa: E402
+from poc.triton_frontend.op_mapping import LazyTileExpr, WalkerCtx  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -323,13 +325,10 @@ def test_multi_element_load_without_shim_emits_degraded_marker(
     assert "for" in text.lower(), f"expected per-element For loop; got:\n{text}"
 
 
-def test_addptr_without_shim_emits_degraded_marker(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pointer-arithmetic test for the no-shim degraded path.
-
-    Without the shim, ``tt.addptr`` cannot fold into a strided layout, so
-    we must emit a visible ``# DEGRADED:`` breadcrumb so reviewers know
-    the result is a scalar offset add only.
-    """
+def test_addptr_without_shim_keeps_scalar_tuple_without_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scalar ``tt.addptr`` is ordinary pointer arithmetic, not a fallback."""
     _force_no_shim(monkeypatch)
     ctx = WalkerCtx()
     ptr_ssa = _ssa("ptr", shape=[], dtype="float32")
@@ -346,9 +345,129 @@ def test_addptr_without_shim_emits_degraded_marker(monkeypatch: pytest.MonkeyPat
     }
     emit_tt_addptr(op, ctx)
     text = _stringify(ctx.stmts)
-    assert "DEGRADED" in text, (
-        f"expected '# DEGRADED:' breadcrumb for shim-less tt.addptr; got:\n{text}"
+    assert "DEGRADED" not in text, (
+        f"scalar tt.addptr should not emit a degraded breadcrumb; got:\n{text}"
     )
+
+
+def test_addptr_tuple_tile_composition_skips_degraded_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A composed tile pointer is not the scalar-only degraded addptr path."""
+    _force_no_shim(monkeypatch)
+    ctx = WalkerCtx()
+    ptr_ssa = _ssa("ptr", shape=[16], dtype="float32")
+    off_ssa = _ssa("off", shape=[16], dtype="int32")
+    out_ssa = _ssa("ptr2", shape=[16], dtype="float32")
+    buf = tvm.tir.decl_buffer([1024], "float32", name="P")
+    offset_tile = tvm.tir.decl_buffer([16], "int32", name="off_tile")
+    ctx.bind(ptr_ssa, (buf, [tvm.tir.const(0, "int32")]))
+    ctx.bind(off_ssa, offset_tile)
+
+    result = emit_tt_addptr(
+        {
+            "name": "tt.addptr",
+            "operands": [ptr_ssa, off_ssa],
+            "results": [out_ssa],
+            "attrs": {},
+        },
+        ctx,
+    )
+
+    assert isinstance(result, tuple)
+    assert "DEGRADED" not in _stringify(ctx.stmts)
+
+
+def test_addptr_uses_seeded_ptrstate_when_in_process_shim_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Subprocess PtrAnalysis states should work after libtriton is loaded.
+
+    In the real FLA path Triton has already loaded its native extension in the
+    current interpreter, so ``has_cxx_shim()`` intentionally returns False to
+    avoid duplicate LLVM static init. The PtrAnalysis pre-pass still ran in a
+    subprocess and seeded ``ctx.ptr_states``; the emitter must therefore avoid
+    the degraded addptr fallback without requiring unsafe serialized SSA
+    lookups when the base pointer is already resolved.
+    """
+    from poc.triton_frontend.ptr_analysis import PtrState  # noqa: WPS433
+
+    _force_no_shim(monkeypatch)
+    ctx = WalkerCtx()
+    ptr_ssa = _ssa("%arg0", shape=[16], dtype="float32")
+    off_ssa = _ssa("%off", shape=[16], dtype="int32")
+    out_ssa = _ssa("%ptr2", shape=[16], dtype="float32")
+    base_buf = tvm.tir.decl_buffer([1024], "float32", name="X")
+    ctx.bind(ptr_ssa, (base_buf, [tvm.tir.const(0, "int32")]))
+    ctx.bind(off_ssa, tvm.tir.const(0, "int32"))
+    ctx.ptr_states = {
+        "%ptr2": PtrState(
+            offsets=("0",),
+            sizes=("16",),
+            strides=("1",),
+            source="%arg0",
+            result_ssa="%ptr2",
+        )
+    }
+
+    result = emit_tt_addptr(
+        {
+            "name": "tt.addptr",
+            "operands": [ptr_ssa, off_ssa],
+            "results": [out_ssa],
+            "attrs": {},
+        },
+        ctx,
+    )
+
+    assert isinstance(result, tuple)
+    assert "DEGRADED" not in _stringify(ctx.stmts)
+
+
+def test_addptr_matches_seeded_ptrstate_after_ssa_renumbering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generic-form parse can renumber SSA names after PtrAnalysis.
+
+    When the exact result key changes, a resolved tuple base is safer than a
+    serialized PtrState keyed by stale printed SSA names. The emitter should
+    keep composing the tuple and leave the real no-degraded tile load path to
+    consume seeded PtrState metadata later.
+    """
+    from poc.triton_frontend.ptr_analysis import PtrState  # noqa: WPS433
+
+    _force_no_shim(monkeypatch)
+    ctx = WalkerCtx()
+    ptr_ssa = _ssa("%renumbered_base", shape=[16, 64], dtype="float32")
+    off_ssa = _ssa("%renumbered_off", shape=[16, 64], dtype="int32")
+    out_ssa = _ssa("%new_name", shape=[16, 64], dtype="float32")
+    base_buf = tvm.tir.decl_buffer([4096], "float32", name="arg2")
+    ctx.bind("%arg2", (base_buf, [tvm.tir.const(0, "int32")]))
+    ctx.bind(ptr_ssa, (base_buf, [tvm.tir.const(0, "int32")]))
+    ctx.bind(off_ssa, tvm.tir.const(0, "int32"))
+    ctx.ptr_states = {
+        "%old_name": PtrState(
+            offsets=("0", "0"),
+            sizes=("16", "64"),
+            strides=("64", "1"),
+            source="%arg2",
+            result_ssa="%old_name",
+        )
+    }
+
+    result = emit_tt_addptr(
+        {
+            "name": "tt.addptr",
+            "operands": [ptr_ssa, off_ssa],
+            "results": [out_ssa],
+            "attrs": {},
+        },
+        ctx,
+    )
+
+    assert isinstance(result, tuple)
+    assert result[0] is base_buf
+    assert "DEGRADED" not in _stringify(ctx.stmts)
 
 
 def test_addptr_uses_only_exact_ptr_state_result(
@@ -397,6 +516,154 @@ def test_addptr_uses_only_exact_ptr_state_result(
     assert isinstance(result, tuple), result
     assert result[0] is base_buf
     assert "later_tile" not in str(result)
+
+
+def test_tts_load_uses_ptrstate_without_degraded_marker() -> None:
+    """PtrAnalysis ``tts.load`` must consume PtrState, not degrade."""
+    from poc.triton_frontend.ptr_analysis import PtrState  # noqa: WPS433
+
+    class _MlirValueLike:
+        shape = (64,)
+        dtype = "float32"
+
+        def __str__(self) -> str:
+            return "Value(%tptr = \"tts.make_tptr\"(...) : tensor<64x!tt.ptr<f32>>)"
+
+    ctx = WalkerCtx()
+    ptr_ssa = _MlirValueLike()
+    mask_dim = _ssa("%mask_dim", shape=[], dtype="int32")
+    out_ssa = _ssa("%out", shape=[64], dtype="float32")
+    ctx.bind(mask_dim, tvm.tir.Var("valid_lanes", "int64"))
+    ctx.ptr_states = {
+        "%tptr": PtrState(
+            offsets=("0",),
+            sizes=("64",),
+            strides=("1",),
+            source="%arg0",
+            result_ssa="%tptr",
+        )
+    }
+
+    out = emit_tts_load(
+        {
+            "name": "tts.load",
+            "operands": [ptr_ssa, mask_dim],
+            "results": [out_ssa],
+            "attrs": {},
+        },
+        ctx,
+    )
+
+    assert isinstance(out, tvm.tir.Buffer)
+    text = _stringify(ctx.stmts)
+    assert "DEGRADED" not in text
+    assert "valid_lanes" in text
+    assert ctx.get(out_ssa) is out
+
+
+def test_tts_make_tptr_rekeys_state_after_mlir_renumbering() -> None:
+    """Parsed ``tts.make_tptr`` should seed PtrState under its parsed SSA."""
+
+    class _MlirValueLike:
+        shape = (16,)
+        dtype = "float32"
+
+        def __str__(self) -> str:
+            return "OpResult(%renum = \"tts.make_tptr\"(...) : tensor<16x!tt.ptr<f32>>)"
+
+    sentinel = -9223372036854775808
+    ctx = WalkerCtx()
+    base = _ssa("%arg0", dtype="float32")
+    stride = _ssa("%stride", dtype="index")
+    offset = _ssa("%offset", dtype="index")
+    ptr = _MlirValueLike()
+    out = _ssa("%loaded", shape=[16], dtype="float32")
+    valid = _ssa("%valid", dtype="index")
+    ctx.bind(stride, tvm.tir.const(1, "int32"))
+    ctx.bind(offset, tvm.tir.const(0, "int32"))
+    ctx.bind(valid, tvm.tir.const(16, "int32"))
+
+    emit_tts_make_tptr(
+        {
+            "name": "tts.make_tptr",
+            "operands": [base, stride, offset],
+            "results": [ptr],
+            "attrs": {
+                "operandSegmentSizes": [1, 1, 1, 0],
+                "static_offsets": [sentinel],
+                "static_strides": [sentinel],
+            },
+        },
+        ctx,
+    )
+    loaded = emit_tts_load(
+        {
+            "name": "tts.load",
+            "operands": [ptr, valid],
+            "results": [out],
+            "attrs": {},
+        },
+        ctx,
+    )
+
+    assert "%renum" in ctx.ptr_states
+    assert isinstance(loaded, tvm.tir.Buffer)
+    assert "DEGRADED" not in _stringify(ctx.stmts)
+
+
+def test_addptr_resolves_tts_make_tptr_dynamic_offset_ssa() -> None:
+    """Structured pointer offsets must be TIR values before composition."""
+
+    class _MlirValueLike:
+        shape = (16,)
+        dtype = "float32"
+
+        def __str__(self) -> str:
+            return "OpResult(%tptr = \"tts.make_tptr\"(...) : tensor<16x!tt.ptr<f32>>)"
+
+    sentinel = -9223372036854775808
+    ctx = WalkerCtx()
+    base = _ssa("%arg0", dtype="float32")
+    stride = _ssa("%stride", dtype="index")
+    offset = _ssa("%range", shape=[16], dtype="int64")
+    ptr = _MlirValueLike()
+    add_off = _ssa("%add_off", shape=[16], dtype="int64")
+    out_ptr = _ssa("%out_ptr", shape=[16], dtype="float32")
+    range_tile = tvm.tir.decl_buffer([16], "int64", name="range_tile")
+    add_tile = tvm.tir.decl_buffer([16], "int64", name="add_tile")
+    colliding_alias = tvm.tir.decl_buffer([16], "bool", name="wrong_mask")
+    ctx.bind(stride, tvm.tir.const(1, "int32"))
+    ctx.bind(offset, range_tile)
+    ctx.bind(add_off, add_tile)
+    ctx.value_map["%range"] = colliding_alias
+
+    emit_tts_make_tptr(
+        {
+            "name": "tts.make_tptr",
+            "operands": [base, stride, offset],
+            "results": [ptr],
+            "attrs": {
+                "operandSegmentSizes": [1, 1, 1, 0],
+                "static_offsets": [sentinel],
+                "static_strides": [sentinel],
+            },
+        },
+        ctx,
+    )
+    result = emit_tt_addptr(
+        {
+            "name": "tt.addptr",
+            "operands": [ptr, add_off],
+            "results": [out_ptr],
+            "attrs": {},
+        },
+        ctx,
+    )
+
+    assert isinstance(result, dict) and "_ptrstate" in result
+    assert isinstance(result["offsets"][-1], tvm.tir.Buffer)
+    assert str(result["offsets"][-1].dtype) == "int64"
+    assert "DEGRADED" not in _stringify(ctx.stmts)
 
 
 # ---------------------------------------------------------------------------
@@ -1505,10 +1772,12 @@ def test_addptr_compose_handles_buffer_plus_vector_primexpr_offset(
     assert isinstance(result, tuple) and len(result) == 2
     out_buf, out_indices = result
     assert out_buf is base_buf
-    assert isinstance(out_indices[0], tvm.tir.Buffer)
-    # Resulting accumulator buffer must inherit the 2-D shape (one slot
+    assert isinstance(out_indices[0], LazyTileExpr)
+    # Resulting accumulator expression must inherit the 2-D shape (one slot
     # per lane), not collapse to scalar or to the vector lane count.
     assert tuple(int(d) for d in out_indices[0].shape) == (64, 64)
+    lane = out_indices[0].read_lane(ctx, (tvm.tir.const(0, "int32"), tvm.tir.const(1, "int32")))
+    assert getattr(lane.dtype, "lanes", 1) == 1
 
 
 def test_addptr_compose_coerces_ptrstate_string_zero_before_vector_add(

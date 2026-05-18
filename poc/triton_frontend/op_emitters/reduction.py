@@ -62,7 +62,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from ..op_mapping import EmitError, _alloc_tile_buffer, _normalize_mlir_dtype
+from ..op_mapping import EmitError, LazyTileExpr, _alloc_tile_buffer, _normalize_mlir_dtype
 
 # WalkerCtx alias only -- imported lazily so this module stays cheap to load.
 EmitContext = Any  # poc.triton_frontend.op_mapping.WalkerCtx
@@ -776,6 +776,14 @@ def map_tt_reduce(op: Any, ctx: EmitContext) -> Any:
 
     # ``src`` may be a Buffer (the common case after ``tt.load`` -> T.copy)
     # or a PrimExpr (lane-wise load); we BufferLoad in the buffer case.
+    if isinstance(src, LazyTileExpr):
+        src = _materialize_lazy_tile(
+            ctx,
+            src,
+            src_shape,
+            _dtype_of(src_ssa),
+            name="reduce_src",
+        )
     if hasattr(src, "shape") and hasattr(src, "dtype"):
         src_elem = tir.BufferLoad(src, list(src_indices))
     else:
@@ -890,6 +898,14 @@ def map_tt_scan(op: Any, ctx: EmitContext) -> Any:
     init = tir.BufferStore(accum, identity, [tir.const(0, "int32")])
 
     i_var = tir.Var(ctx.fresh("i"), "int32")
+    if isinstance(src, LazyTileExpr):
+        src = _materialize_lazy_tile(
+            ctx,
+            src,
+            src_shape,
+            _dtype_of(src_ssa),
+            name="scan_src",
+        )
     if hasattr(src, "shape") and hasattr(src, "dtype"):
         src_elem = tir.BufferLoad(src, [i_var])
     else:
@@ -929,6 +945,58 @@ _FP_LOW_PRECISION_DTYPES = {
     "fp8", "fp8_e4m3", "fp8_e5m2",
     "e4m3", "e5m2",
 }
+
+
+def _materialize_lazy_tile(
+    ctx: EmitContext,
+    expr: LazyTileExpr,
+    shape: List[int],
+    dtype: str,
+    *,
+    name: str,
+    scope: str = "local",
+) -> Any:
+    """Materialize a lazy tile once when reducer/tileop code needs a Buffer."""
+
+    tir = ctx.tir()
+    dst_shape = list(shape or expr.shape or [1])
+    dst = _alloc_tile_buffer(
+        ctx,
+        dst_shape,
+        _normalize_mlir_dtype(dtype),
+        ctx.fresh(name),
+        scope=scope,
+    )
+    loop_vars = [
+        tir.Var(ctx.fresh(f"{name}_i{axis}"), "int32")
+        for axis, _extent in enumerate(dst_shape or [1])
+    ]
+
+    rank = len(expr.shape)
+    if len(loop_vars) >= rank:
+        src_indices = list(loop_vars[-rank:])
+    else:
+        src_indices = [tir.const(0, "int32")] * (rank - len(loop_vars)) + list(loop_vars)
+    for axis, extent in enumerate(expr.shape):
+        if int(extent) == 1:
+            src_indices[axis] = tir.const(0, "int32")
+
+    store = tir.BufferStore(
+        dst,
+        expr.read_lane(ctx, tuple(src_indices)),
+        list(loop_vars) or [tir.const(0, "int32")],
+    )
+    body: Any = store
+    for var, extent in zip(reversed(loop_vars), reversed(dst_shape or [1])):
+        body = tir.For(
+            var,
+            tir.const(0, "int32"),
+            tir.const(int(extent), "int32"),
+            tir.ForKind.SERIAL,
+            body,
+        )
+    ctx.emit(body)
+    return dst
 
 
 def _import_tilelang_gemm() -> Optional[Callable[..., Any]]:
@@ -1059,6 +1127,41 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
             return _scope_of(buf) in ("shared", "shared.dyn")
 
         def _emit_copy_stmt(src: Any, dst: Any, label: str) -> None:
+            if isinstance(src, LazyTileExpr):
+                dst_shape = list(getattr(dst, "shape", []) or src.shape or [1])
+                label_key = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in label)
+                loop_vars: List[Any] = [
+                    tir_mod.Var(ctx.fresh(f"{label_key}_i{axis}"), "int32")
+                    for axis, _extent in enumerate(dst_shape or [1])
+                ]
+
+                def _src_indices() -> Tuple[Any, ...]:
+                    rank = len(src.shape)
+                    if len(loop_vars) >= rank:
+                        idx = list(loop_vars[-rank:])
+                    else:
+                        idx = [tir_mod.const(0, "int32")] * (rank - len(loop_vars)) + list(loop_vars)
+                    for axis, extent in enumerate(src.shape):
+                        if int(extent) == 1:
+                            idx[axis] = tir_mod.const(0, "int32")
+                    return tuple(idx)
+
+                store = tir_mod.BufferStore(
+                    dst,
+                    src.read_lane(ctx, _src_indices()),
+                    list(loop_vars) or [tir_mod.const(0, "int32")],
+                )
+                body: Any = store
+                for var, extent in zip(reversed(loop_vars), reversed(dst_shape or [1])):
+                    body = tir_mod.For(
+                        var,
+                        tir_mod.const(0, "int32"),
+                        tir_mod.const(int(extent), "int32"),
+                        tir_mod.ForKind.SERIAL,
+                        body,
+                    )
+                ctx.emit(body)
+                return
             try:
                 copy_handle = T.copy(src, dst)  # type: ignore[union-attr]
                 if isinstance(copy_handle, tir_mod.PrimExpr):
@@ -1118,6 +1221,11 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
             return bool(set(users) - {"tt.store", "tt.return"})
 
         def _is_zero_constant_tile(buf: Any) -> bool:
+            if isinstance(buf, LazyTileExpr):
+                try:
+                    return float(buf.constant_value) == 0.0
+                except Exception:
+                    return False
             const_tiles = getattr(ctx, "constant_tile_values", {}) or {}
             keys = (
                 str(getattr(buf, "data", "")),
@@ -1132,6 +1240,68 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
                 except Exception:
                     return False
             return False
+
+        def _emit_tiny_dot_loop(a_buf: Any, b_buf: Any, c_buf: Any) -> None:
+            """Emit a scalar loop for tiny dots that are cheaper than tileop lowering."""
+
+            zero = tir_mod.const(0, acc_dtype)
+            m_var = tir_mod.Var(ctx.fresh("td_m"), "int32")
+            n_var = tir_mod.Var(ctx.fresh("td_n"), "int32")
+            k_var = tir_mod.Var(ctx.fresh("td_k"), "int32")
+
+            if clear_accum:
+                init = tir_mod.BufferStore(c_buf, zero, [m_var, n_var])
+                init_body: Any = tir_mod.For(
+                    n_var,
+                    tir_mod.const(0, "int32"),
+                    tir_mod.const(int(N), "int32"),
+                    tir_mod.ForKind.SERIAL,
+                    init,
+                )
+                init_body = tir_mod.For(
+                    m_var,
+                    tir_mod.const(0, "int32"),
+                    tir_mod.const(int(M), "int32"),
+                    tir_mod.ForKind.SERIAL,
+                    init_body,
+                )
+                ctx.emit(init_body)
+
+            a_idx = [k_var, m_var] if transpose_A else [m_var, k_var]
+            b_idx = [n_var, k_var] if transpose_B else [k_var, n_var]
+            a_load = tir_mod.BufferLoad(a_buf, a_idx)
+            b_load = tir_mod.BufferLoad(b_buf, b_idx)
+            c_load = tir_mod.BufferLoad(c_buf, [m_var, n_var])
+            mac = tir_mod.Add(
+                c_load,
+                tir_mod.Mul(
+                    tir_mod.Cast(acc_dtype, a_load),
+                    tir_mod.Cast(acc_dtype, b_load),
+                ),
+            )
+            inner = tir_mod.BufferStore(c_buf, mac, [m_var, n_var])
+            body: Any = tir_mod.For(
+                k_var,
+                tir_mod.const(0, "int32"),
+                tir_mod.const(int(Ka), "int32"),
+                tir_mod.ForKind.SERIAL,
+                inner,
+            )
+            body = tir_mod.For(
+                n_var,
+                tir_mod.const(0, "int32"),
+                tir_mod.const(int(N), "int32"),
+                tir_mod.ForKind.SERIAL,
+                body,
+            )
+            body = tir_mod.For(
+                m_var,
+                tir_mod.const(0, "int32"),
+                tir_mod.const(int(M), "int32"),
+                tir_mod.ForKind.SERIAL,
+                body,
+            )
+            ctx.emit(body)
 
         tir_mod = ctx.tir()
         clear_accum = False
@@ -1196,6 +1366,12 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
 
         a = _stage_operand_to_shared(a, [M, Ka], a_dtype, "a")
         b = _stage_operand_to_shared(b, [Kb, N], b_dtype, "b")
+
+        if M <= 16 and N <= 16:
+            _emit_tiny_dot_loop(a, b, c)
+            if result_value is not None:
+                ctx.bind(result_value, c)
+            return c
 
         handle = gemm(
             a,
@@ -1564,6 +1740,14 @@ def map_tt_histogram(op: Any, ctx: EmitContext) -> Any:
         extents.append(int(ext))
 
     # Read src
+    if isinstance(src, LazyTileExpr):
+        src = _materialize_lazy_tile(
+            ctx,
+            src,
+            list(src_shape),
+            _dtype_of(src_ssa),
+            name="hist_src",
+        )
     if hasattr(src, "shape") and hasattr(src, "dtype"):
         src_val = tir.BufferLoad(src, list(vars))
     else:
@@ -1576,6 +1760,14 @@ def map_tt_histogram(op: Any, ctx: EmitContext) -> Any:
     in_bounds = tir.And(tir.GE(bin_idx, tir.const(0, "int32")), tir.LT(bin_idx, tir.const(num_bins, "int32")))
 
     if mask is not None:
+        if isinstance(mask, LazyTileExpr):
+            mask = _materialize_lazy_tile(
+                ctx,
+                mask,
+                list(src_shape),
+                "bool",
+                name="hist_mask",
+            )
         if hasattr(mask, "shape") and hasattr(mask, "dtype"):
             mask_val = tir.BufferLoad(mask, list(vars))
         else:

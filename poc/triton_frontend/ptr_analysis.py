@@ -47,6 +47,7 @@ __all__ = [
     "run_ptr_analysis",
     "extract_ptr_states",
     "run_ptr_analysis_with_states",
+    "run_ptr_analysis_with_states_generic",
     "SHIM_MODULE_NAME",
 ]
 
@@ -610,6 +611,28 @@ def run_ptr_analysis_with_states(
     """
     shim = _load_shim()
     rewritten, raw_states = shim.run_ptr_analysis_with_states(ttir_text)
+    if not isinstance(raw_states, str):
+        import json as _json
+        raw_states = _json.dumps(raw_states)
+    return rewritten, _parse_states_json(raw_states)
+
+
+@lru_cache(maxsize=128)
+def run_ptr_analysis_with_states_generic(
+    ttir_text: str,
+) -> Tuple[str, List[PtrState]]:
+    """Combined rewrite + extract, returning generic-form TTIR.
+
+    This keeps the rewritten text consumed by ``mlir.ir`` and the serialized
+    PtrState names in the same C++ rewrite/module lifetime. Callers that
+    re-print custom TTIR through a second generic conversion can otherwise
+    observe stale or colliding SSA references in dynamic offsets/strides.
+    """
+    shim = _load_shim()
+    if hasattr(shim, "run_ptr_analysis_with_states_generic"):
+        rewritten, raw_states = shim.run_ptr_analysis_with_states_generic(ttir_text)
+    else:  # pragma: no cover - stale extension fallback
+        rewritten, raw_states = shim.run_ptr_analysis_with_states(ttir_text)
     if not isinstance(raw_states, str):
         import json as _json
         raw_states = _json.dumps(raw_states)
