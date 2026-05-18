@@ -1512,7 +1512,7 @@ void CodeGenTileLangMetal::VisitStmt_(const AllocateNode *op) {
         << "Only float16, float32, and bfloat16 are supported, but got "
         << op->dtype;
     ICHECK(constant_size % 64 == 0) << "Only 8x8 matrix is supported, but got "
-                                    << constant_size << " bytes\n";
+                                    << constant_size << " elements\n";
 
     std::ostringstream dtype_os;
     PrintType(op->dtype, dtype_os);
