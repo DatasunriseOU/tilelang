@@ -213,10 +213,15 @@ def shim_available() -> bool:
     # If the shim itself is already loaded we are safe regardless of triton.
     if SHIM_MODULE_NAME in sys.modules:
         return True
-    # libtriton present + shim built against Triton's pinned LLVM = co-load is
-    # safe (shared ManagedStatics, cl::opt registration runs once). Otherwise
-    # fall back to the conservative refuse-to-load path.
-    if _triton_already_loaded() and not _shim_built_against_triton_llvm():
+    # Even when the shim is built against Triton's pinned LLVM (shared
+    # ManagedStatics, so cl::opt registration is no-op), several vendored
+    # microsoft/triton-shared analyses (MaskAnalysis.cpp:553 parseCmp, etc.)
+    # still contain ``assert()`` paths that SIGABRT the whole interpreter
+    # on shapes they don't yet handle. The subprocess-isolated rewrite
+    # path in path_d_runtime_adapter catches those as exit -6; the
+    # in-process path cannot recover. Until those asserts are converted
+    # into recoverable errors, keep the conservative refuse-to-load guard.
+    if _triton_already_loaded():
         _shim_conflict_warn_once()
         return False
     if importlib.util.find_spec(SHIM_MODULE_NAME) is not None:
@@ -259,20 +264,18 @@ def _load_shim() -> Any:
     # that go straight through the load helper don't trip over a stale
     # negative cache from an early ``find_spec`` miss.
     _ensure_shim_on_syspath()
-    if (
-        SHIM_MODULE_NAME not in sys.modules
-        and _triton_already_loaded()
-        and not _shim_built_against_triton_llvm()
-    ):
+    if SHIM_MODULE_NAME not in sys.modules and _triton_already_loaded():
         _shim_conflict_warn_once()
         raise NotImplementedError(
             "PtrAnalysis C++ shim cannot be loaded in this process: "
-            "Triton's libtriton (with its own LLVM) is already loaded and "
-            "the shim is built against a different LLVM (registering "
-            "cl::opts twice would abort the interpreter). Rebuild the shim "
-            "against Triton's pinned LLVM:\n"
-            "  python -m poc.triton_frontend.build_cxx --build\n"
-            "(build_cxx auto-detects ~/.triton/llvm/llvm-*-<plat> when present)."
+            "Triton's libtriton is already loaded. Even when the shim is "
+            "built against Triton's pinned LLVM (shared ManagedStatics, "
+            "no cl::opt double-registration), the vendored microsoft/"
+            "triton-shared analyses still contain unrecoverable assert() "
+            "paths that SIGABRT the interpreter on unsupported shapes "
+            "(e.g. MaskAnalysis.cpp:553 parseCmp). Run shim-dependent "
+            "work in a subprocess (path_d_runtime_adapter does this) or "
+            "in a fresh interpreter."
         )
     try:
         return importlib.import_module(SHIM_MODULE_NAME)
