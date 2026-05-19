@@ -70,6 +70,25 @@ def allow_tir_cse(pass_ctx: PassContext | None = None) -> bool:
     return not bool(pass_ctx.config.get(tilelang.PassConfigKey.TIR_DISABLE_CSE, False))
 
 
+def _apply_metal_hoist_expression(mod: IRModule, pass_ctx: PassContext | None = None) -> IRModule:
+    """Run HoistExpression in Metal cleanup without duplicating large flattened bodies."""
+
+    hoist_config = {}
+    if pass_ctx is not None:
+        raw_config = pass_ctx.config.get("s_tir.HoistExpression")
+        if isinstance(raw_config, dict):
+            hoist_config.update(raw_config)
+        elif raw_config is not None:
+            return tir.transform.HoistExpression()(mod)
+
+    hoist_config.setdefault("max_hoisted_conditionals_per_scope", 0)
+    with tvm.transform.PassContext(
+        opt_level=3,
+        config={"s_tir.HoistExpression": hoist_config},
+    ):
+        return tir.transform.HoistExpression()(mod)
+
+
 def apply_metal_scalar_pipeline(
     mod: IRModule, target: Target, pass_ctx: PassContext | None = None
 ) -> IRModule:
@@ -78,7 +97,7 @@ def apply_metal_scalar_pipeline(
     mod = tilelang.transform.BindMetalScalarIntrinsics()(mod)
     mod = tir.transform.CommonSubexprElim()(mod)
     mod = tilelang.transform.BindMetalScalarIntrinsics()(mod)
-    mod = tir.transform.HoistExpression()(mod)
+    mod = _apply_metal_hoist_expression(mod, pass_ctx)
     mod = tilelang.transform.BindMetalScalarIntrinsics()(mod)
     mod = tir.transform.CommonSubexprElim()(mod)
     mod = tilelang.transform.BindMetalScalarIntrinsics()(mod)

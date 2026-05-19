@@ -1450,7 +1450,19 @@ def _copy_buffer_stmt(ctx: _om.WalkerCtx, src: Any, dst: Any) -> Any:
         for axis in range(len(shape))
     ]
     idx = list(loop_vars) or [tir.const(0, "int32")]
-    body: Any = tir.BufferStore(dst, tir.BufferLoad(src, idx), idx)
+    if isinstance(src, _om.LazyTileExpr):
+        src_rank = len(src.shape)
+        if src_rank:
+            src_indices = list(idx[-src_rank:])
+            for axis, extent in enumerate(src.shape):
+                if int(extent) == 1:
+                    src_indices[axis] = tir.const(0, "int32")
+        else:
+            src_indices = []
+        value = src.read_lane(ctx, tuple(src_indices))
+    else:
+        value = tir.BufferLoad(src, idx)
+    body: Any = tir.BufferStore(dst, value, idx)
     for axis in range(len(loop_vars) - 1, -1, -1):
         body = tir.For(
             loop_vars[axis],
@@ -1475,9 +1487,11 @@ def _append_loop_carry_copies(
     Buffer = tvm_mod.tir.Buffer
     copies: List[Any] = []
     for (_blk_ssa, carry), yielded_value in zip(iter_arg_pairs, yielded):
-        if not isinstance(carry, Buffer) or not isinstance(yielded_value, Buffer):
+        if not isinstance(carry, Buffer):
             continue
-        if _same_tir_buffer(carry, yielded_value):
+        if not isinstance(yielded_value, (Buffer, _om.LazyTileExpr)):
+            continue
+        if isinstance(yielded_value, Buffer) and _same_tir_buffer(carry, yielded_value):
             continue
         copies.append(_copy_buffer_stmt(ctx, yielded_value, carry))
     if not copies:
@@ -1694,16 +1708,31 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
     # carries live in local buffers; buffer/tuple carries mutate in place.
     if _om._results(op):
         scalar_by_idx = {idx: buf for idx, buf in scalar_carry_buffers}
+        Buffer = ctx.tvm().tir.Buffer
         for idx, result_ssa in enumerate(_om._results(op)):
             if idx in scalar_by_idx:
                 ctx.bind(
                     result_ssa,
                     tir.BufferLoad(scalar_by_idx[idx], [tir.const(0, "int32")]),
                 )
+            elif idx < len(iter_arg_pairs):
+                carry = iter_arg_pairs[idx][1]
+                is_pointer_like_carry = (
+                    isinstance(carry, tuple)
+                    or (isinstance(carry, dict) and "_ptrstate" in carry)
+                )
+                is_tile_like_carry = (
+                    isinstance(carry, (Buffer, _om.LazyTileExpr))
+                    or (hasattr(carry, "shape") and hasattr(carry, "dtype"))
+                )
+                if is_tile_like_carry and not is_pointer_like_carry:
+                    ctx.bind(result_ssa, carry)
+                elif yielded and idx < len(yielded):
+                    ctx.bind(result_ssa, yielded[idx])
+                else:
+                    ctx.bind(result_ssa, carry)
             elif yielded and idx < len(yielded):
                 ctx.bind(result_ssa, yielded[idx])
-            elif idx < len(iter_arg_pairs):
-                ctx.bind(result_ssa, iter_arg_pairs[idx][1])
     return for_stmt
 
 

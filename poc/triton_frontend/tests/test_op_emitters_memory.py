@@ -946,25 +946,20 @@ def test_arith_maxnumf_and_minnumf_route_to_float_minmax_emitters() -> None:
 #
 # Matmul's main loop carries ``a_ptrs += BLOCK_K * stride_ak`` -- a tile-shaped
 # offset-buffer increment that can't be combined with the previous indices via
-# scalar TIR ``+`` (the operand is a Buffer, not a PrimExpr). Before this
-# Wave, ``emit_tt_addptr`` blindly evaluated ``new_indices[-1] + off`` and
-# raised ``Mismatched type ... Expected ir.PrimExpr but got tirx.Buffer``.
-# The fix routes Buffer-shaped offsets through ``_compose_addptr_index``
-# which allocates a fresh tile buffer and emits a per-lane ``tir.For`` nest.
+# scalar TIR ``+`` (the operand is a Buffer, not a PrimExpr). The fix routes
+# Buffer-shaped offsets through ``_compose_addptr_index`` and keeps the
+# composed index lazy, so downstream loads can materialize exactly the lane
+# they need instead of forcing a hidden tile staging allocation.
 
 
-def test_addptr_buffer_offset_emits_per_lane_for_loop(
+def test_addptr_buffer_offset_keeps_lazy_tile_index(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``tt.addptr(ptr, buffer_offset)`` allocates a fresh tile and emits a For.
+    """``tt.addptr(ptr, buffer_offset)`` composes a lazy per-lane tile index.
 
     Mirrors the matmul scf.for body where the offset operand of an in-loop
     ``tt.addptr`` is a per-lane offset Buffer (the ``BLOCK_K * stride_ak``
-    tile from a prior ``arith.muli``), not a scalar PrimExpr. The trailing
-    index entry of the result must itself be a fresh ``tir.Buffer`` so
-    downstream ``tt.load`` consumers see a tile-shaped index, and the
-    walker stmts must contain a serial ``tir.For`` that drives the
-    elementwise add.
+    tile from a prior ``arith.muli``), not a scalar PrimExpr.
     """
     _force_no_shim(monkeypatch)
     ctx = WalkerCtx()
@@ -993,18 +988,16 @@ def test_addptr_buffer_offset_emits_per_lane_for_loop(
     out_buf, out_indices = result
     assert out_buf is base_buf, "tt.addptr must thread the base buffer through"
     assert isinstance(out_indices, list) and len(out_indices) == 1
-    assert isinstance(out_indices[0], tvm.tir.Buffer), (
-        f"trailing index entry must be a fresh tile Buffer; got "
+    assert isinstance(out_indices[0], LazyTileExpr), (
+        f"trailing index entry must be a lazy tile expression; got "
         f"{type(out_indices[0]).__name__}"
     )
-    assert int(out_indices[0].shape[0]) == 32
-
-    text = _stringify(ctx.stmts)
-    assert "for" in text.lower(), (
-        f"expected per-lane For loop driving the addptr accumulation; got:\n"
-        f"{text}"
-    )
-    # The new tile buffer must be different from either input tile.
+    assert out_indices[0].shape == (32,)
+    lane0 = out_indices[0].read_lane(ctx, (tvm.tir.const(0, "int32"),))
+    lane_text = str(lane0)
+    assert "prev_off" in lane_text
+    assert "k_step_tile" in lane_text
+    # The composed tile must be different from either input tile.
     assert out_indices[0] is not prev_off
     assert out_indices[0] is not step_buf
 
