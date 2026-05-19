@@ -1691,6 +1691,11 @@ def emit_tt_store(op: Any, ctx: WalkerCtx) -> Any:
         else:
             indices[axis_i] = idx_v
 
+    if isinstance(val_expr, LazyTileExpr):
+        val_expr = val_expr.read_lane(
+            ctx, tuple(tir.const(0, "int32") for _ in val_expr.shape)
+        )
+
     store_stmt: Any = tir.BufferStore(buf, val_expr, indices)
     if mask_ssa is not None:
         mask_expr = ctx.get(mask_ssa)
@@ -1730,6 +1735,12 @@ def emit_tt_make_range(op: Any, ctx: WalkerCtx) -> Any:
         raise ValueError(
             f"tt.make_range: invalid range [{start}, {end}); end must be > start"
         )
+
+    if lanes == 1:
+        scalar = tir.const(start, "int32")
+        if _results(op):
+            ctx.bind(_results(op)[0], scalar)
+        return scalar
 
     if lanes <= _DEFAULT_VECTOR_WIDTH:
         ramp = tir.Ramp(tir.const(start, "int32"), tir.const(1, "int32"), lanes)

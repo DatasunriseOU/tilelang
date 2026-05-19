@@ -110,6 +110,22 @@ def test_make_range_emits_ramp() -> None:
     assert int(ramp.stride) == 1
 
 
+def test_make_range_single_lane_is_scalar() -> None:
+    """``tir.Ramp`` is invalid for one lane; scalar ranges stay scalar."""
+    ctx = WalkerCtx()
+    out = _ssa("range_out", shape=[1], dtype="int32")
+    op = {
+        "name": "tt.make_range",
+        "operands": [],
+        "results": [out],
+        "attrs": {"start": 0, "end": 1},
+    }
+    scalar = emit_tt_make_range(op, ctx)
+    assert not isinstance(scalar, tvm.tir.Ramp)
+    assert str(scalar.dtype) == "int32"
+    assert ctx.get(out) is scalar
+
+
 def test_make_range_wide_spills_to_for_loop() -> None:
     """A 4096-lane range exceeds the default vector width and spills to a For."""
     ctx = WalkerCtx()
