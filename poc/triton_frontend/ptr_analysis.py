@@ -43,6 +43,7 @@ __all__ = [
     "StridedLayout",
     "PtrAnalysis",
     "shim_available",
+    "shim_subprocess_available",
     "dialects_available",
     "run_ptr_analysis",
     "extract_ptr_states",
@@ -193,8 +194,36 @@ def _shim_conflict_warn_once() -> None:
     )
 
 
+def shim_subprocess_available() -> bool:
+    """Return True if the shim can be loaded in a CLEAN subprocess.
+
+    The subprocess path (``pipeline.run_ptr_analysis_pre_pass_subprocess``)
+    spawns a fresh Python interpreter where Triton's libtriton is NOT
+    pre-loaded, so the cl::opt double-registration and assert() SIGABRT
+    paths are both contained. The only requirement is that the .so exists
+    on disk somewhere our subprocess will find it.
+
+    This is a strictly weaker predicate than :func:`shim_available` and
+    must be used by callers that already route through the subprocess.
+    Direct in-process imports must still go through ``shim_available()``.
+    """
+    if SHIM_MODULE_NAME in sys.modules:
+        return True  # already safely loaded in parent (no triton present)
+    if importlib.util.find_spec(SHIM_MODULE_NAME) is not None:
+        return True
+    if _ensure_shim_on_syspath() and importlib.util.find_spec(SHIM_MODULE_NAME) is not None:
+        return True
+    try:
+        from . import build_cxx as _build_cxx
+    except ImportError:  # pragma: no cover
+        _build_cxx = None  # type: ignore[assignment]
+    if _build_cxx is not None and _build_cxx.ensure_built(build=False, verbose=False):
+        return True
+    return False
+
+
 def shim_available() -> bool:
-    """Return True if the C++ shim is importable from ``sys.path``.
+    """Return True if the C++ shim is importable IN-PROCESS from ``sys.path``.
 
     If a pre-built extension exists under ``_cxx/build/`` but isn't yet on
     ``sys.path``, this prepends the build dir so the next ``import`` succeeds.
@@ -208,7 +237,9 @@ def shim_available() -> bool:
     When upstream Triton's ``libtriton`` is already loaded in this process
     we return ``False`` (with a one-shot warning) instead of letting the
     duplicate LLVM static-init abort the interpreter; the shim is still
-    physically present on disk, just unsafe to import here.
+    physically present on disk, just unsafe to import here. Callers that
+    intend to spawn a subprocess for the actual rewrite work should use
+    :func:`shim_subprocess_available` instead.
     """
     # If the shim itself is already loaded we are safe regardless of triton.
     if SHIM_MODULE_NAME in sys.modules:

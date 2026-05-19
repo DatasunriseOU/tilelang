@@ -1191,7 +1191,14 @@ def from_ttir(
         except Exception:
             _triton_native_loaded = lambda: False  # type: ignore[assignment]
 
-        if shim_available() and _triton_native_loaded():
+        # Subprocess path: only requires shim_subprocess_available() because
+        # the actual rewrite runs in a clean interpreter where libtriton is
+        # NOT loaded. shim_available() would (correctly) return False whenever
+        # libtriton is present in the parent, which used to disable BOTH
+        # branches here and force every Path D lowering through the degraded
+        # scalar walker even when a perfectly safe subprocess was possible.
+        from .ptr_analysis import shim_subprocess_available  # noqa: WPS433
+        if shim_subprocess_available() and _triton_native_loaded():
             try:
                 from .pipeline import (  # noqa: WPS433
                     run_ptr_analysis_pre_pass_subprocess,

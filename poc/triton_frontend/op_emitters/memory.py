@@ -126,9 +126,16 @@ def has_cxx_shim() -> bool:
     """
     # Import lazily so that test-time monkeypatching of ``shim_available``
     # also captures callers of ``has_cxx_shim`` without an extra hook.
-    from ..ptr_analysis import shim_available
+    # We accept the SUBPROCESS-available shim too because the PtrAnalysis
+    # pre-pass in __init__.py already routes through a clean subprocess
+    # when libtriton is loaded — by the time op_emitters runs, ptr_state
+    # metadata is seeded on ``ctx`` either way, so the tile-copy path is
+    # safe to emit. Without this widening, op_emitters silently degraded
+    # to scalar loads whenever libtriton was present, defeating the whole
+    # subprocess fallback.
+    from ..ptr_analysis import shim_available, shim_subprocess_available
 
-    return bool(shim_available())
+    return bool(shim_available() or shim_subprocess_available())
 
 
 # ---------------------------------------------------------------------------
