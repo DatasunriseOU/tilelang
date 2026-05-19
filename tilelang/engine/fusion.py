@@ -291,7 +291,7 @@ def build_mamba3_fp8_train_block_region(
             attrs={"role": "producer_consumer", "backward": "aot_autograd"},
         )
         .add_node(
-            "sparse_mla_fp8_prepared",
+            "fp8_prepare",
             op="sparse_mla_fp8_prepare",
             inputs=("packed_post",),
             outputs=("q_fp8", "q_scale", "kv_fp8", "kv_scale"),
@@ -305,11 +305,11 @@ def build_mamba3_fp8_train_block_region(
             attrs={"role": "consumer", "backward": "owner_output"},
         )
         .connect("mamba3_scan", "m2rnn_packed_post", buffer="mamba3_state")
-        .connect("m2rnn_packed_post", "sparse_mla_fp8_prepared", buffer="packed_post")
-        .connect("sparse_mla_fp8_prepared", "sparse_mla_fp8_apply", buffer="q_fp8")
-        .connect("sparse_mla_fp8_prepared", "sparse_mla_fp8_apply", buffer="q_scale")
-        .connect("sparse_mla_fp8_prepared", "sparse_mla_fp8_apply", buffer="kv_fp8")
-        .connect("sparse_mla_fp8_prepared", "sparse_mla_fp8_apply", buffer="kv_scale")
+        .connect("m2rnn_packed_post", "fp8_prepare", buffer="packed_post")
+        .connect("fp8_prepare", "sparse_mla_fp8_apply", buffer="q_fp8")
+        .connect("fp8_prepare", "sparse_mla_fp8_apply", buffer="q_scale")
+        .connect("fp8_prepare", "sparse_mla_fp8_apply", buffer="kv_fp8")
+        .connect("fp8_prepare", "sparse_mla_fp8_apply", buffer="kv_scale")
         .set_schedule_template(schedule_template)
         .enable_z3_sync_async_optimization()
         .build()
