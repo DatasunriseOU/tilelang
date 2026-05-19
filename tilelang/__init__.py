@@ -193,7 +193,10 @@ if not env.is_light_import():
     from .transform import PassConfigKey  # noqa: F401
     from .engine import (  # noqa: F401
         FusionAutogradPlan,
+        FusionOptimizer,
         FusionRegionBuilder,
+        FusionScheduleRegistry,
+        build_fusion_region,
         compile_fusion_region,
         lower,
         register_c_postproc,

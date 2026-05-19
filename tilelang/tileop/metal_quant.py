@@ -71,6 +71,45 @@ def fp8_e4m3fn_to_float(bits):
     return T.if_then_else(sign != T.uint32(0), -value, value)
 
 
+def float_to_fp8_e4m3fn_bits(value):
+    """Encode fp32 to packed uint8 e4m3fn bits inside TileLang/Metal kernels."""
+    x = T.Cast(FP32, value)
+    finite_x = T.if_then_else(T.isfinite(x), x, T.float32(0.0))
+    sign = T.if_then_else(finite_x < T.float32(0.0), T.uint32(0x80), T.uint32(0))
+    ax = T.min(T.abs(finite_x), T.float32(448.0))
+
+    subnormal_mant = T.min(
+        T.Cast("uint32", T.round(ax * T.float32(512.0))),
+        T.uint32(7),
+    )
+
+    normal_ax = T.max(ax, T.float32(1.0 / 64.0))
+    exp_unbiased = T.Cast("int32", T.floor(T.log2(normal_ax)))
+    exp_bits_i = exp_unbiased + T.int32(7)
+    base = T.exp2(T.Cast(FP32, exp_unbiased))
+    mant = T.Cast(
+        "uint32",
+        T.round((normal_ax / base - T.float32(1.0)) * T.float32(8.0)),
+    )
+
+    mant_carry = mant >= T.uint32(8)
+    exp_bits_i = exp_bits_i + T.if_then_else(mant_carry, T.int32(1), T.int32(0))
+    exp_bits_i = T.max(T.min(exp_bits_i, T.int32(15)), T.int32(1))
+    mant = T.if_then_else(mant_carry, T.uint32(0), mant)
+    mant = T.if_then_else(
+        exp_bits_i == T.int32(15),
+        T.min(mant, T.uint32(6)),
+        T.min(mant, T.uint32(7)),
+    )
+    normal_bits = (T.Cast("uint32", exp_bits_i) << T.uint32(3)) | mant
+    magnitude = T.if_then_else(
+        ax < T.float32(1.0 / 64.0),
+        subnormal_mant,
+        normal_bits,
+    )
+    return T.Cast("uint8", sign | magnitude)
+
+
 def fp4_e2m1fn_to_float(bits, nibble_index):
     """Decode one e2m1fn nibble from packed uint8 storage."""
     bits_u = T.Cast("uint32", bits)

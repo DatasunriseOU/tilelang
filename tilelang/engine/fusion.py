@@ -10,8 +10,10 @@ MSL/CUDA concatenation cannot recover producer/consumer buffer lifetimes.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from hashlib import sha256
+import inspect
 import json
 from typing import Any
 
@@ -57,6 +59,8 @@ class FusionRegion:
     entry_symbol: str
     pass_configs: Mapping[str, Any]
     backend: str = DEFAULT_BACKEND
+    schedule_name: str = "manual"
+    schedule_status: str = "ready"
 
 
 @dataclass(frozen=True)
@@ -80,6 +84,8 @@ class FusionCompilePlan:
     pass_configs: Mapping[str, Any]
     cache_key_material: tuple[str, ...]
     require_single_kernel: bool = False
+    schedule_name: str = "manual"
+    schedule_status: str = "ready"
     autograd_plan: FusionAutogradPlan = field(
         default_factory=lambda: FusionAutogradPlan(mode="none", status="none")
     )
@@ -91,6 +97,15 @@ class FusionCompileResult:
     plan: FusionCompilePlan
     lowered_module: tvm.IRModule
     artifact: Any
+
+
+@dataclass(frozen=True)
+class FusionScheduleEntry:
+    op_signature: tuple[str, ...]
+    schedule_template: ScheduleTemplate
+    name: str
+    cache_key: str
+    status: str = "experimental"
 
 
 @dataclass(frozen=True)
@@ -123,6 +138,185 @@ class FusionCacheKeyAudit:
     cache_hit: bool
 
 
+class FusionScheduleRegistry:
+    """Registry mapping an op-chain signature to one fused schedule template."""
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple[str, ...], FusionScheduleEntry] = {}
+
+    def register(
+        self,
+        op_signature: Sequence[str],
+        schedule_template: ScheduleTemplate | tir.PrimFunc | tvm.IRModule,
+        *,
+        name: str | None = None,
+        status: str = "experimental",
+    ) -> FusionScheduleRegistry:
+        signature = tuple(str(op) for op in op_signature)
+        if not signature:
+            raise ValueError("fusion schedule op signature must not be empty")
+        entry_name = name or ",".join(signature)
+        if isinstance(schedule_template, tir.PrimFunc | tvm.IRModule):
+            lowered = schedule_template
+            schedule_cache_key = f"{entry_name}:{_lowered_schedule_digest(lowered)}"
+
+            def constant_template(_region: FusionRegion) -> tir.PrimFunc | tvm.IRModule:
+                return lowered
+
+            resolved_schedule_template = constant_template
+        elif callable(schedule_template):
+            schedule_cache_key = f"{entry_name}:{_raw_callable_schedule_template_key(schedule_template)}"
+
+            def registered_template(region: FusionRegion) -> tir.PrimFunc | tvm.IRModule:
+                return schedule_template(region)
+
+            resolved_schedule_template = registered_template
+        else:
+            raise TypeError("fusion schedule template must be callable, PrimFunc, or IRModule")
+        with suppress(Exception):
+            resolved_schedule_template._tl_fusion_schedule_key = schedule_cache_key
+        self._entries[signature] = FusionScheduleEntry(
+            op_signature=signature,
+            schedule_template=resolved_schedule_template,
+            name=entry_name,
+            cache_key=schedule_cache_key,
+            status=str(status),
+        )
+        return self
+
+    def select(self, nodes: Sequence[FusionNode]) -> FusionScheduleEntry | None:
+        return self._entries.get(tuple(node.op for node in nodes))
+
+
+class FusionOptimizer:
+    """Top-level FX-like optimizer that selects a fused TileLang schedule."""
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        schedule_registry: FusionScheduleRegistry | None = None,
+        backend: str = DEFAULT_BACKEND,
+        entry_symbol: str | None = None,
+        require_single_kernel: bool = True,
+        enable_z3_sync_async: bool = True,
+    ) -> None:
+        self._builder = FusionRegionBuilder(name, backend=backend, entry_symbol=entry_symbol)
+        self._schedule_registry = schedule_registry or FusionScheduleRegistry()
+        self._require_single_kernel = require_single_kernel
+        self._enable_z3_sync_async = enable_z3_sync_async
+
+    def add_node(
+        self,
+        name: str,
+        *,
+        op: str,
+        inputs: Sequence[str] = (),
+        outputs: Sequence[str] = (),
+        attrs: Mapping[str, Any] | None = None,
+    ) -> FusionOptimizer:
+        self._builder.add_node(name, op=op, inputs=inputs, outputs=outputs, attrs=attrs)
+        return self
+
+    def add_nodes(self, nodes: Sequence[FusionNode]) -> FusionOptimizer:
+        self._builder.add_nodes(nodes)
+        return self
+
+    def add_prim_func_node(
+        self,
+        name: str,
+        prim_func: tir.PrimFunc,
+        *,
+        op: str | None = None,
+        inputs: Sequence[str] = (),
+        outputs: Sequence[str] = (),
+        attrs: Mapping[str, Any] | None = None,
+    ) -> FusionOptimizer:
+        self._builder.add_prim_func_node(
+            name,
+            prim_func,
+            op=op,
+            inputs=inputs,
+            outputs=outputs,
+            attrs=attrs,
+        )
+        return self
+
+    def set_schedule_template(self, schedule_template: ScheduleTemplate) -> FusionOptimizer:
+        self._builder.set_schedule_template(schedule_template)
+        return self
+
+    def add_lowered_source_kernel(self, node_name: str, source: str) -> FusionOptimizer:
+        self._builder.add_lowered_source_kernel(node_name, source)
+        return self
+
+    def _select_schedule_template(self) -> None:
+        if self._builder._schedule_template is not None:
+            return
+        nodes, _ = self._builder._normalized_nodes_and_edges()
+        schedule_entry = self._schedule_registry.select(nodes)
+        if schedule_entry is not None:
+            self._builder.set_schedule_template(
+                schedule_entry.schedule_template,
+                name=schedule_entry.name,
+                status=schedule_entry.status,
+            )
+            return
+        if nodes and all(node.prim_func is not None for node in nodes):
+            return
+        op_signature = ",".join(node.op for node in nodes)
+        raise ValueError(
+            f"no fused schedule registered for op signature {op_signature!r}; "
+            "register one fused TileLang/TIR schedule template or provide raw PrimFunc nodes"
+        )
+
+    def build(self) -> FusionRegion:
+        self._select_schedule_template()
+        if self._enable_z3_sync_async:
+            self._builder.enable_z3_sync_async_optimization()
+        return self._builder.build()
+
+    def plan(
+        self,
+        pass_configs: Mapping[str, Any] | None = None,
+        *,
+        require_single_kernel: bool | None = None,
+    ) -> FusionCompilePlan:
+        return plan_fusion_region(
+            self.build(),
+            pass_configs=pass_configs,
+            require_single_kernel=self._require_single_kernel
+            if require_single_kernel is None
+            else require_single_kernel,
+        )
+
+    def compile(
+        self,
+        *,
+        target: str = "auto",
+        target_host: str | None = None,
+        runtime_only: bool = False,
+        enable_host_codegen: bool = False,
+        enable_device_compile: bool = False,
+        pass_configs: Mapping[str, Any] | None = None,
+        lowerer: Callable[..., Any] | None = None,
+        require_single_kernel: bool | None = None,
+    ) -> FusionCompileResult:
+        return compile_fusion_region(
+            self.build(),
+            target=target,
+            target_host=target_host,
+            runtime_only=runtime_only,
+            enable_host_codegen=enable_host_codegen,
+            enable_device_compile=enable_device_compile,
+            pass_configs=pass_configs,
+            lowerer=lowerer,
+            require_single_kernel=self._require_single_kernel
+            if require_single_kernel is None
+            else require_single_kernel,
+        )
+
+
 class FusionRegionBuilder:
     def __init__(self, name: str, *, backend: str = DEFAULT_BACKEND, entry_symbol: str | None = None):
         self.name = name
@@ -131,7 +325,13 @@ class FusionRegionBuilder:
         self._nodes: list[FusionNode] = []
         self._edges: list[FusionEdge] = []
         self._schedule_template: ScheduleTemplate | None = None
+        self._schedule_name = "manual"
+        self._schedule_status = "ready"
         self._pass_configs: dict[str, Any] = {}
+
+    def _reject_duplicate_node_name(self, name: str) -> None:
+        if any(node.name == name for node in self._nodes):
+            raise ValueError(f"duplicate fusion node: {name!r}")
 
     def add_node(
         self,
@@ -142,6 +342,7 @@ class FusionRegionBuilder:
         outputs: Sequence[str] = (),
         attrs: Mapping[str, Any] | None = None,
     ) -> FusionRegionBuilder:
+        self._reject_duplicate_node_name(name)
         self._nodes.append(
             FusionNode(
                 name=name,
@@ -151,6 +352,27 @@ class FusionRegionBuilder:
                 attrs=dict(attrs or {}),
             )
         )
+        return self
+
+    def add_nodes(self, nodes: Sequence[FusionNode]) -> FusionRegionBuilder:
+        for node in nodes:
+            if node.prim_func is None:
+                self.add_node(
+                    node.name,
+                    op=node.op,
+                    inputs=node.inputs,
+                    outputs=node.outputs,
+                    attrs=node.attrs,
+                )
+            else:
+                self.add_prim_func_node(
+                    node.name,
+                    node.prim_func,
+                    op=node.op,
+                    inputs=node.inputs,
+                    outputs=node.outputs,
+                    attrs=node.attrs,
+                )
         return self
 
     def add_prim_func_node(
@@ -165,6 +387,7 @@ class FusionRegionBuilder:
     ) -> FusionRegionBuilder:
         if not isinstance(prim_func, tir.PrimFunc):
             raise TypeError("Fusion PrimFunc nodes must be tvm.tir.PrimFunc objects")
+        self._reject_duplicate_node_name(name)
         if prim_func.attrs and prim_func.attrs.get("code_block_source") is not None:
             raise ValueError(
                 f"Fusion node {name!r} received a PrimFunc wrapping already-lowered source. "
@@ -197,14 +420,135 @@ class FusionRegionBuilder:
         self._edges.append(FusionEdge(producer=producer, consumer=consumer, buffer=buffer, lifetime=lifetime))
         return self
 
+    def _edges_with_inferred_chain(self) -> tuple[FusionEdge, ...]:
+        edges = list(self._edges)
+        explicit_edge_keys = {(edge.producer, edge.consumer, edge.buffer) for edge in edges}
+        explicit_input_keys = {(edge.consumer, edge.buffer): edge.producer for edge in edges}
+        node_names = {node.name for node in self._nodes}
+        for edge in edges:
+            if edge.producer not in node_names or edge.consumer not in node_names:
+                raise ValueError(
+                    f"Fusion edge {edge.producer!r}->{edge.consumer!r}:{edge.buffer!r} "
+                    "references a missing node"
+                )
+
+        producer_by_buffer: dict[str, str] = {}
+        ambiguous_producers: dict[str, tuple[str, str]] = {}
+        for node in self._nodes:
+            for output_name in node.outputs:
+                existing = producer_by_buffer.get(output_name)
+                if existing is not None and existing != node.name:
+                    ambiguous_producers[output_name] = (existing, node.name)
+                    continue
+                producer_by_buffer[output_name] = node.name
+
+        for node in self._nodes:
+            for input_name in node.inputs:
+                if (node.name, input_name) in explicit_input_keys:
+                    continue
+                ambiguous = ambiguous_producers.get(input_name)
+                if ambiguous is not None:
+                    raise ValueError(
+                        f"ambiguous inferred fusion producer for buffer {input_name!r}: "
+                        f"{ambiguous[0]!r} and {ambiguous[1]!r}"
+                    )
+                producer = producer_by_buffer.get(input_name)
+                if producer is None or producer == node.name:
+                    continue
+                edge_key = (producer, node.name, input_name)
+                if edge_key not in explicit_edge_keys:
+                    edges.append(
+                        FusionEdge(
+                            producer=producer,
+                            consumer=node.name,
+                            buffer=input_name,
+                        )
+                    )
+                    explicit_edge_keys.add(edge_key)
+        return tuple(edges)
+
+    def _nodes_in_dependency_order(self, edges: Sequence[FusionEdge]) -> tuple[FusionNode, ...]:
+        if len(self._nodes) < 2:
+            return tuple(self._nodes)
+
+        nodes_by_name = {node.name: node for node in self._nodes}
+        original_index = {node.name: index for index, node in enumerate(self._nodes)}
+        indegree = {node.name: 0 for node in self._nodes}
+        successors: dict[str, set[str]] = {node.name: set() for node in self._nodes}
+        for edge in edges:
+            if edge.producer not in nodes_by_name or edge.consumer not in nodes_by_name:
+                raise ValueError(
+                    f"Fusion edge {edge.producer!r}->{edge.consumer!r}:{edge.buffer!r} "
+                    "references a missing node"
+                )
+            if edge.producer == edge.consumer:
+                continue
+            if edge.consumer not in successors[edge.producer]:
+                successors[edge.producer].add(edge.consumer)
+                indegree[edge.consumer] += 1
+
+        ready = sorted(
+            (name for name, count in indegree.items() if count == 0),
+            key=original_index.__getitem__,
+        )
+        ordered_names: list[str] = []
+        while ready:
+            name = ready.pop(0)
+            ordered_names.append(name)
+            for successor in sorted(successors[name], key=original_index.__getitem__):
+                indegree[successor] -= 1
+                if indegree[successor] == 0:
+                    ready.append(successor)
+                    ready.sort(key=original_index.__getitem__)
+
+        if len(ordered_names) != len(self._nodes):
+            raise ValueError("Fusion region contains a cycle in producer/consumer dependencies")
+        return tuple(nodes_by_name[name] for name in ordered_names)
+
+    @staticmethod
+    def _edges_in_dependency_order(
+        edges: Sequence[FusionEdge],
+        nodes: Sequence[FusionNode],
+    ) -> tuple[FusionEdge, ...]:
+        node_order = {node.name: index for index, node in enumerate(nodes)}
+        input_order = {
+            (node.name, input_name): index
+            for node in nodes
+            for index, input_name in enumerate(node.inputs)
+        }
+        return tuple(
+            sorted(
+                edges,
+                key=lambda edge: (
+                    node_order.get(edge.consumer, len(nodes)),
+                    input_order.get((edge.consumer, edge.buffer), len(nodes)),
+                    node_order.get(edge.producer, len(nodes)),
+                    edge.buffer,
+                ),
+            )
+        )
+
+    def _normalized_nodes_and_edges(self) -> tuple[tuple[FusionNode, ...], tuple[FusionEdge, ...]]:
+        edges = self._edges_with_inferred_chain()
+        nodes = self._nodes_in_dependency_order(edges)
+        return nodes, self._edges_in_dependency_order(edges, nodes)
+
     def add_lowered_source_kernel(self, node_name: str, source: str) -> FusionRegionBuilder:
         raise ValueError(
             f"Fusion node {node_name!r} received an already-lowered source kernel. "
             "Fusion regions must stay at the pre-source TileLang/TVM IR boundary."
         )
 
-    def set_schedule_template(self, schedule_template: ScheduleTemplate) -> FusionRegionBuilder:
+    def set_schedule_template(
+        self,
+        schedule_template: ScheduleTemplate,
+        *,
+        name: str = "manual",
+        status: str = "ready",
+    ) -> FusionRegionBuilder:
         self._schedule_template = schedule_template
+        self._schedule_name = name
+        self._schedule_status = status
         return self
 
     def enable_z3_sync_async_optimization(self) -> FusionRegionBuilder:
@@ -213,23 +557,30 @@ class FusionRegionBuilder:
         return self
 
     def build(self) -> FusionRegion:
+        nodes, edges = self._normalized_nodes_and_edges()
         if self._schedule_template is None:
-            if not self._nodes or any(node.prim_func is None for node in self._nodes):
+            if not nodes or any(node.prim_func is None for node in nodes):
                 raise ValueError(
                     "FusionRegion without an explicit schedule template requires all nodes "
                     "to be raw PrimFunc nodes"
                 )
             schedule_template = _auto_prim_func_region_template
+            schedule_name = "auto_prim_func_region"
+            schedule_status = "auto_prim_func_graph"
         else:
             schedule_template = self._schedule_template
+            schedule_name = self._schedule_name
+            schedule_status = self._schedule_status
         return FusionRegion(
             name=self.name,
-            nodes=tuple(self._nodes),
-            edges=tuple(self._edges),
+            nodes=nodes,
+            edges=edges,
             schedule_template=schedule_template,
             entry_symbol=self.entry_symbol,
             pass_configs=dict(self._pass_configs),
             backend=self.backend,
+            schedule_name=schedule_name,
+            schedule_status=schedule_status,
         )
 
     def plan(
@@ -269,50 +620,73 @@ class FusionRegionBuilder:
         )
 
 
+_MAMBA3_FP8_TRAIN_BLOCK_CHAIN: tuple[FusionNode, ...] = (
+    FusionNode(
+        name="mamba3_scan",
+        op="mamba3",
+        inputs=("x", "state"),
+        outputs=("mamba3_state",),
+        attrs={"role": "producer", "backward": "aot_autograd"},
+    ),
+    FusionNode(
+        name="m2rnn_packed_post",
+        op="m2rnn",
+        inputs=("mamba3_state",),
+        outputs=("packed_post",),
+        attrs={"role": "producer_consumer", "backward": "aot_autograd"},
+    ),
+    FusionNode(
+        name="fp8_prepare",
+        op="sparse_mla_fp8_prepare",
+        inputs=("packed_post",),
+        outputs=("q_fp8", "q_scale", "kv_fp8", "kv_scale"),
+        attrs={"role": "producer", "backward": "owner_output"},
+    ),
+    FusionNode(
+        name="sparse_mla_fp8_apply",
+        op="sparse_mla_fp8_apply",
+        inputs=("q_fp8", "q_scale", "kv_fp8", "kv_scale"),
+        outputs=("train_block_out",),
+        attrs={"role": "consumer", "backward": "owner_output"},
+    ),
+)
+
+
+def build_fusion_region(
+    *,
+    region_name: str,
+    nodes: Sequence[FusionNode],
+    schedule_template: ScheduleTemplate,
+    edges: Sequence[FusionEdge] = (),
+    backend: str = DEFAULT_BACKEND,
+    entry_symbol: str | None = None,
+    enable_z3_sync_async_optimization: bool = False,
+    schedule_name: str = "manual",
+    schedule_status: str = "ready",
+) -> FusionRegion:
+    builder = (
+        FusionRegionBuilder(region_name, backend=backend, entry_symbol=entry_symbol)
+        .add_nodes(nodes)
+        .set_schedule_template(schedule_template, name=schedule_name, status=schedule_status)
+    )
+    for edge in edges:
+        builder.connect(edge.producer, edge.consumer, buffer=edge.buffer, lifetime=edge.lifetime)
+    if enable_z3_sync_async_optimization:
+        builder.enable_z3_sync_async_optimization()
+    return builder.build()
+
+
 def build_mamba3_fp8_train_block_region(
     *,
     schedule_template: ScheduleTemplate,
     region_name: str = "mamba3_fp8_train_block",
+    nodes: Sequence[FusionNode] | None = None,
 ) -> FusionRegion:
-    return (
-        FusionRegionBuilder(region_name)
-        .add_node(
-            "mamba3_scan",
-            op="mamba3",
-            inputs=("x", "state"),
-            outputs=("mamba3_state",),
-            attrs={"role": "producer", "backward": "aot_autograd"},
-        )
-        .add_node(
-            "m2rnn_packed_post",
-            op="m2rnn",
-            inputs=("mamba3_state",),
-            outputs=("packed_post",),
-            attrs={"role": "producer_consumer", "backward": "aot_autograd"},
-        )
-        .add_node(
-            "fp8_prepare",
-            op="sparse_mla_fp8_prepare",
-            inputs=("packed_post",),
-            outputs=("q_fp8", "q_scale", "kv_fp8", "kv_scale"),
-            attrs={"role": "producer", "backward": "owner_output"},
-        )
-        .add_node(
-            "sparse_mla_fp8_apply",
-            op="sparse_mla_fp8_apply",
-            inputs=("q_fp8", "q_scale", "kv_fp8", "kv_scale"),
-            outputs=("train_block_out",),
-            attrs={"role": "consumer", "backward": "owner_output"},
-        )
-        .connect("mamba3_scan", "m2rnn_packed_post", buffer="mamba3_state")
-        .connect("m2rnn_packed_post", "fp8_prepare", buffer="packed_post")
-        .connect("fp8_prepare", "sparse_mla_fp8_apply", buffer="q_fp8")
-        .connect("fp8_prepare", "sparse_mla_fp8_apply", buffer="q_scale")
-        .connect("fp8_prepare", "sparse_mla_fp8_apply", buffer="kv_fp8")
-        .connect("fp8_prepare", "sparse_mla_fp8_apply", buffer="kv_scale")
-        .set_schedule_template(schedule_template)
-        .enable_z3_sync_async_optimization()
-        .build()
+    return build_fusion_region(
+        region_name=region_name,
+        nodes=_MAMBA3_FP8_TRAIN_BLOCK_CHAIN if nodes is None else nodes,
+        schedule_template=schedule_template,
+        enable_z3_sync_async_optimization=True,
     )
 
 
@@ -340,6 +714,37 @@ def _prim_func_digest(prim_func: tir.PrimFunc) -> str:
     except TypeError:
         script = prim_func.script()
     return sha256(str(script).encode()).hexdigest()
+
+
+def _ir_module_digest(ir_module: tvm.IRModule) -> str:
+    try:
+        script = ir_module.script(show_meta=True)
+    except TypeError:
+        script = ir_module.script()
+    return sha256(str(script).encode()).hexdigest()
+
+
+def _lowered_schedule_digest(lowered: tir.PrimFunc | tvm.IRModule) -> str:
+    if isinstance(lowered, tir.PrimFunc):
+        return f"prim_func:{_prim_func_digest(lowered)}"
+    return f"ir_module:{_ir_module_digest(lowered)}"
+
+
+def _schedule_template_key(schedule_template: ScheduleTemplate) -> str:
+    custom_key = getattr(schedule_template, "_tl_fusion_schedule_key", None)
+    if custom_key is not None:
+        return str(custom_key)
+    return _raw_callable_schedule_template_key(schedule_template)
+
+
+def _raw_callable_schedule_template_key(schedule_template: ScheduleTemplate) -> str:
+    module_name = getattr(schedule_template, "__module__", type(schedule_template).__module__)
+    qualname = getattr(schedule_template, "__qualname__", type(schedule_template).__qualname__)
+    try:
+        source = inspect.getsource(schedule_template)
+    except (OSError, TypeError):
+        source = repr(schedule_template)
+    return f"callable:{module_name}.{qualname}:{sha256(source.encode()).hexdigest()}"
 
 
 def _edge_metadata(region: FusionRegion) -> str:
@@ -448,6 +853,52 @@ def _validate_internal_edges_do_not_escape_entry_abi(func: tir.PrimFunc, region:
     )
 
 
+def _prim_func_load_store_buffer_names(func: tir.PrimFunc) -> tuple[set[str], set[str]]:
+    load_names: set[str] = set()
+    store_names: set[str] = set()
+
+    def visit(node: Any) -> None:
+        if isinstance(node, tir.BufferLoad):
+            load_names.add(str(node.buffer.name))
+        elif isinstance(node, tir.BufferStore):
+            store_names.add(str(node.buffer.name))
+
+    tir.stmt_functor.post_order_visit(func.body, visit)
+    return load_names, store_names
+
+
+def _validate_internal_edges_materialized_in_entry_ir(func: tir.PrimFunc, region: FusionRegion) -> None:
+    if region.schedule_template is _auto_prim_func_region_template:
+        return
+
+    internal_buffers = sorted({edge.buffer for edge in region.edges if edge.lifetime == "internal"})
+    if not internal_buffers:
+        return
+
+    load_names, store_names = _prim_func_load_store_buffer_names(func)
+    missing = [
+        buffer
+        for buffer in internal_buffers
+        if buffer not in load_names or buffer not in store_names
+    ]
+    if not missing:
+        return
+    missing_details = [
+        f"{buffer}:"
+        f"{'missing_load' if buffer not in load_names else 'load_ok'},"
+        f"{'missing_store' if buffer not in store_names else 'store_ok'}"
+        for buffer in missing
+    ]
+
+    raise ValueError(
+        f"Fusion region {region.name!r} explicit schedule did not materialize internal "
+        f"fusion edge buffers: {', '.join(missing)} "
+        f"({'; '.join(missing_details)}). A fullgraph fused schedule must "
+        "keep every producer/consumer edge buffer inside the entry PrimFunc, not just "
+        "hide it from the ABI."
+    )
+
+
 def _required_external_region_buffers(region: FusionRegion) -> set[str]:
     internal_buffers = {edge.buffer for edge in region.edges if edge.lifetime == "internal"}
     required: set[str] = set()
@@ -472,11 +923,17 @@ def _validate_explicit_schedule_covers_region_abi(func: tir.PrimFunc, region: Fu
     )
 
 
-def _module_from_template(region: FusionRegion) -> tvm.IRModule:
+def _module_from_template(
+    region: FusionRegion,
+    *,
+    require_internal_edge_materialization: bool = False,
+) -> tvm.IRModule:
     lowered = region.schedule_template(region)
     if isinstance(lowered, str):
         raise TypeError("Fusion schedule templates must return a PrimFunc or IRModule, not lowered source text")
     if isinstance(lowered, tir.PrimFunc):
+        if require_internal_edge_materialization:
+            _validate_internal_edges_materialized_in_entry_ir(lowered, region)
         entry = _with_region_attrs(lowered, region, region.entry_symbol)
         _validate_internal_edges_do_not_escape_entry_abi(entry, region)
         return tvm.IRModule({region.entry_symbol: entry})
@@ -490,6 +947,8 @@ def _module_from_template(region: FusionRegion) -> tvm.IRModule:
             global_var, func = next(iter(lowered.functions.items()))
             if not isinstance(func, tir.PrimFunc):
                 raise TypeError("Fusion IRModule entries must be PrimFunc objects")
+            if require_internal_edge_materialization:
+                _validate_internal_edges_materialized_in_entry_ir(func, region)
             entry = _with_region_attrs(func, region, region.entry_symbol)
             _validate_internal_edges_do_not_escape_entry_abi(entry, region)
             return tvm.IRModule({region.entry_symbol: entry})
@@ -499,6 +958,8 @@ def _module_from_template(region: FusionRegion) -> tvm.IRModule:
             if global_var.name_hint == region.entry_symbol:
                 if not isinstance(func, tir.PrimFunc):
                     raise TypeError("Fusion IRModule entry must be a PrimFunc")
+                if require_internal_edge_materialization:
+                    _validate_internal_edges_materialized_in_entry_ir(func, region)
                 entry = _with_region_attrs(func, region, region.entry_symbol)
                 _validate_internal_edges_do_not_escape_entry_abi(entry, region)
                 functions[global_var] = entry
@@ -517,6 +978,7 @@ def _cache_key_material(region: FusionRegion, pass_configs: Mapping[str, Any]) -
         f"backend:{region.backend}",
         f"boundary:{LOWERING_BOUNDARY}",
         "z3:sync_async" if pass_configs.get(PassConfigKey.TL_Z3_PROOF_BARRIER_MINIMIZATION.value) else "z3:off",
+        f"schedule:{_schedule_template_key(region.schedule_template)}",
     ]
     prim_func_digests = [
         f"{node.name}:{_prim_func_digest(node.prim_func)}"
@@ -590,6 +1052,8 @@ def plan_fusion_region(
         pass_configs=merged_pass_configs,
         cache_key_material=_cache_key_material(region, merged_pass_configs),
         require_single_kernel=require_single_kernel,
+        schedule_name=region.schedule_name,
+        schedule_status=region.schedule_status,
         autograd_plan=_autograd_plan_for(region),
     )
 
@@ -630,7 +1094,10 @@ def compile_fusion_region(
         pass_configs=pass_configs,
         require_single_kernel=require_single_kernel,
     )
-    lowered_module = _module_from_template(region)
+    lowered_module = _module_from_template(
+        region,
+        require_internal_edge_materialization=require_single_kernel,
+    )
     if require_single_kernel:
         _assert_single_kernel_region(lowered_module, region)
         _assert_single_kernel_region_abi(lowered_module, region)

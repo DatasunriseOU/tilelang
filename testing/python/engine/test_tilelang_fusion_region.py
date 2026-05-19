@@ -7,9 +7,13 @@ from tilelang.engine import compile_fusion_region as exported_compile_fusion_reg
 from tilelang.engine.fusion import (
     BaselineComparison,
     FusionAutogradPlan,
+    FusionNode,
+    FusionOptimizer,
     FusionRegionBuilder,
+    FusionScheduleRegistry,
     audit_fusion_cache_key,
     audit_warm_cache_reuse,
+    build_fusion_region,
     build_mamba3_fp8_train_block_region,
     compile_fusion_region,
     fusion_cache_key_digest,
@@ -47,9 +51,80 @@ def _logical_train_block_with_internal_edges(
     with T.Kernel(1, threads=1):
         mamba3_state = T.alloc_local((4,), "float32")
         packed_post = T.alloc_local((4,), "float32")
+        q_fp8 = T.alloc_local((4,), "float32")
+        q_scale = T.alloc_local((4,), "float32")
+        kv_fp8 = T.alloc_local((4,), "float32")
+        kv_scale = T.alloc_local((4,), "float32")
+        mamba3_state[0] = x[0] + state[0]
+        packed_post[0] = mamba3_state[0]
+        q_fp8[0] = packed_post[0]
+        q_scale[0] = 1.0
+        kv_fp8[0] = packed_post[0]
+        kv_scale[0] = 1.0
+        train_block_out[0] = q_fp8[0] + kv_fp8[0] + q_scale[0] + kv_scale[0]
+
+
+@T.prim_func
+def _logical_train_block_missing_internal_edges(
+    x: T.Buffer((4,), "float32"),
+    state: T.Buffer((4,), "float32"),
+    train_block_out: T.Buffer((4,), "float32"),
+):
+    with T.Kernel(1, threads=1):
+        mamba3_state = T.alloc_local((4,), "float32")
+        packed_post = T.alloc_local((4,), "float32")
         mamba3_state[0] = x[0] + state[0]
         packed_post[0] = mamba3_state[0]
         train_block_out[0] = packed_post[0]
+
+
+@T.prim_func
+def _logical_train_block_with_misleading_internal_buffer_names(
+    x: T.Buffer((4,), "float32"),
+    state: T.Buffer((4,), "float32"),
+    train_block_out: T.Buffer((4,), "float32"),
+):
+    with T.Kernel(1, threads=1):
+        mamba3_state = T.alloc_local((4,), "float32")
+        packed_post = T.alloc_local((4,), "float32")
+        not_q_fp8 = T.alloc_local((4,), "float32")
+        not_q_scale = T.alloc_local((4,), "float32")
+        not_kv_fp8 = T.alloc_local((4,), "float32")
+        not_kv_scale = T.alloc_local((4,), "float32")
+        mamba3_state[0] = x[0] + state[0]
+        packed_post[0] = mamba3_state[0]
+        not_q_fp8[0] = packed_post[0]
+        not_q_scale[0] = 1.0
+        not_kv_fp8[0] = packed_post[0]
+        not_kv_scale[0] = 1.0
+        train_block_out[0] = (
+            not_q_fp8[0]
+            + not_q_scale[0]
+            + not_kv_fp8[0]
+            + not_kv_scale[0]
+        )
+
+
+@T.prim_func
+def _logical_train_block_missing_output_abi(
+    x: T.Buffer((4,), "float32"),
+    state: T.Buffer((4,), "float32"),
+    D: T.Buffer((4,), "float32"),
+):
+    with T.Kernel(1, threads=1):
+        mamba3_state = T.alloc_local((4,), "float32")
+        packed_post = T.alloc_local((4,), "float32")
+        q_fp8 = T.alloc_local((4,), "float32")
+        q_scale = T.alloc_local((4,), "float32")
+        kv_fp8 = T.alloc_local((4,), "float32")
+        kv_scale = T.alloc_local((4,), "float32")
+        mamba3_state[0] = x[0] + state[0]
+        packed_post[0] = mamba3_state[0]
+        q_fp8[0] = packed_post[0]
+        q_scale[0] = 1.0
+        kv_fp8[0] = packed_post[0]
+        kv_scale[0] = 1.0
+        D[0] = q_fp8[0] + kv_fp8[0] + q_scale[0] + kv_scale[0]
 
 
 @T.prim_func
@@ -67,6 +142,7 @@ def test_region_compile_uses_one_pre_source_ir_module_with_z3_config():
     assert tilelang.compile_fusion_region is compile_fusion_region
     assert tilelang.FusionRegionBuilder is FusionRegionBuilder
     assert tilelang.FusionAutogradPlan is FusionAutogradPlan
+    assert tilelang.build_fusion_region is build_fusion_region
 
     def schedule_template(region):
         assert region.name == "mamba3_fp8_train_block"
@@ -167,7 +243,6 @@ def test_prim_func_graph_can_compile_without_manual_schedule_template():
             inputs=("C",),
             outputs=("D",),
         )
-        .connect("producer", "consumer", buffer="C")
         .enable_z3_sync_async_optimization()
         .build()
     )
@@ -219,7 +294,6 @@ def test_fullgraph_compile_rejects_auto_prim_func_graph_breaks():
             inputs=("C",),
             outputs=("D",),
         )
-        .connect("producer", "consumer", buffer="C")
         .build()
     )
 
@@ -250,9 +324,37 @@ def test_fullgraph_compile_accepts_explicit_single_entry_schedule():
     ]
 
 
+def test_fullgraph_compile_rejects_schedule_that_does_not_materialize_internal_edges():
+    region = build_mamba3_fp8_train_block_region(
+        schedule_template=lambda _: _logical_train_block_missing_internal_edges,
+    )
+
+    with pytest.raises(ValueError, match="did not materialize internal fusion edge buffers.*kv_fp8"):
+        compile_fusion_region(
+            region,
+            target="metal",
+            lowerer=lambda *args, **kwargs: "compiled",
+            require_single_kernel=True,
+        )
+
+
+def test_fullgraph_compile_rejects_schedule_with_only_substring_edge_names():
+    region = build_mamba3_fp8_train_block_region(
+        schedule_template=lambda _: _logical_train_block_with_misleading_internal_buffer_names,
+    )
+
+    with pytest.raises(ValueError, match="did not materialize internal fusion edge buffers.*q_fp8"):
+        compile_fusion_region(
+            region,
+            target="metal",
+            lowerer=lambda *args, **kwargs: "compiled",
+            require_single_kernel=True,
+        )
+
+
 def test_fullgraph_compile_rejects_explicit_schedule_missing_region_abi():
     region = build_mamba3_fp8_train_block_region(
-        schedule_template=lambda _: _fused_train_block_with_internal_edge,
+        schedule_template=lambda _: _logical_train_block_missing_output_abi,
     )
 
     with pytest.raises(ValueError, match="missing required region ABI buffers.*train_block_out"):
@@ -305,6 +407,309 @@ def test_auto_prim_func_graph_rejects_edges_missing_from_raw_tir_abi():
 
     with pytest.raises(ValueError, match="not present in raw PrimFunc ABI.*logical_only"):
         compile_fusion_region(region, target="metal", lowerer=lambda *args, **kwargs: None)
+
+
+def test_builder_infers_chain_edges_from_buffer_names():
+    region = (
+        FusionRegionBuilder("inferred_chain")
+        .add_node("producer", op="toy", inputs=("A",), outputs=("mid",))
+        .add_node("consumer", op="toy", inputs=("mid",), outputs=("B",))
+        .set_schedule_template(lambda _: _fused_train_block)
+        .build()
+    )
+
+    assert [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] == [
+        ("producer", "consumer", "mid")
+    ]
+
+
+def test_builder_adds_data_driven_nodes_and_infers_chain_edges():
+    region = (
+        FusionRegionBuilder("data_driven_chain")
+        .add_nodes(
+            (
+                FusionNode("producer", op="toy", inputs=("A",), outputs=("mid",)),
+                FusionNode("consumer", op="toy", inputs=("mid",), outputs=("B",)),
+            )
+        )
+        .set_schedule_template(lambda _: _fused_train_block)
+        .build()
+    )
+
+    assert [node.name for node in region.nodes] == ["producer", "consumer"]
+    assert [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] == [
+        ("producer", "consumer", "mid")
+    ]
+
+
+def test_builder_orders_data_driven_nodes_by_dependencies():
+    region = (
+        FusionRegionBuilder("out_of_order_chain")
+        .add_nodes(
+            (
+                FusionNode("consumer", op="toy_consumer", inputs=("mid",), outputs=("B",)),
+                FusionNode("producer", op="toy_producer", inputs=("A",), outputs=("mid",)),
+            )
+        )
+        .set_schedule_template(lambda _: _fused_train_block)
+        .build()
+    )
+
+    assert [node.name for node in region.nodes] == ["producer", "consumer"]
+    assert [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] == [
+        ("producer", "consumer", "mid")
+    ]
+
+
+def test_build_fusion_region_adds_dynamic_nodes_and_infers_chain():
+    region = build_fusion_region(
+        region_name="dynamic_train_block",
+        nodes=(
+            FusionNode("apply", op="sparse_mla", inputs=("post_y",), outputs=("out",)),
+            FusionNode("scan", op="mamba3", inputs=("x",), outputs=("scan_y",)),
+            FusionNode("post", op="m2rnn", inputs=("scan_y",), outputs=("post_y",)),
+        ),
+        schedule_template=lambda _: _fused_train_block,
+        enable_z3_sync_async_optimization=True,
+    )
+
+    assert [node.name for node in region.nodes] == ["scan", "post", "apply"]
+    assert [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] == [
+        ("scan", "post", "scan_y"),
+        ("post", "apply", "post_y"),
+    ]
+    assert region.pass_configs[PassConfigKey.TL_Z3_PROOF_BARRIER_MINIMIZATION.value] is True
+    assert region.pass_configs[PassConfigKey.TL_Z3_PROOF_ASYNC_ELIGIBILITY.value] is True
+
+
+def test_mamba3_fp8_train_block_helper_uses_inferred_chain_edges():
+    region = build_mamba3_fp8_train_block_region(schedule_template=lambda _: _fused_train_block)
+
+    assert [node.name for node in region.nodes] == [
+        "mamba3_scan",
+        "m2rnn_packed_post",
+        "fp8_prepare",
+        "sparse_mla_fp8_apply",
+    ]
+    assert [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] == [
+        ("mamba3_scan", "m2rnn_packed_post", "mamba3_state"),
+        ("m2rnn_packed_post", "fp8_prepare", "packed_post"),
+        ("fp8_prepare", "sparse_mla_fp8_apply", "q_fp8"),
+        ("fp8_prepare", "sparse_mla_fp8_apply", "q_scale"),
+        ("fp8_prepare", "sparse_mla_fp8_apply", "kv_fp8"),
+        ("fp8_prepare", "sparse_mla_fp8_apply", "kv_scale"),
+    ]
+
+
+def test_mamba3_fp8_train_block_helper_accepts_dynamic_nodes():
+    region = build_mamba3_fp8_train_block_region(
+        schedule_template=lambda _: _fused_train_block,
+        nodes=(
+            FusionNode("apply", op="sparse_mla", inputs=("post_y",), outputs=("out",)),
+            FusionNode("post", op="m2rnn", inputs=("scan_y",), outputs=("post_y",)),
+            FusionNode("scan", op="mamba3", inputs=("x",), outputs=("scan_y",)),
+        ),
+    )
+
+    assert [node.name for node in region.nodes] == ["scan", "post", "apply"]
+    assert [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] == [
+        ("scan", "post", "scan_y"),
+        ("post", "apply", "post_y"),
+    ]
+
+
+def test_mamba3_fp8_train_block_helper_does_not_replace_empty_dynamic_nodes():
+    region = build_mamba3_fp8_train_block_region(
+        schedule_template=lambda _: _fused_train_block,
+        nodes=(),
+    )
+
+    assert region.nodes == ()
+    assert region.edges == ()
+
+
+def test_builder_rejects_ambiguous_inferred_chain_producers():
+    builder = (
+        FusionRegionBuilder("ambiguous_chain")
+        .add_node("producer_a", op="toy", outputs=("mid",))
+        .add_node("producer_b", op="toy", outputs=("mid",))
+        .add_node("consumer", op="toy", inputs=("mid",), outputs=("B",))
+        .set_schedule_template(lambda _: _fused_train_block)
+    )
+
+    with pytest.raises(ValueError, match="ambiguous inferred fusion producer.*mid"):
+        builder.build()
+
+
+def test_optimizer_selects_fused_schedule_from_op_chain_with_z3_fullgraph():
+    registry = FusionScheduleRegistry().register(
+        ("mamba3", "m2rnn", "sparse_mla_fp8_prepare", "sparse_mla_fp8_apply"),
+        _logical_train_block_with_internal_edges,
+        name="mamba3_m2rnn_fp8_train_block",
+        status="ready",
+    )
+    optimizer = FusionOptimizer(
+        "mamba3_fp8_train_block",
+        schedule_registry=registry,
+    )
+    optimizer.add_nodes(
+        (
+            FusionNode(
+                "scan",
+                op="mamba3",
+                inputs=("x", "state"),
+                outputs=("mamba3_state",),
+                attrs={"backward": "aot_autograd"},
+            ),
+            FusionNode(
+                "packed",
+                op="m2rnn",
+                inputs=("mamba3_state",),
+                outputs=("packed_post",),
+                attrs={"backward": "aot_autograd"},
+            ),
+            FusionNode(
+                "prepare",
+                op="sparse_mla_fp8_prepare",
+                inputs=("packed_post",),
+                outputs=("q_fp8", "q_scale", "kv_fp8", "kv_scale"),
+            ),
+            FusionNode(
+                "apply",
+                op="sparse_mla_fp8_apply",
+                inputs=("q_fp8", "q_scale", "kv_fp8", "kv_scale"),
+                outputs=("train_block_out",),
+            ),
+        )
+    )
+
+    result = optimizer.compile(
+        target="metal",
+        lowerer=lambda *args, **kwargs: "compiled-optimizer-region",
+    )
+
+    assert result.artifact == "compiled-optimizer-region"
+    assert result.plan.require_single_kernel is True
+    assert result.plan.schedule_name == "mamba3_m2rnn_fp8_train_block"
+    assert result.plan.schedule_status == "ready"
+    assert result.plan.node_names == ("scan", "packed", "prepare", "apply")
+    assert [(edge.producer, edge.consumer, edge.buffer) for edge in result.plan.edges] == [
+        ("scan", "packed", "mamba3_state"),
+        ("packed", "prepare", "packed_post"),
+        ("prepare", "apply", "q_fp8"),
+        ("prepare", "apply", "q_scale"),
+        ("prepare", "apply", "kv_fp8"),
+        ("prepare", "apply", "kv_scale"),
+    ]
+    assert result.plan.pass_configs[PassConfigKey.TL_Z3_PROOF_BARRIER_MINIMIZATION.value] is True
+    assert result.plan.pass_configs[PassConfigKey.TL_Z3_PROOF_ASYNC_ELIGIBILITY.value] is True
+
+
+def test_optimizer_selects_registered_schedule_after_dependency_ordering():
+    registry = FusionScheduleRegistry().register(
+        ("producer", "consumer"),
+        _fused_train_block,
+        name="toy_schedule",
+        status="ready",
+    )
+    optimizer = FusionOptimizer("out_of_order_optimizer", schedule_registry=registry)
+    optimizer.add_node("consumer", op="consumer", inputs=("mid",), outputs=("B",))
+    optimizer.add_node("producer", op="producer", inputs=("A",), outputs=("mid",))
+
+    plan = optimizer.plan()
+
+    assert plan.schedule_name == "toy_schedule"
+    assert plan.node_names == ("producer", "consumer")
+    assert [(edge.producer, edge.consumer, edge.buffer) for edge in plan.edges] == [
+        ("producer", "consumer", "mid")
+    ]
+
+
+def test_optimizer_fails_closed_when_no_fused_schedule_is_registered():
+    optimizer = FusionOptimizer("missing_schedule")
+    optimizer.add_node("producer", op="producer", inputs=("A",), outputs=("mid",))
+    optimizer.add_node("consumer", op="consumer", inputs=("mid",), outputs=("B",))
+
+    with pytest.raises(ValueError, match="no fused schedule registered.*producer,consumer"):
+        optimizer.plan()
+
+
+def test_registry_schedule_is_experimental_until_marked_ready():
+    registry = FusionScheduleRegistry().register(
+        ("producer", "consumer"),
+        _fused_train_block,
+        name="toy_schedule",
+    )
+    optimizer = FusionOptimizer("experimental_schedule", schedule_registry=registry)
+    optimizer.add_node("producer", op="producer", inputs=("A",), outputs=("C",))
+    optimizer.add_node("consumer", op="consumer", inputs=("C",), outputs=("D",))
+
+    plan = optimizer.plan()
+
+    assert plan.schedule_name == "toy_schedule"
+    assert plan.schedule_status == "experimental"
+
+
+def test_cache_key_material_includes_selected_fused_schedule_template():
+    signature = ("producer", "consumer")
+    registry_a = FusionScheduleRegistry().register(signature, _fused_train_block, name="schedule_a")
+    registry_b = FusionScheduleRegistry().register(signature, _fusion_consumer, name="schedule_b")
+
+    def make_plan(registry):
+        optimizer = FusionOptimizer("same_ops", schedule_registry=registry)
+        optimizer.add_node("producer", op="producer", inputs=("A",), outputs=("C",))
+        optimizer.add_node("consumer", op="consumer", inputs=("C",), outputs=("D",))
+        return optimizer.plan()
+
+    plan_a = make_plan(registry_a)
+    plan_b = make_plan(registry_b)
+
+    assert any(part.startswith("schedule:") for part in plan_a.cache_key_material)
+    assert plan_a.cache_key_material != plan_b.cache_key_material
+
+
+def test_cache_key_digest_is_stable_for_equivalent_dependency_ordering():
+    def schedule_template(_region):
+        return _fused_train_block_with_internal_edge
+
+    ordered_region = build_fusion_region(
+        region_name="same_dynamic_region",
+        nodes=(
+            FusionNode("producer", op="producer", inputs=("A",), outputs=("mid",)),
+            FusionNode("consumer", op="consumer", inputs=("mid",), outputs=("D",)),
+        ),
+        schedule_template=schedule_template,
+    )
+    reversed_region = build_fusion_region(
+        region_name="same_dynamic_region",
+        nodes=(
+            FusionNode("consumer", op="consumer", inputs=("mid",), outputs=("D",)),
+            FusionNode("producer", op="producer", inputs=("A",), outputs=("mid",)),
+        ),
+        schedule_template=schedule_template,
+    )
+
+    ordered_result = compile_fusion_region(
+        ordered_region,
+        target="metal",
+        lowerer=lambda *args, **kwargs: "compiled",
+    )
+    reversed_result = compile_fusion_region(
+        reversed_region,
+        target="metal",
+        lowerer=lambda *args, **kwargs: "compiled",
+    )
+
+    assert ordered_result.plan.node_names == reversed_result.plan.node_names
+    assert ordered_result.plan.edges == reversed_result.plan.edges
+    assert ordered_result.plan.cache_key_material == reversed_result.plan.cache_key_material
+    assert fusion_cache_key_digest(
+        ordered_result.plan,
+        ordered_result.lowered_module,
+    ) == fusion_cache_key_digest(
+        reversed_result.plan,
+        reversed_result.lowered_module,
+    )
 
 
 def test_region_without_template_requires_all_nodes_to_be_prim_funcs():
