@@ -260,7 +260,7 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
 }
 
 TIR_REGISTER_TL_TILE_OP(Gemm, gemm)
-    .set_num_inputs(5)
+    .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
@@ -274,7 +274,7 @@ TVM_REGISTER_OP("tl.tileop.wgmma_gemm")
                                        IntImm(DataType::Int(32), 1));
                                return Gemm(args, ann);
                              })
-    .set_num_inputs(5)
+    .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
@@ -288,7 +288,7 @@ TVM_REGISTER_OP("tl.tileop.tcgen05_gemm")
                                        IntImm(DataType::Int(32), 1));
                                return Gemm(args, ann);
                              })
-    .set_num_inputs(5)
+    .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
@@ -298,9 +298,6 @@ TVM_REGISTER_OP("tl.GemmWarpPolicy")
 TVM_FFI_STATIC_INIT_BLOCK() {
   GemmNode::RegisterReflection();
   GemmWarpPolicyNode::RegisterReflection();
-}
-
-TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("tl.GemmWarpPolicyComputeWarpPartition",
                         [](GemmWarpPolicy policy, int M, int N, int block_size,
