@@ -99,10 +99,40 @@ def _add_build_dir_to_syspath() -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _detect_triton_pinned_llvm() -> Tuple[Optional[str], Optional[str]]:
+    """Locate Triton's pinned LLVM under ``~/.triton/llvm/llvm-<sha>-<plat>/``.
+
+    This is the LLVM that upstream Triton's libtriton.so statically links
+    against. Building the shim against the SAME LLVM means the shim and
+    libtriton share LLVM's ManagedStatics in-process, so cl::opt registration
+    is a no-op for the second loader instead of aborting with
+    ``LLVM ERROR: Option '<name>' already exists!``. This must be tried
+    BEFORE brew/system LLVM, otherwise a fresh build re-introduces the
+    static-init crash.
+    """
+    base = Path.home() / ".triton" / "llvm"
+    if not base.is_dir():
+        return None, None
+    # Prefer the platform-tagged dir (llvm-<sha>-macos-arm64) over the
+    # generic `llvm-macos-arm64` symlink so we lock to a specific Triton
+    # commit; cmake then enforces ABI compatibility for us.
+    candidates = sorted(base.glob("llvm-*-*-arm64")) + sorted(base.glob("llvm-*-*-x86_64"))
+    for cand in candidates:
+        mlir_dir = cand / "lib" / "cmake" / "mlir"
+        llvm_dir = cand / "lib" / "cmake" / "llvm"
+        if mlir_dir.is_dir() and llvm_dir.is_dir():
+            return str(mlir_dir), str(llvm_dir)
+    return None, None
+
+
 def _detect_mlir_dirs() -> Tuple[Optional[str], Optional[str]]:
     """Return ``(MLIR_DIR, LLVM_DIR)`` for cmake's ``find_package`` lookup.
 
-    Honours pre-set environment variables first, then probes:
+    Honours pre-set environment variables first, then probes (in order):
+      - Triton-pinned LLVM at ``~/.triton/llvm/llvm-*-<plat>/`` if present.
+        ALWAYS preferred when available — building against the same LLVM as
+        libtriton is the only way to safely co-load the shim and triton in
+        one Python process.
       - macOS:   ``brew --prefix llvm`` -> ``$prefix/lib/cmake/{mlir,llvm}``
       - Linux:   ``/usr/lib/llvm-<N>/lib/cmake/{mlir,llvm}`` for N in 18..14
                  (preferring the largest version that has both directories).
@@ -114,6 +144,11 @@ def _detect_mlir_dirs() -> Tuple[Optional[str], Optional[str]]:
     llvm = os.environ.get("LLVM_DIR")
     if mlir and llvm:
         return mlir, llvm
+
+    # Highest priority: Triton's own pinned LLVM (matches libtriton's static link).
+    triton_mlir, triton_llvm = _detect_triton_pinned_llvm()
+    if triton_mlir and triton_llvm:
+        return mlir or triton_mlir, llvm or triton_llvm
 
     if sys.platform == "darwin":
         brew = shutil.which("brew")
@@ -377,6 +412,14 @@ def _build(verbose: bool = True) -> Tuple[bool, str]:
             f"build reported success but no {SHIM_MODULE_NAME}*.so was "
             f"produced under {_BUILD_DIR}"
         )
+    # Record which LLVM the shim was linked against so the in-process guard
+    # can decide whether co-loading with triton.libtriton is safe (same LLVM
+    # = same ManagedStatics = cl::opts register exactly once).
+    try:
+        marker = _BUILD_DIR / "BUILT_AGAINST.txt"
+        marker.write_text(f"LLVM_DIR={llvm_dir}\nMLIR_DIR={mlir_dir}\n")
+    except OSError:
+        pass  # marker is advisory; absence falls back to the conservative guard
     return True, ""
 
 

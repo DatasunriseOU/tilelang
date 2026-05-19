@@ -148,6 +148,34 @@ def _triton_already_loaded() -> bool:
     return False
 
 
+def _shim_built_against_triton_llvm() -> bool:
+    """Return True if the shim's build marker records Triton's pinned LLVM.
+
+    A ``BUILT_AGAINST.txt`` is dropped next to ``_triton_frontend_cxx*.so``
+    by ``build_cxx`` recording the ``LLVM_DIR`` used at link time. When that
+    path lives under ``~/.triton/llvm/`` (the LLVM that upstream Triton's
+    libtriton statically links against), the shim and libtriton share LLVM's
+    ManagedStatics tables at runtime: cl::opt registration runs exactly once
+    and the second loader becomes a no-op instead of aborting. In that case
+    co-loading both into one Python process is safe, so the conservative
+    refuse-to-load guard can be lifted.
+    """
+    spec = importlib.util.find_spec(SHIM_MODULE_NAME)
+    if spec is None or spec.origin is None:
+        return False
+    marker = os.path.join(os.path.dirname(spec.origin), "BUILT_AGAINST.txt")
+    try:
+        with open(marker) as fh:
+            text = fh.read()
+    except OSError:
+        return False
+    triton_llvm_root = os.path.join(os.path.expanduser("~"), ".triton", "llvm")
+    for line in text.splitlines():
+        if line.startswith("LLVM_DIR=") and triton_llvm_root in line:
+            return True
+    return False
+
+
 def _shim_conflict_warn_once() -> None:
     global _LLVM_CONFLICT_WARNED
     if _LLVM_CONFLICT_WARNED:
@@ -185,7 +213,10 @@ def shim_available() -> bool:
     # If the shim itself is already loaded we are safe regardless of triton.
     if SHIM_MODULE_NAME in sys.modules:
         return True
-    if _triton_already_loaded():
+    # libtriton present + shim built against Triton's pinned LLVM = co-load is
+    # safe (shared ManagedStatics, cl::opt registration runs once). Otherwise
+    # fall back to the conservative refuse-to-load path.
+    if _triton_already_loaded() and not _shim_built_against_triton_llvm():
         _shim_conflict_warn_once()
         return False
     if importlib.util.find_spec(SHIM_MODULE_NAME) is not None:
@@ -228,13 +259,20 @@ def _load_shim() -> Any:
     # that go straight through the load helper don't trip over a stale
     # negative cache from an early ``find_spec`` miss.
     _ensure_shim_on_syspath()
-    if SHIM_MODULE_NAME not in sys.modules and _triton_already_loaded():
+    if (
+        SHIM_MODULE_NAME not in sys.modules
+        and _triton_already_loaded()
+        and not _shim_built_against_triton_llvm()
+    ):
         _shim_conflict_warn_once()
         raise NotImplementedError(
             "PtrAnalysis C++ shim cannot be loaded in this process: "
             "Triton's libtriton (with its own LLVM) is already loaded and "
-            "registering cl::opts twice would abort the interpreter. "
-            "Run shim-dependent tests in a fresh Python process."
+            "the shim is built against a different LLVM (registering "
+            "cl::opts twice would abort the interpreter). Rebuild the shim "
+            "against Triton's pinned LLVM:\n"
+            "  python -m poc.triton_frontend.build_cxx --build\n"
+            "(build_cxx auto-detects ~/.triton/llvm/llvm-*-<plat> when present)."
         )
     try:
         return importlib.import_module(SHIM_MODULE_NAME)
