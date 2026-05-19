@@ -191,7 +191,15 @@ if not env.is_light_import():
     from .language import dtypes  # noqa: F401
     from .autotuner import autotune  # noqa: F401
     from .transform import PassConfigKey  # noqa: F401
-    from .engine import lower, register_cuda_postproc, register_hip_postproc, register_c_postproc  # noqa: F401
+    from .engine import (  # noqa: F401
+        FusionAutogradPlan,
+        FusionRegionBuilder,
+        compile_fusion_region,
+        lower,
+        register_c_postproc,
+        register_cuda_postproc,
+        register_hip_postproc,
+    )
     from .math import *  # noqa: F403
     from . import ir  # noqa: F401
     from . import tileop  # noqa: F401
