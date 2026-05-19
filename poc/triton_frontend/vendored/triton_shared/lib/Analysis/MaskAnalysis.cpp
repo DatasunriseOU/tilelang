@@ -546,15 +546,28 @@ LogicalResult MaskState::parseCmp(arith::CmpIOp cmpOp, const Location loc,
       cmpDim = i;
     }
   }
-  assert(
-      cmpDim != -1 ||
-      (!lhsState.scalar && cmpOp.getPredicate() == arith::CmpIPredicate::slt ||
-       cmpOp.getPredicate() == arith::CmpIPredicate::ult) &&
-          "Unexpected case where no dimension has size larger than 1");
+  if (!(cmpDim != -1 ||
+        ((!lhsState.scalar &&
+          cmpOp.getPredicate() == arith::CmpIPredicate::slt) ||
+         cmpOp.getPredicate() == arith::CmpIPredicate::ult))) {
+    LLVM_DEBUG({
+      InFlightDiagnostic diag =
+          emitRemark(loc,
+                     "Unsupported cmpi with no dimension larger than 1");
+    });
+    return failure();
+  }
 
   OpFoldResult newDim;
   if (lhsState.scalar) {
-    assert(rhsState.scalar && "Unexpected case where rhs is not a scalar");
+    if (!rhsState.scalar) {
+      LLVM_DEBUG({
+        InFlightDiagnostic diag =
+            emitRemark(loc,
+                       "Unsupported cmpi with scalar lhs and non-scalar rhs");
+      });
+      return failure();
+    }
     // If both lhs and rhs are scalars, we can't just derive the dimension of
     // the mask as the minimum value: lhs/rhs could be 0 and then we don't
     // load/store anything.

@@ -13,6 +13,11 @@ on a correctly-built shim.
 """
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import subprocess
+import sys
+import textwrap
 import warnings
 
 import pytest
@@ -58,6 +63,19 @@ module {
 }
 """
 
+UNSUPPORTED_UNIT_MASK_CMP_MLIR = """\
+module {
+  tt.func @kernel(%arg0: !tt.ptr<f32>) {
+    %ptrs = tt.splat %arg0 : !tt.ptr<f32> -> tensor<1x!tt.ptr<f32>>
+    %r = tt.make_range {start = 0 : i32, end = 1 : i32}: tensor<1xi32>
+    %p = tt.addptr %ptrs, %r : tensor<1x!tt.ptr<f32>>, tensor<1xi32>
+    %m = arith.cmpi eq, %r, %r : tensor<1xi32>
+    %v = tt.load %p, %m {cache = 1 : i32, evict = 1 : i32, isVolatile = false}: tensor<1x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+
 
 @pytest.mark.skipif(
     not dialects_available(),
@@ -84,6 +102,55 @@ def test_ptr_analysis_extract_states_returns_list() -> None:
     assert isinstance(states, list)
     for s in states:
         assert isinstance(s, PtrState)
+
+
+@pytest.mark.skipif(
+    not dialects_available(),
+    reason="shim built without TritonStructured/Triton dialects",
+)
+def test_ptr_analysis_unsupported_unit_mask_cmp_fails_recoverably() -> None:
+    """Unsupported unit-mask cmpi must return failure(), not C++ assert().
+
+    microsoft/triton-shared's MaskState::parseCmp used to assert when no
+    dimension was larger than one and the predicate was not an upper-bound
+    comparison. Run in a subprocess so a regression reports a SIGABRT exit
+    instead of aborting the whole pytest process.
+    """
+
+    import _triton_frontend_cxx
+
+    shim_dir = str(Path(_triton_frontend_cxx.__file__).resolve().parent)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        part
+        for part in (
+            shim_dir,
+            str(Path(__file__).resolve().parents[3]),
+            env.get("PYTHONPATH", ""),
+        )
+        if part
+    )
+    script = f"""
+from poc.triton_frontend.ptr_analysis import PtrAnalysis
+
+mlir = {UNSUPPORTED_UNIT_MASK_CMP_MLIR!r}
+rewritten = PtrAnalysis(mlir).rewrite()
+assert "tt.load" in rewritten
+assert "tts.make_tptr" in rewritten
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, (
+        "PtrAnalysis unsupported unit-mask cmpi must fail recoverably; "
+        f"returncode={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
+    )
 
 
 @pytest.mark.skipif(not shim_available(), reason="C++ shim not built")
