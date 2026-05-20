@@ -5,6 +5,8 @@
  */
 
 #include "operator.h"
+#include "support/check.h"
+#include <tvm/runtime/logging.h>
 
 #include "builtin.h"
 

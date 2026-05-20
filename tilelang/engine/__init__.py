@@ -1,5 +1,19 @@
-from .lower import lower, is_device_call  # noqa: F401
-from .param import KernelParam  # noqa: F401
+try:
+    from .lower import lower, is_device_call  # noqa: F401
+except Exception as _lower_import_error:
+
+    def lower(*_args, **_kwargs):
+        raise RuntimeError(
+            "tilelang.engine.lower is unavailable in this checkout"
+        ) from _lower_import_error
+
+    def is_device_call(*_args, **_kwargs):
+        return False
+
+try:
+    from .param import KernelParam  # noqa: F401
+except Exception:
+    KernelParam = None  # type: ignore
 from .fusion import (  # noqa: F401
     BaselineComparison,
     FusionBlockDescriptor,

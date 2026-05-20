@@ -11,7 +11,9 @@ def is_metal_arch(arch: TileDevice) -> bool:
 class METAL(TileDevice):
     def __init__(self, target: Target | str):
         if isinstance(target, str):
-            target = Target(target)
+            from tilelang.utils.target import determine_target
+
+            target = determine_target(target, return_object=True)
         self.target = target
         device = tvm.runtime.metal(0)
         if not device.exist:

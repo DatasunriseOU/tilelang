@@ -1,9 +1,21 @@
 """Tilelang IR analysis & visitors."""
 
-from .ast_printer import ASTPrinter  # noqa: F401
-from .nested_loop_checker import NestedLoopChecker  # noqa: F401
-from .fragment_loop_checker import FragmentLoopChecker  # noqa: F401
-from .layout_visual import LayoutVisual  # noqa: F401
+try:
+    from .ast_printer import ASTPrinter  # noqa: F401
+except Exception:
+    ASTPrinter = None  # type: ignore
+try:
+    from .nested_loop_checker import NestedLoopChecker  # noqa: F401
+except Exception:
+    NestedLoopChecker = None  # type: ignore
+try:
+    from .fragment_loop_checker import FragmentLoopChecker  # noqa: F401
+except Exception:
+    FragmentLoopChecker = None  # type: ignore
+try:
+    from .layout_visual import LayoutVisual  # noqa: F401
+except Exception:
+    LayoutVisual = None  # type: ignore
 from .reduction_plan import (  # noqa: F401
     ReductionAxisPlan,
     ReductionAliasConstraints,

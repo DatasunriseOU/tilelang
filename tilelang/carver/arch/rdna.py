@@ -25,7 +25,9 @@ def is_rdna_arch(arch: TileDevice) -> bool:
 class RDNA(TileDevice):
     def __init__(self, target: Target | str):
         if isinstance(target, str):
-            target = tvm.target.Target(target)
+            from tilelang.utils.target import determine_target
+
+            target = determine_target(target, return_object=True)
         self.target = target
         self.rdna_generation = target_get_rdna_generation(target)
         if self.rdna_generation != 11:

@@ -3,9 +3,8 @@
  * \brief Annotate PrimFunc parameters that are read-only (never written).
  */
 
+#include "support/check.h"
 #include <string>
-#include <tvm/ffi/function.h>
-#include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/transform.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/expr.h>
@@ -181,7 +180,7 @@ Pass AnnotateReadOnlyParams() {
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
-  namespace refl = tvm::ffi::reflection;
+  namespace refl = reflection;
   refl::GlobalDef().def("tl.transform.AnnotateReadOnlyParams",
                         AnnotateReadOnlyParams);
 }

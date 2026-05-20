@@ -5,6 +5,7 @@
  */
 
 #include "builtin.h"
+#include "support/check.h"
 
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
@@ -37,7 +38,7 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kDisableShuffleElect, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kStorageRewriteDetectInplace, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kASTPrintEnable, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kLayoutVisualizationEnable, Bool);
-TVM_REGISTER_PASS_CONFIG_OPTION(kLayoutVisualizationFormats, String);
+TVM_REGISTER_PASS_CONFIG_OPTION(kLayoutVisualizationFormats, ffi::String);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDeviceCompileFlags, ffi::Array<ffi::String>);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableDataRaceCheck, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kEnableLowerLDGSTG, Bool);
