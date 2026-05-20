@@ -50,6 +50,18 @@ class _ProductionMonkeypatchVisitor(ast.NodeVisitor):
             self.findings.append(f"{self.path}:{node.lineno}: call {'.'.join(chain)}")
         self.generic_visit(node)
 
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self._check_assignment_targets(node.targets, node.lineno)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self._check_assignment_targets([node.target], node.lineno)
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self._check_assignment_targets([node.target], node.lineno)
+        self.generic_visit(node)
+
     def _check_args(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         args = [
             *node.args.posonlyargs,
@@ -62,6 +74,15 @@ class _ProductionMonkeypatchVisitor(ast.NodeVisitor):
             args.append(node.args.kwarg)
         if any(arg.arg == "monkeypatch" for arg in args):
             self.findings.append(f"{self.path}:{node.lineno}: monkeypatch argument")
+
+    def _check_assignment_targets(self, targets: list[ast.expr], lineno: int) -> None:
+        for target in targets:
+            chain = _attribute_chain(target)
+            if chain in {
+                ("ctypes", "CDLL", "__init__"),
+                ("_optional_torch_c_dlpack", "load_torch_c_dlpack_extension"),
+            }:
+                self.findings.append(f"{self.path}:{lineno}: assignment {'.'.join(chain)}")
 
 
 def test_lint_tilelang_production_has_no_monkeypatch_or_mock_patch() -> None:
