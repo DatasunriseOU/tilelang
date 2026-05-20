@@ -597,8 +597,14 @@ LogicalResult MaskState::parseCmp(arith::CmpIOp cmpOp, const Location loc,
     newEnd = maxOFRs(newEnd, lhsState.start, loc, builder);
     newDim = subOFRs(newEnd, lhsState.start, loc, builder);
   } else {
-    assert(cmpOp.getPredicate() == arith::CmpIPredicate::sge &&
-           rhsState.scalar && hasConstZero(rhsState.scalar));
+    if (!(cmpOp.getPredicate() == arith::CmpIPredicate::sge &&
+          rhsState.scalar && hasConstZero(rhsState.scalar))) {
+      LLVM_DEBUG({
+        InFlightDiagnostic diag =
+            emitRemark(loc, "Unsupported cmpi lower-bound fallthrough");
+      });
+      return failure();
+    }
     newDim = lhsState.dims[cmpDim];
   }
 

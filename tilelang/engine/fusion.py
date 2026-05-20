@@ -48,6 +48,7 @@ class FusionEdge:
     consumer: str
     buffer: str
     lifetime: str = "internal"
+    differentiable: bool = True
 
 
 @dataclass(frozen=True)
@@ -249,12 +250,14 @@ class FusionOptimizer:
         *,
         buffer: str,
         lifetime: str = "internal",
+        differentiable: bool = True,
     ) -> FusionOptimizer:
         self._builder.connect(
             producer,
             consumer,
             buffer=buffer,
             lifetime=lifetime,
+            differentiable=differentiable,
         )
         return self
 
@@ -432,8 +435,17 @@ class FusionRegionBuilder:
         *,
         buffer: str,
         lifetime: str = "internal",
+        differentiable: bool = True,
     ) -> FusionRegionBuilder:
-        self._edges.append(FusionEdge(producer=producer, consumer=consumer, buffer=buffer, lifetime=lifetime))
+        self._edges.append(
+            FusionEdge(
+                producer=producer,
+                consumer=consumer,
+                buffer=buffer,
+                lifetime=lifetime,
+                differentiable=differentiable,
+            )
+        )
         return self
 
     def _edges_with_inferred_chain(self) -> tuple[FusionEdge, ...]:
@@ -686,7 +698,13 @@ def build_fusion_region(
         .set_schedule_template(schedule_template, name=schedule_name, status=schedule_status)
     )
     for edge in edges:
-        builder.connect(edge.producer, edge.consumer, buffer=edge.buffer, lifetime=edge.lifetime)
+        builder.connect(
+            edge.producer,
+            edge.consumer,
+            buffer=edge.buffer,
+            lifetime=edge.lifetime,
+            differentiable=edge.differentiable,
+        )
     if enable_z3_sync_async_optimization:
         builder.enable_z3_sync_async_optimization()
     return builder.build()
@@ -1095,6 +1113,7 @@ def _autograd_plan_for(region: FusionRegion) -> FusionAutogradPlan:
         for edge in reversed(region.edges)
         if edge.producer in aot_forward_node_set
         and edge.consumer in aot_forward_node_set
+        and edge.differentiable
         and f"{edge.producer}_bwd" in planned_backward_node_set
         and f"{edge.consumer}_bwd" in planned_backward_node_set
     )
