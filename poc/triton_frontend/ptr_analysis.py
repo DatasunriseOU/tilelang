@@ -244,14 +244,10 @@ def shim_available() -> bool:
     # If the shim itself is already loaded we are safe regardless of triton.
     if SHIM_MODULE_NAME in sys.modules:
         return True
-    # Even when the shim is built against Triton's pinned LLVM (shared
-    # ManagedStatics, so cl::opt registration is no-op), several vendored
-    # microsoft/triton-shared analyses (MaskAnalysis.cpp:553 parseCmp, etc.)
-    # still contain ``assert()`` paths that SIGABRT the whole interpreter
-    # on shapes they don't yet handle. The subprocess-isolated rewrite
-    # path in path_d_runtime_adapter catches those as exit -6; the
-    # in-process path cannot recover. Until those asserts are converted
-    # into recoverable errors, keep the conservative refuse-to-load guard.
+    # Even after the MaskAnalysis parseCmp asserts were converted into
+    # recoverable failures, importing the shim into a process that already
+    # loaded upstream Triton's libtriton can still hit duplicate LLVM static
+    # initialization. Keep this guard scoped to that loader conflict.
     if _triton_already_loaded():
         _shim_conflict_warn_once()
         return False
@@ -299,14 +295,10 @@ def _load_shim() -> Any:
         _shim_conflict_warn_once()
         raise NotImplementedError(
             "PtrAnalysis C++ shim cannot be loaded in this process: "
-            "Triton's libtriton is already loaded. Even when the shim is "
-            "built against Triton's pinned LLVM (shared ManagedStatics, "
-            "no cl::opt double-registration), the vendored microsoft/"
-            "triton-shared analyses still contain unrecoverable assert() "
-            "paths that SIGABRT the interpreter on unsupported shapes "
-            "(e.g. MaskAnalysis.cpp:553 parseCmp). Run shim-dependent "
-            "work in a subprocess (path_d_runtime_adapter does this) or "
-            "in a fresh interpreter."
+            "Triton's libtriton is already loaded, so importing the shim "
+            "can trip duplicate LLVM static initialization. Run shim-dependent "
+            "work in a subprocess (path_d_runtime_adapter does this) or in a "
+            "fresh interpreter."
         )
     try:
         return importlib.import_module(SHIM_MODULE_NAME)

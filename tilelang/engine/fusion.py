@@ -242,6 +242,22 @@ class FusionOptimizer:
         )
         return self
 
+    def connect(
+        self,
+        producer: str,
+        consumer: str,
+        *,
+        buffer: str,
+        lifetime: str = "internal",
+    ) -> FusionOptimizer:
+        self._builder.connect(
+            producer,
+            consumer,
+            buffer=buffer,
+            lifetime=lifetime,
+        )
+        return self
+
     def set_schedule_template(self, schedule_template: ScheduleTemplate) -> FusionOptimizer:
         self._builder.set_schedule_template(schedule_template)
         return self
@@ -842,7 +858,11 @@ def _validate_internal_edges_do_not_escape_entry_abi(func: tir.PrimFunc, region:
         return
 
     internal_buffers = {edge.buffer for edge in region.edges if edge.lifetime == "internal"}
-    escaped = sorted(internal_buffers & _entry_buffer_names(func))
+    scratch_abi_buffers = _internal_scratch_abi_buffer_names(func)
+    escaped = sorted(
+        internal_buffers
+        & (_entry_buffer_names(func) - scratch_abi_buffers)
+    )
     if not escaped:
         return
 
@@ -912,7 +932,13 @@ def _validate_explicit_schedule_covers_region_abi(func: tir.PrimFunc, region: Fu
     if region.schedule_template is _auto_prim_func_region_template:
         return
 
-    missing = sorted(_required_external_region_buffers(region) - _entry_buffer_names(func))
+    entry_names = _entry_buffer_names(func)
+    missing = sorted(_required_external_region_buffers(region) - entry_names)
+    missing = [
+        buffer
+        for buffer in missing
+        if not _physical_abi_map_covers_buffer(func, buffer, entry_names)
+    ]
     if not missing:
         return
 
@@ -921,6 +947,59 @@ def _validate_explicit_schedule_covers_region_abi(func: tir.PrimFunc, region: Fu
         f"{', '.join(missing)}. A fullgraph fused schedule must expose every external "
         "region input/output while keeping internal producer/consumer edges inside the entry PrimFunc."
     )
+
+
+def _physical_abi_map_covers_buffer(
+    func: tir.PrimFunc,
+    buffer_name: str,
+    entry_names: set[str],
+) -> bool:
+    mapping = _physical_abi_logical_to_physical(func)
+    mapped = mapping.get(buffer_name)
+    if not isinstance(mapped, Mapping):
+        return False
+    bank = mapped.get("bank")
+    return isinstance(bank, str) and bank in entry_names
+
+
+def _physical_abi_logical_to_physical(func: tir.PrimFunc) -> Mapping[str, Any]:
+    raw = _prim_func_string_attr(func, "tl.fusion.physical_abi.logical_to_physical")
+    if raw is None:
+        return {}
+    with suppress(json.JSONDecodeError, TypeError):
+        decoded = json.loads(raw)
+        if isinstance(decoded, Mapping):
+            return decoded
+    return {}
+
+
+def _internal_scratch_abi_buffer_names(func: tir.PrimFunc) -> set[str]:
+    raw = _prim_func_string_attr(func, "tl.fusion.internal_scratch_abi_buffers")
+    if raw is None:
+        return set()
+    with suppress(json.JSONDecodeError, TypeError):
+        decoded = json.loads(raw)
+        if isinstance(decoded, Sequence) and not isinstance(decoded, str | bytes):
+            return {str(buffer) for buffer in decoded}
+    return set()
+
+
+def _prim_func_string_attr(func: tir.PrimFunc, key: str) -> str | None:
+    attrs = getattr(func, "attrs", None)
+    if attrs is None:
+        return None
+    try:
+        value = attrs.get(key)
+    except (AttributeError, TypeError):
+        try:
+            value = attrs[key]
+        except (KeyError, TypeError):
+            value = None
+    if value is None:
+        return None
+    if hasattr(value, "value"):
+        return str(value.value)
+    return str(value)
 
 
 def _module_from_template(

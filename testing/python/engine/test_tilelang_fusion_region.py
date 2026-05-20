@@ -137,6 +137,17 @@ def _leaky_fused_train_block(
         D[0] = A[0] + packed_post[0]
 
 
+@T.prim_func
+def _internal_scratch_abi_fused_train_block(
+    A: T.Buffer((4,), "float32"),
+    packed_post: T.Buffer((4,), "float32"),
+    D: T.Buffer((4,), "float32"),
+):
+    with T.Kernel(1, threads=1):
+        packed_post[0] = A[0]
+        D[0] = packed_post[0]
+
+
 def test_region_compile_uses_one_pre_source_ir_module_with_z3_config():
     assert exported_compile_fusion_region is compile_fusion_region
     assert tilelang.compile_fusion_region is compile_fusion_region
@@ -224,6 +235,30 @@ def test_explicit_fused_schedule_rejects_internal_edges_in_entry_abi():
 
     with pytest.raises(ValueError, match="internal fusion edge buffers escaped.*packed_post"):
         compile_fusion_region(region, target="metal", lowerer=lambda *args, **kwargs: "compiled")
+
+
+def test_explicit_fused_schedule_accepts_marked_internal_scratch_abi():
+    def schedule_template(_region):
+        return _internal_scratch_abi_fused_train_block.with_attr(
+            "tl.fusion.internal_scratch_abi_buffers",
+            '["packed_post"]',
+        )
+
+    region = build_mamba3_fp8_train_block_region(schedule_template=schedule_template)
+
+    result = compile_fusion_region(
+        region,
+        target="metal",
+        lowerer=lambda *args, **kwargs: "compiled",
+    )
+
+    entry = result.lowered_module[region.entry_symbol]
+    assert result.artifact == "compiled"
+    assert [buffer.name for buffer in entry.buffer_map.values()] == [
+        "A",
+        "packed_post",
+        "D",
+    ]
 
 
 def test_prim_func_graph_can_compile_without_manual_schedule_template():
