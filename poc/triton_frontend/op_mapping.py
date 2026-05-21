@@ -46,6 +46,7 @@ __all__ = [
     "EmitError",
     "EmitFn",
     "WalkerCtx",
+    "materialize_lazy_tile",
     # Memory ops
     "map_tt_atomic_rmw",
     # Compute ops
@@ -228,7 +229,11 @@ class WalkerCtx:
     test-friendly without importing TVM at module load time.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        ptr_analysis_shim_available: Optional[bool] = None,
+    ) -> None:
         # SSA value -> tvm.tir.PrimExpr or tvm.tir.Buffer
         self.value_map: Dict[Any, Any] = {}
         # Ordered list of emitted statements (becomes a SeqStmt body).
@@ -251,6 +256,12 @@ class WalkerCtx:
         # ``op_emitters/memory.py`` look up here to choose between the real
         # T.copy path and the per-element ``# DEGRADED:`` fallback.
         self.ptr_states: Dict[str, Any] = {}
+        # Optional explicit override for tests and isolated harnesses that
+        # need deterministic PtrAnalysis availability without mutating module
+        # globals. ``None`` keeps the production probe.
+        self.ptr_analysis_shim_available: Optional[bool] = (
+            ptr_analysis_shim_available
+        )
         # Symbol name (e.g. "@triton.language.standard.max__...") -> tt.func
         # op. Populated by the module-level pre-pass in
         # ``triton_frontend._walk_mlir_module`` so the ``tt.call`` emitter can
@@ -980,6 +991,71 @@ def _alloc_tile_buffer(
             buf = tir.decl_buffer(shape_list, dtype, name=name)
     ctx.local_buffers.append(buf)
     return buf
+
+
+def materialize_lazy_tile(
+    ctx: "WalkerCtx",
+    expr: LazyTileExpr,
+    shape: Optional[Sequence[Any]] = None,
+    dtype: Optional[str] = None,
+    *,
+    name: str,
+    scope: str = "local",
+    loop_var_prefix: Optional[str] = None,
+) -> Any:
+    """Materialize a lane-indexable tile expression when a Buffer is required."""
+
+    tir = ctx.tir()
+    dst_shape = list(shape or expr.shape or [1])
+    dst_dtype = _normalize_mlir_dtype(str(dtype or expr.dtype or "float32"))
+    dst = _alloc_tile_buffer(
+        ctx,
+        dst_shape,
+        dst_dtype,
+        ctx.fresh(name),
+        scope=scope,
+    )
+    loop_vars = [
+        tir.Var(
+            ctx.fresh(
+                f"{loop_var_prefix}{axis}"
+                if loop_var_prefix is not None
+                else f"{name}_i{axis}"
+            ),
+            "int32",
+        )
+        for axis, _extent in enumerate(dst_shape or [1])
+    ]
+
+    rank = len(expr.shape)
+    if rank:
+        if len(loop_vars) >= rank:
+            src_indices = list(loop_vars[-rank:])
+        else:
+            src_indices = [tir.const(0, "int32")] * (rank - len(loop_vars)) + list(loop_vars)
+        for axis, extent in enumerate(expr.shape):
+            if int(extent) == 1:
+                src_indices[axis] = tir.const(0, "int32")
+        value = expr.read_lane(ctx, tuple(src_indices))
+    else:
+        value = expr.read_lane(ctx, ())
+
+    store = tir.BufferStore(
+        dst,
+        value,
+        list(loop_vars) or [tir.const(0, "int32")],
+    )
+    body: Any = store
+    for var, extent in zip(reversed(loop_vars), reversed(dst_shape or [1])):
+        body = tir.For(
+            var,
+            tir.const(0, "int32"),
+            tir.const(int(extent), "int32"),
+            tir.ForKind.SERIAL,
+            body,
+        )
+    ctx.emit(body)
+    return dst
 
 
 def _emit_load_copy(op: Any, ctx: "WalkerCtx", resolved: Dict[str, Any],

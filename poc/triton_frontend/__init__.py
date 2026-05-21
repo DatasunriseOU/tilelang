@@ -165,7 +165,6 @@ def _flat_extent_for_indices(
 
     Broadcast = getattr(tvm_mod.tir, "Broadcast", None)
     Ramp = getattr(tvm_mod.tir, "Ramp", None)
-    BufferLoad = getattr(tvm_mod.tir, "BufferLoad", None)
 
     # Walk the (single, post-flatten) offset expression collecting Vars
     # that are program_id Vars. For the typical ``pid * stride + col``
@@ -1016,17 +1015,21 @@ def from_triton_kernel(
         fn, grid=grid, constexprs=constexprs, target=target
     )
     # ``_compile_to_ttir`` may return either an ``mlir.ir.Module`` or a
-    # textual MLIR string (depending on Triton version). Force the MLIR
-    # object path: re-parse the text through ``mlir.ir`` so the walker
-    # sees real ops. Fall back to the explicit text-walker only when the
-    # MLIR Python bindings are unavailable.
+    # textual MLIR string (depending on Triton version). Delegate string
+    # TTIR to ``from_ttir`` so the same PtrAnalysis + generic-form MLIR
+    # parser path handles direct and harness callers. Fall back to the
+    # explicit text-walker only when that real path is unavailable.
     if isinstance(ttir_module, str):
         try:
-            from mlir import ir as _mlir_ir  # type: ignore
-            ctx = _mlir_ir.Context()
-            ctx.allow_unregistered_dialects = True
-            ttir_module = _mlir_ir.Module.parse(ttir_module, ctx)
-        except Exception as exc:  # pragma: no cover -- mlir bindings absent
+            return from_ttir(
+                ttir_module,
+                target=target,
+                name=getattr(fn, "__name__", "main"),
+                grid=grid,
+            )
+        except TypeError as exc:
+            if "textual TTIR is no longer the default path" not in str(exc):
+                raise
             warnings.warn(
                 "triton_frontend: mlir.ir bindings unavailable; using "
                 f"text-TTIR coverage walker. cause={exc!r}",

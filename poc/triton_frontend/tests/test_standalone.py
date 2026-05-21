@@ -9,6 +9,10 @@ own (no shim loaded yet) behaves exactly like before.
 """
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
+
 import pytest
 
 from poc.triton_frontend._test_harness.native_import_guard import (
@@ -30,9 +34,6 @@ if _triton_block_reason is not None:
         allow_module_level=True,
     )
 
-import numpy as np  # noqa: E402
-import tvm  # noqa: E402
-import tvm.testing  # noqa: E402
 import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
@@ -49,29 +50,57 @@ def _vector_add_kernel(x_ptr, y_ptr, out_ptr, n_elements, BLOCK: tl.constexpr):
     tl.store(out_ptr + offsets, x + y, mask=mask)
 
 
-@pytest.mark.xfail(reason="Expected locally if LLVM is missing", raises=ValueError)
 def test_run():
-    N = 1024
     BLOCK = 128
-    func = from_triton_kernel(_vector_add_kernel, constexprs={"BLOCK": BLOCK}, target="llvm")
-    print("Lowered func!")
+    func = from_triton_kernel(
+        _vector_add_kernel,
+        constexprs={"BLOCK": BLOCK},
+        target="metal",
+    )
+    text = str(func)
+    assert "_vector_add_kernel" in text
+    assert "arg0" in text
+    assert "arg1" in text
+    assert "arg2" in text
 
-    rt_mod = tvm.build(func, target="llvm")
-    print("Built func!")
+    result = _run_vector_add_numeric_smoke_in_fresh_process()
+    assert result["verdict"] == "NUMERIC_PASS", result
+    assert result["max_abs_err"] is not None
 
-    x_np = np.random.rand(N).astype("float32")
-    y_np = np.random.rand(N).astype("float32")
-    out_np = np.zeros(N, dtype="float32")
 
-    dev = tvm.cpu()
-    x_tvm = tvm.nd.array(x_np, dev)
-    y_tvm = tvm.nd.array(y_np, dev)
-    out_tvm = tvm.nd.array(out_np, dev)
+def _run_vector_add_numeric_smoke_in_fresh_process() -> dict[str, object]:
+    sentinel = "__TRITON_STANDALONE_VECTOR_ADD__"
+    script = f"""
+import dataclasses
+import json
+from poc.triton_frontend._test_harness import numeric_smoke
 
-    rt_mod(x_tvm, y_tvm, out_tvm, N)
-    print("Ran func!")
-    tvm.testing.assert_allclose(out_tvm.numpy(), x_np + y_np)
-    print("Passed!")
+result = numeric_smoke.run_one("vector_add", numeric_smoke._probe_deps())
+print({sentinel!r} + json.dumps(dataclasses.asdict(result), sort_keys=True))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.fail(
+            "standalone vector_add numeric smoke failed with "
+            f"exit={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
+            f"STDERR:\n{completed.stderr}"
+        )
+    for line in reversed(completed.stdout.splitlines()):
+        if line.startswith(sentinel):
+            result = json.loads(line[len(sentinel) :])
+            if result["verdict"] == "SKIP":
+                pytest.skip(result.get("detail") or "<no detail>")
+            return result
+    pytest.fail(
+        "standalone vector_add numeric smoke did not emit result sentinel\n"
+        f"STDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+    )
 
 
 if __name__ == "__main__":

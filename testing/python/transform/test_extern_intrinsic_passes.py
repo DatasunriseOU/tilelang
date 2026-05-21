@@ -14,6 +14,8 @@ carries the inferred Fragment layout / pipeline-stage AttrStmt.
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 
 tvm = pytest.importorskip("tvm")
@@ -28,6 +30,10 @@ from tilelang.language.extern import (  # noqa: E402
 )
 
 _CUDA_TARGET = tvm.target.Target("cuda")
+
+
+def _registered_transform_is_callable(name: str) -> bool:
+    return callable(tvm.get_global_func(name, allow_missing=True))
 
 
 # ---------------------------------------------------------------------------
@@ -74,8 +80,7 @@ def _bind_layout_target(mod: tvm.IRModule) -> tvm.IRModule:
 
 
 @pytest.mark.skipif(
-    not hasattr(tvm.get_global_func("tl.transform.LayoutInference", allow_missing=True),
-                "__call__"),
+    not _registered_transform_is_callable("tl.transform.LayoutInference"),
     reason="tl.transform.LayoutInference not registered (TileLang C++ side missing).",
 )
 def test_layout_inference_picks_up_extern_meta():
@@ -114,9 +119,7 @@ def test_layout_inference_picks_up_extern_meta():
 
 
 @pytest.mark.skipif(
-    not hasattr(tvm.get_global_func("tl.transform.InjectSoftwarePipeline",
-                                    allow_missing=True),
-                "__call__"),
+    not _registered_transform_is_callable("tl.transform.InjectSoftwarePipeline"),
     reason="tl.transform.InjectSoftwarePipeline not registered.",
 )
 def test_inject_pipeline_picks_up_extern_meta():
@@ -152,9 +155,7 @@ def test_inject_pipeline_picks_up_extern_meta():
 
 
 @pytest.mark.skipif(
-    not hasattr(tvm.get_global_func("tl.transform.InjectSoftwarePipeline",
-                                    allow_missing=True),
-                "__call__"),
+    not _registered_transform_is_callable("tl.transform.InjectSoftwarePipeline"),
     reason="tl.transform.InjectSoftwarePipeline not registered.",
 )
 def test_inject_pipeline_passthrough_for_unset_stage():
@@ -198,8 +199,7 @@ def test_build_meta_emits_tile_size():
 
 
 @pytest.mark.skipif(
-    not hasattr(tvm.get_global_func("tl.transform.LayoutInference", allow_missing=True),
-                "__call__"),
+    not _registered_transform_is_callable("tl.transform.LayoutInference"),
     reason="tl.transform.LayoutInference not registered (TileLang C++ side missing).",
 )
 def test_layout_inference_dispatches_mma_tile_size():
@@ -226,8 +226,7 @@ def test_layout_inference_dispatches_mma_tile_size():
 
 
 @pytest.mark.skipif(
-    not hasattr(tvm.get_global_func("tl.transform.LayoutInference", allow_missing=True),
-                "__call__"),
+    not _registered_transform_is_callable("tl.transform.LayoutInference"),
     reason="tl.transform.LayoutInference not registered.",
 )
 def test_layout_inference_unknown_layout_falls_through():
@@ -257,32 +256,143 @@ def test_lower_extern_intrinsic_per_target_dispatch():
     from tilelang.transform import LowerExternIntrinsic
     from tilelang.language.extern_registry import unregister
 
+    name = "test_dispatch"
     try:
-        op = extern_intrinsic(
-            name="test_dispatch",
+        with contextlib.suppress(KeyError):
+            unregister(name)
+
+        extern_intrinsic(
+            name=name,
             signature=lambda: (Frag("c", (16, 16), "local", "float32", is_output=True),),
             bodies={
                 "cuda": '__device__ void test_dispatch(float* c) { c[0] = 1.0f; }',
                 "metal": 'void test_dispatch(threadgroup float* c) { c[0] = 1.0f; }'
             }
         )
-    except Exception:
-        pass # allow running the test multiple times or ignore if already registered
+
+        @T.prim_func
+        def kernel(C: T.Buffer((16, 16), "float32")):
+            with T.sblock("root"):
+                T.evaluate(T.call_extern("handle", "tl.extern_intrinsic.test_dispatch", C.access_ptr("rw")))
+
+        mod = tvm.IRModule({"main": kernel})
+
+        cuda_mod = LowerExternIntrinsic("cuda")(mod)
+        cuda_func = cuda_mod["main"]
+        assert "pragma_import_c" in str(cuda_func.body)
+        assert "void test_dispatch(float* c)" in str(cuda_func.body)
+        assert "threadgroup" not in str(cuda_func.body)
+
+        metal_mod = LowerExternIntrinsic("metal")(mod)
+        metal_func = metal_mod["main"]
+        assert "pragma_import_c" in str(metal_func.body)
+        assert "void test_dispatch(threadgroup float* c)" in str(metal_func.body)
+    finally:
+        with contextlib.suppress(KeyError):
+            unregister(name)
+
+
+def test_lower_extern_intrinsic_accepts_cutedsl_body_target():
+    """CuTeDSL extern bodies must be selectable separately from CUDA bodies."""
+    from tilelang.language.extern import extern_intrinsic, Frag
+    from tilelang.transform import LowerExternIntrinsic
+    from tilelang.language.extern_registry import unregister
+
+    name = "test_cutedsl_dispatch"
+    body = """import cutlass.cute as cute
+
+@cute.kernel
+def test_cutedsl_dispatch(c: cute.Tensor):
+    c[0] = c[0]
+"""
+    try:
+        with contextlib.suppress(KeyError):
+            unregister(name)
+
+        extern_intrinsic(
+            name=name,
+            signature=lambda: (Frag("c", (16, 16), "local", "float32", is_output=True),),
+            bodies={"cutedsl": body},
+        )
+
+        @T.prim_func
+        def kernel(C: T.Buffer((16, 16), "float32")):
+            with T.sblock("root"):
+                T.evaluate(
+                    T.call_extern(
+                        "handle",
+                        "tl.extern_intrinsic.test_cutedsl_dispatch",
+                        C.access_ptr("rw"),
+                    )
+                )
+
+        cutedsl_mod = LowerExternIntrinsic("cutedsl")(tvm.IRModule({"main": kernel}))
+        cutedsl_body = cutedsl_mod["main"].script(show_meta=True)
+        assert "pragma_import_c" in cutedsl_body
+        assert "@cute.kernel" in cutedsl_body
+        assert "test_cutedsl_dispatch" in cutedsl_body
+        assert "tl.extern_intrinsic.test_cutedsl_dispatch" not in cutedsl_body
+    finally:
+        with contextlib.suppress(KeyError):
+            unregister(name)
+
+
+def test_cutedsl_target_selects_cutedsl_extern_intrinsic_target():
+    from tilelang.engine.lower import _extern_intrinsic_target_name
+
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80", "keys": ["cuda", "gpu", "cutedsl"]})
+    assert _extern_intrinsic_target_name(target) == "cutedsl"
+    assert _extern_intrinsic_target_name(_CUDA_TARGET) == "cuda"
+
+
+def test_lower_extern_intrinsic_missing_target_body_fails_closed():
+    """Extern fusion must surface missing target bodies at lowering time."""
+    from tilelang.language.extern import extern_intrinsic, Frag
+    from tilelang.transform import LowerExternIntrinsic
+    from tilelang.language.extern_registry import unregister
+
+    name = "test_dispatch_cuda_only"
+    try:
+        extern_intrinsic(
+            name=name,
+            signature=lambda: (Frag("c", (16, 16), "local", "float32", is_output=True),),
+            bodies={"cuda": '__device__ void test_dispatch_cuda_only(float* c) { c[0] = 1.0f; }'},
+        )
+
+        @T.prim_func
+        def kernel(C: T.Buffer((16, 16), "float32")):
+            with T.sblock("root"):
+                T.evaluate(
+                    T.call_extern(
+                        "handle",
+                        "tl.extern_intrinsic.test_dispatch_cuda_only",
+                        C.access_ptr("rw"),
+                    )
+                )
+
+        mod = tvm.IRModule({"main": kernel})
+        with pytest.raises(ValueError, match="has no body for target 'metal'"):
+            LowerExternIntrinsic("metal")(mod)
+    finally:
+        with contextlib.suppress(KeyError):
+            unregister(name)
+
+
+def test_lower_extern_intrinsic_unregistered_symbol_fails_closed():
+    """Prefixed extern calls must resolve through the registry explicitly."""
+    from tilelang.transform import LowerExternIntrinsic
 
     @T.prim_func
     def kernel(C: T.Buffer((16, 16), "float32")):
         with T.sblock("root"):
-            T.evaluate(T.call_extern("handle", "tl.extern_intrinsic.test_dispatch", C.access_ptr("rw")))
+            T.evaluate(
+                T.call_extern(
+                    "handle",
+                    "tl.extern_intrinsic.not_registered",
+                    C.access_ptr("rw"),
+                )
+            )
 
     mod = tvm.IRModule({"main": kernel})
-    
-    cuda_mod = LowerExternIntrinsic("cuda")(mod)
-    cuda_func = cuda_mod["main"]
-    assert "pragma_import_c" in str(cuda_func.body)
-    assert "void test_dispatch(float* c)" in str(cuda_func.body)
-    assert "threadgroup" not in str(cuda_func.body)
-    
-    metal_mod = LowerExternIntrinsic("metal")(mod)
-    metal_func = metal_mod["main"]
-    assert "pragma_import_c" in str(metal_func.body)
-    assert "void test_dispatch(threadgroup float* c)" in str(metal_func.body)
+    with pytest.raises(ValueError, match="not_registered' is not registered"):
+        LowerExternIntrinsic("metal")(mod)

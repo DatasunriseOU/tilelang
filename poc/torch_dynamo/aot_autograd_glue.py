@@ -83,6 +83,7 @@ to be safe — see :func:`_import_make_boxed_func`.
 
 from __future__ import annotations
 
+import importlib
 import threading
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
@@ -383,6 +384,27 @@ def register_double_backward(
     bwd_op = _REGISTRY.get(bwd_op_qualname)
     if bwd_op is None:
         return False
+    try:
+        import torch as _torch  # type: ignore[import-not-found]
+
+        ns_name, op_name = fwd_op_qualname.split("::", 1)
+        getattr(getattr(_torch.ops, ns_name), op_name)
+    except Exception:
+        return False
+
+    def _boxed_list_grad_return(ctx: Any, grads: list[Any]) -> Any:
+        """Match torch.library's boxed ``Tensor[] args`` input tree."""
+        needs = getattr(ctx, "needs_input_grad", ())
+        if isinstance(needs, tuple) and len(needs) > 1:
+            return (grads, *([None] * (len(needs) - 1)))
+        return (grads,)
+
+    def _as_grad_list(raw: Any) -> list[Any]:
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, tuple):
+            return list(raw)
+        return [raw]
 
     # Wave-4 fix #3 + #5: setup_context / backward must follow torch.library
     # contract:
@@ -430,7 +452,10 @@ def register_double_backward(
         if has_atomic_accumulator:
             if len(saved_tensors) == 1:
                 import torch as _torch  # type: ignore[import-not-found]
-                return tuple(_torch.zeros_like(t) for t in saved_tensors)
+                return _boxed_list_grad_return(
+                    ctx,
+                    [_torch.zeros_like(t) for t in saved_tensors],
+                )
             raise DoubleBackwardUnsupportedError(
                 "integration-09: double-backward through multi-target "
                 "atomic-accumulator path not supported; use "
@@ -449,7 +474,13 @@ def register_double_backward(
                 ti += 1
         # The bwd custom_op accepts ``args: Sequence[Tensor]`` — a single list
         # of saved fwd inputs followed by tangents (one per fwd output).
-        return bwd_op(recombined + list(grad_outputs))
+        grad_list = _as_grad_list(bwd_op(recombined + list(grad_outputs)))
+        if len(grad_list) != n_args:
+            raise RuntimeError(
+                f"{bwd_op_qualname}: backward returned {len(grad_list)} "
+                f"gradients for {n_args} boxed forward inputs"
+            )
+        return _boxed_list_grad_return(ctx, grad_list)
 
     register_autograd(fwd_op_qualname, backward, setup_context=setup_context)
 
@@ -487,7 +518,7 @@ def register_double_backward(
                     grads.append(None)
             else:
                 grads.append(None)
-        return (grads,)
+        return _boxed_list_grad_return(ctx, grads)
 
     try:
         register_autograd(bwd_op_qualname, dbw_backward, setup_context=dbw_setup_context)
@@ -497,7 +528,13 @@ def register_double_backward(
     return True
 
 
-def _import_make_boxed_func() -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+ModuleImporter = Callable[[str], Any]
+
+
+def _import_make_boxed_func(
+    *,
+    import_module: ModuleImporter = importlib.import_module,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Lazily import ``make_boxed_func`` across PyTorch 2.10/2.11/2.12.
 
     The canonical 2.11+ path is ``functorch.compile.make_boxed_func``. PyTorch
@@ -505,19 +542,39 @@ def _import_make_boxed_func() -> Callable[[Callable[..., Any]], Callable[..., An
     We try both, in priority order. Verified on PyTorch 2.13 (both work).
     """
     try:
-        from functorch.compile import make_boxed_func  # type: ignore[import-not-found]
-        return make_boxed_func
-    except ImportError:  # pragma: no cover - defensive
+        return import_module("functorch.compile").make_boxed_func
+    except (AttributeError, ImportError):  # pragma: no cover - defensive
         pass
     try:
-        from torch._functorch.aot_autograd import make_boxed_func  # type: ignore[import-not-found]
-        return make_boxed_func
-    except ImportError as exc:  # pragma: no cover - defensive
+        return import_module("torch._functorch.aot_autograd").make_boxed_func
+    except (AttributeError, ImportError) as exc:  # pragma: no cover - defensive
         raise ImportError(
             "Could not import make_boxed_func from either functorch.compile "
             "or torch._functorch.aot_autograd; integration #10 requires "
             "PyTorch >= 2.10."
         ) from exc
+
+
+def _import_aot_autograd(
+    *,
+    import_module: ModuleImporter = importlib.import_module,
+) -> Callable[..., Any]:
+    candidates = (
+        "torch._dynamo.backends.common",
+        "torch._functorch.aot_autograd",
+        "functorch.compile",
+    )
+    last_error: BaseException | None = None
+    for module_name in candidates:
+        try:
+            return import_module(module_name).aot_autograd
+        except (AttributeError, ImportError) as exc:
+            last_error = exc
+    raise ImportError(
+        "Could not import aot_autograd from torch._dynamo.backends.common, "
+        "torch._functorch.aot_autograd, or functorch.compile. "
+        "Please verify your PyTorch version."
+    ) from last_error
 
 
 # Wave-4 #09 fix #6 helper: extract atomic-accumulator detection so it is a
@@ -749,6 +806,8 @@ def tilelang_bw_compiler(
 def make_aot_backend(
     fw_compiler: Optional[Callable[..., Any]] = None,
     bw_compiler: Optional[Callable[..., Any]] = None,
+    *,
+    import_module: ModuleImporter = importlib.import_module,
 ) -> Callable[..., Any]:
     """Build an ``aot_autograd``-wrapped Dynamo backend.
 
@@ -763,20 +822,7 @@ def make_aot_backend(
         same FX walker — only ``ATEN_DISPATCH`` differs by op kind).
     """
     # Lazy import: module must be importable without torch.
-    try:
-        from torch._dynamo.backends.common import aot_autograd  # type: ignore[import-not-found]
-    except ImportError:
-        try:
-            from torch._functorch.aot_autograd import aot_autograd  # type: ignore[import-not-found]
-        except ImportError:
-            try:
-                from functorch.compile import aot_autograd  # type: ignore[import-not-found]
-            except ImportError as exc:
-                raise ImportError(
-                    "Could not import aot_autograd from torch._dynamo.backends.common, "
-                    "torch._functorch.aot_autograd, or functorch.compile. "
-                    "Please verify your PyTorch version."
-                ) from exc
+    aot_autograd = _import_aot_autograd(import_module=import_module)
 
     fw = fw_compiler if fw_compiler is not None else tilelang_fw_compiler
     bw = bw_compiler if bw_compiler is not None else fw

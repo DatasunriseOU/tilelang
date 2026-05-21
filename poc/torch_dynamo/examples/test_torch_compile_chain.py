@@ -357,7 +357,7 @@ def test_wave2_aten_dispatch_covers_top_ops() -> None:
 
     must_have = (
         "view", "reshape", "permute", "transpose", "flatten",
-        "broadcast_to", "expand",
+        "broadcast_to", "expand", "detach",
         "exp", "log", "sqrt", "rsqrt", "sigmoid", "pow",
         "cat", "stack",
         "clamp", "clip",
@@ -438,11 +438,70 @@ def test_wave2_multi_region_launcher_does_not_use_gm_forward() -> None:
     )
 
 
-def test_wave2_contiguity_guard_warns_and_materialises() -> None:
-    """Non-contiguous input through ``_impl`` must trigger one warning and
-    a ``.contiguous()`` materialisation.
-    """
-    import warnings as _w
+def test_single_region_launcher_does_not_hide_compiled_region_errors() -> None:
+    """A broken compiled single-region launcher must not replay ``gm.forward``."""
+    import torch
+    import torch.fx
+    from torch.fx.passes.shape_prop import ShapeProp
+
+    from poc.torch_dynamo.fx_to_tilelang import FXToTileLang
+
+    def fn(x: torch.Tensor) -> torch.Tensor:
+        return torch.relu(x)
+
+    x = torch.randn(4, 8, dtype=torch.float32)
+    gm = torch.fx.symbolic_trace(fn)
+    ShapeProp(gm).propagate(x)
+    lowerer = FXToTileLang(gm, [x])
+
+    def raising_region_launcher(*_args: object) -> object:
+        raise RuntimeError("compiled region failed")
+
+    launcher = lowerer._build_chain_launcher(  # noqa: SLF001
+        [raising_region_launcher],
+        [[("relu", ("relu",))]],
+    )
+
+    with pytest.raises(RuntimeError, match="compiled region failed"):
+        launcher(x)
+
+
+def test_single_region_launcher_marks_runtime_replay_fallback() -> None:
+    """Runtime FX replay fallback must be observable on the launcher."""
+    import torch
+    import torch.fx
+    from torch.fx.passes.shape_prop import ShapeProp
+
+    from poc.torch_dynamo.fx_to_tilelang import (
+        FXToTileLang, _RegionFallbackReplayError,
+    )
+
+    def fn(x: "torch.Tensor") -> "torch.Tensor":
+        return torch.relu(x)
+
+    x = torch.randn(4, 8, dtype=torch.float32)
+    gm = torch.fx.symbolic_trace(fn)
+    ShapeProp(gm).propagate(x)
+    lowerer = FXToTileLang(gm, [x])
+
+    def fallbacking_region_launcher(*_args: object) -> object:
+        raise _RegionFallbackReplayError(
+            RuntimeError("compiled kernel rejected runtime tensors"),
+            RuntimeError("region replay lacked full inputs"),
+        )
+
+    launcher = lowerer._build_chain_launcher(  # noqa: SLF001
+        [fallbacking_region_launcher],
+        [[("relu", ("relu",))]],
+    )
+
+    out = launcher(x)
+    torch.testing.assert_close(out, fn(x))
+    assert getattr(launcher, "_tilelang_runtime_fallback_count", 0) == 1
+
+
+def test_wave2_contiguity_guard_rejects_implicit_materialisation() -> None:
+    """Non-contiguous input through ``_impl`` must fail explicitly."""
     import torch
 
     from poc.torch_dynamo.custom_op_wrapper import _ensure_contiguous_inputs
@@ -451,23 +510,8 @@ def test_wave2_contiguity_guard_warns_and_materialises() -> None:
     xt = x.t()  # non-contiguous view
     assert not xt.is_contiguous()
 
-    with _w.catch_warnings(record=True) as caught:
-        _w.simplefilter("always")
-        out = _ensure_contiguous_inputs("tilelang::test_op_a", (xt,))
-    assert out[0].is_contiguous()
-    assert any(issubclass(w.category, RuntimeWarning) for w in caught), (
-        f"expected RuntimeWarning, got {[w.category for w in caught]!r}"
-    )
-
-    # Second call with the same op+slot pattern must NOT warn again.
-    with _w.catch_warnings(record=True) as caught2:
-        _w.simplefilter("always")
+    with pytest.raises(RuntimeError, match=r"input #0 .*non-contiguous"):
         _ensure_contiguous_inputs("tilelang::test_op_a", (xt,))
-    assert not any(issubclass(w.category, RuntimeWarning)
-                   for w in caught2), (
-        f"warn-once cache leaked; second call warned again: "
-        f"{[w.category for w in caught2]!r}"
-    )
 
 
 def test_wave2_dropout_eval_is_identity_spec() -> None:
@@ -496,7 +540,7 @@ def test_wave2_dropout_eval_is_identity_spec() -> None:
 
 
 def test_wave2_view_reshape_specs_resolve() -> None:
-    """``view`` / ``reshape`` emitters must resolve -1 dims correctly."""
+    """``view`` / ``reshape`` emitters must resolve tuple and vararg dims."""
     from poc.torch_dynamo.fx_to_tilelang import (
         ATEN_DISPATCH, _TensorSpec, LoweringContext,
     )
@@ -509,6 +553,62 @@ def test_wave2_view_reshape_specs_resolve() -> None:
     spec = ATEN_DISPATCH["view"](_StubNode(), (src, (2, -1)), ctx)
     assert spec.shape == (2, 16)
     assert spec.dtype == "float32"
+
+    vararg_spec = ATEN_DISPATCH["view"](_StubNode(), (src, 2, -1), ctx)
+    assert vararg_spec.shape == (2, 16)
+    assert vararg_spec.dtype == "float32"
+
+
+def test_method_view_graph_records_full_output_shape() -> None:
+    import torch
+    import torch.fx
+    from torch.fx.passes.shape_prop import ShapeProp
+
+    from poc.torch_dynamo.fx_to_tilelang import FXToTileLang
+
+    class ViewModule(torch.nn.Module):
+        def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+            return x.view(2, 3)
+
+    x = torch.randn(6, dtype=torch.float32)
+    gm = torch.fx.symbolic_trace(ViewModule().eval())
+    ShapeProp(gm).propagate(x)
+
+    artifact = FXToTileLang(gm, [x]).run()
+    assert tuple(artifact.output_specs[0].shape) == (2, 3)
+    out = artifact.launcher(x)
+    assert tuple(out.shape) == (2, 3)
+
+
+def test_fused_addmm_activation_primfunc_keeps_bias_operand() -> None:
+    """``addmm + activation`` must materialise bias inside the fused kernel."""
+    if _no_tilelang_jit():
+        pytest.skip("tilelang.compile unavailable; PrimFunc path unverifiable")
+
+    import torch
+    import torch.fx
+    from torch import nn
+    from torch.fx.passes.shape_prop import ShapeProp
+
+    from poc.torch_dynamo.fx_to_tilelang import FXToTileLang
+
+    class AddmmTanh(nn.Module):
+        def forward(self, x, bias, w):  # type: ignore[no-untyped-def]
+            return torch.tanh(torch.addmm(bias, x, w))
+
+    x = torch.randn(8, 32, dtype=torch.float32)
+    bias = torch.randn(16, dtype=torch.float32)
+    w = torch.randn(32, 16, dtype=torch.float32)
+    gm = torch.fx.symbolic_trace(AddmmTanh().eval())
+    ShapeProp(gm).propagate(x, bias, w)
+
+    artifact = FXToTileLang(gm, [x, bias, w]).run()
+    prim_funcs = tuple(getattr(artifact, "prim_funcs", ()))
+    assert len(prim_funcs) == 1
+    assert "tilelang.compile ok" in artifact.source
+    prim_func_text = str(prim_funcs[0])
+    assert len(prim_funcs[0].params) == 4, prim_func_text
+    assert "Bias[" in prim_func_text
 
 
 def test_wave3_content_hash_is_128_bits() -> None:
@@ -574,23 +674,15 @@ def test_wave3_binary_elementwise_uses_sequential_emitter() -> None:
     )
 
 
-def test_wave3_contiguity_guard_avoids_clone_for_non_aliased() -> None:
-    """grok wave-2 review #02 perf §1: ``_ensure_contiguous_inputs`` must
-    use ``.contiguous()`` (no extra clone) on plain non-contiguous inputs;
-    only the *aliased+already-contiguous* case warrants ``clone()``.
-    """
+def test_wave3_contiguity_guard_rejects_view_aliased_inputs() -> None:
+    """``_ensure_contiguous_inputs`` must not clone hidden view aliases."""
     import torch
     from poc.torch_dynamo.custom_op_wrapper import _ensure_contiguous_inputs
 
-    # Plain non-contiguous tensor: transpose of contiguous storage. Not
-    # aliased (._base is None on a freshly-allocated transpose? — actually
-    # transpose returns a view with a base, so we use a stride-permuted
-    # advanced-indexed copy that is non-contiguous + non-aliased).
     x = torch.randn(8, 4)
     nc = x.t()  # non-contiguous AND aliased (view)
-    out = _ensure_contiguous_inputs("tilelang::test_wave3_alias", (nc,))
-    assert out[0].is_contiguous()
-    assert out[0].data_ptr() != x.data_ptr()
+    with pytest.raises(RuntimeError, match=r"input #0 .*non-contiguous"):
+        _ensure_contiguous_inputs("tilelang::test_wave3_alias", (nc,))
 
     # Contiguous + aliased (e.g. narrow on a 1D contiguous slice that
     # happens to start at offset 0 — still has _base set).
@@ -598,7 +690,5 @@ def test_wave3_contiguity_guard_avoids_clone_for_non_aliased() -> None:
     sliced = base.narrow(0, 0, 8)
     assert sliced.is_contiguous()
     assert sliced._base is not None
-    out2 = _ensure_contiguous_inputs("tilelang::test_wave3_alias_clone", (sliced,))
-    assert out2[0].is_contiguous()
-    # Must NOT share storage with the parent (clone() forces a fresh alloc).
-    assert out2[0].data_ptr() != base.data_ptr()
+    with pytest.raises(RuntimeError, match=r"input #0 .*view-aliased"):
+        _ensure_contiguous_inputs("tilelang::test_wave3_alias_clone", (sliced,))

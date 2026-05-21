@@ -81,6 +81,7 @@ from ..op_mapping import (
     _normalize_mlir_dtype,
     _results,
     _shape_of,
+    materialize_lazy_tile,
 )
 
 
@@ -136,6 +137,13 @@ def has_cxx_shim() -> bool:
     from ..ptr_analysis import shim_available, shim_subprocess_available
 
     return bool(shim_available() or shim_subprocess_available())
+
+
+def _ctx_has_cxx_shim(ctx: WalkerCtx) -> bool:
+    override = getattr(ctx, "ptr_analysis_shim_available", None)
+    if override is not None:
+        return bool(override)
+    return has_cxx_shim()
 
 
 # ---------------------------------------------------------------------------
@@ -1403,7 +1411,7 @@ def emit_tt_load(op: Any, ctx: WalkerCtx) -> Any:
                 mask_ssa, other_ssa,
             )
         tile_offsets = [_coerce_index_scalar(ctx, v) for v in _ptrstate_offsets_or_zero(resolved)]
-        if has_cxx_shim():
+        if _ctx_has_cxx_shim(ctx):
             # Defer to the legacy ``_emit_load_copy`` path which already
             # knows how to talk to ``T.copy`` once PtrAnalysis is in.
             from ..op_mapping import _emit_load_copy
@@ -1481,7 +1489,7 @@ def emit_tt_load(op: Any, ctx: WalkerCtx) -> Any:
         # only fires earlier in this function (the ``_ptrstate_is_tile``
         # branch); here we have no PtrState, so the rolled-loop path is
         # the contractually-correct lowering.
-        if has_cxx_shim():
+        if _ctx_has_cxx_shim(ctx):
             base_indices = [tir.const(0, "int32") for _ in out_shape]
             return _emit_tile_copy_tir(
                 op, ctx, src_buf, base_indices, out_shape, out_dtype,
@@ -1596,7 +1604,7 @@ def emit_tt_store(op: Any, ctx: WalkerCtx) -> Any:
                 op, ctx, tile_buf, resolved, val_expr, tile_shape, mask_ssa,
             )
         tile_offsets = [_coerce_index_scalar(ctx, v) for v in _ptrstate_offsets_or_zero(resolved)]
-        if has_cxx_shim():
+        if _ctx_has_cxx_shim(ctx):
             from ..op_mapping import _emit_store_copy
             return _emit_store_copy(op, ctx, resolved, val_expr, mask_ssa)
         return _emit_degraded_tile_store(
@@ -1619,7 +1627,7 @@ def emit_tt_store(op: Any, ctx: WalkerCtx) -> Any:
             dst_buf = _alloc_tile_buffer(ctx, list(val_shape), dtype, buf_name)
         else:
             dst_buf = ctx.buffers[buf_name]
-        if has_cxx_shim():
+        if _ctx_has_cxx_shim(ctx):
             # Detect Buffer-shaped mask early: the single-statement path
             # below has no enclosing loop to index a per-lane mask, so we
             # must fall through to the per-lane ``_emit_degraded_tile_store``
@@ -2061,10 +2069,6 @@ def emit_tt_expand_dims(op: Any, ctx: WalkerCtx) -> Any:
 
     src_vec_lanes = _vector_lanes(src)
 
-    # Vector/tile path: keep this logical-only.  Materializing every
-    # expand_dims into a local buffer turns Triton tile arithmetic into
-    # 4096-element Metal thread arrays; consumers can ask the expression for
-    # the current lane when they really need a scalar.
     if (src_vec_lanes > 1 or isinstance(src, LazyTileExpr)) and out_shape:
         dtype = _dtype_of(result_value) if result_value is not None else _vector_scalar_dtype(src)
         attrs = _attrs_with_properties_shared(op)
@@ -2089,9 +2093,17 @@ def emit_tt_expand_dims(op: Any, ctx: WalkerCtx) -> Any:
             ),
             name=ctx.fresh("expand_expr"),
         )
+        out = materialize_lazy_tile(
+            ctx,
+            lazy,
+            out_shape,
+            dtype,
+            name="expand",
+            loop_var_prefix="v",
+        )
         if result_value is not None:
-            ctx.bind(result_value, lazy)
-        return lazy
+            ctx.bind(result_value, out)
+        return out
 
     # Scalar PrimExpr path: tir.Broadcast(scalar, lanes) is correct.
     lanes = 1
@@ -2221,7 +2233,15 @@ def emit_tt_broadcast(op: Any, ctx: WalkerCtx) -> Any:
                 return _read_vector_lane(read_ctx, src, idx_tuple[-1])
             return src
 
-        out_buf = LazyTileExpr(out_shape, dtype, _broadcast_reader, name=ctx.fresh("bcast_expr"))
+        lazy = LazyTileExpr(out_shape, dtype, _broadcast_reader, name=ctx.fresh("bcast_expr"))
+        out_buf = materialize_lazy_tile(
+            ctx,
+            lazy,
+            out_shape,
+            dtype,
+            name="bcast",
+            loop_var_prefix="b",
+        )
         if result_value is not None:
             ctx.bind(result_value, out_buf)
         return out_buf
@@ -2353,6 +2373,7 @@ def _compose_addptr_index(
     off: Any,
     *,
     target: Any = None,
+    materialize: bool = False,
 ) -> Any:
     """Return a per-lane sum ``prev + off`` for an in-loop ``tt.addptr``.
 
@@ -2370,11 +2391,10 @@ def _compose_addptr_index(
       buffer of the broadcast shape (rank picked from the larger-rank
       operand, padded with leading 1s for the smaller).
 
-    Always returns either a ``tir.PrimExpr`` (scalar fast path) or a fresh
-    ``tir.Buffer`` allocated via ``_alloc_tile_buffer``. The caller stores
-    this as the trailing entry of ``new_indices`` so downstream
-    ``tt.load`` / ``tt.store`` consumers see the same shape contract they
-    already handled.
+    Returns a ``tir.PrimExpr`` for scalar fast paths, a ``LazyTileExpr`` for
+    same-shape per-lane index composition, or a fresh ``tir.Buffer`` when a
+    caller needs a materialized tile (PtrState metadata, explicit loop-carried
+    targets, or broadcast-shape expansion).
     """
     tvm_mod = ctx.tvm()
     tir = ctx.tir()
@@ -2426,6 +2446,25 @@ def _compose_addptr_index(
         out_shape = list(off.shape)
         out_dtype = str(getattr(off, "dtype", "int32"))
 
+    def _shape_tuple(value: Any) -> Optional[Tuple[int, ...]]:
+        if not isinstance(value, (Buffer, LazyTileExpr)):
+            return None
+        try:
+            return tuple(int(s) for s in value.shape)
+        except Exception:
+            return None
+
+    try:
+        out_shape_tuple = tuple(int(s) for s in out_shape)
+    except Exception:
+        out_shape_tuple = ()
+    needs_materialized_shape = materialize
+    for operand in (prev, off):
+        operand_shape = _shape_tuple(operand)
+        if operand_shape is not None and operand_shape != out_shape_tuple:
+            needs_materialized_shape = True
+            break
+
     if target is not None and isinstance(target, Buffer):
         try:
             target_shape = [int(s) for s in target.shape]
@@ -2440,6 +2479,8 @@ def _compose_addptr_index(
                 ctx, out_shape, out_dtype, ctx.fresh("addptr_acc")
             )
     elif target is not None:
+        out_buf = _alloc_tile_buffer(ctx, out_shape, out_dtype, ctx.fresh("addptr_acc"))
+    elif needs_materialized_shape:
         out_buf = _alloc_tile_buffer(ctx, out_shape, out_dtype, ctx.fresh("addptr_acc"))
     else:
         out_buf = None
@@ -2610,7 +2651,6 @@ def emit_tt_addptr(op: Any, ctx: WalkerCtx) -> Any:
     full strided-layout fold). Without the shim we degrade to a scalar
     offset add on the underlying var/value.
     """
-    tvm_mod = ctx.tvm()
     tir = ctx.tir()
     operands = _operands(op)
     if len(operands) < 2:
@@ -2651,7 +2691,12 @@ def emit_tt_addptr(op: Any, ctx: WalkerCtx) -> Any:
             if isinstance(new_offsets[-1], int):
                 new_offsets[-1] = new_offsets[-1] + 0
             else:
-                new_offsets[-1] = _compose_addptr_index(ctx, new_offsets[-1], off)
+                new_offsets[-1] = _compose_addptr_index(
+                    ctx,
+                    new_offsets[-1],
+                    off,
+                    materialize=True,
+                )
         else:
             new_offsets = [off]
         new_state = dict(base)
@@ -2675,7 +2720,7 @@ def emit_tt_addptr(op: Any, ctx: WalkerCtx) -> Any:
             ctx.bind(result_value, value)
         return value
 
-    if has_cxx_shim():
+    if _ctx_has_cxx_shim(ctx):
         state = _compatible_ptr_state(ctx, base, result_value)
         if state is not None:
             value = _ptrstate_resolved_dict_from_state(state, ctx, strict=True)
@@ -2737,7 +2782,6 @@ def emit_tts_make_tptr(op: Any, ctx: WalkerCtx) -> Any:
     shim is present) consumes this binding directly via PtrState; without
     the shim we still produce a buffer so downstream emitters see a value.
     """
-    tir = ctx.tir()
     result_value = _results(op)[0] if _results(op) else None
     out_shape = list(_shape_of(result_value)) if result_value is not None else [1]
     out_dtype = _dtype_of(result_value) if result_value is not None else "float32"

@@ -66,6 +66,7 @@ from ..op_mapping import (
     LazyTileExpr,
     _attrs_with_properties_shared,
     EmitError,
+    materialize_lazy_tile,
 )
 
 # We import op_mapping lazily inside emitters when we need to reach into
@@ -367,7 +368,6 @@ def _emit_tile_binop(
     Returns the freshly allocated result ``tir.Buffer``. ``scalar_combine``
     receives per-lane PrimExprs and returns the per-lane result PrimExpr.
     """
-    tir = ctx.tir()
     # Pick the larger shape between the two operands; tile-vs-scalar broadcasts.
     shape_a = _tile_shape(ctx, a) if _is_tile_operand(ctx, a) else ()
     shape_b = _tile_shape(ctx, b) if _is_tile_operand(ctx, b) else ()
@@ -386,7 +386,14 @@ def _emit_tile_binop(
         ),
         name=ctx.fresh("tile_expr"),
     )
-    return _bind_result(op, ctx, lazy)
+    out = materialize_lazy_tile(
+        ctx,
+        lazy,
+        out_shape,
+        out_dtype,
+        name="tile_binop",
+    )
+    return _bind_result(op, ctx, out)
 
 
 def _emit_tile_unary(
@@ -405,7 +412,6 @@ def _emit_tile_unary(
     result PrimExpr. Used by ``math.exp`` / ``math.sqrt`` / ``math.log`` and
     cast emitters when the input resolves to a tile.
     """
-    tir = ctx.tir()
     out_shape = _tile_shape(ctx, x) if _is_tile_operand(ctx, x) else ()
     if not out_shape:
         raise EmitError(

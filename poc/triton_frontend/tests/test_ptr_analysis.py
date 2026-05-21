@@ -26,6 +26,7 @@ from poc.triton_frontend.ptr_analysis import (
     PtrAnalysis,
     PtrState,
     dialects_available,
+    run_ptr_analysis_with_states_generic,
     shim_available,
 )
 
@@ -63,6 +64,14 @@ module {
 }
 """
 
+NUMERIC_PROGRAM_ID_ADDPTR_MLIR = ADDPTR_MLIR.replace(
+    "  %0 = tt.make_range {end = 4 : i32, start = 0 : i32}:tensor<4xi32>",
+    (
+        "  %pid = tt.get_program_id {axis = 0 : i32} : i32\n"
+        "  %0 = tt.make_range {end = 4 : i32, start = 0 : i32}:tensor<4xi32>"
+    ),
+)
+
 UNSUPPORTED_UNIT_MASK_CMP_MLIR = """\
 module {
   tt.func @kernel(%arg0: !tt.ptr<f32>) {
@@ -90,6 +99,19 @@ def test_ptr_analysis_rewrites_addptr() -> None:
     assert isinstance(rewritten, str) and rewritten
     # The hallmark of a successful PtrAnalysis rewrite is the appearance of
     # tts.make_tptr in place of (or alongside) the original tt.addptr chain.
+    assert "tts.make_tptr" in rewritten
+
+
+@pytest.mark.skipif(
+    not dialects_available(),
+    reason="shim built without TritonStructured/Triton dialects",
+)
+def test_ptr_analysis_accepts_numeric_program_id_axis_for_text_ttir() -> None:
+    rewritten, _states = run_ptr_analysis_with_states_generic(
+        NUMERIC_PROGRAM_ID_ADDPTR_MLIR
+    )
+
+    assert "tt.get_program_id" in rewritten
     assert "tts.make_tptr" in rewritten
 
 
@@ -296,7 +318,7 @@ def test_rewrite_error_is_cached_and_re_raised() -> None:
     assert _BoomShim.Module.calls == 1
 
 def test_run_ptr_analysis_with_states_is_cached() -> None:
-    from poc.triton_frontend.ptr_analysis import run_ptr_analysis_with_states, _load_shim
+    from poc.triton_frontend.ptr_analysis import run_ptr_analysis_with_states
     from unittest.mock import patch
 
     run_ptr_analysis_with_states.cache_clear()

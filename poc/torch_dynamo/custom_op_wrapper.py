@@ -26,47 +26,101 @@ AOTAutograd-managed forward calls pass ``allow_grad_inputs=True`` explicitly.
 """
 
 import threading
-import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
 # Process-wide cache so re-registering the same fused op is idempotent.
 _REGISTRY: Dict[str, Callable[..., Any]] = {}
 _REGISTRY_LOCK = threading.Lock()
 
-# Wave-2 fix-pack (grok #02 security note 2 + killer scenarios):
-# warn-once cache for non-contiguous / aliased tensors at the custom_op
-# boundary. Keyed by (op_qualname, position-in-args, contiguity-flag) so
-# the warning fires once per op×slot×stride-pattern.
-_CONTIGUITY_WARN_SEEN: FrozenSet = frozenset()
-_CONTIGUITY_LOCK = threading.Lock()
+def _iter_tensors(value: Any) -> list[Any]:
+    """Return tensor-like leaves from a flat/nested runtime value."""
+    if isinstance(value, (list, tuple)):
+        out: list[Any] = []
+        for item in value:
+            out.extend(_iter_tensors(item))
+        return out
+    if hasattr(value, "is_contiguous") and hasattr(value, "clone"):
+        return [value]
+    return []
+
+
+def _storage_key(tensor: Any) -> tuple[int, int] | None:
+    """Best-effort storage identity for PyTorch alias checks."""
+    try:
+        storage = tensor.untyped_storage()
+        return (int(storage.data_ptr()), int(tensor.storage_offset()))
+    except Exception:
+        try:
+            return (int(tensor.data_ptr()), 0)
+        except Exception:
+            return None
+
+
+def _ensure_non_aliased_outputs(
+    args: Sequence[Any],
+    result: Any,
+) -> Any:
+    """Reject outputs that violate ``torch.library.custom_op`` alias rules.
+
+    AOTAutograd forward graphs may return saved primals alongside computed
+    tensors, and metadata ops such as ``aten.detach`` may produce a second
+    result that aliases an earlier output. ``torch.library.custom_op`` does
+    not allow either form. The wrapper reports the alias instead of hiding a
+    copy so alias/view handling stays visible to partitioning and lowering.
+    """
+    input_keys: dict[tuple[int, int], int] = {}
+    for input_idx, tensor in enumerate(_iter_tensors(args)):
+        key = _storage_key(tensor)
+        if key is not None:
+            input_keys[key] = input_idx
+    seen_output_keys: dict[tuple[int, int], int] = {}
+
+    def _check_one(value: Any, output_idx: int) -> Any:
+        key = _storage_key(value)
+        if key is None:
+            return value
+        if key in input_keys:
+            input_idx = input_keys[key]
+            raise RuntimeError(
+                f"tilelang custom_op output #{output_idx} aliases input "
+                f"#{input_idx}. Keep alias/view ops outside the fused region "
+                "or materialise them explicitly in the captured graph."
+            )
+        if key in seen_output_keys:
+            first_idx = seen_output_keys[key]
+            raise RuntimeError(
+                f"tilelang custom_op output #{output_idx} aliases output "
+                f"#{first_idx}. Keep alias/view ops outside the fused region "
+                "or materialise them explicitly in the captured graph."
+            )
+        seen_output_keys[key] = output_idx
+        return value
+
+    if isinstance(result, tuple):
+        return tuple(_check_one(value, i) for i, value in enumerate(result))
+    if isinstance(result, list):
+        return [_check_one(value, i) for i, value in enumerate(result)]
+    return _check_one(result, 0)
 
 
 def _ensure_contiguous_inputs(
     op_qualname: str,
     tensors: Sequence[Any],
 ) -> Tuple[Any, ...]:
-    """Return ``tensors`` with each non-contiguous / aliasing input replaced
-    by a fresh contiguous copy, warning once per ``(op, slot, reason)`` triple.
+    """Return ``tensors`` only when every tensor is contiguous and unaliased.
 
-    Wave-2 #09 expansion: in addition to non-contiguous strides, we also
-    detect view-aliased inputs (``t._base is not None``). The fused TileLang
-    kernel writes through pointer arithmetic that assumes the input owns its
-    storage; a view backed by another live tensor would silently overwrite
-    the parent's memory once the launcher believes the slot is exclusive.
+    The fused TileLang runtime boundary must not hide layout repairs. If a
+    caller wants a materialised tensor, it must put that operation in the FX
+    graph before fusion so allocation/copy cost is visible to compilation.
     """
-    global _CONTIGUITY_WARN_SEEN
-    fixed: list = []
-    new_seen = set(_CONTIGUITY_WARN_SEEN)
-    changed = False
     for i, t in enumerate(tensors):
         try:
             is_tensor = hasattr(t, "is_contiguous")
         except Exception:  # pragma: no cover
             is_tensor = False
         if not is_tensor:
-            fixed.append(t)
             continue
         try:
             ok = t.is_contiguous()
@@ -74,43 +128,22 @@ def _ensure_contiguous_inputs(
             ok = True
         # Wave-2 #09 view-aliasing guard: ``t._base is not None`` signals the
         # tensor shares storage with another live tensor (slice / select /
-        # narrow / unbind / expand). Re-materialise so the kernel writes do
-        # not corrupt the parent.
+        # narrow / unbind / expand). Reject it here so any materialisation is
+        # a visible graph operation rather than a wrapper-side copy.
         try:
             aliased = getattr(t, "_base", None) is not None
         except Exception:  # pragma: no cover
             aliased = False
         if not ok or aliased:
             reason = "non-contiguous" if not ok else "view-aliased"
-            key = (op_qualname, i, reason)
-            if key not in new_seen:
-                new_seen.add(key)
-                changed = True
-                warnings.warn(
-                    f"tilelang custom_op {op_qualname!r}: input #{i} "
-                    f"(shape={tuple(getattr(t, 'shape', ()))}) is "
-                    f"{reason}; auto-materialising a fresh contiguous "
-                    f"copy. For best perf insert an explicit .contiguous() "
-                    f"upstream of this op.",
-                    RuntimeWarning,
-                    stacklevel=4,
-                )
-            # Wave-3 perf fix (grok review #02 perf §1): only the *aliased+
-            # already-contiguous* case forces ``clone()`` — that is the slot
-            # where ``.contiguous()`` is a no-op and would still share storage
-            # with the parent tensor. For non-contiguous inputs (the common
-            # view-heavy LLM-forward case) ``.contiguous()`` already allocates
-            # fresh storage, so the extra ``clone()`` is wasted ~2× cost.
-            if aliased and ok:
-                fixed.append(t.contiguous().clone())
-            else:
-                fixed.append(t.contiguous())
-        else:
-            fixed.append(t)
-    if changed:
-        with _CONTIGUITY_LOCK:
-            _CONTIGUITY_WARN_SEEN = frozenset(new_seen)
-    return tuple(fixed)
+            raise RuntimeError(
+                f"tilelang custom_op {op_qualname!r}: input #{i} "
+                f"(shape={tuple(getattr(t, 'shape', ()))}) is {reason}. "
+                "Materialise layout explicitly before this fused op, e.g. "
+                "with .contiguous() in the captured graph, so the copy is "
+                "visible to compilation."
+            )
+    return tuple(tensors)
 
 
 @dataclass
@@ -153,6 +186,13 @@ class FusedKernelArtifact:
     prim_func: Any = None
     prim_funcs: Tuple[Any, ...] = ()
     source: str = ""
+    # Per-output source for tensors that must be passed through outside the
+    # custom_op because torch.library forbids returning aliases of inputs.
+    # Entries are ``None`` for real fused outputs, ``("input", i)`` /
+    # ``("param", i)`` for graph outputs that are exactly a placeholder or
+    # get_attr parameter, or ``("output", i)`` for duplicate saved outputs
+    # that reuse an earlier graph output.
+    output_passthrough_sources: Tuple[Optional[Tuple[str, int]], ...] = ()
     # Wave-4 #09 fix #6: atomic-accumulator flag lives on the artifact so
     # the bwd compile can read it back (was previously sniffed inline in
     # aot_autograd_glue, which made the metadata orthogonal to the
@@ -196,6 +236,158 @@ def _check_no_grad(tensors: Sequence[Any], *, allow_grad: bool = False) -> None:
                 "fires when the joint capture was bypassed.")
 
 
+def _normalise_passthrough_sources(
+    artifact: FusedKernelArtifact,
+) -> Tuple[Optional[Tuple[str, int]], ...]:
+    n_outputs = len(artifact.output_specs)
+    raw = tuple(getattr(artifact, "output_passthrough_sources", ()) or ())
+    if not raw:
+        return tuple(None for _ in range(n_outputs))
+    if len(raw) != n_outputs:
+        raise RuntimeError(
+            f"tilelang custom_op {artifact.name!r}: "
+            f"output_passthrough_sources has {len(raw)} entries for "
+            f"{n_outputs} output specs"
+        )
+    out: List[Optional[Tuple[str, int]]] = []
+    for i, source in enumerate(raw):
+        if source is None:
+            out.append(None)
+            continue
+        if (
+            not isinstance(source, tuple)
+            or len(source) != 2
+            or source[0] not in {"input", "param", "output"}
+            or not isinstance(source[1], int)
+        ):
+            raise RuntimeError(
+                f"tilelang custom_op {artifact.name!r}: invalid pass-through "
+                f"source at output #{i}: {source!r}"
+            )
+        out.append(source)
+    return tuple(out)
+
+
+def _as_output_list(result: Any) -> List[Any]:
+    if isinstance(result, list):
+        return result
+    if isinstance(result, tuple):
+        return list(result)
+    return [result]
+
+
+def _select_custom_op_outputs(
+    result: Any,
+    *,
+    custom_output_indices: Tuple[int, ...],
+    full_output_count: int,
+    op_qualname: str,
+) -> List[Any]:
+    values = _as_output_list(result)
+    if len(values) == full_output_count:
+        return [values[i] for i in custom_output_indices]
+    if len(values) == len(custom_output_indices):
+        return values
+    raise RuntimeError(
+        f"{op_qualname}: launcher returned {len(values)} values, expected "
+        f"either {full_output_count} full graph outputs or "
+        f"{len(custom_output_indices)} custom-op outputs"
+    )
+
+
+def _passthrough_value(
+    source: Tuple[str, int],
+    runtime_inputs: Sequence[Any],
+    param_tensors: Sequence[Any],
+    *,
+    op_qualname: str,
+) -> Any:
+    kind, index = source
+    if kind == "output":
+        raise RuntimeError(
+            f"{op_qualname}: output pass-through sources are resolved from "
+            "the reconstructed output list"
+        )
+    pool = runtime_inputs if kind == "input" else param_tensors
+    try:
+        return pool[index]
+    except IndexError as exc:
+        raise RuntimeError(
+            f"{op_qualname}: pass-through output references missing "
+            f"{kind} #{index}"
+        ) from exc
+
+
+def _reconstruct_full_outputs(
+    op_result: Any,
+    *,
+    passthrough_sources: Tuple[Optional[Tuple[str, int]], ...],
+    custom_output_indices: Tuple[int, ...],
+    runtime_inputs: Sequence[Any],
+    param_tensors: Sequence[Any],
+    op_qualname: str,
+) -> Any:
+    custom_values = _as_output_list(op_result)
+    if len(custom_values) != len(custom_output_indices):
+        raise RuntimeError(
+            f"{op_qualname}: custom op returned {len(custom_values)} values "
+            f"for {len(custom_output_indices)} non-pass-through outputs"
+        )
+    custom_by_index = dict(zip(custom_output_indices, custom_values))
+    full: List[Any] = []
+    for output_idx, source in enumerate(passthrough_sources):
+        if source is None:
+            full.append(custom_by_index[output_idx])
+        elif source[0] == "output":
+            source_index = source[1]
+            try:
+                full.append(full[source_index])
+            except IndexError as exc:
+                raise RuntimeError(
+                    f"{op_qualname}: output #{output_idx} references "
+                    f"unavailable earlier output #{source_index}"
+                ) from exc
+        else:
+            full.append(_passthrough_value(
+                source,
+                runtime_inputs,
+                param_tensors,
+                op_qualname=op_qualname,
+            ))
+    if len(full) == 1:
+        return full[0]
+    return full
+
+
+def _bind_passthrough_only_runtime(
+    artifact: FusedKernelArtifact,
+    passthrough_sources: Tuple[Optional[Tuple[str, int]], ...],
+    *,
+    is_backward: bool = False,
+    allow_grad_inputs: Optional[bool] = None,
+) -> Callable[..., Any]:
+    allow_grad = is_backward if allow_grad_inputs is None else allow_grad_inputs
+    op_qualname = f"tilelang::{artifact.name}{'_bwd' if is_backward else '_fwd'}"
+    param_tensors = tuple(artifact.param_tensors)
+
+    def _runner(*runtime_inputs: Any) -> Any:
+        _check_no_grad(runtime_inputs, allow_grad=allow_grad)
+        return _reconstruct_full_outputs(
+            (),
+            passthrough_sources=passthrough_sources,
+            custom_output_indices=(),
+            runtime_inputs=runtime_inputs,
+            param_tensors=param_tensors,
+            op_qualname=op_qualname,
+        )
+
+    side = "bw" if is_backward else "fw"
+    _runner.__name__ = f"tilelang_{side}_passthrough_{artifact.name}"
+    _runner._tilelang_artifact = artifact  # type: ignore[attr-defined]
+    _runner._tilelang_is_backward = is_backward  # type: ignore[attr-defined]
+    return _runner
+
+
 def wrap_as_custom_op(
     artifact: FusedKernelArtifact,
     fx_signature: Dict[str, Any],
@@ -237,6 +429,19 @@ def wrap_as_custom_op(
     suffix = "_bwd" if is_backward else "_fwd"
     op_qualname = f"tilelang::{artifact.name}{suffix}"
     allow_grad_runtime = is_backward if allow_grad_inputs is None else allow_grad_inputs
+    passthrough_sources = _normalise_passthrough_sources(artifact)
+    custom_output_indices = tuple(
+        i for i, source in enumerate(passthrough_sources) if source is None
+    )
+    op_output_specs = tuple(artifact.output_specs[i] for i in custom_output_indices)
+
+    if not custom_output_indices:
+        return _bind_passthrough_only_runtime(
+            artifact,
+            passthrough_sources,
+            is_backward=is_backward,
+            allow_grad_inputs=allow_grad_runtime,
+        )
 
     with _REGISTRY_LOCK:
         cached = _REGISTRY.get(op_qualname)
@@ -244,6 +449,8 @@ def wrap_as_custom_op(
             return _bind_runtime(
                 cached,
                 artifact,
+                passthrough_sources=passthrough_sources,
+                custom_output_indices=custom_output_indices,
                 is_backward=is_backward,
                 allow_grad_inputs=allow_grad_runtime,
             )
@@ -258,7 +465,7 @@ def wrap_as_custom_op(
         # one from the typed wrapper. The wrapper takes a flat tensor list
         # and returns a flat tensor (or tuple). Concrete shapes / dtypes are
         # tracked via the meta function.
-        n_outputs = len(artifact.output_specs)
+        n_outputs = len(op_output_specs)
         allow_grad = allow_grad_runtime
 
         # Hot-path optimisation (grok #09 perf review): captures
@@ -285,11 +492,18 @@ def wrap_as_custom_op(
             @custom_op(op_qualname, mutates_args=())
             def _impl(args: List[torch.Tensor]) -> torch.Tensor:  # type: ignore[name-defined]
                 _check_no_grad(args, allow_grad=allow_grad)
-                args = _ensure_contiguous_inputs(op_qualname, args)
+                checked_args = _ensure_contiguous_inputs(op_qualname, args)
                 if _has_params:
-                    result = _bound_launcher(*args, *param_tensors)
+                    result = _bound_launcher(*checked_args, *param_tensors)
                 else:
-                    result = _bound_launcher(*args)
+                    result = _bound_launcher(*checked_args)
+                custom_values = _select_custom_op_outputs(
+                    result,
+                    custom_output_indices=custom_output_indices,
+                    full_output_count=len(artifact.output_specs),
+                    op_qualname=op_qualname,
+                )
+                result = _ensure_non_aliased_outputs(checked_args, custom_values[0])
                 # Launcher may return a 1-tuple/1-list around the single
                 # tensor — unwrap to match the declared schema.
                 if isinstance(result, (list, tuple)):
@@ -302,7 +516,7 @@ def wrap_as_custom_op(
 
             @register_fake(op_qualname)
             def _fake(args: List[torch.Tensor]) -> torch.Tensor:  # type: ignore[name-defined]
-                spec = artifact.output_specs[0]
+                spec = op_output_specs[0]
                 return torch.empty(
                     spec.shape,
                     dtype=_spec_to_torch_dtype(spec.dtype),
@@ -314,11 +528,18 @@ def wrap_as_custom_op(
             @custom_op(op_qualname, mutates_args=())
             def _impl(args: List[torch.Tensor]) -> List[torch.Tensor]:  # type: ignore[name-defined]
                 _check_no_grad(args, allow_grad=allow_grad)
-                args = _ensure_contiguous_inputs(op_qualname, args)
+                checked_args = _ensure_contiguous_inputs(op_qualname, args)
                 if _has_params:
-                    result = _bound_launcher(*args, *param_tensors)
+                    result = _bound_launcher(*checked_args, *param_tensors)
                 else:
-                    result = _bound_launcher(*args)
+                    result = _bound_launcher(*checked_args)
+                result = _select_custom_op_outputs(
+                    result,
+                    custom_output_indices=custom_output_indices,
+                    full_output_count=len(artifact.output_specs),
+                    op_qualname=op_qualname,
+                )
+                result = _ensure_non_aliased_outputs(checked_args, result)
                 # Multi-output: launcher may return tuple (FA 9-tuple) or
                 # list — coerce to the declared list[Tensor] schema.
                 if isinstance(result, (list, tuple)):
@@ -333,7 +554,7 @@ def wrap_as_custom_op(
             @register_fake(op_qualname)
             def _fake(args: List[torch.Tensor]) -> List[torch.Tensor]:  # type: ignore[name-defined]
                 outs = []
-                for spec in artifact.output_specs:
+                for spec in op_output_specs:
                     outs.append(torch.empty(
                         spec.shape,
                         dtype=_spec_to_torch_dtype(spec.dtype),
@@ -356,6 +577,8 @@ def wrap_as_custom_op(
         return _bind_runtime(
             _impl,
             artifact,
+            passthrough_sources=passthrough_sources,
+            custom_output_indices=custom_output_indices,
             is_backward=is_backward,
             allow_grad_inputs=allow_grad_runtime,
         )
@@ -365,6 +588,8 @@ def _bind_runtime(
     op: Callable[..., Any],
     artifact: FusedKernelArtifact,
     *,
+    passthrough_sources: Optional[Tuple[Optional[Tuple[str, int]], ...]] = None,
+    custom_output_indices: Optional[Tuple[int, ...]] = None,
     is_backward: bool = False,
     allow_grad_inputs: Optional[bool] = None,
 ) -> Callable[..., Any]:
@@ -380,10 +605,29 @@ def _bind_runtime(
     """
 
     allow_grad = is_backward if allow_grad_inputs is None else allow_grad_inputs
+    param_tensors = tuple(artifact.param_tensors)
+    if passthrough_sources is None:
+        passthrough_sources = _normalise_passthrough_sources(artifact)
+    if custom_output_indices is None:
+        custom_output_indices = tuple(
+            i for i, source in enumerate(passthrough_sources) if source is None
+        )
+    has_passthrough = any(source is not None for source in passthrough_sources)
+    op_qualname = f"tilelang::{artifact.name}{'_bwd' if is_backward else '_fwd'}"
 
     def _runner(*runtime_inputs: Any) -> Any:
         _check_no_grad(runtime_inputs, allow_grad=allow_grad)
-        return op(list(runtime_inputs))
+        result = op(list(runtime_inputs))
+        if not has_passthrough:
+            return result
+        return _reconstruct_full_outputs(
+            result,
+            passthrough_sources=passthrough_sources,
+            custom_output_indices=custom_output_indices,
+            runtime_inputs=runtime_inputs,
+            param_tensors=param_tensors,
+            op_qualname=op_qualname,
+        )
 
     side = "bw" if is_backward else "fw"
     _runner.__name__ = f"tilelang_{side}_runner_{artifact.name}"

@@ -18,6 +18,13 @@ can grep for cross-kernel patterns even when one kernel hard-fails.
 """
 from __future__ import annotations
 
+import dataclasses
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
 import pytest
 
 from poc.triton_frontend._test_harness import numeric_kernels
@@ -33,6 +40,9 @@ from poc.triton_frontend._test_harness.numeric_smoke import Verdict
 # already exists). Deferring to the fixture moves the load into individual
 # tests where it can be process-isolated or simply not exercised.
 _DEPS: dict | None = None
+_FRESH_NUMERIC_RESULTS: dict[str, dict[str, Any]] | None = None
+_FRESH_NUMERIC_SENTINEL = "__TRITON_NUMERIC_RESULTS__"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def test_rfc_conformance_ladder_includes_paged_attention() -> None:
@@ -152,6 +162,145 @@ def test_probe_deps_blocks_triton_after_tilelang_native_load() -> None:
     assert "triton" not in calls
 
 
+def test_probe_deps_blocks_triton_compile_after_both_native_sides_load() -> None:
+    """Dep probing must not treat mixed LLVM-native state as compile-safe."""
+    loaded_modules = {
+        "triton._C.libtriton": object(),
+        "tilelang_cython_wrapper": object(),
+    }
+    calls: list[str] = []
+
+    def fake_import_module(name: str):
+        calls.append(name)
+        return object()
+
+    deps = numeric_smoke._probe_deps(
+        import_module=fake_import_module,
+        loaded_modules=loaded_modules,
+    )
+
+    assert deps["triton"] is not None
+    assert "triton compile blocked" in deps["triton"]
+    assert "triton" not in calls
+
+
+def _result_failure_detail(kernel_module: str, result: dict[str, Any]) -> str:
+    return (
+        f"{kernel_module}: verdict={result.get('verdict')} "
+        f"detail={result.get('detail')!r} "
+        f"max_abs={result.get('max_abs_err')} "
+        f"max_rel={result.get('max_rel_err')} "
+        f"first_mismatches={result.get('first_mismatches')}"
+    )
+
+
+def _is_triton_process_blocked(result: numeric_smoke.KernelResult) -> bool:
+    detail = result.detail or ""
+    return result.verdict == Verdict.SKIP and (
+        "triton import blocked" in detail or "triton compile blocked" in detail
+    )
+
+
+def _fresh_numeric_results() -> dict[str, dict[str, Any]]:
+    global _FRESH_NUMERIC_RESULTS
+    if _FRESH_NUMERIC_RESULTS is not None:
+        return _FRESH_NUMERIC_RESULTS
+
+    script = f"""
+import dataclasses
+import json
+from pathlib import Path
+
+from poc.triton_frontend._test_harness import numeric_kernels
+from poc.triton_frontend._test_harness import numeric_smoke
+
+results = numeric_smoke.run_all(
+    report_path=Path("/tmp/triton_e2e_numeric_fresh_pytest.md"),
+    kernels=list(numeric_kernels.KERNEL_MODULES),
+)
+print({_FRESH_NUMERIC_SENTINEL!r} + json.dumps([
+    dataclasses.asdict(result) for result in results
+], sort_keys=True))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.fail(
+            "fresh-process numeric smoke failed with "
+            f"exit={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
+            f"STDERR:\n{completed.stderr}"
+        )
+
+    payload = None
+    for line in reversed(completed.stdout.splitlines()):
+        if line.startswith(_FRESH_NUMERIC_SENTINEL):
+            payload = line[len(_FRESH_NUMERIC_SENTINEL) :]
+            break
+    if payload is None:
+        pytest.fail(
+            "fresh-process numeric smoke did not emit result sentinel\n"
+            f"STDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+        )
+
+    decoded = json.loads(payload)
+    _FRESH_NUMERIC_RESULTS = {item["name"]: item for item in decoded}
+    return _FRESH_NUMERIC_RESULTS
+
+
+def _resolve_triton_process_blocked_result(
+    kernel_module: str,
+    blocked_result: numeric_smoke.KernelResult,
+) -> dict[str, Any]:
+    if not _is_triton_process_blocked(blocked_result):
+        return dataclasses.asdict(blocked_result)
+
+    fresh = _fresh_numeric_results()
+    if kernel_module not in fresh:
+        pytest.fail(
+            f"fresh-process numeric smoke omitted {kernel_module!r}; "
+            f"available={sorted(fresh)}"
+        )
+    fresh_result = fresh[kernel_module]
+    if fresh_result.get("verdict") == Verdict.SKIP:
+        pytest.skip(
+            f"{kernel_module}: fresh-process numeric smoke also skipped: "
+            f"{fresh_result.get('detail') or '<no detail>'}"
+        )
+    return fresh_result
+
+
+def test_triton_import_blocked_numeric_skip_uses_fresh_process() -> None:
+    blocked = numeric_smoke.KernelResult(
+        name="vector_add",
+        verdict=Verdict.SKIP,
+        detail="triton unavailable: RuntimeError: triton import blocked",
+    )
+
+    fresh = _resolve_triton_process_blocked_result("vector_add", blocked)
+
+    assert fresh["verdict"] == Verdict.NUMERIC_PASS
+    assert fresh["max_abs_err"] is not None
+
+
+def test_triton_compile_blocked_numeric_skip_uses_fresh_process() -> None:
+    blocked = numeric_smoke.KernelResult(
+        name="vector_add",
+        verdict=Verdict.SKIP,
+        detail="triton unavailable: RuntimeError: triton compile blocked",
+    )
+
+    fresh = _resolve_triton_process_blocked_result("vector_add", blocked)
+
+    assert fresh["verdict"] == Verdict.NUMERIC_PASS
+    assert fresh["max_abs_err"] is not None
+
+
 @pytest.mark.parametrize("kernel_module", numeric_kernels.KERNEL_MODULES)
 def test_kernel_numeric_pass(kernel_module: str, deps_dict) -> None:
     """End-to-end numeric check for one kernel.
@@ -162,6 +311,13 @@ def test_kernel_numeric_pass(kernel_module: str, deps_dict) -> None:
     result = numeric_smoke.run_one(kernel_module, deps_dict)
 
     if result.verdict == Verdict.SKIP:
+        if _is_triton_process_blocked(result):
+            result_dict = _resolve_triton_process_blocked_result(kernel_module, result)
+            if result_dict["verdict"] == Verdict.NUMERIC_PASS:
+                # Sanity: numeric tolerances actually populated.
+                assert result_dict["max_abs_err"] is not None
+                return
+            pytest.fail(_result_failure_detail(kernel_module, result_dict))
         pytest.skip(result.detail or "<no detail>")
     if result.verdict == Verdict.NUMERIC_PASS:
         # Sanity: numeric tolerances actually populated.
@@ -188,14 +344,43 @@ def test_vector_add_numeric_pass_in_venv(deps_dict) -> None:
     test fails with the precise stage so the toolchain regression is
     obvious in CI logs.
     """
-    if any(deps_dict[c] for c in ("triton", "tvm", "tilelang", "mlx", "cppmega_mlx")):
+    missing = {
+        c: deps_dict[c]
+        for c in ("triton", "tvm", "tilelang", "mlx", "cppmega_mlx")
+        if deps_dict[c]
+    }
+    if missing:
+        if set(missing) == {"triton"} and (
+            "triton import blocked" in (missing["triton"] or "")
+            or "triton compile blocked" in (missing["triton"] or "")
+        ):
+            blocked = numeric_smoke.KernelResult(
+                name="vector_add",
+                verdict=Verdict.SKIP,
+                detail=f"triton unavailable: {missing['triton']}",
+            )
+            result_dict = _resolve_triton_process_blocked_result("vector_add", blocked)
+            if result_dict["verdict"] == Verdict.NUMERIC_PASS:
+                from poc.triton_frontend._test_harness.numeric_kernels import (
+                    vector_add as va,
+                )
+
+                assert result_dict["max_abs_err"] is not None
+                assert result_dict["max_abs_err"] <= va.ATOL, (
+                    "vector_add fresh-process NUMERIC_PASS but "
+                    f"max_abs_err={result_dict['max_abs_err']} "
+                    f"exceeds kernel ATOL={va.ATOL}"
+                )
+                return
+            pytest.fail(_result_failure_detail("vector_add", result_dict))
+
         # At least one component is missing -- this is the legitimate
         # SKIP case (e.g. a CI runner without Metal). The
         # ``test_kernel_numeric_pass[vector_add]`` parametrize covers
         # the SKIP path; nothing further to verify here.
         pytest.skip(
             "venv-grade stack not fully importable: "
-            + ", ".join(f"{k}={v}" for k, v in deps_dict.items() if v)
+            + ", ".join(f"{k}={v}" for k, v in missing.items())
         )
 
     result = numeric_smoke.run_one("vector_add", deps_dict)
@@ -246,6 +431,34 @@ def test_kernel_filter_restricts_run(tmp_path) -> None:
         numeric_smoke.run_all(
             report_path=target, kernels=["definitely_not_a_kernel"]
         )
+
+
+def test_numeric_smoke_script_path_cli_invocation(tmp_path) -> None:
+    """The advertised smoke harness must also run when invoked by file path."""
+    report_path = tmp_path / "numeric.md"
+    script = _REPO_ROOT / "poc" / "triton_frontend" / "_test_harness" / "numeric_smoke.py"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--kernel",
+            "vector_add",
+            "--report",
+            str(report_path),
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert completed.returncode == 0, (
+        f"numeric_smoke.py file-path CLI failed with exit={completed.returncode}\n"
+        f"STDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+    )
+    assert report_path.exists()
+    assert "vector_add" in report_path.read_text()
 
 
 def test_run_all_writes_report(tmp_path) -> None:

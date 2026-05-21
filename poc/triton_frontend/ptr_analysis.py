@@ -36,7 +36,7 @@ import warnings
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 __all__ = [
     "PtrState",
@@ -67,6 +67,26 @@ _SHIM_BUILD_DIRS: Tuple[Path, ...] = (
     _THIS_DIR / "_cxx" / "build-port",
     _THIS_DIR / "_cxx" / "build",
 )
+
+_PROGRAM_ID_AXIS_NAMES = {"0": "x", "1": "y", "2": "z"}
+_PROGRAM_ID_PRETTY_NUMERIC_AXIS_RE = re.compile(
+    r"tt\.get_program_id\s*\{\s*axis\s*=\s*([012])\s*:\s*i32\s*\}\s*:\s*i32"
+)
+_PROGRAM_ID_GENERIC_NUMERIC_AXIS_RE = re.compile(
+    r'"tt\.get_program_id"\s*\(\)\s*<\{\s*axis\s*=\s*([012])\s*:\s*i32\s*\}>'
+    r"\s*:\s*\(\)\s*->\s*i32"
+)
+
+
+def _normalize_program_id_axis_for_ptr_analysis(ttir_text: str) -> str:
+    """Convert legacy numeric ``tt.get_program_id`` axes to enum syntax."""
+
+    def replace_axis(match: re.Match[str]) -> str:
+        axis = _PROGRAM_ID_AXIS_NAMES[match.group(1)]
+        return f"tt.get_program_id {axis} : i32"
+
+    ttir_text = _PROGRAM_ID_PRETTY_NUMERIC_AXIS_RE.sub(replace_axis, ttir_text)
+    return _PROGRAM_ID_GENERIC_NUMERIC_AXIS_RE.sub(replace_axis, ttir_text)
 
 
 def _shim_dir_has_extension(d: Path) -> bool:
@@ -644,6 +664,7 @@ def run_ptr_analysis(ttir_text: str) -> str:
     importable.
     """
     shim = _load_shim()
+    ttir_text = _normalize_program_id_axis_for_ptr_analysis(ttir_text)
     return shim.run_ptr_analysis(ttir_text)
 
 
@@ -654,6 +675,7 @@ def extract_ptr_states(ttir_text: str) -> List[PtrState]:
     the current shim build) and parses it through :func:`_parse_states_json`.
     """
     shim = _load_shim()
+    ttir_text = _normalize_program_id_axis_for_ptr_analysis(ttir_text)
     raw = shim.extract_ptr_states(ttir_text)
     if not isinstance(raw, str):
         # Future-proof: if the shim ever returns a structured list directly
@@ -674,6 +696,7 @@ def run_ptr_analysis_with_states(
     helpers separately because the shim parses the input only once.
     """
     shim = _load_shim()
+    ttir_text = _normalize_program_id_axis_for_ptr_analysis(ttir_text)
     rewritten, raw_states = shim.run_ptr_analysis_with_states(ttir_text)
     if not isinstance(raw_states, str):
         import json as _json
@@ -693,6 +716,7 @@ def run_ptr_analysis_with_states_generic(
     observe stale or colliding SSA references in dynamic offsets/strides.
     """
     shim = _load_shim()
+    ttir_text = _normalize_program_id_axis_for_ptr_analysis(ttir_text)
     if hasattr(shim, "run_ptr_analysis_with_states_generic"):
         rewritten, raw_states = shim.run_ptr_analysis_with_states_generic(ttir_text)
     else:  # pragma: no cover - stale extension fallback

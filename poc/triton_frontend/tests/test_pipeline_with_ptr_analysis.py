@@ -17,7 +17,7 @@ Skip semantics
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List
+from typing import Any, List
 
 import pytest
 
@@ -39,19 +39,13 @@ from poc.triton_frontend.pipeline import (  # noqa: E402
 )
 from poc.triton_frontend.ptr_analysis import (  # noqa: E402
     PtrState,
-    extract_ptr_states,
-    run_ptr_analysis,
-    run_ptr_analysis_with_states,
     shim_available,
 )
 
 # These imports trigger ``op_mapping`` which imports tvm lazily (only when
 # WalkerCtx.tir() / .tvm() is called). Importing the modules themselves is
 # safe without tvm.
-from poc.triton_frontend.op_emitters.memory import (  # noqa: E402
-    emit_tt_load,
-    has_cxx_shim,
-)
+from poc.triton_frontend.op_emitters.memory import emit_tt_load  # noqa: E402
 from poc.triton_frontend.op_mapping import WalkerCtx  # noqa: E402
 
 
@@ -320,7 +314,7 @@ def test_tile_load_without_seeded_state_still_degrades() -> None:
     # No skip: the no-shim emitter is fully exercised in dict-mode.
     import warnings
 
-    ctx = WalkerCtx()  # ptr_states empty
+    ctx = WalkerCtx(ptr_analysis_shim_available=False)  # ptr_states empty
     ptr_ssa = _fake_value("%no_state_ptr", shape=[32], dtype="float32")
     out_ssa = _fake_value("%no_state_out", shape=[32], dtype="float32")
     op = {
@@ -330,18 +324,9 @@ def test_tile_load_without_seeded_state_still_degrades() -> None:
         "attrs": {},
     }
 
-    # Force the no-shim path so this case is deterministic regardless of
-    # whether the C++ shim is built on the runner.
-    import poc.triton_frontend.op_emitters.memory as _mm
-
-    real_has_shim = _mm.has_cxx_shim
-    _mm.has_cxx_shim = lambda: False
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            emit_tt_load(op, ctx)
-    finally:
-        _mm.has_cxx_shim = real_has_shim
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        emit_tt_load(op, ctx)
 
     assert _count_degraded(ctx.stmts) >= 1, (
         f"no-shim path must keep the ``# DEGRADED:`` breadcrumb; got:\n"
@@ -367,13 +352,13 @@ def test_pre_pass_surfaces_pipeline_error_on_bad_input() -> None:
     assert "PtrAnalysis pre-pass failed" in msg, msg
 
 
-def test_pre_pass_returns_empty_when_shim_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pre_pass_returns_empty_when_shim_missing() -> None:
     """Without the shim the pre-pass returns the input text unchanged and
     an empty state map -- the documented degraded path.
     """
-    monkeypatch.setattr(
-        "poc.triton_frontend.ptr_analysis.shim_available", lambda: False
+    text, states = run_ptr_analysis_pre_pass(
+        _TILE_LOAD_TTIR,
+        shim_available_fn=lambda: False,
     )
-    text, states = run_ptr_analysis_pre_pass(_TILE_LOAD_TTIR)
     assert text == _TILE_LOAD_TTIR
     assert states == {}

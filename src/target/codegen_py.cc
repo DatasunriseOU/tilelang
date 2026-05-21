@@ -506,6 +506,16 @@ void CodeGenTileLangPY::VisitStmt_(const AllocateNode *op) {
 }
 
 void CodeGenTileLangPY::VisitStmt_(const AttrStmtNode *op) {
+  if (op->attr_key == "pragma_import_c") {
+    const auto *value = op->value.as<StringImmNode>();
+    ICHECK(value != nullptr) << "pragma_import_c expects a StringImm value";
+    decl_stream << value->value;
+    if (!value->value.empty() && value->value.back() != '\n') {
+      decl_stream << "\n";
+    }
+    PrintStmt_(op->body);
+    return;
+  }
   PrintStmt_(op->body);
 }
 

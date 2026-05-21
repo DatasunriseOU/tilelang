@@ -66,6 +66,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CH
 if TYPE_CHECKING:  # pragma: no cover
     import torch
     import torch.fx
+    from .custom_op_wrapper import FusedKernelArtifact
 
 # ---------------------------------------------------------------------------
 # FX node target -> ATEN_DISPATCH key
@@ -113,6 +114,43 @@ class FxToTileLangUnsupported(NotImplementedError):
     same except branch. The orchestrator still converts this into an
     extern-fallback region; the difference is purely diagnostic.
     """
+
+
+class _RegionFallbackReplayError(RuntimeError):
+    """A compiled region fell back to FX replay with region-local args."""
+
+    def __init__(self, kernel_error: RuntimeError, replay_error: Exception) -> None:
+        super().__init__(
+            "compiled region runtime fallback replay failed with region-local "
+            f"inputs: {replay_error}"
+        )
+        self.kernel_error = kernel_error
+        self.replay_error = replay_error
+
+
+def _init_runtime_fallback_counter(fn: Callable[..., Any]) -> Callable[..., Any]:
+    fn._tilelang_runtime_fallback_count = 0  # type: ignore[attr-defined]
+    return fn
+
+
+def _record_runtime_fallback(fn: Callable[..., Any]) -> None:
+    fn._tilelang_runtime_fallback_count = (  # type: ignore[attr-defined]
+        getattr(fn, "_tilelang_runtime_fallback_count", 0) + 1
+    )
+
+
+def _sync_child_runtime_fallbacks(
+    parent: Callable[..., Any],
+    child: Callable[..., Any],
+    child_count_before: int,
+) -> None:
+    child_count_after = getattr(child, "_tilelang_runtime_fallback_count", 0)
+    delta = child_count_after - child_count_before
+    if delta <= 0:
+        return
+    parent._tilelang_runtime_fallback_count = (  # type: ignore[attr-defined]
+        getattr(parent, "_tilelang_runtime_fallback_count", 0) + delta
+    )
 
 
 @dataclass
@@ -857,7 +895,13 @@ def _emit_view_like(name: str) -> Callable[..., _TensorSpec]:
         x = args[0]
         if not isinstance(x, _TensorSpec):
             raise TypeError(f"aten.{name} requires a tensor input")
-        target = args[1] if len(args) > 1 else None
+        if name in ("view", "reshape") and len(args) > 2:
+            # Method-style FX nodes encode ``x.view(2, 3)`` as
+            # ``args=(x, 2, 3)`` while function-style nodes commonly encode
+            # ``view(x, (2, 3))`` as ``args=(x, (2, 3))``.
+            target = tuple(args[1:])
+        else:
+            target = args[1] if len(args) > 1 else None
         # Resolve -1 entries against the source numel.
         if target is None:
             new_shape: Tuple[int, ...] = x.shape
@@ -890,6 +934,15 @@ def _emit_view_like(name: str) -> Callable[..., _TensorSpec]:
 
     _emit.__name__ = f"emit_{name}"
     return _emit
+
+
+def _emit_detach(node, args, ctx: LoweringContext) -> _TensorSpec:
+    """``aten.detach`` — autograd metadata boundary, storage/spec unchanged."""
+    x = args[0]
+    if not isinstance(x, _TensorSpec):
+        raise TypeError("aten.detach requires a tensor input")
+    ctx.op_trace.append(("detach", (node.name, x)))
+    return _TensorSpec(shape=x.shape, dtype=x.dtype)
 
 
 def _emit_permute(node, args, ctx: LoweringContext) -> _TensorSpec:
@@ -956,9 +1009,9 @@ def _emit_dropout(node, args, ctx: LoweringContext) -> _TensorSpec:
         raise TypeError("aten.dropout requires a tensor input")
     p = args[1] if len(args) > 1 else 0.0
     training = bool(args[2]) if len(args) > 2 else False
-    
+
     ctx.op_trace.append(("dropout", (node.name, x, p, training)))
-    
+
     # aten.native_dropout returns (out, mask). We emit the primary shape.
     # The getitem emitter will surface the mask if needed downstream.
     return _TensorSpec(shape=x.shape, dtype=x.dtype)
@@ -1079,11 +1132,13 @@ def _emit_topk(node, args, ctx: LoweringContext):
 
     ctx.op_trace.append(("topk", (node.name, x, k, dim)))
 
-    # Return a tuple of two _TensorSpecs (values, indices)
-    # Both have the same shape. values has same dtype as x, indices is int64.
-    import torch
-    return (_TensorSpec(shape=tuple(out_shape), dtype=x.dtype), 
-            _TensorSpec(shape=tuple(out_shape), dtype=torch.int64))
+    # Return a tuple of two _TensorSpecs (values, indices).
+    # Both have the same shape. Values keep x's TileLang dtype string; indices
+    # use the custom-op meta path's dtype-string contract.
+    return (
+        _TensorSpec(shape=tuple(out_shape), dtype=x.dtype),
+        _TensorSpec(shape=tuple(out_shape), dtype="int64"),
+    )
 
 ATEN_DISPATCH: Dict[str, Callable[..., Any]] = {
     # --- qk_reduce custom ops ----------------------------------------------
@@ -1128,6 +1183,7 @@ ATEN_DISPATCH: Dict[str, Callable[..., Any]] = {
     "reshape": _emit_view_like("reshape"),
     "_unsafe_view": _emit_view_like("view"),
     "flatten": _emit_view_like("flatten"),
+    "detach": _emit_detach,
     "permute": _emit_permute,
     "transpose": _emit_transpose,
     "broadcast_to": _emit_broadcast_to,
@@ -1521,6 +1577,7 @@ class FXToTileLang:
             launcher=launcher,
             input_specs=tuple(self.ctx.input_specs),
             output_specs=tuple(self.ctx.output_specs),
+            output_passthrough_sources=self._output_passthrough_sources(),
             param_tensors=tuple(self.ctx.param_tensors),
             prim_func=prim_funcs[0] if prim_funcs else None,
             source=source_info,
@@ -1588,8 +1645,74 @@ class FXToTileLang:
         return {
             "input_specs": list(self.ctx.input_specs),
             "output_specs": list(self.ctx.output_specs),
+            "output_passthrough_sources": list(self._output_passthrough_sources()),
             "n_params": len(self.ctx.param_tensors),
         }
+
+    def _normalised_output_values(self) -> Tuple[Any, ...]:
+        for node in self.gm.graph.nodes:
+            if node.op != "output":
+                continue
+            outs_raw = node.args[0] if node.args else ()
+            if isinstance(outs_raw, (tuple, list)):
+                return tuple(outs_raw)
+            return (outs_raw,)
+        return ()
+
+    def _output_passthrough_sources(self) -> Tuple[Optional[Tuple[str, int]], ...]:
+        """Map FX outputs that are exact placeholders/params to their source."""
+        placeholder_indices = {
+            node.name: i
+            for i, node in enumerate(self.gm.graph.nodes)
+            if node.op == "placeholder"
+        }
+
+        def _source_for_node(node: Any) -> Optional[Tuple[str, int]]:
+            name = getattr(node, "name", None)
+            op = getattr(node, "op", None)
+            if isinstance(name, str) and name in seen_outputs:
+                return ("output", seen_outputs[name])
+            if op == "placeholder" and name in placeholder_indices:
+                return ("input", placeholder_indices[name])
+            if op == "get_attr" and name in self._param_node_names:
+                return ("param", self._param_node_names[name])
+            return None
+
+        seen_outputs: Dict[str, int] = {}
+        sources: List[Optional[Tuple[str, int]]] = []
+        for output_idx, out in enumerate(self._normalised_output_values()):
+            name = getattr(out, "name", None)
+            source = _source_for_node(out)
+            if source is not None:
+                sources.append(source)
+            elif (
+                getattr(out, "op", None) == "call_function"
+                and _node_op_key(getattr(out, "target", None)) == "detach"
+                and getattr(out, "args", None)
+            ):
+                sources.append(_source_for_node(out.args[0]))
+            else:
+                sources.append(None)
+            if isinstance(name, str):
+                seen_outputs.setdefault(name, output_idx)
+        return tuple(sources)
+
+    def _graph_output_names(self) -> Tuple[str, ...]:
+        names: List[str] = []
+        for out in self._normalised_output_values():
+            name = getattr(out, "name", None)
+            if not isinstance(name, str):
+                return ()
+            names.append(name)
+        return tuple(names)
+
+    def _spec_for_node_name(self, name: str) -> Optional["_TensorSpec"]:
+        for node in self.gm.graph.nodes:
+            if node.name != name:
+                continue
+            spec = self.ctx.value_map.get(node)
+            return spec if isinstance(spec, _TensorSpec) else None
+        return None
 
     def content_hash(self) -> str:
         """Stable hash of the FX graph used as the custom_op qualname.
@@ -1625,6 +1748,8 @@ class FXToTileLang:
                     h.update(repr(x).encode())
         for spec in self.ctx.input_specs + self.ctx.output_specs:
             h.update(f"S{spec.shape}|{spec.dtype}".encode())
+        for source in self._output_passthrough_sources():
+            h.update(f"P{source!r}".encode())
         self._content_hash = h.hexdigest()
         return f"fused_{self._content_hash}"
 
@@ -1879,7 +2004,7 @@ class FXToTileLang:
                         except TypeError:
                             # Fall through to the implicit-output path.
                             pass
-                        except RuntimeError:
+                        except RuntimeError as exc:
                             # B2 wave fix-pack: the JIT kernel was
                             # successfully compiled (so prim_funcs is
                             # populated and HAS_PRIM_FUNC=True records the
@@ -1893,12 +2018,24 @@ class FXToTileLang:
                             # use it ONLY at runtime, not at materialisation
                             # time. Materialisation-time bugs continue to
                             # raise (per the brief: "no silent fallback").
-                            return fallback(*tensors)
+                            try:
+                                result = fallback(*tensors)
+                            except Exception as replay_exc:
+                                raise _RegionFallbackReplayError(
+                                    exc, replay_exc) from replay_exc
+                            _record_runtime_fallback(_run)
+                            return result
                     try:
                         return k(*tensors)
-                    except RuntimeError:
-                        return fallback(*tensors)
-                return _run
+                    except RuntimeError as exc:
+                        try:
+                            result = fallback(*tensors)
+                        except Exception as replay_exc:
+                            raise _RegionFallbackReplayError(
+                                exc, replay_exc) from replay_exc
+                        _record_runtime_fallback(_run)
+                        return result
+                return _init_runtime_fallback_counter(_run)
 
             region_launchers.append(_make(kernel, region_output_specs, extern_fallback))
 
@@ -1977,8 +2114,12 @@ class FXToTileLang:
         # legacy ``_emit_matmul_relu_primfunc`` was emitting (single
         # ``T.Kernel`` body, ``T.gemm`` + ``T.Parallel`` epilogue,
         # shared-resident A/B tiles, fragment-resident accumulator).
-        match = try_match(region, 0)
-        if match is not None and match[2] == len(region):
+        pattern_region = region
+        while pattern_region and pattern_region[-1][0] == "detach":
+            pattern_region = pattern_region[:-1]
+
+        match = try_match(pattern_region, 0)
+        if match is not None and match[2] == len(pattern_region):
             pattern_name = match[0]
             captured = match[1]
             if pattern_name == "fused_linear":
@@ -2039,25 +2180,88 @@ class FXToTileLang:
         dtype = a_spec.dtype  # type: ignore[union-attr]
         accum_dtype = "float32"
         block_M, block_N, block_K = self._tile_constants(m, n, k)
+        threads = 32 if (block_M < 16 or block_N < 16) else 128
 
         if activation == "relu":
-            def _epi(C_l: Any, i: Any, j: Any) -> Any:
-                return T.max(C_l[i, j], 0)
+            def _epi_value(x: Any) -> Any:
+                return T.max(x, T.cast(0, accum_dtype))
         elif activation == "gelu":
-            def _epi(C_l: Any, i: Any, j: Any) -> Any:
+            def _epi_value(x: Any) -> Any:
                 # tanh approximation: 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715 x^3)))
-                x = C_l[i, j]
                 return 0.5 * x * (1.0 + T.tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
         elif activation == "silu":
-            def _epi(C_l: Any, i: Any, j: Any) -> Any:
-                x = C_l[i, j]
+            def _epi_value(x: Any) -> Any:
                 return x / (1.0 + T.exp(-x))
         elif activation == "tanh":
-            def _epi(C_l: Any, i: Any, j: Any) -> Any:
-                return T.tanh(C_l[i, j])
+            def _epi_value(x: Any) -> Any:
+                return T.tanh(x)
         else:
-            def _epi(C_l: Any, i: Any, j: Any) -> Any:
-                return C_l[i, j]
+            def _epi_value(x: Any) -> Any:
+                return x
+
+        if op_name == "addmm":
+            if not isinstance(bias_spec, _TensorSpec):
+                raise NotImplementedError(
+                    "fused addmm requires a tensor bias spec")
+            bias_shape = bias_spec.shape
+            bias_dtype = bias_spec.dtype
+            if bias_shape == (n,):
+                bias_rank = 1
+            elif bias_shape in ((m, n), (1, n)):
+                bias_rank = 2
+            else:
+                raise NotImplementedError(
+                    "fused addmm only supports bias shapes "
+                    f"(N,), (M,N), or (1,N); got {bias_shape}")
+
+            @T.prim_func
+            def kernel(
+                Bias: T.Tensor(bias_shape, bias_dtype),
+                A: T.Tensor((m, k), dtype),
+                B: T.Tensor((k, n), dtype),
+                C: T.Tensor((m, n), dtype),
+            ):
+                if False:  # noqa: SIM103
+                    _ = (bias_shape, bias_dtype)  # noqa: F841
+                with T.Kernel(T.ceildiv(n, block_N), T.ceildiv(m, block_M),
+                              threads=threads) as (bx, by):
+                    A_s = T.alloc_shared((block_M, block_K), dtype)
+                    B_s = T.alloc_shared((block_K, block_N), dtype)
+                    C_s = T.alloc_shared((block_M, block_N), accum_dtype)
+                    T.clear(C_s)
+                    for ko in T.Pipelined(T.ceildiv(k, block_K), num_stages=2):
+                        T.copy(A[by * block_M, ko * block_K], A_s)
+                        T.copy(B[ko * block_K, bx * block_N], B_s)
+                        T.gemm(A_s, B_s, C_s)
+                    for i, j in T.Parallel(block_M, block_N):
+                        if bias_rank == 1:
+                            C[by * block_M + i, bx * block_N + j] = T.cast(
+                                _epi_value(
+                                    C_s[i, j] + T.cast(
+                                        Bias[bx * block_N + j], accum_dtype)),
+                                dtype,
+                            )
+                        elif bias_shape[0] == 1:
+                            C[by * block_M + i, bx * block_N + j] = T.cast(
+                                _epi_value(
+                                    C_s[i, j] + T.cast(
+                                        Bias[0, bx * block_N + j], accum_dtype)),
+                                dtype,
+                            )
+                        else:
+                            C[by * block_M + i, bx * block_N + j] = T.cast(
+                                _epi_value(
+                                    C_s[i, j] + T.cast(
+                                        Bias[
+                                            by * block_M + i,
+                                            bx * block_N + j,
+                                        ],
+                                        accum_dtype,
+                                    )),
+                                dtype,
+                            )
+
+            return kernel
 
         @T.prim_func
         def kernel(
@@ -2066,18 +2270,18 @@ class FXToTileLang:
             C: T.Tensor((m, n), dtype),
         ):
             with T.Kernel(T.ceildiv(n, block_N), T.ceildiv(m, block_M),
-                          threads=128) as (bx, by):
+                          threads=threads) as (bx, by):
                 A_s = T.alloc_shared((block_M, block_K), dtype)
                 B_s = T.alloc_shared((block_K, block_N), dtype)
-                C_l = T.alloc_fragment((block_M, block_N), accum_dtype)
-                T.clear(C_l)
+                C_s = T.alloc_shared((block_M, block_N), accum_dtype)
+                T.clear(C_s)
                 for ko in T.Pipelined(T.ceildiv(k, block_K), num_stages=2):
                     T.copy(A[by * block_M, ko * block_K], A_s)
                     T.copy(B[ko * block_K, bx * block_N], B_s)
-                    T.gemm(A_s, B_s, C_l)
+                    T.gemm(A_s, B_s, C_s)
                 for i, j in T.Parallel(block_M, block_N):
-                    C_l[i, j] = _epi(C_l, i, j)
-                T.copy(C_l, C[by * block_M, bx * block_N])
+                    C[by * block_M + i, bx * block_N + j] = T.cast(
+                        _epi_value(C_s[i, j]), dtype)
 
         return kernel
 
@@ -2089,7 +2293,6 @@ class FXToTileLang:
         if has_transpose:
             k_spec = captured[0][1][1]
             q_spec = captured[1][1][1]
-            p_spec = captured[2][1][1]
             m, k = q_spec.shape
             n, k2 = k_spec.shape
             dtype = q_spec.dtype
@@ -2126,7 +2329,6 @@ class FXToTileLang:
         else:
             q_spec = captured[0][1][1]
             k_t_spec = captured[0][1][2]
-            p_spec = captured[1][1][1]
             m, k = q_spec.shape
             k2, n = k_t_spec.shape
             dtype = q_spec.dtype
@@ -2168,12 +2370,12 @@ class FXToTileLang:
         q_spec = captured[0][1][1]
         k_spec = captured[0][1][2]
         mul_payload = captured[1][1]
-        
+
         if isinstance(mul_payload[1], _TensorSpec):
             scale_val = mul_payload[2]
         else:
             scale_val = mul_payload[1]
-            
+
         m, k_dim = q_spec.shape
         n, k_dim2 = k_spec.shape
         dtype = q_spec.dtype
@@ -2213,7 +2415,7 @@ class FXToTileLang:
     })
     _SEQUENTIAL_VIEW_OPS = frozenset({
         "view", "reshape", "flatten", "permute", "transpose",
-        "broadcast_to", "expand", "dropout",
+        "broadcast_to", "expand", "dropout", "detach",
         # B2 wave fix-pack: ``aten.t`` is metadata-only at the matmul boundary
         # (the matmul payload already records the post-transpose ``_TensorSpec``
         # for its operands, see ``emit_t``+``emit_matmul``). Treating it as a
@@ -2290,10 +2492,10 @@ class FXToTileLang:
         # Dataflow analysis
         node_map = {n.name: n for n in self.gm.graph.nodes}
         internal_nodes = {payload[0] for _, payload in compute_ops}
-        
+
         external_inputs: List[str] = []
         external_names_set = set()
-        
+
         for op_name, payload in compute_ops:
             node_name = payload[0]
             if node_name not in node_map:
@@ -2310,11 +2512,11 @@ class FXToTileLang:
                                     f"({arg_spec.shape}|{arg_spec.dtype} vs {shape}|{dtype})")
                         external_inputs.append(arg.name)
                         external_names_set.add(arg.name)
-                        
+
         if len(external_inputs) > 6:
             raise FxToTileLangUnsupported(
                 f"sequential region: too many external inputs ({len(external_inputs)})")
-                
+
         def _apply_unary_local(T_mod: Any, op_name: str, v: Any) -> Any:
             if op_name == "relu":
                 return T_mod.max(v, T_mod.cast(0, dtype))
@@ -2577,6 +2779,8 @@ class FXToTileLang:
                 _ = out_kernel_shape  # noqa: F841
                 _ = dtype  # noqa: F841
             with T.Kernel(1, threads=1) as bx:
+                if False:  # noqa: SIM103
+                    _ = bx  # noqa: F841
                 X_flat = T.Buffer((n_elem,), dtype, data=X.data)
                 Y_flat = T.Buffer((1,), dtype, data=Y.data)
                 acc = T.alloc_local((1,), dtype)
@@ -2792,8 +2996,25 @@ class FXToTileLang:
         """
         if not region:
             return ()
-        # For a single-region graph the FX outputs are the region's outputs.
-        if len(self.ctx.output_specs) > 0 and len(self._partition_count_cache()) == 1:
+        partitions = self._partition_count_cache()
+        region_io = self._derive_region_io(partitions)
+        if region_io is not None:
+            for candidate, (_, out_names) in zip(partitions, region_io):
+                if candidate is region or candidate == region:
+                    specs = [
+                        self._spec_for_node_name(name)
+                        for name in out_names
+                    ]
+                    return tuple(spec for spec in specs if spec is not None)
+        # For a single-region graph the non-pass-through FX outputs are the
+        # region's custom-op outputs.
+        if len(self.ctx.output_specs) > 0 and len(partitions) == 1:
+            sources = self._output_passthrough_sources()
+            if len(sources) == len(self.ctx.output_specs):
+                return tuple(
+                    spec for spec, source in zip(self.ctx.output_specs, sources)
+                    if source is None
+                )
             return tuple(self.ctx.output_specs)
         # Best-effort: derive from the last op's payload tensors. We
         # cannot statically know which payload slot is the output, so we
@@ -2973,6 +3194,16 @@ class FXToTileLang:
           op-trace payload doesn't carry node-name strings).
         """
         gm = self.gm
+        final_output_names = self._graph_output_names()
+
+        def _final_outputs_from_env(env: Dict[str, Any]) -> Any:
+            if not final_output_names:
+                raise KeyError("FX output names unavailable")
+            values = [env[name] for name in final_output_names]
+            if len(values) == 1:
+                return values[0]
+            return tuple(values)
+
         all_extern = all(
             getattr(rl, "_tilelang_extern_fallback", False)
             for rl in region_launchers
@@ -2980,13 +3211,59 @@ class FXToTileLang:
         if all_extern:
             def _launcher(*runtime_inputs: Any) -> Any:
                 return gm(*runtime_inputs)
+            _init_runtime_fallback_counter(_launcher)
             _launcher._tilelang_chain_mode = "extern_all"  # type: ignore[attr-defined]
             return _launcher
 
         if len(region_launchers) == 1:
             single = region_launchers[0]
+            region_io = self._derive_region_io(regions)
+            try:
+                placeholder_names = [
+                    n.name for n in self.gm.graph.nodes if n.op == "placeholder"
+                ]
+                attr_names = [
+                    n.name for n in self.gm.graph.nodes if n.op == "get_attr"
+                ]
+            except Exception:  # pragma: no cover
+                placeholder_names = []
+                attr_names = []
+            runtime_input_names = placeholder_names + attr_names
+
             def _launcher_one(*runtime_inputs: Any) -> Any:
-                return single(*runtime_inputs)
+                if region_io is None or not runtime_input_names:
+                    return single(*runtime_inputs)
+                try:
+                    env: Dict[str, Any] = dict(
+                        zip(runtime_input_names, runtime_inputs))
+                    in_names = region_io[0][0]
+                    out_names = region_io[0][1]
+                    in_tensors = tuple(env[n] for n in in_names)
+                except KeyError:
+                    return gm(*runtime_inputs)
+                single_count = getattr(
+                    single, "_tilelang_runtime_fallback_count", 0)
+                try:
+                    result = single(*in_tensors)
+                except _RegionFallbackReplayError:
+                    _record_runtime_fallback(_launcher_one)
+                    return gm(*runtime_inputs)
+                _sync_child_runtime_fallbacks(
+                    _launcher_one, single, single_count)
+                if not isinstance(result, tuple):
+                    out_tup: Tuple[Any, ...] = (result,)
+                else:
+                    out_tup = result
+                if len(out_tup) < len(out_names) and out_tup:
+                    out_tup = out_tup + (out_tup[-1],) * (len(out_names) - len(out_tup))
+                for nm, t in zip(out_names, out_tup):
+                    env[nm] = t
+                try:
+                    return _final_outputs_from_env(env)
+                except KeyError:
+                    return gm(*runtime_inputs)
+
+            _init_runtime_fallback_counter(_launcher_one)
             _launcher_one._tilelang_chain_mode = "single_region"  # type: ignore[attr-defined]
             return _launcher_one
 
@@ -3009,6 +3286,7 @@ class FXToTileLang:
             # results. This is the ONLY remaining gm.forward fall-through.
             def _launcher_multi_fallback(*runtime_inputs: Any) -> Any:
                 return gm(*runtime_inputs)
+            _init_runtime_fallback_counter(_launcher_multi_fallback)
             _launcher_multi_fallback._tilelang_chain_mode = (  # type: ignore[attr-defined]
                 "multi_fallback_to_gm_forward"
             )
@@ -3027,7 +3305,9 @@ class FXToTileLang:
                     # A region needs a tensor we don't have in the env yet.
                     # Fall back to gm.forward this call.
                     return gm(*runtime_inputs)
+                rl_count = getattr(rl, "_tilelang_runtime_fallback_count", 0)
                 out = rl(*in_tensors)
+                _sync_child_runtime_fallbacks(_launcher_multi, rl, rl_count)
                 if not isinstance(out, tuple):
                     out_tup: Tuple[Any, ...] = (out,)
                 else:
@@ -3039,16 +3319,12 @@ class FXToTileLang:
                 for nm, t in zip(out_names, out_tup):
                     env[nm] = t
 
-            # Final outputs = the last region's output names.
-            final_names = region_io[-1][1] if region_io else []
-            if not final_names:
-                # Should not happen given _derive_region_io's fallback,
-                # but stay safe.
+            try:
+                return _final_outputs_from_env(env)
+            except KeyError:
                 return gm(*runtime_inputs)
-            if len(final_names) == 1:
-                return env[final_names[0]]
-            return tuple(env[n] for n in final_names)
 
+        _init_runtime_fallback_counter(_launcher_multi)
         _launcher_multi._tilelang_chain_mode = "multi_real_chain"  # type: ignore[attr-defined]
         return _launcher_multi
 

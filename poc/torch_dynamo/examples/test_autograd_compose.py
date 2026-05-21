@@ -6,7 +6,9 @@ fail.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 import threading
+from uuid import uuid4
 import warnings
 
 import pytest
@@ -55,18 +57,15 @@ def test_autotune_select_bench_picks_fastest():
     assert chosen == (128, 64, 8)
 
 
-def test_view_aliased_input_warned_and_replaced():
+def test_view_aliased_input_rejected_without_hidden_copy():
     torch = pytest.importorskip("torch")
 
     from poc.torch_dynamo.custom_op_wrapper import _ensure_contiguous_inputs
 
     base = torch.randn(8, 8)
     view = base[2:6]  # ``view._base is base``
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        out = _ensure_contiguous_inputs("tilelang::view_probe_fwd", [view])
-    assert any("view-aliased" in str(w.message) for w in caught)
-    assert out[0].data_ptr() != view.data_ptr()
+    with pytest.raises(RuntimeError, match=r"input #0 .*view-aliased"):
+        _ensure_contiguous_inputs("tilelang::view_probe_fwd", [view])
 
 
 def test_wave3_specialize_prim_func_returns_input_when_tvm_missing():
@@ -101,47 +100,88 @@ def test_wave3_has_symint_shape_detects_non_int_dims():
 def test_wave4_atomic_accumulator_double_backward_invokes_real_closure():
     # Wave-4 fix: previous wave-3 test re-implemented the zero-grad rule in
     # the test, so it would silently drift if the impl changed. This test
-    # actually invokes the registered backward closure via a fake ctx + fake
-    # bwd_op so it locks in the real branch logic.
+    # actually invokes the registered backward closure via real custom ops so
+    # it locks in PyTorch's boxed List[Tensor] autograd structure.
     torch = pytest.importorskip("torch")
 
-    from poc.torch_dynamo.aot_autograd_glue import (
-        DoubleBackwardUnsupportedError,
-        register_double_backward,
-    )
-    from poc.torch_dynamo import custom_op_wrapper
+    from poc.torch_dynamo.aot_autograd_glue import register_double_backward
+    from poc.torch_dynamo.custom_op_wrapper import FusedKernelArtifact, wrap_as_custom_op
 
-    # Stub a bwd op into _REGISTRY so register_double_backward proceeds.
-    fwd_q = "tilelang::wave4_dbw_test_fwd"
-    bwd_q = "tilelang::wave4_dbw_test_bwd"
+    name = f"wave4_dbw_test_{uuid4().hex}"
+    spec = SimpleNamespace(shape=(3,), dtype="float32")
     bwd_calls = []
 
-    def _fake_bwd(args):
-        bwd_calls.append(list(args))
-        return tuple(torch.zeros_like(t) for t in args if isinstance(t, torch.Tensor))
+    def _fwd_launcher(x):
+        return x * 2
 
-    custom_op_wrapper._REGISTRY[bwd_q] = _fake_bwd
-    try:
-        # Trivial atomic case — register, then invoke closure manually.
-        ok = register_double_backward(fwd_q, bwd_q, has_atomic_accumulator=True)
-    except Exception:
-        # Older torch lacks register_autograd; skip the runtime invocation.
-        custom_op_wrapper._REGISTRY.pop(bwd_q, None)
-        pytest.skip("torch.library.register_autograd not available")
+    def _bwd_launcher(x, grad):
+        bwd_calls.append((x.detach().clone(), grad.detach().clone()))
+        return grad * 2
 
-    if not ok:
-        custom_op_wrapper._REGISTRY.pop(bwd_q, None)
-        pytest.skip("register_double_backward returned False")
+    fwd = wrap_as_custom_op(
+        FusedKernelArtifact(
+            name=name,
+            launcher=_fwd_launcher,
+            input_specs=(spec,),
+            output_specs=(spec,),
+        ),
+        {},
+        is_backward=False,
+        allow_grad_inputs=True,
+    )
+    wrap_as_custom_op(
+        FusedKernelArtifact(
+            name=name,
+            launcher=_bwd_launcher,
+            input_specs=(spec, spec),
+            output_specs=(spec,),
+        ),
+        {},
+        is_backward=True,
+        allow_grad_inputs=True,
+    )
 
-    # The closure was wired via register_autograd; we verify by importing the
-    # symbols and checking the multi-target atomic case raises the explicit
-    # error when called through register_double_backward → backward closure.
-    # (Fully invoking register_autograd's installed closure requires a full
-    # torch op call; the symbol-level check below is the most we can do
-    # offline. The logic itself is also covered by hand below via the fake.)
-    assert issubclass(DoubleBackwardUnsupportedError, NotImplementedError)
+    ok = register_double_backward(f"tilelang::{name}_fwd", f"tilelang::{name}_bwd")
+    assert ok is True
 
-    custom_op_wrapper._REGISTRY.pop(bwd_q, None)
+    x = torch.randn(3, requires_grad=True)
+    y = fwd(x)
+    grad_out = torch.ones_like(y)
+    assert grad_out.is_contiguous()
+    (grad_x,) = torch.autograd.grad(y, x, grad_outputs=grad_out)
+
+    assert torch.allclose(grad_x, torch.full_like(x, 2))
+    assert len(bwd_calls) == 1
+
+
+def test_wave4_missing_forward_dispatch_op_returns_false():
+    pytest.importorskip("torch")
+
+    from poc.torch_dynamo.aot_autograd_glue import register_double_backward
+    from poc.torch_dynamo.custom_op_wrapper import FusedKernelArtifact, wrap_as_custom_op
+
+    name = f"wave4_missing_fwd_{uuid4().hex}"
+    spec = SimpleNamespace(shape=(3,), dtype="float32")
+
+    def _bwd_launcher(x, grad):
+        return grad
+
+    wrap_as_custom_op(
+        FusedKernelArtifact(
+            name=name,
+            launcher=_bwd_launcher,
+            input_specs=(spec, spec),
+            output_specs=(spec,),
+        ),
+        {},
+        is_backward=True,
+        allow_grad_inputs=True,
+    )
+
+    assert register_double_backward(
+        f"tilelang::{name}_missing_fwd",
+        f"tilelang::{name}_bwd",
+    ) is False
 
 
 def test_wave4_compile_symbolic_fallback_does_not_recurse():
@@ -231,7 +271,6 @@ def test_wave4_pending_double_backward_pairing_flushes_on_bwd_compile():
     """Wave-4 fix #4: forward compile records a pending pairing; the bwd
     side flushes it once the bwd op lands in _REGISTRY."""
     from poc.torch_dynamo import aot_autograd_glue as glue
-    from poc.torch_dynamo import custom_op_wrapper
 
     fwd_q = "tilelang::wave4_pending_test_fwd"
     bwd_q = "tilelang::wave4_pending_test_bwd"
@@ -257,7 +296,6 @@ def test_wave4_autotune_cache_is_thread_safe():
     so concurrent compiles can't lose the first writer's choice."""
     from poc.torch_dynamo.aot_autograd_glue import (
         _AUTOTUNE_CACHE,
-        _AUTOTUNE_LOCK,
         autotune_select,
     )
 

@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -289,7 +288,6 @@ def build_pipeline(
     Returns a ``tvm.transform.Sequential`` ready to apply via
     ``seq(IRModule)`` or to slot into ``tilelang.engine.phase``.
     """
-    import tvm  # noqa: WPS433 (intentional lazy import)
     from tvm.transform import Sequential  # noqa: WPS433
 
     nv = _is_nv(target)
@@ -322,7 +320,6 @@ def run(prim_func: Any, target: Optional[str] = None, **kwargs: Any) -> Any:
     Wraps ``prim_func`` in an ``IRModule`` first (Sequential operates on
     modules); the result is the lowered ``IRModule``.
     """
-    import tvm  # noqa: WPS433
     from tvm.ir import IRModule  # noqa: WPS433
 
     seq = build_pipeline(target, **kwargs)
@@ -356,6 +353,9 @@ def _ptr_states_to_map(states: List[Any]) -> dict:
 
 def run_ptr_analysis_pre_pass(
     ttir_text: str,
+    *,
+    shim_available_fn: Callable[[], bool] | None = None,
+    run_with_states_fn: Callable[[str], Tuple[str, List[Any]]] | None = None,
 ) -> Tuple[str, dict]:
     """Run PtrAnalysis on TTIR text and return ``(rewritten_ttir, state_map)``.
 
@@ -370,11 +370,14 @@ def run_ptr_analysis_pre_pass(
     """
     from .ptr_analysis import shim_available, run_ptr_analysis_with_states_generic
 
-    if not shim_available():
+    is_available = shim_available_fn or shim_available
+    run_with_states = run_with_states_fn or run_ptr_analysis_with_states_generic
+
+    if not is_available():
         return ttir_text, {}
 
     try:
-        rewritten, states = run_ptr_analysis_with_states_generic(ttir_text)
+        rewritten, states = run_with_states(ttir_text)
     except BaseException as exc:  # noqa: BLE001
         raise PipelineError(
             f"PtrAnalysis pre-pass failed: {type(exc).__name__}: {exc}. "

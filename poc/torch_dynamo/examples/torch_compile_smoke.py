@@ -133,21 +133,7 @@ def test_tinymm_relu_backward_matches_eager() -> None:
     model, x = _build_model_and_input()
     x = x.detach().clone().requires_grad_(True)
     compiled = torch.compile(model, backend="tilelang", fullgraph=True)
-    # NOTE: previously wrapped in ``except NotImplementedError: pytest.skip``
-    # which silently masked the regression we want to catch. Keep the xfail
-    # tied to the actual unsupported ATen op so unrelated failures surface.
-    try:
-        y = compiled(x)
-    except Exception as exc:
-        detail = str(exc)
-        if "aten.detach" in detail and "ATEN_DISPATCH" in detail:
-            pytest.xfail(
-                "AOT autograd forward capture now emits aten.detach before "
-                "the backward graph is reached; add a detach lowering to "
-                "ATEN_DISPATCH before this test can verify the "
-                "threshold_backward/mm/sum_dim emitters."
-            )
-        raise
+    y = compiled(x)
     loss = y.sum()
     loss.backward()
 

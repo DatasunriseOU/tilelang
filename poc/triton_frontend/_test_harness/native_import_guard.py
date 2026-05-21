@@ -53,6 +53,8 @@ def triton_import_block_reason(
     catch an exception. In that state callers should report Triton as
     unavailable and run live Triton checks in a fresh process.
     """
+    if triton_native_loaded(loaded_modules):
+        return None
     peers = loaded_llvm_peer_modules(loaded_modules)
     if peers:
         return (
@@ -62,6 +64,24 @@ def triton_import_block_reason(
             "too can abort on duplicate LLVM cl::opt registration. Re-run the "
             "Triton-dependent check in a fresh Python process."
         )
-    if triton_native_loaded(loaded_modules):
-        return None
+    return None
+
+
+def triton_compile_block_reason(
+    loaded_modules: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """Return a reason to avoid Triton TTIR generation in this process."""
+    import_reason = triton_import_block_reason(loaded_modules)
+    if import_reason is not None:
+        return import_reason
+
+    peers = loaded_llvm_peer_modules(loaded_modules)
+    if triton_native_loaded(loaded_modules) and peers:
+        return (
+            "triton compile blocked because triton._C.libtriton and "
+            + ", ".join(peers)
+            + " are already loaded in this process; Triton TTIR generation "
+            "can abort on duplicate LLVM cl::opt registration. Re-run the "
+            "Triton-dependent check in a fresh Python process."
+        )
     return None

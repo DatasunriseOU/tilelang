@@ -28,6 +28,12 @@ def is_cpu_device_backend(target: Target):
     return target.kind.name == "c"
 
 
+def _extern_intrinsic_target_name(target: Target) -> str:
+    if target.kind.name == "cuda" and "cutedsl" in target.keys:
+        return "cutedsl"
+    return target.kind.name
+
+
 def has_device_kernel_launch(attrs) -> bool:
     """Check if the attributes indicate a device kernel launch."""
     return bool(attrs and "calling_conv" in attrs and attrs["calling_conv"] == CallingConv.DEVICE_KERNEL_LAUNCH)
@@ -241,7 +247,7 @@ def device_codegen(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
     device_mod = tilelang.transform.LowerTileLangAllocate()(device_mod)
     device_mod = tilelang.transform.LowerDeviceStorageAccessInfo()(device_mod)
     device_mod = tilelang.transform.LowerIntrin()(device_mod)
-    device_mod = tilelang.transform.LowerExternIntrinsic(target.kind.name)(device_mod)
+    device_mod = tilelang.transform.LowerExternIntrinsic(_extern_intrinsic_target_name(target))(device_mod)
     device_mod = tir.transform.Simplify()(device_mod)
     device_mod = tilelang.transform.HoistBroadcastValues()(device_mod)
     device_mod = apply_metal_scalar_pipeline(device_mod, target)
@@ -265,7 +271,7 @@ def device_codegen_without_compile(device_mod: tvm.IRModule, target: Target) -> 
     device_mod = tilelang.transform.LowerTileLangAllocate()(device_mod)
     device_mod = tilelang.transform.LowerDeviceStorageAccessInfo()(device_mod)
     device_mod = tilelang.transform.LowerIntrin()(device_mod)
-    device_mod = tilelang.transform.LowerExternIntrinsic(target.kind.name)(device_mod)
+    device_mod = tilelang.transform.LowerExternIntrinsic(_extern_intrinsic_target_name(target))(device_mod)
     device_mod = tir.transform.Simplify()(device_mod)
     device_mod = tilelang.transform.HoistBroadcastValues()(device_mod)
     device_mod = apply_metal_scalar_pipeline(device_mod, target)

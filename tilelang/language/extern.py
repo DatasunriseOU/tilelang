@@ -3,7 +3,7 @@ TIR ops (RFC §6).
 
 This module implements the user-facing decorator and the :class:`Frag` data
 type that capture the **tile contract** of an externally-authored CUDA / HIP /
-Metal kernel snippet so that existing TileLang fusion passes (
+Metal / CuTeDSL kernel snippet so that existing TileLang fusion passes (
 ``auto_double_buffer``, ``thread_storage_sync``, ``inject_pipeline``,
 ``layout_inference``) treat the call as a regular TIR block — i.e. without
 forcing an HBM round-trip.
@@ -63,10 +63,12 @@ Citations:
 
 from __future__ import annotations
 
+import ast
 import re
 import warnings
-from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Literal, Mapping, Sequence, Tuple
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from . import extern_registry as _registry
 
@@ -120,7 +122,7 @@ class Frag:
     """
 
     name: str
-    shape: Tuple[int, ...]
+    shape: tuple[int, ...]
     scope: str
     dtype: str
     layout: str = "row_major"
@@ -167,6 +169,73 @@ _METAL_FN_RE = re.compile(
     r"(?:inline\s+)?(?:void|[\w:]+)\s+(\w+)\s*\(([^)]*)\)\s*\{",
     re.MULTILINE,
 )
+
+
+def _attribute_path(node: ast.AST) -> tuple[str, ...]:
+    path: list[str] = []
+    cur: ast.AST | None = node
+    while isinstance(cur, ast.Attribute):
+        path.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        path.append(cur.id)
+    return tuple(reversed(path))
+
+
+def _is_cutedsl_kernel_decorator(node: ast.AST) -> bool:
+    if isinstance(node, ast.Call):
+        node = node.func
+    path = _attribute_path(node)
+    return len(path) >= 2 and path[-2:] == ("cute", "kernel")
+
+
+def _cutedsl_kernel_functions(
+    body: str,
+    intrinsic_name: str,
+    target: str,
+) -> list[ast.FunctionDef]:
+    try:
+        tree = ast.parse(body)
+    except SyntaxError as err:
+        raise ValueError(
+            f"extern_intrinsic[{target}] body for '{intrinsic_name}' is not valid "
+            f"Python CuTeDSL source: {err.msg}."
+        ) from err
+
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and any(_is_cutedsl_kernel_decorator(decorator) for decorator in node.decorator_list)
+    ]
+
+
+def _validate_cutedsl_body(
+    target: str,
+    intrinsic_name: str,
+    body: str,
+    frags: Sequence[Frag],
+) -> None:
+    matches = _cutedsl_kernel_functions(body, intrinsic_name, target)
+    found = [node for node in matches if node.name == intrinsic_name]
+    if not found:
+        if not matches:
+            raise ValueError(
+                f"extern_intrinsic[{target}] body for '{intrinsic_name}' contains "
+                f"no recognisable CuTeDSL @cute.kernel definition; expected "
+                f"'@cute.kernel\\ndef {intrinsic_name}(...)'."
+            )
+        return
+
+    fn = found[0]
+    args = [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]
+    if len(args) != len(frags):
+        raise ValueError(
+            f"extern_intrinsic[{target}] '{intrinsic_name}' declares "
+            f"{len(args)} body parameter(s), but the signature declares "
+            f"{len(frags)} Frag(s). Body args: {[arg.arg for arg in args]!r}; "
+            f"Frags: {[f.name for f in frags]!r}."
+        )
 
 
 def _split_args(arglist: str) -> list[str]:
@@ -242,26 +311,29 @@ def _validate_body(target: str, intrinsic_name: str, body: str, frags: Sequence[
     declared" check because it would false-fire on every helper local
     variable in the body.
     """
-    pat = _METAL_FN_RE if target == "metal" else _DEVICE_FN_RE
-    matches = list(pat.finditer(body))
-    found = [m for m in matches if m.group(1) == intrinsic_name]
-    if not found:
-        # Be tolerant: many users may inline the body without a matching name.
-        # Only error if no function definition appears at all.
-        if not matches:
-            raise ValueError(
-                f"extern_intrinsic[{target}] body for '{intrinsic_name}' contains "
-                f"no recognisable function definition; expected '{intrinsic_name}(...)'."
-            )
+    if target == "cutedsl":
+        _validate_cutedsl_body(target, intrinsic_name, body, frags)
     else:
-        args = _split_args(found[0].group(2))
-        if len(args) != len(frags):
-            raise ValueError(
-                f"extern_intrinsic[{target}] '{intrinsic_name}' declares "
-                f"{len(args)} body parameter(s), but the signature declares "
-                f"{len(frags)} Frag(s). Body args: {args!r}; "
-                f"Frags: {[f.name for f in frags]!r}."
-            )
+        pat = _METAL_FN_RE if target == "metal" else _DEVICE_FN_RE
+        matches = list(pat.finditer(body))
+        found = [m for m in matches if m.group(1) == intrinsic_name]
+        if not found:
+            # Be tolerant: many users may inline the body without a matching name.
+            # Only error if no function definition appears at all.
+            if not matches:
+                raise ValueError(
+                    f"extern_intrinsic[{target}] body for '{intrinsic_name}' contains "
+                    f"no recognisable function definition; expected '{intrinsic_name}(...)'."
+                )
+        else:
+            args = _split_args(found[0].group(2))
+            if len(args) != len(frags):
+                raise ValueError(
+                    f"extern_intrinsic[{target}] '{intrinsic_name}' declares "
+                    f"{len(args)} body parameter(s), but the signature declares "
+                    f"{len(frags)} Frag(s). Body args: {args!r}; "
+                    f"Frags: {[f.name for f in frags]!r}."
+                )
 
     scrubbed = _scrub_body_for_name_scan(body)
     missing: list[str] = []
@@ -370,7 +442,7 @@ def extern_intrinsic(
         name: Globally-unique intrinsic name (becomes the ``call_extern`` symbol).
         signature: Callable that, given runtime shape parameters, returns the
             tuple of :class:`Frag` describing the contract.
-        bodies: Mapping ``"cuda"`` / ``"hip"`` / ``"metal"`` -> body source.
+        bodies: Mapping ``"cuda"`` / ``"hip"`` / ``"metal"`` / ``"cutedsl"`` -> body source.
 
     Returns:
         A callable that, when invoked from inside a TileLang kernel body,
@@ -499,9 +571,7 @@ def _looks_like_buffer(obj: Any) -> bool:
     # Fallback: if .data carries .type_annotation it's a TVM Var, not a
     # numpy/torch data attribute.
     data = getattr(obj, "data", None)
-    if data is not None and hasattr(data, "type_annotation"):
-        return True
-    return False
+    return data is not None and hasattr(data, "type_annotation")
 
 
 def _split_shape_and_buffer_args(
@@ -629,7 +699,7 @@ def _simdgroup_factory(
 ) -> Callable[..., Frag]:
     def _make(
         name: str,
-        shape: Tuple[int, int] = (8, 8),
+        shape: tuple[int, int] = (8, 8),
         dtype: str = default_dtype,
         *,
         scope: str = "simdgroup",

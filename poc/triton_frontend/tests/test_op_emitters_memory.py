@@ -68,25 +68,6 @@ def _stringify(node: Any) -> str:
     return str(node)
 
 
-def _force_no_shim(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Force ``has_cxx_shim`` to return False inside ``op_emitters.memory``.
-
-    The C++ shim's availability is not under test here; we want to exercise
-    the degraded path deterministically.
-    """
-    monkeypatch.setattr(
-        "poc.triton_frontend.op_emitters.memory.has_cxx_shim",
-        lambda: False,
-    )
-
-
-def _force_shim(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "poc.triton_frontend.op_emitters.memory.has_cxx_shim",
-        lambda: True,
-    )
-
-
 # ---------------------------------------------------------------------------
 # tt.make_range -> tir.Ramp
 # ---------------------------------------------------------------------------
@@ -241,10 +222,9 @@ def test_broadcast_buffer_with_singleton_axis_uses_zero_index() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_load_with_mask_emits_if_then_else(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_with_mask_emits_if_then_else() -> None:
     """Scalar masked load wraps the BufferLoad in ``tir.if_then_else``."""
-    _force_no_shim(monkeypatch)
-    ctx = WalkerCtx()
+    ctx = WalkerCtx(ptr_analysis_shim_available=False)
     buf = tvm.tir.decl_buffer([16], "float32", name="A")
     ptr_ssa = _ssa("ptr", shape=[], dtype="float32")
     mask_ssa = _ssa("mask", shape=[], dtype="bool")
@@ -267,10 +247,9 @@ def test_load_with_mask_emits_if_then_else(monkeypatch: pytest.MonkeyPatch) -> N
     assert "if_then_else" in text, f"expected if_then_else mask guard, got {text!r}"
 
 
-def test_store_with_mask_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_store_with_mask_round_trip() -> None:
     """Round-trip: load masked, store masked into the same buffer shape."""
-    _force_no_shim(monkeypatch)
-    ctx = WalkerCtx()
+    ctx = WalkerCtx(ptr_analysis_shim_available=False)
     buf = tvm.tir.decl_buffer([16], "float32", name="B")
 
     ptr_in = _ssa("ptr_in", shape=[], dtype="float32")
@@ -312,9 +291,7 @@ def test_store_with_mask_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_multi_element_load_without_shim_emits_degraded_marker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_multi_element_load_without_shim_emits_degraded_marker() -> None:
     """Without the PtrAnalysis shim a tile load must emit ``# DEGRADED:``.
 
     The maintainer's hard constraint: never silent-fallback. We force the
@@ -322,8 +299,7 @@ def test_multi_element_load_without_shim_emits_degraded_marker(
     contains the ``# DEGRADED:`` marker that the AttrStmt pragma_comment
     survives all the way through.
     """
-    _force_no_shim(monkeypatch)
-    ctx = WalkerCtx()
+    ctx = WalkerCtx(ptr_analysis_shim_available=False)
     ptr_ssa = _ssa("tile_ptr", shape=[32], dtype="float32")
     out_ssa = _ssa("tile_out", shape=[32], dtype="float32")
     op = {
@@ -341,12 +317,9 @@ def test_multi_element_load_without_shim_emits_degraded_marker(
     assert "for" in text.lower(), f"expected per-element For loop; got:\n{text}"
 
 
-def test_addptr_without_shim_keeps_scalar_tuple_without_marker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_addptr_without_shim_keeps_scalar_tuple_without_marker() -> None:
     """Scalar ``tt.addptr`` is ordinary pointer arithmetic, not a fallback."""
-    _force_no_shim(monkeypatch)
-    ctx = WalkerCtx()
+    ctx = WalkerCtx(ptr_analysis_shim_available=False)
     ptr_ssa = _ssa("ptr", shape=[], dtype="float32")
     off_ssa = _ssa("off", shape=[], dtype="int32")
     out_ssa = _ssa("ptr2", shape=[], dtype="float32")
@@ -366,12 +339,9 @@ def test_addptr_without_shim_keeps_scalar_tuple_without_marker(
     )
 
 
-def test_addptr_tuple_tile_composition_skips_degraded_marker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_addptr_tuple_tile_composition_skips_degraded_marker() -> None:
     """A composed tile pointer is not the scalar-only degraded addptr path."""
-    _force_no_shim(monkeypatch)
-    ctx = WalkerCtx()
+    ctx = WalkerCtx(ptr_analysis_shim_available=False)
     ptr_ssa = _ssa("ptr", shape=[16], dtype="float32")
     off_ssa = _ssa("off", shape=[16], dtype="int32")
     out_ssa = _ssa("ptr2", shape=[16], dtype="float32")
@@ -394,9 +364,7 @@ def test_addptr_tuple_tile_composition_skips_degraded_marker(
     assert "DEGRADED" not in _stringify(ctx.stmts)
 
 
-def test_addptr_uses_seeded_ptrstate_when_in_process_shim_is_disabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_addptr_uses_seeded_ptrstate_when_in_process_shim_is_disabled() -> None:
     """Subprocess PtrAnalysis states should work after libtriton is loaded.
 
     In the real FLA path Triton has already loaded its native extension in the
@@ -408,8 +376,7 @@ def test_addptr_uses_seeded_ptrstate_when_in_process_shim_is_disabled(
     """
     from poc.triton_frontend.ptr_analysis import PtrState  # noqa: WPS433
 
-    _force_no_shim(monkeypatch)
-    ctx = WalkerCtx()
+    ctx = WalkerCtx(ptr_analysis_shim_available=False)
     ptr_ssa = _ssa("%arg0", shape=[16], dtype="float32")
     off_ssa = _ssa("%off", shape=[16], dtype="int32")
     out_ssa = _ssa("%ptr2", shape=[16], dtype="float32")
@@ -440,9 +407,7 @@ def test_addptr_uses_seeded_ptrstate_when_in_process_shim_is_disabled(
     assert "DEGRADED" not in _stringify(ctx.stmts)
 
 
-def test_addptr_matches_seeded_ptrstate_after_ssa_renumbering(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_addptr_matches_seeded_ptrstate_after_ssa_renumbering() -> None:
     """Generic-form parse can renumber SSA names after PtrAnalysis.
 
     When the exact result key changes, a resolved tuple base is safer than a
@@ -452,8 +417,7 @@ def test_addptr_matches_seeded_ptrstate_after_ssa_renumbering(
     """
     from poc.triton_frontend.ptr_analysis import PtrState  # noqa: WPS433
 
-    _force_no_shim(monkeypatch)
-    ctx = WalkerCtx()
+    ctx = WalkerCtx(ptr_analysis_shim_available=False)
     ptr_ssa = _ssa("%renumbered_base", shape=[16, 64], dtype="float32")
     off_ssa = _ssa("%renumbered_off", shape=[16, 64], dtype="int32")
     out_ssa = _ssa("%new_name", shape=[16, 64], dtype="float32")
@@ -486,9 +450,7 @@ def test_addptr_matches_seeded_ptrstate_after_ssa_renumbering(
     assert "DEGRADED" not in _stringify(ctx.stmts)
 
 
-def test_addptr_uses_only_exact_ptr_state_result(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_addptr_uses_only_exact_ptr_state_result() -> None:
     """Source-keyed PtrState must not hijack an earlier scalar addptr.
 
     PtrAnalysis also keys tile states by their source pointer (``%arg0``)
@@ -498,11 +460,7 @@ def test_addptr_uses_only_exact_ptr_state_result(
     """
     from poc.triton_frontend.ptr_analysis import PtrState  # noqa: WPS433
 
-    monkeypatch.setattr(
-        "poc.triton_frontend.op_emitters.memory.has_cxx_shim",
-        lambda: True,
-    )
-    ctx = WalkerCtx()
+    ctx = WalkerCtx(ptr_analysis_shim_available=True)
     ptr_ssa = _ssa("%arg0", shape=[], dtype="float32")
     off_ssa = _ssa("%row_offset", shape=[], dtype="int32")
     out_ssa = _ssa("%row_ptr", shape=[], dtype="float32")
@@ -700,12 +658,9 @@ def test_addptr_resolves_tts_make_tptr_dynamic_offset_ssa() -> None:
 #     ``tir.For`` loops that produce a fresh result Buffer.
 
 
-def test_addptr_returns_buffer_indices_tuple_for_load_consumer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_addptr_returns_buffer_indices_tuple_for_load_consumer() -> None:
     """``tt.addptr`` result is a ``(Buffer, [PrimExpr])`` tuple."""
-    _force_no_shim(monkeypatch)
-    ctx = WalkerCtx()
+    ctx = WalkerCtx(ptr_analysis_shim_available=False)
     ptr_ssa = _ssa("ptr", shape=[], dtype="float32")
     off_ssa = _ssa("off", shape=[], dtype="int32")
     out_ssa = _ssa("ptr_added", shape=[], dtype="float32")
@@ -832,12 +787,9 @@ def test_arith_addf_on_loop_carried_tile_keeps_ssa_result_distinct() -> None:
     assert not any(store.buffer.same_as(acc_buf) for store in stores)
 
 
-def test_addptr_mutates_loop_carried_pointer_index_in_place(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_addptr_mutates_loop_carried_pointer_index_in_place() -> None:
     """Loop-carried pointer tiles must update the carried index buffer."""
-    _force_no_shim(monkeypatch)
-    ctx = WalkerCtx()
+    ctx = WalkerCtx(ptr_analysis_shim_available=False)
     ptr_ssa = _ssa("a_ptrs", shape=[32, 32], dtype="float32")
     off_ssa = _ssa("k_step", shape=[32, 32], dtype="int32")
     out_ssa = _ssa("a_ptrs_next", shape=[32, 32], dtype="float32")
@@ -873,14 +825,11 @@ def test_addptr_mutates_loop_carried_pointer_index_in_place(
     assert any(store.buffer.same_as(carried_index) for store in stores)
 
 
-def test_addptr_ignores_result_ptrstate_when_source_mismatches_base(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_addptr_ignores_result_ptrstate_when_source_mismatches_base() -> None:
     """A stale/colliding PtrState result must not hijack a tuple descriptor."""
     from poc.triton_frontend.ptr_analysis import PtrState  # noqa: WPS433
 
-    _force_shim(monkeypatch)
-    ctx = WalkerCtx()
+    ctx = WalkerCtx(ptr_analysis_shim_available=True)
     ptr_ssa = _ssa("a_ptrs", shape=[32, 32], dtype="float32")
     off_ssa = _ssa("k_step", shape=[32, 32], dtype="int32")
     out_ssa = _ssa("%66", shape=[32, 32], dtype="float32")
@@ -968,17 +917,14 @@ def test_arith_maxnumf_and_minnumf_route_to_float_minmax_emitters() -> None:
 # they need instead of forcing a hidden tile staging allocation.
 
 
-def test_addptr_buffer_offset_keeps_lazy_tile_index(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_addptr_buffer_offset_keeps_lazy_tile_index() -> None:
     """``tt.addptr(ptr, buffer_offset)`` composes a lazy per-lane tile index.
 
     Mirrors the matmul scf.for body where the offset operand of an in-loop
     ``tt.addptr`` is a per-lane offset Buffer (the ``BLOCK_K * stride_ak``
     tile from a prior ``arith.muli``), not a scalar PrimExpr.
     """
-    _force_no_shim(monkeypatch)
-    ctx = WalkerCtx()
+    ctx = WalkerCtx(ptr_analysis_shim_available=False)
     ptr_ssa = _ssa("a_ptrs", shape=[32], dtype="float32")
     off_ssa = _ssa("k_step", shape=[32], dtype="int32")
     out_ssa = _ssa("a_ptrs_new", shape=[32], dtype="float32")
@@ -1018,12 +964,9 @@ def test_addptr_buffer_offset_keeps_lazy_tile_index(
     assert out_indices[0] is not step_buf
 
 
-def test_addptr_buffer_offsets_use_broadcast_shape(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_addptr_buffer_offsets_use_broadcast_shape() -> None:
     """Composed row/column offset tiles must expand singleton dimensions."""
-    _force_no_shim(monkeypatch)
-    ctx = WalkerCtx()
+    ctx = WalkerCtx(ptr_analysis_shim_available=False)
     ptr_ssa = _ssa("c_rows", shape=[32, 1], dtype="float32")
     off_ssa = _ssa("c_cols", shape=[32, 32], dtype="int32")
     out_ssa = _ssa("c_ptrs", shape=[32, 32], dtype="float32")
@@ -1052,17 +995,14 @@ def test_addptr_buffer_offsets_use_broadcast_shape(
     assert "ROW[" in text and ", 0]" in text
 
 
-def test_addptr_scalar_offset_keeps_scalar_fast_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_addptr_scalar_offset_keeps_scalar_fast_path() -> None:
     """Scalar PrimExpr offsets must NOT trigger a tile-buffer allocation.
 
     The fast path is what the original (pre-loop) matmul ``a_ptrs =
     a_ptr + offs_am`` lowering relies on; we must preserve it so we don't
     regress the non-loop call site.
     """
-    _force_no_shim(monkeypatch)
-    ctx = WalkerCtx()
+    ctx = WalkerCtx(ptr_analysis_shim_available=False)
     ptr_ssa = _ssa("ptr", shape=[], dtype="float32")
     off_ssa = _ssa("off", shape=[], dtype="int32")
     out_ssa = _ssa("ptr_added", shape=[], dtype="float32")
@@ -1412,9 +1352,7 @@ def test_broadcast_vector_to_tile_emits_for_nest() -> None:
     assert "for" in text.lower(), f"expected For-nest in stmts; got:\n{text}"
 
 
-def test_tt_load_with_buffer_other_emits_per_lane_buffer_load(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_tt_load_with_buffer_other_emits_per_lane_buffer_load() -> None:
     """Tile load whose ``other`` resolved to a Buffer (post Wave E2 lowering)
     must emit ``BufferLoad(other_buf, [lane])`` inside the IfThenElse arg #2,
     NOT a bare buffer reference (which TVM rejects with
@@ -1425,8 +1363,7 @@ def test_tt_load_with_buffer_other_emits_per_lane_buffer_load(
     a freshly declared buffer (the lowered ``arith.constant dense<0.0>``)
     and the ``mask`` likewise resolves to a Buffer-shaped boolean tile.
     """
-    _force_no_shim(monkeypatch)
-    ctx = WalkerCtx()
+    ctx = WalkerCtx(ptr_analysis_shim_available=False)
 
     src_buf = tvm.tir.decl_buffer([256], "float32", name="A")
     mask_buf = tvm.tir.decl_buffer([256], "bool", name="M")
@@ -1737,9 +1674,7 @@ def test_emit_tt_join() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_addptr_compose_handles_buffer_plus_vector_primexpr_offset(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_addptr_compose_handles_buffer_plus_vector_primexpr_offset() -> None:
     """``tt.addptr`` inside ``scf.for`` with a Buffer prev-tile and a
     *vector* PrimExpr offset (e.g. ``Broadcast(scalar, prod(out_shape))``)
     must scalarise the vector per-lane via the flat lane index.
@@ -1751,8 +1686,7 @@ def test_addptr_compose_handles_buffer_plus_vector_primexpr_offset(
     inside the surrounding ``T.grid(64, 64)`` saw a 4096-lane RHS against
     a single-lane storage slot.
     """
-    _force_no_shim(monkeypatch)
-    ctx = WalkerCtx()
+    ctx = WalkerCtx(ptr_analysis_shim_available=False)
 
     ptr_ssa = _ssa("a_ptrs", shape=[64, 64], dtype="float32")
     off_ssa = _ssa("k_step", shape=[64, 64], dtype="int32")
@@ -1789,12 +1723,9 @@ def test_addptr_compose_handles_buffer_plus_vector_primexpr_offset(
     assert getattr(lane.dtype, "lanes", 1) == 1
 
 
-def test_addptr_compose_coerces_ptrstate_string_zero_before_vector_add(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_addptr_compose_coerces_ptrstate_string_zero_before_vector_add() -> None:
     """PtrAnalysis JSON offsets use strings; ``"0" + vector`` is invalid."""
-    _force_shim(monkeypatch)
-    ctx = WalkerCtx()
+    ctx = WalkerCtx(ptr_analysis_shim_available=True)
     ptr_ssa = _ssa("ptrs", shape=[64, 64], dtype="float32")
     off_ssa = _ssa("off", shape=[64, 64], dtype="int32")
     out_ssa = _ssa("ptrs_new", shape=[64, 64], dtype="float32")

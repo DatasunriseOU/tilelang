@@ -37,16 +37,24 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import io
+import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable
+from collections.abc import Mapping
 
 import numpy as np
 
 
+if __package__ in (None, ""):
+    _REPO_ROOT = Path(__file__).resolve().parents[3]
+    if str(_REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(_REPO_ROOT))
+    __package__ = "poc.triton_frontend._test_harness"
+
 from . import numeric_kernels  # noqa: E402
-from .native_import_guard import triton_import_block_reason
+from .native_import_guard import triton_compile_block_reason
 
 
 __all__ = [
@@ -94,9 +102,9 @@ class KernelResult:
     verdict: str
     detail: str = ""
     elapsed_s: float = 0.0
-    max_abs_err: Optional[float] = None
-    max_rel_err: Optional[float] = None
-    first_mismatches: Optional[List[Tuple[int, ...]]] = None
+    max_abs_err: float | None = None
+    max_rel_err: float | None = None
+    first_mismatches: list[tuple[int, ...]] | None = None
 
     def short(self) -> str:
         """One-line summary for the markdown table."""
@@ -113,16 +121,16 @@ class KernelResult:
 
 def _probe_deps(
     *,
-    import_module: Optional[Callable[[str], Any]] = None,
-    loaded_modules: Optional[Mapping[str, Any]] = None,
-) -> Dict[str, Optional[str]]:
+    import_module: Callable[[str], Any] | None = None,
+    loaded_modules: Mapping[str, Any] | None = None,
+) -> dict[str, str | None]:
     """Return ``{component: error_str_or_None}`` for each pipeline dep.
 
     A non-None value means the component is unavailable; the harness
     will SKIP each kernel with that error string.
     """
     importer = importlib.import_module if import_module is None else import_module
-    deps: Dict[str, Optional[str]] = {
+    deps: dict[str, str | None] = {
         "triton": None,
         "tvm": None,
         "tilelang": None,
@@ -131,7 +139,7 @@ def _probe_deps(
     }
     for name in deps:
         if name == "triton":
-            block_reason = triton_import_block_reason(loaded_modules)
+            block_reason = triton_compile_block_reason(loaded_modules)
             if block_reason is not None:
                 deps[name] = f"RuntimeError: {block_reason}"
                 continue
@@ -152,7 +160,7 @@ def _probe_deps(
 
 def _capture_ttir(
     kernel_mod: Any,
-) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
+) -> tuple[str | None, str | None, dict[str, Any]]:
     """Run ``triton.compiler.compile`` to obtain TTIR text.
 
     Returns ``(ttir_text, error, options)``. ``options`` is a small dict
@@ -163,7 +171,7 @@ def _capture_ttir(
     from these. On failure ``ttir_text is None``, ``error`` is the
     diagnostic, and ``options`` is the Triton-default ``{4, 2}``.
     """
-    _default_options: Dict[str, Any] = {"num_warps": 4, "num_stages": 2}
+    _default_options: dict[str, Any] = {"num_warps": 4, "num_stages": 2}
     try:
         import triton  # type: ignore  # noqa: F401  -- import probe
         from triton.compiler.compiler import ASTSource  # type: ignore
@@ -249,7 +257,7 @@ def _capture_ttir(
             # reducer can wrap the body in a matching ``threadIdx.x``
             # ``thread_extent`` AttrStmt (TileLang's ``gemm.lower`` derives
             # ``num_warps = block_size / warp_size`` from that extent).
-            opts_dict: Dict[str, Any] = {
+            opts_dict: dict[str, Any] = {
                 "num_warps": int(getattr(options, "num_warps", 4) or 4),
                 "num_stages": int(getattr(options, "num_stages", 2) or 2),
             }
@@ -279,7 +287,7 @@ def _capture_ttir(
         )
 
 
-def _default_signature(fn: Any, constants: Dict[str, Any]) -> Dict[str, str]:
+def _default_signature(fn: Any, constants: dict[str, Any]) -> dict[str, str]:
     """Build a default Triton signature from ``fn``'s parameter names.
 
     Convention: any parameter ending in ``_ptr`` is a pointer to fp32;
@@ -295,7 +303,7 @@ def _default_signature(fn: Any, constants: Dict[str, Any]) -> Dict[str, str]:
             arg_names = [p.name for p in sig.parameters.values()]
         except Exception:
             arg_names = []
-    sig_dict: Dict[str, str] = {}
+    sig_dict: dict[str, str] = {}
     for name in arg_names:
         if name in constants:
             continue
@@ -361,10 +369,10 @@ def _ensure_cxx_shim_on_syspath() -> None:
 def _lower_ttir(
     ttir_text: str,
     kernel_name: str,
-    options: Optional[Dict[str, Any]] = None,
-    arg_buffer_shapes: Optional[List[Tuple[int, ...]]] = None,
-    grid: Optional[Tuple[int, ...]] = None,
-) -> Tuple[Any, Optional[str]]:
+    options: dict[str, Any] | None = None,
+    arg_buffer_shapes: list[tuple[int, ...]] | None = None,
+    grid: tuple[int, ...] | None = None,
+) -> tuple[Any, str | None]:
     """Run ``poc.triton_frontend.from_ttir`` on the captured TTIR.
 
     Uses the lifted helpers:
@@ -469,7 +477,7 @@ def _lower_ttir(
 # ---------------------------------------------------------------------------
 
 
-def _compile_metal(prim: Any) -> Tuple[Any, Optional[str]]:
+def _compile_metal(prim: Any) -> tuple[Any, str | None]:
     """Compile the PrimFunc to a Metal CompiledArtifact via TileLang."""
     try:
         import tilelang  # type: ignore
@@ -489,7 +497,7 @@ def _compile_metal(prim: Any) -> Tuple[Any, Optional[str]]:
         return None, f"tilelang.lower raised: {type(exc).__name__}: {exc}\n{tb}"
 
 
-def _positive_int_or_none(value: Any) -> Optional[int]:
+def _positive_int_or_none(value: Any) -> int | None:
     """Best-effort conversion for TVM IntImm / Python ints."""
     if value is None:
         return None
@@ -504,7 +512,7 @@ def _positive_int_or_none(value: Any) -> Optional[int]:
     return out if out > 0 else None
 
 
-def _threadgroup_from_artifact(artifact: Any, kernel_mod: Any) -> Tuple[int, int, int]:
+def _threadgroup_from_artifact(artifact: Any, kernel_mod: Any) -> tuple[int, int, int]:
     """Infer the Metal threadgroup shape TileLang encoded on the device func."""
     explicit = getattr(kernel_mod, "THREADGROUP", None)
     if explicit is not None:
@@ -548,9 +556,9 @@ def _threadgroup_from_artifact(artifact: Any, kernel_mod: Any) -> Tuple[int, int
 
 def _run_mlx(
     artifact: Any,
-    kernel_args: List[np.ndarray],
+    kernel_args: list[np.ndarray],
     kernel_mod: Any,
-) -> Tuple[Optional[np.ndarray], Optional[str]]:
+) -> tuple[np.ndarray | None, str | None]:
     """Wrap the artifact's metal_source in mx.fast.metal_kernel and run.
 
     NOTE: TileLang's Metal artifact emits a Metal Shading Language
@@ -602,7 +610,7 @@ def _run_mlx(
     #   args follow the buffer args in PrimFunc declaration order; the
     #   only such scalar in vector_add is ``n_elements`` whose value is
     #   the length of the first input array.
-    args_struct_inline: Dict[str, int] = {}
+    args_struct_inline: dict[str, int] = {}
     launch_grid = tuple(int(g) for g in getattr(kernel_mod, "LAUNCH_GRID", (1,)))
     for i in range(3):
         args_struct_inline[f"gridDim_{i}"] = (
@@ -695,7 +703,7 @@ def _compare(
     *,
     atol: float,
     rtol: float,
-) -> Tuple[bool, float, float, List[Tuple[int, ...]]]:
+) -> tuple[bool, float, float, list[tuple[int, ...]]]:
     """Return ``(passed, max_abs, max_rel, first_5_mismatch_indices)``."""
     if actual.shape != expected.shape:
         return (
@@ -722,7 +730,7 @@ def _compare(
 # ---------------------------------------------------------------------------
 
 
-def run_one(kernel_module_name: str, deps: Dict[str, Optional[str]]) -> KernelResult:
+def run_one(kernel_module_name: str, deps: dict[str, str | None]) -> KernelResult:
     """Run a single kernel module end-to-end and return a KernelResult."""
     started = time.monotonic()
 
@@ -834,9 +842,9 @@ def run_one(kernel_module_name: str, deps: Dict[str, Optional[str]]) -> KernelRe
 
 
 def run_all(
-    report_path: Optional[Path] = None,
-    kernels: Optional[List[str]] = None,
-) -> List[KernelResult]:
+    report_path: Path | None = None,
+    kernels: list[str] | None = None,
+) -> list[KernelResult]:
     """Run kernel modules and write a markdown report.
 
     ``kernels`` -- if provided, restrict the run to these kernel module
@@ -853,7 +861,7 @@ def run_all(
                 f"unknown kernel(s): {unknown}; "
                 f"available: {list(numeric_kernels.KERNEL_MODULES)}"
             )
-    results: List[KernelResult] = []
+    results: list[KernelResult] = []
     for mod_name in kernels:
         results.append(run_one(mod_name, deps))
 
@@ -894,12 +902,12 @@ def _build_arg_parser():
 
 
 def _write_report(
-    results: List[KernelResult],
-    deps: Dict[str, Optional[str]],
+    results: list[KernelResult],
+    deps: dict[str, str | None],
     report_path: Path,
 ) -> None:
     """Write a markdown summary at ``report_path``."""
-    counts: Dict[str, int] = {}
+    counts: dict[str, int] = {}
     for r in results:
         counts[r.verdict] = counts.get(r.verdict, 0) + 1
 

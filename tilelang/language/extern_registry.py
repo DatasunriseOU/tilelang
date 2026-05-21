@@ -13,11 +13,11 @@ DSL surface (which lazily depends on TVM).
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Mapping, Optional
 
-# Public targets (matches RFC §6 backend priority — Metal, CUDA, HIP).
-_VALID_TARGETS: frozenset[str] = frozenset({"cuda", "hip", "metal"})
+# Public targets (matches RFC §6 backend priority — Metal, CUDA, HIP, CuTeDSL).
+_VALID_TARGETS: frozenset[str] = frozenset({"cuda", "hip", "metal", "cutedsl"})
 
 
 @dataclass(frozen=True)
@@ -27,7 +27,7 @@ class ExternIntrinsic:
     Attributes:
         name: Globally-unique intrinsic name, used as the ``call_extern`` symbol.
         signature: Callable returning the tuple of :class:`Frag` for given shape args.
-        bodies: Mapping target -> raw ``__device__`` source string.
+        bodies: Mapping target -> raw device source string.
     """
 
     name: str
@@ -44,7 +44,7 @@ class _Registry:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._table: Dict[str, ExternIntrinsic] = {}
+        self._table: dict[str, ExternIntrinsic] = {}
 
     def register(self, intrinsic: ExternIntrinsic) -> None:
         """Insert ``intrinsic``; raise if name is already taken."""
@@ -89,7 +89,7 @@ class _Registry:
             self._table[intrinsic.name] = intrinsic
             return prev
 
-    def lookup(self, name: str) -> Optional[ExternIntrinsic]:
+    def lookup(self, name: str) -> ExternIntrinsic | None:
         """Return the entry for ``name`` or None."""
         with self._lock:
             return self._table.get(name)
@@ -113,7 +113,7 @@ def register(intrinsic: ExternIntrinsic) -> None:
     _REGISTRY.register(intrinsic)
 
 
-def lookup(name: str) -> Optional[ExternIntrinsic]:
+def lookup(name: str) -> ExternIntrinsic | None:
     """Return the registered intrinsic for ``name`` or ``None``."""
     return _REGISTRY.lookup(name)
 

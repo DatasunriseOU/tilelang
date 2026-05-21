@@ -62,7 +62,13 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from ..op_mapping import EmitError, LazyTileExpr, _alloc_tile_buffer, _normalize_mlir_dtype
+from ..op_mapping import (
+    EmitError,
+    LazyTileExpr,
+    _alloc_tile_buffer,
+    _normalize_mlir_dtype,
+    materialize_lazy_tile as _materialize_lazy_tile,
+)
 
 # WalkerCtx alias only -- imported lazily so this module stays cheap to load.
 EmitContext = Any  # poc.triton_frontend.op_mapping.WalkerCtx
@@ -948,58 +954,6 @@ _FP_LOW_PRECISION_DTYPES = {
     "fp8", "fp8_e4m3", "fp8_e5m2",
     "e4m3", "e5m2",
 }
-
-
-def _materialize_lazy_tile(
-    ctx: EmitContext,
-    expr: LazyTileExpr,
-    shape: List[int],
-    dtype: str,
-    *,
-    name: str,
-    scope: str = "local",
-) -> Any:
-    """Materialize a lazy tile once when reducer/tileop code needs a Buffer."""
-
-    tir = ctx.tir()
-    dst_shape = list(shape or expr.shape or [1])
-    dst = _alloc_tile_buffer(
-        ctx,
-        dst_shape,
-        _normalize_mlir_dtype(dtype),
-        ctx.fresh(name),
-        scope=scope,
-    )
-    loop_vars = [
-        tir.Var(ctx.fresh(f"{name}_i{axis}"), "int32")
-        for axis, _extent in enumerate(dst_shape or [1])
-    ]
-
-    rank = len(expr.shape)
-    if len(loop_vars) >= rank:
-        src_indices = list(loop_vars[-rank:])
-    else:
-        src_indices = [tir.const(0, "int32")] * (rank - len(loop_vars)) + list(loop_vars)
-    for axis, extent in enumerate(expr.shape):
-        if int(extent) == 1:
-            src_indices[axis] = tir.const(0, "int32")
-
-    store = tir.BufferStore(
-        dst,
-        expr.read_lane(ctx, tuple(src_indices)),
-        list(loop_vars) or [tir.const(0, "int32")],
-    )
-    body: Any = store
-    for var, extent in zip(reversed(loop_vars), reversed(dst_shape or [1])):
-        body = tir.For(
-            var,
-            tir.const(0, "int32"),
-            tir.const(int(extent), "int32"),
-            tir.ForKind.SERIAL,
-            body,
-        )
-    ctx.emit(body)
-    return dst
 
 
 def _import_tilelang_gemm() -> Optional[Callable[..., Any]]:
