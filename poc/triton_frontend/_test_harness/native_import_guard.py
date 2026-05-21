@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sys
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 
 _TRITON_NATIVE_MODULES = (
@@ -20,17 +20,31 @@ _LLVM_PEER_MODULES = (
 )
 
 
-def triton_native_loaded() -> bool:
+def _loaded_modules(
+    loaded_modules: Optional[Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    return sys.modules if loaded_modules is None else loaded_modules
+
+
+def triton_native_loaded(
+    loaded_modules: Optional[Mapping[str, Any]] = None,
+) -> bool:
     """Return True when Triton's native libtriton is already resident."""
-    return any(name in sys.modules for name in _TRITON_NATIVE_MODULES)
+    modules = _loaded_modules(loaded_modules)
+    return any(name in modules for name in _TRITON_NATIVE_MODULES)
 
 
-def loaded_llvm_peer_modules() -> list[str]:
+def loaded_llvm_peer_modules(
+    loaded_modules: Optional[Mapping[str, Any]] = None,
+) -> list[str]:
     """Return loaded native-side peers known to conflict with libtriton."""
-    return [name for name in _LLVM_PEER_MODULES if name in sys.modules]
+    modules = _loaded_modules(loaded_modules)
+    return [name for name in _LLVM_PEER_MODULES if name in modules]
 
 
-def triton_import_block_reason() -> Optional[str]:
+def triton_import_block_reason(
+    loaded_modules: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
     """Return a human-readable reason to avoid importing Triton now.
 
     Triton and the TileLang/TVM/shim side can each statically register LLVM
@@ -39,15 +53,15 @@ def triton_import_block_reason() -> Optional[str]:
     catch an exception. In that state callers should report Triton as
     unavailable and run live Triton checks in a fresh process.
     """
-    if triton_native_loaded():
+    peers = loaded_llvm_peer_modules(loaded_modules)
+    if peers:
+        return (
+            "triton import blocked because "
+            + ", ".join(peers)
+            + " already loaded in this process; importing triton._C.libtriton "
+            "too can abort on duplicate LLVM cl::opt registration. Re-run the "
+            "Triton-dependent check in a fresh Python process."
+        )
+    if triton_native_loaded(loaded_modules):
         return None
-    peers = loaded_llvm_peer_modules()
-    if not peers:
-        return None
-    return (
-        "triton import blocked because "
-        + ", ".join(peers)
-        + " already loaded in this process; importing triton._C.libtriton "
-        "too can abort on duplicate LLVM cl::opt registration. Re-run the "
-        "Triton-dependent check in a fresh Python process."
-    )
+    return None

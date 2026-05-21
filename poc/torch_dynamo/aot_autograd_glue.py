@@ -676,6 +676,7 @@ def _compile_one_side(
         artifact,
         lowerer.fx_signature(),
         is_backward=is_backward,
+        allow_grad_inputs=True,
     )
 
     # Wave-4 #09 fix #4: registration timing.  aot_autograd calls

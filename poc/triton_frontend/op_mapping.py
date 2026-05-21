@@ -312,6 +312,11 @@ class WalkerCtx:
         # options or kernel autotune-config when available.
         self.num_warps: int = 4
         self.num_stages: int = 2
+        # Some scalar fallback emitters implement tile-level semantics with
+        # serial read-modify-write loops. When one is used under the synthetic
+        # ``threadIdx.x`` wrapper, run the whole block body on lane 0 to avoid
+        # intra-block races.
+        self.requires_single_thread_body: bool = False
         # Printed SSA name -> op names that consume it. Seeded by the MLIR
         # module pre-pass when available. Emitters use this only for layout
         # choices where downstream composability matters (for example
@@ -343,7 +348,6 @@ class WalkerCtx:
 
     def tir(self) -> Any:
         """Shortcut to ``tvm.tir``."""
-        import tvm
         from tvm import tir
         return tir
 
@@ -1071,7 +1075,6 @@ def _emit_store_copy(op: Any, ctx: "WalkerCtx", resolved: Dict[str, Any],
                      val_expr: Any, mask_ssa: Any) -> Any:
     """Emit ``T.copy(val_frag, global[region])`` for the buffer-region path."""
     tir = ctx.tir()
-    out_shape = _ptrstate_sizes_int(resolved) or [1024]
     # Pull dtype from the value being stored where possible.
     dtype = "float32"
     try:

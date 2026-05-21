@@ -19,18 +19,16 @@ op), and the autograd-disabled tag stays in place — aot_autograd handles
 gradient routing externally so the bwd op itself does NOT need a
 ``register_autograd`` block (option (B) from the RFC).
 
-A forward-only call (``is_backward=False`` and any input has
-``requires_grad=True``) still raises through ``_check_no_grad`` because it
-indicates a missed aot_autograd capture.
+A legacy forward-only call (``is_backward=False`` with default
+``allow_grad_inputs`` and any input has ``requires_grad=True``) still raises
+through ``_check_no_grad`` because it indicates a missed aot_autograd capture.
+AOTAutograd-managed forward calls pass ``allow_grad_inputs=True`` explicitly.
 """
 
 import threading
 import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, FrozenSet, List, Sequence, Tuple, TYPE_CHECKING  # noqa: F401
-
-if TYPE_CHECKING:  # pragma: no cover
-    import torch
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 
 # Process-wide cache so re-registering the same fused op is idempotent.
@@ -203,6 +201,7 @@ def wrap_as_custom_op(
     fx_signature: Dict[str, Any],
     *,
     is_backward: bool = False,
+    allow_grad_inputs: Optional[bool] = None,
 ) -> Callable[..., Any]:
     """Register ``artifact`` as ``tilelang::<artifact.name>{_fwd,_bwd}``
     and return a plain Python callable Dynamo can splice back into the
@@ -228,14 +227,26 @@ def wrap_as_custom_op(
         externally, so the bwd op itself stays a leaf in the autograd
         graph — option (B) from the RFC). When False the qualname is
         suffixed ``_fwd``.
+    allow_grad_inputs
+        Explicit autograd ownership flag.  ``None`` preserves the legacy
+        behavior: backward ops accept grad-bearing inputs and forward-only ops
+        reject them.  AOTAutograd-managed forward ops pass ``True`` because
+        model parameters remain ``requires_grad=True`` even when runtime
+        execution is under ``torch.no_grad()``.
     """
     suffix = "_bwd" if is_backward else "_fwd"
     op_qualname = f"tilelang::{artifact.name}{suffix}"
+    allow_grad_runtime = is_backward if allow_grad_inputs is None else allow_grad_inputs
 
     with _REGISTRY_LOCK:
         cached = _REGISTRY.get(op_qualname)
         if cached is not None:
-            return _bind_runtime(cached, artifact, is_backward=is_backward)
+            return _bind_runtime(
+                cached,
+                artifact,
+                is_backward=is_backward,
+                allow_grad_inputs=allow_grad_runtime,
+            )
 
         # Lazy import — module must import without torch.
         from torch.library import custom_op, register_fake  # type: ignore[import-not-found]
@@ -248,7 +259,7 @@ def wrap_as_custom_op(
         # and returns a flat tensor (or tuple). Concrete shapes / dtypes are
         # tracked via the meta function.
         n_outputs = len(artifact.output_specs)
-        allow_grad = is_backward
+        allow_grad = allow_grad_runtime
 
         # Hot-path optimisation (grok #09 perf review): captures
         # ``param_tensors`` as a frozen tuple and avoids the per-call
@@ -342,7 +353,12 @@ def wrap_as_custom_op(
         _impl._tilelang_artifact = artifact  # type: ignore[attr-defined]
 
         _REGISTRY[op_qualname] = _impl
-        return _bind_runtime(_impl, artifact, is_backward=is_backward)
+        return _bind_runtime(
+            _impl,
+            artifact,
+            is_backward=is_backward,
+            allow_grad_inputs=allow_grad_runtime,
+        )
 
 
 def _bind_runtime(
@@ -350,6 +366,7 @@ def _bind_runtime(
     artifact: FusedKernelArtifact,
     *,
     is_backward: bool = False,
+    allow_grad_inputs: Optional[bool] = None,
 ) -> Callable[..., Any]:
     """Wrap a registered op into the (placeholder-args)->output callable
     Dynamo expects from a backend.
@@ -358,10 +375,11 @@ def _bind_runtime(
     signature as ``gm.forward``. FX placeholders (model inputs) are passed
     positionally; parameters / buffers were captured via ``get_attr`` at
     trace time and live inside the artifact. Integration #10 plumbs
-    ``is_backward`` so the runtime guard accepts grad-bearing tangents.
+    ``allow_grad_inputs`` so the AOTAutograd-managed path accepts grad-bearing
+    primals/tangents while the forward-only fallback keeps its guard.
     """
 
-    allow_grad = is_backward
+    allow_grad = is_backward if allow_grad_inputs is None else allow_grad_inputs
 
     def _runner(*runtime_inputs: Any) -> Any:
         _check_no_grad(runtime_inputs, allow_grad=allow_grad)

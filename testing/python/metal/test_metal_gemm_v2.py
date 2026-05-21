@@ -11,6 +11,52 @@ import tilelang.language as T
 import torch
 
 
+def _make_pipelined_trans_b_shared_gemm_func(
+    M=64,
+    N=64,
+    K=64,
+    block_M=32,
+    block_N=32,
+    block_K=32,
+    num_stages=3,
+    dtype=T.float16,
+    accum_dtype=T.float32,
+):
+    @T.prim_func
+    def gemm_kernel(
+        A: T.Tensor((M, K), dtype),
+        B_t: T.Tensor((N, K), dtype),
+        C: T.Tensor((M, N), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype, scope="shared")
+            B_shared = T.alloc_shared((block_N, block_K), dtype, scope="shared")
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype, scope="shared")
+
+            T.clear(C_shared)
+
+            for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
+                T.copy(A[by * block_M, ko * block_K], A_shared)
+                T.copy(B_t[bx * block_N, ko * block_K], B_shared)
+                T.gemm(A_shared, B_shared, C_shared, transpose_B=True)
+
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return gemm_kernel
+
+
+def test_codegen_pipelined_shared_gemm_trans_b_handles_staged_buffers():
+    func = _make_pipelined_trans_b_shared_gemm_func()
+
+    with tvm.transform.PassContext(), tvm.target.Target("metal"):
+        artifact = tilelang.lower(func, target="metal")
+
+    src = artifact.kernel_source
+    assert src is not None
+    assert "kernel void" in src
+    assert "simdgroup_multiply_accumulate" in src
+
+
 @tilelang.jit
 def matmul_gemm_v2(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
     @T.prim_func

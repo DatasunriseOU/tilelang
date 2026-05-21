@@ -773,8 +773,6 @@ def map_tt_func(op: Any, ctx: _om.WalkerCtx) -> Any:
 
     tir_mod = None
     try:
-        import tvm
-        from tvm import tir  # ensure tir is loaded
         tir_mod = ctx.tir()
     except Exception:
         pass
@@ -889,6 +887,12 @@ def map_tt_func(op: Any, ctx: _om.WalkerCtx) -> Any:
     threads_per_block = num_warps * 32
     tid_var = tir_mod.Var("threadIdx_x", "int32")
     tid_extent = tir_mod.const(threads_per_block, "int32")
+    if getattr(ctx, "requires_single_thread_body", False):
+        body_stmt = tir_mod.IfThenElse(
+            tir_mod.EQ(tid_var, tir_mod.const(0, "int32")),
+            body_stmt,
+            None,
+        )
     tid_iter = tir_mod.IterVar(
         (0, tid_extent), tid_var, tir_mod.IterVar.ThreadIndex, "threadIdx.x",
     )
@@ -1313,6 +1317,9 @@ def _emit_region(
     child.fixed_arg_buffer_keys = getattr(ctx, "fixed_arg_buffer_keys", set())
     child.constant_tile_values = getattr(ctx, "constant_tile_values", {})
     child.loop_carry_buffers = dict(getattr(ctx, "loop_carry_buffers", {}))
+    child.requires_single_thread_body = bool(
+        getattr(ctx, "requires_single_thread_body", False)
+    )
     child._tmp_counter = ctx._tmp_counter
     child._tvm = ctx._tvm
     child._T = ctx._T
@@ -1392,6 +1399,8 @@ def _emit_region(
 
     # Bubble counter back so fresh names stay unique across siblings.
     ctx._tmp_counter = child._tmp_counter
+    if getattr(child, "requires_single_thread_body", False):
+        ctx.requires_single_thread_body = True
     # Propagate tile-scoped buffers allocated inside the region back to the
     # parent context. ``_alloc_tile_buffer`` registers each buffer in
     # ``ctx.local_buffers``; when ``ctx`` is the child, those buffers are
@@ -1480,12 +1489,19 @@ def _append_loop_carry_copies(
     iter_arg_pairs: List[Tuple[Any, Any]],
     yielded: List[Any],
 ) -> Any:
-    """Copy yielded tile values into carried buffers at loop-body end."""
+    """Copy yielded tile values into carried buffers at loop-body end.
+
+    Multiple loop carries are committed through temporaries so every yielded
+    expression observes the previous-iteration carries. This matters for
+    online softmax patterns such as Flash Attention, where ``l_i`` and
+    ``acc`` must use the old ``m_i`` even though ``m_i`` is also yielded.
+    """
     if not yielded:
         return body
     tvm_mod = ctx.tvm()
     Buffer = tvm_mod.tir.Buffer
-    copies: List[Any] = []
+    snapshot_copies: List[Any] = []
+    commit_copies: List[Any] = []
     for (_blk_ssa, carry), yielded_value in zip(iter_arg_pairs, yielded):
         if not isinstance(carry, Buffer):
             continue
@@ -1493,10 +1509,27 @@ def _append_loop_carry_copies(
             continue
         if isinstance(yielded_value, Buffer) and _same_tir_buffer(carry, yielded_value):
             continue
-        copies.append(_copy_buffer_stmt(ctx, yielded_value, carry))
-    if not copies:
+        scope_fn = getattr(carry, "scope", None)
+        try:
+            scope = str(scope_fn() if callable(scope_fn) else scope_fn)
+        except Exception:
+            scope = "local"
+        if getattr(ctx, "requires_single_thread_body", False):
+            scope = "local"
+        if not scope:
+            scope = "local"
+        tmp = _om._alloc_tile_buffer(
+            ctx,
+            list(getattr(carry, "shape", []) or [1]),
+            str(getattr(carry, "dtype", "float32")),
+            ctx.fresh("carry_next"),
+            scope=scope,
+        )
+        snapshot_copies.append(_copy_buffer_stmt(ctx, yielded_value, tmp))
+        commit_copies.append(_copy_buffer_stmt(ctx, tmp, carry))
+    if not snapshot_copies:
         return body
-    return ctx.tir().SeqStmt([body] + copies)
+    return ctx.tir().SeqStmt([body] + snapshot_copies + commit_copies)
 
 
 def _scf_for_bounds(op: Any) -> Tuple[Any, Any, Any]:
@@ -1610,6 +1643,41 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
             init_val = ctx.get(init_ssa)
         except KeyError:
             init_val = init_ssa
+        if isinstance(init_val, _om.LazyTileExpr):
+            shape = list(init_val.shape or (1,))
+            carry_buf = _om._alloc_tile_buffer(
+                ctx,
+                shape,
+                init_val.dtype,
+                ctx.fresh("carry_tile"),
+                scope="shared",
+            )
+            ctx.emit(_copy_buffer_stmt(ctx, init_val, carry_buf))
+            iter_arg_pairs.append((blk_ssa, carry_buf))
+            continue
+        if (
+            isinstance(init_val, tuple)
+            and len(init_val) == 2
+            and isinstance(init_val[1], (list, tuple))
+        ):
+            base_buf, indices = init_val
+            new_indices: List[Any] = []
+            materialized = False
+            for index_expr in indices:
+                if isinstance(index_expr, _om.LazyTileExpr):
+                    index_buf = _om._alloc_tile_buffer(
+                        ctx,
+                        list(index_expr.shape or (1,)),
+                        index_expr.dtype,
+                        ctx.fresh("carry_index"),
+                    )
+                    ctx.emit(_copy_buffer_stmt(ctx, index_expr, index_buf))
+                    new_indices.append(index_buf)
+                    materialized = True
+                else:
+                    new_indices.append(index_expr)
+            if materialized:
+                init_val = (base_buf, new_indices)
         if _is_scalar_primexpr(init_val):
             dt = _om._normalize_mlir_dtype(
                 _om._dtype_of(blk_ssa) or _om._dtype_of(init_ssa) or "float32"

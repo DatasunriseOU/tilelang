@@ -140,23 +140,11 @@ def test_tiny_matmul_relu_uses_real_tir() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason=(
-        "AOT-wrapped torch.compile still routes this parameterized "
-        "layer_norm chain through the forward-only custom-op runner; "
-        "custom_op_wrapper.py:_check_no_grad raises when the captured "
-        "parameters require grad. Remove this xfail when the chain uses "
-        "the AOT autograd-safe runner or detaches frozen eval parameters."
-    ),
-    strict=False,
-    raises=NotImplementedError,
-)
 def test_tiny_linear_layernorm_gelu_chain() -> None:
     """``gelu(layer_norm(x @ w))`` — multi-op fusion-pattern exercise.
 
-    The current expected failure is the forward-only runner's grad guard
-    seeing eval parameters with ``requires_grad=True`` during AOT runtime
-    execution; unrelated exceptions should still fail the test.
+    AOTAutograd owns the gradient plumbing, so eval parameters may still carry
+    ``requires_grad=True`` without tripping the legacy forward-only guard.
     """
     import torch
     from torch import nn

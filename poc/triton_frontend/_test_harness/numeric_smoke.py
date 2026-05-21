@@ -40,7 +40,7 @@ import io
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -111,12 +111,17 @@ class KernelResult:
 # ---------------------------------------------------------------------------
 
 
-def _probe_deps() -> Dict[str, Optional[str]]:
+def _probe_deps(
+    *,
+    import_module: Optional[Callable[[str], Any]] = None,
+    loaded_modules: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Optional[str]]:
     """Return ``{component: error_str_or_None}`` for each pipeline dep.
 
     A non-None value means the component is unavailable; the harness
     will SKIP each kernel with that error string.
     """
+    importer = importlib.import_module if import_module is None else import_module
     deps: Dict[str, Optional[str]] = {
         "triton": None,
         "tvm": None,
@@ -126,7 +131,7 @@ def _probe_deps() -> Dict[str, Optional[str]]:
     }
     for name in deps:
         if name == "triton":
-            block_reason = triton_import_block_reason()
+            block_reason = triton_import_block_reason(loaded_modules)
             if block_reason is not None:
                 deps[name] = f"RuntimeError: {block_reason}"
                 continue
@@ -134,7 +139,7 @@ def _probe_deps() -> Dict[str, Optional[str]]:
             module_name = "mlx.core" if name == "mlx" else name
             if name == "cppmega_mlx":
                 module_name = "cppmega_mlx.nn._tilelang._mlx_runtime"
-            importlib.import_module(module_name)
+            importer(module_name)
         except Exception as exc:  # noqa: BLE001 -- broad-by-design, recorded
             deps[name] = f"{type(exc).__name__}: {exc}"
     return deps
@@ -357,6 +362,8 @@ def _lower_ttir(
     ttir_text: str,
     kernel_name: str,
     options: Optional[Dict[str, Any]] = None,
+    arg_buffer_shapes: Optional[List[Tuple[int, ...]]] = None,
+    grid: Optional[Tuple[int, ...]] = None,
 ) -> Tuple[Any, Optional[str]]:
     """Run ``poc.triton_frontend.from_ttir`` on the captured TTIR.
 
@@ -417,6 +424,8 @@ def _lower_ttir(
         prim = from_ttir(
             adapter,
             name=kernel_name,
+            grid=grid,
+            arg_buffer_shapes=arg_buffer_shapes,
             num_warps=opts.get("num_warps"),
             num_stages=opts.get("num_stages"),
         )
@@ -440,6 +449,8 @@ def _lower_ttir(
         prim = from_ttir(
             ttir_text,
             name=kernel_name,
+            grid=grid,
+            arg_buffer_shapes=arg_buffer_shapes,
             num_warps=opts.get("num_warps"),
             num_stages=opts.get("num_stages"),
             _allow_text_ttir=True,
@@ -748,8 +759,21 @@ def run_one(kernel_module_name: str, deps: Dict[str, Optional[str]]) -> KernelRe
             elapsed_s=time.monotonic() - started,
         )
 
+    args, expected = kernel_mod.make_inputs()
+    # TTIR pointer arithmetic is flat addptr indexing.  Keep the PrimFunc ABI
+    # buffers rank-1 but size them to the full underlying storage so TileLang
+    # does not infer a tile-only extent such as 32x32 -> (1024,).
+    arg_buffer_shapes = [(int(arr.size),) for arr in args]
+    launch_grid = tuple(int(g) for g in getattr(kernel_mod, "LAUNCH_GRID", (1,)))
+
     # Stage 2: PrimFunc
-    prim, lower_err = _lower_ttir(ttir_text, kernel_module_name, ttir_options)
+    prim, lower_err = _lower_ttir(
+        ttir_text,
+        kernel_module_name,
+        ttir_options,
+        arg_buffer_shapes=arg_buffer_shapes,
+        grid=launch_grid,
+    )
     if prim is None:
         return KernelResult(
             name=kernel_module_name,
@@ -771,7 +795,6 @@ def run_one(kernel_module_name: str, deps: Dict[str, Optional[str]]) -> KernelRe
         )
 
     # Stage 4 + 5: MLX run
-    args, expected = kernel_mod.make_inputs()
     actual, runtime_err = _run_mlx(artifact, args, kernel_mod)
     if actual is None:
         return KernelResult(

@@ -32,4 +32,5 @@ KERNEL_MODULES = (
     "matmul",
     "layer_norm",
     "flash_attention",
+    "paged_attention",
 )

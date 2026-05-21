@@ -8,8 +8,8 @@ in ascending difficulty:
     3. matmul             -- dot + multi-stage load
     4. layer_norm         -- Triton tutorial 05 Welford
     5. fa_v2              -- Triton tutorial 06 (wired up to numeric_kernels)
-    6. fa_v3              -- Hopper TMA + WGMMA (TODO)
-    7. paged_attn         -- vLLM port (TODO)
+    6. fa_v3              -- Hopper TMA + WGMMA, with TileLang fallback
+    7. paged_attn         -- vLLM-style block-table KV indirection
     8. dot_reduce_atomic  -- dot + reduce + atomic_add (Wave-2 add)
 
 Each implemented ``kernel_<name>`` returns a compiled TileLang kernel (or
@@ -195,19 +195,368 @@ def kernel_layer_norm(
     return tilelang.compile(layer_norm)
 
 
+def _build_fa_v2_prim(
+    SEQ_Q: int = 128,
+    SEQ_K: int = 128,
+    HEAD_DIM: int = 32,
+    BLOCK_M: int = 32,
+    BLOCK_N: int = 32,
+    BLOCK_DMODEL: int = 32,
+    SM_SCALE: float = 0.17677669529663687,
+    dtype: str = "float16",
+    accum_dtype: str = "float32",
+) -> Optional[Any]:
+    """Build RFC 5.5 #5 TileLang IR for dense FA-v2 forward conformance.
+
+    This mirrors the dense Triton target in
+    ``_test_harness/numeric_kernels/flash_attention.py``: one query block
+    streams over K/V blocks and applies the online softmax recurrence without
+    materializing the full attention matrix.
+    """
+    T = _try_tilelang()
+    if T is None:
+        return None
+
+    NUM_KV_BLOCKS = SEQ_K // BLOCK_N
+
+    @T.prim_func
+    def fa_v2(
+        Q: T.Tensor((SEQ_Q, HEAD_DIM), dtype),
+        K: T.Tensor((SEQ_K, HEAD_DIM), dtype),
+        V: T.Tensor((SEQ_K, HEAD_DIM), dtype),
+        O: T.Tensor((SEQ_Q, HEAD_DIM), accum_dtype),
+    ):
+        if False:  # noqa: SIM103
+            _ = (
+                SEQ_Q,
+                SEQ_K,
+                HEAD_DIM,
+                NUM_KV_BLOCKS,
+                dtype,
+                accum_dtype,
+            )
+        with T.Kernel(T.ceildiv(SEQ_Q, BLOCK_M), threads=128) as bx:
+            Q_shared = T.alloc_shared((BLOCK_M, BLOCK_DMODEL), dtype)
+            K_shared = T.alloc_shared((BLOCK_N, BLOCK_DMODEL), dtype)
+            V_shared = T.alloc_shared((BLOCK_N, BLOCK_DMODEL), dtype)
+            Probs_shared = T.alloc_shared((BLOCK_M, BLOCK_N), dtype)
+            Scores = T.alloc_shared((BLOCK_M, BLOCK_N), accum_dtype)
+            Probs = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
+            Probs_cast = T.alloc_fragment((BLOCK_M, BLOCK_N), dtype)
+            Acc = T.alloc_shared((BLOCK_M, BLOCK_DMODEL), accum_dtype)
+            row_max = T.alloc_fragment((BLOCK_M,), accum_dtype)
+            row_max_prev = T.alloc_fragment((BLOCK_M,), accum_dtype)
+            page_max = T.alloc_fragment((BLOCK_M,), accum_dtype)
+            row_sum = T.alloc_fragment((BLOCK_M,), accum_dtype)
+            page_sum = T.alloc_fragment((BLOCK_M,), accum_dtype)
+            row_scale = T.alloc_fragment((BLOCK_M,), accum_dtype)
+
+            T.copy(Q[bx * BLOCK_M, 0], Q_shared)
+            T.clear(Acc)
+            neg_max = T.cast(-3.4028234663852886e38, accum_dtype)
+            T.fill(row_max, neg_max)
+            T.clear(row_sum)
+
+            for kv_block in T.serial(NUM_KV_BLOCKS):
+                T.copy(K[kv_block * BLOCK_N, 0], K_shared)
+                T.copy(V[kv_block * BLOCK_N, 0], V_shared)
+
+                T.clear(Scores)
+                T.gemm(
+                    Q_shared,
+                    K_shared,
+                    Scores,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullRow,
+                )
+                for i, j in T.Parallel(BLOCK_M, BLOCK_N):
+                    Scores[i, j] = Scores[i, j] * T.cast(SM_SCALE, accum_dtype)
+
+                T.copy(row_max, row_max_prev)
+                T.fill(page_max, neg_max)
+                for i in T.Parallel(BLOCK_M):
+                    for j in T.serial(BLOCK_N):
+                        page_max[i] = T.max(page_max[i], Scores[i, j])
+
+                for i in T.Parallel(BLOCK_M):
+                    row_max[i] = T.max(row_max_prev[i], page_max[i])
+                    row_scale[i] = T.exp(row_max_prev[i] - row_max[i])
+
+                for i, j in T.Parallel(BLOCK_M, BLOCK_N):
+                    Probs[i, j] = T.exp(Scores[i, j] - row_max[i])
+                    Probs_cast[i, j] = T.cast(Probs[i, j], dtype)
+
+                T.clear(page_sum)
+                for i in T.Parallel(BLOCK_M):
+                    for j in T.serial(BLOCK_N):
+                        page_sum[i] = page_sum[i] + Probs[i, j]
+                for i in T.Parallel(BLOCK_M):
+                    row_sum[i] = row_sum[i] * row_scale[i] + page_sum[i]
+
+                for i, j in T.Parallel(BLOCK_M, BLOCK_DMODEL):
+                    Acc[i, j] = Acc[i, j] * row_scale[i]
+                T.copy(Probs_cast, Probs_shared)
+                T.gemm(Probs_shared, V_shared, Acc, policy=T.GemmWarpPolicy.FullRow)
+
+            for i, j in T.Parallel(BLOCK_M, BLOCK_DMODEL):
+                Acc[i, j] = Acc[i, j] / row_sum[i]
+            T.copy(Acc, O[bx * BLOCK_M, 0])
+
+    return fa_v2
+
+
 def kernel_fa_v2() -> Optional[Any]:
     """RFC 5.5 #5: FlashAttention-2 (pipelined dot + online softmax)."""
-    return None
+    prim = _build_fa_v2_prim()
+    if prim is None:
+        return None
+    import tilelang
+
+    return tilelang.compile(prim)
 
 
-def kernel_fa_v3() -> Optional[Any]:
+def kernel_fa_v3(num_stages: int = 3) -> Optional[Any]:
     """RFC 5.5 #6: FlashAttention-3 (Hopper TMA + WGMMA + WS)."""
-    return None
+    prim = _build_fa_v3_tma_fallback_prim(NUM_STAGES=num_stages)
+    if prim is None:
+        return None
+    import tilelang
+
+    return tilelang.compile(prim)
+
+
+def _build_fa_v3_tma_fallback_prim(
+    SEQ_Q: int = 128,
+    SEQ_K: int = 128,
+    HEAD_DIM: int = 32,
+    BLOCK_M: int = 32,
+    BLOCK_N: int = 32,
+    BLOCK_DMODEL: int = 32,
+    NUM_STAGES: int = 3,
+    SM_SCALE: float = 0.17677669529663687,
+    dtype: str = "float16",
+    accum_dtype: str = "float32",
+) -> Optional[Any]:
+    """Build RFC 5.5 #6 TileLang IR for the FA-v3 TMA fallback path.
+
+    Hopper targets may lower the shared-memory copies and GEMMs to TMA/WGMMA.
+    Non-NV targets keep the same fused attention contract with pipelined
+    ``T.copy`` stages and target-native ``T.gemm`` lowering.
+    """
+    T = _try_tilelang()
+    if T is None:
+        return None
+
+    NUM_KV_BLOCKS = SEQ_K // BLOCK_N
+
+    @T.prim_func
+    def fa_v3_tma_fallback(
+        Q: T.Tensor((SEQ_Q, HEAD_DIM), dtype),
+        K: T.Tensor((SEQ_K, HEAD_DIM), dtype),
+        V: T.Tensor((SEQ_K, HEAD_DIM), dtype),
+        O: T.Tensor((SEQ_Q, HEAD_DIM), accum_dtype),
+    ):
+        if False:  # noqa: SIM103
+            _ = (
+                SEQ_Q,
+                SEQ_K,
+                HEAD_DIM,
+                NUM_KV_BLOCKS,
+                NUM_STAGES,
+                dtype,
+                accum_dtype,
+            )
+        with T.Kernel(T.ceildiv(SEQ_Q, BLOCK_M), threads=128) as bx:
+            Q_shared = T.alloc_shared((BLOCK_M, BLOCK_DMODEL), dtype)
+            K_shared = T.alloc_shared((BLOCK_N, BLOCK_DMODEL), dtype)
+            V_shared = T.alloc_shared((BLOCK_N, BLOCK_DMODEL), dtype)
+            Probs_shared = T.alloc_shared((BLOCK_M, BLOCK_N), dtype)
+            Scores = T.alloc_shared((BLOCK_M, BLOCK_N), accum_dtype)
+            Probs = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
+            Probs_cast = T.alloc_fragment((BLOCK_M, BLOCK_N), dtype)
+            Acc = T.alloc_shared((BLOCK_M, BLOCK_DMODEL), accum_dtype)
+            row_max = T.alloc_fragment((BLOCK_M,), accum_dtype)
+            row_max_prev = T.alloc_fragment((BLOCK_M,), accum_dtype)
+            page_max = T.alloc_fragment((BLOCK_M,), accum_dtype)
+            row_sum = T.alloc_fragment((BLOCK_M,), accum_dtype)
+            page_sum = T.alloc_fragment((BLOCK_M,), accum_dtype)
+            row_scale = T.alloc_fragment((BLOCK_M,), accum_dtype)
+
+            T.copy(Q[bx * BLOCK_M, 0], Q_shared)
+            T.clear(Acc)
+            neg_max = T.cast(-3.4028234663852886e38, accum_dtype)
+            T.fill(row_max, neg_max)
+            T.clear(row_sum)
+
+            for kv_block in T.Pipelined(NUM_KV_BLOCKS, num_stages=NUM_STAGES):
+                T.copy(K[kv_block * BLOCK_N, 0], K_shared)
+                T.copy(V[kv_block * BLOCK_N, 0], V_shared)
+
+                T.clear(Scores)
+                T.gemm(
+                    Q_shared,
+                    K_shared,
+                    Scores,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullRow,
+                )
+                for i, j in T.Parallel(BLOCK_M, BLOCK_N):
+                    Scores[i, j] = Scores[i, j] * T.cast(SM_SCALE, accum_dtype)
+
+                T.copy(row_max, row_max_prev)
+                T.fill(page_max, neg_max)
+                for i in T.Parallel(BLOCK_M):
+                    for j in T.serial(BLOCK_N):
+                        page_max[i] = T.max(page_max[i], Scores[i, j])
+
+                for i in T.Parallel(BLOCK_M):
+                    row_max[i] = T.max(row_max_prev[i], page_max[i])
+                    row_scale[i] = T.exp(row_max_prev[i] - row_max[i])
+
+                for i, j in T.Parallel(BLOCK_M, BLOCK_N):
+                    Probs[i, j] = T.exp(Scores[i, j] - row_max[i])
+                    Probs_cast[i, j] = T.cast(Probs[i, j], dtype)
+
+                T.clear(page_sum)
+                for i in T.Parallel(BLOCK_M):
+                    for j in T.serial(BLOCK_N):
+                        page_sum[i] = page_sum[i] + Probs[i, j]
+                for i in T.Parallel(BLOCK_M):
+                    row_sum[i] = row_sum[i] * row_scale[i] + page_sum[i]
+
+                for i, j in T.Parallel(BLOCK_M, BLOCK_DMODEL):
+                    Acc[i, j] = Acc[i, j] * row_scale[i]
+                T.copy(Probs_cast, Probs_shared)
+                T.gemm(Probs_shared, V_shared, Acc, policy=T.GemmWarpPolicy.FullRow)
+
+            for i, j in T.Parallel(BLOCK_M, BLOCK_DMODEL):
+                Acc[i, j] = Acc[i, j] / row_sum[i]
+            T.copy(Acc, O[bx * BLOCK_M, 0])
+
+    return fa_v3_tma_fallback
+
+
+def _build_paged_attention_prim(
+    SEQ_Q: int = 16,
+    NUM_PAGES: int = 4,
+    PAGE_SIZE: int = 16,
+    HEAD_DIM: int = 32,
+    NUM_PHYS_BLOCKS: int = 6,
+    BLOCK_M: int = 16,
+    BLOCK_N: int = 16,
+    BLOCK_DMODEL: int = 32,
+    SM_SCALE: float = 0.17677669529663687,
+    dtype: str = "float16",
+    accum_dtype: str = "float32",
+) -> Optional[Any]:
+    """Build RFC 5.5 #7 TileLang IR for paged-attention conformance.
+
+    The kernel mirrors the Triton numeric target in
+    ``_test_harness/numeric_kernels/paged_attention.py``: one query block
+    gathers KV pages through ``BlockTable`` and runs the streaming softmax
+    recurrence without materializing the full logical KV sequence.
+    """
+    T = _try_tilelang()
+    if T is None:
+        return None
+
+    @T.prim_func
+    def paged_attention(
+        Q: T.Tensor((SEQ_Q, HEAD_DIM), dtype),
+        KCache: T.Tensor((NUM_PHYS_BLOCKS, PAGE_SIZE, HEAD_DIM), dtype),
+        VCache: T.Tensor((NUM_PHYS_BLOCKS, PAGE_SIZE, HEAD_DIM), dtype),
+        BlockTable: T.Tensor((NUM_PAGES,), "int32"),
+        O: T.Tensor((SEQ_Q, HEAD_DIM), accum_dtype),
+    ):
+        if False:  # noqa: SIM103
+            _ = (
+                SEQ_Q,
+                NUM_PAGES,
+                PAGE_SIZE,
+                HEAD_DIM,
+                NUM_PHYS_BLOCKS,
+                dtype,
+                accum_dtype,
+            )
+        with T.Kernel(T.ceildiv(SEQ_Q, BLOCK_M), threads=128) as bx:
+            Q_shared = T.alloc_shared((BLOCK_M, BLOCK_DMODEL), dtype)
+            K_shared = T.alloc_shared((BLOCK_N, BLOCK_DMODEL), dtype)
+            V_shared = T.alloc_shared((BLOCK_N, BLOCK_DMODEL), dtype)
+            Probs_shared = T.alloc_shared((BLOCK_M, BLOCK_N), dtype)
+            Scores = T.alloc_shared((BLOCK_M, BLOCK_N), accum_dtype)
+            Probs = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
+            Probs_cast = T.alloc_fragment((BLOCK_M, BLOCK_N), dtype)
+            Acc = T.alloc_shared((BLOCK_M, BLOCK_DMODEL), accum_dtype)
+            row_max = T.alloc_fragment((BLOCK_M,), accum_dtype)
+            row_max_prev = T.alloc_fragment((BLOCK_M,), accum_dtype)
+            page_max = T.alloc_fragment((BLOCK_M,), accum_dtype)
+            row_sum = T.alloc_fragment((BLOCK_M,), accum_dtype)
+            page_sum = T.alloc_fragment((BLOCK_M,), accum_dtype)
+            row_scale = T.alloc_fragment((BLOCK_M,), accum_dtype)
+
+            T.copy(Q[bx * BLOCK_M, 0], Q_shared)
+            T.clear(Acc)
+            neg_max = T.cast(-3.4028234663852886e38, accum_dtype)
+            T.fill(row_max, neg_max)
+            T.clear(row_sum)
+
+            for logical_page in T.serial(NUM_PAGES):
+                physical_page = BlockTable[logical_page]
+                T.copy(KCache[physical_page, 0, 0], K_shared)
+                T.copy(VCache[physical_page, 0, 0], V_shared)
+
+                T.clear(Scores)
+                T.gemm(
+                    Q_shared,
+                    K_shared,
+                    Scores,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullRow,
+                )
+                for i, j in T.Parallel(BLOCK_M, BLOCK_N):
+                    Scores[i, j] = Scores[i, j] * T.cast(SM_SCALE, accum_dtype)
+
+                T.copy(row_max, row_max_prev)
+                T.fill(page_max, neg_max)
+                for i in T.Parallel(BLOCK_M):
+                    for j in T.serial(BLOCK_N):
+                        page_max[i] = T.max(page_max[i], Scores[i, j])
+
+                for i in T.Parallel(BLOCK_M):
+                    row_max[i] = T.max(row_max_prev[i], page_max[i])
+                    row_scale[i] = T.exp(row_max_prev[i] - row_max[i])
+
+                for i, j in T.Parallel(BLOCK_M, BLOCK_N):
+                    Probs[i, j] = T.exp(Scores[i, j] - row_max[i])
+                    Probs_cast[i, j] = T.cast(Probs[i, j], dtype)
+
+                T.clear(page_sum)
+                for i in T.Parallel(BLOCK_M):
+                    for j in T.serial(BLOCK_N):
+                        page_sum[i] = page_sum[i] + Probs[i, j]
+                for i in T.Parallel(BLOCK_M):
+                    row_sum[i] = row_sum[i] * row_scale[i] + page_sum[i]
+
+                for i, j in T.Parallel(BLOCK_M, BLOCK_DMODEL):
+                    Acc[i, j] = Acc[i, j] * row_scale[i]
+                T.copy(Probs_cast, Probs_shared)
+                T.gemm(Probs_shared, V_shared, Acc, policy=T.GemmWarpPolicy.FullRow)
+
+            for i, j in T.Parallel(BLOCK_M, BLOCK_DMODEL):
+                Acc[i, j] = Acc[i, j] / row_sum[i]
+            T.copy(Acc, O[bx * BLOCK_M, 0])
+
+    return paged_attention
 
 
 def kernel_paged_attn() -> Optional[Any]:
-    """RFC 5.5 #7: paged-attention, ported from vLLM."""
-    return None
+    """RFC 5.5 #7: paged-attention, ported from vLLM-style KV caches."""
+    prim = _build_paged_attention_prim()
+    if prim is None:
+        return None
+    import tilelang
+
+    return tilelang.compile(prim)
 
 
 def kernel_dot_reduce_atomic(

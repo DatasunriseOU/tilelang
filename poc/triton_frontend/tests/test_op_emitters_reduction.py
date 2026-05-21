@@ -9,9 +9,9 @@ checks that:
   initialised to 0.
 * ``tt.reduce`` with a ``maximumf`` combiner initialises the accumulator
   to ``tir.min_value(dtype)`` (which is -inf for float dtypes).
-* ``tt.dot`` (M=N=K=32, fp32) emits either a ``T.gemm`` block (when
-  ``tilelang.language.gemm`` is importable) or a 3-loop ``tir.For`` nest
-  with a ``BufferStore(C, ...)`` whose RHS is a multiply-accumulate.
+* ``tt.dot`` (M=N=K=32, fp32) emits a 3-loop ``tir.For`` nest with a
+  ``BufferStore(C, ...)`` whose RHS is a multiply-accumulate, while
+  low-precision inputs still route through ``T.gemm``.
 * ``tt.atomic_add`` emits a TileLang atomic call (preferred) or a raw
   ``tir.atomic_add`` ``call_intrin``.
 * The combiner detector is precise: an unsupported combiner raises
@@ -28,14 +28,13 @@ import pytest
 
 pytest.importorskip("tilelang")
 tvm = pytest.importorskip("tvm")
-from tvm import tir
 
 from poc.triton_frontend.op_emitters.reduction import (  # noqa: E402
     EmitError,
     REDUCTION_EMITTERS,
     detect_combiner_kind,
 )
-from poc.triton_frontend.op_mapping import OP_TABLE, WalkerCtx  # noqa: E402
+from poc.triton_frontend.op_mapping import OP_TABLE, LazyTileExpr, WalkerCtx  # noqa: E402
 
 from ._fixtures import FakeSSA  # noqa: E402
 
@@ -323,6 +322,43 @@ def test_tt_reduce_welford_binds_three_scalar_results():
     assert any(n.startswith("welford_weight_accum") for n in new_names)
 
 
+def test_tt_reduce_welford_reads_lazy_tile_operands_per_lane():
+    """Welford inputs may be LazyTileExpr values from prior elementwise ops."""
+    ctx = WalkerCtx()
+    x_ssa = _ssa("x", shape=[4], dtype="float32")
+    m2_ssa = _ssa("m2", shape=[4], dtype="float32")
+    w_ssa = _ssa("w", shape=[4], dtype="float32")
+    mean_out = _ssa("mean_out", shape=[], dtype="float32")
+    m2_out = _ssa("m2_out", shape=[], dtype="float32")
+    w_out = _ssa("w_out", shape=[], dtype="float32")
+
+    def _lazy(name: str, value: float) -> LazyTileExpr:
+        return LazyTileExpr(
+            (4,),
+            "float32",
+            lambda read_ctx, _indices: read_ctx.tir().const(value, "float32"),
+            name=name,
+        )
+
+    ctx.bind(x_ssa, _lazy("x_lazy", 1.0))
+    ctx.bind(m2_ssa, _lazy("m2_lazy", 0.0))
+    ctx.bind(w_ssa, _lazy("w_lazy", 1.0))
+
+    op = _op(
+        "tt.reduce",
+        [x_ssa, m2_ssa, w_ssa],
+        [mean_out, m2_out, w_out],
+        combiner="welford",
+        axis=0,
+    )
+
+    REDUCTION_EMITTERS["tt.reduce"](op, ctx)
+
+    body = _seq_or_single(ctx.stmts)
+    assert "ffi.OpaquePyObject" not in str(body)
+    assert isinstance(ctx.get(mean_out), tvm.tir.BufferLoad)
+
+
 # ---------------------------------------------------------------------------
 # tt.scan
 # ---------------------------------------------------------------------------
@@ -399,12 +435,7 @@ def test_tt_scan_buffers_registered_in_local_buffers():
 
 
 def test_tt_dot_emits_gemm_or_3loop_with_mul_add():
-    """tt.dot(M=32, K=32, N=32, fp32) -> T.gemm OR explicit 3-loop nest.
-
-    When ``tilelang.language.gemm`` is importable in the environment we
-    require the gemm path; otherwise we accept the manual fallback as
-    long as the inner BufferStore on C is a multiply-accumulate.
-    """
+    """tt.dot(M=32, K=32, N=32, fp32) -> explicit 3-loop nest."""
     import tilelang.language as T
 
     ctx = WalkerCtx()
@@ -425,31 +456,26 @@ def test_tt_dot_emits_gemm_or_3loop_with_mul_add():
             handles.append(REDUCTION_EMITTERS["tt.dot"](op, ctx))
 
     handle = handles[0]
+    text = str(handle) + " " + str(ctx.stmts)
+    assert "gemm" not in text.lower(), f"fp32 dot should use scalar fallback: {text!r}"
 
-    # Path 1: tilelang.gemm path -- the handle string mentions gemm.
-    try:
-        import tilelang.language as T  # noqa: F401
-        gemm_available = True
-    except ImportError:
-        gemm_available = False
-
-    if gemm_available:
-        text = str(handle) + " " + str(ctx.stmts)
-        assert "gemm" in text.lower(), (
-            f"expected gemm in emitted TIR when tilelang is importable; "
-            f"got {text!r}"
-        )
-        return
-
-    # Path 2: manual 3-loop nest. We expect:
-    #  * three nested tir.For nodes,
-    #  * a single BufferStore on C whose RHS is Add(BufferLoad(C), Mul(...)).
+    # Manual fp32 path. We expect at least the compute-loop triplet and a
+    # BufferStore on C whose RHS is Add(BufferLoad(C), Mul(...)). The path may
+    # also emit an initialization loop when the accumulator starts as zero.
     body = _seq_or_single(ctx.stmts)
     fors = _walk_for_loops(body)
-    assert len(fors) == 3, f"expected 3 nested tir.For; got {len(fors)}"
+    assert len(fors) >= 3, f"expected at least 3 nested tir.For; got {len(fors)}"
     stores = _walk_buffer_stores(body)
-    assert len(stores) == 1
-    store = stores[0]
+    store = next(
+        (
+            s
+            for s in stores
+            if isinstance(s.value, tvm.tir.Add)
+            and isinstance(s.value.b, tvm.tir.Mul)
+        ),
+        None,
+    )
+    assert store is not None, f"expected a multiply-accumulate store; got {stores!r}"
     assert isinstance(store.value, tvm.tir.Add), (
         f"expected outer Add for accumulate; got {type(store.value).__name__}"
     )
@@ -478,12 +504,12 @@ def test_tt_dot_uses_shared_scope_for_C_result():
         pytest.skip("tilelang not importable; gemm path test cannot run")
 
     ctx = WalkerCtx()
-    a_ssa = _ssa("A", shape=[64, 64], dtype="float32")
-    b_ssa = _ssa("B", shape=[64, 64], dtype="float32")
+    a_ssa = _ssa("A", shape=[64, 64], dtype="float16")
+    b_ssa = _ssa("B", shape=[64, 64], dtype="float16")
     c_ssa_in = _ssa("Cin", shape=[64, 64], dtype="float32")
     c_ssa = _ssa("C", shape=[64, 64], dtype="float32")
-    a_buf = tvm.tir.decl_buffer([64, 64], "float32", name="A")
-    b_buf = tvm.tir.decl_buffer([64, 64], "float32", name="B")
+    a_buf = tvm.tir.decl_buffer([64, 64], "float16", name="A")
+    b_buf = tvm.tir.decl_buffer([64, 64], "float16", name="B")
     # The pre-existing C buffer comes from arith.constant — the bug
     # scenario is exactly this: C is bound to a plain ``local`` tile.
     c_in_buf = tvm.tir.decl_buffer([64, 64], "float32", name="Cin",
@@ -517,11 +543,11 @@ def test_tt_dot_direct_store_result_keeps_fragment_C_to_limit_shared_memory():
         pytest.skip("tilelang not importable; gemm path test cannot run")
 
     ctx = WalkerCtx()
-    a_ssa = _ssa("A", shape=[64, 64], dtype="float32")
-    b_ssa = _ssa("B", shape=[64, 64], dtype="float32")
+    a_ssa = _ssa("A", shape=[64, 64], dtype="float16")
+    b_ssa = _ssa("B", shape=[64, 64], dtype="float16")
     c_ssa = _ssa("C", shape=[64, 64], dtype="float32")
-    a_buf = tvm.tir.decl_buffer([64, 64], "float32", name="A", scope="shared")
-    b_buf = tvm.tir.decl_buffer([64, 64], "float32", name="B", scope="shared")
+    a_buf = tvm.tir.decl_buffer([64, 64], "float16", name="A", scope="shared")
+    b_buf = tvm.tir.decl_buffer([64, 64], "float16", name="B", scope="shared")
     ctx.bind(a_ssa, a_buf)
     ctx.bind(b_ssa, b_buf)
     ctx.ssa_users["C"] = {"tt.store"}
@@ -549,11 +575,11 @@ def test_tt_dot_stages_non_shared_operand_to_shared_before_gemm():
         pytest.skip("tilelang not importable; gemm path test cannot run")
 
     ctx = WalkerCtx()
-    a_ssa = _ssa("A", shape=[64, 64], dtype="float32")
-    b_ssa = _ssa("B", shape=[64, 64], dtype="float32")
+    a_ssa = _ssa("A", shape=[64, 64], dtype="float16")
+    b_ssa = _ssa("B", shape=[64, 64], dtype="float16")
     c_ssa = _ssa("C", shape=[64, 64], dtype="float32")
-    a_buf = tvm.tir.decl_buffer([64, 64], "float32", name="A", scope="local")
-    b_buf = tvm.tir.decl_buffer([64, 64], "float32", name="B", scope="shared")
+    a_buf = tvm.tir.decl_buffer([64, 64], "float16", name="A", scope="local")
+    b_buf = tvm.tir.decl_buffer([64, 64], "float16", name="B", scope="shared")
     ctx.bind(a_ssa, a_buf)
     ctx.bind(b_ssa, b_buf)
 

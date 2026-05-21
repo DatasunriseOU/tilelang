@@ -19,7 +19,8 @@ API spelling differences we handle:
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional
+import importlib
+from typing import Any, Callable, Dict, Mapping, Optional
 
 from .native_import_guard import triton_import_block_reason
 
@@ -32,41 +33,55 @@ class TTIRCaptureError(RuntimeError):
     """Raised when triton imports but compile-to-TTIR fails."""
 
 
-def _import_triton():
-    block_reason = triton_import_block_reason()
+def _import_triton(
+    *,
+    import_module: Optional[Callable[[str], Any]] = None,
+    loaded_modules: Optional[Mapping[str, Any]] = None,
+):
+    block_reason = triton_import_block_reason(loaded_modules)
     if block_reason is not None:
         raise TritonUnavailable(block_reason)
+    importer = importlib.import_module if import_module is None else import_module
     try:
-        import triton  # noqa: F401
-        return triton
+        return importer("triton")
     except Exception as exc:
         raise TritonUnavailable(
             f"triton not importable: {exc.__class__.__name__}: {exc}"
         ) from exc
 
 
-def triton_available() -> bool:
+def triton_available(
+    *,
+    import_module: Optional[Callable[[str], Any]] = None,
+    loaded_modules: Optional[Mapping[str, Any]] = None,
+) -> bool:
     """Return True if triton is importable. Used as a feature-detect guard.
 
     Returns False when a TileLang/TVM native peer is already loaded in this
     process: importing triton there can abort the interpreter because both
     sides statically register LLVM command-line options.
     """
-    if triton_import_block_reason() is not None:
+    if triton_import_block_reason(loaded_modules) is not None:
         return False
+    importer = importlib.import_module if import_module is None else import_module
     try:
-        import triton  # noqa: F401
+        importer("triton")
         return True
     except Exception:
         return False
 
 
-def triton_version() -> Optional[str]:
+def triton_version(
+    *,
+    import_module: Optional[Callable[[str], Any]] = None,
+    loaded_modules: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
     """Return installed triton version, or None if not importable."""
-    if triton_import_block_reason() is not None:
+    if triton_import_block_reason(loaded_modules) is not None:
         return None
+    importer = importlib.import_module if import_module is None else import_module
     try:
-        import triton
+        triton = importer("triton")
         return getattr(triton, "__version__", None)
     except Exception:
         return None

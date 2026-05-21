@@ -18,8 +18,6 @@ can grep for cross-kernel patterns even when one kernel hard-fails.
 """
 from __future__ import annotations
 
-import sys
-
 import pytest
 
 from poc.triton_frontend._test_harness import numeric_kernels
@@ -37,6 +35,78 @@ from poc.triton_frontend._test_harness.numeric_smoke import Verdict
 _DEPS: dict | None = None
 
 
+def test_rfc_conformance_ladder_includes_paged_attention() -> None:
+    """RFC section 5.5's paged-attention target must stay in the live numeric ladder."""
+    assert "paged_attention" in numeric_kernels.KERNEL_MODULES
+
+
+def test_rfc_fa_v2_conformance_builds_tilelang_ir() -> None:
+    """RFC section 5.5's FA-v2 target must have TileLang IR coverage."""
+    pytest.importorskip("tilelang")
+
+    from poc.triton_frontend import conformance
+
+    prim = conformance._build_fa_v2_prim()
+
+    text = str(prim)
+    assert "Q" in text
+    assert "K" in text
+    assert "V" in text
+    assert "gemm" in text
+    assert "page_sum" in text
+    assert "row_sum" in text
+    assert "exp" in text
+
+
+def test_rfc_fa_v3_tma_fallback_builds_tilelang_ir() -> None:
+    """RFC section 5.5's FA-v3 target must expose a TileLang TMA fallback."""
+    pytest.importorskip("tilelang")
+
+    from poc.triton_frontend import conformance
+
+    prim = conformance._build_fa_v3_tma_fallback_prim()
+
+    text = str(prim)
+    assert "Q" in text
+    assert "K" in text
+    assert "V" in text
+    assert "num_stages" in text
+    assert "gemm" in text
+    assert "page_sum" in text
+    assert "row_sum" in text
+    assert "exp" in text
+
+
+def test_rfc_fa_v3_public_kernel_uses_staged_fallback_by_default() -> None:
+    """The public FA-v3 conformance entry must compile the staged fallback."""
+    pytest.importorskip("tilelang")
+
+    from poc.triton_frontend import conformance
+
+    assert conformance.kernel_fa_v3.__defaults__ == (3,)
+    kernel = conformance.kernel_fa_v3()
+    assert kernel is not None
+
+
+def test_rfc_paged_attention_conformance_builds_tilelang_ir() -> None:
+    """RFC section 5.5's paged-attention target must have TileLang IR coverage."""
+    pytest.importorskip("tilelang")
+
+    from poc.triton_frontend import conformance
+
+    prim = conformance._build_paged_attention_prim()
+
+    text = str(prim)
+    assert "BlockTable" in text
+    assert "KCache" in text
+    assert "VCache" in text
+    assert "gemm" in text
+    assert "T.max" in text
+    assert "page_sum" in text
+    assert "row_sum" in text
+    assert "exp" in text
+
+
 @pytest.fixture(scope="module")
 def deps_dict():
     """Module-scoped dep probe so each test sees the same component map."""
@@ -46,9 +116,9 @@ def deps_dict():
     return _DEPS
 
 
-def test_probe_deps_blocks_triton_after_tilelang_native_load(monkeypatch) -> None:
+def test_probe_deps_blocks_triton_after_tilelang_native_load() -> None:
     """Dep probing must not import Triton into a TileLang-native process."""
-    monkeypatch.setitem(sys.modules, "tilelang_cython_wrapper", object())
+    loaded_modules = {"tilelang_cython_wrapper": object()}
     calls: list[str] = []
 
     def fake_import_module(name: str):
@@ -57,9 +127,10 @@ def test_probe_deps_blocks_triton_after_tilelang_native_load(monkeypatch) -> Non
             raise AssertionError("triton import must be blocked before import")
         return object()
 
-    monkeypatch.setattr(numeric_smoke.importlib, "import_module", fake_import_module)
-
-    deps = numeric_smoke._probe_deps()
+    deps = numeric_smoke._probe_deps(
+        import_module=fake_import_module,
+        loaded_modules=loaded_modules,
+    )
 
     assert deps["triton"] is not None
     assert "triton import blocked" in deps["triton"]
@@ -73,38 +144,6 @@ def test_kernel_numeric_pass(kernel_module: str, deps_dict) -> None:
     SKIP -> pytest.skip; NUMERIC_PASS -> assert; everything else fails
     with the harness detail string so CI logs surface the cause.
     """
-    if kernel_module == "layer_norm":
-        result = numeric_smoke.run_one(kernel_module, deps_dict)
-        if result.verdict == Verdict.SKIP:
-            pytest.skip(result.detail or "<no detail>")
-        if result.verdict == Verdict.NUMERIC_PASS:
-            return
-        if result.verdict == Verdict.LOWER_FAIL and "unsupported op 'tt.call->" in (result.detail or "") and "welford_combine" in (result.detail or ""):
-            pytest.xfail("Welford combiner (tuple-returning custom tl.reduce) not yet supported by frontend")
-        pytest.fail(
-            f"{kernel_module}: verdict={result.verdict} "
-            f"detail={result.detail!r} "
-            f"max_abs={result.max_abs_err} "
-            f"max_rel={result.max_rel_err} "
-            f"first_mismatches={result.first_mismatches}"
-        )
-
-    if kernel_module == "flash_attention":
-        result = numeric_smoke.run_one(kernel_module, deps_dict)
-        if result.verdict == Verdict.SKIP:
-            pytest.skip(result.detail or "<no detail>")
-        if result.verdict == Verdict.NUMERIC_PASS:
-            return
-        if result.verdict == Verdict.LOWER_FAIL:
-            pytest.xfail(f"Flash Attention v2 frontend support incomplete: {result.detail}")
-        pytest.fail(
-            f"{kernel_module}: verdict={result.verdict} "
-            f"detail={result.detail!r} "
-            f"max_abs={result.max_abs_err} "
-            f"max_rel={result.max_rel_err} "
-            f"first_mismatches={result.first_mismatches}"
-        )
-
     result = numeric_smoke.run_one(kernel_module, deps_dict)
 
     if result.verdict == Verdict.SKIP:

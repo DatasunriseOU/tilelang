@@ -138,3 +138,163 @@ def test_scf_for_materializes_lazy_buffer_carry_yield() -> None:
 
     assert ctx.get(result) is carry
     assert "carry_copy" in str(ctx.stmts[-1])
+
+
+def test_scf_for_materializes_lazy_initial_tile_carry() -> None:
+    """Tile iter_args initialized from LazyTileExpr need mutable carry storage."""
+    ctx = WalkerCtx()
+    init = FakeSSA(name="init", shape=(4,), dtype="f32")
+    result = FakeSSA(name="result", shape=(4,), dtype="f32")
+    induction = FakeSSA(name="iv", dtype="index")
+    block_carry = FakeSSA(name="block_carry", shape=(4,), dtype="f32")
+    zero = LazyTileExpr(
+        (4,),
+        "float32",
+        lambda read_ctx, _indices: read_ctx.tir().const(0.0, "float32"),
+        name="zero_tile",
+    )
+    ctx.bind(init, zero)
+
+    map_scf_for(
+        {
+            "name": "scf.for",
+            "operands": [0, 1, 1, init],
+            "results": [result],
+            "regions": [
+                {
+                    "block_args": [induction, block_carry],
+                    "ops": [
+                        {"name": "scf.yield", "operands": [block_carry], "results": []},
+                    ],
+                }
+            ],
+        },
+        ctx,
+    )
+
+    out = ctx.get(result)
+    assert isinstance(out, tvm.tir.Buffer)
+    assert out is not zero
+
+
+def test_scf_for_materializes_lazy_pointer_index_carry() -> None:
+    """Loop-carried pointer descriptors need mutable index storage."""
+    ctx = WalkerCtx()
+    base = tvm.tir.decl_buffer((64,), "float32", name="A")
+    init = FakeSSA(name="init_ptr", shape=(4,), dtype="f32")
+    result = FakeSSA(name="result_ptr", shape=(4,), dtype="f32")
+    induction = FakeSSA(name="iv", dtype="index")
+    block_carry = FakeSSA(name="block_ptr", shape=(4,), dtype="f32")
+    index = LazyTileExpr(
+        (4,),
+        "int32",
+        lambda read_ctx, indices: indices[0],
+        name="lazy_index",
+    )
+    ctx.bind(init, (base, [index]))
+
+    map_scf_for(
+        {
+            "name": "scf.for",
+            "operands": [0, 1, 1, init],
+            "results": [result],
+            "regions": [
+                {
+                    "block_args": [induction, block_carry],
+                    "ops": [
+                        {"name": "scf.yield", "operands": [block_carry], "results": []},
+                    ],
+                }
+            ],
+        },
+        ctx,
+    )
+
+    out = ctx.get(result)
+    assert isinstance(out, tuple)
+    assert isinstance(out[1][0], tvm.tir.Buffer)
+    assert out[1][0] is not index
+
+
+def test_scf_for_snapshots_multiple_tile_carry_yields() -> None:
+    """Multiple tile carries must commit after all yielded values are evaluated."""
+    ctx = WalkerCtx()
+    init_a = FakeSSA(name="init_a", shape=(4,), dtype="f32")
+    init_b = FakeSSA(name="init_b", shape=(4,), dtype="f32")
+    result_a = FakeSSA(name="result_a", shape=(4,), dtype="f32")
+    result_b = FakeSSA(name="result_b", shape=(4,), dtype="f32")
+    induction = FakeSSA(name="iv", dtype="index")
+    block_a = FakeSSA(name="block_a", shape=(4,), dtype="f32")
+    block_b = FakeSSA(name="block_b", shape=(4,), dtype="f32")
+    next_a = FakeSSA(name="next_a", shape=(4,), dtype="f32")
+    next_b = FakeSSA(name="next_b", shape=(4,), dtype="f32")
+
+    ctx.bind(
+        init_a,
+        LazyTileExpr(
+            (4,),
+            "float32",
+            lambda read_ctx, _indices: read_ctx.tir().const(0.0, "float32"),
+            name="init_a_lazy",
+        ),
+    )
+    ctx.bind(
+        init_b,
+        LazyTileExpr(
+            (4,),
+            "float32",
+            lambda read_ctx, _indices: read_ctx.tir().const(10.0, "float32"),
+            name="init_b_lazy",
+        ),
+    )
+
+    def emit_nexts(_inner, child):
+        tir = child.tir()
+        a_buf = child.get(block_a)
+        b_buf = child.get(block_b)
+        child.bind(
+            next_a,
+            LazyTileExpr(
+                (4,),
+                "float32",
+                lambda _read_ctx, indices: tir.BufferLoad(a_buf, list(indices))
+                + tir.const(1.0, "float32"),
+                name="a_next",
+            ),
+        )
+        child.bind(
+            next_b,
+            LazyTileExpr(
+                (4,),
+                "float32",
+                lambda _read_ctx, indices: tir.BufferLoad(b_buf, list(indices))
+                + tir.BufferLoad(a_buf, list(indices)),
+                name="b_next_reads_old_a",
+            ),
+        )
+        return None
+
+    CONTROL_EMITTERS["test.next_carries"] = emit_nexts
+    try:
+        map_scf_for(
+            {
+                "name": "scf.for",
+                "operands": [0, 2, 1, init_a, init_b],
+                "results": [result_a, result_b],
+                "regions": [
+                    {
+                        "block_args": [induction, block_a, block_b],
+                        "ops": [
+                            {"name": "test.next_carries", "operands": [], "results": []},
+                            {"name": "scf.yield", "operands": [next_a, next_b], "results": []},
+                        ],
+                    }
+                ],
+            },
+            ctx,
+        )
+    finally:
+        CONTROL_EMITTERS.pop("test.next_carries", None)
+
+    names = [str(getattr(buf, "name", "")) for buf in ctx.local_buffers]
+    assert any(name.startswith("carry_next") for name in names)

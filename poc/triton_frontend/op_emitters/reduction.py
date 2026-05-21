@@ -14,11 +14,11 @@ Ops implemented
 * ``tt.reduce``        -> ``tir.For`` + accumulator (identity from combiner).
 * ``tt.scan``          -> ``tir.For`` writing a running accumulator into a
                           fresh fragment buffer at each step (prefix scan).
-* ``tt.dot``           -> ``T.gemm(A, B, C)`` when ``tilelang.language.gemm``
-                          is importable; for fp8 / fp16 / bf16 inputs this
-                          path is mandatory (Path C kernel quality matters).
-                          Otherwise a 3-loop ``tir.For`` nest with a
-                          BufferStore on the inner body.
+* ``tt.dot``           -> ``T.gemm(A, B, C)`` for fp8 / fp16 / bf16 inputs when
+                          ``tilelang.language.gemm`` is importable. fp32 uses
+                          the scalar 3-loop ``tir.For`` fallback because the
+                          current Metal GEMM path is low-precision oriented;
+                          the fallback emits a BufferStore on the inner body.
 * ``tt.atomic_add``    -> ``T.atomic_add`` / ``tir.call_intrin("tir.atomic_add", ...)``.
 * ``tt.atomic_max``    -> ``T.atomic_max`` / ``tir.call_intrin("tir.atomic_max", ...)``.
 * ``tt.atomic_min``    -> ``T.atomic_min`` / ``tir.call_intrin("tir.atomic_min", ...)``.
@@ -532,9 +532,12 @@ def _is_welford_reduce(op: Any, ctx: Any = None) -> bool:
 
 def _read_reduce_operand_elem(
     tir: Any,
+    ctx: Any,
     value: Any,
     indices: List[Any],
 ) -> Any:
+    if isinstance(value, LazyTileExpr):
+        return value.read_lane(ctx, tuple(indices))
     if hasattr(value, "shape") and hasattr(value, "dtype"):
         return tir.BufferLoad(value, list(indices))
     return value
@@ -612,9 +615,9 @@ def _map_tt_reduce_welford(op: Any, ctx: EmitContext) -> Any:
     mean_1 = tir.BufferLoad(mean_accum, idx0)
     m2_1 = tir.BufferLoad(m2_accum, idx0)
     weight_1 = tir.BufferLoad(weight_accum, idx0)
-    mean_2 = _read_reduce_operand_elem(tir, values[0], lane_idx)
-    m2_2 = _read_reduce_operand_elem(tir, values[1], lane_idx)
-    weight_2 = _read_reduce_operand_elem(tir, values[2], lane_idx)
+    mean_2 = _read_reduce_operand_elem(tir, ctx, values[0], lane_idx)
+    m2_2 = _read_reduce_operand_elem(tir, ctx, values[1], lane_idx)
+    weight_2 = _read_reduce_operand_elem(tir, ctx, values[2], lane_idx)
 
     new_weight = weight_1 + weight_2
     weight_zero = tir.const(0, str(getattr(new_weight, "dtype", dtypes[2])))
@@ -1009,12 +1012,16 @@ def _import_tilelang_gemm() -> Optional[Callable[..., Any]]:
 
 
 def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
-    """Lower ``tt.dot(a, b, c)`` to ``T.gemm`` (preferred) or a 3-loop nest.
+    """Lower ``tt.dot(a, b, c)`` to ``T.gemm`` or a 3-loop nest.
 
     Routing rules:
-      * If ``tilelang.language.gemm`` is importable, always use it -- this
-        is the Path C kernel surface: layout inference picks WMMA / WGMMA
-        / MFMA / SIMDgroup per target.
+      * If ``tilelang.language.gemm`` is importable and either input is fp8 /
+        fp16 / bf16, use it -- this is the Path C low-precision kernel
+        surface: layout inference picks WMMA / WGMMA / MFMA / SIMDgroup per
+        target.
+      * For fp32 inputs, use a scalar 3-loop nest. This is slower but keeps
+        the conformance path numerically stable on Metal while low-precision
+        work continues to exercise TileLang GEMM.
       * Otherwise, for **fp8 / fp16 / bf16** inputs we still raise
         :class:`EmitError`: a manual loop nest will produce a numerically
         correct but wildly slow kernel on those dtypes, which is worse
@@ -1077,6 +1084,12 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
     # and the folded upstream `tt.trans`.
     transpose_A = bool(attrs.get("transpose_A", False) or attrs.get("trans_a", False)) ^ pre_trans_a
     transpose_B = bool(attrs.get("transpose_B", False) or attrs.get("trans_b", False)) ^ pre_trans_b
+    low_precision_dot = (
+        a_dtype in _FP_LOW_PRECISION_DTYPES or b_dtype in _FP_LOW_PRECISION_DTYPES
+    )
+    prefer_scalar_fp32 = (
+        a_dtype == "float32" and b_dtype == "float32" and out_dtype == "float32"
+    )
 
     if gemm is not None:
         # Resolve / allocate accumulator C.
@@ -1367,7 +1380,9 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
         a = _stage_operand_to_shared(a, [M, Ka], a_dtype, "a")
         b = _stage_operand_to_shared(b, [Kb, N], b_dtype, "b")
 
-        if M <= 16 and N <= 16:
+        if prefer_scalar_fp32 or (M <= 16 and N <= 16 and not low_precision_dot):
+            if prefer_scalar_fp32:
+                ctx.requires_single_thread_body = True
             _emit_tiny_dot_loop(a, b, c)
             if result_value is not None:
                 ctx.bind(result_value, c)

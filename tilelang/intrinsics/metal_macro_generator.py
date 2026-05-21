@@ -63,17 +63,33 @@ class MPSIntrinEmitter:
 
     @staticmethod
     def _parse_buffer_2d(buf):
-        """Extract (buffer, row_offset, col_offset, stride) from Buffer or BufferRegion."""
+        """Extract 2D view metadata from Buffer or BufferRegion."""
         if isinstance(buf, BufferRegion):
             buffer = buf.buffer
+            prefix_offsets = [axis.min for axis in buf.region[:-2]]
             off_row = buf.region[-2].min
             off_col = buf.region[-1].min
         else:
             buffer = buf
+            prefix_offsets = [0 for _ in buffer.shape[:-2]]
             off_row = 0
             off_col = 0
         stride = buffer.strides[-2] if len(buffer.strides) == len(buffer.shape) else buffer.shape[-1]
-        return buffer, off_row, off_col, stride
+        return buffer, prefix_offsets, off_row, off_col, stride
+
+    @staticmethod
+    def _access_2d(buffer, prefix_offsets, row_idx, col_idx):
+        prefix_rank = len(prefix_offsets)
+        if prefix_rank == 0:
+            return buffer[row_idx, col_idx]
+        if prefix_rank == 1:
+            return buffer[prefix_offsets[0], row_idx, col_idx]
+        if prefix_rank == 2:
+            return buffer[prefix_offsets[0], prefix_offsets[1], row_idx, col_idx]
+        raise ValueError(
+            "Metal GEMM supports at most two leading staged/shared buffer "
+            f"dimensions, got {prefix_rank}"
+        )
 
     def ldmatrix_a(self, A_local_buf, A_shared_buf: Buffer | BufferRegion, ki):
         warp_rows = self.warp_rows
@@ -83,7 +99,7 @@ class MPSIntrinEmitter:
 
         warp_m, _ = self._get_warp_indices()
 
-        buffer, offset_m, offset_k, stride = self._parse_buffer_2d(A_shared_buf)
+        buffer, prefix_offsets, offset_m, offset_k, stride = self._parse_buffer_2d(A_shared_buf)
 
         @T.macro
         def _warp_ldmatrix_a(A_local_buf, buffer, offset_m, offset_k, stride, warp_m, ki):
@@ -95,7 +111,7 @@ class MPSIntrinEmitter:
                     row_idx = offset_m + warp_m * (self.warp_row_tiles) + i * micro_size_x
                     col_idx = offset_k + ki * micro_size_k
 
-                ptr = T.access_ptr(buffer[row_idx, col_idx], "r")
+                ptr = T.access_ptr(self._access_2d(buffer, prefix_offsets, row_idx, col_idx), "r")
 
                 T.simdgroup_load(
                     A_local_buf.data,
@@ -117,7 +133,7 @@ class MPSIntrinEmitter:
 
         _, warp_n = self._get_warp_indices()
 
-        buffer, offset_k, offset_n, stride = self._parse_buffer_2d(B_shared_buf)
+        buffer, prefix_offsets, offset_k, offset_n, stride = self._parse_buffer_2d(B_shared_buf)
 
         @T.macro
         def _warp_ldmatrix_b(B_local_buf, buffer, offset_k, offset_n, stride, warp_n, ki):
@@ -129,7 +145,7 @@ class MPSIntrinEmitter:
                     row_idx = offset_k + ki * micro_size_k
                     col_idx = offset_n + warp_n * (self.warp_col_tiles) + j * micro_size_y
 
-                ptr = T.access_ptr(buffer[row_idx, col_idx], "r")
+                ptr = T.access_ptr(self._access_2d(buffer, prefix_offsets, row_idx, col_idx), "r")
 
                 T.simdgroup_load(
                     B_local_buf.data,
@@ -171,7 +187,7 @@ class MPSIntrinEmitter:
 
         warp_m, warp_n = self._get_warp_indices()
 
-        buffer, offset_m, offset_n, stride = self._parse_buffer_2d(C_dst)
+        buffer, prefix_offsets, offset_m, offset_n, stride = self._parse_buffer_2d(C_dst)
 
         simd_op = T.simdgroup_store if is_store else T.simdgroup_load
         access_mode = "w" if is_store else "r"
@@ -187,7 +203,7 @@ class MPSIntrinEmitter:
                 simd_op(
                     C_simd_buf.data,
                     index_c,
-                    T.access_ptr(buffer[row, col], access_mode),
+                    T.access_ptr(self._access_2d(buffer, prefix_offsets, row, col), access_mode),
                     stride,
                     micro_size_x,
                     micro_size_y,
