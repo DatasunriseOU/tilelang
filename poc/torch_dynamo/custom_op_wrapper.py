@@ -61,14 +61,19 @@ def _storage_key(tensor: Any) -> tuple[int, int] | None:
 def _ensure_non_aliased_outputs(
     args: Sequence[Any],
     result: Any,
+    *,
+    materialize_aliases: bool = False,
 ) -> Any:
-    """Reject outputs that violate ``torch.library.custom_op`` alias rules.
+    """Reject or materialise outputs that violate custom_op alias rules.
 
     AOTAutograd forward graphs may return saved primals alongside computed
     tensors, and metadata ops such as ``aten.detach`` may produce a second
     result that aliases an earlier output. ``torch.library.custom_op`` does
-    not allow either form. The wrapper reports the alias instead of hiding a
-    copy so alias/view handling stays visible to partitioning and lowering.
+    not allow either form. Forward wrappers report the alias instead of hiding
+    a copy so alias/view handling stays visible to partitioning and lowering.
+    AOTAutograd backward wrappers may receive legitimate view/expand-style
+    gradients, so they explicitly materialise those outputs at the bwd
+    boundary.
     """
     input_keys: dict[tuple[int, int], int] = {}
     for input_idx, tensor in enumerate(_iter_tensors(args)):
@@ -82,6 +87,14 @@ def _ensure_non_aliased_outputs(
         if key is None:
             return value
         if key in input_keys:
+            if materialize_aliases and hasattr(value, "clone"):
+                value = value.clone()
+                key = _storage_key(value)
+                if key is None:
+                    return value
+            if materialize_aliases and key not in input_keys:
+                seen_output_keys[key] = output_idx
+                return value
             input_idx = input_keys[key]
             raise RuntimeError(
                 f"tilelang custom_op output #{output_idx} aliases input "
@@ -89,6 +102,14 @@ def _ensure_non_aliased_outputs(
                 "or materialise them explicitly in the captured graph."
             )
         if key in seen_output_keys:
+            if materialize_aliases and hasattr(value, "clone"):
+                value = value.clone()
+                key = _storage_key(value)
+                if key is None:
+                    return value
+            if materialize_aliases and key not in seen_output_keys:
+                seen_output_keys[key] = output_idx
+                return value
             first_idx = seen_output_keys[key]
             raise RuntimeError(
                 f"tilelang custom_op output #{output_idx} aliases output "
@@ -190,8 +211,9 @@ class FusedKernelArtifact:
     # custom_op because torch.library forbids returning aliases of inputs.
     # Entries are ``None`` for real fused outputs, ``("input", i)`` /
     # ``("param", i)`` for graph outputs that are exactly a placeholder or
-    # get_attr parameter, or ``("output", i)`` for duplicate saved outputs
-    # that reuse an earlier graph output.
+    # get_attr parameter, ``("input_view", i)`` / ``("param_view", i)`` for
+    # reconstructable metadata views of those values, or ``("output", i)``
+    # for duplicate saved outputs that reuse an earlier graph output.
     output_passthrough_sources: Tuple[Optional[Tuple[str, int]], ...] = ()
     # Wave-4 #09 fix #6: atomic-accumulator flag lives on the artifact so
     # the bwd compile can read it back (was previously sniffed inline in
@@ -257,7 +279,9 @@ def _normalise_passthrough_sources(
         if (
             not isinstance(source, tuple)
             or len(source) != 2
-            or source[0] not in {"input", "param", "output"}
+            or source[0] not in {
+                "input", "param", "output", "input_view", "param_view",
+            }
             or not isinstance(source[1], int)
         ):
             raise RuntimeError(
@@ -301,6 +325,7 @@ def _passthrough_value(
     param_tensors: Sequence[Any],
     *,
     op_qualname: str,
+    output_spec: Any = None,
 ) -> Any:
     kind, index = source
     if kind == "output":
@@ -308,13 +333,30 @@ def _passthrough_value(
             f"{op_qualname}: output pass-through sources are resolved from "
             "the reconstructed output list"
         )
-    pool = runtime_inputs if kind == "input" else param_tensors
+    is_view = kind.endswith("_view")
+    pool_kind = kind[:-5] if is_view else kind
+    pool = runtime_inputs if pool_kind == "input" else param_tensors
     try:
-        return pool[index]
+        value = pool[index]
     except IndexError as exc:
         raise RuntimeError(
             f"{op_qualname}: pass-through output references missing "
             f"{kind} #{index}"
+        ) from exc
+    if not is_view:
+        return value
+    if output_spec is None:
+        raise RuntimeError(
+            f"{op_qualname}: pass-through {kind} #{index} needs an output "
+            "spec to reconstruct its view shape"
+        )
+    shape = tuple(getattr(output_spec, "shape", ()))
+    try:
+        return value.reshape(shape)
+    except Exception as exc:
+        raise RuntimeError(
+            f"{op_qualname}: pass-through {kind} #{index} could not reshape "
+            f"to {shape}"
         ) from exc
 
 
@@ -326,6 +368,7 @@ def _reconstruct_full_outputs(
     runtime_inputs: Sequence[Any],
     param_tensors: Sequence[Any],
     op_qualname: str,
+    output_specs: Sequence[Any] = (),
 ) -> Any:
     custom_values = _as_output_list(op_result)
     if len(custom_values) != len(custom_output_indices):
@@ -348,11 +391,17 @@ def _reconstruct_full_outputs(
                     f"unavailable earlier output #{source_index}"
                 ) from exc
         else:
+            output_spec = (
+                output_specs[output_idx]
+                if output_idx < len(output_specs)
+                else None
+            )
             full.append(_passthrough_value(
                 source,
                 runtime_inputs,
                 param_tensors,
                 op_qualname=op_qualname,
+                output_spec=output_spec,
             ))
     if len(full) == 1:
         return full[0]
@@ -379,6 +428,7 @@ def _bind_passthrough_only_runtime(
             runtime_inputs=runtime_inputs,
             param_tensors=param_tensors,
             op_qualname=op_qualname,
+            output_specs=tuple(artifact.output_specs),
         )
 
     side = "bw" if is_backward else "fw"
@@ -503,7 +553,11 @@ def wrap_as_custom_op(
                     full_output_count=len(artifact.output_specs),
                     op_qualname=op_qualname,
                 )
-                result = _ensure_non_aliased_outputs(checked_args, custom_values[0])
+                result = _ensure_non_aliased_outputs(
+                    checked_args,
+                    custom_values[0],
+                    materialize_aliases=is_backward,
+                )
                 # Launcher may return a 1-tuple/1-list around the single
                 # tensor — unwrap to match the declared schema.
                 if isinstance(result, (list, tuple)):
@@ -539,7 +593,11 @@ def wrap_as_custom_op(
                     full_output_count=len(artifact.output_specs),
                     op_qualname=op_qualname,
                 )
-                result = _ensure_non_aliased_outputs(checked_args, result)
+                result = _ensure_non_aliased_outputs(
+                    checked_args,
+                    result,
+                    materialize_aliases=is_backward,
+                )
                 # Multi-output: launcher may return tuple (FA 9-tuple) or
                 # list — coerce to the declared list[Tensor] schema.
                 if isinstance(result, (list, tuple)):
@@ -627,6 +685,7 @@ def _bind_runtime(
             runtime_inputs=runtime_inputs,
             param_tensors=param_tensors,
             op_qualname=op_qualname,
+            output_specs=tuple(artifact.output_specs),
         )
 
     side = "bw" if is_backward else "fw"

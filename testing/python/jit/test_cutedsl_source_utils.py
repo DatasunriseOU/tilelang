@@ -17,6 +17,20 @@ def external_tile(a: cute.Tensor):
     assert source[index:].startswith("(a: cute.Tensor)")
 
 
+def test_match_declare_kernel_cutedsl_accepts_imported_fully_qualified_cute():
+    source = """
+import cutlass.cute
+
+@cutlass.cute.kernel
+def external_tile(a: cutlass.cute.Tensor):
+    pass
+"""
+
+    index = match_declare_kernel_cutedsl(source)
+
+    assert source[index:].startswith("(a: cutlass.cute.Tensor)")
+
+
 def test_match_declare_kernel_cutedsl_accepts_imported_cute_alias():
     source = """
 import cutlass.cute as ct
@@ -48,6 +62,17 @@ def external_tile(a: Tensor):
 def test_match_declare_kernel_cutedsl_rejects_unimported_bare_kernel():
     source = """
 @kernel
+def external_tile(a):
+    pass
+"""
+
+    with pytest.raises(ValueError, match="No global kernel found"):
+        match_declare_kernel_cutedsl(source)
+
+
+def test_match_declare_kernel_cutedsl_rejects_unimported_fully_qualified_kernel():
+    source = """
+@cutlass.cute.kernel
 def external_tile(a):
     pass
 """

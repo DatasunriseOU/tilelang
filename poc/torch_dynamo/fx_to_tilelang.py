@@ -945,6 +945,46 @@ def _emit_detach(node, args, ctx: LoweringContext) -> _TensorSpec:
     return _TensorSpec(shape=x.shape, dtype=x.dtype)
 
 
+def _emit_clone(node, args, ctx: LoweringContext) -> _TensorSpec:
+    """``aten.clone`` — explicit materialisation boundary."""
+    x = args[0]
+    if not isinstance(x, _TensorSpec):
+        raise TypeError("aten.clone requires a tensor input")
+    ctx.op_trace.append(("clone", (node.name, x)))
+    return _TensorSpec(shape=x.shape, dtype=x.dtype)
+
+
+def _emit_slice(node, args, ctx: LoweringContext) -> _TensorSpec:
+    """``aten.slice.Tensor`` — view-like shape restriction on one axis."""
+    x = args[0]
+    if not isinstance(x, _TensorSpec):
+        raise TypeError("aten.slice requires a tensor input")
+    rank = len(x.shape)
+    dim = int(args[1]) if len(args) > 1 else 0
+    if dim < 0:
+        dim += rank
+    if not (0 <= dim < rank):
+        raise NotImplementedError(
+            f"aten.slice: out-of-range dim {dim} for rank {rank}")
+    size = int(x.shape[dim])
+    start = int(args[2]) if len(args) > 2 else 0
+    end = int(args[3]) if len(args) > 3 else size
+    step = int(args[4]) if len(args) > 4 else 1
+    if step <= 0:
+        raise NotImplementedError("aten.slice: only positive step is supported")
+    if start < 0:
+        start += size
+    if end < 0:
+        end += size
+    start = min(max(start, 0), size)
+    end = min(max(end, 0), size)
+    length = 0 if end <= start else (end - start + step - 1) // step
+    out_shape = list(x.shape)
+    out_shape[dim] = length
+    ctx.op_trace.append(("slice", (node.name, x, dim, start, end, step)))
+    return _TensorSpec(shape=tuple(out_shape), dtype=x.dtype)
+
+
 def _emit_permute(node, args, ctx: LoweringContext) -> _TensorSpec:
     """``aten.permute`` — track the spec under axis permutation.
 
@@ -1184,6 +1224,8 @@ ATEN_DISPATCH: Dict[str, Callable[..., Any]] = {
     "_unsafe_view": _emit_view_like("view"),
     "flatten": _emit_view_like("flatten"),
     "detach": _emit_detach,
+    "clone": _emit_clone,
+    "slice": _emit_slice,
     "permute": _emit_permute,
     "transpose": _emit_transpose,
     "broadcast_to": _emit_broadcast_to,
@@ -1451,6 +1493,27 @@ def emit_expand(node, args, ctx: LoweringContext) -> _TensorSpec:
     return _TensorSpec(shape=out_shape, dtype=x.dtype)
 
 
+def emit_slice_backward(node, args, ctx: LoweringContext) -> _TensorSpec:
+    """Emit ``aten.slice_backward`` shape metadata.
+
+    The math is a scatter of ``grad_out`` into a zero-filled tensor shaped
+    like ``input_sizes``. Until a native scatter materialiser lands, recording
+    the output spec lets the existing region fallback replay the real ATen op.
+    """
+    grad_out = args[0]
+    input_sizes = tuple(int(s) for s in args[1])
+    dim = int(args[2]) if len(args) > 2 else 0
+    start = int(args[3]) if len(args) > 3 else 0
+    end = int(args[4]) if len(args) > 4 else input_sizes[dim]
+    step = int(args[5]) if len(args) > 5 else 1
+    if not isinstance(grad_out, _TensorSpec):
+        raise TypeError("slice_backward requires tensor grad input")
+    ctx.op_trace.append(
+        ("slice_backward", (node.name, grad_out, input_sizes, dim, start, end, step))
+    )
+    return _TensorSpec(shape=input_sizes, dtype=grad_out.dtype)
+
+
 # Top 8 backward ATEN ops — APPEND-ONLY to ATEN_DISPATCH.
 # (Sibling integration #9 owns the forward entries above. We use
 # ``setdefault`` semantics manually so we never clobber a forward entry
@@ -1483,6 +1546,7 @@ _BWD_DISPATCH: Dict[str, Callable[..., _TensorSpec]] = {
     # --- threshold/relu bwd + broadcast (grok #09 review) -----------------
     "threshold_backward": emit_threshold_backward,
     "expand": emit_expand,
+    "slice_backward": emit_slice_backward,
     # --- attention backward (deferred) ------------------------------------
     "_scaled_dot_product_flash_attention_backward": _hard_stub(
         "_scaled_dot_product_flash_attention_backward", _FLASH_ATTN_BWD_RECIPE),
@@ -1660,12 +1724,14 @@ class FXToTileLang:
         return ()
 
     def _output_passthrough_sources(self) -> Tuple[Optional[Tuple[str, int]], ...]:
-        """Map FX outputs that are exact placeholders/params to their source."""
+        """Map FX outputs that can bypass the custom-op return boundary."""
         placeholder_indices = {
             node.name: i
             for i, node in enumerate(self.gm.graph.nodes)
             if node.op == "placeholder"
         }
+
+        view_ops = {"view", "reshape", "_unsafe_view"}
 
         def _source_for_node(node: Any) -> Optional[Tuple[str, int]]:
             name = getattr(node, "name", None)
@@ -1676,6 +1742,36 @@ class FXToTileLang:
                 return ("input", placeholder_indices[name])
             if op == "get_attr" and name in self._param_node_names:
                 return ("param", self._param_node_names[name])
+            if op == "call_function":
+                op_key = _node_op_key(getattr(node, "target", None))
+                args = getattr(node, "args", ()) or ()
+                if op_key == "detach" and args:
+                    return _source_for_node(args[0])
+                if op_key in view_ops and args:
+                    base_source = _source_for_node(args[0])
+                    if base_source is not None and base_source[0] in {
+                        "input", "param", "input_view", "param_view",
+                    }:
+                        return (
+                            "input_view"
+                            if base_source[0].startswith("input")
+                            else "param_view",
+                            base_source[1],
+                        )
+            if op == "call_method":
+                method_name = str(getattr(node, "target", ""))
+                args = getattr(node, "args", ()) or ()
+                if method_name in view_ops and args:
+                    base_source = _source_for_node(args[0])
+                    if base_source is not None and base_source[0] in {
+                        "input", "param", "input_view", "param_view",
+                    }:
+                        return (
+                            "input_view"
+                            if base_source[0].startswith("input")
+                            else "param_view",
+                            base_source[1],
+                        )
             return None
 
         seen_outputs: Dict[str, int] = {}
@@ -1683,16 +1779,7 @@ class FXToTileLang:
         for output_idx, out in enumerate(self._normalised_output_values()):
             name = getattr(out, "name", None)
             source = _source_for_node(out)
-            if source is not None:
-                sources.append(source)
-            elif (
-                getattr(out, "op", None) == "call_function"
-                and _node_op_key(getattr(out, "target", None)) == "detach"
-                and getattr(out, "args", None)
-            ):
-                sources.append(_source_for_node(out.args[0]))
-            else:
-                sources.append(None)
+            sources.append(source)
             if isinstance(name, str):
                 seen_outputs.setdefault(name, output_idx)
         return tuple(sources)
@@ -1783,6 +1870,21 @@ class FXToTileLang:
         self.ctx.param_tensors.append(attr)
         self._param_node_names[node.name] = len(self.ctx.param_tensors) - 1
 
+    def _resolve_fx_arg(self, value: Any, node_type: type) -> Any:
+        """Resolve FX Node leaves inside nested args to lowering values."""
+        if isinstance(value, node_type):
+            return self.ctx.value_map[value]
+        if isinstance(value, tuple):
+            return tuple(self._resolve_fx_arg(v, node_type) for v in value)
+        if isinstance(value, list):
+            return [self._resolve_fx_arg(v, node_type) for v in value]
+        if isinstance(value, dict):
+            return {
+                k: self._resolve_fx_arg(v, node_type)
+                for k, v in value.items()
+            }
+        return value
+
     def on_call_function(self, node: "torch.fx.Node") -> None:
         """Dispatch a ``call_function`` FX node via ``ATEN_DISPATCH``.
 
@@ -1800,10 +1902,7 @@ class FXToTileLang:
         # through.
         resolved_args: List[Any] = []
         for a in node.args:
-            if isinstance(a, type(node)):  # FX Node
-                resolved_args.append(self.ctx.value_map[a])
-            else:
-                resolved_args.append(a)
+            resolved_args.append(self._resolve_fx_arg(a, type(node)))
         if emitter is None:
             # No dispatch entry — fall back to extern slot for this node.
             self._fallback_extern_op(node, op_key or str(node.target),
@@ -1863,10 +1962,7 @@ class FXToTileLang:
         emitter = ATEN_DISPATCH.get(method_name)
         resolved_args: List[Any] = []
         for a in node.args:
-            if isinstance(a, type(node)):  # FX Node
-                resolved_args.append(self.ctx.value_map[a])
-            else:
-                resolved_args.append(a)
+            resolved_args.append(self._resolve_fx_arg(a, type(node)))
         if emitter is None:
             self._fallback_extern_op(node, method_name, resolved_args)
             return
@@ -1887,10 +1983,7 @@ class FXToTileLang:
         """
         resolved_args: List[Any] = []
         for a in node.args:
-            if isinstance(a, type(node)):  # FX Node
-                resolved_args.append(self.ctx.value_map[a])
-            else:
-                resolved_args.append(a)
+            resolved_args.append(self._resolve_fx_arg(a, type(node)))
         self._fallback_extern_op(node, str(node.target), resolved_args)
 
     def on_output(self, node: "torch.fx.Node") -> None:
@@ -2415,7 +2508,7 @@ class FXToTileLang:
     })
     _SEQUENTIAL_VIEW_OPS = frozenset({
         "view", "reshape", "flatten", "permute", "transpose",
-        "broadcast_to", "expand", "dropout", "detach",
+        "broadcast_to", "expand", "dropout", "detach", "clone", "slice",
         # B2 wave fix-pack: ``aten.t`` is metadata-only at the matmul boundary
         # (the matmul payload already records the post-transpose ``_TensorSpec``
         # for its operands, see ``emit_t``+``emit_matmul``). Treating it as a
@@ -2475,7 +2568,10 @@ class FXToTileLang:
                     "contains unsupported ops; falling back to extern is intentional")
 
         first_payload = compute_ops[0][1]
-        src_spec = first_payload[1] if len(first_payload) > 1 else None
+        src_spec = next(
+            (item for item in first_payload[1:] if isinstance(item, _TensorSpec)),
+            None,
+        )
         if not isinstance(src_spec, _TensorSpec):
             raise NotImplementedError("sequential region: cannot resolve source tensor spec")
 
@@ -2566,21 +2662,35 @@ class FXToTileLang:
         def _compose_chain(T_mod: Any, ext_vals: dict) -> Any:
             computed = dict(ext_vals)
             last_val = None
+
+            def _resolve_operand(arg: Any) -> Any:
+                arg_name = getattr(arg, "name", None)
+                if isinstance(arg_name, str):
+                    value = computed.get(arg_name)
+                    if value is None:
+                        raise FxToTileLangUnsupported(
+                            f"sequential region: operand {arg_name!r} is not "
+                            "available in the elementwise dataflow")
+                    return value
+                if isinstance(arg, (bool, int, float)):
+                    return T_mod.cast(arg, dtype)
+                raise FxToTileLangUnsupported(
+                    f"sequential region: unsupported scalar operand {arg!r}")
+
             for op_name, payload in compute_ops:
                 node_name = payload[0]
                 fx_node = node_map.get(node_name)
                 if not fx_node:
                     continue
                 if op_name in self._SEQUENTIAL_UNARY_OPS:
-                    arg_name = fx_node.args[0].name
-                    v = computed.get(arg_name)
+                    v = _resolve_operand(fx_node.args[0])
                     v_out = _apply_unary_local(T_mod, op_name, v)
                     computed[node_name] = v_out
                     last_val = v_out
                 elif op_name in self._SEQUENTIAL_BINARY_OPS:
-                    name1 = fx_node.args[0].name
-                    name2 = fx_node.args[1].name
-                    v_out = _apply_binary_local(T_mod, op_name, computed.get(name1), computed.get(name2))
+                    lhs = _resolve_operand(fx_node.args[0])
+                    rhs = _resolve_operand(fx_node.args[1])
+                    v_out = _apply_binary_local(T_mod, op_name, lhs, rhs)
                     computed[node_name] = v_out
                     last_val = v_out
             return last_val

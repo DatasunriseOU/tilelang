@@ -381,10 +381,49 @@ def fused_relu_add_16(a: ct.Tensor, out: ct.Tensor):
     assert entry.has_target("cutedsl")
 
 
+def test_cutedsl_body_accepts_imported_fully_qualified_cute_module():
+    """Fully-qualified CuTe decorators are valid when the module is imported."""
+    body = """import cutlass.cute
+
+@cutlass.cute.kernel(preprocessor=False)
+def fused_relu_add_16(a: cutlass.cute.Tensor, out: cutlass.cute.Tensor):
+    out[0] = a[0]
+"""
+    extern_intrinsic(
+        name="fused_relu_add_16",
+        signature=lambda: (
+            Frag("a", (16,), "shared", "float32"),
+            Frag("out", (16,), "shared", "float32", is_output=True),
+        ),
+        bodies={"cutedsl": body},
+    )
+    entry = extern_registry.lookup("fused_relu_add_16")
+    assert entry is not None
+    assert entry.has_target("cutedsl")
+
+
 def test_cutedsl_body_rejects_unimported_bare_kernel_decorator():
     """Bare ``@kernel`` only counts when imported from ``cutlass.cute``."""
     body = """
 @kernel
+def fused_relu_add_16(a, out):
+    out[0] = a[0]
+"""
+    with pytest.raises(ValueError, match="no recognisable CuTeDSL"):
+        extern_intrinsic(
+            name="fused_relu_add_16",
+            signature=lambda: (
+                Frag("a", (16,), "shared", "float32"),
+                Frag("out", (16,), "shared", "float32", is_output=True),
+            ),
+            bodies={"cutedsl": body},
+        )
+
+
+def test_cutedsl_body_rejects_unimported_fully_qualified_kernel_decorator():
+    """Fully-qualified ``@cutlass.cute.kernel`` still needs an import."""
+    body = """
+@cutlass.cute.kernel
 def fused_relu_add_16(a, out):
     out[0] = a[0]
 """

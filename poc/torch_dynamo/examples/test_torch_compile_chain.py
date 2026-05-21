@@ -357,7 +357,7 @@ def test_wave2_aten_dispatch_covers_top_ops() -> None:
 
     must_have = (
         "view", "reshape", "permute", "transpose", "flatten",
-        "broadcast_to", "expand", "detach",
+        "broadcast_to", "expand", "detach", "clone", "slice",
         "exp", "log", "sqrt", "rsqrt", "sigmoid", "pow",
         "cat", "stack",
         "clamp", "clip",

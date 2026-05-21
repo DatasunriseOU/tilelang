@@ -55,7 +55,7 @@ def _attribute_path(node: ast.AST) -> tuple[str, ...]:
 
 
 def _cutedsl_kernel_decorator_names(tree: ast.Module) -> tuple[set[str], set[str]]:
-    module_aliases: set[str] = {"cutlass.cute"}
+    module_aliases: set[str] = set()
     kernel_aliases: set[str] = set()
 
     for node in tree.body:

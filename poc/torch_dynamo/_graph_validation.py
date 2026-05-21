@@ -46,9 +46,12 @@ def validate_graph(gm: "torch.fx.GraphModule") -> None:
                 continue
             unsupported.append(f"{node.format_node()} (target={node.target!r})")
         elif node.op == "call_method":
+            method = str(node.target)
+            if method in ATEN_DISPATCH:
+                continue
             unsupported.append(
                 f"{node.format_node()} (method={node.target!r}; "
-                "call_method lowering not implemented in POC)"
+                "no call_method lowering rule in ATEN_DISPATCH)"
             )
         else:
             unsupported.append(

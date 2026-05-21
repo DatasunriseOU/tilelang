@@ -68,6 +68,105 @@ def test_view_aliased_input_rejected_without_hidden_copy():
         _ensure_contiguous_inputs("tilelang::view_probe_fwd", [view])
 
 
+def test_torch_compile_view_sum_backward_materialises_gradient_alias():
+    torch = pytest.importorskip("torch")
+
+    from poc.torch_dynamo import register
+
+    register()
+
+    def fn(x):
+        return x.view(2, 3).sum()
+
+    x = torch.randn(6, dtype=torch.float32, requires_grad=True)
+    ref = fn(x)
+    ref.backward()
+    expected_grad = x.grad.detach().clone()
+    x.grad = None
+
+    compiled = torch.compile(fn, backend="tilelang", fullgraph=True)
+    actual = compiled(x)
+    actual.backward()
+
+    torch.testing.assert_close(actual.detach(), ref.detach())
+    torch.testing.assert_close(x.grad, expected_grad)
+
+
+def test_torch_compile_transpose_sum_backward_lowers_clone(capsys):
+    torch = pytest.importorskip("torch")
+
+    from poc.torch_dynamo import register
+
+    register()
+
+    def fn(x):
+        return (x.view(2, 3).transpose(0, 1) * 2).sum()
+
+    x = torch.randn(6, dtype=torch.float32, requires_grad=True)
+    ref = fn(x)
+    ref.backward()
+    expected_grad = x.grad.detach().clone()
+    x.grad = None
+
+    capsys.readouterr()
+    compiled = torch.compile(fn, backend="tilelang", fullgraph=True)
+    actual = compiled(x)
+    actual.backward()
+    captured = capsys.readouterr()
+
+    torch.testing.assert_close(actual.detach(), ref.detach())
+    torch.testing.assert_close(x.grad, expected_grad)
+    assert "Failed to build prim_func" not in captured.out + captured.err
+
+
+def test_torch_compile_layer_norm_backward_reconstructs_saved_view():
+    torch = pytest.importorskip("torch")
+
+    from poc.torch_dynamo import register
+
+    register()
+
+    def fn(x):
+        return torch.nn.functional.layer_norm(x.view(2, 3), (3,)).sum()
+
+    x = torch.randn(6, dtype=torch.float32, requires_grad=True)
+    ref = fn(x)
+    ref.backward()
+    expected_grad = x.grad.detach().clone()
+    x.grad = None
+
+    compiled = torch.compile(fn, backend="tilelang", fullgraph=True)
+    actual = compiled(x)
+    actual.backward()
+
+    torch.testing.assert_close(actual.detach(), ref.detach(), rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(x.grad, expected_grad, rtol=1e-5, atol=1e-5)
+
+
+def test_torch_compile_cat_of_slices_backward_lowers_slice():
+    torch = pytest.importorskip("torch")
+
+    from poc.torch_dynamo import register
+
+    register()
+
+    def fn(x):
+        return torch.cat([x[:3], x[3:]], dim=0).sum()
+
+    x = torch.randn(6, dtype=torch.float32, requires_grad=True)
+    ref = fn(x)
+    ref.backward()
+    expected_grad = x.grad.detach().clone()
+    x.grad = None
+
+    compiled = torch.compile(fn, backend="tilelang", fullgraph=True)
+    actual = compiled(x)
+    actual.backward()
+
+    torch.testing.assert_close(actual.detach(), ref.detach())
+    torch.testing.assert_close(x.grad, expected_grad)
+
+
 def test_wave3_specialize_prim_func_returns_input_when_tvm_missing():
     # specialize_prim_func is a no-op when tvm isn't importable or PrimFunc is
     # None. We pin the no-op branch — the tvm-present branch is exercised
