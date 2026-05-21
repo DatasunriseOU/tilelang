@@ -182,11 +182,41 @@ def _attribute_path(node: ast.AST) -> tuple[str, ...]:
     return tuple(reversed(path))
 
 
-def _is_cutedsl_kernel_decorator(node: ast.AST) -> bool:
+def _cutedsl_kernel_decorator_names(tree: ast.Module) -> tuple[set[str], set[str]]:
+    module_aliases: set[str] = {"cutlass.cute"}
+    kernel_aliases: set[str] = set()
+
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "cutlass.cute":
+                    module_aliases.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "cutlass":
+                for alias in node.names:
+                    if alias.name == "cute":
+                        module_aliases.add(alias.asname or alias.name)
+            elif node.module == "cutlass.cute":
+                for alias in node.names:
+                    if alias.name == "kernel":
+                        kernel_aliases.add(alias.asname or alias.name)
+
+    return module_aliases, kernel_aliases
+
+
+def _is_cutedsl_kernel_decorator(
+    node: ast.AST,
+    module_aliases: set[str],
+    kernel_aliases: set[str],
+) -> bool:
     if isinstance(node, ast.Call):
         node = node.func
     path = _attribute_path(node)
-    return len(path) >= 2 and path[-2:] == ("cute", "kernel")
+    if len(path) == 1:
+        return path[0] in kernel_aliases
+    if len(path) >= 2 and path[-1] == "kernel":
+        return ".".join(path[:-1]) in module_aliases
+    return False
 
 
 def _cutedsl_kernel_functions(
@@ -202,11 +232,19 @@ def _cutedsl_kernel_functions(
             f"Python CuTeDSL source: {err.msg}."
         ) from err
 
+    module_aliases, kernel_aliases = _cutedsl_kernel_decorator_names(tree)
     return [
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef)
-        and any(_is_cutedsl_kernel_decorator(decorator) for decorator in node.decorator_list)
+        and any(
+            _is_cutedsl_kernel_decorator(
+                decorator,
+                module_aliases=module_aliases,
+                kernel_aliases=kernel_aliases,
+            )
+            for decorator in node.decorator_list
+        )
     ]
 
 
@@ -222,10 +260,16 @@ def _validate_cutedsl_body(
         if not matches:
             raise ValueError(
                 f"extern_intrinsic[{target}] body for '{intrinsic_name}' contains "
-                f"no recognisable CuTeDSL @cute.kernel definition; expected "
+                f"no recognisable CuTeDSL @kernel definition; expected "
+                f"'@kernel\\ndef {intrinsic_name}(...)' or "
                 f"'@cute.kernel\\ndef {intrinsic_name}(...)'."
             )
-        return
+        raise ValueError(
+            f"extern_intrinsic[{target}] body for '{intrinsic_name}' defines "
+            f"CuTeDSL kernel(s) {[node.name for node in matches]!r}, but lowering "
+            f"will call '{intrinsic_name}(...)'. Expected '@cute.kernel\\ndef "
+            f"{intrinsic_name}(...)' or '@kernel\\ndef {intrinsic_name}(...)'."
+        )
 
     fn = found[0]
     args = [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]

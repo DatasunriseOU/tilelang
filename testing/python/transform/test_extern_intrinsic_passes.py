@@ -337,6 +337,51 @@ def test_cutedsl_dispatch(c: cute.Tensor):
             unregister(name)
 
 
+def test_lower_extern_intrinsic_accepts_aliased_cutedsl_kernel_decorator():
+    """Aliased CuTe imports must survive through the lowering import path."""
+    from tilelang.language.extern import extern_intrinsic, Frag
+    from tilelang.transform import LowerExternIntrinsic
+    from tilelang.language.extern_registry import unregister
+
+    name = "test_cutedsl_alias_dispatch"
+    body = """import cutlass.cute as ct
+
+@ct.kernel(preprocessor=False)
+def test_cutedsl_alias_dispatch(c: ct.Tensor):
+    c[0] = c[0]
+"""
+    try:
+        with contextlib.suppress(KeyError):
+            unregister(name)
+
+        extern_intrinsic(
+            name=name,
+            signature=lambda: (Frag("c", (16, 16), "local", "float32", is_output=True),),
+            bodies={"cutedsl": body},
+        )
+
+        @T.prim_func
+        def kernel(C: T.Buffer((16, 16), "float32")):
+            with T.sblock("root"):
+                T.evaluate(
+                    T.call_extern(
+                        "handle",
+                        "tl.extern_intrinsic.test_cutedsl_alias_dispatch",
+                        C.access_ptr("rw"),
+                    )
+                )
+
+        cutedsl_mod = LowerExternIntrinsic("cutedsl")(tvm.IRModule({"main": kernel}))
+        cutedsl_body = cutedsl_mod["main"].script(show_meta=True)
+        assert "pragma_import_c" in cutedsl_body
+        assert "@ct.kernel" in cutedsl_body
+        assert "test_cutedsl_alias_dispatch" in cutedsl_body
+        assert "tl.extern_intrinsic.test_cutedsl_alias_dispatch" not in cutedsl_body
+    finally:
+        with contextlib.suppress(KeyError):
+            unregister(name)
+
+
 def test_cutedsl_target_selects_cutedsl_extern_intrinsic_target():
     from tilelang.engine.lower import _extern_intrinsic_target_name
 

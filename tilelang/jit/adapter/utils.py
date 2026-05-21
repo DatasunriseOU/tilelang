@@ -43,17 +43,92 @@ def match_declare_kernel(source: str, annotation: str = "__global__") -> int:
     raise ValueError("No global kernel found in the source code")
 
 
+def _attribute_path(node: ast.AST) -> tuple[str, ...]:
+    path: list[str] = []
+    cur: ast.AST | None = node
+    while isinstance(cur, ast.Attribute):
+        path.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        path.append(cur.id)
+    return tuple(reversed(path))
+
+
+def _cutedsl_kernel_decorator_names(tree: ast.Module) -> tuple[set[str], set[str]]:
+    module_aliases: set[str] = {"cutlass.cute"}
+    kernel_aliases: set[str] = set()
+
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "cutlass.cute":
+                    module_aliases.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "cutlass":
+                for alias in node.names:
+                    if alias.name == "cute":
+                        module_aliases.add(alias.asname or alias.name)
+            elif node.module == "cutlass.cute":
+                for alias in node.names:
+                    if alias.name == "kernel":
+                        kernel_aliases.add(alias.asname or alias.name)
+
+    return module_aliases, kernel_aliases
+
+
+def _is_cutedsl_kernel_decorator(
+    node: ast.AST,
+    module_aliases: set[str],
+    kernel_aliases: set[str],
+) -> bool:
+    if isinstance(node, ast.Call):
+        node = node.func
+    path = _attribute_path(node)
+    if len(path) == 1:
+        return path[0] in kernel_aliases
+    if len(path) >= 2 and path[-1] == "kernel":
+        return ".".join(path[:-1]) in module_aliases
+    return False
+
+
+def _source_offset_for_line_col(source: str, lineno: int, col_offset: int) -> int:
+    offset = 0
+    for line_no, line in enumerate(source.splitlines(keepends=True), start=1):
+        if line_no == lineno:
+            return offset + col_offset
+        offset += len(line)
+    return -1
+
+
 def match_declare_kernel_cutedsl(source: str, annotation: str = "@cute.kernel") -> int:
-    # Match decorator followed by function definition across lines
-    # \s+ allows any whitespace including newlines between decorator and def
-    pattern = r"@cute\.kernel\s+def\s+(\w+)"
-    matched = re.search(pattern, source, re.MULTILINE)
-    if matched:
-        # Find the position of the opening parenthesis after the function name
-        # matched.start(1) gives position of function name
-        func_name_pos = matched.start(1)
-        # Find the '(' after function name
-        paren_pos = source.find("(", func_name_pos)
+    del annotation
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as err:
+        raise ValueError("No global kernel found in the source code") from err
+
+    module_aliases, kernel_aliases = _cutedsl_kernel_decorator_names(tree)
+    functions = sorted(
+        (node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)),
+        key=lambda node: (node.lineno, node.col_offset),
+    )
+    for node in functions:
+        if not any(
+            _is_cutedsl_kernel_decorator(
+                decorator,
+                module_aliases=module_aliases,
+                kernel_aliases=kernel_aliases,
+            )
+            for decorator in node.decorator_list
+        ):
+            continue
+        def_pos = _source_offset_for_line_col(source, node.lineno, node.col_offset)
+        if def_pos == -1:
+            break
+        name_pos = source.find(node.name, def_pos)
+        if name_pos == -1:
+            break
+        paren_pos = source.find("(", name_pos + len(node.name))
         if paren_pos != -1:
             return paren_pos
     raise ValueError("No global kernel found in the source code")

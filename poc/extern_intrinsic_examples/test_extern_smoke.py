@@ -6,6 +6,7 @@ being importable; compilation/runtime is not exercised here.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import pytest
 
@@ -49,15 +50,13 @@ def _isolate_registry():
     ``_REGISTRY`` attribute (security/test-fragility nit from grok review).
     """
     yield
-    try:
+    with contextlib.suppress(KeyError):
         extern_registry.unregister("fused_relu_add_16")
-    except KeyError:
-        pass
 
 
 def test_registration_no_cuda_required():
     """Decorator must work even when CUDA / TVM are absent."""
-    op = extern_intrinsic(
+    extern_intrinsic(
         name="fused_relu_add_16",
         signature=lambda: (
             Frag("a", (16,), "shared", "float32", layout="row_major"),
@@ -309,6 +308,95 @@ __device__ void clean_intrinsic(const float *a, const float *b, float *out) {
         if issubclass(w.category, UserWarning) and "do not appear in the body" in str(w.message)
     ]
     assert not body_warns, f"unexpected body-name warning(s): {body_warns!r}"
+
+
+def test_cutedsl_body_requires_matching_kernel_name():
+    """CuTeDSL imports must define the registered callable symbol.
+
+    LowerExternIntrinsic rewrites ``tl.extern_intrinsic.<name>`` calls to
+    plain ``<name>(...)`` calls. Accepting a body whose only ``@cute.kernel``
+    has another name would defer the failure until generated CuTeDSL code
+    references a missing symbol.
+    """
+    body = """import cutlass.cute as cute
+
+@cute.kernel
+def wrong_name(a: cute.Tensor, out: cute.Tensor):
+    out[0] = a[0]
+"""
+    with pytest.raises(ValueError, match="Expected '@cute.kernel"):
+        extern_intrinsic(
+            name="fused_relu_add_16",
+            signature=lambda: (
+                Frag("a", (16,), "shared", "float32"),
+                Frag("out", (16,), "shared", "float32", is_output=True),
+            ),
+            bodies={"cutedsl": body},
+        )
+
+
+def test_cutedsl_body_accepts_bare_kernel_decorator_alias():
+    """Official CuTe DSL docs describe the GPU decorator as ``@kernel``.
+
+    Users may import the decorator directly rather than spelling
+    ``@cute.kernel``. That is still a CuTeDSL kernel body and should validate.
+    """
+    body = """from cutlass.cute import Tensor, kernel
+
+@kernel(preprocessor=False)
+def fused_relu_add_16(a: Tensor, out: Tensor):
+    out[0] = a[0]
+"""
+    extern_intrinsic(
+        name="fused_relu_add_16",
+        signature=lambda: (
+            Frag("a", (16,), "shared", "float32"),
+            Frag("out", (16,), "shared", "float32", is_output=True),
+        ),
+        bodies={"cutedsl": body},
+    )
+    entry = extern_registry.lookup("fused_relu_add_16")
+    assert entry is not None
+    assert entry.has_target("cutedsl")
+
+
+def test_cutedsl_body_accepts_imported_cute_module_alias():
+    """CuTeDSL users commonly alias the imported module."""
+    body = """import cutlass.cute as ct
+
+@ct.kernel(preprocessor=False)
+def fused_relu_add_16(a: ct.Tensor, out: ct.Tensor):
+    out[0] = a[0]
+"""
+    extern_intrinsic(
+        name="fused_relu_add_16",
+        signature=lambda: (
+            Frag("a", (16,), "shared", "float32"),
+            Frag("out", (16,), "shared", "float32", is_output=True),
+        ),
+        bodies={"cutedsl": body},
+    )
+    entry = extern_registry.lookup("fused_relu_add_16")
+    assert entry is not None
+    assert entry.has_target("cutedsl")
+
+
+def test_cutedsl_body_rejects_unimported_bare_kernel_decorator():
+    """Bare ``@kernel`` only counts when imported from ``cutlass.cute``."""
+    body = """
+@kernel
+def fused_relu_add_16(a, out):
+    out[0] = a[0]
+"""
+    with pytest.raises(ValueError, match="no recognisable CuTeDSL"):
+        extern_intrinsic(
+            name="fused_relu_add_16",
+            signature=lambda: (
+                Frag("a", (16,), "shared", "float32"),
+                Frag("out", (16,), "shared", "float32", is_output=True),
+            ),
+            bodies={"cutedsl": body},
+        )
 
 
 def test_validate_body_ignores_names_inside_raw_string(recwarn):
