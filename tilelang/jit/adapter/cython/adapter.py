@@ -17,7 +17,11 @@ from tilelang.jit.adapter.wrapper import TLWrapper
 from tilelang.jit.adapter.libgen import LibraryGenerator
 from tilelang.jit.adapter.utils import is_cuda_target, is_hip_target, is_cpu_target, is_metal_target
 from tilelang.utils.target import determine_target
-from tilelang.utils.language import retrieve_func_from_module
+from tilelang.utils.language import (
+    is_prim_func_like,
+    make_ir_module_from_prim_func,
+    retrieve_func_from_module,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,8 +102,8 @@ class CythonKernelAdapter(BaseKernelAdapter):
         self.device_kernel_source = device_kernel_source
         self.kernel_global_source = device_kernel_source  # Set alias for compatibility
 
-        if isinstance(func_or_mod, tir.PrimFunc):
-            self.ir_module = tvm.IRModule({func_or_mod.attrs["global_symbol"]: func_or_mod})
+        if is_prim_func_like(func_or_mod):
+            self.ir_module = make_ir_module_from_prim_func(func_or_mod)
         else:
             self.ir_module = func_or_mod
 
@@ -170,8 +174,8 @@ class CythonKernelAdapter(BaseKernelAdapter):
         adapter.kernel_global_source = device_kernel_source  # Set alias for compatibility
         adapter.pass_configs = pass_configs
 
-        if isinstance(func_or_mod, tir.PrimFunc):
-            adapter.ir_module = tvm.IRModule({func_or_mod.attrs["global_symbol"]: func_or_mod})
+        if is_prim_func_like(func_or_mod):
+            adapter.ir_module = make_ir_module_from_prim_func(func_or_mod)
         else:
             adapter.ir_module = func_or_mod
 

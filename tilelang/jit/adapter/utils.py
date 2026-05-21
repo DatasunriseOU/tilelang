@@ -20,6 +20,7 @@ from tilelang.engine.phase import (
     LowerAndLegalize,
     OptimizeForTarget,
 )
+from tilelang.utils.language import is_prim_func_like, make_ir_module_from_prim_func
 
 
 def match_global_kernel(source: str, annotation: str = "__global__") -> int:
@@ -174,8 +175,8 @@ def get_annotated_mod(
 
     # Convert PrimFunc to IRModule if needed
     mod = func_or_mod
-    if isinstance(func_or_mod, tir.PrimFunc):
-        mod = tvm.IRModule({func_or_mod.attrs["global_symbol"]: func_or_mod})
+    if is_prim_func_like(func_or_mod):
+        mod = make_ir_module_from_prim_func(func_or_mod)
 
     # Handle target and target_host
     if isinstance(target, str):

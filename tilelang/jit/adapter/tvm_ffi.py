@@ -19,7 +19,11 @@ from tvm.target import Target
 from tvm.relax import TensorType
 from tilelang.utils.target import determine_target
 from tilelang.jit.adapter.base import BaseKernelAdapter
-from tilelang.utils.language import retrieve_func_from_module
+from tilelang.utils.language import (
+    is_prim_func_like,
+    make_ir_module_from_prim_func,
+    retrieve_func_from_module,
+)
 from tilelang.engine.param import KernelParam
 from tilelang.language.dtypes import dtype
 from tilelang.contrib.mlx_interop import (
@@ -147,8 +151,8 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         self.host_kernel_source = host_kernel_source
         self.device_kernel_source = device_kernel_source
 
-        if isinstance(func_or_mod, tir.PrimFunc):
-            self.ir_module = tvm.IRModule({func_or_mod.attrs["global_symbol"]: func_or_mod})
+        if is_prim_func_like(func_or_mod):
+            self.ir_module = make_ir_module_from_prim_func(func_or_mod)
         else:
             self.ir_module = func_or_mod
 
@@ -983,8 +987,8 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         adapter.wrapped_source = device_kernel_source + "\n\n" + host_kernel_source
         adapter.pass_configs = pass_configs
 
-        if isinstance(func_or_mod, tir.PrimFunc):
-            adapter.ir_module = tvm.IRModule({func_or_mod.attrs["global_symbol"]: func_or_mod})
+        if is_prim_func_like(func_or_mod):
+            adapter.ir_module = make_ir_module_from_prim_func(func_or_mod)
         else:
             adapter.ir_module = func_or_mod
 

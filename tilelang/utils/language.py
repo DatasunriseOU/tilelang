@@ -12,6 +12,26 @@ from tvm.tir.expr import CallEffectKind
 # These utility functions check the memory scope of a given TVM buffer.
 
 
+def is_prim_func_like(func) -> bool:
+    return isinstance(func, PrimFunc) or (
+        hasattr(func, "params")
+        and hasattr(func, "body")
+        and hasattr(func, "attrs")
+    )
+
+
+def prim_func_global_symbol(func) -> str:
+    attrs = getattr(func, "attrs", None)
+    symbol = attrs.get("global_symbol") if hasattr(attrs, "get") else None
+    if symbol is None:
+        raise ValueError("PrimFunc is missing required attr 'global_symbol'")
+    return str(symbol)
+
+
+def make_ir_module_from_prim_func(func) -> IRModule:
+    return IRModule({prim_func_global_symbol(func): func})
+
+
 def _get_buffer(buffer_or_load_or_region: BufferLikeType) -> Buffer:
     """
     Extract Buffer from Buffer, BufferLoad, or BufferRegion.
@@ -181,7 +201,12 @@ def retrieve_func_from_module(ir_module: IRModule) -> PrimFunc:
         ValueError: If ir_module is not an IRModule.
         AssertionError: If the module contains more than one global function.
     """
-    if not isinstance(ir_module, IRModule):
+    if is_prim_func_like(ir_module):
+        return ir_module
+    if not isinstance(ir_module, IRModule) and not (
+        hasattr(ir_module, "get_global_vars")
+        and hasattr(ir_module, "functions")
+    ):
         raise ValueError("Not supported type: ", type(ir_module))
     assert len(ir_module.get_global_vars()) == 1, "The optimized module should only have one global variable for default schedule."
     func = list(ir_module.functions.values())[0]

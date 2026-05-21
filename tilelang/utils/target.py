@@ -52,6 +52,7 @@ def rocm_warp_size_for_arch(arch: str | None) -> int | None:
 
 
 def with_rocm_target_attrs(target: Target) -> Target:
+    target = _current_target_object(target)
     if target.kind.name != "hip":
         return target
     arch = target_get_mcpu(target)
@@ -181,13 +182,32 @@ def _target_from_string(target: str) -> Target:
     return Target(target_dict) if target_dict is not None else Target(target)
 
 
-def normalize_cutedsl_target(target: str | Target) -> Target | None:
+def _is_target_object(target) -> bool:
+    return isinstance(target, Target) or (
+        hasattr(target, "kind") and hasattr(target, "keys")
+    )
+
+
+def _target_export_dict(target) -> dict:
+    if hasattr(target, "export"):
+        return dict(target.export())
+    return dict(Target(str(target)).export())
+
+
+def _current_target_object(target) -> Target:
     if isinstance(target, Target):
+        return target
+    return Target(_target_export_dict(target))
+
+
+def normalize_cutedsl_target(target: str | Target) -> Target | None:
+    if _is_target_object(target):
+        target = _current_target_object(target)
         if target.kind.name == "cuda" and "cutedsl" in target.keys:
             return target
         return None
 
-    if target.startswith("cutedsl"):
+    if isinstance(target, str) and target.startswith("cutedsl"):
         cuda_target_str = target.replace("cutedsl", "cuda", 1)
 
         try:
@@ -203,7 +223,7 @@ def normalize_cutedsl_target(target: str | Target) -> Target | None:
     return None
 
 
-def determine_target(target: str | Target | Literal["auto"] = "auto", return_object: bool = False) -> str | Target:
+def determine_target(target: str | Target | Literal["auto"] = "auto", return_object: bool = False) -> str | Target | dict:
     """
     Determine the appropriate target for compilation (CUDA, HIP, or manual selection).
 
@@ -262,8 +282,8 @@ def determine_target(target: str | Target | Literal["auto"] = "auto", return_obj
             return_var = possible_cutedsl_target
         else:
             # Validate the target if it's not "auto"
-            if isinstance(target, Target):
-                return_var = with_rocm_target_attrs(target)
+            if _is_target_object(target):
+                return_var = with_rocm_target_attrs(_current_target_object(target))
             elif isinstance(target, str):
                 normalized_target = target.strip()
                 if not normalized_target:
@@ -285,12 +305,12 @@ def determine_target(target: str | Target | Literal["auto"] = "auto", return_obj
             else:
                 raise AssertionError(f"Target {target} is not supported")
 
-    if isinstance(return_var, Target):
-        return return_var
     if return_object:
-        if isinstance(return_var, Target):
-            return return_var
+        if _is_target_object(return_var):
+            return _current_target_object(return_var)
         return Target(return_var)
+    if _is_target_object(return_var):
+        return _target_export_dict(_current_target_object(return_var))
     return return_var
 
 

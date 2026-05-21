@@ -9,7 +9,11 @@ from tvm.target import Target
 from tilelang import tvm as tvm
 from tilelang.engine.param import KernelParam
 from tilelang.jit.adapter.wrapper import TLPyWrapper
-from tilelang.utils.language import retrieve_func_from_module
+from tilelang.utils.language import (
+    is_prim_func_like,
+    make_ir_module_from_prim_func,
+    retrieve_func_from_module,
+)
 from tilelang.utils.target import determine_target
 from tilelang.jit.adapter.base import BaseKernelAdapter
 from tilelang.jit.adapter.nvrtc import is_nvrtc_available, check_nvrtc_available
@@ -46,8 +50,8 @@ class NVRTCKernelAdapter(BaseKernelAdapter):
         self.result_idx = self._legalize_result_idx(result_idx)
         self.device_kernel_source = device_kernel_source
 
-        if isinstance(func_or_mod, tir.PrimFunc):
-            self.ir_module = tvm.IRModule({func_or_mod.attrs["global_symbol"]: func_or_mod})
+        if is_prim_func_like(func_or_mod):
+            self.ir_module = make_ir_module_from_prim_func(func_or_mod)
         else:
             self.ir_module = func_or_mod
 
@@ -115,8 +119,8 @@ class NVRTCKernelAdapter(BaseKernelAdapter):
         adapter.host_kernel_source = host_kernel_source
         adapter.device_kernel_source = device_kernel_source
 
-        if isinstance(func_or_mod, tir.PrimFunc):
-            adapter.ir_module = tvm.IRModule({func_or_mod.attrs["global_symbol"]: func_or_mod})
+        if is_prim_func_like(func_or_mod):
+            adapter.ir_module = make_ir_module_from_prim_func(func_or_mod)
         else:
             adapter.ir_module = func_or_mod
 

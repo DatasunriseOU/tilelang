@@ -9,13 +9,13 @@ from tilelang.backend.gemm import resolve_gemm_impl
 from tilelang import _ffi_api
 
 
-@tvm_ffi.register_global_func("tl.gemm.infer_layout")
+@tvm_ffi.register_global_func("tl.gemm.infer_layout", override=True)
 def gemm_infer_layout(gemm, target: Target, thread_bounds: Range):
     thread_nums = thread_bounds.extent
     return gemm.infer_layout(target, thread_nums)
 
 
-@tvm_ffi.register_global_func("tl.gemm.lower")
+@tvm_ffi.register_global_func("tl.gemm.lower", override=True)
 def gemm_lower(
     gemm,
     layout_map,

@@ -12,13 +12,13 @@ from tilelang.tileop.base import GemmWarpPolicy
 from .gemm_sp_mma import GemmSPMMA
 
 
-@tvm_ffi.register_global_func("tl.gemm_sp_py.infer_layout")
+@tvm_ffi.register_global_func("tl.gemm_sp_py.infer_layout", override=True)
 def gemm_sp_py_infer_layout(gemm_sp_py: GemmSPMMA, target: Target, thread_bounds: Range):
     thread_nums = thread_bounds.extent
     return gemm_sp_py.infer_layout(target, thread_nums)
 
 
-@tvm_ffi.register_global_func("tl.gemm_sp_py.lower")
+@tvm_ffi.register_global_func("tl.gemm_sp_py.lower", override=True)
 def gemm_sp_py_lower(gemm_sp_py: GemmSPMMA, target: Target, thread_bounds: Range, thread_var: tir.Var):
     thread_nums = thread_bounds.extent
     stmt = gemm_sp_py.lower(target, thread_nums, thread_var)

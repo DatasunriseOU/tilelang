@@ -1506,20 +1506,23 @@ void CodeGenTileLangMetal::VisitStmt_(const AllocateNode *op) {
   auto scope = GetPtrStorageScope(op->buffer_var);
   alloc_storage_scope_[op->buffer_var.get()] = scope;
   if (scope == "metal.simdgroup") {
-    ICHECK(op->dtype == DataType::Float(16) ||
-           op->dtype == DataType::Float(32) ||
-           op->dtype == DataType::BFloat(16))
+    DataType matrix_dtype = op->dtype.element_of();
+    size_t scalar_elements = constant_size * op->dtype.lanes();
+    ICHECK(matrix_dtype == DataType::Float(16) ||
+           matrix_dtype == DataType::Float(32) ||
+           matrix_dtype == DataType::BFloat(16))
         << "Only float16, float32, and bfloat16 are supported, but got "
         << op->dtype;
-    ICHECK(constant_size % 64 == 0) << "Only 8x8 matrix is supported, but got "
-                                    << constant_size << " elements\n";
+    ICHECK(scalar_elements % 64 == 0)
+        << "Only 8x8 matrix is supported, but got " << scalar_elements
+        << " scalar elements\n";
 
     std::ostringstream dtype_os;
-    PrintType(op->dtype, dtype_os);
+    PrintType(matrix_dtype, dtype_os);
     std::string dtype_str = dtype_os.str();
     simdgroup_dtype_[op->buffer_var.get()] = dtype_str;
     stream << "simdgroup_" << dtype_str << "8x8 " << vid << '['
-           << constant_size / 64 << "];\n";
+           << scalar_elements / 64 << "];\n";
   } else if (scope == "local.var") {
     ICHECK(op->dtype.is_scalar())
         << "Vector local.var allocation is not supported.";
@@ -1565,20 +1568,23 @@ void CodeGenTileLangMetal::VisitStmt_(const AllocBufferNode *op) {
   alloc_storage_scope_[op->buffer->data.get()] = scope;
   DataType dtype = op->buffer->dtype;
   if (scope == "metal.simdgroup") {
-    ICHECK(dtype == DataType::Float(16) || dtype == DataType::Float(32) ||
-           dtype == DataType::BFloat(16))
+    DataType matrix_dtype = dtype.element_of();
+    size_t scalar_elements = constant_size * dtype.lanes();
+    ICHECK(matrix_dtype == DataType::Float(16) ||
+           matrix_dtype == DataType::Float(32) ||
+           matrix_dtype == DataType::BFloat(16))
         << "Only float16, float32, and bfloat16 are supported, but got "
         << dtype;
-    ICHECK(constant_size % 64 == 0)
-        << "Only 8x8 matrix is supported, but got " << constant_size
-        << " bytes\n";
+    ICHECK(scalar_elements % 64 == 0)
+        << "Only 8x8 matrix is supported, but got " << scalar_elements
+        << " scalar elements\n";
 
     std::ostringstream dtype_os;
-    PrintType(dtype, dtype_os);
+    PrintType(matrix_dtype, dtype_os);
     std::string dtype_str = dtype_os.str();
     simdgroup_dtype_[op->buffer->data.get()] = dtype_str;
     stream << "simdgroup_" << dtype_str << "8x8 " << vid << '['
-           << constant_size / 64 << "];\n";
+           << scalar_elements / 64 << "];\n";
   } else if (scope == "local.var") {
     ICHECK(dtype.is_scalar()) << "Vector local.var allocation is not supported.";
     ICHECK_EQ(constant_size, 1)

@@ -11,6 +11,7 @@ from tilelang import tvm as tvm
 
 from ..base import BaseKernelAdapter
 from tilelang.engine.param import KernelParam
+from tilelang.utils.language import is_prim_func_like, prim_func_global_symbol
 
 
 class MetalKernelAdapter(BaseKernelAdapter):
@@ -92,10 +93,8 @@ class MetalKernelAdapter(BaseKernelAdapter):
         if match:
             return match.group(1)
 
-        if isinstance(func_or_mod, tir.PrimFunc):
-            func_name = func_or_mod.attrs.get("global_symbol")
-            if func_name is not None:
-                return str(func_name) + "_kernel"
+        if is_prim_func_like(func_or_mod):
+            return prim_func_global_symbol(func_or_mod) + "_kernel"
 
         raise ValueError("Cannot determine Metal kernel name from cached source")
 
@@ -181,7 +180,7 @@ class MetalKernelAdapter(BaseKernelAdapter):
 
     @classmethod
     def _source_param_aliases(cls, func_or_mod: tir.PrimFunc | tvm.IRModule) -> list[set[str]]:
-        if not isinstance(func_or_mod, tir.PrimFunc):
+        if not is_prim_func_like(func_or_mod):
             return []
 
         param_aliases: list[set[str]] = []

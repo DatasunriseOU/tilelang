@@ -299,7 +299,12 @@ def lower_to_host_device_ir(
 
     mod = func_or_mod
     params = None
-    if isinstance(func_or_mod, tir.PrimFunc):
+    is_prim_func = isinstance(func_or_mod, tir.PrimFunc) or (
+        hasattr(func_or_mod, "params")
+        and hasattr(func_or_mod, "body")
+        and hasattr(func_or_mod, "attrs")
+    )
+    if is_prim_func:
         func = func_or_mod
         params = extrac_params(func) if not runtime_only else None
         mod = tvm.IRModule({func.attrs["global_symbol"]: func})
@@ -308,6 +313,11 @@ def lower_to_host_device_ir(
         target = determine_target(target)
 
     target_host = canon_target_host(target, target_host)
+
+    if hasattr(target, "export") and not isinstance(target, (str, dict)):
+        target = dict(target.export())
+    if hasattr(target_host, "export") and not isinstance(target_host, (str, dict)):
+        target_host = dict(target_host.export())
 
     target_host = tvm.target.Target.canon_target(target_host)
     target = tvm.target.Target(target, target_host)

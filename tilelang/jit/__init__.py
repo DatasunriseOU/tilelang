@@ -90,7 +90,10 @@ def compile(
         Set to "1", "true", "yes", or "on" to enable verbose compilation by default.
     """
 
-    assert isinstance(func, PrimFunc), f"target function must be a PrimFunc but got {type(func)}"
+    is_prim_func = isinstance(func, PrimFunc) or (
+        hasattr(func, "params") and hasattr(func, "body") and hasattr(func, "attrs")
+    )
+    assert is_prim_func, f"target function must be a PrimFunc but got {type(func)}"
 
     # Merge function-level attrs from PrimFunc
     func_attrs = func.attrs
