@@ -43,6 +43,157 @@ class FusionNode:
 
 
 @dataclass(frozen=True)
+class FusionBlockDescriptor:
+    """Reusable building-block contract consumed by TileLang fusion.
+
+    External projects can keep model-specific discovery in their own model code
+    and pass allocation-free block objects here.  TileLang owns normalization
+    into a fusion graph, edge inference, schedule selection, and lowering.
+    """
+
+    op: str
+    inputs: tuple[str, ...] = ()
+    outputs: tuple[str, ...] = ()
+    attrs: Mapping[str, Any] = field(default_factory=dict)
+    prim_func: tir.PrimFunc | None = None
+    aliases: tuple[str, ...] = ()
+
+
+class FusionBlockRegistry:
+    """Registry mapping caller block kinds to fusion node contracts."""
+
+    def __init__(self, descriptors: Sequence[FusionBlockDescriptor] = ()) -> None:
+        self._descriptors: dict[str, FusionBlockDescriptor] = {}
+        for descriptor in descriptors:
+            self.register(descriptor)
+
+    def register(
+        self,
+        descriptor: FusionBlockDescriptor,
+        *,
+        aliases: Sequence[str] = (),
+    ) -> FusionBlockRegistry:
+        if not isinstance(descriptor, FusionBlockDescriptor):
+            raise TypeError("descriptor must be a FusionBlockDescriptor")
+        op = str(descriptor.op)
+        if not op:
+            raise ValueError("Fusion block descriptor op must not be empty")
+        for key in (op, *descriptor.aliases, *aliases):
+            normalized_key = str(key)
+            if not normalized_key:
+                raise ValueError("Fusion block descriptor alias must not be empty")
+            self._descriptors[normalized_key] = descriptor
+        return self
+
+    def descriptor_for(self, block: Any) -> FusionBlockDescriptor | None:
+        if isinstance(block, FusionBlockDescriptor):
+            return block
+        op = _block_op(block)
+        if op is None:
+            return None
+        return self._descriptors.get(op)
+
+    def node_from_block(self, block: Any, *, index: int) -> FusionNode:
+        if isinstance(block, FusionNode):
+            return block
+
+        descriptor = self.descriptor_for(block)
+        raw_op = _block_op(block)
+        if descriptor is None and raw_op is None:
+            raise ValueError("fusion block must expose op, op_name, kind, or route_symbol")
+
+        lookup_op = raw_op or str(descriptor.op)
+        node_op = str(descriptor.op if descriptor is not None else lookup_op)
+        name = _block_name(block, index=index, op=node_op)
+        inputs = _block_sequence_attr(block, "inputs")
+        outputs = _block_sequence_attr(block, "outputs")
+        attrs = dict(descriptor.attrs) if descriptor is not None else {}
+        block_attrs = _block_attr(block, "attrs")
+        if block_attrs is not None:
+            if not isinstance(block_attrs, Mapping):
+                raise TypeError("fusion block attrs must be a mapping")
+            attrs.update(block_attrs)
+        prim_func = _block_attr(block, "prim_func")
+        if prim_func is None and descriptor is not None:
+            prim_func = descriptor.prim_func
+        if prim_func is not None and not isinstance(prim_func, tir.PrimFunc):
+            raise TypeError("fusion block prim_func must be a tvm.tir.PrimFunc")
+
+        return FusionNode(
+            name=name,
+            op=node_op,
+            inputs=_resolve_block_ports(
+                inputs if inputs is not None else (() if descriptor is None else descriptor.inputs),
+                name=name,
+                index=index,
+                op=node_op,
+            ),
+            outputs=_resolve_block_ports(
+                outputs if outputs is not None else (() if descriptor is None else descriptor.outputs),
+                name=name,
+                index=index,
+                op=node_op,
+            ),
+            attrs=attrs,
+            prim_func=prim_func,
+        )
+
+    def nodes_from_blocks(self, blocks: Sequence[Any]) -> tuple[FusionNode, ...]:
+        return tuple(
+            self.node_from_block(block, index=index)
+            for index, block in enumerate(blocks)
+        )
+
+
+def _block_attr(block: Any, name: str) -> Any | None:
+    if isinstance(block, Mapping):
+        return block.get(name)
+    return getattr(block, name, None)
+
+
+def _block_op(block: Any) -> str | None:
+    for name in ("op", "op_name", "kind", "route_symbol"):
+        value = _block_attr(block, name)
+        if value is not None:
+            text = str(value)
+            if text:
+                return text
+    return None
+
+
+def _block_name(block: Any, *, index: int, op: str) -> str:
+    raw_name = _block_attr(block, "name")
+    if raw_name is not None:
+        text = str(raw_name)
+        if text:
+            return text
+    safe_op = "".join(char if char.isalnum() or char == "_" else "_" for char in op).strip("_")
+    return f"block_{index}_{safe_op or 'fusion'}"
+
+
+def _block_sequence_attr(block: Any, name: str) -> tuple[str, ...] | None:
+    value = _block_attr(block, name)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return (value,)
+    return tuple(str(item) for item in value)
+
+
+def _resolve_block_ports(
+    ports: Sequence[str],
+    *,
+    name: str,
+    index: int,
+    op: str,
+) -> tuple[str, ...]:
+    return tuple(
+        str(port).format(name=name, index=index, op=op)
+        for port in ports
+    )
+
+
+@dataclass(frozen=True)
 class FusionEdge:
     producer: str
     consumer: str
@@ -188,6 +339,25 @@ class FusionScheduleRegistry:
     def select(self, nodes: Sequence[FusionNode]) -> FusionScheduleEntry | None:
         return self._entries.get(tuple(node.op for node in nodes))
 
+    def select_longest(
+        self,
+        nodes: Sequence[FusionNode],
+        *,
+        start: int = 0,
+        min_length: int = 2,
+    ) -> tuple[FusionScheduleEntry, int] | None:
+        if start < 0:
+            raise ValueError("fusion schedule start index must be non-negative")
+        if min_length < 1:
+            raise ValueError("fusion schedule minimum length must be positive")
+        if start >= len(nodes):
+            return None
+        for end in range(len(nodes), start + min_length - 1, -1):
+            entry = self.select(nodes[start:end])
+            if entry is not None:
+                return entry, end
+        return None
+
 
 class FusionOptimizer:
     """Top-level FX-like optimizer that selects a fused TileLang schedule."""
@@ -221,6 +391,15 @@ class FusionOptimizer:
 
     def add_nodes(self, nodes: Sequence[FusionNode]) -> FusionOptimizer:
         self._builder.add_nodes(nodes)
+        return self
+
+    def add_blocks(
+        self,
+        blocks: Sequence[Any],
+        *,
+        block_registry: FusionBlockRegistry | None = None,
+    ) -> FusionOptimizer:
+        self._builder.add_blocks(blocks, block_registry=block_registry)
         return self
 
     def add_prim_func_node(
@@ -393,6 +572,15 @@ class FusionRegionBuilder:
                     attrs=node.attrs,
                 )
         return self
+
+    def add_blocks(
+        self,
+        blocks: Sequence[Any],
+        *,
+        block_registry: FusionBlockRegistry | None = None,
+    ) -> FusionRegionBuilder:
+        registry = block_registry or FusionBlockRegistry()
+        return self.add_nodes(registry.nodes_from_blocks(blocks))
 
     def add_prim_func_node(
         self,
@@ -708,6 +896,158 @@ def build_fusion_region(
     if enable_z3_sync_async_optimization:
         builder.enable_z3_sync_async_optimization()
     return builder.build()
+
+
+def build_fusion_region_from_blocks(
+    *,
+    region_name: str,
+    blocks: Sequence[Any],
+    block_registry: FusionBlockRegistry | None = None,
+    schedule_template: ScheduleTemplate | None = None,
+    schedule_registry: FusionScheduleRegistry | None = None,
+    edges: Sequence[FusionEdge] = (),
+    backend: str = DEFAULT_BACKEND,
+    entry_symbol: str | None = None,
+    enable_z3_sync_async_optimization: bool = False,
+    schedule_name: str = "manual",
+    schedule_status: str = "ready",
+) -> FusionRegion:
+    """Build a fusion region from caller-owned building-block descriptors."""
+
+    if schedule_template is None:
+        optimizer = FusionOptimizer(
+            region_name,
+            schedule_registry=schedule_registry,
+            backend=backend,
+            entry_symbol=entry_symbol,
+            enable_z3_sync_async=enable_z3_sync_async_optimization,
+        ).add_blocks(blocks, block_registry=block_registry)
+        for edge in edges:
+            optimizer.connect(
+                edge.producer,
+                edge.consumer,
+                buffer=edge.buffer,
+                lifetime=edge.lifetime,
+                differentiable=edge.differentiable,
+            )
+        return optimizer.build()
+
+    builder = (
+        FusionRegionBuilder(region_name, backend=backend, entry_symbol=entry_symbol)
+        .add_blocks(blocks, block_registry=block_registry)
+        .set_schedule_template(
+            schedule_template,
+            name=schedule_name,
+            status=schedule_status,
+        )
+    )
+    for edge in edges:
+        builder.connect(
+            edge.producer,
+            edge.consumer,
+            buffer=edge.buffer,
+            lifetime=edge.lifetime,
+            differentiable=edge.differentiable,
+        )
+    if enable_z3_sync_async_optimization:
+        builder.enable_z3_sync_async_optimization()
+    return builder.build()
+
+
+def build_fusion_regions_from_blocks(
+    *,
+    region_name: str,
+    blocks: Sequence[Any],
+    block_registry: FusionBlockRegistry | None,
+    schedule_registry: FusionScheduleRegistry,
+    edges: Sequence[FusionEdge] = (),
+    backend: str = DEFAULT_BACKEND,
+    entry_symbol_prefix: str | None = None,
+    enable_z3_sync_async_optimization: bool = False,
+    min_region_size: int = 2,
+    allow_unmatched_blocks: bool = True,
+) -> tuple[FusionRegion, ...]:
+    """Discover fused regions from a caller-owned model block stream.
+
+    The caller supplies model building blocks and reusable block contracts.
+    TileLang normalizes the graph, infers data-flow edges, selects registered
+    fused schedules by op-chain, and emits one region per matched chain.
+    """
+
+    if block_registry is None:
+        raise ValueError("block_registry is required when discovering fusion regions from blocks")
+    if not isinstance(schedule_registry, FusionScheduleRegistry):
+        raise TypeError("schedule_registry must be a FusionScheduleRegistry")
+    if min_region_size < 1:
+        raise ValueError("min_region_size must be positive")
+
+    builder = FusionRegionBuilder(region_name, backend=backend).add_blocks(
+        blocks,
+        block_registry=block_registry,
+    )
+    for edge in edges:
+        builder.connect(
+            edge.producer,
+            edge.consumer,
+            buffer=edge.buffer,
+            lifetime=edge.lifetime,
+            differentiable=edge.differentiable,
+        )
+    normalized_nodes, normalized_edges = builder._normalized_nodes_and_edges()
+    regions: list[FusionRegion] = []
+    index = 0
+    while index < len(normalized_nodes):
+        selected = schedule_registry.select_longest(
+            normalized_nodes,
+            start=index,
+            min_length=min_region_size,
+        )
+        if selected is None:
+            if not allow_unmatched_blocks:
+                remaining_signature = ",".join(node.op for node in normalized_nodes[index:])
+                raise ValueError(
+                    "no fused schedule registered for model block suffix "
+                    f"{remaining_signature!r} starting at block {normalized_nodes[index].name!r}"
+                )
+            index += 1
+            continue
+
+        schedule_entry, end = selected
+        region_nodes = normalized_nodes[index:end]
+        node_names = {node.name for node in region_nodes}
+        region_edges = tuple(
+            edge
+            for edge in normalized_edges
+            if edge.producer in node_names and edge.consumer in node_names
+        )
+        region_index = len(regions)
+        region_suffix = _safe_region_suffix(schedule_entry.name)
+        discovered_region_name = f"{region_name}_{region_index}_{region_suffix}"
+        entry_symbol = (
+            f"{entry_symbol_prefix}_{region_index}_{region_suffix}"
+            if entry_symbol_prefix is not None
+            else discovered_region_name
+        )
+        regions.append(
+            build_fusion_region(
+                region_name=discovered_region_name,
+                nodes=region_nodes,
+                edges=region_edges,
+                schedule_template=schedule_entry.schedule_template,
+                backend=backend,
+                entry_symbol=entry_symbol,
+                enable_z3_sync_async_optimization=enable_z3_sync_async_optimization,
+                schedule_name=schedule_entry.name,
+                schedule_status=schedule_entry.status,
+            )
+        )
+        index = end
+    return tuple(regions)
+
+
+def _safe_region_suffix(name: str) -> str:
+    suffix = "".join(char if char.isalnum() or char == "_" else "_" for char in name).strip("_")
+    return suffix or "fusion"
 
 
 def build_mamba3_fp8_train_block_region(

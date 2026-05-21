@@ -7,6 +7,8 @@ from tilelang.engine import compile_fusion_region as exported_compile_fusion_reg
 from tilelang.engine.fusion import (
     BaselineComparison,
     FusionAutogradPlan,
+    FusionBlockDescriptor,
+    FusionBlockRegistry,
     FusionNode,
     FusionOptimizer,
     FusionRegionBuilder,
@@ -14,6 +16,8 @@ from tilelang.engine.fusion import (
     audit_fusion_cache_key,
     audit_warm_cache_reuse,
     build_fusion_region,
+    build_fusion_region_from_blocks,
+    build_fusion_regions_from_blocks,
     build_mamba3_fp8_train_block_region,
     compile_fusion_region,
     fusion_cache_key_digest,
@@ -515,6 +519,217 @@ def test_build_fusion_region_adds_dynamic_nodes_and_infers_chain():
     ]
     assert region.pass_configs[PassConfigKey.TL_Z3_PROOF_BARRIER_MINIMIZATION.value] is True
     assert region.pass_configs[PassConfigKey.TL_Z3_PROOF_ASYNC_ELIGIBILITY.value] is True
+
+
+def test_build_fusion_region_from_blocks_resolves_registry_contracts():
+    block_registry = (
+        FusionBlockRegistry()
+        .register(
+            FusionBlockDescriptor(
+                op="producer",
+                inputs=("A",),
+                outputs=("{name}_mid",),
+                aliases=("M",),
+                attrs={"role": "producer"},
+            )
+        )
+        .register(
+            FusionBlockDescriptor(
+                op="consumer",
+                inputs=("producer_mid",),
+                outputs=("D",),
+                aliases=("R",),
+                attrs={"role": "consumer"},
+            )
+        )
+    )
+
+    region = build_fusion_region_from_blocks(
+        region_name="block_registry_region",
+        blocks=(
+            {"name": "consumer", "route_symbol": "R"},
+            {"name": "producer", "route_symbol": "M"},
+        ),
+        block_registry=block_registry,
+        schedule_template=lambda _: _fused_train_block,
+        enable_z3_sync_async_optimization=True,
+    )
+
+    assert [node.name for node in region.nodes] == ["producer", "consumer"]
+    assert [node.op for node in region.nodes] == ["producer", "consumer"]
+    assert region.nodes[0].outputs == ("producer_mid",)
+    assert region.nodes[0].attrs["role"] == "producer"
+    assert [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] == [
+        ("producer", "consumer", "producer_mid")
+    ]
+    assert region.pass_configs[PassConfigKey.TL_Z3_PROOF_ASYNC_ELIGIBILITY.value] is True
+
+
+def test_block_registry_allows_same_op_blocks_with_distinct_contracts():
+    block_registry = FusionBlockRegistry(
+        (
+            FusionBlockDescriptor(
+                op="repeat_op",
+                inputs=("A",),
+                outputs=("first_mid",),
+                aliases=("first_contract",),
+            ),
+            FusionBlockDescriptor(
+                op="repeat_op",
+                inputs=("first_mid",),
+                outputs=("D",),
+                aliases=("second_contract",),
+            ),
+        )
+    )
+
+    region = build_fusion_region_from_blocks(
+        region_name="same_op_distinct_contracts",
+        blocks=(
+            {"name": "second", "kind": "second_contract"},
+            {"name": "first", "kind": "first_contract"},
+        ),
+        block_registry=block_registry,
+        schedule_template=lambda _: _fused_train_block,
+    )
+
+    assert [node.name for node in region.nodes] == ["first", "second"]
+    assert [node.op for node in region.nodes] == ["repeat_op", "repeat_op"]
+    assert [node.outputs for node in region.nodes] == [("first_mid",), ("D",)]
+    assert [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] == [
+        ("first", "second", "first_mid")
+    ]
+
+
+def test_optimizer_add_blocks_selects_registered_fused_schedule():
+    block_registry = FusionBlockRegistry(
+        (
+            FusionBlockDescriptor(
+                op="producer",
+                inputs=("A",),
+                outputs=("{name}_mid",),
+                aliases=("M",),
+            ),
+            FusionBlockDescriptor(
+                op="consumer",
+                inputs=("producer_mid",),
+                outputs=("D",),
+                aliases=("R",),
+            ),
+        )
+    )
+    schedule_registry = FusionScheduleRegistry().register(
+        ("producer", "consumer"),
+        _fused_train_block,
+        name="producer_consumer_fused",
+        status="ready",
+    )
+
+    plan = (
+        FusionOptimizer("block_optimizer", schedule_registry=schedule_registry)
+        .add_blocks(
+            (
+                {"name": "producer", "kind": "M"},
+                {"name": "consumer", "kind": "R"},
+            ),
+            block_registry=block_registry,
+        )
+        .plan()
+    )
+
+    assert plan.schedule_name == "producer_consumer_fused"
+    assert plan.schedule_status == "ready"
+    assert plan.node_names == ("producer", "consumer")
+    assert [(edge.producer, edge.consumer, edge.buffer) for edge in plan.edges] == [
+        ("producer", "consumer", "producer_mid")
+    ]
+
+
+def test_build_fusion_regions_from_blocks_discovers_registered_chains():
+    block_registry = FusionBlockRegistry(
+        (
+            FusionBlockDescriptor(
+                op="producer",
+                inputs=("A",),
+                outputs=("{name}_mid",),
+                aliases=("M",),
+            ),
+            FusionBlockDescriptor(
+                op="consumer",
+                inputs=("{producer}_mid",),
+                outputs=("{name}_out",),
+                aliases=("R",),
+            ),
+        )
+    )
+    schedule_registry = FusionScheduleRegistry().register(
+        ("producer", "consumer"),
+        _fused_train_block,
+        name="producer_consumer_fused",
+        status="ready",
+    )
+
+    regions = build_fusion_regions_from_blocks(
+        region_name="model_fusion",
+        blocks=(
+            {"name": "consumer0", "route_symbol": "R", "inputs": ("producer0_mid",)},
+            {"name": "producer0", "route_symbol": "M"},
+            {"name": "layernorm0", "op": "layernorm", "inputs": ("consumer0_out",), "outputs": ("norm0",)},
+            {"name": "producer1", "route_symbol": "M"},
+            {"name": "consumer1", "route_symbol": "R", "inputs": ("producer1_mid",)},
+        ),
+        block_registry=block_registry,
+        schedule_registry=schedule_registry,
+        enable_z3_sync_async_optimization=True,
+    )
+
+    assert [region.name for region in regions] == [
+        "model_fusion_0_producer_consumer_fused",
+        "model_fusion_1_producer_consumer_fused",
+    ]
+    assert [tuple(node.name for node in region.nodes) for region in regions] == [
+        ("producer0", "consumer0"),
+        ("producer1", "consumer1"),
+    ]
+    assert [
+        [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges]
+        for region in regions
+    ] == [
+        [("producer0", "consumer0", "producer0_mid")],
+        [("producer1", "consumer1", "producer1_mid")],
+    ]
+    assert [region.schedule_name for region in regions] == [
+        "producer_consumer_fused",
+        "producer_consumer_fused",
+    ]
+    assert regions[0].pass_configs[PassConfigKey.TL_Z3_PROOF_ASYNC_ELIGIBILITY.value] is True
+
+
+def test_build_fusion_regions_from_blocks_can_fail_closed_on_unmatched_blocks():
+    block_registry = FusionBlockRegistry(
+        (
+            FusionBlockDescriptor(op="producer", outputs=("mid",), aliases=("M",)),
+            FusionBlockDescriptor(op="consumer", inputs=("mid",), aliases=("R",)),
+        )
+    )
+    schedule_registry = FusionScheduleRegistry().register(
+        ("producer", "consumer"),
+        _fused_train_block,
+        name="producer_consumer_fused",
+    )
+
+    with pytest.raises(ValueError, match="no fused schedule registered.*layernorm"):
+        build_fusion_regions_from_blocks(
+            region_name="model_fusion",
+            blocks=(
+                {"name": "layernorm0", "op": "layernorm"},
+                {"name": "producer0", "route_symbol": "M"},
+                {"name": "consumer0", "route_symbol": "R"},
+            ),
+            block_registry=block_registry,
+            schedule_registry=schedule_registry,
+            allow_unmatched_blocks=False,
+        )
 
 
 def test_mamba3_fp8_train_block_helper_uses_inferred_chain_edges():
