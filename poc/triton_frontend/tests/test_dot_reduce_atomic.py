@@ -22,6 +22,7 @@ tvm = pytest.importorskip("tvm")
 pytest.importorskip("tilelang")
 
 from poc.triton_frontend.op_mapping import (  # noqa: E402
+    LazyTileExpr,
     WalkerCtx,
     map_tt_atomic_rmw,
 )
@@ -144,7 +145,13 @@ def test_tt_atomic_rmw_dispatch(kind: str, expected_substr: str, dtype: str) -> 
     with _warnings.catch_warnings():
         _warnings.simplefilter("ignore", DeprecationWarning)
         handle = map_tt_atomic_rmw(op, ctx)
-    text = _stringify(handle) + " " + _stringify(ctx.stmts) + " " + _stringify(ctx.value_map)
+    text = (
+        _stringify(handle)
+        + " "
+        + _stringify(ctx.stmts)
+        + " "
+        + _stringify(ctx.value_map)
+    )
     # TVM's TIR printer renders ``atomic_add`` as ``atomicadd``; we accept
     # both the underscored and concatenated kind name to stay independent
     # of cosmetic printer changes.
@@ -156,6 +163,49 @@ def test_tt_atomic_rmw_dispatch(kind: str, expected_substr: str, dtype: str) -> 
         f"expected {expected_substr!r} (or alt {kind_alt!r}, atomic{kind!r}, "
         f"atomic_{kind!r}) in atomic emission for kind={kind!r}; got {text!r}"
     )
+
+
+def test_tt_atomic_rmw_accepts_unconditional_lazy_mask() -> None:
+    """Triton's default vector mask is a splat-true tile and must not reach TIR as Python."""
+    ctx = WalkerCtx()
+    ptr_ssa = _fake_value("ptr", shape=[1], dtype="float32")
+    val_ssa = _fake_value("val", shape=[], dtype="float32")
+    mask_ssa = _fake_value("mask", shape=[1], dtype="bool")
+    res_ssa = _fake_value("res", shape=[], dtype="float32")
+
+    ctx.bind(ptr_ssa, _decl_buffer("dst", [1], "float32"))
+    ctx.bind(val_ssa, tvm.tir.const(1.0, "float32"))
+    ctx.bind(
+        mask_ssa,
+        LazyTileExpr(
+            (1,),
+            "bool",
+            lambda read_ctx, _indices: read_ctx.tir().const(True, "bool"),
+            constant_value=True,
+        ),
+    )
+
+    op = {
+        "name": "tt.atomic_rmw",
+        "operands": [ptr_ssa, val_ssa, mask_ssa],
+        "results": [res_ssa],
+        "attrs": {"rmw_op": "add"},
+    }
+
+    import warnings as _warnings
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore", DeprecationWarning)
+        handle = map_tt_atomic_rmw(op, ctx)
+
+    text = (
+        _stringify(handle)
+        + " "
+        + _stringify(ctx.stmts)
+        + " "
+        + _stringify(ctx.value_map)
+    )
+    assert "ffi.OpaquePyObject" not in text
+    assert "atomic" in text.lower()
 
 
 # ---------------------------------------------------------------------------

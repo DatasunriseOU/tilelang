@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import ast
+import io
 import re
+import textwrap
+import tokenize
 from typing import Literal, Callable, Any
 from tilelang import tvm as tvm
 from tvm import IRModule, tir
@@ -71,9 +75,52 @@ def extract_python_func_declaration(source: str, func_name: str) -> str:
                 ...
         Returns: "def kernel(arg1: cute.Tensor, arg2: int)"
     """
-    # Remove '(' suffix if present
     if func_name.endswith("("):
         func_name = func_name[:-1]
+
+    def trim_header_at_colon(header: str) -> str:
+        line_offsets = []
+        offset = 0
+        for line in header.splitlines(keepends=True):
+            line_offsets.append(offset)
+            offset += len(line)
+
+        depth = 0
+        try:
+            tokens = tokenize.generate_tokens(io.StringIO(header).readline)
+            for tok_type, tok_str, start, _, _ in tokens:
+                if tok_type != tokenize.OP:
+                    continue
+                if tok_str in "([{":
+                    depth += 1
+                elif tok_str in ")]}":
+                    depth = max(0, depth - 1)
+                elif tok_str == ":" and depth == 0:
+                    start_line, start_col = start
+                    idx = line_offsets[start_line - 1] + start_col
+                    return header[:idx].rstrip()
+        except tokenize.TokenError:
+            pass
+        return header.rstrip()
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        tree = None
+
+    if tree is not None:
+        lines = source.splitlines()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef) or node.name != func_name:
+                continue
+            if not node.body:
+                break
+            start_line = node.lineno - 1
+            body_line = node.body[0].lineno - 1
+            end_line = body_line if body_line > start_line else start_line + 1
+            header = "\n".join(lines[start_line:end_line])
+            header = textwrap.dedent(header)
+            return trim_header_at_colon(header)
 
     # Match from def to the closing ) followed by :
     # This handles multi-line function signatures

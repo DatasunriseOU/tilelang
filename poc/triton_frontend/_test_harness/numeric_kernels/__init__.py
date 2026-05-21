@@ -32,5 +32,8 @@ KERNEL_MODULES = (
     "matmul",
     "layer_norm",
     "flash_attention",
+    "fa_v3",
     "paged_attention",
+    "dot_reduce_atomic",
+    "dot_reduce_atomic_trans_b",
 )

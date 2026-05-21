@@ -40,6 +40,21 @@ def test_rfc_conformance_ladder_includes_paged_attention() -> None:
     assert "paged_attention" in numeric_kernels.KERNEL_MODULES
 
 
+def test_rfc_conformance_ladder_includes_fa_v3_numeric() -> None:
+    """RFC section 5.5's FA-v3 staged fallback must be numerically exercised."""
+    assert "fa_v3" in numeric_kernels.KERNEL_MODULES
+
+
+def test_rfc_conformance_ladder_includes_dot_reduce_atomic_numeric() -> None:
+    """RFC section 5.5's dot/reduce/atomic target must be numerically exercised."""
+    assert "dot_reduce_atomic" in numeric_kernels.KERNEL_MODULES
+
+
+def test_rfc_conformance_ladder_includes_dot_reduce_atomic_trans_b_numeric() -> None:
+    """cppmega's transposed-B dot/reduce/atomic path must be numerically exercised."""
+    assert "dot_reduce_atomic_trans_b" in numeric_kernels.KERNEL_MODULES
+
+
 def test_rfc_fa_v2_conformance_builds_tilelang_ir() -> None:
     """RFC section 5.5's FA-v2 target must have TileLang IR coverage."""
     pytest.importorskip("tilelang")

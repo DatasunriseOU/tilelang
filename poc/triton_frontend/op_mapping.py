@@ -1144,6 +1144,22 @@ def _atomic_rmw_kind(op: Any) -> str:
     if raw is None:
         raise EmitError("tt.atomic_rmw: missing 'rmw_op' attribute")
     s = str(raw).lower().strip()
+    # The custom TTIR printer spells the op as ``fadd``. After the C++ shim
+    # converts it to generic form, Triton's I32EnumAttr value is printed as
+    # an integer property, e.g. ``atomic_rmw_op = 5`` for ``fadd``.
+    numeric_enum = {
+        "1": "and",
+        "2": "or",
+        "3": "xor",
+        "4": "add",
+        "5": "fadd",
+        "6": "max",
+        "7": "min",
+        "8": "umax",
+        "9": "umin",
+        "10": "exch",
+    }
+    s = numeric_enum.get(s, s)
     # Strip MLIR-style prefixes/suffixes that occasionally appear.
     if s.startswith("rmw_op."):
         s = s[len("rmw_op."):]
@@ -1155,7 +1171,20 @@ def _atomic_rmw_kind(op: Any) -> str:
     if s.startswith("u") and s[1:] in {"max", "min"}:
         # umax / umin -> max / min (signedness disambiguated by buffer dtype)
         return s[1:]
+    if s == "exch":
+        return "xchg"
     return s
+
+
+def _constant_tile_bool(value: Any) -> Optional[bool]:
+    """Return bool for a splat boolean tile mask, else ``None``."""
+    if not isinstance(value, LazyTileExpr):
+        return None
+    if value.constant_value is None:
+        return None
+    if str(value.dtype) != "bool":
+        return None
+    return bool(value.constant_value)
 
 
 def map_tt_atomic_rmw(op: Any, ctx: WalkerCtx) -> Any:
@@ -1266,6 +1295,16 @@ def map_tt_atomic_rmw(op: Any, ctx: WalkerCtx) -> Any:
 
     if mask_ssa is not None:
         mask_expr = ctx.get(mask_ssa)
+        constant_mask = _constant_tile_bool(mask_expr)
+        if constant_mask is True:
+            mask_expr = None
+        elif constant_mask is False:
+            if return_prev:
+                result = tir.const(0, _dtype_of(_results(op)[0]))
+                ctx.bind(_results(op)[0], result)
+                return result
+            return result
+    if mask_ssa is not None and mask_expr is not None:
         # Wrap in if_then_else; for non-prev returns we still emit the call
         # unconditionally because TileLang intrinsics treat the call as a
         # statement-level handle.
@@ -1276,6 +1315,11 @@ def map_tt_atomic_rmw(op: Any, ctx: WalkerCtx) -> Any:
             result = tir.IfThenElse(mask_expr, tir.Evaluate(result), None)
 
     if return_prev:
+        if downgraded_return_prev:
+            if isinstance(result, tir.PrimExpr):
+                ctx.emit(tir.Evaluate(result))
+            else:
+                ctx.emit(result)
         ctx.bind(_results(op)[0], result)
     else:
         ctx.emit(result)

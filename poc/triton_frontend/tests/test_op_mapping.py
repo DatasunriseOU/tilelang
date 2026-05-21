@@ -82,6 +82,22 @@ def test_atomic_rmw_kind_from_properties_block() -> None:
     assert _atomic_rmw_kind(op) == "add"
 
 
+def test_atomic_rmw_kind_from_numeric_enum_property() -> None:
+    """Generic-form Triton TTIR prints the RMW enum as an integer property."""
+    printed = (
+        '%2 = "tt.atomic_rmw"(%ptr, %val, %mask) '
+        "<{atomic_rmw_op = 5 : i32, scope = 1 : i32, sem = 4 : i32}>"
+        " : (!tt.ptr<f32>, f32, i1) -> f32"
+    )
+    op = _FakeMlirOp(
+        name="tt.atomic_rmw",
+        operands=[_ssa("ptr"), _ssa("val"), _ssa("mask")],
+        results=[_ssa("res")],
+        printed=printed,
+    )
+    assert _atomic_rmw_kind(op) == "add"
+
+
 # ---------------------------------------------------------------------------
 # 2. tt.dot -- ``transpose_A`` / ``transpose_B`` / ``out_dtype``
 # ---------------------------------------------------------------------------
