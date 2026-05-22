@@ -53,3 +53,36 @@ def test_torch_compile_linear_bias_relu_backward_saved_params_passthrough():
     ):
         assert actual_grad is not None
         torch.testing.assert_close(actual_grad, expected_grad)
+
+
+def test_torch_compile_qk_softmax_backward_materializes_saved_input_aliases():
+    torch = pytest.importorskip("torch")
+
+    from poc.torch_dynamo import register
+
+    register()
+
+    def fn(q, k):
+        return torch.softmax(q @ k.transpose(-1, -2), dim=-1).square().sum()
+
+    torch.manual_seed(0)
+    q_ref = torch.randn(2, 4, 8, dtype=torch.float32, requires_grad=True)
+    k_ref = torch.randn(2, 4, 8, dtype=torch.float32, requires_grad=True)
+    expected = fn(q_ref, k_ref)
+    expected.backward()
+    expected_grads = (
+        q_ref.grad.detach().clone(),
+        k_ref.grad.detach().clone(),
+    )
+
+    q = q_ref.detach().clone().requires_grad_(True)
+    k = k_ref.detach().clone().requires_grad_(True)
+
+    compiled = torch.compile(fn, backend="tilelang", fullgraph=True)
+    actual = compiled(q, k)
+    actual.backward()
+
+    torch.testing.assert_close(actual.detach(), expected.detach())
+    for actual_grad, expected_grad in zip((q.grad, k.grad), expected_grads):
+        assert actual_grad is not None
+        torch.testing.assert_close(actual_grad, expected_grad)

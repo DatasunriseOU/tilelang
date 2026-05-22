@@ -36,4 +36,7 @@ KERNEL_MODULES = (
     "paged_attention",
     "dot_reduce_atomic",
     "dot_reduce_atomic_trans_b",
+    "histogram",
+    "split_join",
+    "where_broadcast",
 )

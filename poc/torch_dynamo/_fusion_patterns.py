@@ -37,12 +37,22 @@ _QK_REDUCE_OPS = frozenset({
 })
 
 
+def _is_scalar_like(value: object) -> bool:
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        return True
+    try:
+        return tuple(shape) in {(), (1,)}
+    except TypeError:
+        return False
+
+
 def _scalar_operand(payload: Tuple[object, ...]) -> bool:
     if len(payload) < 3:
         return False
     lhs = payload[1]
     rhs = payload[2]
-    return not hasattr(lhs, "shape") or not hasattr(rhs, "shape")
+    return _is_scalar_like(lhs) or _is_scalar_like(rhs)
 
 
 def _match_fused_linear(

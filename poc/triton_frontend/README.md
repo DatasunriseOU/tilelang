@@ -4,8 +4,10 @@
 captured Triton TTIR module to a TileLang-shaped `tvm.tir.PrimFunc`,
 runs the resulting kernel through the TileLang -> Metal -> MLX adapter,
 and round-trips numeric outputs against the original `@triton.jit`
-reference for the four end-to-end targets (`vector_add`, `softmax`,
-`matmul`, `layer_norm`). The "every public function raises
+reference for the 12-kernel RFC ladder (`vector_add`, `softmax`,
+`matmul`, `layer_norm`, `flash_attention`, `fa_v3`, `paged_attention`,
+`dot_reduce_atomic`, `dot_reduce_atomic_trans_b`, `histogram`,
+`split_join`, `where_broadcast`). The "every public function raises
 `NotImplementedError`" disclaimer that opened earlier revisions of this
 file no longer applies; see `## Current limitations` below for what is
 still degraded.
@@ -74,7 +76,7 @@ extern intrinsic mechanism).
 | `layout.py`                           | TTGIR encoding translators (placeholder; not used in MVP path).           | section 5.2   |
 | `pipeline.py`                         | Ordered TileLang TIR transform passes (reuse / extend / skip).            | section 3     |
 | `_test_harness/numeric_smoke.py`      | E2E numeric harness; compares TileLang output vs Triton reference.        | section 5.5   |
-| `_test_harness/numeric_kernels/*.py`  | `vector_add`, `softmax`, `matmul`, `layer_norm` numeric targets.          | section 5.5   |
+| `_test_harness/numeric_kernels/*.py`  | 12-kernel RFC ladder plus split/join, histogram, broadcast, and atomic coverage. | section 5.5   |
 | `_test_harness/run_corpus.py`         | 17-kernel reducer-corpus driver (bulk regression sweep).                  | section 5.5   |
 | `_cxx/`                               | pybind11 extension (`_triton_frontend_cxx`): `to_generic()`, ptr-analysis.| section 3     |
 | `conformance/__init__.py`             | Reference kernels for end-to-end tests.                                   | section 5.5   |
@@ -100,9 +102,11 @@ extern intrinsic mechanism).
   output runs end-to-end through TileLang's Metal codegen and is
   dispatched on MLX buffers; outputs are compared against the Triton
   reference inside `_test_harness/numeric_smoke.py`.
-* **E2E numeric harness**: `vector_add`, `softmax`, `matmul`, and
-  `layer_norm` targets pass numeric parity vs the `@triton.jit`
-  reference under the harness.
+* **E2E numeric harness**: the 12-kernel ladder (`vector_add`,
+  `softmax`, `matmul`, `layer_norm`, `flash_attention`, `fa_v3`,
+  `paged_attention`, `dot_reduce_atomic`, `dot_reduce_atomic_trans_b`,
+  `histogram`, `split_join`, `where_broadcast`) passes numeric parity
+  vs the `@triton.jit` reference under the harness.
 * **Reducer corpus**: the 17-kernel reducer corpus (`run_corpus.py`)
   reports **17/17 LOWERED_DEGRADED** -- every kernel reaches the
   TileLang PrimFunc stage. "Degraded" here means the per-element
@@ -127,6 +131,10 @@ hand-written TileLang kernel:
   facade falls back to MVP scalar; multi-element tile loads do not
   fuse into `T.copy`. Build with `TRITON_INSTALL_DIR` pointing at a
   Triton install to light up the fast path.
+* **In-process numeric harness disables the C++ `PtrAnalysis` shim after
+  Triton has loaded its own MLIR stack.** Use fresh-process shim checks
+  when validating the fast path instead of relying on the long-lived
+  numeric-smoke process.
 * **`tt.atomic_*` ops** prefer the TileLang atomic intrinsic when
   importable, otherwise emit a raw `tir.atomic_*` `call_intrin`. The
   MLX adapter does not yet round-trip the raw `call_intrin` form.
@@ -268,18 +276,21 @@ Reducer corpus (17 kernels):
 python -m poc.triton_frontend._test_harness.run_corpus
 ```
 
-Order is set by RFC section 5.5: `vector_add` -> `softmax` -> `matmul` ->
-`layer_norm` -> `fa_v2` -> `fa_v3` -> `paged_attn`. The first three must
-pass on Metal before CUDA work begins (RFC section 7 phase 1.5).
+Order is set by RFC section 5.5 plus the RFC section 9 op-hole audit:
+`vector_add` -> `softmax` -> `matmul` -> `layer_norm` ->
+`flash_attention` -> `fa_v3` -> `paged_attention` ->
+`dot_reduce_atomic` -> `dot_reduce_atomic_trans_b` -> `histogram` ->
+`split_join` -> `where_broadcast`. The first three must pass on Metal
+before CUDA work begins (RFC section 7 phase 1.5).
 
 ## Non-goals (explicit)
 
 - **TTGIR encoding ingestion.** RFC section 5.2 -- we hook before layout
   assignment; TileLang re-derives layouts per target. Stubs in
   `layout.py` exist for the rare future case only.
-- **Autograd through fused kernels.** RFC section 8 question 5 -- left
-  to phase 2.3, manual.
-- **CUTile ingestion.** RFC section 7 phase 5 -- deferred.
+- **CuTeDSL runtime execution.** RFC section 7 phase 5 has source-level
+  import-body and lowering coverage, but runtime execution depends on
+  CUDA plus `nvidia-cutlass-dsl`.
 
 ## Cross-references
 

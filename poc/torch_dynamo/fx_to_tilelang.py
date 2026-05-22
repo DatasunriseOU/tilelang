@@ -297,11 +297,23 @@ def _extract_metal_grid(
     )
 
 
+def _prim_func_buffer_param_names(prim_func: Any) -> Tuple[str, ...]:
+    names: List[str] = []
+    buffer_map = getattr(prim_func, "buffer_map", {}) or {}
+    for param in getattr(prim_func, "params", ()):
+        buf = buffer_map.get(param)
+        name = getattr(buf, "name", None)
+        names.append(str(name if name is not None else param))
+    return tuple(names)
+
+
 def _build_metal_launcher(
     prim_func: Any,
     *,
     input_specs: Sequence[_TensorSpec],
     output_specs: Sequence[_TensorSpec],
+    input_buffer_names: Sequence[str] | None = None,
+    output_buffer_names: Sequence[str] | None = None,
     name: Optional[str] = None,
 ) -> Callable[..., Any]:
     """Compile ``prim_func`` for Metal and wrap via the MLX runtime adapter.
@@ -330,6 +342,13 @@ def _build_metal_launcher(
     if not output_specs:
         raise FXToTileLangMetalBridgeError(
             "metal launcher requires at least one output tensor spec")
+    input_buffer_names = tuple(str(name) for name in (input_buffer_names or ()))
+    output_buffer_names = tuple(str(name) for name in (output_buffer_names or ()))
+    if bool(input_buffer_names) != bool(output_buffer_names):
+        raise FXToTileLangMetalBridgeError(
+            "metal launcher requires input_buffer_names and "
+            "output_buffer_names together"
+        )
 
     # 1. Lower the PrimFunc to a Metal CompiledArtifact.
     try:
@@ -390,6 +409,8 @@ def _build_metal_launcher(
             output_count=len(output_specs),
             name=name,
             args_struct_inline=args_struct_inline,
+            input_buffer_names=input_buffer_names or None,
+            output_buffer_names=output_buffer_names or None,
             allow_mx_fast_metal_kernel=True,
         )
     except Exception as exc:  # noqa: BLE001
@@ -401,6 +422,18 @@ def _build_metal_launcher(
     # 4. Build the torch <-> MLX launcher closure.
     output_shapes = tuple(tuple(int(d) for d in s.shape) for s in output_specs)
     output_dtype_names = tuple(s.dtype for s in output_specs)
+    used_input_indices = tuple(
+        idx
+        for idx, buffer_name in enumerate(input_buffer_names)
+        if buffer_name in getattr(adapter, "buffer_names", ())
+    )
+    if input_buffer_names and len(used_input_indices) != len(adapter.input_names):
+        raise FXToTileLangMetalBridgeError(
+            "metal launcher input mapping mismatch: "
+            f"input_buffer_names={input_buffer_names!r}, "
+            f"adapter buffers={getattr(adapter, 'buffer_names', ())!r}, "
+            f"adapter inputs={adapter.input_names!r}"
+        )
 
     def _launcher(*torch_inputs: Any) -> Any:
         try:
@@ -418,8 +451,12 @@ def _build_metal_launcher(
                 f"got {len(torch_inputs)}")
 
         mlx_inputs = []
-        for t in torch_inputs[: len(input_specs)]:
+        input_positions = used_input_indices or tuple(range(len(input_specs)))
+        for input_idx in input_positions:
+            t = torch_inputs[input_idx]
             arr = t.detach().contiguous().cpu().numpy()
+            if arr.shape == ():
+                arr = arr.reshape((1,))
             mlx_inputs.append(mx.array(arr))
 
         out_dtypes = [_tl_dtype_to_mlx(mx, n) for n in output_dtype_names]
@@ -1155,7 +1192,8 @@ def _emit_qk_reduce(node, args, ctx: LoweringContext) -> _TensorSpec:
     m = q.shape[0] if len(q.shape) > 0 else 1
     n = k.shape[0] if len(k.shape) > 0 else 1
     op_name = _node_op_key(node.target) or "qk_reduce"
-    ctx.op_trace.append((op_name, (node.name, q, k)))
+    extra_specs = tuple(arg for arg in args[2:] if isinstance(arg, _TensorSpec))
+    ctx.op_trace.append((op_name, (node.name, q, k, *extra_specs)))
     return _TensorSpec(shape=(m, n), dtype=q.dtype)
 
 
@@ -1676,6 +1714,8 @@ class FXToTileLang:
                 prim_funcs[0],
                 input_specs=tuple(self.ctx.input_specs),
                 output_specs=tuple(self.ctx.output_specs),
+                input_buffer_names=self._metal_input_buffer_names(prim_funcs[0]),
+                output_buffer_names=self._metal_output_buffer_names(prim_funcs[0]),
                 name=f"fx_metal_{self.content_hash()}",
             )
             try:
@@ -1704,6 +1744,74 @@ class FXToTileLang:
             pass
         return list(self.gm.graph.nodes)
 
+    def _metal_output_buffer_names(self, prim_func: Any) -> Tuple[str, ...]:
+        param_names = _prim_func_buffer_param_names(prim_func)
+        if not self.ctx.output_specs:
+            return ()
+        return tuple(param_names[-len(self.ctx.output_specs):])
+
+    def _metal_input_buffer_names(self, prim_func: Any) -> Tuple[str, ...]:
+        """Map runtime FX input order to generated PrimFunc buffer names."""
+        param_names = _prim_func_buffer_param_names(prim_func)
+        output_names = set(self._metal_output_buffer_names(prim_func))
+        available = [name for name in param_names if name not in output_names]
+        used: set[str] = set()
+
+        def _candidates(node_name: str) -> Tuple[str, ...]:
+            special = {
+                "q": "Q",
+                "k": "K",
+                "v": "V",
+                "indices": "Indices",
+                "index": "Indices",
+                "scale": "Scale",
+                "sm_scale": "Scale",
+            }
+            raw = node_name.strip("_")
+            variants = [node_name, raw]
+            if raw.startswith("l_"):
+                variants.append(raw[2:])
+            out: List[str] = []
+            for variant in variants:
+                parts = tuple(part for part in variant.split("_") if part)
+                pascal = "".join(part[:1].upper() + part[1:] for part in parts)
+                out.extend(
+                    candidate
+                    for candidate in (
+                        special.get(variant),
+                        variant,
+                        variant.upper(),
+                        variant[:1].upper() + variant[1:],
+                        pascal,
+                    )
+                    if candidate
+                )
+            return tuple(
+                dict.fromkeys(out)
+            )
+
+        names: List[str] = []
+        for node in self.gm.graph.nodes:
+            if node.op != "placeholder":
+                continue
+            node_name = str(node.name)
+            match = next(
+                (
+                    candidate for candidate in _candidates(node_name)
+                    if candidate in available and candidate not in used
+                ),
+                None,
+            )
+            if match is None:
+                remaining = [name for name in available if name not in used]
+                if len(remaining) == 1:
+                    match = remaining[0]
+            if match is None:
+                return ()
+            used.add(match)
+            names.append(match)
+        return tuple(names)
+
     def fx_signature(self) -> Dict[str, Any]:
         """Return a small dict describing the placeholder->output mapping."""
         return {
@@ -1719,6 +1827,14 @@ class FXToTileLang:
             if node.op != "output":
                 continue
             outs_raw = node.args[0] if node.args else ()
+            out_spec = getattr(self.gm, "_out_spec", None)
+            if (
+                isinstance(outs_raw, list)
+                and len(outs_raw) == 1
+                and out_spec is not None
+                and type(out_spec).__name__ == "LeafSpec"
+            ):
+                return "single"
             if isinstance(outs_raw, tuple):
                 return "tuple"
             if isinstance(outs_raw, list):
@@ -2534,6 +2650,53 @@ class FXToTileLang:
             dtype = q_spec.dtype
             block_M, block_N, block_K = self._tile_constants(m, n, k)
 
+            if block_K < 16 and block_M * block_N <= 1024:
+                @T.prim_func
+                def kernel(
+                    K: T.Tensor((n, k), dtype),
+                    Q: T.Tensor((m, k), dtype),
+                    P: T.Tensor((m, n), dtype),
+                ):
+                    if False:  # noqa: SIM103
+                        _ = (m, n, k, dtype)  # noqa: F841
+                    with T.Kernel(T.ceildiv(n, block_N), T.ceildiv(m, block_M),
+                                  threads=128) as (bx, by):
+                        S_l = T.alloc_fragment((block_M, block_N), "float32")
+                        for i, j in T.Parallel(block_M, block_N):
+                            row = by * block_M + i
+                            col = bx * block_N + j
+                            S_l[i, j] = T.cast(-3.4028234663852886e38, "float32")
+                            if row < m and col < n:
+                                S_l[i, j] = T.cast(0, "float32")
+                                for kk in T.serial(k):
+                                    S_l[i, j] += (
+                                        T.cast(Q[row, kk], "float32")
+                                        * T.cast(K[col, kk], "float32")
+                                    )
+                        m_max = T.alloc_fragment((block_M,), "float32")
+                        for i in T.Parallel(block_M):
+                            m_max[i] = T.cast(-3.4028234663852886e38, "float32")
+                            for j in T.serial(block_N):
+                                m_max[i] = T.max(m_max[i], S_l[i, j])
+                        for i, j in T.Parallel(block_M, block_N):
+                            row = by * block_M + i
+                            col = bx * block_N + j
+                            if row < m and col < n:
+                                S_l[i, j] = T.exp(S_l[i, j] - m_max[i])
+                            else:
+                                S_l[i, j] = T.cast(0, "float32")
+                        l_sum = T.alloc_fragment((block_M,), "float32")
+                        for i in T.Parallel(block_M):
+                            l_sum[i] = T.cast(0, "float32")
+                            for j in T.serial(block_N):
+                                l_sum[i] += S_l[i, j]
+                        for i, j in T.Parallel(block_M, block_N):
+                            row = by * block_M + i
+                            col = bx * block_N + j
+                            if row < m and col < n:
+                                P[row, col] = T.cast(S_l[i, j] / l_sum[i], dtype)
+                return kernel
+
             @T.prim_func
             def kernel(
                 K: T.Tensor((n, k), dtype),
@@ -2715,19 +2878,271 @@ class FXToTileLang:
         self, T: Any,
         captured: List[Tuple[str, Tuple[Any, ...]]],
     ) -> Any:
-        q_spec = captured[0][1][1]
-        k_spec = captured[0][1][2]
+        q_payload = captured[0][1]
+        q_spec = q_payload[1]
+        k_spec = q_payload[2]
         mul_payload = captured[1][1]
 
-        if isinstance(mul_payload[1], _TensorSpec):
-            scale_val = mul_payload[2]
+        if not (isinstance(q_spec, _TensorSpec) and isinstance(k_spec, _TensorSpec)):
+            raise NotImplementedError(
+                "qk_reduce_sm_scale requires resolved Q/K tensor specs")
+        if len(q_spec.shape) != 2 or len(k_spec.shape) != 2:
+            raise NotImplementedError(
+                "qk_reduce_sm_scale emitter currently supports only 2D Q/K "
+                f"(got Q.shape={q_spec.shape}, K.shape={k_spec.shape})")
+
+        def _is_scalar_tensor(value: Any) -> bool:
+            return isinstance(value, _TensorSpec) and value.shape in {(), (1,)}
+
+        lhs = mul_payload[1]
+        rhs = mul_payload[2]
+        if _is_scalar_tensor(lhs) or not isinstance(lhs, _TensorSpec):
+            scale_val = lhs
+        elif _is_scalar_tensor(rhs) or not isinstance(rhs, _TensorSpec):
+            scale_val = rhs
         else:
-            scale_val = mul_payload[1]
+            raise NotImplementedError(
+                "qk_reduce_sm_scale requires a scalar literal or scalar tensor "
+                f"scale operand (got {lhs!r}, {rhs!r})")
 
         m, k_dim = q_spec.shape
         n, k_dim2 = k_spec.shape
+        if k_dim != k_dim2:
+            raise ValueError(
+                f"qk_reduce inner dim mismatch: Q.shape={q_spec.shape}, "
+                f"K.shape={k_spec.shape}")
         dtype = q_spec.dtype
         block_M, block_N, block_K = self._tile_constants(m, n, k_dim)
+        threads = 32 if (block_M < 16 or block_N < 16) else 128
+        manual_qk = n % 8 != 0 or k_dim % 8 != 0
+        indices_spec = next(
+            (
+                spec for spec in q_payload[3:]
+                if isinstance(spec, _TensorSpec)
+            ),
+            None,
+        )
+        scale_spec = scale_val if isinstance(scale_val, _TensorSpec) else None
+
+        if indices_spec is not None and scale_spec is not None:
+            if len(indices_spec.shape) != 1:
+                raise NotImplementedError(
+                    "qk_reduce_sm_scale supports only 1D indices operands "
+                    f"(got {indices_spec.shape})")
+            idx_len = indices_spec.shape[0]
+            indices_dtype = indices_spec.dtype
+            scale_dtype = scale_spec.dtype
+            if scale_spec.shape == ():
+                if manual_qk:
+                    @T.prim_func
+                    def kernel(
+                        Q: T.Tensor((m, k_dim), dtype),
+                        K: T.Tensor((n, k_dim), dtype),
+                        Indices: T.Tensor((idx_len,), indices_dtype),
+                        Scale: T.Tensor((1,), scale_dtype),
+                        P: T.Tensor((m, n), dtype),
+                    ):
+                        if False:  # noqa: SIM103
+                            _ = (  # noqa: F841
+                                m, n, k_dim, dtype, idx_len, indices_dtype,
+                                scale_dtype, Indices,
+                            )
+                        with T.Kernel(T.ceildiv(n, block_N),
+                                      T.ceildiv(m, block_M),
+                                      threads=threads) as (bx, by):
+                            S_l = T.alloc_fragment(
+                                (block_M, block_N), "float32")
+                            for i, j in T.Parallel(block_M, block_N):
+                                row = by * block_M + i
+                                col = bx * block_N + j
+                                S_l[i, j] = T.cast(0, "float32")
+                                if row < m and col < n:
+                                    for kk in T.serial(k_dim):
+                                        S_l[i, j] += (
+                                            T.cast(Q[row, kk], "float32")
+                                            * T.cast(K[col, kk], "float32")
+                                        )
+                                    P[row, col] = S_l[i, j] * Scale[0]
+                    return kernel
+
+                @T.prim_func
+                def kernel(
+                    Q: T.Tensor((m, k_dim), dtype),
+                    K: T.Tensor((n, k_dim), dtype),
+                    Indices: T.Tensor((idx_len,), indices_dtype),
+                    Scale: T.Tensor((1,), scale_dtype),
+                    P: T.Tensor((m, n), dtype),
+                ):
+                    if False:  # noqa: SIM103
+                        _ = (  # noqa: F841
+                            m, n, k_dim, dtype, idx_len, indices_dtype,
+                            scale_dtype, Indices,
+                        )
+                    with T.Kernel(T.ceildiv(n, block_N), T.ceildiv(m, block_M),
+                                  threads=threads) as (bx, by):
+                        Q_s = T.alloc_shared((block_M, block_K), dtype)
+                        K_s = T.alloc_shared((block_N, block_K), dtype)
+                        S_l = T.alloc_fragment((block_M, block_N), "float32")
+                        T.clear(S_l)
+                        for ko in T.Pipelined(T.ceildiv(k_dim, block_K),
+                                              num_stages=2):
+                            T.copy(Q[by * block_M, ko * block_K], Q_s)
+                            T.copy(K[bx * block_N, ko * block_K], K_s)
+                            T.gemm(Q_s, K_s, S_l, transpose_B=True)
+                        for i, j in T.Parallel(block_M, block_N):
+                            S_l[i, j] = S_l[i, j] * Scale[0]
+                        T.copy(S_l, P[by * block_M, bx * block_N])
+                return kernel
+
+            scale_len = scale_spec.shape[0]
+            if manual_qk:
+                @T.prim_func
+                def kernel(
+                    Q: T.Tensor((m, k_dim), dtype),
+                    K: T.Tensor((n, k_dim), dtype),
+                    Indices: T.Tensor((idx_len,), indices_dtype),
+                    Scale: T.Tensor((scale_len,), scale_dtype),
+                    P: T.Tensor((m, n), dtype),
+                ):
+                    if False:  # noqa: SIM103
+                        _ = (  # noqa: F841
+                            m, n, k_dim, dtype, idx_len, indices_dtype,
+                            scale_len, scale_dtype, Indices,
+                        )
+                    with T.Kernel(T.ceildiv(n, block_N),
+                                  T.ceildiv(m, block_M),
+                                  threads=threads) as (bx, by):
+                        S_l = T.alloc_fragment(
+                            (block_M, block_N), "float32")
+                        for i, j in T.Parallel(block_M, block_N):
+                            row = by * block_M + i
+                            col = bx * block_N + j
+                            S_l[i, j] = T.cast(0, "float32")
+                            if row < m and col < n:
+                                for kk in T.serial(k_dim):
+                                    S_l[i, j] += (
+                                        T.cast(Q[row, kk], "float32")
+                                        * T.cast(K[col, kk], "float32")
+                                    )
+                                P[row, col] = S_l[i, j] * Scale[0]
+                return kernel
+
+            @T.prim_func
+            def kernel(
+                Q: T.Tensor((m, k_dim), dtype),
+                K: T.Tensor((n, k_dim), dtype),
+                Indices: T.Tensor((idx_len,), indices_dtype),
+                Scale: T.Tensor((scale_len,), scale_dtype),
+                P: T.Tensor((m, n), dtype),
+            ):
+                if False:  # noqa: SIM103
+                    _ = (  # noqa: F841
+                        m, n, k_dim, dtype, idx_len, indices_dtype,
+                        scale_len, scale_dtype, Indices,
+                    )
+                with T.Kernel(T.ceildiv(n, block_N), T.ceildiv(m, block_M),
+                              threads=threads) as (bx, by):
+                    Q_s = T.alloc_shared((block_M, block_K), dtype)
+                    K_s = T.alloc_shared((block_N, block_K), dtype)
+                    S_l = T.alloc_fragment((block_M, block_N), "float32")
+                    T.clear(S_l)
+                    for ko in T.Pipelined(T.ceildiv(k_dim, block_K),
+                                          num_stages=2):
+                        T.copy(Q[by * block_M, ko * block_K], Q_s)
+                        T.copy(K[bx * block_N, ko * block_K], K_s)
+                        T.gemm(Q_s, K_s, S_l, transpose_B=True)
+                    for i, j in T.Parallel(block_M, block_N):
+                        S_l[i, j] = S_l[i, j] * Scale[0]
+                    T.copy(S_l, P[by * block_M, bx * block_N])
+            return kernel
+
+        if scale_spec is not None:
+            scale_dtype = scale_spec.dtype
+            if scale_spec.shape == ():
+                @T.prim_func
+                def kernel(
+                    Q: T.Tensor((m, k_dim), dtype),
+                    K: T.Tensor((n, k_dim), dtype),
+                    Scale: T.Tensor((1,), scale_dtype),
+                    P: T.Tensor((m, n), dtype),
+                ):
+                    if False:  # noqa: SIM103
+                        _ = (m, n, k_dim, dtype, scale_dtype)  # noqa: F841
+                    with T.Kernel(T.ceildiv(n, block_N), T.ceildiv(m, block_M),
+                                  threads=threads) as (bx, by):
+                        Q_s = T.alloc_shared((block_M, block_K), dtype)
+                        K_s = T.alloc_shared((block_N, block_K), dtype)
+                        S_l = T.alloc_fragment((block_M, block_N), "float32")
+                        T.clear(S_l)
+                        for ko in T.Pipelined(T.ceildiv(k_dim, block_K),
+                                              num_stages=2):
+                            T.copy(Q[by * block_M, ko * block_K], Q_s)
+                            T.copy(K[bx * block_N, ko * block_K], K_s)
+                            T.gemm(Q_s, K_s, S_l, transpose_B=True)
+                        for i, j in T.Parallel(block_M, block_N):
+                            S_l[i, j] = S_l[i, j] * Scale[0]
+                        T.copy(S_l, P[by * block_M, bx * block_N])
+                return kernel
+
+            scale_len = scale_spec.shape[0]
+
+            @T.prim_func
+            def kernel(
+                Q: T.Tensor((m, k_dim), dtype),
+                K: T.Tensor((n, k_dim), dtype),
+                Scale: T.Tensor((scale_len,), scale_dtype),
+                P: T.Tensor((m, n), dtype),
+            ):
+                if False:  # noqa: SIM103
+                    _ = (m, n, k_dim, dtype, scale_len, scale_dtype)  # noqa: F841
+                with T.Kernel(T.ceildiv(n, block_N), T.ceildiv(m, block_M),
+                              threads=threads) as (bx, by):
+                    Q_s = T.alloc_shared((block_M, block_K), dtype)
+                    K_s = T.alloc_shared((block_N, block_K), dtype)
+                    S_l = T.alloc_fragment((block_M, block_N), "float32")
+                    T.clear(S_l)
+                    for ko in T.Pipelined(T.ceildiv(k_dim, block_K), num_stages=2):
+                        T.copy(Q[by * block_M, ko * block_K], Q_s)
+                        T.copy(K[bx * block_N, ko * block_K], K_s)
+                        T.gemm(Q_s, K_s, S_l, transpose_B=True)
+                    for i, j in T.Parallel(block_M, block_N):
+                        S_l[i, j] = S_l[i, j] * Scale[0]
+                    T.copy(S_l, P[by * block_M, bx * block_N])
+            return kernel
+
+        if indices_spec is not None:
+            if len(indices_spec.shape) != 1:
+                raise NotImplementedError(
+                    "qk_reduce_sm_scale supports only 1D indices operands "
+                    f"(got {indices_spec.shape})")
+            idx_len = indices_spec.shape[0]
+            indices_dtype = indices_spec.dtype
+
+            @T.prim_func
+            def kernel(
+                Q: T.Tensor((m, k_dim), dtype),
+                K: T.Tensor((n, k_dim), dtype),
+                Indices: T.Tensor((idx_len,), indices_dtype),
+                P: T.Tensor((m, n), dtype),
+            ):
+                if False:  # noqa: SIM103
+                    _ = (  # noqa: F841
+                        m, n, k_dim, dtype, idx_len, indices_dtype, Indices,
+                    )
+                with T.Kernel(T.ceildiv(n, block_N), T.ceildiv(m, block_M),
+                              threads=threads) as (bx, by):
+                    Q_s = T.alloc_shared((block_M, block_K), dtype)
+                    K_s = T.alloc_shared((block_N, block_K), dtype)
+                    S_l = T.alloc_fragment((block_M, block_N), "float32")
+                    T.clear(S_l)
+                    for ko in T.Pipelined(T.ceildiv(k_dim, block_K), num_stages=2):
+                        T.copy(Q[by * block_M, ko * block_K], Q_s)
+                        T.copy(K[bx * block_N, ko * block_K], K_s)
+                        T.gemm(Q_s, K_s, S_l, transpose_B=True)
+                    for i, j in T.Parallel(block_M, block_N):
+                        S_l[i, j] = S_l[i, j] * scale_val
+                    T.copy(S_l, P[by * block_M, bx * block_N])
+            return kernel
 
         @T.prim_func
         def kernel(
@@ -2738,7 +3153,7 @@ class FXToTileLang:
             if False:  # noqa: SIM103
                 _ = (m, n, k_dim, dtype)  # noqa: F841
             with T.Kernel(T.ceildiv(n, block_N), T.ceildiv(m, block_M),
-                          threads=128) as (bx, by):
+                          threads=threads) as (bx, by):
                 Q_s = T.alloc_shared((block_M, block_K), dtype)
                 K_s = T.alloc_shared((block_N, block_K), dtype)
                 S_l = T.alloc_fragment((block_M, block_N), "float32")

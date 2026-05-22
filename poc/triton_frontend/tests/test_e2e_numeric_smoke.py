@@ -65,6 +65,115 @@ def test_rfc_conformance_ladder_includes_dot_reduce_atomic_trans_b_numeric() -> 
     assert "dot_reduce_atomic_trans_b" in numeric_kernels.KERNEL_MODULES
 
 
+def test_rfc_conformance_ladder_includes_histogram_numeric() -> None:
+    """Triton's histogram op must be numerically exercised, not only structurally lowered."""
+    assert "histogram" in numeric_kernels.KERNEL_MODULES
+
+
+def test_rfc_conformance_ladder_includes_split_join_numeric() -> None:
+    """Triton's split/join ops must be numerically exercised end-to-end."""
+    assert "split_join" in numeric_kernels.KERNEL_MODULES
+
+
+def test_rfc_conformance_ladder_includes_where_broadcast_numeric() -> None:
+    """Triton's broadcasted where path must be numerically exercised end-to-end."""
+    assert "where_broadcast" in numeric_kernels.KERNEL_MODULES
+
+
+def test_split_join_numeric_kernel_preserves_ttir_ops() -> None:
+    """The split/join numeric case must actually exercise TTIR split/join."""
+    sentinel = "__SPLIT_JOIN_TTIR__"
+    script = f"""
+import json
+from poc.triton_frontend._test_harness import numeric_smoke
+from poc.triton_frontend._test_harness.numeric_kernels import split_join
+
+ttir_text, err, _opts = numeric_smoke._capture_ttir(split_join)
+payload = {{
+    "ok": ttir_text is not None,
+    "err": err,
+    "has_join": bool(ttir_text and "tt.join" in ttir_text),
+    "has_split": bool(ttir_text and "tt.split" in ttir_text),
+}}
+print({sentinel!r} + json.dumps(payload, sort_keys=True))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.fail(
+            "fresh-process split/join TTIR capture failed with "
+            f"exit={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
+            f"STDERR:\n{completed.stderr}"
+        )
+
+    payload = None
+    for line in reversed(completed.stdout.splitlines()):
+        if line.startswith(sentinel):
+            payload = json.loads(line[len(sentinel) :])
+            break
+    if payload is None:
+        pytest.fail(
+            "fresh-process split/join TTIR capture omitted sentinel\n"
+            f"STDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+        )
+    assert payload["ok"], payload["err"]
+    assert payload["has_join"], completed.stdout
+    assert payload["has_split"], completed.stdout
+
+
+def test_where_broadcast_numeric_kernel_preserves_ttir_ops() -> None:
+    """The where/broadcast numeric case must actually exercise TTIR ops."""
+    sentinel = "__WHERE_BROADCAST_TTIR__"
+    script = f"""
+import json
+from poc.triton_frontend._test_harness import numeric_smoke
+from poc.triton_frontend._test_harness.numeric_kernels import where_broadcast
+
+ttir_text, err, _opts = numeric_smoke._capture_ttir(where_broadcast)
+payload = {{
+    "ok": ttir_text is not None,
+    "err": err,
+    "has_select": bool(ttir_text and "arith.select" in ttir_text),
+    "has_broadcast": bool(ttir_text and "tt.broadcast" in ttir_text),
+}}
+print({sentinel!r} + json.dumps(payload, sort_keys=True))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.fail(
+            "fresh-process where/broadcast TTIR capture failed with "
+            f"exit={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
+            f"STDERR:\n{completed.stderr}"
+        )
+
+    payload = None
+    for line in reversed(completed.stdout.splitlines()):
+        if line.startswith(sentinel):
+            payload = json.loads(line[len(sentinel) :])
+            break
+    if payload is None:
+        pytest.fail(
+            "fresh-process where/broadcast TTIR capture omitted sentinel\n"
+            f"STDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+        )
+    assert payload["ok"], payload["err"]
+    assert payload["has_select"], completed.stdout
+    assert payload["has_broadcast"], completed.stdout
+
+
 def test_rfc_fa_v2_conformance_builds_tilelang_ir() -> None:
     """RFC section 5.5's FA-v2 target must have TileLang IR coverage."""
     pytest.importorskip("tilelang")

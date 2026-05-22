@@ -132,6 +132,54 @@ def _is_noncontiguous_fx_tensor(value: Any) -> bool:
     return tuple(stride) != tuple(reversed(expected))
 
 
+def _fx_op_key(target: Any) -> str | None:
+    overloadpacket = getattr(target, "overloadpacket", None)
+    if overloadpacket is not None:
+        return str(getattr(overloadpacket, "__name__", ""))
+    name = getattr(target, "_opname", None)
+    if name is not None:
+        return str(name)
+    raw = getattr(target, "__name__", None)
+    if isinstance(raw, str):
+        return raw.split(".")[0]
+    return None
+
+
+def _is_input_aliasing_fx_value(value: Any) -> bool:
+    """Return True when an FX value is a metadata/view alias of an input.
+
+    AOTAutograd forward graphs may return saved tensors that are just
+    ``view``/``expand``/``transpose`` wrappers around primal placeholders.
+    Those aliases are useful to the backward graph but cannot cross a
+    ``torch.library.custom_op`` return boundary directly.
+    """
+    if getattr(value, "op", None) in {"placeholder", "get_attr"}:
+        return True
+    if getattr(value, "op", None) not in {"call_function", "call_method"}:
+        return False
+    if getattr(value, "op", None) == "call_function":
+        op_key = _fx_op_key(getattr(value, "target", None))
+    else:
+        op_key = str(getattr(value, "target", ""))
+    if op_key not in {
+        "detach",
+        "view",
+        "reshape",
+        "_unsafe_view",
+        "flatten",
+        "expand",
+        "broadcast_to",
+        "transpose",
+        "t",
+        "permute",
+        "slice",
+        "select",
+    }:
+        return False
+    args = getattr(value, "args", ()) or ()
+    return bool(args) and _is_input_aliasing_fx_value(args[0])
+
+
 def _materialize_noncontiguous_saved_outputs(gm: torch.fx.GraphModule) -> bool:
     """Insert explicit contiguous materialisation for AOT saved views.
 
@@ -156,7 +204,9 @@ def _materialize_noncontiguous_saved_outputs(gm: torch.fx.GraphModule) -> bool:
             return False
         new_outs = []
         for out, desc in zip(outs_raw, descs):
-            if _is_saved_for_backward_desc(desc) and _is_noncontiguous_fx_tensor(out):
+            if _is_saved_for_backward_desc(desc) and (
+                _is_noncontiguous_fx_tensor(out) or _is_input_aliasing_fx_value(out)
+            ):
                 with gm.graph.inserting_after(out):
                     out = gm.graph.call_function(
                         torch.ops.aten.clone.default,

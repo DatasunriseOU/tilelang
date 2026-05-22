@@ -115,16 +115,16 @@ def _shape_of(value: Any) -> Tuple[int, ...]:
 
 def _dtype_of(value: Any) -> str:
     if isinstance(value, dict):
-        return str(value.get("dtype", "float32"))
+        return _normalize_mlir_dtype(str(value.get("dtype", "float32")))
     if hasattr(value, "dtype"):
-        return str(value.dtype)
+        return _normalize_mlir_dtype(str(value.dtype))
     typ = getattr(value, "type", None)
     if typ is None:
         return "float32"
     elt = getattr(typ, "element_type", None)
     if elt is None:
-        return "float32"
-    return str(elt)
+        return _normalize_mlir_dtype(str(typ))
+    return _normalize_mlir_dtype(str(elt))
 
 
 # ---------------------------------------------------------------------------
