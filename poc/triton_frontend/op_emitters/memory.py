@@ -125,8 +125,8 @@ def has_cxx_shim() -> bool:
     annotate the emitted IR with ``# DEGRADED:`` (see
     :func:`_emit_degraded_tile_load`).
     """
-    # Import lazily so that test-time monkeypatching of ``shim_available``
-    # also captures callers of ``has_cxx_shim`` without an extra hook.
+    # Import lazily so tests and isolated harnesses can exercise shim probing
+    # without importing the native extension at module import time.
     # We accept the SUBPROCESS-available shim too because the PtrAnalysis
     # pre-pass in __init__.py already routes through a clean subprocess
     # when libtriton is loaded — by the time op_emitters runs, ptr_state

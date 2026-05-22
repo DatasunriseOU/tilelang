@@ -166,6 +166,7 @@ ffi::Module BuildTileLangCUDA(IRModule mod, Target target) {
   // Hand off compiled bytes to the fallback-aware factory (apache/tvm-latest
   // dropped the public `runtime::CUDAModuleCreate` wrapper).
   ffi::Map<ffi::String, ffi::String> source_map;
+  source_map.Set("cuda", code);
   source_map.Set("cuda_source", code);
   return target::CUDAModuleCreateWithFallback(ffi::Bytes(ptx.data(), ptx.size()),
                                               ffi::String(fmt), ExtractFuncInfo(mod),
@@ -199,6 +200,7 @@ ffi::Module BuildTileLangCUDAWithoutCompile(IRModule mod, Target target) {
     code = (*f)(code, target).cast<std::string>();
   }
   ffi::Map<ffi::String, ffi::String> source_map;
+  source_map.Set("cuda", code);
   source_map.Set("cuda_source", code);
   return target::CUDAModuleCreateWithFallback(ffi::Bytes("ptx", 3), ffi::String("ptx"),
                                               ExtractFuncInfo(mod), source_map);

@@ -145,6 +145,19 @@ PYBIND11_MODULE(_triton_frontend_cxx, m) {
         },
         py::arg("mlir_text"));
 
+  m.def("walk_op_names_json",
+        [](const std::string& mlir_text) -> std::string {
+          Context ctx;
+          Module mod(ctx, mlir_text);
+          char* names = tl_pa_module_op_names_json(mod.get());
+          std::string out = names ? std::string(names) : std::string("[]");
+          tl_pa_string_free(names);
+          return out;
+        },
+        py::arg("mlir_text"),
+        "Parse MLIR text with the shim context and return walked operation "
+        "names as a JSON array.");
+
   // Convenience top-level: parse, rewrite, return printed text in one step.
   m.def("run_ptr_analysis",
         [](const std::string& mlir_text,

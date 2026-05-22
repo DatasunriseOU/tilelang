@@ -51,6 +51,19 @@ del _compute_version
 logger = logging.getLogger(__name__)
 
 
+def _import_optional_torch():
+    try:
+        import torch  # type: ignore
+    except ModuleNotFoundError as exc:
+        if exc.name == "torch":
+            return None
+        raise
+    return torch
+
+
+_TORCH = _import_optional_torch()
+
+
 def set_log_level(level):
     """Set the logging level for the module's logger.
 
@@ -115,9 +128,8 @@ def _guard_rocm_tvm_ffi_torch_c_dlpack(torch_module):
 
 @contextlib.contextmanager
 def _lazy_extension_imports():
-    import torch  # preload torch to avoid dlopen errors
-
-    _guard_rocm_tvm_ffi_torch_c_dlpack(torch)
+    if _TORCH is not None:
+        _guard_rocm_tvm_ffi_torch_c_dlpack(_TORCH)
 
     old_flags = sys.getdlopenflags()
     sys.setdlopenflags(old_flags | os.RTLD_LAZY)
@@ -151,14 +163,46 @@ if not env.is_light_import():
         if env.SKIP_LOADING_TILELANG_SO == "0":
             _LIB, _LIB_PATH = _load_tile_lang_lib()
 
-    from .jit import jit, JITKernel, compile, par_compile  # noqa: F401
-    from .profiler import Profiler  # noqa: F401
-    from .cache import clear_cache  # noqa: F401
-    from .utils import (
-        TensorSupplyType,  # noqa: F401
-        deprecated,  # noqa: F401
-        build_date,  # noqa: F401
-    )
+    if _TORCH is not None:
+        from .jit import jit, JITKernel, compile, par_compile  # noqa: F401
+        from .profiler import Profiler  # noqa: F401
+        from .cache import clear_cache  # noqa: F401
+        from .utils import (
+            TensorSupplyType,  # noqa: F401
+            deprecated,  # noqa: F401
+            build_date,  # noqa: F401
+        )
+    else:
+        TensorSupplyType = None  # type: ignore
+
+        def deprecated(method_name, new_method_name, phaseout_version=None):
+            import functools
+
+            def _deprecate(func):
+                @functools.wraps(func)
+                def _wrapper(*args, **kwargs):
+                    warnings.warn(
+                        f"{method_name} is deprecated, use {new_method_name} instead"
+                        + (
+                            f" and will be removed in {phaseout_version}"
+                            if phaseout_version
+                            else ""
+                        ),
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+                    return func(*args, **kwargs)
+
+                return _wrapper
+
+            return _deprecate
+
+        def build_date(version_str=None):
+            import re
+
+            match = re.search(r"\.d(\d{8})\.", version_str or __version__)
+            return int(match.group(1)) if match else None
+
     from .layout import (
         Layout,  # noqa: F401
         Fragment,  # noqa: F401
@@ -167,30 +211,52 @@ if not env.is_light_import():
         analysis,  # noqa: F401
         transform,  # noqa: F401
         language,  # noqa: F401
-        engine,  # noqa: F401
         tools,  # noqa: F401
     )
     from .language import dtypes  # noqa: F401
-    from .autotuner import autotune  # noqa: F401
     from .transform import PassConfigKey  # noqa: F401
-    from .engine import (  # noqa: F401
-        FusionAutogradPlan,
-        FusionBlockDescriptor,
-        FusionBlockRegistry,
-        FusionOptimizer,
-        FusionRegionBuilder,
-        FusionScheduleRegistry,
-        build_fusion_region,
-        build_fusion_region_from_blocks,
-        build_fusion_regions_from_blocks,
-        compile_fusion_region,
-        lower,
-        register_c_postproc,
-        register_cuda_postproc,
-        register_hip_postproc,
-    )
+
+    if _TORCH is not None:
+        from .autotuner import autotune  # noqa: F401
+        from . import engine  # noqa: F401
+        from .engine import (  # noqa: F401
+            FusionAutogradPlan,
+            FusionBlockDescriptor,
+            FusionBlockRegistry,
+            FusionOptimizer,
+            FusionRegionBuilder,
+            FusionScheduleRegistry,
+            build_fusion_region,
+            build_fusion_region_from_blocks,
+            build_fusion_regions_from_blocks,
+            compile_fusion_region,
+            lower,
+            register_c_postproc,
+            register_cuda_postproc,
+            register_hip_postproc,
+        )
+    else:
+
+        def _requires_torch(*_args, **_kwargs):
+            raise ModuleNotFoundError(
+                "torch is required for TileLang JIT, profiler, autotuner, "
+                "and engine lowering APIs"
+            )
+
+        jit = compile = par_compile = autotune = lower = _requires_torch
+        JITKernel = Profiler = None  # type: ignore
+
+        def clear_cache():
+            cache_dir = env.TILELANG_CACHE_DIR
+            raise RuntimeError(
+                "tilelang.clear_cache() is disabled because deleting the cache directory "
+                "is dangerous. If you accept the risk, remove it manually with "
+                f"`rm -rf '{cache_dir}'`."
+            )
+
     from .math import *  # noqa: F403
     from . import ir  # noqa: F401
     from . import tileop  # noqa: F401
 
 del _lazy_extension_imports
+del _import_optional_torch

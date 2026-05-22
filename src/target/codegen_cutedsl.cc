@@ -1771,6 +1771,67 @@ void CodeGenTileLangCuTeDSL::VisitStmt_(const AllocateNode *op) {
   PrintStmt_(op->body);
 }
 
+void CodeGenTileLangCuTeDSL::VisitStmt_(const AllocBufferNode *op) {
+  ICHECK(op->buffer.defined());
+  std::string vid = AllocVarID(op->buffer->data.get());
+  PrintIndent();
+  std::string scope = GetPtrStorageScope(op->buffer->data);
+  alloc_storage_scope_[op->buffer->data.get()] = scope;
+  DataType dtype = op->buffer->dtype;
+
+  if (scope == "local.descriptor.wgmma") {
+    stream << vid << " = tl.GmmaDescriptor()\n";
+  } else if (scope == "local.descriptor.tcgen05_smem") {
+    stream << vid << " = tl.Tcgen05SmemDescriptor()\n";
+  } else if (scope == "local.descriptor.tcgen05_instr") {
+    stream << vid << " = 0\n";
+  } else if (scope == "shared.dyn") {
+    stream << vid << " = tl.make_tensor(tl.get_dyn_smem(";
+    PrintType(dtype, stream);
+    // there is no bound check for Tensor access, so just set shape to 1
+    stream << ", alignment=1024), (1,))\n";
+  } else {
+    size_t constant_size = 1;
+    for (const auto &dim : op->buffer->shape) {
+      const IntImmNode *dim_imm = dim.as<IntImmNode>();
+      ICHECK(dim_imm)
+          << "Can only handle constant size stack allocation for now";
+      constant_size *= dim_imm->value;
+    }
+    ICHECK_GT(constant_size, 0)
+        << "Can only handle constant size stack allocation for now, but get "
+        << constant_size << " for " << op->buffer->data->name_hint;
+
+    if (scope == "shared") {
+      stream << vid << " = tl.make_tensor(tl.alloc_smem(";
+      PrintType(dtype, stream);
+      stream << ", " << constant_size << "), (" << constant_size << ",))\n";
+    } else if (scope == "shared.barrier" || scope == "shared.cluster_barrier") {
+      stream << vid << " = tl.alloc_smem(cutlass.Uint64, size_in_elems="
+             << constant_size << ")\n";
+    } else if (scope == "local") {
+      stream << vid << " = tl.make_rmem_tensor((" << constant_size << "),";
+      PrintType(dtype, stream);
+      stream << ")\n";
+    } else if (scope == "local.var") {
+      PrimExpr init = tirx::make_const(dtype, 0);
+      auto init_it = op->annotations.find(tl::attr::kLocalVarInit);
+      if (init_it != op->annotations.end()) {
+        PrimExpr user_init = Downcast<PrimExpr>((*init_it).second);
+        if (!user_init.dtype().is_void() && user_init.dtype() != dtype) {
+          user_init = tirx::Cast(dtype, user_init);
+        }
+        init = user_init;
+      }
+      stream << vid << " = " << PrintExpr_(init) << "\n";
+    } else {
+      ICHECK(false) << "Unsupported scope: " << scope;
+    }
+  }
+
+  RegisterHandleType_(op->buffer->data.get(), dtype);
+}
+
 void CodeGenTileLangCuTeDSL::VisitStmt_(const AttrStmtNode *op) {
   if (op->attr_key == tirx::attr::thread_extent) {
     IterVar iv = Downcast<IterVar>(op->node);

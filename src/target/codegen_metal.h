@@ -95,6 +95,7 @@ private:
   void CollectReferencedLowPrecisionDtypes(const PrimFunc &f);
   void EmitFPHelperPrelude();          // public dispatch entry
   void EmitAtomicAddHelperPrelude();
+  void EmitAtomicCASHelperPrelude();
   void EmitFp8E3M4Helper();
   void EmitFp8E4M3Helper();
   void EmitFp8E4M3FnAliasHelper();     // delegates to E4M3
@@ -108,7 +109,9 @@ private:
   std::set<int> referenced_fp8_codes_;
   bool uses_fp8_dot4_{false};
   bool uses_atomic_add_{false};
+  bool uses_atomic_cas_{false};
   bool emitted_atomic_add_helper_{false};
+  bool emitted_atomic_cas_helper_{false};
   bool emitted_bfloat16_helper_{false};
 
   std::unordered_map<const VarNode *, std::string> simdgroup_dtype_;

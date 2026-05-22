@@ -778,6 +778,7 @@ public:
   std::set<int> referenced_codes;
   bool uses_dot4{false};
   bool uses_atomic_add{false};
+  bool uses_atomic_cas{false};
   // CPPMEGA / Path C: track usage of the two MSL kernel-attribute intrinsics
   // emitted by tilelang/language/fp8_op.py. These do not have a matching
   // ``[[thread_position_in_grid]]`` / ``[[thread_index_in_simdgroup]]``
@@ -868,6 +869,9 @@ public:
         op->op.same_as(tl::atomic_add_ret_elem_op())) {
       uses_atomic_add = true;
     }
+    if (op->op.same_as(builtin::atomic_cas())) {
+      uses_atomic_cas = true;
+    }
     if (auto *opn = op->op.as<OpNode>()) {
       // CPPMEGA: the python ``T.call_intrin("tir.metal.fp8_e4m3_dot4", ...)``
       // wrapper rewrites legacy ``tir.*`` names to ``tirx.*`` (see
@@ -938,6 +942,7 @@ void CodeGenTileLangMetal::CollectReferencedLowPrecisionDtypes(
   referenced_fp8_codes_.clear();
   uses_fp8_dot4_ = false;
   uses_atomic_add_ = false;
+  uses_atomic_cas_ = false;
   MetalFp8DTypeCollector collector;
   // Inspect parameter dtypes (handle pointers carry their pointee dtype via
   // the buffer_map; non-handle parameters carry it directly).
@@ -964,6 +969,7 @@ void CodeGenTileLangMetal::CollectReferencedLowPrecisionDtypes(
                                collector.referenced_codes.end());
   if (collector.uses_dot4) uses_fp8_dot4_ = true;
   if (collector.uses_atomic_add) uses_atomic_add_ = true;
+  if (collector.uses_atomic_cas) uses_atomic_cas_ = true;
 }
 
 void CodeGenTileLangMetal::EmitAtomicAddHelperPrelude() {
@@ -1001,6 +1007,36 @@ void CodeGenTileLangMetal::EmitAtomicAddHelperPrelude() {
       << "  return atomic_fetch_add_explicit(\n"
       << "      reinterpret_cast<device atomic_uint*>(address), val,\n"
       << "      memory_order_relaxed);\n"
+      << "}\n"
+      << "} /* namespace tl */\n\n";
+}
+
+void CodeGenTileLangMetal::EmitAtomicCASHelperPrelude() {
+  if (!uses_atomic_cas_ || emitted_atomic_cas_helper_) return;
+  emitted_atomic_cas_helper_ = true;
+  decl_stream
+      << "namespace tl {\n"
+      << "static inline int AtomicCAS(device int* address, int expected,\n"
+      << "                            int desired, int memory_order = 0) {\n"
+      << "  (void)memory_order;\n"
+      << "  int observed = expected;\n"
+      << "  while (!atomic_compare_exchange_weak_explicit(\n"
+      << "             reinterpret_cast<device atomic_int*>(address), &observed,\n"
+      << "             desired, memory_order_relaxed, memory_order_relaxed)) {\n"
+      << "    if (observed != expected) break;\n"
+      << "  }\n"
+      << "  return observed;\n"
+      << "}\n"
+      << "static inline uint AtomicCAS(device uint* address, uint expected,\n"
+      << "                             uint desired, int memory_order = 0) {\n"
+      << "  (void)memory_order;\n"
+      << "  uint observed = expected;\n"
+      << "  while (!atomic_compare_exchange_weak_explicit(\n"
+      << "             reinterpret_cast<device atomic_uint*>(address), &observed,\n"
+      << "             desired, memory_order_relaxed, memory_order_relaxed)) {\n"
+      << "    if (observed != expected) break;\n"
+      << "  }\n"
+      << "  return observed;\n"
       << "}\n"
       << "} /* namespace tl */\n\n";
 }
@@ -1082,6 +1118,7 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
   // helpers.
   this->CollectReferencedLowPrecisionDtypes(func);
   this->EmitAtomicAddHelperPrelude();
+  this->EmitAtomicCASHelperPrelude();
   this->EmitFPHelperPrelude();
 
   // add to alloc buffer type.
@@ -1862,6 +1899,17 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
       os << ", " << PrintExpr(op->args[2]);
     }
     os << ")";
+  } else if (op->op.same_as(builtin::atomic_cas())) {
+    ICHECK_EQ(op->args.size(), 3U)
+        << "tir.atomic_cas expects dst_ptr, expected, and desired.";
+    ICHECK(op->dtype.is_int() || op->dtype.is_uint())
+        << "Metal tir.atomic_cas supports int/uint dtypes; got "
+        << op->dtype;
+    ICHECK_EQ(op->dtype.bits(), 32)
+        << "Metal tir.atomic_cas supports 32-bit atomics; got "
+        << op->dtype;
+    os << "tl::AtomicCAS(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]) << ", " << PrintExpr(op->args[2]) << ")";
   } else if (op->op.same_as(tl::atomic_xchg_elem_op()) ||
              op->op.same_as(tl::atomic_xchg_ret_elem_op()) ||
              op->op.same_as(tl::atomic_and_elem_op()) ||

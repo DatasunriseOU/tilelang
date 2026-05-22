@@ -23,9 +23,7 @@ Ops implemented
 * ``tt.atomic_max``    -> ``T.atomic_max`` / ``tir.call_intrin("tir.atomic_max", ...)``.
 * ``tt.atomic_min``    -> ``T.atomic_min`` / ``tir.call_intrin("tir.atomic_min", ...)``.
 * ``tt.atomic_xchg``   -> ``T.atomic_xchg`` / ``tir.call_intrin("tir.atomic_xchg", ...)``.
-* ``tt.atomic_cas``    -> ``tir.call_intrin("tir.atomic_cas", ...)`` (TileLang
-                          does not currently expose a CAS primitive on its
-                          language surface — see ``tilelang/language/atomic.py``).
+* ``tt.atomic_cas``    -> ``tir.call_intrin("tir.atomic_cas", ...)``.
 
 Combiner-region detection
 -------------------------
@@ -956,16 +954,33 @@ _FP_LOW_PRECISION_DTYPES = {
 }
 
 
-def _import_tilelang_gemm() -> Optional[Callable[..., Any]]:
-    """Return ``tilelang.language.gemm`` if importable, else None."""
+def _tilelang_language(language_module: Optional[Any] = None) -> Optional[Any]:
+    """Return an explicit TileLang language surface or import the default one."""
+    if language_module is not None:
+        return language_module
     try:
         import tilelang.language as T  # type: ignore
     except ImportError:
         return None
+    return T
+
+
+def _import_tilelang_gemm(
+    language_module: Optional[Any] = None,
+) -> Optional[Callable[..., Any]]:
+    """Return ``tilelang.language.gemm`` if importable, else None."""
+    T = _tilelang_language(language_module)
+    if T is None:
+        return None
     return getattr(T, "gemm", None)
 
 
-def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
+def map_tt_dot(
+    op: Any,
+    ctx: EmitContext,
+    *,
+    language_module: Optional[Any] = None,
+) -> Any:
     """Lower ``tt.dot(a, b, c)`` to ``T.gemm`` or a 3-loop nest.
 
     Routing rules:
@@ -1031,7 +1046,7 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
         # Rebind b to its original source
         pass
 
-    gemm = _import_tilelang_gemm()
+    gemm = _import_tilelang_gemm(language_module)
     attrs = _attrs(op)
     # The final transposition is an XOR between the explicit op attrs
     # (if the frontend lowered `trans_b=True` directly into the dot)
@@ -1047,10 +1062,9 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
 
     if gemm is not None:
         # Resolve / allocate accumulator C.
-        try:
-            import tilelang.language as T  # type: ignore
-        except ImportError:  # pragma: no cover - we just imported this above
-            T = None  # type: ignore
+        T = _tilelang_language(language_module)
+        if T is None:  # pragma: no cover - gemm lookup above already succeeded
+            raise EmitError("tt.dot: tilelang.language is unavailable")
         if c_ssa is not None:
             try:
                 c = ctx.get(c_ssa)
@@ -1094,6 +1108,7 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
             return _scope_of(buf) in ("shared", "shared.dyn")
 
         def _emit_copy_stmt(src: Any, dst: Any, label: str) -> None:
+            tir_mod = ctx.tir()
             if isinstance(src, LazyTileExpr):
                 dst_shape = list(getattr(dst, "shape", []) or src.shape or [1])
                 label_key = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in label)
@@ -1211,6 +1226,7 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
         def _emit_tiny_dot_loop(a_buf: Any, b_buf: Any, c_buf: Any) -> None:
             """Emit a scalar loop for tiny dots that are cheaper than tileop lowering."""
 
+            tir_mod = ctx.tir()
             zero = tir_mod.const(0, acc_dtype)
             m_var = tir_mod.Var(ctx.fresh("td_m"), "int32")
             n_var = tir_mod.Var(ctx.fresh("td_n"), "int32")
@@ -1270,7 +1286,6 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
             )
             ctx.emit(body)
 
-        tir_mod = ctx.tir()
         clear_accum = False
         prefer_shared_c = _result_needs_shared_c()
         c_scope = "shared" if prefer_shared_c else "local.fragment"
@@ -1356,11 +1371,12 @@ def map_tt_dot(op: Any, ctx: EmitContext) -> Any:
         # ``TypeError: Mismatched type ... Expected Array<tirx.Stmt> but got
         # Array[index N: tirx.Call]``. Wrap in ``tir.Evaluate`` so the call
         # becomes a side-effect-only Stmt.
-        tir_mod = ctx.tir()
-        if isinstance(handle, tir_mod.PrimExpr):
-            ctx.emit(tir_mod.Evaluate(handle))
-        else:
-            ctx.emit(handle)
+        if handle is not None:
+            tir_mod = ctx.tir()
+            if isinstance(handle, tir_mod.PrimExpr):
+                ctx.emit(tir_mod.Evaluate(handle))
+            else:
+                ctx.emit(handle)
         if result_value is not None:
             ctx.bind(result_value, c)
         return handle
@@ -1551,103 +1567,9 @@ def map_tt_atomic_xchg(op: Any, ctx: EmitContext) -> Any:
 
 
 def map_tt_atomic_cas(op: Any, ctx: EmitContext) -> Any:
-    """Compare-and-swap: rewritten as ``atomic_xchg`` + ``tir.if_then_else``.
+    """Lower Triton compare-and-swap to the native TIR CAS intrinsic."""
 
-    TileLang's vendored TVM does not register ``tirx.atomic_cas`` (only
-    ``tirx.atomic_add`` is registered in ``src/tirx/op/builtin.cc``), so
-    routing through ``tir.call_intrin('tir.atomic_cas', ...)`` raises
-    ``Operator tirx.atomic_cas is not registered`` at op-construction
-    time. Rather than land a brand-new builtin in the vendored TVM (which
-    would also need codegen support in every backend), we synthesise CAS
-    from a registered atomic primitive.
-
-    Semantics: CAS(ptr, expected, desired) atomically does
-        prev = *ptr
-        if prev == expected: *ptr = desired
-        return prev
-
-    Synthesis: we use ``tir.atomic_xchg(ptr, desired)`` (registered as
-    ``tirx.atomic_xchg`` in TileLang via ``T.atomic_xchg``) to swap in
-    the new value, then check the prior value against ``expected``. If
-    they don't match we re-store the original via a second xchg to roll
-    back. This is NOT a true CAS at the hardware level (it's a
-    "double-xchg" approximation), so we emit a deprecation warning to
-    keep the behaviour visible. Tests that only assert the lowered TIR
-    contains ``atomic`` will pass; correctness-critical CAS users must
-    wait for native ``tirx.atomic_cas`` registration.
-    """
-    import warnings as _warnings
-
-    operands = _operands(op)
-    if len(operands) < 3:
-        raise EmitError(
-            f"tt.atomic_cas: expected at least 3 operands "
-            f"(ptr, expected, desired); got {len(operands)}"
-        )
-    ptr_ssa = operands[0]
-    cmp_ssa = operands[1]
-    new_ssa = operands[2]
-
-    buf, indices = _resolve_atomic_target(ctx, ptr_ssa)
-    cmp_expr = ctx.get(cmp_ssa)
-    new_expr = ctx.get(new_ssa)
-
-    tir = ctx.tir()
-    return_prev = bool(_results(op))
-
-    _warnings.warn(
-        "tt.atomic_cas: tirx.atomic_cas is not registered in this libtvm "
-        "build; synthesising CAS from atomic_xchg + comparison. This is "
-        "a deterministic dispatch (not a silent fallback) but is NOT a "
-        "true hardware CAS; correctness-critical users should land "
-        "tirx.atomic_cas in 3rdparty/tvm/src/tirx/op/builtin.cc and "
-        "switch this emitter back to tir.call_intrin('tir.atomic_cas', "
-        "...) once available.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-
-    # Try TileLang's atomic_xchg first; fall back to tir.call_intrin.
-    fn = _import_tilelang_atomic("xchg")
-    if fn is not None:
-        prev_via_xchg = fn(buf, new_expr, return_prev=True)
-    else:
-        ret_dtype = (
-            _dtype_of(_results(op)[0]) if return_prev and _results(op) else "handle"
-        )
-        try:
-            addr = tir.call_intrin(
-                "handle",
-                tir.op.Op.get("tir.address_of"),
-                tir.BufferLoad(buf, list(indices)),
-            )
-        except Exception:  # pragma: no cover - older TVMs
-            addr = buf
-        prev_via_xchg = tir.call_intrin(ret_dtype, "tir.atomic_xchg", addr, new_expr)
-
-    # If the prev value doesn't match ``expected``, roll back by
-    # xchg-ing the original value back. This mirrors a CAS as a sequence
-    # of two xchg operations -- not race-free at the hardware level but
-    # functionally correct when the surrounding kernel guarantees
-    # exclusive access. We attach an ``"atomic_cas_synthesis"`` annotation
-    # on an AttrStmt so the printed TIR carries an ``atomic_cas``-shaped
-    # trail that downstream tests + grep can find without us needing to
-    # register a new TVM Op.
-    if isinstance(prev_via_xchg, tir.PrimExpr):
-        body = tir.Evaluate(prev_via_xchg)
-    else:
-        body = prev_via_xchg
-    cas_marker = tir.AttrStmt(
-        tir.const(0, "int32"),
-        "atomic_cas_synthesis",
-        cmp_expr,
-        body,
-    )
-
-    if return_prev:
-        ctx.bind(_results(op)[0], prev_via_xchg)
-    ctx.emit(cas_marker)
-    return prev_via_xchg
+    return _emit_atomic(op, ctx, kind="cas", expects_two_values=True)
 
 
 # ---------------------------------------------------------------------------

@@ -280,6 +280,14 @@ def _validate_cutedsl_body(
             f"{len(frags)} Frag(s). Body args: {[arg.arg for arg in args]!r}; "
             f"Frags: {[f.name for f in frags]!r}."
         )
+    arg_names = [arg.arg for arg in args]
+    frag_names = [f.name for f in frags]
+    if arg_names != frag_names:
+        raise ValueError(
+            f"extern_intrinsic[{target}] '{intrinsic_name}' parameter name "
+            f"mismatch: body args {arg_names!r} must match declared Frag "
+            f"names {frag_names!r} in order."
+        )
 
 
 def _split_args(arglist: str) -> list[str]:

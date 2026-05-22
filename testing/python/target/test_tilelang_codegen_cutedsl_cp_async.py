@@ -13,9 +13,6 @@ from tvm.target import Target
 
 
 def test_cutedsl_codegen_supports_tl_ptx_cp_async():
-    if not tvm.runtime.enabled("cuda"):
-        pytest.skip("TileLang CuTeDSL codegen requires TVM built with CUDA support.")
-
     build_cutedsl = tvm.ffi.get_global_func("target.build.tilelang_cutedsl_without_compile", allow_missing=True)
     if build_cutedsl is None:
         pytest.skip("TileLang CuTeDSL backend is not enabled in this build.")
@@ -33,10 +30,17 @@ def test_cutedsl_codegen_supports_tl_ptx_cp_async():
     assert "tl.cp_async_gs(" in artifact.kernel_source
 
 
-def test_cutedsl_codegen_preserves_extern_intrinsic_import_body():
-    if not tvm.runtime.enabled("cuda"):
-        pytest.skip("TileLang CuTeDSL codegen requires TVM built with CUDA support.")
+def test_cutedsl_compile_free_builder_is_registered_without_cuda_runtime():
+    """Source-only CuTeDSL codegen should load without a CUDA runtime."""
 
+    build_cutedsl = tvm.ffi.get_global_func(
+        "target.build.tilelang_cutedsl_without_compile",
+        allow_missing=True,
+    )
+    assert build_cutedsl is not None
+
+
+def test_cutedsl_codegen_preserves_extern_intrinsic_import_body():
     build_cutedsl = tvm.ffi.get_global_func("target.build.tilelang_cutedsl_without_compile", allow_missing=True)
     if build_cutedsl is None:
         pytest.skip("TileLang CuTeDSL backend is not enabled in this build.")

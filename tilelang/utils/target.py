@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-
-import torch
+from typing import Any
 
 from platform import mac_ver
 from typing import Literal
@@ -24,6 +23,19 @@ SUPPORTED_TARGETS: dict[str, str] = {
 }
 
 ROCM_MTRIPLE = "amdgcn-amd-amdhsa-hcc"
+
+
+def _import_optional_torch() -> Any | None:
+    try:
+        import torch  # type: ignore
+    except ModuleNotFoundError as exc:
+        if exc.name == "torch":
+            return None
+        raise
+    return torch
+
+
+torch = _import_optional_torch()
 
 
 def normalize_rocm_arch(arch: str | None) -> str | None:
@@ -70,6 +82,8 @@ def with_rocm_target_attrs(target: Target) -> Target:
 
 
 def _detect_torch_rocm_arch() -> str | None:
+    if torch is None:
+        return None
     if not torch.cuda.is_available():
         return None
     props = torch.cuda.get_device_properties(0)
@@ -139,7 +153,7 @@ def determine_fp8_type(fp8_format: Literal["e4m3", "e5m2"] = "e4m3") -> str:
     """
     if fp8_format not in {"e4m3", "e5m2"}:
         raise ValueError(f"Unsupported FP8 format: {fp8_format}")
-    if torch.version.hip is None:
+    if torch is None or torch.version.hip is None:
         return T.float8_e4m3fn if fp8_format == "e4m3" else T.float8_e5m2
     if not torch.cuda.is_available():
         return T.float8_e4m3fnuz if fp8_format == "e4m3" else T.float8_e5m2fnuz
@@ -155,6 +169,8 @@ def determine_fp8_type(fp8_format: Literal["e4m3", "e5m2"] = "e4m3") -> str:
 
 
 def determine_torch_fp8_type(fp8_format: Literal["e4m3", "e5m2"] = "e4m3") -> torch.dtype:
+    if torch is None:
+        raise RuntimeError("PyTorch is required to determine a torch FP8 dtype")
     dtype_name = determine_fp8_type(fp8_format)
     torch_dtype = getattr(torch, dtype_name, None)
     if torch_dtype is None:
@@ -249,7 +265,7 @@ def determine_target(target: str | Target | Literal["auto"] = "auto", return_obj
         # ROCm PyTorch exposes devices through torch.cuda. If CUDA tooling is
         # also present, prefer HIP so APUs such as gfx1151 are not misread as
         # CUDA architectures like sm_115a.
-        if torch.version.hip is not None and check_hip_availability():
+        if torch is not None and torch.version.hip is not None and check_hip_availability():
             return_var = _rocm_target_from_arch(_detect_torch_rocm_arch())
         else:
             # Check for CUDA and HIP availability
@@ -258,7 +274,11 @@ def determine_target(target: str | Target | Literal["auto"] = "auto", return_obj
 
             # Determine the target based on availability
             if is_cuda_available:
-                if torch.cuda.is_available() and (cap := torch.cuda.get_device_capability(0)):
+                if (
+                    torch is not None
+                    and torch.cuda.is_available()
+                    and (cap := torch.cuda.get_device_capability(0))
+                ):
                     return_var = Target({"kind": "cuda", "arch": f"sm_{nvcc.get_target_arch(cap)}"})
                 else:
                     return_var = "cuda"

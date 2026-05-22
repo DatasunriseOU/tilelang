@@ -212,8 +212,10 @@ class FusedKernelArtifact:
     # Entries are ``None`` for real fused outputs, ``("input", i)`` /
     # ``("param", i)`` for graph outputs that are exactly a placeholder or
     # get_attr parameter, ``("input_view", i)`` / ``("param_view", i)`` for
-    # reconstructable metadata views of those values, or ``("output", i)``
-    # for duplicate saved outputs that reuse an earlier graph output.
+    # reconstructable reshape-style metadata views of those values,
+    # ``("input_t", i)`` / ``("param_t", i)`` for 2-D transpose views, or
+    # ``("output", i)`` for duplicate saved outputs that reuse an earlier
+    # graph output.
     output_passthrough_sources: Tuple[Optional[Tuple[str, int]], ...] = ()
     # Wave-4 #09 fix #6: atomic-accumulator flag lives on the artifact so
     # the bwd compile can read it back (was previously sniffed inline in
@@ -281,6 +283,7 @@ def _normalise_passthrough_sources(
             or len(source) != 2
             or source[0] not in {
                 "input", "param", "output", "input_view", "param_view",
+                "input_t", "param_t",
             }
             or not isinstance(source[1], int)
         ):
@@ -298,6 +301,30 @@ def _as_output_list(result: Any) -> List[Any]:
     if isinstance(result, tuple):
         return list(result)
     return [result]
+
+
+def _output_container_from_signature(fx_signature: Dict[str, Any]) -> str:
+    container = fx_signature.get("output_container", "single")
+    if container not in {"single", "tuple", "list"}:
+        raise RuntimeError(
+            "tilelang custom_op wrapper received invalid output_container "
+            f"{container!r}"
+        )
+    return str(container)
+
+
+def _restore_output_container(result: Any, output_container: str) -> Any:
+    if output_container == "single":
+        return result
+    values = _as_output_list(result)
+    if output_container == "tuple":
+        return tuple(values)
+    if output_container == "list":
+        return values
+    raise RuntimeError(
+        f"tilelang custom_op wrapper received invalid output_container "
+        f"{output_container!r}"
+    )
 
 
 def _select_custom_op_outputs(
@@ -333,9 +360,14 @@ def _passthrough_value(
             f"{op_qualname}: output pass-through sources are resolved from "
             "the reconstructed output list"
         )
-    is_view = kind.endswith("_view")
-    pool_kind = kind[:-5] if is_view else kind
-    pool = runtime_inputs if pool_kind == "input" else param_tensors
+    if kind.startswith("input"):
+        pool = runtime_inputs
+    elif kind.startswith("param"):
+        pool = param_tensors
+    else:
+        raise RuntimeError(
+            f"{op_qualname}: unsupported pass-through source kind {kind!r}"
+        )
     try:
         value = pool[index]
     except IndexError as exc:
@@ -343,8 +375,30 @@ def _passthrough_value(
             f"{op_qualname}: pass-through output references missing "
             f"{kind} #{index}"
         ) from exc
-    if not is_view:
+    if kind in {"input", "param"}:
         return value
+    if kind in {"input_t", "param_t"}:
+        try:
+            value = value.t()
+        except Exception as exc:
+            raise RuntimeError(
+                f"{op_qualname}: pass-through {kind} #{index} could not "
+                "reconstruct aten.t"
+            ) from exc
+        if output_spec is not None:
+            expected_shape = tuple(getattr(output_spec, "shape", ()))
+            actual_shape = tuple(getattr(value, "shape", ()))
+            if expected_shape and actual_shape != expected_shape:
+                raise RuntimeError(
+                    f"{op_qualname}: pass-through {kind} #{index} "
+                    f"reconstructed shape {actual_shape}, expected "
+                    f"{expected_shape}"
+                )
+        return value
+    if kind not in {"input_view", "param_view"}:
+        raise RuntimeError(
+            f"{op_qualname}: unsupported pass-through source kind {kind!r}"
+        )
     if output_spec is None:
         raise RuntimeError(
             f"{op_qualname}: pass-through {kind} #{index} needs an output "
@@ -414,6 +468,7 @@ def _bind_passthrough_only_runtime(
     *,
     is_backward: bool = False,
     allow_grad_inputs: Optional[bool] = None,
+    output_container: str = "single",
 ) -> Callable[..., Any]:
     allow_grad = is_backward if allow_grad_inputs is None else allow_grad_inputs
     op_qualname = f"tilelang::{artifact.name}{'_bwd' if is_backward else '_fwd'}"
@@ -421,7 +476,7 @@ def _bind_passthrough_only_runtime(
 
     def _runner(*runtime_inputs: Any) -> Any:
         _check_no_grad(runtime_inputs, allow_grad=allow_grad)
-        return _reconstruct_full_outputs(
+        result = _reconstruct_full_outputs(
             (),
             passthrough_sources=passthrough_sources,
             custom_output_indices=(),
@@ -430,6 +485,7 @@ def _bind_passthrough_only_runtime(
             op_qualname=op_qualname,
             output_specs=tuple(artifact.output_specs),
         )
+        return _restore_output_container(result, output_container)
 
     side = "bw" if is_backward else "fw"
     _runner.__name__ = f"tilelang_{side}_passthrough_{artifact.name}"
@@ -480,6 +536,7 @@ def wrap_as_custom_op(
     op_qualname = f"tilelang::{artifact.name}{suffix}"
     allow_grad_runtime = is_backward if allow_grad_inputs is None else allow_grad_inputs
     passthrough_sources = _normalise_passthrough_sources(artifact)
+    output_container = _output_container_from_signature(fx_signature)
     custom_output_indices = tuple(
         i for i, source in enumerate(passthrough_sources) if source is None
     )
@@ -491,6 +548,7 @@ def wrap_as_custom_op(
             passthrough_sources,
             is_backward=is_backward,
             allow_grad_inputs=allow_grad_runtime,
+            output_container=output_container,
         )
 
     with _REGISTRY_LOCK:
@@ -503,6 +561,7 @@ def wrap_as_custom_op(
                 custom_output_indices=custom_output_indices,
                 is_backward=is_backward,
                 allow_grad_inputs=allow_grad_runtime,
+                output_container=output_container,
             )
 
         # Lazy import — module must import without torch.
@@ -639,6 +698,7 @@ def wrap_as_custom_op(
             custom_output_indices=custom_output_indices,
             is_backward=is_backward,
             allow_grad_inputs=allow_grad_runtime,
+            output_container=output_container,
         )
 
 
@@ -650,6 +710,7 @@ def _bind_runtime(
     custom_output_indices: Optional[Tuple[int, ...]] = None,
     is_backward: bool = False,
     allow_grad_inputs: Optional[bool] = None,
+    output_container: str = "single",
 ) -> Callable[..., Any]:
     """Wrap a registered op into the (placeholder-args)->output callable
     Dynamo expects from a backend.
@@ -677,8 +738,8 @@ def _bind_runtime(
         _check_no_grad(runtime_inputs, allow_grad=allow_grad)
         result = op(list(runtime_inputs))
         if not has_passthrough:
-            return result
-        return _reconstruct_full_outputs(
+            return _restore_output_container(result, output_container)
+        result = _reconstruct_full_outputs(
             result,
             passthrough_sources=passthrough_sources,
             custom_output_indices=custom_output_indices,
@@ -687,6 +748,7 @@ def _bind_runtime(
             op_qualname=op_qualname,
             output_specs=tuple(artifact.output_specs),
         )
+        return _restore_output_container(result, output_container)
 
     side = "bw" if is_backward else "fw"
     _runner.__name__ = f"tilelang_{side}_runner_{artifact.name}"

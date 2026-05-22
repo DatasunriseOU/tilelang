@@ -77,7 +77,12 @@ class _FakeRes:
         self.type = type("Ty", (), {"shape": shape, "element_type": dtype})()
 
 
-def test_dot_after_trans_b_emits_gemm_with_transpose_B_true(monkeypatch):
+class _FakeSharedBuffer:
+    def scope(self):
+        return "shared"
+
+
+def test_dot_after_trans_b_emits_gemm_with_transpose_B_true():
     """End-to-end fake-op walk: ``%bt = tt.trans %b ; tt.dot %a, %bt``."""
     om = _ctx()
     captured = {}
@@ -89,32 +94,25 @@ def test_dot_after_trans_b_emits_gemm_with_transpose_B_true(monkeypatch):
             return "FRESH_C"
 
         @staticmethod
-        def gemm(a, b, c, transpose_A=False, transpose_B=False):
+        def gemm(a, b, c, transpose_A=False, transpose_B=False, clear_accum=False):
             captured["gemm"] = {
                 "a": a,
                 "b": b,
                 "c": c,
                 "transpose_A": transpose_A,
                 "transpose_B": transpose_B,
+                "clear_accum": clear_accum,
             }
-            return ("gemm_handle", a, b, c, transpose_A, transpose_B)
-
-    # Stub the ``tilelang.language as T`` lazy import inside map_tt_dot.
-    import sys
-
-    import tilelang as real_tilelang
-
-    monkeypatch.setattr(real_tilelang, "language", _FakeT, raising=False)
-    monkeypatch.setitem(sys.modules, "tilelang", real_tilelang)
-    monkeypatch.setitem(sys.modules, "tilelang.language", _FakeT)  # type: ignore[arg-type]
 
     ctx = om.WalkerCtx()
-    a_fake = _FakeRes((16, 16), "float32")
-    b_fake = _FakeRes((16, 16), "float32")
-    bt_fake = _FakeRes((16, 16), "float32")
+    a_fake = _FakeRes((16, 16), "float16")
+    b_fake = _FakeRes((16, 16), "float16")
+    bt_fake = _FakeRes((16, 16), "float16")
+    c_fake = _FakeRes((16, 16), "float32")
     # Bind them in context
     ctx.bind(a_fake, "TIR_A")
     ctx.bind(b_fake, "TIR_B")
+    ctx.bind(c_fake, _FakeSharedBuffer())
 
     # tt.trans %b -> %bt
     om.map_tt_trans(
@@ -123,13 +121,13 @@ def test_dot_after_trans_b_emits_gemm_with_transpose_B_true(monkeypatch):
 
     # tt.dot %a, %bt -> %c. No transpose_B in attrs; the trans should fold.
     dot_op = {
-        "operands": [a_fake, bt_fake],
+        "operands": [a_fake, bt_fake, c_fake],
         "results": [_FakeRes((16, 16), "float32")],
         "attrs": {},
     }
     from poc.triton_frontend.op_emitters.reduction import map_tt_dot
-    
-    map_tt_dot(dot_op, ctx)
+
+    map_tt_dot(dot_op, ctx, language_module=_FakeT)
     assert "gemm" in captured, "T.gemm should have been called"
     assert captured["gemm"]["transpose_B"] is True, (
         "trans_b on %bt should fold into transpose_B=True at gemm time"
@@ -137,7 +135,7 @@ def test_dot_after_trans_b_emits_gemm_with_transpose_B_true(monkeypatch):
     assert captured["gemm"]["transpose_A"] is False
 
 
-def test_dot_with_transpose_B_attr_xors_with_pre_trans_b(monkeypatch):
+def test_dot_with_transpose_B_attr_xors_with_pre_trans_b():
     """If trans_b is *both* on the dot attr and via tt.trans, they cancel."""
     om = _ctx()
     captured = {}
@@ -148,35 +146,29 @@ def test_dot_with_transpose_B_attr_xors_with_pre_trans_b(monkeypatch):
             return "FRESH_C"
 
         @staticmethod
-        def gemm(a, b, c, transpose_A=False, transpose_B=False):
+        def gemm(a, b, c, transpose_A=False, transpose_B=False, clear_accum=False):
             captured["transpose_B"] = transpose_B
             return None
 
-    import sys
-
-    import tilelang as real_tilelang
-
-    monkeypatch.setattr(real_tilelang, "language", _FakeT, raising=False)
-    monkeypatch.setitem(sys.modules, "tilelang", real_tilelang)
-    monkeypatch.setitem(sys.modules, "tilelang.language", _FakeT)  # type: ignore[arg-type]
-
     ctx = om.WalkerCtx()
-    a_fake = _FakeRes((4, 4), "float32")
-    b_fake = _FakeRes((4, 4), "float32")
-    bt_fake = _FakeRes((4, 4), "float32")
+    a_fake = _FakeRes((4, 4), "float16")
+    b_fake = _FakeRes((4, 4), "float16")
+    bt_fake = _FakeRes((4, 4), "float16")
+    c_fake = _FakeRes((4, 4), "float32")
     ctx.bind(a_fake, "A")
     ctx.bind(b_fake, "B")
+    ctx.bind(c_fake, _FakeSharedBuffer())
     om.map_tt_trans(
         {"operands": [b_fake], "results": [bt_fake], "attrs": {}}, ctx
     )
     
     dot_op = {
-        "operands": [a_fake, bt_fake],
+        "operands": [a_fake, bt_fake, c_fake],
         "results": [_FakeRes((4, 4), "float32")],
         "attrs": {"trans_b": True},
     }
     from poc.triton_frontend.op_emitters.reduction import map_tt_dot
-    map_tt_dot(dot_op, ctx)    # trans_b on the dot attr (True) XOR pre-transposed via tt.trans (True)
+    map_tt_dot(dot_op, ctx, language_module=_FakeT)
     # => transpose_B=False reaches T.gemm.
     assert captured["transpose_B"] is False
 

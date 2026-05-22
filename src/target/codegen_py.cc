@@ -505,12 +505,35 @@ void CodeGenTileLangPY::VisitStmt_(const AllocateNode *op) {
   PrintStmt_(op->body);
 }
 
+void CodeGenTileLangPY::VisitStmt_(const AllocBufferNode *op) {
+  ICHECK(op->buffer.defined());
+  std::string vid = AllocVarID(op->buffer->data.get());
+
+  size_t constant_size = 1;
+  for (const auto &dim : op->buffer->shape) {
+    const IntImmNode *dim_imm = dim.as<IntImmNode>();
+    ICHECK(dim_imm) << "Can only handle constant size stack allocation for now";
+    constant_size *= dim_imm->value;
+  }
+  ICHECK_GT(constant_size, 0)
+      << "Can only handle constant size stack allocation for now";
+
+  auto scope = GetPtrStorageScope(op->buffer->data);
+  alloc_storage_scope_[op->buffer->data.get()] = scope;
+
+  PrintIndent();
+  stream << vid << " = [None] * " << constant_size << "\n";
+
+  RegisterHandleType_(op->buffer->data.get(), op->buffer->dtype);
+}
+
 void CodeGenTileLangPY::VisitStmt_(const AttrStmtNode *op) {
   if (op->attr_key == "pragma_import_c") {
     const auto *value = op->value.as<StringImmNode>();
     ICHECK(value != nullptr) << "pragma_import_c expects a StringImm value";
-    decl_stream << value->value;
-    if (!value->value.empty() && value->value.back() != '\n') {
+    std::string import_source = value->value;
+    decl_stream << import_source;
+    if (!import_source.empty() && import_source.back() != '\n') {
       decl_stream << "\n";
     }
     PrintStmt_(op->body);

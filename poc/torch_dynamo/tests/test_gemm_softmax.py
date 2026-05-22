@@ -25,6 +25,49 @@ def test_gemm_softmax_3op():
     out_tl = artifact.launcher(q, k)
     torch.testing.assert_close(out_ref, out_tl, atol=1e-2, rtol=1e-2)
 
+
+def test_gemm_softmax_3op_compiles_without_extern_fallback():
+    def fn(q, k):
+        return torch.softmax(torch.matmul(q, k.transpose(-1, -2)), dim=-1)
+
+    q = torch.randn(16, 8)
+    k = torch.randn(16, 8)
+    gm = fx.symbolic_trace(fn)
+    lowerer = FXToTileLang(gm, [q, k])
+    artifact = lowerer.run()
+
+    source = getattr(artifact, "source", "")
+    assert "tilelang.compile failed" not in source
+    assert "extern slot" not in source
+    torch.testing.assert_close(
+        artifact.launcher(q, k),
+        fn(q, k),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+def test_batched_gemm_softmax_3op_compiles_without_extern_fallback():
+    def fn(q, k):
+        return torch.softmax(torch.matmul(q, k.transpose(-1, -2)), dim=-1)
+
+    q = torch.randn(2, 4, 8)
+    k = torch.randn(2, 4, 8)
+    gm = fx.symbolic_trace(fn)
+    lowerer = FXToTileLang(gm, [q, k])
+    artifact = lowerer.run()
+
+    source = getattr(artifact, "source", "")
+    assert "tilelang.compile failed" not in source
+    assert "extern slot" not in source
+    torch.testing.assert_close(
+        artifact.launcher(q, k),
+        fn(q, k),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
 def test_gemm_softmax_2op():
     _FUSION_HITS.clear()
     def fn(q, k_t):
@@ -42,4 +85,3 @@ def test_gemm_softmax_2op():
     out_ref = fn(q, k_t)
     out_tl = artifact.launcher(q, k_t)
     torch.testing.assert_close(out_ref, out_tl, atol=1e-2, rtol=1e-2)
-

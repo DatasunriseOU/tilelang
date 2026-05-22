@@ -55,6 +55,35 @@ def test_passthrough_saved_input_stays_outside_custom_op_without_clone():
     assert saved_x is x
 
 
+def test_passthrough_saved_input_t_reconstructs_transpose_outside_custom_op():
+    @dataclass
+    class Spec:
+        shape: tuple
+        dtype: str
+
+    input_spec = Spec((4, 3), "float32")
+    output_spec = Spec((3, 4), "float32")
+
+    def my_launcher(w):
+        return w.t()
+
+    artifact = FusedKernelArtifact(
+        name="test_passthrough_saved_input_t_op",
+        launcher=my_launcher,
+        input_specs=[input_spec],
+        output_specs=[output_spec],
+        output_passthrough_sources=(("input_t", 0),),
+    )
+
+    runner = wrap_as_custom_op(artifact, fx_signature={})
+    w = torch.randn(4, 3, dtype=torch.float32)
+
+    saved_w_t = runner(w)
+
+    torch.testing.assert_close(saved_w_t, w.t())
+    assert saved_w_t.untyped_storage().data_ptr() == w.untyped_storage().data_ptr()
+
+
 def test_duplicate_saved_output_stays_outside_custom_op_without_clone():
     @dataclass
     class Spec:
@@ -117,6 +146,38 @@ def test_shape_dtype_inference():
             assert meta.dtype == torch.float32
 
     assert op_found
+
+
+def test_single_output_tuple_container_is_preserved():
+    @dataclass
+    class Spec:
+        shape: tuple
+        dtype: str
+
+    spec = Spec((2, 3), "float32")
+
+    def my_launcher(x):
+        return x * 2.0
+
+    artifact = FusedKernelArtifact(
+        name="test_single_output_tuple_container_op",
+        launcher=my_launcher,
+        input_specs=[spec],
+        output_specs=[spec],
+    )
+
+    runner = wrap_as_custom_op(
+        artifact,
+        fx_signature={"output_container": "tuple"},
+    )
+
+    x = torch.randn(2, 3, dtype=torch.float32)
+    out = runner(x)
+
+    assert isinstance(out, tuple)
+    assert len(out) == 1
+    torch.testing.assert_close(out[0], x * 2.0)
+
 
 def test_multi_output_shape_dtype_inference():
     @dataclass

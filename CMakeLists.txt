@@ -191,6 +191,14 @@ file(GLOB TILE_LANG_SRCS
   src/backend/cuda/op/copy_analysis.cc
   src/backend/metal/op/*.cc
   src/backend/webgpu/op/*.cc
+  # CuTeDSL codegen emits Python source and uses TVM's CUDA fallback module
+  # only as a source container. Keep this compile-free builder available in
+  # Metal/CPU dev builds so source-level CuTeDSL tests do not require CUDA.
+  src/target/codegen_py.cc
+  src/target/codegen_utils.cc
+  src/target/codegen_cutedsl.cc
+  src/target/ptx.cc
+  src/target/rt_mod_cutedsl.cc
   src/target/utils.cc
   src/target/codegen_c_host.cc
   src/target/codegen_c.cc

@@ -104,6 +104,75 @@ def _in_symbolic_fallback() -> bool:
     return bool(getattr(_symbolic_fallback_state, "active", False))
 
 
+def _is_saved_for_backward_desc(desc: Any) -> bool:
+    """Return True for functorch's SavedForBackwardsAOTOutput marker."""
+    return type(desc).__name__ == "SavedForBackwardsAOTOutput"
+
+
+def _is_noncontiguous_fx_tensor(value: Any) -> bool:
+    meta = getattr(value, "meta", None)
+    if not isinstance(meta, dict):
+        return False
+    fake_value = meta.get("val")
+    try:
+        if hasattr(fake_value, "is_contiguous"):
+            return not bool(fake_value.is_contiguous())
+    except Exception:
+        pass
+    tensor_meta = meta.get("tensor_meta")
+    stride = getattr(tensor_meta, "stride", None)
+    shape = getattr(tensor_meta, "shape", None)
+    if stride is None or shape is None:
+        return False
+    expected = []
+    running = 1
+    for dim in reversed(tuple(int(d) for d in shape)):
+        expected.append(running)
+        running *= dim
+    return tuple(stride) != tuple(reversed(expected))
+
+
+def _materialize_noncontiguous_saved_outputs(gm: torch.fx.GraphModule) -> bool:
+    """Insert explicit contiguous materialisation for AOT saved views.
+
+    AOTAutograd forward graphs return user outputs followed by saved tensors
+    for the backward graph. When one of those saved tensors is a non-contiguous
+    view of an input, returning it through ``torch.library.custom_op`` either
+    violates the aliasing contract or pushes a strided tensor through the next
+    fused kernel boundary. Materialising it here keeps the copy visible in the
+    FX graph instead of hiding it in the Python wrapper.
+    """
+    import torch  # type: ignore[import-not-found]
+
+    changed = False
+    for output_node in gm.graph.nodes:
+        if output_node.op != "output":
+            continue
+        outs_raw = output_node.args[0] if output_node.args else ()
+        if not isinstance(outs_raw, (tuple, list)):
+            return False
+        descs = output_node.meta.get("desc", ())
+        if not isinstance(descs, (tuple, list)) or len(descs) != len(outs_raw):
+            return False
+        new_outs = []
+        for out, desc in zip(outs_raw, descs):
+            if _is_saved_for_backward_desc(desc) and _is_noncontiguous_fx_tensor(out):
+                with gm.graph.inserting_after(out):
+                    out = gm.graph.call_function(
+                        torch.ops.aten.clone.default,
+                        args=(out,),
+                        kwargs={"memory_format": torch.contiguous_format},
+                    )
+                changed = True
+            new_outs.append(out)
+        output_node.args = (type(outs_raw)(new_outs),)
+        break
+    if changed:
+        gm.graph.lint()
+        gm.recompile()
+    return changed
+
+
 __all__ = [
     "make_aot_backend",
     "tilelang_fw_compiler",
@@ -711,6 +780,8 @@ def _compile_one_side(
     # absent from ``ATEN_DISPATCH``. Surfacing them here yields one
     # actionable error per missing emitter instead of a confusing dispatch
     # crash deep in the walker.
+    if not is_backward:
+        _materialize_noncontiguous_saved_outputs(gm)
     _validate_graph(gm)
     # Wave-3 #09 item 1: route SymInt-bearing graphs through the symbolic-
     # tile compile path so dynamic-shape callers stop recompiling per

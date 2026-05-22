@@ -66,6 +66,7 @@ ffi::Module BuildTileLangCuTeDSLWithoutCompile(IRModule mod, Target target) {
     code = (*f)(code, target).cast<std::string>();
   }
   ffi::Map<ffi::String, ffi::String> source_map;
+  source_map.Set("cuda", code);
   source_map.Set("cuda_source", code);
   return target::CUDAModuleCreateWithFallback(ffi::Bytes("ptx", 3), ffi::String("ptx"),
                                               ExtractFuncInfo(mod), source_map);

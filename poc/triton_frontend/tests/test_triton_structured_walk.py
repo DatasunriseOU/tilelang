@@ -11,6 +11,8 @@ Skipped when the vendored ``register_dialects`` shim has not been built
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 
@@ -39,11 +41,23 @@ def _try_import_mlir_ir():
         return None
 
 
+def _try_load_cxx_shim():
+    try:
+        from poc.triton_frontend.ptr_analysis import dialects_available, _load_shim
+        if dialects_available():
+            return _load_shim()
+    except (ImportError, NotImplementedError):
+        return None
+    return None
+
+
 _REGISTER = _try_load_register_dialects()
 _IR = _try_import_mlir_ir()
+_CXX_SHIM = _try_load_cxx_shim()
 
-skip_no_dialects = pytest.mark.skipif(
-    _REGISTER is None or _IR is None,
+
+skip_no_structured_parser = pytest.mark.skipif(
+    (_REGISTER is None or _IR is None) and _CXX_SHIM is None,
     reason=(
         "vendored TritonStructured pybind shim or mlir python bindings not "
         "available; build with -DTRITON_INSTALL_DIR set (see "
@@ -55,33 +69,25 @@ skip_no_dialects = pytest.mark.skipif(
 # Keep the snippet small but exercise multiple tts.* ops + at least one tt.* op.
 RICHER_MODULE = (
     "module {\n"
-    "  func.func @walk_target(\n"
-    "      %base: !tt.ptr<f32>, %off: index, %st: index,\n"
-    "      %gs_off: tensor<8xi32>) {\n"
-    "    %0 = tts.make_tptr %base to\n"
-    "          sizes: [4],\n"
-    "          strides: [%st],\n"
-    "          offsets: [%off],\n"
-    "          shape: [0],\n"
-    "          order: []\n"
-    "          : !tt.ptr<f32> to tensor<4x!tt.ptr<f32>>\n"
-    "    %1 = tts.make_gather_scatter_tptr %base to\n"
-    "          sizes: [8]\n"
-    "          gather_scatter_dim: 0\n"
-    "          gather_scatter_offset: %gs_off,\n"
-    "          strides: [%st],\n"
-    "          offsets: [%off],\n"
-    "          shape: [0],\n"
-    "          order: []\n"
-    "          : !tt.ptr<f32> to tensor<8x!tt.ptr<f32>>\n"
-    "    return\n"
+    "  tt.func public @walk_target(\n"
+    "      %base: !tt.ptr<f32>, %gs_off: tensor<8xi32>, %st: index) {\n"
+    "    %0 = tts.make_tptr %base to sizes: [4], strides: [1],\n"
+    "          offsets: [0], shape: [0], order: []\n"
+    "          : <f32> to tensor<4x!tt.ptr<f32>>\n"
+    "    %1 = tts.make_gather_scatter_tptr %base to sizes: [8]\n"
+    "          gather_scatter_dim: 0 gather_scatter_offset: %gs_off,\n"
+    "          strides: [%st], offsets: [0]\n"
+    "          : tensor<8xi32>  <f32> to tensor<8x!tt.ptr<f32>>\n"
+    "    tt.return\n"
     "  }\n"
     "}\n"
 )
 
 
-@skip_no_dialects
-def test_walk_visits_tts_ops() -> None:
+def _walk_names_with_python_mlir() -> list[str] | None:
+    if _REGISTER is None or _IR is None:
+        return None
+
     ir = _IR  # captured at import time
     register_dialects = _REGISTER
 
@@ -109,18 +115,30 @@ def test_walk_visits_tts_ops() -> None:
                         for block in region:
                             for inner in block:
                                 seen.append(inner.name)
-
-        tts_ops = [n for n in seen if n.startswith("tts.")]
-        assert tts_ops, (
-            f"expected at least one tts.* op in the walk, saw: {seen!r}"
-        )
-        assert any(n == "tts.make_tptr" for n in tts_ops)
+        return seen
 
 
-@skip_no_dialects
+def _walk_names_with_cxx_shim() -> list[str] | None:
+    if _CXX_SHIM is None:
+        return None
+    return json.loads(_CXX_SHIM.walk_op_names_json(RICHER_MODULE))
+
+
+@skip_no_structured_parser
+def test_walk_visits_tts_ops() -> None:
+    seen = _walk_names_with_python_mlir()
+    if seen is None:
+        seen = _walk_names_with_cxx_shim()
+
+    assert seen is not None
+    tts_ops = [n for n in seen if n.startswith("tts.")]
+    assert tts_ops, f"expected at least one tts.* op in the walk, saw: {seen!r}"
+    assert any(n == "tts.make_tptr" for n in tts_ops)
+
+
+@skip_no_structured_parser
 def test_parser_rejects_unregistered_when_disallowed() -> None:
     """Sanity: confirm the dialect registry is the ONLY thing letting tts.* parse."""
-    ir = _IR
     bad = (
         "module {\n"
         "  func.func @uses_phantom_dialect() {\n"
@@ -129,6 +147,15 @@ def test_parser_rejects_unregistered_when_disallowed() -> None:
         "  }\n"
         "}\n"
     )
+
+    if _IR is None:
+        assert _CXX_SHIM is not None
+        ctx = _CXX_SHIM.Context()
+        with pytest.raises(RuntimeError):
+            _CXX_SHIM.Module(ctx, bad)
+        return
+
+    ir = _IR
     with ir.Context() as ctx:
         # Don't register dialects -- ensure unregistered dialects are blocked.
         ctx.allow_unregistered_dialects = False

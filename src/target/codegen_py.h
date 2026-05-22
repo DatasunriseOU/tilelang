@@ -183,6 +183,7 @@ protected:
   // source compatibility with sites that dispatch to it explicitly via
   // `as<AllocateNode>()`.
   void VisitStmt_(const AllocateNode *op);
+  void VisitStmt_(const AllocBufferNode *op) override;
   void VisitStmt_(const AttrStmtNode *op) override;
   void VisitStmt_(const ForNode *op) override;
   void VisitStmt_(const WhileNode *op) override;

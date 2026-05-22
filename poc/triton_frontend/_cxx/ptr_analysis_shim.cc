@@ -50,6 +50,7 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/Operation.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
@@ -209,6 +210,29 @@ char* tl_pa_module_to_generic(TLPtrAnalysisModule* mod) {
   mlir::OpPrintingFlags flags;
   flags.printGenericOpForm();
   m->module.get().print(os, flags);
+  os.flush();
+  char* buf = static_cast<char*>(std::malloc(out.size() + 1));
+  if (!buf) return nullptr;
+  std::memcpy(buf, out.data(), out.size());
+  buf[out.size()] = '\0';
+  return buf;
+}
+
+char* tl_pa_module_op_names_json(TLPtrAnalysisModule* mod) {
+  if (!mod) return nullptr;
+  auto* m = reinterpret_cast<ModuleImpl*>(mod);
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  os << "[";
+  bool first = true;
+  m->module.get().walk([&](mlir::Operation* op) {
+    if (!first) {
+      os << ",";
+    }
+    first = false;
+    os << "\"" << jsonEscape(op->getName().getStringRef()) << "\"";
+  });
+  os << "]";
   os.flush();
   char* buf = static_cast<char*>(std::malloc(out.size() + 1));
   if (!buf) return nullptr;

@@ -117,12 +117,12 @@ class FxToTileLangUnsupported(NotImplementedError):
 
 
 class _RegionFallbackReplayError(RuntimeError):
-    """A compiled region fell back to FX replay with region-local args."""
+    """A compiled region needs outer whole-graph FX replay."""
 
     def __init__(self, kernel_error: RuntimeError, replay_error: Exception) -> None:
         super().__init__(
-            "compiled region runtime fallback replay failed with region-local "
-            f"inputs: {replay_error}"
+            "compiled region runtime fallback needs outer FX replay: "
+            f"{replay_error}"
         )
         self.kernel_error = kernel_error
         self.replay_error = replay_error
@@ -1709,9 +1709,22 @@ class FXToTileLang:
         return {
             "input_specs": list(self.ctx.input_specs),
             "output_specs": list(self.ctx.output_specs),
+            "output_container": self._output_container_kind(),
             "output_passthrough_sources": list(self._output_passthrough_sources()),
             "n_params": len(self.ctx.param_tensors),
         }
+
+    def _output_container_kind(self) -> str:
+        for node in self.gm.graph.nodes:
+            if node.op != "output":
+                continue
+            outs_raw = node.args[0] if node.args else ()
+            if isinstance(outs_raw, tuple):
+                return "tuple"
+            if isinstance(outs_raw, list):
+                return "list"
+            return "single"
+        return "single"
 
     def _normalised_output_values(self) -> Tuple[Any, ...]:
         for node in self.gm.graph.nodes:
@@ -1747,6 +1760,16 @@ class FXToTileLang:
                 args = getattr(node, "args", ()) or ()
                 if op_key == "detach" and args:
                     return _source_for_node(args[0])
+                if op_key == "t" and args:
+                    base_source = _source_for_node(args[0])
+                    if (
+                        base_source is not None
+                        and base_source[0] in {"input", "param"}
+                    ):
+                        return (
+                            "input_t" if base_source[0] == "input" else "param_t",
+                            base_source[1],
+                        )
                 if op_key in view_ops and args:
                     base_source = _source_for_node(args[0])
                     if base_source is not None and base_source[0] in {
@@ -1761,6 +1784,16 @@ class FXToTileLang:
             if op == "call_method":
                 method_name = str(getattr(node, "target", ""))
                 args = getattr(node, "args", ()) or ()
+                if method_name == "t" and args:
+                    base_source = _source_for_node(args[0])
+                    if (
+                        base_source is not None
+                        and base_source[0] in {"input", "param"}
+                    ):
+                        return (
+                            "input_t" if base_source[0] == "input" else "param_t",
+                            base_source[1],
+                        )
                 if method_name in view_ops and args:
                     base_source = _source_for_node(args[0])
                     if base_source is not None and base_source[0] in {
@@ -1819,6 +1852,15 @@ class FXToTileLang:
         # ``tilelang::fused_<hash>`` registry move from "theoretically
         # plausible" to "practically infeasible".
         h = hashlib.blake2b(digest_size=16)
+        for node in self.gm.graph.nodes:
+            input_names = tuple(
+                getattr(input_node, "name", "")
+                for input_node in getattr(node, "all_input_nodes", ())
+            )
+            h.update(
+                f"G{node.op}|{getattr(node, 'name', '')}|"
+                f"{getattr(node, 'target', '')}|{input_names}".encode()
+            )
         for op, payload in self.ctx.op_trace:
             h.update(op.encode())
             for x in payload:
@@ -1835,6 +1877,7 @@ class FXToTileLang:
                     h.update(repr(x).encode())
         for spec in self.ctx.input_specs + self.ctx.output_specs:
             h.update(f"S{spec.shape}|{spec.dtype}".encode())
+        h.update(f"O{self._output_container_kind()}".encode())
         for source in self._output_passthrough_sources():
             h.update(f"P{source!r}".encode())
         self._content_hash = h.hexdigest()
@@ -2386,6 +2429,106 @@ class FXToTileLang:
         if has_transpose:
             k_spec = captured[0][1][1]
             q_spec = captured[1][1][1]
+            if len(q_spec.shape) == 3 and len(k_spec.shape) == 3:
+                bsz, m, k = q_spec.shape
+                bsz2, n, k2 = k_spec.shape
+                if bsz != bsz2 or k != k2:
+                    raise NotImplementedError(
+                        "batched gemm_softmax shape mismatch: "
+                        f"Q.shape={q_spec.shape}, K.shape={k_spec.shape}"
+                    )
+                dtype = q_spec.dtype
+                block_M, block_N, block_K = self._tile_constants(m, n, k)
+                threads = 32 if (block_M < 8 or block_N < 8) else 128
+
+                if block_M % 8 != 0:
+                    @T.prim_func
+                    def kernel(
+                        K: T.Tensor((bsz, n, k), dtype),
+                        Q: T.Tensor((bsz, m, k), dtype),
+                        P: T.Tensor((bsz, m, n), dtype),
+                    ):
+                        if False:  # noqa: SIM103
+                            _ = (bsz, m, n, k, dtype)  # noqa: F841
+                        with T.Kernel(
+                            T.ceildiv(n, block_N),
+                            T.ceildiv(m, block_M),
+                            bsz,
+                            threads=threads,
+                        ) as (bx, by, bz):
+                            S_l = T.alloc_shared((block_M, block_N), "float32")
+                            T.clear(S_l)
+                            for kk in T.serial(k):
+                                for i, j in T.Parallel(block_M, block_N):
+                                    S_l[i, j] += (
+                                        T.cast(
+                                            Q[bz, by * block_M + i, kk],
+                                            "float32",
+                                        )
+                                        * T.cast(
+                                            K[bz, bx * block_N + j, kk],
+                                            "float32",
+                                        )
+                                    )
+                            m_max = T.alloc_fragment((block_M,), "float32")
+                            for i in T.Parallel(block_M):
+                                m_max[i] = T.cast(-3.4028234663852886e38, "float32")
+                                for j in T.serial(block_N):
+                                    m_max[i] = T.max(m_max[i], S_l[i, j])
+                            for i, j in T.Parallel(block_M, block_N):
+                                S_l[i, j] = T.exp(S_l[i, j] - m_max[i])
+                            l_sum = T.alloc_fragment((block_M,), "float32")
+                            for i in T.Parallel(block_M):
+                                l_sum[i] = T.cast(0, "float32")
+                                for j in T.serial(block_N):
+                                    l_sum[i] += S_l[i, j]
+                            for i, j in T.Parallel(block_M, block_N):
+                                P[bz, by * block_M + i, bx * block_N + j] = (
+                                    T.cast(S_l[i, j] / l_sum[i], dtype)
+                                )
+
+                    return kernel
+
+                @T.prim_func
+                def kernel(
+                    K: T.Tensor((bsz, n, k), dtype),
+                    Q: T.Tensor((bsz, m, k), dtype),
+                    P: T.Tensor((bsz, m, n), dtype),
+                ):
+                    if False:  # noqa: SIM103
+                        _ = (bsz, m, n, k, dtype)  # noqa: F841
+                    with T.Kernel(
+                        T.ceildiv(n, block_N),
+                        T.ceildiv(m, block_M),
+                        bsz,
+                        threads=threads,
+                    ) as (bx, by, bz):
+                        Q_s = T.alloc_shared((block_M, block_K), dtype)
+                        K_s = T.alloc_shared((block_N, block_K), dtype)
+                        S_l = T.alloc_shared((block_M, block_N), "float32")
+                        T.clear(S_l)
+                        for ko in T.Pipelined(T.ceildiv(k, block_K), num_stages=2):
+                            T.copy(Q[bz, by * block_M, ko * block_K], Q_s)
+                            T.copy(K[bz, bx * block_N, ko * block_K], K_s)
+                            T.gemm(Q_s, K_s, S_l, transpose_B=True)
+                        m_max = T.alloc_fragment((block_M,), "float32")
+                        for i in T.Parallel(block_M):
+                            m_max[i] = T.cast(-3.4028234663852886e38, "float32")
+                            for j in T.serial(block_N):
+                                m_max[i] = T.max(m_max[i], S_l[i, j])
+                        for i, j in T.Parallel(block_M, block_N):
+                            S_l[i, j] = T.exp(S_l[i, j] - m_max[i])
+                        l_sum = T.alloc_fragment((block_M,), "float32")
+                        for i in T.Parallel(block_M):
+                            l_sum[i] = T.cast(0, "float32")
+                            for j in T.serial(block_N):
+                                l_sum[i] += S_l[i, j]
+                        for i, j in T.Parallel(block_M, block_N):
+                            S_l[i, j] = S_l[i, j] / l_sum[i]
+                        T.copy(S_l, P[bz, by * block_M, bx * block_N])
+
+                return kernel
+
             m, k = q_spec.shape
             n, k2 = k_spec.shape
             dtype = q_spec.dtype
@@ -2403,18 +2546,24 @@ class FXToTileLang:
                               threads=128) as (bx, by):
                     Q_s = T.alloc_shared((block_M, block_K), dtype)
                     K_s = T.alloc_shared((block_N, block_K), dtype)
-                    S_l = T.alloc_fragment((block_M, block_N), "float32")
+                    S_l = T.alloc_shared((block_M, block_N), "float32")
                     T.clear(S_l)
                     for ko in T.Pipelined(T.ceildiv(k, block_K), num_stages=2):
                         T.copy(Q[by * block_M, ko * block_K], Q_s)
                         T.copy(K[bx * block_N, ko * block_K], K_s)
                         T.gemm(Q_s, K_s, S_l, transpose_B=True)
                     m_max = T.alloc_fragment((block_M,), "float32")
-                    T.reduce_max(S_l, m_max, dim=-1, clear=True)
+                    for i in T.Parallel(block_M):
+                        m_max[i] = T.cast(-3.4028234663852886e38, "float32")
+                        for j in T.serial(block_N):
+                            m_max[i] = T.max(m_max[i], S_l[i, j])
                     for i, j in T.Parallel(block_M, block_N):
                         S_l[i, j] = T.exp(S_l[i, j] - m_max[i])
                     l_sum = T.alloc_fragment((block_M,), "float32")
-                    T.reduce_sum(S_l, l_sum, dim=-1, clear=True)
+                    for i in T.Parallel(block_M):
+                        l_sum[i] = T.cast(0, "float32")
+                        for j in T.serial(block_N):
+                            l_sum[i] += S_l[i, j]
                     for i, j in T.Parallel(block_M, block_N):
                         S_l[i, j] = S_l[i, j] / l_sum[i]
                     T.copy(S_l, P[by * block_M, bx * block_N])
@@ -2422,6 +2571,106 @@ class FXToTileLang:
         else:
             q_spec = captured[0][1][1]
             k_t_spec = captured[0][1][2]
+            if len(q_spec.shape) == 3 and len(k_t_spec.shape) == 3:
+                bsz, m, k = q_spec.shape
+                bsz2, k2, n = k_t_spec.shape
+                if bsz != bsz2 or k != k2:
+                    raise NotImplementedError(
+                        "batched softmax_epilogue shape mismatch: "
+                        f"Q.shape={q_spec.shape}, K_t.shape={k_t_spec.shape}"
+                    )
+                dtype = q_spec.dtype
+                block_M, block_N, block_K = self._tile_constants(m, n, k)
+                threads = 32 if (block_M < 8 or block_N < 8) else 128
+
+                if block_M % 8 != 0:
+                    @T.prim_func
+                    def kernel(
+                        Q: T.Tensor((bsz, m, k), dtype),
+                        K_t: T.Tensor((bsz, k, n), dtype),
+                        P: T.Tensor((bsz, m, n), dtype),
+                    ):
+                        if False:  # noqa: SIM103
+                            _ = (bsz, m, n, k, dtype)  # noqa: F841
+                        with T.Kernel(
+                            T.ceildiv(n, block_N),
+                            T.ceildiv(m, block_M),
+                            bsz,
+                            threads=threads,
+                        ) as (bx, by, bz):
+                            S_l = T.alloc_shared((block_M, block_N), "float32")
+                            T.clear(S_l)
+                            for kk in T.serial(k):
+                                for i, j in T.Parallel(block_M, block_N):
+                                    S_l[i, j] += (
+                                        T.cast(
+                                            Q[bz, by * block_M + i, kk],
+                                            "float32",
+                                        )
+                                        * T.cast(
+                                            K_t[bz, kk, bx * block_N + j],
+                                            "float32",
+                                        )
+                                    )
+                            m_max = T.alloc_fragment((block_M,), "float32")
+                            for i in T.Parallel(block_M):
+                                m_max[i] = T.cast(-3.4028234663852886e38, "float32")
+                                for j in T.serial(block_N):
+                                    m_max[i] = T.max(m_max[i], S_l[i, j])
+                            for i, j in T.Parallel(block_M, block_N):
+                                S_l[i, j] = T.exp(S_l[i, j] - m_max[i])
+                            l_sum = T.alloc_fragment((block_M,), "float32")
+                            for i in T.Parallel(block_M):
+                                l_sum[i] = T.cast(0, "float32")
+                                for j in T.serial(block_N):
+                                    l_sum[i] += S_l[i, j]
+                            for i, j in T.Parallel(block_M, block_N):
+                                P[bz, by * block_M + i, bx * block_N + j] = (
+                                    T.cast(S_l[i, j] / l_sum[i], dtype)
+                                )
+
+                    return kernel
+
+                @T.prim_func
+                def kernel(
+                    Q: T.Tensor((bsz, m, k), dtype),
+                    K_t: T.Tensor((bsz, k, n), dtype),
+                    P: T.Tensor((bsz, m, n), dtype),
+                ):
+                    if False:  # noqa: SIM103
+                        _ = (bsz, m, n, k, dtype)  # noqa: F841
+                    with T.Kernel(
+                        T.ceildiv(n, block_N),
+                        T.ceildiv(m, block_M),
+                        bsz,
+                        threads=threads,
+                    ) as (bx, by, bz):
+                        Q_s = T.alloc_shared((block_M, block_K), dtype)
+                        K_t_s = T.alloc_shared((block_K, block_N), dtype)
+                        S_l = T.alloc_shared((block_M, block_N), "float32")
+                        T.clear(S_l)
+                        for ko in T.Pipelined(T.ceildiv(k, block_K), num_stages=2):
+                            T.copy(Q[bz, by * block_M, ko * block_K], Q_s)
+                            T.copy(K_t[bz, ko * block_K, bx * block_N], K_t_s)
+                            T.gemm(Q_s, K_t_s, S_l)
+                        m_max = T.alloc_fragment((block_M,), "float32")
+                        for i in T.Parallel(block_M):
+                            m_max[i] = T.cast(-3.4028234663852886e38, "float32")
+                            for j in T.serial(block_N):
+                                m_max[i] = T.max(m_max[i], S_l[i, j])
+                        for i, j in T.Parallel(block_M, block_N):
+                            S_l[i, j] = T.exp(S_l[i, j] - m_max[i])
+                        l_sum = T.alloc_fragment((block_M,), "float32")
+                        for i in T.Parallel(block_M):
+                            l_sum[i] = T.cast(0, "float32")
+                            for j in T.serial(block_N):
+                                l_sum[i] += S_l[i, j]
+                        for i, j in T.Parallel(block_M, block_N):
+                            S_l[i, j] = S_l[i, j] / l_sum[i]
+                        T.copy(S_l, P[bz, by * block_M, bx * block_N])
+
+                return kernel
+
             m, k = q_spec.shape
             k2, n = k_t_spec.shape
             dtype = q_spec.dtype
@@ -2439,18 +2688,24 @@ class FXToTileLang:
                               threads=128) as (bx, by):
                     Q_s = T.alloc_shared((block_M, block_K), dtype)
                     K_t_s = T.alloc_shared((block_K, block_N), dtype)
-                    S_l = T.alloc_fragment((block_M, block_N), "float32")
+                    S_l = T.alloc_shared((block_M, block_N), "float32")
                     T.clear(S_l)
                     for ko in T.Pipelined(T.ceildiv(k, block_K), num_stages=2):
                         T.copy(Q[by * block_M, ko * block_K], Q_s)
                         T.copy(K_t[ko * block_K, bx * block_N], K_t_s)
                         T.gemm(Q_s, K_t_s, S_l)
                     m_max = T.alloc_fragment((block_M,), "float32")
-                    T.reduce_max(S_l, m_max, dim=-1, clear=True)
+                    for i in T.Parallel(block_M):
+                        m_max[i] = T.cast(-3.4028234663852886e38, "float32")
+                        for j in T.serial(block_N):
+                            m_max[i] = T.max(m_max[i], S_l[i, j])
                     for i, j in T.Parallel(block_M, block_N):
                         S_l[i, j] = T.exp(S_l[i, j] - m_max[i])
                     l_sum = T.alloc_fragment((block_M,), "float32")
-                    T.reduce_sum(S_l, l_sum, dim=-1, clear=True)
+                    for i in T.Parallel(block_M):
+                        l_sum[i] = T.cast(0, "float32")
+                        for j in T.serial(block_N):
+                            l_sum[i] += S_l[i, j]
                     for i, j in T.Parallel(block_M, block_N):
                         S_l[i, j] = S_l[i, j] / l_sum[i]
                     T.copy(S_l, P[by * block_M, bx * block_N])
@@ -3202,10 +3457,38 @@ class FXToTileLang:
         boundary handling.
         """
         gm = self.gm
+        input_names: List[str] = []
+        try:
+            partitions = self._partition_count_cache()
+            region_io = self._derive_region_io(partitions)
+            if region_io is not None:
+                for candidate, (candidate_inputs, _) in zip(partitions, region_io):
+                    if candidate is region or candidate == region:
+                        input_names = list(candidate_inputs)
+                        break
+            runtime_input_names = [
+                n.name
+                for n in self.gm.graph.nodes
+                if n.op == "placeholder"
+            ]
+        except Exception:  # pragma: no cover - defensive only
+            runtime_input_names = []
+
         # Mark this launcher as the extern fallback so the chain launcher
         # can detect "all regions extern" and short-circuit to a single
         # gm.forward call (the only safe approximation today).
         def _launcher(*runtime_inputs: Any) -> Any:
+            if input_names and runtime_input_names:
+                env = dict(zip(input_names, runtime_inputs))
+                if all(name in env for name in runtime_input_names):
+                    return gm(*(env[name] for name in runtime_input_names))
+                missing = [
+                    name for name in runtime_input_names if name not in env
+                ]
+                raise RuntimeError(
+                    "region-local fallback lacks graph input(s): "
+                    + ", ".join(missing)
+                )
             return gm(*runtime_inputs)
 
         _launcher._tilelang_extern_fallback = True  # type: ignore[attr-defined]
@@ -3416,7 +3699,11 @@ class FXToTileLang:
                     # Fall back to gm.forward this call.
                     return gm(*runtime_inputs)
                 rl_count = getattr(rl, "_tilelang_runtime_fallback_count", 0)
-                out = rl(*in_tensors)
+                try:
+                    out = rl(*in_tensors)
+                except _RegionFallbackReplayError:
+                    _record_runtime_fallback(_launcher_multi)
+                    return gm(*runtime_inputs)
                 _sync_child_runtime_fallbacks(_launcher_multi, rl, rl_count)
                 if not isinstance(out, tuple):
                     out_tup: Tuple[Any, ...] = (out,)

@@ -335,6 +335,25 @@ def wrong_name(a: cute.Tensor, out: cute.Tensor):
         )
 
 
+def test_cutedsl_body_requires_matching_frag_parameter_names():
+    """CuTeDSL is AST-parseable, so mismatched arg names should fail closed."""
+    body = """import cutlass.cute as cute
+
+@cute.kernel
+def fused_relu_add_16(x: cute.Tensor, y: cute.Tensor):
+    y[0] = x[0]
+"""
+    with pytest.raises(ValueError, match="parameter name"):
+        extern_intrinsic(
+            name="fused_relu_add_16",
+            signature=lambda: (
+                Frag("a", (16,), "shared", "float32"),
+                Frag("out", (16,), "shared", "float32", is_output=True),
+            ),
+            bodies={"cutedsl": body},
+        )
+
+
 def test_cutedsl_body_accepts_bare_kernel_decorator_alias():
     """Official CuTe DSL docs describe the GPU decorator as ``@kernel``.
 

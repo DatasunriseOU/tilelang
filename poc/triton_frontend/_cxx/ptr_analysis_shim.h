@@ -71,6 +71,11 @@ char*                tl_pa_module_to_string(TLPtrAnalysisModule* mod);
 // loaded (jaxlib's stripped mlir.ir, brew mlir-opt) can round-trip the text.
 char*                tl_pa_module_to_generic(TLPtrAnalysisModule* mod);
 
+// Walk the parsed module and return a JSON array of operation names in MLIR
+// walk order. This is intentionally a lightweight diagnostics/test seam for
+// hosts whose Python MLIR bindings cannot share contexts with the C++ shim.
+char*                tl_pa_module_op_names_json(TLPtrAnalysisModule* mod);
+
 void                 tl_pa_string_free(char* s);
 
 // ---- Driver entry points ---------------------------------------------------

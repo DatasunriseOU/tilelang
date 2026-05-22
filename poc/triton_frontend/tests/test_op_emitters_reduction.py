@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 import pytest
+import warnings
 
 pytest.importorskip("tilelang")
 tvm = pytest.importorskip("tvm")
@@ -660,8 +661,8 @@ def test_tt_atomic_max_dispatches_to_max_emitter():
     assert "atomic_max" in text_l or "atomicmax" in text_l
 
 
-def test_tt_atomic_cas_uses_call_intrin_path():
-    """CAS isn't on the TileLang surface; we always use call_intrin."""
+def test_tt_atomic_cas_uses_native_call_intrin_without_synthesis_warning():
+    """CAS must lower to native tir.atomic_cas, not the xchg synthesis."""
     ctx = WalkerCtx()
     ptr_ssa = _ssa("ptr", dtype="int32")
     cmp_ssa = _ssa("cmp", dtype="int32")
@@ -674,9 +675,13 @@ def test_tt_atomic_cas_uses_call_intrin_path():
     ctx.bind(new_ssa, new_var)
 
     op = _op("tt.atomic_cas", [ptr_ssa, cmp_ssa, new_ssa], [])
-    handle = REDUCTION_EMITTERS["tt.atomic_cas"](op, ctx)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        handle = REDUCTION_EMITTERS["tt.atomic_cas"](op, ctx)
     text_l = (str(handle) + " " + str(ctx.stmts)).lower()
     assert "atomic_cas" in text_l
+    assert "atomic_cas_synthesis" not in text_l
+    assert "atomic_xchg" not in text_l
 
 
 # ---------------------------------------------------------------------------

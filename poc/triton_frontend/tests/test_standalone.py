@@ -1,11 +1,9 @@
 """Standalone numeric check that drives Triton -> TileLang end-to-end.
 
-Importing ``triton`` (and therefore ``triton._C.libtriton``) at module
-scope conflicts with ``_triton_frontend_cxx`` -- both statically link
-their own LLVM. We therefore guard the triton import behind a module-
-level skip that fires when the shim is already loaded in this process,
-and lazy-import triton inside the test body. Running this file on its
-own (no shim loaded yet) behaves exactly like before.
+Importing ``triton`` (and therefore ``triton._C.libtriton``) in a pytest
+process that has already imported TileLang/TVM can abort on duplicate LLVM
+command-line option registration. Keep this test import-safe by running every
+Triton-dependent check in a fresh child process.
 """
 from __future__ import annotations
 
@@ -15,29 +13,21 @@ import sys
 
 import pytest
 
-from poc.triton_frontend._test_harness.native_import_guard import (
-    triton_import_block_reason,
-)
+
+def test_run():
+    _run_from_triton_kernel_smoke_in_fresh_process()
+
+    result = _run_vector_add_numeric_smoke_in_fresh_process()
+    assert result["verdict"] == "NUMERIC_PASS", result
+    assert result["max_abs_err"] is not None
 
 
-# If the C++ shim / TileLang / TVM side has already been imported in this
-# Python process, loading Triton's libtriton too can register duplicate LLVM
-# cl::opts and SIGABRT the interpreter. Skip the whole module cleanly in that
-# case; operators can rerun this file in a fresh process to exercise it.
-_triton_block_reason = triton_import_block_reason()
-if _triton_block_reason is not None:
-    pytest.skip(
-        "test_standalone.py skipped: "
-        f"{_triton_block_reason} Re-run "
-        "`pytest poc/triton_frontend/tests/test_standalone.py` in a fresh "
-        "Python process to exercise it.",
-        allow_module_level=True,
-    )
+def _run_from_triton_kernel_smoke_in_fresh_process() -> None:
+    script = """
+import triton
+import triton.language as tl
 
-import triton  # noqa: E402
-import triton.language as tl  # noqa: E402
-
-from poc.triton_frontend import from_triton_kernel  # noqa: E402
+from poc.triton_frontend import from_triton_kernel
 
 
 @triton.jit
@@ -50,22 +40,30 @@ def _vector_add_kernel(x_ptr, y_ptr, out_ptr, n_elements, BLOCK: tl.constexpr):
     tl.store(out_ptr + offsets, x + y, mask=mask)
 
 
-def test_run():
-    BLOCK = 128
-    func = from_triton_kernel(
-        _vector_add_kernel,
-        constexprs={"BLOCK": BLOCK},
-        target="metal",
+func = from_triton_kernel(
+    _vector_add_kernel,
+    constexprs={"BLOCK": 128},
+    target="metal",
+)
+text = str(func)
+assert "_vector_add_kernel" in text, text
+assert "arg0" in text, text
+assert "arg1" in text, text
+assert "arg2" in text, text
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
     )
-    text = str(func)
-    assert "_vector_add_kernel" in text
-    assert "arg0" in text
-    assert "arg1" in text
-    assert "arg2" in text
-
-    result = _run_vector_add_numeric_smoke_in_fresh_process()
-    assert result["verdict"] == "NUMERIC_PASS", result
-    assert result["max_abs_err"] is not None
+    if completed.returncode != 0:
+        pytest.fail(
+            "standalone from_triton_kernel smoke failed with "
+            f"exit={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
+            f"STDERR:\n{completed.stderr}"
+        )
 
 
 def _run_vector_add_numeric_smoke_in_fresh_process() -> dict[str, object]:

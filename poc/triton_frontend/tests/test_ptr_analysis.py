@@ -319,30 +319,35 @@ def test_rewrite_error_is_cached_and_re_raised() -> None:
 
 def test_run_ptr_analysis_with_states_is_cached() -> None:
     from poc.triton_frontend.ptr_analysis import run_ptr_analysis_with_states
-    from unittest.mock import patch
 
     run_ptr_analysis_with_states.cache_clear()
 
-    with patch("poc.triton_frontend.ptr_analysis._load_shim") as mock_load_shim:
-        class DummyShim:
-            def run_ptr_analysis_with_states(self, text):
-                # Intentionally returns the minimal `{"op": ...}` schema so the
-                # parser exercises Path B (printed-op regex fallback). Filter the
-                # one-shot RuntimeWarning emitted by that path; this test is
-                # about LRU caching, not the JSON shape.
-                return text + "_rewritten", '[{"op": "dummy"}]'
+    class DummyShim:
+        def run_ptr_analysis_with_states(self, text):
+            # Intentionally returns the minimal `{"op": ...}` schema so the
+            # parser exercises Path B (printed-op regex fallback). Filter the
+            # one-shot RuntimeWarning emitted by that path; this test is
+            # about LRU caching, not the JSON shape.
+            return text + "_rewritten", '[{"op": "dummy"}]'
 
-        mock_load_shim.return_value = DummyShim()
+    class DummyShimLoader:
+        def __init__(self) -> None:
+            self.calls = 0
 
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message=r".*missing fields.*",
-                category=RuntimeWarning,
-            )
-            res1 = run_ptr_analysis_with_states("test_module_1")
-            res2 = run_ptr_analysis_with_states("test_module_1")
+        def __call__(self) -> DummyShim:
+            self.calls += 1
+            return DummyShim()
 
-        assert res1 == res2
-        # The shim should only be requested and called once
-        mock_load_shim.assert_called_once()
+    loader = DummyShimLoader()
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*missing fields.*",
+            category=RuntimeWarning,
+        )
+        res1 = run_ptr_analysis_with_states("test_module_1", shim_loader=loader)
+        res2 = run_ptr_analysis_with_states("test_module_1", shim_loader=loader)
+
+    assert res1 == res2
+    # The shim should only be requested and called once
+    assert loader.calls == 1

@@ -461,6 +461,37 @@ def test_numeric_smoke_script_path_cli_invocation(tmp_path) -> None:
     assert "vector_add" in report_path.read_text()
 
 
+def test_standalone_numeric_test_runs_after_tilelang_import() -> None:
+    """Standalone conformance must not skip once TileLang is already loaded."""
+    script = f"""
+import pytest
+import tilelang  # noqa: F401
+
+raise SystemExit(pytest.main([
+    "-q",
+    "{(_REPO_ROOT / 'poc' / 'triton_frontend' / 'tests' / 'test_standalone.py').as_posix()}",
+    "-rs",
+]))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert completed.returncode == 0, (
+        "standalone numeric pytest failed after TileLang import with "
+        f"exit={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
+        f"STDERR:\n{completed.stderr}"
+    )
+    combined = completed.stdout + completed.stderr
+    assert "skipped" not in combined.lower(), combined
+    assert "passed" in combined.lower(), combined
+
+
 def test_run_all_writes_report(tmp_path) -> None:
     """``run_all`` writes a markdown report at the requested path.
 

@@ -36,7 +36,7 @@ import warnings
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 __all__ = [
     "PtrState",
@@ -689,13 +689,15 @@ def extract_ptr_states(ttir_text: str) -> List[PtrState]:
 @lru_cache(maxsize=128)
 def run_ptr_analysis_with_states(
     ttir_text: str,
+    *,
+    shim_loader: Callable[[], Any] | None = None,
 ) -> Tuple[str, List[PtrState]]:
     """Combined rewrite + extract; one shim invocation.
 
     Returns ``(rewritten_ttir_text, states)``. Cheaper than calling the two
     helpers separately because the shim parses the input only once.
     """
-    shim = _load_shim()
+    shim = (shim_loader or _load_shim)()
     ttir_text = _normalize_program_id_axis_for_ptr_analysis(ttir_text)
     rewritten, raw_states = shim.run_ptr_analysis_with_states(ttir_text)
     if not isinstance(raw_states, str):
