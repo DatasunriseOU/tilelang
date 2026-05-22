@@ -26,6 +26,7 @@ Adding a new kernel
 3. Tag it with a ``source`` URI so the report can cite where the
    pattern came from.
 """
+
 from __future__ import annotations
 
 import os
@@ -67,6 +68,18 @@ class CannedKernel:
 
     constexprs: Optional[dict] = None
     """Compile-time constants if/when running through the live compiler."""
+
+    live_kernel_module: Optional[str] = None
+    """Optional numeric_kernels module name used to capture real TTIR."""
+
+    live_kernel_attr: str = "TRITON_KERNEL"
+    """Attribute on ``live_kernel_module`` that holds the @triton.jit kernel."""
+
+    live_meta_args_attr: str = "META_ARGS"
+    """Attribute on ``live_kernel_module`` that holds constexpr bindings."""
+
+    live_signature_attr: str = "TTIR_SIGNATURE"
+    """Attribute on ``live_kernel_module`` that holds Triton arg types."""
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +274,7 @@ CANNED_TTIR_FIXTURES: List[CannedKernel] = [
         source="triton tutorial 01 / poc/triton_frontend/tests/test_vector_add.py",
         ttir_text=_VECTOR_ADD_TTIR,
         constexprs={"BLOCK": 128},
+        live_kernel_module="vector_add",
     ),
     CannedKernel(
         name="softmax",
@@ -268,6 +282,7 @@ CANNED_TTIR_FIXTURES: List[CannedKernel] = [
         source="triton tutorial 02",
         ttir_text=_SOFTMAX_TTIR,
         constexprs={"BLOCK_N": 256},
+        live_kernel_module="softmax",
     ),
     CannedKernel(
         name="matmul",
@@ -275,6 +290,7 @@ CANNED_TTIR_FIXTURES: List[CannedKernel] = [
         source="triton tutorial 03",
         ttir_text=_MATMUL_TTIR,
         constexprs={"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+        live_kernel_module="matmul",
     ),
     CannedKernel(
         name="row_sum",
@@ -282,6 +298,7 @@ CANNED_TTIR_FIXTURES: List[CannedKernel] = [
         source="canonical reduction kernel",
         ttir_text=_REDUCTION_TTIR,
         constexprs={"BLOCK_N": 256},
+        live_kernel_module="row_sum",
     ),
     CannedKernel(
         name="layer_norm",
@@ -289,24 +306,28 @@ CANNED_TTIR_FIXTURES: List[CannedKernel] = [
         source="triton tutorial 05",
         ttir_text=_LAYER_NORM_TTIR,
         constexprs={"BLOCK_N": 256},
+        live_kernel_module="layer_norm",
     ),
     CannedKernel(
         name="gather_rows_3d",
         description="Gather + scatter pattern from nanochat/triton_kernels.py.",
         source="~/sources/nanochat/nanochat/triton_kernels.py:_gather_rows_3d_kernel",
         ttir_text=_GATHER_3D_TTIR,
+        live_kernel_module="gather_rows_3d",
     ),
     CannedKernel(
         name="atomic_hist",
         description="Atomic-add histogram pattern (cppmega megatron kernels).",
         source="~/sources/cppmega/cppmega/megatron/* (atomic_rmw flavour)",
         ttir_text=_ATOMIC_HIST_TTIR,
+        live_kernel_module="atomic_hist",
     ),
     CannedKernel(
         name="async_pipeline",
-        description="Async copy + mbarrier protocol skeleton (Hopper TMA-style).",
-        source="hand-derived from RFC section 5.4 and tt.async_* coverage",
+        description=("RFC 5.4 descriptor/TMA transfer: native TMA on NV, pointer-arith fallback elsewhere."),
+        source="live tl.make_tensor_descriptor descriptor-load fallback for RFC section 5.4",
         ttir_text=_ASYNC_PIPELINE_TTIR,
+        live_kernel_module="tma_descriptor_copy",
     ),
     CannedKernel(
         name="fla_dot_exp2",
@@ -318,6 +339,7 @@ CANNED_TTIR_FIXTURES: List[CannedKernel] = [
         source="~/sources/rent_kernels/flash-linear-attention/fla/ops/common/chunk_delta_h.py",
         ttir_text=_FLA_DOT_EXP2_TTIR,
         constexprs={"BT": 32, "BV": 32, "K": 32},
+        live_kernel_module="fla_dot_exp2",
     ),
     # ---- Real captured TTIR (not hand-written) ----------------------------
     # ``fla_chunk_delta_h_real_ttir`` is the *actual* Triton-3.6 TTIR text
@@ -333,18 +355,22 @@ CANNED_TTIR_FIXTURES: List[CannedKernel] = [
     # ``fla_dot_exp2`` motif above is the toy cousin.
     CannedKernel(
         name="fla_chunk_delta_h_real_ttir",
-        description=(
-            "Real captured TTIR for FLA "
-            "chunk_gated_delta_rule_fwd_kernel_h_blockdim64 "
-            "(K=64 single-block, no gates, no varlen)."
-        ),
+        description=("Real captured TTIR for FLA chunk_gated_delta_rule_fwd_kernel_h_blockdim64 (K=64 single-block, no gates, no varlen)."),
         source="~/sources/rent_kernels/flash-linear-attention/fla/ops/common/chunk_delta_h.py:41 (captured via triton_jit_to_ttir, apple/mps backend, triton-pr9701)",
         ttir_text=_read_capture("fla_chunk_delta_h_real_ttir.mlir"),
         constexprs={
-            "H": 1, "HV": 1, "K": 64, "V": 32, "BT": 16, "BV": 32,
-            "USE_G": False, "USE_GK": False,
-            "USE_INITIAL_STATE": False, "STORE_FINAL_STATE": False,
-            "SAVE_NEW_VALUE": False, "TRANSPOSE_STATE": False,
+            "H": 1,
+            "HV": 1,
+            "K": 64,
+            "V": 32,
+            "BT": 16,
+            "BV": 32,
+            "USE_G": False,
+            "USE_GK": False,
+            "USE_INITIAL_STATE": False,
+            "STORE_FINAL_STATE": False,
+            "SAVE_NEW_VALUE": False,
+            "TRANSPOSE_STATE": False,
             "IS_VARLEN": False,
         },
     ),

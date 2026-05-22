@@ -17,7 +17,10 @@ canonical vector_add fixture catches that class of bug at CI time.
 Per the project's ``feedback_no_silent_delete`` rule we deliberately
 do not delete or modify any reducer state from the tests.
 """
+
 from __future__ import annotations
+
+import pytest
 
 from poc.triton_frontend._test_harness import canned_ttir, run_corpus
 from poc.triton_frontend._test_harness import jit_to_ttir
@@ -34,14 +37,20 @@ def test_triton_available_blocks_after_tilelang_native_load() -> None:
             raise AssertionError("triton import must be blocked before import")
         return object()
 
-    assert jit_to_ttir.triton_available(
-        import_module=guarded_import,
-        loaded_modules=loaded_modules,
-    ) is False
-    assert jit_to_ttir.triton_version(
-        import_module=guarded_import,
-        loaded_modules=loaded_modules,
-    ) is None
+    assert (
+        jit_to_ttir.triton_available(
+            import_module=guarded_import,
+            loaded_modules=loaded_modules,
+        )
+        is False
+    )
+    assert (
+        jit_to_ttir.triton_version(
+            import_module=guarded_import,
+            loaded_modules=loaded_modules,
+        )
+        is None
+    )
     assert "triton" not in calls
 
 
@@ -55,9 +64,7 @@ def test_vector_add_at_least_degraded() -> None:
     floor.
     """
     fixtures = {k.name: k for k in canned_ttir.CANNED_TTIR_FIXTURES}
-    assert "vector_add" in fixtures, (
-        "vector_add canned fixture must exist for the harness self-test"
-    )
+    assert "vector_add" in fixtures, "vector_add canned fixture must exist for the harness self-test"
 
     result = run_corpus.run_one(fixtures["vector_add"])
     acceptable = {
@@ -65,13 +72,127 @@ def test_vector_add_at_least_degraded() -> None:
         run_corpus.Status.LOWERED_DEGRADED,
     }
     assert result.status in acceptable, (
-        f"vector_add expected LOWERED_*, got {result.status} "
-        f"(error_type={result.error_type!r}, msg={result.error_message!r})"
+        f"vector_add expected LOWERED_*, got {result.status} (error_type={result.error_type!r}, msg={result.error_message!r})"
     )
     # Sanity: visited_ops must contain the kernel's headline ops.
     visited = set(result.visited_ops)
     assert "tt.load" in visited, f"tt.load missing from {visited!r}"
     assert "tt.store" in visited, f"tt.store missing from {visited!r}"
+
+
+def test_vector_add_live_numeric_kernel_reaches_full_when_triton_available() -> None:
+    """The reducer corpus should use the real numeric Triton kernel when safe.
+
+    The hand-written vector_add TTIR is only an OP_TABLE coverage sketch. In a
+    process where Triton can be imported before TileLang/TVM native peers, the
+    corpus should prefer the numeric conformance kernel so this row proves the
+    production MLIR walker path instead of staying at LOWERED_DEGRADED.
+    """
+    if not jit_to_ttir.triton_available():
+        pytest.skip("Triton import blocked or unavailable in this process")
+    if not run_corpus._has_tvm():
+        pytest.skip("TVM unavailable; LOWERED_FULL classification is not meaningful")
+
+    fixtures = {k.name: k for k in canned_ttir.CANNED_TTIR_FIXTURES}
+    result = run_corpus.run_one(fixtures["vector_add"])
+
+    assert result.status == run_corpus.Status.LOWERED_FULL, (
+        f"vector_add should use the live numeric Triton kernel when available; "
+        f"got status={result.status}, walker={result.walker_used}, "
+        f"error_type={result.error_type!r}, msg={result.error_message!r}"
+    )
+    assert result.walker_used == "mlir"
+
+
+def test_row_sum_live_numeric_kernel_reaches_full_when_triton_available() -> None:
+    """The canonical reduction row should use a live TTIR capture."""
+    if not jit_to_ttir.triton_available():
+        pytest.skip("Triton import blocked or unavailable in this process")
+    if not run_corpus._has_tvm():
+        pytest.skip("TVM unavailable; LOWERED_FULL classification is not meaningful")
+
+    fixtures = {k.name: k for k in canned_ttir.CANNED_TTIR_FIXTURES}
+    result = run_corpus.run_one(fixtures["row_sum"])
+
+    assert result.status == run_corpus.Status.LOWERED_FULL, (
+        f"row_sum should use the live numeric Triton kernel when available; "
+        f"got status={result.status}, walker={result.walker_used}, "
+        f"error_type={result.error_type!r}, msg={result.error_message!r}"
+    )
+    assert result.walker_used == "mlir"
+
+
+def test_gather_rows_3d_live_numeric_kernel_reaches_full_when_triton_available() -> None:
+    """The gather/scatter row should use a live TTIR capture."""
+    if not jit_to_ttir.triton_available():
+        pytest.skip("Triton import blocked or unavailable in this process")
+    if not run_corpus._has_tvm():
+        pytest.skip("TVM unavailable; LOWERED_FULL classification is not meaningful")
+
+    fixtures = {k.name: k for k in canned_ttir.CANNED_TTIR_FIXTURES}
+    result = run_corpus.run_one(fixtures["gather_rows_3d"])
+
+    assert result.status == run_corpus.Status.LOWERED_FULL, (
+        f"gather_rows_3d should use the live numeric Triton kernel when "
+        f"available; got status={result.status}, walker={result.walker_used}, "
+        f"error_type={result.error_type!r}, msg={result.error_message!r}"
+    )
+    assert result.walker_used == "mlir"
+
+
+def test_atomic_hist_live_numeric_kernel_reaches_full_when_triton_available() -> None:
+    """The atomic histogram row should use a live TTIR capture."""
+    if not jit_to_ttir.triton_available():
+        pytest.skip("Triton import blocked or unavailable in this process")
+    if not run_corpus._has_tvm():
+        pytest.skip("TVM unavailable; LOWERED_FULL classification is not meaningful")
+
+    fixtures = {k.name: k for k in canned_ttir.CANNED_TTIR_FIXTURES}
+    result = run_corpus.run_one(fixtures["atomic_hist"])
+
+    assert result.status == run_corpus.Status.LOWERED_FULL, (
+        f"atomic_hist should use the live numeric Triton kernel when "
+        f"available; got status={result.status}, walker={result.walker_used}, "
+        f"error_type={result.error_type!r}, msg={result.error_message!r}"
+    )
+    assert result.walker_used == "mlir"
+
+
+def test_async_pipeline_live_tma_fallback_reaches_full_when_triton_available() -> None:
+    """The RFC 5.4 async/TMA row should use a live descriptor fallback capture."""
+    if not jit_to_ttir.triton_available():
+        pytest.skip("Triton import blocked or unavailable in this process")
+    if not run_corpus._has_tvm():
+        pytest.skip("TVM unavailable; LOWERED_FULL classification is not meaningful")
+
+    fixtures = {k.name: k for k in canned_ttir.CANNED_TTIR_FIXTURES}
+    assert fixtures["async_pipeline"].live_kernel_module == "tma_descriptor_copy"
+    result = run_corpus.run_one(fixtures["async_pipeline"])
+
+    assert result.status == run_corpus.Status.LOWERED_FULL, (
+        f"async_pipeline should use the live descriptor/TMA fallback kernel "
+        f"when available; got status={result.status}, walker={result.walker_used}, "
+        f"error_type={result.error_type!r}, msg={result.error_message!r}"
+    )
+    assert result.walker_used == "mlir"
+
+
+def test_fla_dot_exp2_live_numeric_kernel_reaches_full_when_triton_available() -> None:
+    """The FLA dot+exp2 row should use a live TTIR capture."""
+    if not jit_to_ttir.triton_available():
+        pytest.skip("Triton import blocked or unavailable in this process")
+    if not run_corpus._has_tvm():
+        pytest.skip("TVM unavailable; LOWERED_FULL classification is not meaningful")
+
+    fixtures = {k.name: k for k in canned_ttir.CANNED_TTIR_FIXTURES}
+    result = run_corpus.run_one(fixtures["fla_dot_exp2"])
+
+    assert result.status == run_corpus.Status.LOWERED_FULL, (
+        f"fla_dot_exp2 should use the live numeric Triton kernel when "
+        f"available; got status={result.status}, walker={result.walker_used}, "
+        f"error_type={result.error_type!r}, msg={result.error_message!r}"
+    )
+    assert result.walker_used == "mlir"
 
 
 def test_run_corpus_renders_markdown() -> None:
@@ -132,10 +253,7 @@ def test_fla_chunk_delta_h_real_ttir_routes() -> None:
         f"error_type={result.error_type!r}, "
         f"error_message={(result.error_message or '')[:200]!r}"
     )
-    assert not result.missing_ops, (
-        "FLA TTIR has missing_ops -- new emitters needed: "
-        f"{result.missing_ops!r}"
-    )
+    assert not result.missing_ops, f"FLA TTIR has missing_ops -- new emitters needed: {result.missing_ops!r}"
 
     # 2) Sanity: visited_ops must contain the kernel's headline ops --
     # tt.dot (accumulator chain), tt.load / tt.store (block-ptr I/O),
@@ -143,31 +261,32 @@ def test_fla_chunk_delta_h_real_ttir_routes() -> None:
     # helper inlines), and tt.return (function epilogue).
     visited = set(result.visited_ops)
     for needed in ("tt.dot", "tt.load", "tt.store", "tt.addptr", "tt.call", "tt.return"):
-        assert needed in visited, (
-            f"FLA TTIR visited set missing {needed!r}; got {sorted(visited)!r}"
-        )
+        assert needed in visited, f"FLA TTIR visited set missing {needed!r}; got {sorted(visited)!r}"
 
     # 3) Strict cross-dialect probe: every dotted op (``tt.*``,
     # ``arith.*``, ``math.*``, ``scf.*``, ``ub.*``, ``llvm.*``) must be
     # in OP_TABLE or in the structural skip list.
     from poc.triton_frontend import OP_TABLE
+
     enumerated = run_corpus._enumerate_all_ops(fix.ttir_text)
     structural = {"tt.func", "tt.return"}
-    truly_missing = sorted({
-        op for op in enumerated
-        if "." in op
-        and op not in OP_TABLE
-        and op not in structural
-        # Loc-tag noise: the textual TTIR contains "chunk_delta_h.py" and
-        # "standard.py" inside ``loc("...":line:col)`` annotations. Those
-        # match our dotted-op regex but are file paths, not ops.
-        and not op.endswith(".py")
-        and op != "triton.language"
-        and op != "tt.ptr"  # part of ``!tt.ptr<f32>`` type syntax
-    })
+    truly_missing = sorted(
+        {
+            op
+            for op in enumerated
+            if "." in op
+            and op not in OP_TABLE
+            and op not in structural
+            # Loc-tag noise: the textual TTIR contains "chunk_delta_h.py" and
+            # "standard.py" inside ``loc("...":line:col)`` annotations. Those
+            # match our dotted-op regex but are file paths, not ops.
+            and not op.endswith(".py")
+            and op != "triton.language"
+            and op != "tt.ptr"  # part of ``!tt.ptr<f32>`` type syntax
+        }
+    )
     assert not truly_missing, (
-        f"FLA TTIR has dialect ops not in OP_TABLE: {truly_missing!r}. "
-        "Add emitters in op_emitters/{arith,memory,reduction,control}.py."
+        f"FLA TTIR has dialect ops not in OP_TABLE: {truly_missing!r}. Add emitters in op_emitters/{{arith,memory,reduction,control}}.py."
     )
 
 

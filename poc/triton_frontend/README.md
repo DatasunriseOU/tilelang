@@ -35,24 +35,24 @@ extern intrinsic mechanism).
     options, codegen,                  v
     module_map, ctx))         +----------------------+
                               | jaxlib alias bootstrap|
-                              | (mlir.ir bindings    |
-                              |  reused from jaxlib) |
+                              | (mlir.ir bindings     |
+                              |  reused from jaxlib)  |
                               +----------------------+
                                        |
                                        v
                          +-----------------------------+
                          | Custom -> generic round-trip |
-                         | via _triton_frontend_cxx    |
-                         | Module.to_generic() so the  |
-                         | walker sees stable text     |
+                         | via _triton_frontend_cxx     |
+                         | Module.to_generic() so the   |
+                         | walker sees stable text      |
                          +-----------------------------+
                                        |
                                        v
-                       +---------------+---------------+
-                       |               |               |
+                       +---------------+---------------------------+
+                       |               |                           |
                      CUDA            HIP/ROCm      Metal/SIMDgroup
-                       |               |               |
-                       +---------------+---------------+
+                       |               |                           |
+                       +---------------+---------------------------+
                                        |
                                        v
                            TileLang -> Metal -> MLX

@@ -161,12 +161,8 @@ def _resolved_or_none(ctx: WalkerCtx, ssa_value: Any) -> Any:
     if ssa_value is None:
         return None
     try:
-        return ctx.value_map.get(ssa_value)
-    except TypeError:
-        # ssa_value is unhashable (e.g. a dict-shaped fake op from tests, or
-        # a raw operand record from the regex walker). value_map keys are
-        # always hashable SSA names; an unhashable key is by definition
-        # not in the map, so return None.
+        return ctx.get(ssa_value)
+    except (KeyError, TypeError):
         return None
 
 
@@ -1390,7 +1386,9 @@ def emit_tt_load(op: Any, ctx: WalkerCtx) -> Any:
     # ``ctx.ptr_states`` keyed by SSA name). When found, we synthesize the
     # legacy tagged-dict shape that ``_emit_load_copy`` already understands
     # so the existing T.copy code path runs and we DON'T emit ``# DEGRADED:``.
-    if (resolved is None or not (isinstance(resolved, dict) and "_ptrstate" in resolved)):
+    if resolved is None or (
+        isinstance(resolved, dict) and "_ptrstate" not in resolved
+    ):
         state = _lookup_ptr_state(ctx, op, ptr_ssa)
         if state is not None:
             resolved = {
@@ -1583,7 +1581,9 @@ def emit_tt_store(op: Any, ctx: WalkerCtx) -> Any:
     # Pre-pass-seeded PtrState lookup (see emit_tt_load). Promotes the no-shim
     # ``# DEGRADED:`` path to the real T.copy when run_ptr_analysis_pre_pass
     # has surfaced a tile descriptor for the destination pointer.
-    if (resolved is None or not (isinstance(resolved, dict) and "_ptrstate" in resolved)):
+    if resolved is None or (
+        isinstance(resolved, dict) and "_ptrstate" not in resolved
+    ):
         state = _lookup_ptr_state(ctx, op, ptr_ssa)
         if state is not None:
             resolved = {

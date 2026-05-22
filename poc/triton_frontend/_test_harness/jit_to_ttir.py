@@ -7,7 +7,7 @@ textual IR. Returns the TTIR as a string.
 Public surface:
     - TTIRCaptureError       — Triton compile failed *after* it was reachable.
     - TritonUnavailable      — Triton not installed (or import fails hard).
-    - triton_jit_to_ttir(fn, constexprs=None, target=None) -> str
+    - triton_jit_to_ttir(fn, constexprs=None, signature=None, target=None) -> str
 
 API spelling differences we handle:
     * Triton 3.6+: ``ASTSource(constexprs=...)`` + ``make_ir(target, options,
@@ -118,7 +118,7 @@ def _infer_signature(fn, constexprs) -> Dict[str, str]:
     return sig
 
 
-def _try_triton_3_6(fn, constexprs, target):
+def _try_triton_3_6(fn, constexprs, signature, target):
     """Triton 3.6+: ASTSource(constexprs=...) + make_ir.
 
     Stops at the TTIR stage — never invokes Metal/PTX codegen, so the
@@ -159,7 +159,11 @@ def _try_triton_3_6(fn, constexprs, target):
             module_map = backend_inst.get_module_map()
             ctx = _libir.context()
             backend_inst.load_dialects(ctx)
-            sig = _infer_signature(fn, constexprs)
+            sig = (
+                dict(signature)
+                if signature is not None
+                else _infer_signature(fn, constexprs)
+            )
             src = ASTSource(fn=fn, signature=sig, constexprs=constexprs or {})
             module = src.make_ir(gpu_target, opts, codegen, module_map, ctx)
             return str(module)
@@ -171,14 +175,14 @@ def _try_triton_3_6(fn, constexprs, target):
     )
 
 
-def _try_triton_3_0(fn, constexprs, target):
+def _try_triton_3_0(fn, constexprs, signature, target):
     """Triton 3.0/3.1: ASTSource(constants=...) + compile(stage='ttir')."""
     try:
         from triton.compiler.compiler import ASTSource, compile as _compile
     except ImportError as exc:
         raise TTIRCaptureError(f"3.0 API not found: {exc}") from exc
     try:
-        src = ASTSource(fn=fn, signature={}, constants=constexprs or {})
+        src = ASTSource(fn=fn, signature=signature or {}, constants=constexprs or {})
         result = _compile(src, options={"stage": "ttir"})
         if hasattr(result, "asm") and "ttir" in result.asm:
             return result.asm["ttir"]
@@ -187,11 +191,11 @@ def _try_triton_3_0(fn, constexprs, target):
         raise TTIRCaptureError(f"3.0 compile failed: {exc}") from exc
 
 
-def _try_triton_2(fn, constexprs, target):
+def _try_triton_2(fn, constexprs, signature, target):
     """Triton 2.x: positional ``triton.compile(fn, signature=..., output='ttir')``."""
     import triton
     try:
-        return triton.compile(fn, signature={}, output="ttir")
+        return triton.compile(fn, signature=signature or {}, output="ttir")
     except Exception as exc:
         raise TTIRCaptureError(f"2.x compile failed: {exc}") from exc
 
@@ -200,6 +204,7 @@ def triton_jit_to_ttir(
     fn: Callable[..., Any],
     *,
     constexprs: Optional[Dict[str, Any]] = None,
+    signature: Optional[Dict[str, str]] = None,
     target: Optional[str] = None,
 ) -> str:
     """Lower a ``@triton.jit`` kernel to TTIR text, probing for the right API.
@@ -212,7 +217,7 @@ def triton_jit_to_ttir(
     last_err: Optional[Exception] = None
     for variant in (_try_triton_3_6, _try_triton_3_0, _try_triton_2):
         try:
-            return variant(fn, constexprs, target)
+            return variant(fn, constexprs, signature, target)
         except TTIRCaptureError as exc:
             last_err = exc
             continue

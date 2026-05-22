@@ -33,7 +33,6 @@ all exceptions are captured, never silenced.
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import importlib
 import os
 import re
@@ -42,7 +41,7 @@ import traceback
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # Make sure we can import poc.triton_frontend regardless of how the
 # script is invoked (``python -m`` vs. plain ``python path/to/file``).
@@ -161,7 +160,7 @@ def _try_mlir_walker(
     populated :class:`WalkerCtx`) is returned for inspection.
     """
     try:
-        from poc.triton_frontend import mlir_walker  # noqa: WPS433
+        from poc.triton_frontend import mlir_walker as _mlir_walker  # noqa: F401,WPS433
     except Exception as exc:
         return [], exc, None, None
 
@@ -174,6 +173,38 @@ def _try_mlir_walker(
         return _enumerate_all_ops(ttir_text), None, kind, prim
     except Exception as exc:  # noqa: BLE001
         return [], exc, None, None
+
+
+def _resolve_live_kernel(
+    kernel: _canned.CannedKernel,
+) -> tuple[Any | None, dict[str, Any] | None, dict[str, str] | None]:
+    """Resolve optional live numeric-kernel metadata without eager imports."""
+
+    live_kernel = getattr(kernel, "live_kernel", None)
+    constexprs = kernel.constexprs
+    if live_kernel is not None:
+        return live_kernel, constexprs, None
+
+    module_name = getattr(kernel, "live_kernel_module", None)
+    if not module_name:
+        return None, constexprs, None
+    if "." not in module_name:
+        module_name = (
+            "poc.triton_frontend._test_harness.numeric_kernels."
+            f"{module_name}"
+        )
+    module = importlib.import_module(module_name)
+    kernel_attr = getattr(kernel, "live_kernel_attr", "TRITON_KERNEL")
+    meta_attr = getattr(kernel, "live_meta_args_attr", "META_ARGS")
+    signature_attr = getattr(kernel, "live_signature_attr", "TTIR_SIGNATURE")
+    live_kernel = getattr(module, kernel_attr, None)
+    live_meta = getattr(module, meta_attr, constexprs)
+    live_signature = getattr(module, signature_attr, None)
+    return (
+        live_kernel,
+        dict(live_meta or {}),
+        dict(live_signature) if live_signature is not None else None,
+    )
 
 
 _OP_NAME_RE = re.compile(
@@ -228,19 +259,35 @@ def run_one(kernel: _canned.CannedKernel) -> KernelResult:
     # Prefer live Triton compile when available (more authentic). Fall
     # back to the canned fixture text otherwise.
     ttir_text: Optional[str] = None
-    if _jit.triton_available() and getattr(kernel, "live_kernel", None) is not None:
+    if _jit.triton_available():
         try:
-            ttir_text = _jit.triton_jit_to_ttir(
-                kernel.live_kernel,  # type: ignore[arg-type]
-                constexprs=kernel.constexprs,
-            )
-        except _jit.TritonUnavailable:
-            ttir_text = None
-        except _jit.TTIRCaptureError as exc:
+            live_kernel, live_constexprs, live_signature = _resolve_live_kernel(kernel)
+        except Exception as exc:  # noqa: BLE001 -- report import failures
             result.status = Status.FAILED_PARSE
             result.error_type = type(exc).__name__
-            result.error_message = str(exc)
+            result.error_message = (
+                "live numeric kernel import failed: " + str(exc)
+            )
             return result
+        if live_kernel is not None:
+            try:
+                ttir_text = _jit.triton_jit_to_ttir(
+                    live_kernel,
+                    constexprs=live_constexprs,
+                    signature=live_signature,
+                )
+            except _jit.TritonUnavailable:
+                ttir_text = None
+            except _jit.TTIRCaptureError as exc:
+                result.status = Status.FAILED_PARSE
+                result.error_type = type(exc).__name__
+                result.error_message = str(exc)
+                return result
+            except ValueError as exc:
+                result.status = Status.FAILED_PARSE
+                result.error_type = type(exc).__name__
+                result.error_message = str(exc)
+                return result
 
     if ttir_text is None:
         ttir_text = kernel.ttir_text  # canned fallback

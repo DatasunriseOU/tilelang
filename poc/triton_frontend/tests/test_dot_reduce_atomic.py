@@ -14,7 +14,7 @@ Coverage:
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, List
 
 import pytest
 
@@ -208,6 +208,36 @@ def test_tt_atomic_rmw_accepts_unconditional_lazy_mask() -> None:
     assert "atomic" in text.lower()
 
 
+def test_tt_atomic_rmw_unused_result_does_not_request_return_prev() -> None:
+    """Discarded Triton atomic results must not force prev-value lowering."""
+
+    class _UnusedResult:
+        @property
+        def uses(self):
+            return iter(())
+
+    ctx = WalkerCtx()
+    ptr_ssa = _fake_value("ptr", shape=[4], dtype="int32")
+    val_ssa = _fake_value("val", shape=[4], dtype="int32")
+    res_ssa = _UnusedResult()
+
+    ctx.bind(ptr_ssa, _decl_buffer("dst", [4], "int32"))
+    ctx.bind(val_ssa, tvm.tir.const(1, "int32"))
+
+    op = {
+        "name": "tt.atomic_rmw",
+        "operands": [ptr_ssa, val_ssa],
+        "results": [res_ssa],
+        "attrs": {"rmw_op": "add"},
+    }
+
+    handle = map_tt_atomic_rmw(op, ctx)
+    text = _stringify(handle) + " " + _stringify(ctx.stmts)
+
+    assert "atomic" in text.lower()
+    assert res_ssa not in ctx.value_map
+
+
 # ---------------------------------------------------------------------------
 # tt.reduce
 # ---------------------------------------------------------------------------
@@ -246,7 +276,6 @@ def test_tt_reduce_combiner_dispatch(combiner: str, expected_substr: str) -> Non
         with T.Kernel(1, threads=128):
             out_bufs.append(map_tt_reduce(op, ctx))
 
-    out_buf = out_bufs[0]
     # Walk emitted statements + the bound result for the combiner-specific
     # call_intrin name. Reduce internally lowers via macros that may not
     # leave a literal ``reduce_sum`` substring in __str__; the safest

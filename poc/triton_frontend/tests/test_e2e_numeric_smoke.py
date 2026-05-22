@@ -16,6 +16,7 @@ The full markdown report is always written to
 ``/tmp/triton_e2e_numeric.md`` regardless of pass/fail/skip, so you
 can grep for cross-kernel patterns even when one kernel hard-fails.
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -80,6 +81,261 @@ def test_rfc_conformance_ladder_includes_where_broadcast_numeric() -> None:
     assert "where_broadcast" in numeric_kernels.KERNEL_MODULES
 
 
+def test_rfc_conformance_ladder_includes_row_sum_numeric() -> None:
+    """The canonical row-wise reduction must be numerically exercised end-to-end."""
+    assert "row_sum" in numeric_kernels.KERNEL_MODULES
+
+
+def test_rfc_conformance_ladder_includes_gather_rows_3d_numeric() -> None:
+    """The gather/scatter corpus pattern must be numerically exercised."""
+    assert "gather_rows_3d" in numeric_kernels.KERNEL_MODULES
+
+
+def test_rfc_conformance_ladder_includes_atomic_hist_numeric() -> None:
+    """The atomic histogram corpus row must be numerically exercised."""
+    assert "atomic_hist" in numeric_kernels.KERNEL_MODULES
+
+
+def test_rfc_conformance_ladder_includes_fla_dot_exp2_numeric() -> None:
+    """The FLA dot+exp2 corpus row must be numerically exercised."""
+    assert "fla_dot_exp2" in numeric_kernels.KERNEL_MODULES
+
+
+def test_rfc_conformance_ladder_includes_tma_descriptor_copy_numeric() -> None:
+    """The RFC 5.4 TMA fallback row must be numerically exercised."""
+    assert "tma_descriptor_copy" in numeric_kernels.KERNEL_MODULES
+
+
+def test_tma_descriptor_copy_numeric_kernel_preserves_descriptor_ops() -> None:
+    """The TMA fallback numeric case must exercise real descriptor TTIR ops."""
+    sentinel = "__TMA_DESCRIPTOR_COPY_TTIR__"
+    script = f"""
+import json
+from poc.triton_frontend._test_harness import numeric_smoke
+from poc.triton_frontend._test_harness.numeric_kernels import tma_descriptor_copy
+
+ttir_text, err, _opts = numeric_smoke._capture_ttir(tma_descriptor_copy)
+payload = {{
+    "ok": ttir_text is not None,
+    "err": err,
+    "has_make_descriptor": bool(ttir_text and "make_tensor_descriptor" in ttir_text),
+    "has_descriptor_load": bool(ttir_text and "descriptor_load" in ttir_text),
+    "has_store": bool(ttir_text and "tt.store" in ttir_text),
+}}
+print({sentinel!r} + json.dumps(payload, sort_keys=True))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.fail(
+            "fresh-process tma_descriptor_copy TTIR capture failed with "
+            f"exit={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
+            f"STDERR:\n{completed.stderr}"
+        )
+
+    payload = None
+    for line in reversed(completed.stdout.splitlines()):
+        if line.startswith(sentinel):
+            payload = json.loads(line[len(sentinel) :])
+            break
+    if payload is None:
+        pytest.fail(
+            f"fresh-process tma_descriptor_copy TTIR capture omitted sentinel\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+        )
+    assert payload["ok"], payload["err"]
+    assert payload["has_make_descriptor"], completed.stdout
+    assert payload["has_descriptor_load"], completed.stdout
+    assert payload["has_store"], completed.stdout
+
+
+def test_fla_dot_exp2_numeric_kernel_preserves_ttir_ops() -> None:
+    """The FLA dot+exp2 numeric case must exercise TTIR dot and math.exp2."""
+    sentinel = "__FLA_DOT_EXP2_TTIR__"
+    script = f"""
+import json
+from poc.triton_frontend._test_harness import numeric_smoke
+from poc.triton_frontend._test_harness.numeric_kernels import fla_dot_exp2
+
+ttir_text, err, _opts = numeric_smoke._capture_ttir(fla_dot_exp2)
+payload = {{
+    "ok": ttir_text is not None,
+    "err": err,
+    "has_dot": bool(ttir_text and "tt.dot" in ttir_text),
+    "has_exp2": bool(ttir_text and "math.exp2" in ttir_text),
+    "has_store": bool(ttir_text and "tt.store" in ttir_text),
+}}
+print({sentinel!r} + json.dumps(payload, sort_keys=True))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.fail(
+            "fresh-process fla_dot_exp2 TTIR capture failed with "
+            f"exit={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
+            f"STDERR:\n{completed.stderr}"
+        )
+
+    payload = None
+    for line in reversed(completed.stdout.splitlines()):
+        if line.startswith(sentinel):
+            payload = json.loads(line[len(sentinel) :])
+            break
+    if payload is None:
+        pytest.fail(f"fresh-process fla_dot_exp2 TTIR capture omitted sentinel\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}")
+    assert payload["ok"], payload["err"]
+    assert payload["has_dot"], completed.stdout
+    assert payload["has_exp2"], completed.stdout
+    assert payload["has_store"], completed.stdout
+
+
+def test_row_sum_numeric_kernel_preserves_ttir_reduce() -> None:
+    """The row_sum numeric case must actually exercise TTIR reduce."""
+    sentinel = "__ROW_SUM_TTIR__"
+    script = f"""
+import json
+from poc.triton_frontend._test_harness import numeric_smoke
+from poc.triton_frontend._test_harness.numeric_kernels import row_sum
+
+ttir_text, err, _opts = numeric_smoke._capture_ttir(row_sum)
+payload = {{
+    "ok": ttir_text is not None,
+    "err": err,
+    "has_reduce": bool(ttir_text and "tt.reduce" in ttir_text),
+    "has_reduce_return": bool(ttir_text and "tt.reduce.return" in ttir_text),
+}}
+print({sentinel!r} + json.dumps(payload, sort_keys=True))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.fail(
+            "fresh-process row_sum TTIR capture failed with "
+            f"exit={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
+            f"STDERR:\n{completed.stderr}"
+        )
+
+    payload = None
+    for line in reversed(completed.stdout.splitlines()):
+        if line.startswith(sentinel):
+            payload = json.loads(line[len(sentinel) :])
+            break
+    if payload is None:
+        pytest.fail(f"fresh-process row_sum TTIR capture omitted sentinel\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}")
+    assert payload["ok"], payload["err"]
+    assert payload["has_reduce"], completed.stdout
+    assert payload["has_reduce_return"], completed.stdout
+
+
+def test_gather_rows_3d_numeric_kernel_preserves_ttir_ops() -> None:
+    """The gather_rows_3d numeric case must exercise TTIR load/store."""
+    sentinel = "__GATHER_ROWS_3D_TTIR__"
+    script = f"""
+import json
+from poc.triton_frontend._test_harness import numeric_smoke
+from poc.triton_frontend._test_harness.numeric_kernels import gather_rows_3d
+
+ttir_text, err, _opts = numeric_smoke._capture_ttir(gather_rows_3d)
+payload = {{
+    "ok": ttir_text is not None,
+    "err": err,
+    "load_count": ttir_text.count("tt.load") if ttir_text else 0,
+    "has_store": bool(ttir_text and "tt.store" in ttir_text),
+    "has_program_id": bool(ttir_text and "tt.get_program_id" in ttir_text),
+}}
+print({sentinel!r} + json.dumps(payload, sort_keys=True))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.fail(
+            "fresh-process gather_rows_3d TTIR capture failed with "
+            f"exit={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
+            f"STDERR:\n{completed.stderr}"
+        )
+
+    payload = None
+    for line in reversed(completed.stdout.splitlines()):
+        if line.startswith(sentinel):
+            payload = json.loads(line[len(sentinel) :])
+            break
+    if payload is None:
+        pytest.fail(f"fresh-process gather_rows_3d TTIR capture omitted sentinel\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}")
+    assert payload["ok"], payload["err"]
+    assert payload["load_count"] >= 2, completed.stdout
+    assert payload["has_store"], completed.stdout
+    assert payload["has_program_id"], completed.stdout
+
+
+def test_atomic_hist_numeric_kernel_preserves_ttir_atomic_rmw() -> None:
+    """The atomic_hist numeric case must exercise Triton's atomic_rmw op."""
+    sentinel = "__ATOMIC_HIST_TTIR__"
+    script = f"""
+import json
+from poc.triton_frontend._test_harness import numeric_smoke
+from poc.triton_frontend._test_harness.numeric_kernels import atomic_hist
+
+ttir_text, err, _opts = numeric_smoke._capture_ttir(atomic_hist)
+payload = {{
+    "ok": ttir_text is not None,
+    "err": err,
+    "has_atomic": bool(ttir_text and "tt.atomic_rmw" in ttir_text),
+    "has_load": bool(ttir_text and "tt.load" in ttir_text),
+    "has_program_id": bool(ttir_text and "tt.get_program_id" in ttir_text),
+}}
+print({sentinel!r} + json.dumps(payload, sort_keys=True))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.fail(
+            "fresh-process atomic_hist TTIR capture failed with "
+            f"exit={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
+            f"STDERR:\n{completed.stderr}"
+        )
+
+    payload = None
+    for line in reversed(completed.stdout.splitlines()):
+        if line.startswith(sentinel):
+            payload = json.loads(line[len(sentinel) :])
+            break
+    if payload is None:
+        pytest.fail(f"fresh-process atomic_hist TTIR capture omitted sentinel\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}")
+    assert payload["ok"], payload["err"]
+    assert payload["has_atomic"], completed.stdout
+    assert payload["has_load"], completed.stdout
+    assert payload["has_program_id"], completed.stdout
+
+
 def test_split_join_numeric_kernel_preserves_ttir_ops() -> None:
     """The split/join numeric case must actually exercise TTIR split/join."""
     sentinel = "__SPLIT_JOIN_TTIR__"
@@ -118,10 +374,7 @@ print({sentinel!r} + json.dumps(payload, sort_keys=True))
             payload = json.loads(line[len(sentinel) :])
             break
     if payload is None:
-        pytest.fail(
-            "fresh-process split/join TTIR capture omitted sentinel\n"
-            f"STDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
-        )
+        pytest.fail(f"fresh-process split/join TTIR capture omitted sentinel\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}")
     assert payload["ok"], payload["err"]
     assert payload["has_join"], completed.stdout
     assert payload["has_split"], completed.stdout
@@ -166,8 +419,7 @@ print({sentinel!r} + json.dumps(payload, sort_keys=True))
             break
     if payload is None:
         pytest.fail(
-            "fresh-process where/broadcast TTIR capture omitted sentinel\n"
-            f"STDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            f"fresh-process where/broadcast TTIR capture omitted sentinel\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
         )
     assert payload["ok"], payload["err"]
     assert payload["has_select"], completed.stdout
@@ -305,9 +557,7 @@ def _result_failure_detail(kernel_module: str, result: dict[str, Any]) -> str:
 
 def _is_triton_process_blocked(result: numeric_smoke.KernelResult) -> bool:
     detail = result.detail or ""
-    return result.verdict == Verdict.SKIP and (
-        "triton import blocked" in detail or "triton compile blocked" in detail
-    )
+    return result.verdict == Verdict.SKIP and ("triton import blocked" in detail or "triton compile blocked" in detail)
 
 
 def _fresh_numeric_results() -> dict[str, dict[str, Any]]:
@@ -341,9 +591,7 @@ print({_FRESH_NUMERIC_SENTINEL!r} + json.dumps([
     )
     if completed.returncode != 0:
         pytest.fail(
-            "fresh-process numeric smoke failed with "
-            f"exit={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
-            f"STDERR:\n{completed.stderr}"
+            f"fresh-process numeric smoke failed with exit={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
         )
 
     payload = None
@@ -352,10 +600,7 @@ print({_FRESH_NUMERIC_SENTINEL!r} + json.dumps([
             payload = line[len(_FRESH_NUMERIC_SENTINEL) :]
             break
     if payload is None:
-        pytest.fail(
-            "fresh-process numeric smoke did not emit result sentinel\n"
-            f"STDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
-        )
+        pytest.fail(f"fresh-process numeric smoke did not emit result sentinel\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}")
 
     decoded = json.loads(payload)
     _FRESH_NUMERIC_RESULTS = {item["name"]: item for item in decoded}
@@ -371,16 +616,10 @@ def _resolve_triton_process_blocked_result(
 
     fresh = _fresh_numeric_results()
     if kernel_module not in fresh:
-        pytest.fail(
-            f"fresh-process numeric smoke omitted {kernel_module!r}; "
-            f"available={sorted(fresh)}"
-        )
+        pytest.fail(f"fresh-process numeric smoke omitted {kernel_module!r}; available={sorted(fresh)}")
     fresh_result = fresh[kernel_module]
     if fresh_result.get("verdict") == Verdict.SKIP:
-        pytest.skip(
-            f"{kernel_module}: fresh-process numeric smoke also skipped: "
-            f"{fresh_result.get('detail') or '<no detail>'}"
-        )
+        pytest.skip(f"{kernel_module}: fresh-process numeric smoke also skipped: {fresh_result.get('detail') or '<no detail>'}")
     return fresh_result
 
 
@@ -453,15 +692,10 @@ def test_vector_add_numeric_pass_in_venv(deps_dict) -> None:
     test fails with the precise stage so the toolchain regression is
     obvious in CI logs.
     """
-    missing = {
-        c: deps_dict[c]
-        for c in ("triton", "tvm", "tilelang", "mlx", "cppmega_mlx")
-        if deps_dict[c]
-    }
+    missing = {c: deps_dict[c] for c in ("triton", "tvm", "tilelang", "mlx", "cppmega_mlx") if deps_dict[c]}
     if missing:
         if set(missing) == {"triton"} and (
-            "triton import blocked" in (missing["triton"] or "")
-            or "triton compile blocked" in (missing["triton"] or "")
+            "triton import blocked" in (missing["triton"] or "") or "triton compile blocked" in (missing["triton"] or "")
         ):
             blocked = numeric_smoke.KernelResult(
                 name="vector_add",
@@ -476,9 +710,7 @@ def test_vector_add_numeric_pass_in_venv(deps_dict) -> None:
 
                 assert result_dict["max_abs_err"] is not None
                 assert result_dict["max_abs_err"] <= va.ATOL, (
-                    "vector_add fresh-process NUMERIC_PASS but "
-                    f"max_abs_err={result_dict['max_abs_err']} "
-                    f"exceeds kernel ATOL={va.ATOL}"
+                    f"vector_add fresh-process NUMERIC_PASS but max_abs_err={result_dict['max_abs_err']} exceeds kernel ATOL={va.ATOL}"
                 )
                 return
             pytest.fail(_result_failure_detail("vector_add", result_dict))
@@ -487,10 +719,7 @@ def test_vector_add_numeric_pass_in_venv(deps_dict) -> None:
         # SKIP case (e.g. a CI runner without Metal). The
         # ``test_kernel_numeric_pass[vector_add]`` parametrize covers
         # the SKIP path; nothing further to verify here.
-        pytest.skip(
-            "venv-grade stack not fully importable: "
-            + ", ".join(f"{k}={v}" for k, v in missing.items())
-        )
+        pytest.skip("venv-grade stack not fully importable: " + ", ".join(f"{k}={v}" for k, v in missing.items()))
 
     result = numeric_smoke.run_one("vector_add", deps_dict)
 
@@ -501,16 +730,11 @@ def test_vector_add_numeric_pass_in_venv(deps_dict) -> None:
         )
 
         assert result.max_abs_err is not None
-        assert result.max_abs_err <= va.ATOL, (
-            f"vector_add NUMERIC_PASS but max_abs_err={result.max_abs_err} "
-            f"exceeds kernel ATOL={va.ATOL}"
-        )
+        assert result.max_abs_err <= va.ATOL, f"vector_add NUMERIC_PASS but max_abs_err={result.max_abs_err} exceeds kernel ATOL={va.ATOL}"
         return
 
     pytest.fail(
-        f"vector_add expected NUMERIC_PASS in venv313; got "
-        f"verdict={result.verdict} detail={result.detail!r} "
-        f"max_abs={result.max_abs_err}"
+        f"vector_add expected NUMERIC_PASS in venv313; got verdict={result.verdict} detail={result.detail!r} max_abs={result.max_abs_err}"
     )
 
 
@@ -520,9 +744,7 @@ def test_kernel_filter_restricts_run(tmp_path) -> None:
     against the regression where the CLI flag was silently ignored.
     """
     target = tmp_path / "report.md"
-    results = numeric_smoke.run_all(
-        report_path=target, kernels=["vector_add"]
-    )
+    results = numeric_smoke.run_all(report_path=target, kernels=["vector_add"])
     assert len(results) == 1, [r.name for r in results]
     assert results[0].name == "vector_add"
 
@@ -537,9 +759,7 @@ def test_kernel_filter_restricts_run(tmp_path) -> None:
     # ``run_all`` itself must reject unknown kernel names if a caller
     # bypasses the parser (defence in depth).
     with pytest.raises(SystemExit):
-        numeric_smoke.run_all(
-            report_path=target, kernels=["definitely_not_a_kernel"]
-        )
+        numeric_smoke.run_all(report_path=target, kernels=["definitely_not_a_kernel"])
 
 
 def test_numeric_smoke_script_path_cli_invocation(tmp_path) -> None:
@@ -563,8 +783,7 @@ def test_numeric_smoke_script_path_cli_invocation(tmp_path) -> None:
     )
 
     assert completed.returncode == 0, (
-        f"numeric_smoke.py file-path CLI failed with exit={completed.returncode}\n"
-        f"STDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+        f"numeric_smoke.py file-path CLI failed with exit={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
     )
     assert report_path.exists()
     assert "vector_add" in report_path.read_text()
@@ -578,7 +797,7 @@ import tilelang  # noqa: F401
 
 raise SystemExit(pytest.main([
     "-q",
-    "{(_REPO_ROOT / 'poc' / 'triton_frontend' / 'tests' / 'test_standalone.py').as_posix()}",
+    "{(_REPO_ROOT / "poc" / "triton_frontend" / "tests" / "test_standalone.py").as_posix()}",
     "-rs",
 ]))
 """

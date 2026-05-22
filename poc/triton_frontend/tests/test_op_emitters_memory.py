@@ -19,6 +19,7 @@ Coverage:
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any, Dict, List, Sequence
 
 import pytest
@@ -59,6 +60,19 @@ from ._fixtures import FakeSSA as _HashableSSA  # noqa: E402
 def _ssa(name: str, *, shape: Sequence[int] = (), dtype: str = "float32") -> _HashableSSA:
     """Hashable counterpart to ``_fake_value`` for tests that need ``ctx.bind``."""
     return _HashableSSA(name=name, shape=tuple(shape), dtype=dtype)
+
+
+class _NamedValue:
+    """MLIR-value-like object with identity equality and a stable SSA name."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def get_name(self) -> str:
+        return self._name
+
+    def __str__(self) -> str:
+        return self._name
 
 
 def _stringify(node: Any) -> str:
@@ -337,6 +351,52 @@ def test_addptr_without_shim_keeps_scalar_tuple_without_marker() -> None:
     assert "DEGRADED" not in text, (
         f"scalar tt.addptr should not emit a degraded breadcrumb; got:\n{text}"
     )
+
+
+def test_scalar_addptr_load_resolves_pointer_arg_by_printed_ssa_name() -> None:
+    """Generic-form MLIR may hand operand objects distinct from block args."""
+    ctx = WalkerCtx(ptr_analysis_shim_available=False)
+    idx_arg_def = _NamedValue("%idx_ptr")
+    idx_arg_use = _NamedValue("%idx_ptr")
+    gather_ssa = _ssa("%gather", shape=[], dtype="int32")
+    row_ptr_ssa = _ssa("%row", shape=[], dtype="int32")
+    row_ssa = _ssa("%row_0", shape=[], dtype="int32")
+    idx_buf = tvm.tir.decl_buffer([4], "int32", name="idx")
+    gather = tvm.tir.Var("gather", "int32")
+    ctx.bind(idx_arg_def, idx_buf)
+    ctx.bind(gather_ssa, gather)
+    ctx.ptr_states["%row"] = SimpleNamespace(
+        source="%idx_ptr",
+        offsets=("0",),
+        sizes=("1",),
+        strides=("1",),
+        shape=(1,),
+        result_ssa="%row",
+    )
+
+    ptr = emit_tt_addptr(
+        {
+            "name": "tt.addptr",
+            "operands": [idx_arg_use, gather_ssa],
+            "results": [row_ptr_ssa],
+            "attrs": {},
+        },
+        ctx,
+    )
+    loaded = emit_tt_load(
+        {
+            "name": "tt.load",
+            "operands": [row_ptr_ssa],
+            "results": [row_ssa],
+            "attrs": {},
+        },
+        ctx,
+    )
+
+    assert isinstance(ptr, tuple)
+    assert ptr[0] is idx_buf
+    assert "idx" in str(loaded)
+    assert "gather" in str(loaded)
 
 
 def test_addptr_tuple_tile_composition_skips_degraded_marker() -> None:

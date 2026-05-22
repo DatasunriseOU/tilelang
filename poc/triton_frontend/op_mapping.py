@@ -9,8 +9,8 @@ Implemented in this file:
     tt.load, tt.store, tt.atomic_rmw, tt.dot, tt.reduce, tt.where,
     tt.broadcast, tt.splat, tt.expand_dims, tt.reshape, tt.make_range,
     async_copy (and tt.async_commit / tt.async_wait), mbarrier
-    (init/arrive/wait), tt.experimental_descriptor_load / _store,
-    tt.print.
+    (init/arrive/wait), tt.make_tensor_descriptor, tt.descriptor_load /
+    _store, tt.experimental_descriptor_load / _store, tt.print.
 
 Each ``map_tt_<name>`` is the emitter for one TTIR op. The dispatch
 table :data:`OP_TABLE` is consumed by the TTIR walker invoked from
@@ -30,6 +30,7 @@ Adding a new mapping
 4. Add a conformance kernel under :mod:`triton_frontend.conformance`
    that exercises the new op end-to-end.
 """
+
 from __future__ import annotations
 
 import re
@@ -58,6 +59,9 @@ __all__ = [
     "map_tt_mbarrier",
     "map_tt_sync_threads_partial",
     # TMA
+    "map_tt_make_tensor_descriptor",
+    "map_tt_descriptor_load",
+    "map_tt_descriptor_store",
     "map_tt_experimental_descriptor_load",
     "map_tt_experimental_descriptor_store",
     # Grid / launch
@@ -259,9 +263,7 @@ class WalkerCtx:
         # Optional explicit override for tests and isolated harnesses that
         # need deterministic PtrAnalysis availability without mutating module
         # globals. ``None`` keeps the production probe.
-        self.ptr_analysis_shim_available: Optional[bool] = (
-            ptr_analysis_shim_available
-        )
+        self.ptr_analysis_shim_available: Optional[bool] = ptr_analysis_shim_available
         # Symbol name (e.g. "@triton.language.standard.max__...") -> tt.func
         # op. Populated by the module-level pre-pass in
         # ``triton_frontend._walk_mlir_module`` so the ``tt.call`` emitter can
@@ -354,12 +356,14 @@ class WalkerCtx:
         """Lazy-import ``tvm`` and cache the module handle."""
         if self._tvm is None:
             import tvm  # noqa: WPS433 (intentional lazy import)
+
             self._tvm = tvm
         return self._tvm
 
     def tir(self) -> Any:
         """Shortcut to ``tvm.tir``."""
         from tvm import tir
+
         return tir
 
     def get(self, ssa_value: Any) -> Any:
@@ -388,8 +392,19 @@ class WalkerCtx:
                         return frame[name]
             except Exception:
                 pass
-        if ssa_value in self.value_map:
-            return self.value_map[ssa_value]
+        try:
+            if ssa_value in self.value_map:
+                return self.value_map[ssa_value]
+        except TypeError:
+            # Some MLIR binding objects are unhashable. ``bind`` also stores
+            # a printed SSA-name alias, so fall through to that lookup.
+            pass
+        try:
+            name = _printed_ssa_name(ssa_value)
+        except Exception:
+            name = None
+        if name and name in self.value_map:
+            return self.value_map[name]
         # Best-effort context: identify the producing op and (if the SSA
         # value is a BlockArgument) the parent op + region index. This
         # is invaluable when the walker descends into a region it should
@@ -403,9 +418,7 @@ class WalkerCtx:
                 producer = getattr(owner, "name", None) or producer
                 # BlockArgument.owner -> Block; climb to its parent op.
                 if not getattr(owner, "name", None):
-                    parent_op = getattr(owner, "parent_op", None) or getattr(
-                        owner, "owner", None
-                    )
+                    parent_op = getattr(owner, "parent_op", None) or getattr(owner, "owner", None)
                     parent_name = getattr(parent_op, "name", None)
                     if parent_name:
                         producer = f"<block-arg of {parent_name}>"
@@ -458,6 +471,7 @@ class WalkerCtx:
             return
         if isinstance(stmt, tir.PrimExpr):
             import warnings
+
             warnings.warn(
                 f"WalkerCtx.emit() received a PrimExpr "
                 f"({type(stmt).__name__}); auto-wrapping in tir.Evaluate. "
@@ -538,6 +552,30 @@ def _results(op: Any) -> Tuple[Any, ...]:
     return tuple(op.results)
 
 
+def _result_is_consumed(result: Any) -> bool:
+    """Return whether a real MLIR result has downstream users.
+
+    Triton generic-form ``tt.atomic_rmw`` prints a result even when source
+    code discards the return value of ``tl.atomic_add``. Requesting
+    ``return_prev=True`` for those unused results forces TileLang's
+    tile-region atomic path into an unsupported mode. Real MLIR results expose
+    a ``uses`` iterator; dict/fake results do not, so keep the conservative
+    "consumed" answer for test-only shapes with no use-def data.
+    """
+    uses = getattr(result, "uses", None)
+    if uses is None:
+        return True
+    try:
+        return any(True for _ in uses)
+    except Exception:
+        return True
+
+
+def _has_consumed_result(op: Any) -> bool:
+    """Return True when any SSA result of ``op`` is actually consumed."""
+    return any(_result_is_consumed(result) for result in _results(op))
+
+
 def _attrs(op: Any) -> Dict[str, Any]:
     """Return ``op`` attribute dict, hiding the MLIR vs dict shape diff."""
     if isinstance(op, dict):
@@ -610,7 +648,7 @@ def _parse_generic_properties_shared(op: Any) -> Dict[str, Any]:
             out[key] = True
         elif raw == "false":
             out[key] = False
-        elif raw.startswith("\"") and raw.endswith("\""):
+        elif raw.startswith('"') and raw.endswith('"'):
             out[key] = raw[1:-1]
         else:
             try:
@@ -751,6 +789,7 @@ _PTR_RE = re.compile(r"^!?tt\.ptr<(.+)>$")
 # Without this branch ``map_tt_func`` raised
 # ``unsupported MLIR dtype: 'tensor<128xf32>'``.
 _TENSOR_RE = re.compile(r"^tensor<([^>]+)>$")
+_TENSOR_DESC_RE = re.compile(r"!?tt\.tensordesc<(?P<tensor>tensor<[^>]+>)>")
 
 
 def _parse_tensor_type(s: str) -> Tuple[List[int], str]:
@@ -796,9 +835,7 @@ def _parse_tensor_type(s: str) -> Tuple[List[int], str]:
     for dim in shape_str.split("x"):
         d = dim.strip()
         if not d.isdigit():
-            raise ValueError(
-                f"non-integer extent {d!r} in tensor type: {s!r}"
-            )
+            raise ValueError(f"non-integer extent {d!r} in tensor type: {s!r}")
         shape.append(int(d))
     if not shape:
         raise ValueError(f"empty shape in tensor type: {s!r}")
@@ -978,15 +1015,13 @@ def _alloc_tile_buffer(
         # Force ``elem_offset=0`` so TVM doesn't auto-create a free
         # ``\u003cname\u003e_elem_offset`` Var that MakePackedAPI would flag as
         # undefined. Tile-scoped buffers are always zero-offset.
-        buf = tir.decl_buffer(shape_list, dtype, name=name, scope=scope,
-                              elem_offset=tir.const(0, "int32"))
+        buf = tir.decl_buffer(shape_list, dtype, name=name, scope=scope, elem_offset=tir.const(0, "int32"))
     except TypeError:
         # Older decl_buffer signatures don't accept ``scope`` kw -- fall
         # back to the unscoped form. The buffer still bypasses buffer_map
         # via ``ctx.local_buffers`` so VerifyMemory will skip it.
         try:
-            buf = tir.decl_buffer(shape_list, dtype, name=name,
-                                  elem_offset=tir.const(0, "int32"))
+            buf = tir.decl_buffer(shape_list, dtype, name=name, elem_offset=tir.const(0, "int32"))
         except TypeError:
             buf = tir.decl_buffer(shape_list, dtype, name=name)
     ctx.local_buffers.append(buf)
@@ -1017,11 +1052,7 @@ def materialize_lazy_tile(
     )
     loop_vars = [
         tir.Var(
-            ctx.fresh(
-                f"{loop_var_prefix}{axis}"
-                if loop_var_prefix is not None
-                else f"{name}_i{axis}"
-            ),
+            ctx.fresh(f"{loop_var_prefix}{axis}" if loop_var_prefix is not None else f"{name}_i{axis}"),
             "int32",
         )
         for axis, _extent in enumerate(dst_shape or [1])
@@ -1058,8 +1089,7 @@ def materialize_lazy_tile(
     return dst
 
 
-def _emit_load_copy(op: Any, ctx: "WalkerCtx", resolved: Dict[str, Any],
-                    mask_ssa: Any, other_ssa: Any) -> Any:
+def _emit_load_copy(op: Any, ctx: "WalkerCtx", resolved: Dict[str, Any], mask_ssa: Any, other_ssa: Any) -> Any:
     """Emit ``T.copy(global[region], frag)`` and bind the result SSA to frag.
 
     The buffer-region path keeps the frontend on the high-level surface
@@ -1147,8 +1177,7 @@ def _emit_load_copy(op: Any, ctx: "WalkerCtx", resolved: Dict[str, Any],
     return frag
 
 
-def _emit_store_copy(op: Any, ctx: "WalkerCtx", resolved: Dict[str, Any],
-                     val_expr: Any, mask_ssa: Any) -> Any:
+def _emit_store_copy(op: Any, ctx: "WalkerCtx", resolved: Dict[str, Any], val_expr: Any, mask_ssa: Any) -> Any:
     """Emit ``T.copy(val_frag, global[region])`` for the buffer-region path."""
     tir = ctx.tir()
     # Pull dtype from the value being stored where possible.
@@ -1199,10 +1228,6 @@ def _emit_store_copy(op: Any, ctx: "WalkerCtx", resolved: Dict[str, Any],
 # ---------------------------------------------------------------------------
 
 
-
-
-
-
 def _atomic_rmw_kind(op: Any) -> str:
     """Extract the RMW kind from a TTIR ``tt.atomic_rmw`` op.
 
@@ -1238,7 +1263,7 @@ def _atomic_rmw_kind(op: Any) -> str:
     s = numeric_enum.get(s, s)
     # Strip MLIR-style prefixes/suffixes that occasionally appear.
     if s.startswith("rmw_op."):
-        s = s[len("rmw_op."):]
+        s = s[len("rmw_op.") :]
     if s.startswith("f"):
         # fadd / fmax / fmin -> add / max / min
         rest = s[1:]
@@ -1261,6 +1286,239 @@ def _constant_tile_bool(value: Any) -> Optional[bool]:
     if str(value.dtype) != "bool":
         return None
     return bool(value.constant_value)
+
+
+def _shape_product(shape: Sequence[Any]) -> int:
+    total = 1
+    for extent in shape:
+        total *= int(extent)
+    return total
+
+
+def _atomic_tile_shape(
+    val_ssa: Any,
+    val_expr: Any,
+    indices: Sequence[Any],
+    mask_expr: Any,
+) -> Tuple[int, ...]:
+    """Best-effort lane shape for vector/tile atomic operands."""
+    candidates: List[Sequence[Any]] = []
+    for value in (val_expr, mask_expr, *indices):
+        if isinstance(value, LazyTileExpr):
+            candidates.append(value.shape)
+        else:
+            shape = getattr(value, "shape", None)
+            if shape is not None:
+                candidates.append(tuple(shape))
+    candidates.append(_shape_of(val_ssa))
+    for shape in candidates:
+        if shape and _shape_product(shape) > 1:
+            return tuple(int(s) for s in shape)
+    return ()
+
+
+def _flat_lane_index(tir: Any, shape: Sequence[int], loop_vars: Sequence[Any]) -> Any:
+    if not loop_vars:
+        return tir.const(0, "int32")
+    flat = loop_vars[0]
+    for var, extent in zip(loop_vars[1:], shape[1:]):
+        flat = flat * tir.const(int(extent), "int32") + var
+    return flat
+
+
+def _lane_indices_for_shape(
+    tir: Any,
+    value_shape: Sequence[int],
+    outer_shape: Sequence[int],
+    loop_vars: Sequence[Any],
+    flat_lane: Any,
+) -> Tuple[Any, ...]:
+    if not value_shape:
+        return ()
+    if len(value_shape) == len(loop_vars):
+        return tuple(tir.const(0, "int32") if int(extent) == 1 else loop_vars[i] for i, extent in enumerate(value_shape))
+    if len(value_shape) == 1:
+        return (flat_lane,)
+    indices: List[Any] = []
+    rem = flat_lane
+    for axis, extent in enumerate(value_shape):
+        stride = 1
+        for trailing in value_shape[axis + 1 :]:
+            stride *= int(trailing)
+        if stride == 1:
+            idx = rem
+        else:
+            idx = rem // tir.const(stride, "int32")
+            rem = rem - idx * tir.const(stride, "int32")
+        indices.append(tir.const(0, "int32") if int(extent) == 1 else idx)
+    return tuple(indices)
+
+
+def _atomic_read_lane(
+    ctx: WalkerCtx,
+    value: Any,
+    outer_shape: Sequence[int],
+    loop_vars: Sequence[Any],
+    flat_lane: Any,
+) -> Any:
+    """Read one lane from lazy, buffer, or vector-valued atomic operands."""
+    tir = ctx.tir()
+    tvm_mod = ctx.tvm()
+    if isinstance(value, LazyTileExpr):
+        lane_indices = _lane_indices_for_shape(tir, value.shape, outer_shape, loop_vars, flat_lane)
+        return value.read_lane(ctx, lane_indices)
+    if isinstance(value, tvm_mod.tir.Buffer):
+        rank = len(value.shape)
+        if rank == 0:
+            return tir.BufferLoad(value, [tir.const(0, "int32")])
+        if rank == len(loop_vars):
+            return tir.BufferLoad(value, list(loop_vars))
+        return tir.BufferLoad(value, [flat_lane])
+
+    bcast_cls = getattr(tir, "Broadcast", None)
+    if bcast_cls is not None and isinstance(value, bcast_cls):
+        return value.value
+    ramp_cls = getattr(tir, "Ramp", None)
+    if ramp_cls is not None and isinstance(value, ramp_cls):
+        return value.base + value.stride * flat_lane
+
+    dt = getattr(value, "dtype", None)
+    if dt is not None and "x" not in str(dt):
+        return value
+
+    binop_pyops = {
+        "Add": lambda a, b: a + b,
+        "Sub": lambda a, b: a - b,
+        "Mul": lambda a, b: a * b,
+        "Div": lambda a, b: a / b,
+        "Mod": lambda a, b: a % b,
+        "FloorDiv": lambda a, b: a // b,
+        "FloorMod": lambda a, b: a % b,
+    }
+    for cls_name, pyop in binop_pyops.items():
+        cls = getattr(tir, cls_name, None)
+        if cls is not None and isinstance(value, cls):
+            lhs = _atomic_read_lane(ctx, value.a, outer_shape, loop_vars, flat_lane)
+            rhs = _atomic_read_lane(ctx, value.b, outer_shape, loop_vars, flat_lane)
+            return pyop(lhs, rhs)
+    for cls_name, fn_name in (("Min", "min"), ("Max", "max")):
+        cls = getattr(tir, cls_name, None)
+        if cls is not None and isinstance(value, cls):
+            lhs = _atomic_read_lane(ctx, value.a, outer_shape, loop_vars, flat_lane)
+            rhs = _atomic_read_lane(ctx, value.b, outer_shape, loop_vars, flat_lane)
+            fn = getattr(tir, fn_name, None)
+            if fn is not None:
+                return fn(lhs, rhs)
+            return tir.Select(lhs < rhs, lhs, rhs) if fn_name == "min" else tir.Select(lhs > rhs, lhs, rhs)
+    cast_cls = getattr(tir, "Cast", None)
+    if cast_cls is not None and isinstance(value, cast_cls):
+        scalar_dtype = str(value.dtype).rsplit("x", 1)[0]
+        return tir.Cast(scalar_dtype, _atomic_read_lane(ctx, value.value, outer_shape, loop_vars, flat_lane))
+
+    return value
+
+
+def _atomic_intrin_call(
+    tir: Any,
+    *,
+    kind: str,
+    buf: Any,
+    indices: Sequence[Any],
+    val_expr: Any,
+    ret_dtype: str,
+) -> Any:
+    tl_intrin_names = {
+        "add": ("tl.atomic_add_elem_op", "tl.atomic_add_ret_elem_op"),
+        "max": ("tl.atomic_max_elem_op", "tl.atomic_max_ret_elem_op"),
+        "min": ("tl.atomic_min_elem_op", "tl.atomic_min_ret_elem_op"),
+        "xchg": ("tl.atomic_xchg_elem_op", "tl.atomic_xchg_ret_elem_op"),
+        "and": ("tl.atomic_and_elem_op", "tl.atomic_and_ret_elem_op"),
+        "or": ("tl.atomic_or_elem_op", "tl.atomic_or_ret_elem_op"),
+        "xor": ("tl.atomic_xor_elem_op", "tl.atomic_xor_ret_elem_op"),
+    }
+    try:
+        addr = tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tir.address_of"),
+            tir.BufferLoad(buf, list(indices)),
+        )
+    except Exception:  # pragma: no cover -- older TVM bindings
+        addr = buf
+    if kind in tl_intrin_names:
+        no_ret, with_ret = tl_intrin_names[kind]
+        op_name = with_ret if ret_dtype != "handle" else no_ret
+        return tir.call_intrin(ret_dtype, tir.op.Op.get(op_name), addr, val_expr)
+    intrin_name = f"tir.atomic_{kind}"
+    return tir.call_intrin(ret_dtype, intrin_name, addr, val_expr)
+
+
+def _emit_tile_atomic_rmw(
+    op: Any,
+    ctx: WalkerCtx,
+    *,
+    kind: str,
+    buf: Any,
+    indices: Sequence[Any],
+    val_expr: Any,
+    val_ssa: Any,
+    mask_expr: Any,
+    return_prev: bool,
+) -> Any:
+    """Emit per-lane scalar atomics for vector/tile ``tt.atomic_rmw``."""
+    tir = ctx.tir()
+    shape = _atomic_tile_shape(val_ssa, val_expr, indices, mask_expr)
+    if not shape:
+        raise EmitError("tt.atomic_rmw: tile atomic requested without tile shape")
+
+    loop_vars = [tir.Var(ctx.fresh(f"atomic_i{axis}"), "int32") for axis, _extent in enumerate(shape)]
+    flat_lane = _flat_lane_index(tir, shape, loop_vars)
+    target_indices = [_atomic_read_lane(ctx, idx, shape, loop_vars, flat_lane) for idx in indices] or [tir.const(0, "int32")]
+    val_lane = _atomic_read_lane(ctx, val_expr, shape, loop_vars, flat_lane)
+    result_dtype = _dtype_of(_results(op)[0]) if _results(op) else _dtype_of(val_ssa)
+    ret_dtype = result_dtype if return_prev else "handle"
+    atomic_call = _atomic_intrin_call(
+        tir,
+        kind=kind,
+        buf=buf,
+        indices=target_indices,
+        val_expr=val_lane,
+        ret_dtype=ret_dtype,
+    )
+
+    body: Any
+    result_buf = None
+    if return_prev:
+        result_buf = _alloc_tile_buffer(
+            ctx,
+            shape,
+            result_dtype,
+            ctx.fresh("atomic_prev"),
+        )
+        body = tir.BufferStore(result_buf, atomic_call, list(loop_vars))
+    else:
+        body = tir.Evaluate(atomic_call)
+
+    if mask_expr is not None:
+        constant_mask = _constant_tile_bool(mask_expr)
+        if constant_mask is False:
+            body = tir.Evaluate(tir.const(0, "int32"))
+        elif constant_mask is not True:
+            mask_lane = _atomic_read_lane(ctx, mask_expr, shape, loop_vars, flat_lane)
+            body = tir.IfThenElse(mask_lane, body, None)
+
+    for var, extent in zip(reversed(loop_vars), reversed(shape)):
+        body = tir.For(
+            var,
+            tir.const(0, "int32"),
+            tir.const(int(extent), "int32"),
+            tir.ForKind.SERIAL,
+            body,
+        )
+    ctx.requires_single_thread_body = True
+    ctx.emit(body)
+    if return_prev and result_buf is not None:
+        ctx.bind(_results(op)[0], result_buf)
+    return body
 
 
 def map_tt_atomic_rmw(op: Any, ctx: WalkerCtx) -> Any:
@@ -1287,6 +1545,7 @@ def map_tt_atomic_rmw(op: Any, ctx: WalkerCtx) -> Any:
     else:
         buf, indices = resolved, [0]
     val_expr = ctx.get(val_ssa)
+    mask_expr = ctx.get(mask_ssa) if mask_ssa is not None else None
     kind = _atomic_rmw_kind(op)
 
     tir = ctx.tir()
@@ -1301,7 +1560,22 @@ def map_tt_atomic_rmw(op: Any, ctx: WalkerCtx) -> Any:
     # ``atomic_add`` / ``atomic_max`` / ``atomic_min`` accept a Buffer; we
     # pass the underlying buffer with the indices encoded in ``val_expr``
     # by way of BufferLoad / BufferStore semantics handled inside TileLang.
-    return_prev = bool(_results(op))
+    return_prev = _has_consumed_result(op)
+
+    tile_shape = _atomic_tile_shape(val_ssa, val_expr, list(indices), mask_expr)
+    mask_is_effective = mask_expr is not None and _constant_tile_bool(mask_expr) is not True
+    if tile_shape and mask_is_effective:
+        return _emit_tile_atomic_rmw(
+            op,
+            ctx,
+            kind=kind,
+            buf=buf,
+            indices=list(indices),
+            val_expr=val_expr,
+            val_ssa=val_ssa,
+            mask_expr=mask_expr,
+            return_prev=return_prev,
+        )
 
     if T is not None and kind in {"add", "max", "min", "xchg", "and", "or", "xor"}:
         atomic_fn = {
@@ -1330,12 +1604,14 @@ def map_tt_atomic_rmw(op: Any, ctx: WalkerCtx) -> Any:
         if return_prev and kind in {"add", "max", "min"}:
             try:
                 from tilelang.language.utils import get_extent  # type: ignore
+
                 dst_has_extent = get_extent(buf) is not None
             except Exception:
                 dst_has_extent = False
             res_dtype = _dtype_of(_results(op)[0]) if _results(op) else ""
             if dst_has_extent and res_dtype.startswith("float"):
                 import warnings as _warnings
+
                 _warnings.warn(
                     f"map_tt_atomic_rmw: return_prev unsupported on tile-region "
                     f"path for dtype={res_dtype!r} (kind={kind!r}); downgrading "
@@ -1362,15 +1638,18 @@ def map_tt_atomic_rmw(op: Any, ctx: WalkerCtx) -> Any:
         # Build access pointer: buf.access_ptr("rw") + offset_indices.
         # For the MVP we let the buffer's flat element 0 be the target;
         # ptr_analysis fills in proper indices for non-trivial cases.
-        access = tir.call_intrin(
-            "handle",
-            tir.op.Op.get("tir.address_of"),
-            tir.BufferLoad(buf, list(indices)),
-        ) if hasattr(tir.op.Op, "get") else buf
+        access = (
+            tir.call_intrin(
+                "handle",
+                tir.op.Op.get("tir.address_of"),
+                tir.BufferLoad(buf, list(indices)),
+            )
+            if hasattr(tir.op.Op, "get")
+            else buf
+        )
         result = tir.call_intrin(ret_dtype, intrin_name, access, val_expr)
 
     if mask_ssa is not None:
-        mask_expr = ctx.get(mask_ssa)
         constant_mask = _constant_tile_bool(mask_expr)
         if constant_mask is True:
             mask_expr = None
@@ -1405,8 +1684,6 @@ def map_tt_atomic_rmw(op: Any, ctx: WalkerCtx) -> Any:
 # ---------------------------------------------------------------------------
 # Compute ops -- RFC section 5.1, "tt.dot" / "tt.reduce" / "tt.where"
 # ---------------------------------------------------------------------------
-
-
 
 
 def _reduce_combiner_kind(op: Any) -> str:
@@ -1447,16 +1724,12 @@ def _reduce_combiner_kind(op: Any) -> str:
     raise EmitError("tt.reduce: cannot determine combiner kind from op")
 
 
-
-
 def map_tt_where(op: Any, ctx: WalkerCtx) -> Any:
     """Lower ``tt.where(cond, t, f)`` to ``tir.Select`` (lane-wise)."""
     tir = ctx.tir()
     operands = _operands(op)
     if len(operands) != 3:
-        raise EmitError(
-            f"tt.where: expected 3 operands (cond, true, false); got {len(operands)}"
-        )
+        raise EmitError(f"tt.where: expected 3 operands (cond, true, false); got {len(operands)}")
     cond, t_val, f_val = (ctx.get(o) for o in operands)
     sel = tir.Select(cond, t_val, f_val)
     if _results(op):
@@ -1467,14 +1740,6 @@ def map_tt_where(op: Any, ctx: WalkerCtx) -> Any:
 # ---------------------------------------------------------------------------
 # Shape ops -- RFC section 5.1, broadcast/splat/expand_dims/reshape/make_range
 # ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
 
 
 def map_tt_trans(op: Any, ctx: WalkerCtx) -> Any:
@@ -1519,8 +1784,6 @@ def map_tt_trans(op: Any, ctx: WalkerCtx) -> Any:
     return src
 
 
-
-
 # ---------------------------------------------------------------------------
 # Async / barrier -- RFC section 5.1, async_copy / mbarrier
 # ---------------------------------------------------------------------------
@@ -1547,12 +1810,13 @@ def map_tt_async_copy(op: Any, ctx: WalkerCtx) -> Any:
     # Commit / wait are pipeline boundary markers.
     if "commit" in name:
         import tilelang.language as T  # type: ignore  # lazy
+
         if hasattr(T, "ptx_commit_group"):
             handle = T.ptx_commit_group()
         else:
             tir = ctx.tir()
             handle = tir.call_intrin("handle", tir.op.Op.get("tir.ptx_commit_group"))
-        
+
         tir = ctx.tir()
         ctx.emit(tir.Evaluate(handle))
         return handle
@@ -1561,12 +1825,13 @@ def map_tt_async_copy(op: Any, ctx: WalkerCtx) -> Any:
         attrs = _attrs_with_properties_shared(op)
         num = int(attrs.get("num", 0))
         import tilelang.language as T  # type: ignore  # lazy
+
         if hasattr(T, "ptx_wait_group"):
             handle = T.ptx_wait_group(num)
         else:
             tir = ctx.tir()
             handle = tir.call_intrin("handle", tir.op.Op.get("tir.ptx_wait_group"), num)
-        
+
         tir = ctx.tir()
         ctx.emit(tir.Evaluate(handle))
         return handle
@@ -1591,6 +1856,7 @@ def map_tt_async_copy(op: Any, ctx: WalkerCtx) -> Any:
     dst = _materialize(dst_resolved)
 
     import tilelang.language as T  # type: ignore  # lazy
+
     handle = T.async_copy(src, dst)
     ctx.emit(handle)
     return handle
@@ -1641,9 +1907,7 @@ def map_tt_mbarrier(op: Any, ctx: WalkerCtx) -> Any:
         if hasattr(T, "barrier_arrive"):
             handle = T.barrier_arrive(bar)
         else:
-            handle = tir.call_intrin(
-                "handle", tir.op.Op.get("tl.mbarrier_arrive"), bar
-            )
+            handle = tir.call_intrin("handle", tir.op.Op.get("tl.mbarrier_arrive"), bar)
         ctx.emit(handle)
         return handle
 
@@ -1656,9 +1920,7 @@ def map_tt_mbarrier(op: Any, ctx: WalkerCtx) -> Any:
         if hasattr(T, "barrier_wait"):
             handle = T.barrier_wait(bar, parity)
         else:
-            handle = tir.call_intrin(
-                "handle", tir.op.Op.get("tl.mbarrier_wait_parity"), bar, parity
-            )
+            handle = tir.call_intrin("handle", tir.op.Op.get("tl.mbarrier_wait_parity"), bar, parity)
         ctx.emit(handle)
         return handle
 
@@ -1683,10 +1945,7 @@ def map_tt_sync_threads_partial(op: Any, ctx: WalkerCtx) -> Any:
     """
     operands = _operands(op)
     if len(operands) < 2:
-        raise EmitError(
-            f"tt.sync_threads_partial: expected (mask, n_threads); got "
-            f"{len(operands)} operands"
-        )
+        raise EmitError(f"tt.sync_threads_partial: expected (mask, n_threads); got {len(operands)} operands")
     mask = ctx.get(operands[0])
     n_threads = ctx.get(operands[1])
 
@@ -1728,6 +1987,332 @@ def _is_nv_target() -> bool:
     return "cuda" in kind or "nvptx" in kind
 
 
+def _tensor_desc_shape_dtype(value: Any, op: Any) -> Tuple[List[int], str]:
+    """Extract ``tensor<...>`` payload from a descriptor/result type.
+
+    Real Triton TTIR prints descriptor types as
+    ``!tt.tensordesc<tensor<MxNxf32>>`` while descriptor loads return a
+    plain ``tensor<MxNxf32>``. Parse only explicit type spellings; guessing
+    descriptor rank or dtype here would make TMA fallback unsafe.
+    """
+    if isinstance(value, dict) and value.get("shape"):
+        return list(value.get("shape") or ()), _normalize_mlir_dtype(str(value.get("dtype", "float32")))
+
+    candidates: List[str] = []
+    typ = getattr(value, "type", None)
+    if typ is not None:
+        candidates.append(str(typ))
+    try:
+        candidates.append(str(value))
+    except Exception:
+        pass
+    try:
+        candidates.append(str(op))
+    except Exception:
+        pass
+
+    for text in candidates:
+        type_text = (text or "").strip()
+        if not type_text:
+            continue
+        desc_match = _TENSOR_DESC_RE.search(type_text)
+        if desc_match is not None:
+            return _parse_tensor_type(desc_match.group("tensor"))
+        tensor_match = _TENSOR_RE.match(type_text)
+        if tensor_match is not None:
+            return _parse_tensor_type(type_text)
+
+    raise EmitError(f"tt.tensor_descriptor: cannot parse tensor descriptor/result type from {getattr(value, 'type', value)!r}")
+
+
+def _tir_index(ctx: WalkerCtx, value: Any, *, dtype: str = "int32") -> Any:
+    """Return ``value`` as a scalar TIR index expression."""
+    tir = ctx.tir()
+    if isinstance(value, bool):
+        return tir.const(int(value), dtype)
+    if isinstance(value, int):
+        return tir.const(value, dtype)
+    if hasattr(value, "dtype") and str(value.dtype) != dtype:
+        return tir.Cast(dtype, value)
+    return value
+
+
+def _int_if_const(value: Any) -> Optional[int]:
+    """Best-effort concrete integer extraction for IntImm-like values."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    raw = getattr(value, "value", None)
+    if raw is not None:
+        try:
+            return int(raw)
+        except Exception:
+            return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _descriptor_flat_extent(
+    logical_shape: Sequence[Any],
+    strides: Sequence[Any],
+    block_shape: Sequence[int],
+) -> Optional[int]:
+    """Return the minimum flat buffer extent for a strided descriptor."""
+    shape_ints: List[int] = []
+    for dim in logical_shape:
+        parsed = _int_if_const(dim)
+        if parsed is None:
+            shape_ints = []
+            break
+        shape_ints.append(parsed)
+    if not shape_ints:
+        shape_ints = [int(dim) for dim in block_shape]
+
+    stride_ints: List[int] = []
+    for stride in strides:
+        parsed = _int_if_const(stride)
+        if parsed is None:
+            return None
+        stride_ints.append(parsed)
+
+    if not shape_ints or not stride_ints:
+        return None
+    extent = 1
+    for dim, stride in zip(shape_ints, stride_ints):
+        extent += max(int(dim) - 1, 0) * max(int(stride), 0)
+    return max(int(extent), 1)
+
+
+def _descriptor_base_and_offset(ctx: WalkerCtx, base: Any) -> Tuple[Any, Any]:
+    """Resolve a descriptor base pointer to ``(buffer, flat_base_offset)``."""
+    tir = ctx.tir()
+    if isinstance(base, tuple) and len(base) == 2:
+        buf, indices = base
+        if not hasattr(buf, "shape"):
+            raise EmitError("tt.tensor_descriptor: tuple base is not a TIR buffer")
+        if not indices:
+            return buf, tir.const(0, "int32")
+        if len(indices) == 1:
+            return buf, _tir_index(ctx, indices[0])
+        flat: Any = tir.const(0, "int32")
+        for idx in indices:
+            flat = flat + _tir_index(ctx, idx)
+        return buf, flat
+
+    if hasattr(base, "shape"):
+        return base, tir.const(0, "int32")
+    raise EmitError(f"tt.tensor_descriptor: descriptor base must resolve to a TIR buffer or (buffer, indices), got {type(base).__name__}")
+
+
+def _maybe_redeclare_descriptor_buffer(
+    ctx: WalkerCtx,
+    buf: Any,
+    dtype: str,
+    min_extent: Optional[int],
+) -> Any:
+    """Resize placeholder pointer buffers when descriptor shape is known."""
+    if min_extent is None:
+        return buf
+    try:
+        rank = len(buf.shape)
+        current_extent = int(buf.shape[0]) if rank == 1 else 0
+    except Exception:
+        rank = 0
+        current_extent = 0
+    if rank == 1 and current_extent >= int(min_extent):
+        return buf
+
+    name = getattr(buf, "name", None) or "buf"
+    target_key: Any = None
+    for key, value in (getattr(ctx, "buffers", {}) or {}).items():
+        if value is buf:
+            target_key = key
+            break
+    if target_key is None:
+        return buf
+    fixed_keys = getattr(ctx, "fixed_arg_buffer_keys", set()) or set()
+    if target_key in fixed_keys or str(name) in fixed_keys:
+        return buf
+
+    new_buf = ctx.tir().decl_buffer([max(int(min_extent), 1)], dtype, name=str(name))
+    ctx.buffers[target_key] = new_buf
+    for key, value in list(getattr(ctx, "value_map", {}).items()):
+        if value is buf:
+            ctx.value_map[key] = new_buf
+        elif isinstance(value, tuple) and len(value) == 2 and value[0] is buf:
+            ctx.value_map[key] = (new_buf, value[1])
+    return new_buf
+
+
+def _descriptor_flat_index(
+    ctx: WalkerCtx,
+    offsets: Sequence[Any],
+    strides: Sequence[Any],
+    loop_vars: Sequence[Any],
+    base_offset: Any,
+) -> Any:
+    """Build the flat source/destination index for a descriptor lane."""
+    tir = ctx.tir()
+    flat: Any = _tir_index(ctx, base_offset)
+    for axis, lv in enumerate(loop_vars):
+        offset = offsets[axis] if axis < len(offsets) else tir.const(0, "int32")
+        stride = strides[axis] if axis < len(strides) else tir.const(1, "int32")
+        offset = _tir_index(ctx, offset)
+        stride = _tir_index(ctx, stride)
+        flat = flat + (offset + lv) * stride
+    return flat
+
+
+def map_tt_make_tensor_descriptor(op: Any, ctx: WalkerCtx) -> Any:
+    """Capture Triton tensor-descriptor metadata for later TMA fallback.
+
+    RFC 5.4 maps tensor descriptors to native TMA on NVIDIA and to
+    pointer-arithmetic tile copies elsewhere. This op itself has no side
+    effect; it records the base pointer, logical shape, strides, tile shape
+    and dtype so ``tt.descriptor_load/store`` can lower from live TTIR.
+    """
+    operands = _operands(op)
+    results = _results(op)
+    if len(operands) < 1 or not results:
+        raise EmitError("tt.make_tensor_descriptor: expected a base pointer operand and one descriptor result")
+
+    block_shape, dtype = _tensor_desc_shape_dtype(results[0], op)
+    rank = len(block_shape)
+    expected = 1 + (rank * 2)
+    if len(operands) < expected:
+        raise EmitError(
+            f"tt.make_tensor_descriptor: expected base plus {rank} shape operands and {rank} stride operands; got {len(operands)} operands"
+        )
+
+    base = ctx.get(operands[0])
+    logical_shape = [ctx.get(operand) for operand in operands[1 : 1 + rank]]
+    strides = [ctx.get(operand) for operand in operands[1 + rank : expected]]
+    descriptor = {
+        "kind": "tensor_descriptor",
+        "base": base,
+        "logical_shape": logical_shape,
+        "strides": strides,
+        "block_shape": tuple(int(dim) for dim in block_shape),
+        "dtype": dtype,
+    }
+    ctx.bind(results[0], descriptor)
+    return descriptor
+
+
+def _descriptor_state(value: Any, op_name: str) -> Dict[str, Any]:
+    if not isinstance(value, dict) or value.get("kind") != "tensor_descriptor":
+        raise EmitError(f"{op_name}: first operand must resolve to a tensor descriptor; got {type(value).__name__}")
+    return value
+
+
+def map_tt_descriptor_load(op: Any, ctx: WalkerCtx) -> Any:
+    """Lower real Triton ``tt.descriptor_load`` into a tile copy fallback."""
+    operands = _operands(op)
+    results = _results(op)
+    if len(operands) < 1 or not results:
+        raise EmitError("tt.descriptor_load: expected descriptor operand and result")
+
+    desc = _descriptor_state(ctx.get(operands[0]), "tt.descriptor_load")
+    result_shape, result_dtype = _tensor_desc_shape_dtype(results[0], op)
+    block_shape = tuple(int(dim) for dim in desc.get("block_shape") or result_shape)
+    if tuple(result_shape) != tuple(block_shape):
+        raise EmitError(
+            f"tt.descriptor_load: result tensor shape does not match descriptor block shape ({tuple(result_shape)} vs {block_shape})"
+        )
+
+    rank = len(block_shape)
+    if len(operands) - 1 < rank:
+        raise EmitError(f"tt.descriptor_load: expected {rank} coordinate operands; got {len(operands) - 1}")
+
+    offsets = [ctx.get(operand) for operand in operands[1 : 1 + rank]]
+    strides = list(desc.get("strides") or ())
+    if len(strides) < rank:
+        raise EmitError(f"tt.descriptor_load: descriptor has {len(strides)} strides for rank-{rank} result")
+
+    dtype = _normalize_mlir_dtype(str(result_dtype or desc.get("dtype", "float32")))
+    base_buf, base_offset = _descriptor_base_and_offset(ctx, desc["base"])
+    min_extent = _descriptor_flat_extent(desc.get("logical_shape") or (), strides, block_shape)
+    base_buf = _maybe_redeclare_descriptor_buffer(ctx, base_buf, dtype, min_extent)
+
+    tir = ctx.tir()
+    tile_buf = _alloc_tile_buffer(
+        ctx,
+        list(block_shape) or [1],
+        dtype,
+        ctx.fresh("desc_load"),
+        scope="shared" if rank >= 2 else "local",
+    )
+    loop_vars = [tir.Var(ctx.fresh(f"i{axis}"), "int32") for axis in range(rank)]
+    flat = _descriptor_flat_index(ctx, offsets, strides, loop_vars, base_offset)
+    body: Any = tir.BufferStore(
+        tile_buf,
+        tir.BufferLoad(base_buf, [flat]),
+        list(loop_vars) or [tir.const(0, "int32")],
+    )
+    for axis in range(rank - 1, -1, -1):
+        body = tir.For(
+            loop_vars[axis],
+            tir.const(0, "int32"),
+            tir.const(int(block_shape[axis]), "int32"),
+            tir.ForKind.SERIAL,
+            body,
+        )
+    ctx.emit(body)
+    ctx.bind(results[0], tile_buf)
+    return tile_buf
+
+
+def map_tt_descriptor_store(op: Any, ctx: WalkerCtx) -> Any:
+    """Lower real Triton ``tt.descriptor_store`` into a tile store fallback."""
+    operands = _operands(op)
+    if len(operands) < 2:
+        raise EmitError("tt.descriptor_store: expected descriptor, tile value, and offsets")
+
+    desc = _descriptor_state(ctx.get(operands[0]), "tt.descriptor_store")
+    value = ctx.get(operands[1])
+    block_shape = tuple(int(dim) for dim in desc.get("block_shape") or ())
+    if not block_shape:
+        block_shape, _dtype = _tensor_desc_shape_dtype(operands[1], op)
+        block_shape = tuple(int(dim) for dim in block_shape)
+    rank = len(block_shape)
+    if len(operands) - 2 < rank:
+        raise EmitError(f"tt.descriptor_store: expected {rank} coordinate operands; got {len(operands) - 2}")
+
+    offsets = [ctx.get(operand) for operand in operands[2 : 2 + rank]]
+    strides = list(desc.get("strides") or ())
+    if len(strides) < rank:
+        raise EmitError(f"tt.descriptor_store: descriptor has {len(strides)} strides for rank-{rank} value")
+
+    dtype = _normalize_mlir_dtype(str(desc.get("dtype", "float32")))
+    base_buf, base_offset = _descriptor_base_and_offset(ctx, desc["base"])
+    min_extent = _descriptor_flat_extent(desc.get("logical_shape") or (), strides, block_shape)
+    base_buf = _maybe_redeclare_descriptor_buffer(ctx, base_buf, dtype, min_extent)
+
+    tir = ctx.tir()
+    loop_vars = [tir.Var(ctx.fresh(f"i{axis}"), "int32") for axis in range(rank)]
+    flat = _descriptor_flat_index(ctx, offsets, strides, loop_vars, base_offset)
+    if isinstance(value, LazyTileExpr):
+        rhs = value.read_lane(ctx, tuple(loop_vars))
+    elif hasattr(value, "shape"):
+        rhs = tir.BufferLoad(value, list(loop_vars))
+    else:
+        rhs = value
+    body: Any = tir.BufferStore(base_buf, rhs, [flat])
+    for axis in range(rank - 1, -1, -1):
+        body = tir.For(
+            loop_vars[axis],
+            tir.const(0, "int32"),
+            tir.const(int(block_shape[axis]), "int32"),
+            tir.ForKind.SERIAL,
+            body,
+        )
+    ctx.emit(body)
+    return body
+
+
 def _emit_descriptor_copy(op: Any, ctx: WalkerCtx, *, is_load: bool) -> Any:
     """Shared body for descriptor load/store: TMA on NV, fallback elsewhere.
 
@@ -1737,10 +2322,7 @@ def _emit_descriptor_copy(op: Any, ctx: WalkerCtx, *, is_load: bool) -> Any:
     """
     operands = _operands(op)
     if len(operands) < 2:
-        raise EmitError(
-            f"{'descriptor_load' if is_load else 'descriptor_store'}: expected "
-            f"(desc, tile, ...offsets) operands"
-        )
+        raise EmitError(f"{'descriptor_load' if is_load else 'descriptor_store'}: expected (desc, tile, ...offsets) operands")
     desc_ssa, tile_ssa = operands[0], operands[1]
     desc = ctx.get(desc_ssa)
     tile = ctx.get(tile_ssa)
@@ -1761,7 +2343,7 @@ def _emit_descriptor_copy(op: Any, ctx: WalkerCtx, *, is_load: bool) -> Any:
     # T.copy over the descriptor's base buffer + coordinate offsets that
     # PtrAnalysis has resolved.
     tir = ctx.tir()
-    desc_buf, desc_idx = (desc if isinstance(desc, tuple) else (desc, [0]))
+    desc_buf, desc_idx = desc if isinstance(desc, tuple) else (desc, [0])
     src = tir.BufferLoad(desc_buf, list(desc_idx)) if hasattr(desc_buf, "shape") else desc_buf
     if is_load:
         handle = T.copy(src, tile)
@@ -1818,6 +2400,7 @@ def map_tt_print(op: Any, ctx: WalkerCtx) -> Any:
     # When a single operand is a buffer, defer to the rich TileLang
     # print() macro which handles per-thread / per-warp gating.
     import tilelang.language as T  # type: ignore  # lazy
+
     if len(args) == 1 and hasattr(args[0], "scope") and callable(args[0].scope):
         # Buffer-shaped arg.
         T.print(args[0], msg=prefix or "")
@@ -1849,21 +2432,22 @@ def _sanitize_printf_format(fmt: str) -> str:
     leak anything non-trivial, and our caller fixes the arg count.
     """
     import re
+
     if not fmt:
         return fmt
-    
+
     # Split the format string by literal % (which is written as %%)
     # This prevents us from accidentally thinking the second % in %%n is a format start.
     parts = fmt.split("%%")
     sanitized_parts = []
-    
+
     for p in parts:
         # Match % followed by optional flags, width, precision, length modifiers, and 'n'
         # e.g., %n, %lln, %10n, %-10.5lln, %*.*n
         # Replace the matched string with % + matched (e.g., %n -> %%n)
-        p = re.sub(r'%(?:[-+ #0\'I]*)(?:[0-9*]*)(?:\.[0-9*]*)?(?:hh|h|ll|l|j|z|t|L)*n', lambda m: '%' + m.group(0), p)
+        p = re.sub(r"%(?:[-+ #0\'I]*)(?:[0-9*]*)(?:\.[0-9*]*)?(?:hh|h|ll|l|j|z|t|L)*n", lambda m: "%" + m.group(0), p)
         sanitized_parts.append(p)
-        
+
     return "%%".join(sanitized_parts)
 
 
@@ -1886,13 +2470,12 @@ def map_tt_program_id(op: Any, ctx: WalkerCtx) -> Any:
     attrs = _attrs_with_properties_shared(op)
     axis = int(attrs.get("axis", 0))
     if axis < 0 or axis > 2:
-        raise EmitError(
-            f"tt.program_id: axis must be in [0, 2]; got {axis}"
-        )
+        raise EmitError(f"tt.program_id: axis must be in [0, 2]; got {axis}")
 
     var: Any
     try:
         from tilelang.language.kernel import KernelLaunchFrame  # type: ignore
+
         frame = KernelLaunchFrame.Current()
     except Exception:  # pragma: no cover -- TileLang absent during tests
         frame = None
@@ -1954,6 +2537,9 @@ OP_TABLE: Dict[str, EmitFn] = {
     "tt.partial_barrier": map_tt_sync_threads_partial,
     "triton.language.partial_barrier": map_tt_sync_threads_partial,
     # TMA
+    "tt.make_tensor_descriptor": map_tt_make_tensor_descriptor,
+    "tt.descriptor_load": map_tt_descriptor_load,
+    "tt.descriptor_store": map_tt_descriptor_store,
     "tt.experimental_descriptor_load": map_tt_experimental_descriptor_load,
     "tt.experimental_descriptor_store": map_tt_experimental_descriptor_store,
     # grid / launch (multiple TTIR spellings route through one emitter)
