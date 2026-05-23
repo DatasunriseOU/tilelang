@@ -218,6 +218,7 @@ filterwarnings = ["always"]
 markers = [
     "perf: benchmark and performance API tests skipped by default",
     "slow: long-running correctness sweeps",
+    "cuda_hardware: tests requiring real CUDA/Hopper hardware",
 ]
 
 [tool.cibuildwheel]

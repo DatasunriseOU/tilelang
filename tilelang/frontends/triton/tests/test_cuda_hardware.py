@@ -32,10 +32,13 @@ if _HAS_TORCH:
         _CUDA_AVAILABLE = False
 
 
-pytestmark = pytest.mark.skipif(
-    not _CUDA_AVAILABLE,
-    reason="CUDA hardware required: this test exercises Hopper TMA + WGMMA paths",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not _CUDA_AVAILABLE,
+        reason="CUDA hardware required: this test exercises Hopper TMA + WGMMA paths",
+    ),
+    pytest.mark.cuda_hardware,
+]
 
 
 def _run_numeric_one(name: str):

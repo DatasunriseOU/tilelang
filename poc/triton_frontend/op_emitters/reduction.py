@@ -163,6 +163,29 @@ _COMBINER_TABLE: Dict[str, Tuple[str, Callable[[Any, str], Any]]] = {
 }
 
 
+def _combine_expr(tir: Any, kind: str, a: Any, b: Any) -> Any:
+    """Build a combiner PrimExpr using Python operator overloads.
+
+    Using ``a + b`` instead of ``tir.Add(a, b)`` avoids the ``TypeError:
+    Expected ir.PrimExpr but got ffi.Array`` that occurs when the text
+    walker's tir module produces BufferLoad objects whose type the TVM
+    FFI ``_OpAdd`` class-constructor rejects as positional args.  Python
+    operator overloads go through PrimExpr.__add__ which handles the
+    coercion correctly.
+    """
+    if kind in ("add",):
+        return a + b
+    if kind in ("mul",):
+        return a * b
+    if kind in ("max", "argmax"):
+        return tir.Max(a, b)
+    if kind in ("min", "argmin"):
+        return tir.Min(a, b)
+    # Fallback: try the class constructor (may raise on text-walker path).
+    BinOp = getattr(tir, _COMBINER_TABLE[kind][0])
+    return BinOp(a, b)
+
+
 # Identity values for the *index* slot of paired reducers. Per H4-followup
 # review: -1 sentinel means "no input element encountered yet", which
 # mirrors the convention used by ``triton.language.argmax`` / ``argmin``
@@ -813,7 +836,7 @@ def map_tt_reduce(op: Any, ctx: EmitContext) -> Any:
 
     accum_indices = list(outer_vars) if outer_vars else [tir.const(0, "int32")]
     accum_load = tir.BufferLoad(accum, list(accum_indices))
-    update = tir.BufferStore(accum, BinOp(accum_load, src_elem), list(accum_indices))
+    update = tir.BufferStore(accum, _combine_expr(tir, kind, accum_load, src_elem), list(accum_indices))
 
     # Reduction For-loop.
     inner_for = tir.For(
@@ -934,7 +957,7 @@ def map_tt_scan(op: Any, ctx: EmitContext) -> Any:
         src_elem = src
 
     accum_load = tir.BufferLoad(accum, [tir.const(0, "int32")])
-    new_val = BinOp(accum_load, src_elem)
+    new_val = _combine_expr(tir, kind, accum_load, src_elem)
     update = tir.BufferStore(accum, new_val, [tir.const(0, "int32")])
     write_dst = tir.BufferStore(
         dst, tir.BufferLoad(accum, [tir.const(0, "int32")]), [i_var]
