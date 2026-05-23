@@ -223,11 +223,17 @@ def parse_ttir(text: str) -> Optional[Any]:
     """
     ir = _try_import_mlir_quiet()
     if ir is None:
+        # Resolve jaxlib's MLIR bindings WITHOUT publishing them under
+        # ``sys.modules['mlir.ir']``. Publishing the alias makes any
+        # subsequent ``triton._C.libtriton.ir.context()`` call abort
+        # the process because Triton's nanobind LLVM extension and
+        # jaxlib's MLIR extension cannot coexist in one interpreter.
         try:
-            from poc.triton_frontend._mlir_path_setup import bootstrap_jaxlib_alias
+            from poc.triton_frontend._mlir_path_setup import (
+                local_jaxlib_mlir_ir,
+            )
 
-            bootstrap_jaxlib_alias()
-            ir = _try_import_mlir_quiet()
+            ir = local_jaxlib_mlir_ir()
         except Exception:
             ir = None
     if ir is None:
@@ -274,7 +280,9 @@ def parse_ttir(text: str) -> Optional[Any]:
         return module
     except Exception as exc:
         try:
-            from poc.triton_frontend._mlir_path_setup import bootstrap_jaxlib_alias
+            from poc.triton_frontend._mlir_path_setup import (
+                local_jaxlib_mlir_ir,
+            )
             from poc.triton_frontend.pipeline import (
                 is_custom_form_ttir,
                 round_trip_through_cxx_shim,
@@ -295,8 +303,7 @@ def parse_ttir(text: str) -> Optional[Any]:
                     stacklevel=2,
                 )
                 return None
-            bootstrap_jaxlib_alias()
-            ir = _try_import_mlir_quiet()
+            ir = _try_import_mlir_quiet() or local_jaxlib_mlir_ir()
             if ir is None:
                 warnings.warn(
                     f"mlir_walker.parse_ttir: parse failed -- {exc!r}",

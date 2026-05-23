@@ -232,11 +232,255 @@ def triton_jit_to_ttir(
     )
 
 
+def triton_jit_to_ttir_subprocess_from_source(
+    *,
+    source: str,
+    kernel_name: str,
+    constexprs: Optional[Dict[str, Any]] = None,
+    signature: Optional[Dict[str, str]] = None,
+    target: Optional[str] = None,
+    extra_sys_path: Optional[list[str]] = None,
+    timeout: int = 120,
+) -> str:
+    """Capture TTIR by exec'ing ``source`` in a fresh subprocess.
+
+    The bridge in cppmega.mlx receives ``@triton.jit`` ``JITFunction``
+    objects that live only in the host interpreter and cannot be
+    pickled across processes. We side-step this by shipping the
+    kernel's source text (obtained via :func:`inspect.getsource` on
+    ``JITFunction.fn``) to a fresh subprocess, exec'ing it inside a
+    namespace that has ``triton`` / ``triton.language`` pre-imported,
+    and then re-applying the ``@triton.jit`` decorator. The decorated
+    kernel is then routed through :func:`triton_jit_to_ttir` exactly
+    the same way an in-process call would be.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+    import tempfile
+    import textwrap
+
+    with tempfile.NamedTemporaryFile(
+        prefix="triton_ttir_src_", suffix=".txt", delete=False, mode="w"
+    ) as tmp:
+        out_path = tmp.name
+    payload = {
+        "source": source,
+        "kernel_name": kernel_name,
+        "constexprs": dict(constexprs or {}),
+        "signature": dict(signature or {}) if signature is not None else None,
+        "target": target,
+        "out_path": out_path,
+    }
+    # Native Triton requires ``@triton.jit`` kernels to be defined in a
+    # real Python file (the JIT compiler reads ``co_filename`` via
+    # ``inspect.findsource``). We materialise the source into a temp
+    # module file, import it by spec, and feed the resulting kernel into
+    # the in-process ``triton_jit_to_ttir`` path. Failure to read the
+    # file would abort with ``ValueError("@jit functions should be
+    # defined in a Python file")`` — see triton/runtime/jit.py:__init__.
+    script = textwrap.dedent(
+        """
+        import importlib, importlib.util, json, os, sys, tempfile, traceback
+        payload = json.loads(sys.argv[1])
+        try:
+            import triton
+            import triton.language as tl  # noqa: F401
+            header = \"import triton\\nimport triton.language as tl\\n\\n\"
+            src_dir = tempfile.mkdtemp(prefix=\"triton_ttir_src_\")
+            src_path = os.path.join(src_dir, \"_subprocess_kernel.py\")
+            with open(src_path, \"w\") as fh:
+                fh.write(header)
+                fh.write(payload[\"source\"])
+            spec = importlib.util.spec_from_file_location(
+                \"_subprocess_kernel\", src_path
+            )
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[\"_subprocess_kernel\"] = module
+            spec.loader.exec_module(module)
+            fn = getattr(module, payload[\"kernel_name\"], None)
+            if fn is None:
+                raise RuntimeError(
+                    f\"materialised module did not define {payload['kernel_name']!r}\"
+                )
+            if not hasattr(fn, \"params\") and callable(fn):
+                fn = triton.jit(fn)
+            from poc.triton_frontend._test_harness.jit_to_ttir import (
+                triton_jit_to_ttir,
+            )
+            text = triton_jit_to_ttir(
+                fn,
+                constexprs=payload[\"constexprs\"] or None,
+                signature=payload[\"signature\"],
+                target=payload[\"target\"],
+            )
+            with open(payload[\"out_path\"], \"w\") as fh:
+                fh.write(text)
+        except BaseException as exc:
+            traceback.print_exc()
+            print(f\"__TTIR_CAPTURE_ERROR__:{type(exc).__name__}:{exc}\", file=sys.stderr)
+            sys.exit(2)
+        """
+    )
+    env = dict(os.environ)
+    sys_path_entries = list(extra_sys_path or [])
+    sys_path_entries.append(os.getcwd())
+    existing = env.get("PYTHONPATH")
+    if existing:
+        sys_path_entries.append(existing)
+    env["PYTHONPATH"] = os.pathsep.join(sys_path_entries)
+    completed = subprocess.run(
+        [sys.executable, "-c", script, json.dumps(payload)],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+        check=False,
+    )
+    if completed.returncode != 0:
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+        raise TTIRCaptureError(
+            f"subprocess (from-source) TTIR capture exited "
+            f"{completed.returncode} for kernel={kernel_name!r}: "
+            f"stderr={completed.stderr[-1500:]!r} "
+            f"stdout={completed.stdout[-500:]!r}"
+        )
+    try:
+        with open(out_path) as fh:
+            ttir_text = fh.read()
+    finally:
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+    if not ttir_text.strip():
+        raise TTIRCaptureError(
+            f"subprocess returned empty TTIR for kernel={kernel_name!r}"
+        )
+    return ttir_text
+
+
+def triton_jit_to_ttir_subprocess(
+    *,
+    module_name: str,
+    kernel_attr: str = "TRITON_KERNEL",
+    constexprs: Optional[Dict[str, Any]] = None,
+    signature: Optional[Dict[str, str]] = None,
+    target: Optional[str] = None,
+    extra_sys_path: Optional[list[str]] = None,
+    timeout: int = 120,
+) -> str:
+    """Capture TTIR text from a Python module attribute in a fresh subprocess.
+
+    Necessary when the calling interpreter already has an LLVM peer module
+    resident (jaxlib's MLIR/LLVM nanobind extension or our PtrAnalysis C++
+    shim) that would clash with ``triton._C.libtriton`` on the next
+    ``make_ir`` call. Pickling ``@triton.jit`` kernel objects across
+    processes is not supported, so we resolve the kernel *inside* the
+    subprocess by importing ``module_name`` and reading ``kernel_attr``.
+
+    Returns the TTIR text exactly as :func:`triton_jit_to_ttir` would in
+    a clean process. Raises :class:`TTIRCaptureError` when the subprocess
+    fails for any reason, with the subprocess stderr/stdout attached for
+    debugging.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+    import tempfile
+    import textwrap
+
+    with tempfile.NamedTemporaryFile(
+        prefix="triton_ttir_", suffix=".txt", delete=False, mode="w"
+    ) as tmp:
+        out_path = tmp.name
+    payload = {
+        "module_name": module_name,
+        "kernel_attr": kernel_attr,
+        "constexprs": dict(constexprs or {}),
+        "signature": dict(signature or {}) if signature is not None else None,
+        "target": target,
+        "out_path": out_path,
+    }
+    script = textwrap.dedent(
+        """
+        import importlib, json, sys, traceback
+        payload = json.loads(sys.argv[1])
+        try:
+            mod = importlib.import_module(payload["module_name"])
+            fn = getattr(mod, payload["kernel_attr"], None)
+            if fn is None:
+                raise RuntimeError(
+                    f"module {payload['module_name']!r} has no attribute "
+                    f"{payload['kernel_attr']!r}"
+                )
+            from poc.triton_frontend._test_harness.jit_to_ttir import (
+                triton_jit_to_ttir,
+            )
+            text = triton_jit_to_ttir(
+                fn,
+                constexprs=payload["constexprs"] or None,
+                signature=payload["signature"],
+                target=payload["target"],
+            )
+            with open(payload["out_path"], "w") as fh:
+                fh.write(text)
+        except BaseException as exc:
+            traceback.print_exc()
+            print(f"__TTIR_CAPTURE_ERROR__:{type(exc).__name__}:{exc}", file=sys.stderr)
+            sys.exit(2)
+        """
+    )
+    env = dict(os.environ)
+    sys_path_entries = list(extra_sys_path or [])
+    sys_path_entries.append(os.getcwd())
+    existing = env.get("PYTHONPATH")
+    if existing:
+        sys_path_entries.append(existing)
+    env["PYTHONPATH"] = os.pathsep.join(sys_path_entries)
+    completed = subprocess.run(
+        [sys.executable, "-c", script, json.dumps(payload)],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+        check=False,
+    )
+    if completed.returncode != 0:
+        os.unlink(out_path)
+        raise TTIRCaptureError(
+            f"subprocess TTIR capture exited {completed.returncode} "
+            f"for module={module_name!r} attr={kernel_attr!r}: "
+            f"stderr={completed.stderr[-1500:]!r} stdout={completed.stdout[-500:]!r}"
+        )
+    try:
+        with open(out_path) as fh:
+            ttir_text = fh.read()
+    finally:
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+    if not ttir_text.strip():
+        raise TTIRCaptureError(
+            f"subprocess returned empty TTIR for module={module_name!r} "
+            f"attr={kernel_attr!r}"
+        )
+    return ttir_text
+
+
 __all__ = [
     "TTIRCaptureError",
     "TritonUnavailable",
     "describe_triton_env",
     "triton_available",
     "triton_jit_to_ttir",
+    "triton_jit_to_ttir_subprocess",
+    "triton_jit_to_ttir_subprocess_from_source",
     "triton_version",
 ]

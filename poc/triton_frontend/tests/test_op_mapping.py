@@ -441,7 +441,19 @@ def test_op_table_has_expected_size() -> None:
     # Bumped 101 -> 105 by the FLA structured-pointer/control seam:
     # ``tts.{load,store}`` are now first-class emitters and ``cf.{br,cond_br}``
     # are explicit region terminators rather than unmapped ops.
-    EXPECTED = 105
+    #
+    # Bumped 105 -> 108 by the real Triton 3.6 tensor-descriptor seam:
+    # ``tt.make_tensor_descriptor`` (typed descriptor capture),
+    # ``tt.descriptor_load`` and ``tt.descriptor_store`` now have first-
+    # class emitters that produce a TileLang TIR fallback (RFC §5.4) so
+    # the live ``tma_descriptor_copy`` numeric kernel reaches LOWERED_FULL
+    # instead of FAILED_OPS. The legacy ``tt.experimental_descriptor_*``
+    # entries are kept for older TTIR captures.
+    # Bumped 108 -> 110 by registering ``tt.reduce.return`` and
+    # ``tt.scan.return`` as structural no-ops so live reduce/scan TTIR
+    # captures don't surface those region terminators as FAILED_OPS
+    # in the reducer corpus.
+    EXPECTED = 110
     assert len(OP_TABLE) == EXPECTED, (
         f"OP_TABLE size changed from {EXPECTED} to {len(OP_TABLE)}; "
         f"if intentional, update this constant + the three README "

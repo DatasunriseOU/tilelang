@@ -502,9 +502,15 @@ def deps_dict():
     return _DEPS
 
 
-def test_probe_deps_blocks_triton_after_tilelang_native_load() -> None:
-    """Dep probing must not import Triton into a TileLang-native process."""
-    loaded_modules = {"tilelang_cython_wrapper": object()}
+def test_probe_deps_blocks_triton_after_jaxlib_mlir_load() -> None:
+    """Dep probing must not import Triton into a jaxlib-MLIR-resident process.
+
+    Empirically only jaxlib's MLIR/LLVM nanobind extension (and our own
+    ``_triton_frontend_cxx`` shim) collide with ``triton._C.libtriton``.
+    TileLang / TVM / tvm_ffi happily coexist with native Triton in the
+    cppmega.mlx bridge suite, so they are deliberately not peer-blocked.
+    """
+    loaded_modules = {"jaxlib.mlir._mlir_libs": object()}
     calls: list[str] = []
 
     def fake_import_module(name: str):
@@ -523,11 +529,11 @@ def test_probe_deps_blocks_triton_after_tilelang_native_load() -> None:
     assert "triton" not in calls
 
 
-def test_probe_deps_blocks_triton_compile_after_both_native_sides_load() -> None:
-    """Dep probing must not treat mixed LLVM-native state as compile-safe."""
+def test_probe_deps_blocks_triton_compile_after_libtriton_and_jaxlib_mlir_loaded() -> None:
+    """Dep probing must not treat libtriton+jaxlib LLVM state as compile-safe."""
     loaded_modules = {
         "triton._C.libtriton": object(),
-        "tilelang_cython_wrapper": object(),
+        "jaxlib.mlir._mlir_libs": object(),
     }
     calls: list[str] = []
 
@@ -543,6 +549,31 @@ def test_probe_deps_blocks_triton_compile_after_both_native_sides_load() -> None
     assert deps["triton"] is not None
     assert "triton compile blocked" in deps["triton"]
     assert "triton" not in calls
+
+
+def test_probe_deps_allows_triton_when_only_tilelang_resident() -> None:
+    """TileLang / TVM presence MUST NOT block Triton -- cppmega bridge depends on this."""
+    loaded_modules = {
+        "tilelang": object(),
+        "tilelang_cython_wrapper": object(),
+        "tvm": object(),
+        "tvm_ffi": object(),
+    }
+    calls: list[str] = []
+
+    def fake_import_module(name: str):
+        calls.append(name)
+        return object()
+
+    deps = numeric_smoke._probe_deps(
+        import_module=fake_import_module,
+        loaded_modules=loaded_modules,
+    )
+
+    # No "triton blocked" message -- the probe is allowed to import
+    # triton (the fake_import_module returns object() for everything).
+    if deps["triton"] is not None:
+        assert "blocked" not in deps["triton"]
 
 
 def _result_failure_detail(kernel_module: str, result: dict[str, Any]) -> str:

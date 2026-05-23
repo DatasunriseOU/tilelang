@@ -10,13 +10,25 @@ _TRITON_NATIVE_MODULES = (
     "triton._C.libtriton",
 )
 
+# Peer modules whose nanobind LLVM extensions empirically conflict with
+# Triton's ``triton._C.libtriton``. Loading any of these in the same
+# interpreter as native Triton can abort the next ``make_ir`` call on
+# duplicate LLVM ``cl::opt`` registration. TVM/TileLang/tvm_ffi are
+# deliberately NOT in this list -- they have been verified to coexist
+# with ``triton._C`` in the cppmega.mlx integration suite.
 _LLVM_PEER_MODULES = (
+    # PtrAnalysis C++ shim, statically linked against its own LLVM.
     "_triton_frontend_cxx",
-    "tilelang_cython_wrapper",
-    "tilelang",
-    "tvm_ffi.core",
-    "tvm_ffi",
-    "tvm",
+    # jaxlib bundles its own MLIR / LLVM nanobind extension under
+    # ``jaxlib.mlir._mlir_libs``. Loading it in the same interpreter
+    # that has also loaded ``triton._C.libtriton`` aborts the next
+    # ``triton.compiler.compiler.make_ir`` call because both extensions
+    # register clashing LLVM cl::opt entries. Importing TTIR via the
+    # native walker through jaxlib (``_mlir_path_setup.local_jaxlib_mlir_ir``)
+    # is the trigger; once jaxlib's MLIR is resident the only safe way
+    # to call Triton is in a fresh subprocess.
+    "jaxlib.mlir._mlir_libs",
+    "jaxlib.mlir",
 )
 
 
@@ -45,24 +57,25 @@ def loaded_llvm_peer_modules(
 def triton_import_block_reason(
     loaded_modules: Optional[Mapping[str, Any]] = None,
 ) -> Optional[str]:
-    """Return a human-readable reason to avoid importing Triton now.
+    """Return a human-readable reason to avoid importing/calling Triton now.
 
     Triton and the TileLang/TVM/shim side can each statically register LLVM
-    command-line options. If the TileLang side is already loaded and
-    libtriton is not, importing Triton can abort the process before Python can
-    catch an exception. In that state callers should report Triton as
-    unavailable and run live Triton checks in a fresh process.
+    command-line options. If a non-Triton LLVM peer (TileLang, TVM, the C++
+    shim, or jaxlib's bundled MLIR/LLVM nanobind extension) is resident in
+    the interpreter, calling Triton's ``make_ir`` can abort the process on
+    duplicate LLVM cl::opt registration -- even if ``triton._C.libtriton``
+    itself has already been imported (the abort happens on the next attempt
+    to spin up an MLIR context). In that state callers should report Triton
+    as unavailable and run live Triton checks in a fresh subprocess.
     """
-    if triton_native_loaded(loaded_modules):
-        return None
     peers = loaded_llvm_peer_modules(loaded_modules)
     if peers:
         return (
-            "triton import blocked because "
+            "triton import blocked / triton compile blocked because "
             + ", ".join(peers)
-            + " already loaded in this process; importing triton._C.libtriton "
-            "too can abort on duplicate LLVM cl::opt registration. Re-run the "
-            "Triton-dependent check in a fresh Python process."
+            + " already loaded in this process; calling triton._C.libtriton "
+            "on top can abort on duplicate LLVM cl::opt registration. "
+            "Re-run the Triton-dependent check in a fresh Python process."
         )
     return None
 

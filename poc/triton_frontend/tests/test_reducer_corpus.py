@@ -24,11 +24,43 @@ import pytest
 
 from poc.triton_frontend._test_harness import canned_ttir, run_corpus
 from poc.triton_frontend._test_harness import jit_to_ttir
+import os
+import subprocess
+import sys
 
 
-def test_triton_available_blocks_after_tilelang_native_load() -> None:
-    """Feature detection must not import Triton into a TileLang-native process."""
-    loaded_modules = {"tilelang_cython_wrapper": object()}
+def _live_triton_path_available() -> bool:
+    """Return True iff some path can capture live Triton TTIR for this process.
+
+    Two routes are accepted:
+
+    * In-process: ``jit_to_ttir.triton_available()`` returns True (no LLVM
+      peer modules resident, native Triton installable).
+    * Subprocess: native Triton is installed in this venv and can run in a
+      fresh interpreter where no LLVM peer is loaded. We probe by spawning
+      ``python -c 'import triton'`` and observing the exit code.
+    """
+    if jit_to_ttir.triton_available():
+        return True
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", "import triton; print(triton.__version__)"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env={**os.environ},
+        )
+    except Exception:
+        return False
+    return completed.returncode == 0
+
+
+
+
+def test_triton_available_blocks_after_jaxlib_mlir_load() -> None:
+    """Feature detection must not import Triton into a jaxlib-MLIR-resident process."""
+    loaded_modules = {"jaxlib.mlir._mlir_libs": object()}
     calls: list[str] = []
 
     def guarded_import(name: str):
@@ -88,8 +120,8 @@ def test_vector_add_live_numeric_kernel_reaches_full_when_triton_available() -> 
     corpus should prefer the numeric conformance kernel so this row proves the
     production MLIR walker path instead of staying at LOWERED_DEGRADED.
     """
-    if not jit_to_ttir.triton_available():
-        pytest.skip("Triton import blocked or unavailable in this process")
+    if not _live_triton_path_available():
+        pytest.skip("Triton not available either in-process or via subprocess")
     if not run_corpus._has_tvm():
         pytest.skip("TVM unavailable; LOWERED_FULL classification is not meaningful")
 
@@ -106,8 +138,8 @@ def test_vector_add_live_numeric_kernel_reaches_full_when_triton_available() -> 
 
 def test_row_sum_live_numeric_kernel_reaches_full_when_triton_available() -> None:
     """The canonical reduction row should use a live TTIR capture."""
-    if not jit_to_ttir.triton_available():
-        pytest.skip("Triton import blocked or unavailable in this process")
+    if not _live_triton_path_available():
+        pytest.skip("Triton not available either in-process or via subprocess")
     if not run_corpus._has_tvm():
         pytest.skip("TVM unavailable; LOWERED_FULL classification is not meaningful")
 
@@ -124,8 +156,8 @@ def test_row_sum_live_numeric_kernel_reaches_full_when_triton_available() -> Non
 
 def test_gather_rows_3d_live_numeric_kernel_reaches_full_when_triton_available() -> None:
     """The gather/scatter row should use a live TTIR capture."""
-    if not jit_to_ttir.triton_available():
-        pytest.skip("Triton import blocked or unavailable in this process")
+    if not _live_triton_path_available():
+        pytest.skip("Triton not available either in-process or via subprocess")
     if not run_corpus._has_tvm():
         pytest.skip("TVM unavailable; LOWERED_FULL classification is not meaningful")
 
@@ -142,8 +174,8 @@ def test_gather_rows_3d_live_numeric_kernel_reaches_full_when_triton_available()
 
 def test_atomic_hist_live_numeric_kernel_reaches_full_when_triton_available() -> None:
     """The atomic histogram row should use a live TTIR capture."""
-    if not jit_to_ttir.triton_available():
-        pytest.skip("Triton import blocked or unavailable in this process")
+    if not _live_triton_path_available():
+        pytest.skip("Triton not available either in-process or via subprocess")
     if not run_corpus._has_tvm():
         pytest.skip("TVM unavailable; LOWERED_FULL classification is not meaningful")
 
@@ -160,8 +192,8 @@ def test_atomic_hist_live_numeric_kernel_reaches_full_when_triton_available() ->
 
 def test_async_pipeline_live_tma_fallback_reaches_full_when_triton_available() -> None:
     """The RFC 5.4 async/TMA row should use a live descriptor fallback capture."""
-    if not jit_to_ttir.triton_available():
-        pytest.skip("Triton import blocked or unavailable in this process")
+    if not _live_triton_path_available():
+        pytest.skip("Triton not available either in-process or via subprocess")
     if not run_corpus._has_tvm():
         pytest.skip("TVM unavailable; LOWERED_FULL classification is not meaningful")
 
@@ -179,8 +211,8 @@ def test_async_pipeline_live_tma_fallback_reaches_full_when_triton_available() -
 
 def test_fla_dot_exp2_live_numeric_kernel_reaches_full_when_triton_available() -> None:
     """The FLA dot+exp2 row should use a live TTIR capture."""
-    if not jit_to_ttir.triton_available():
-        pytest.skip("Triton import blocked or unavailable in this process")
+    if not _live_triton_path_available():
+        pytest.skip("Triton not available either in-process or via subprocess")
     if not run_corpus._has_tvm():
         pytest.skip("TVM unavailable; LOWERED_FULL classification is not meaningful")
 

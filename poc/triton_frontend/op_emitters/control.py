@@ -2650,6 +2650,13 @@ CONTROL_EMITTERS: Dict[str, Callable[..., Any]] = {
     # owns recursion into the body region itself.
     "tt.func": map_tt_func,
     "tt.return": lambda op, ctx: None,
+    # Region terminators consumed by the parent reduce/scan emitter; the
+    # walker still encounters them as standalone ops in some captures
+    # (when the parent emitter walks the region manually but the global
+    # walker also descends). Register a no-op so OP_TABLE lookups don't
+    # surface them as ``FAILED_OPS``.
+    "tt.reduce.return": lambda op, ctx: None,
+    "tt.scan.return": lambda op, ctx: None,
     "ub.poison": lambda op, ctx: ctx.tir().const(0, "int32"),
     # CFG branch terminators appear after TritonStructured rewrites some
     # early returns into basic-block diamonds.

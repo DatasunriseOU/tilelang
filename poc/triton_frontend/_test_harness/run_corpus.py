@@ -258,6 +258,13 @@ def run_one(kernel: _canned.CannedKernel) -> KernelResult:
     # --- Step 1: obtain TTIR text. ---
     # Prefer live Triton compile when available (more authentic). Fall
     # back to the canned fixture text otherwise.
+    #
+    # When this interpreter has already loaded an LLVM peer that conflicts
+    # with native Triton's libtriton (jaxlib's MLIR or our C++ shim),
+    # ``triton_available()`` returns False even though native Triton is
+    # installed. In that case we route the TTIR capture through a fresh
+    # subprocess via ``triton_jit_to_ttir_subprocess`` so live coverage is
+    # preserved without crashing the host interpreter.
     ttir_text: Optional[str] = None
     if _jit.triton_available():
         try:
@@ -288,6 +295,53 @@ def run_one(kernel: _canned.CannedKernel) -> KernelResult:
                 result.error_type = type(exc).__name__
                 result.error_message = str(exc)
                 return result
+    elif getattr(kernel, "live_kernel_module", None):
+        # Native Triton is installed but the in-process guard blocks it;
+        # route the TTIR capture to a fresh subprocess so the live numeric
+        # kernel still drives the corpus row instead of falling back to
+        # the hand-written canned TTIR. Pull META_ARGS / TTIR_SIGNATURE
+        # from the live numeric module so the subprocess sees the full
+        # constexpr binding the kernel needs (canned ``constexprs`` may be
+        # a documentation-only subset).
+        module_name = kernel.live_kernel_module
+        if "." not in module_name:
+            module_name = (
+                "poc.triton_frontend._test_harness.numeric_kernels."
+                + module_name
+            )
+        sub_constexprs = dict(kernel.constexprs or {})
+        sub_signature = None
+        try:
+            live_mod = importlib.import_module(module_name)
+            meta = getattr(
+                live_mod,
+                getattr(kernel, "live_meta_args_attr", "META_ARGS"),
+                None,
+            )
+            if isinstance(meta, dict):
+                sub_constexprs = dict(meta)
+            sig = getattr(
+                live_mod,
+                getattr(kernel, "live_signature_attr", "TTIR_SIGNATURE"),
+                None,
+            )
+            if isinstance(sig, dict):
+                sub_signature = dict(sig)
+        except Exception:  # noqa: BLE001 -- best-effort; subprocess will
+            # report a TTIRCaptureError if the kernel module can't be
+            # imported.
+            pass
+        try:
+            ttir_text = _jit.triton_jit_to_ttir_subprocess(
+                module_name=module_name,
+                kernel_attr=getattr(kernel, "live_kernel_attr", "TRITON_KERNEL"),
+                constexprs=sub_constexprs,
+                signature=sub_signature,
+            )
+        except _jit.TTIRCaptureError:
+            ttir_text = None  # fall through to canned TTIR
+        except Exception:  # noqa: BLE001 -- best-effort; canned fallback is safe
+            ttir_text = None
 
     if ttir_text is None:
         ttir_text = kernel.ttir_text  # canned fallback

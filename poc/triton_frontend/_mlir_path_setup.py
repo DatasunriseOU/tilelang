@@ -53,6 +53,7 @@ from typing import List, Optional
 __all__ = [
     "probe_and_wire_mlir",
     "bootstrap_jaxlib_alias",
+    "local_jaxlib_mlir_ir",
     "SELECTED_PATH",
     "SELECTED_SOURCE",
 ]
@@ -135,6 +136,29 @@ def _set_env_prefix(path: str) -> None:
     """
     if not os.environ.get("MLIR_PYTHON_PACKAGE_PREFIX"):
         os.environ["MLIR_PYTHON_PACKAGE_PREFIX"] = path
+
+
+def local_jaxlib_mlir_ir():
+    """Return ``jaxlib.mlir.ir`` *without* publishing it as ``mlir.ir``.
+
+    Use when the caller needs the MLIR Python API for a short-lived
+    parse step in a process that may later load native Triton's
+    ``triton._C`` (whose own MLIR/LLVM nanobind extension cannot share
+    a process with jaxlib's MLIR shared library). Publishing the alias
+    via :func:`bootstrap_jaxlib_alias` triggers a SIGABRT down the
+    line in ``ast_to_ttir`` because the two LLVM CommandLine / nanobind
+    type registries collide. Keeping the binding local to the caller
+    avoids the cross-binding leak.
+
+    Returns ``None`` if jaxlib's bundled MLIR Python bindings aren't
+    importable.
+    """
+    try:
+        import importlib
+
+        return importlib.import_module("jaxlib.mlir.ir")
+    except Exception:
+        return None
 
 
 def bootstrap_jaxlib_alias() -> bool:
@@ -251,17 +275,18 @@ def probe_and_wire_mlir() -> Optional[str]:
         SELECTED_SOURCE = "iree"
         return iree_path
 
-    # Probe 4: jaxlib's bundled mlir bindings (jaxlib.mlir.*). Do not do
-    # this before Triton is loaded: pre-aliasing jaxlib's MLIR dialect
-    # extension and then importing Triton's native bindings can trigger
-    # nanobind duplicate-registration aborts. Numeric harnesses load Triton
-    # first, then call ``bootstrap_jaxlib_alias`` just before MLIR parsing.
-    triton_already_loaded = any(
-        name == "triton" or name.startswith("triton.")
-        for name in sys.modules
-    )
-    eager_jaxlib = os.environ.get("TRITON_FRONTEND_EAGER_JAXLIB_MLIR") == "1"
-    if (triton_already_loaded or eager_jaxlib) and bootstrap_jaxlib_alias():
+    # Probe 4: jaxlib's bundled mlir bindings (jaxlib.mlir.*). We do NOT
+    # publish them under ``sys.modules['mlir.ir']`` from probe_and_wire_mlir
+    # anymore. Callers that need the binding must go through
+    # :func:`local_jaxlib_mlir_ir` so the reference stays local; publishing
+    # the alias makes any later native Triton ``make_ir`` call (which spins
+    # up ``triton._C.libtriton.ir.context()``) collide with jaxlib's
+    # MLIR/LLVM nanobind extension and SIGABRT mid-suite.
+    #
+    # ``bootstrap_jaxlib_alias`` is kept for callers that intentionally
+    # opt into the alias (e.g. dev/debug shells) and is no longer used by
+    # the production walker path.
+    if os.environ.get("TRITON_FRONTEND_EAGER_JAXLIB_MLIR") == "1" and bootstrap_jaxlib_alias():
         try:
             import jaxlib.mlir  # type: ignore  # noqa: WPS433
             jaxlib_path = os.path.dirname(jaxlib.mlir.__file__)

@@ -55,6 +55,7 @@ def compile(
     verbose: bool | None = None,
     pass_configs: dict[str, Any] | None = None,
     compile_flags: list[str] | str | None = None,
+    **frontend_kwargs: Any,
 ) -> JITKernel[_KP, _T]:
     """
     Compile the given TileLang PrimFunc with TVM and build a JITKernel.
@@ -90,10 +91,44 @@ def compile(
         Set to "1", "true", "yes", or "on" to enable verbose compilation by default.
     """
 
+    # ---- Triton TTIR input dispatch ---------------------------------
+    # When ``func`` looks like a Triton TTIR module or text rather than
+    # a TileLang PrimFunc, defer to the Triton frontend and recurse on
+    # the lowered PrimFunc. This is the public glue that lets
+    # ``tilelang.compile(ttir_text)`` work without callers having to
+    # know about ``tilelang.frontends.triton.from_ttir``.
+    try:
+        from tilelang.frontends.triton import (  # type: ignore
+            compile_ttir as _compile_ttir,
+            is_ttir_input as _is_ttir_input,
+        )
+    except Exception:
+        _compile_ttir = None  # type: ignore
+        _is_ttir_input = lambda _obj: False  # type: ignore[assignment]
+    if _compile_ttir is not None and _is_ttir_input(func):
+        return _compile_ttir(
+            func,
+            out_idx=out_idx,
+            target=target,
+            execution_backend=execution_backend,
+            target_host=target_host,
+            verbose=verbose,
+            pass_configs=pass_configs,
+            compile_flags=compile_flags,
+            **frontend_kwargs,
+        )
+
     is_prim_func = isinstance(func, PrimFunc) or (
         hasattr(func, "params") and hasattr(func, "body") and hasattr(func, "attrs")
     )
     assert is_prim_func, f"target function must be a PrimFunc but got {type(func)}"
+    if frontend_kwargs:
+        raise TypeError(
+            "tilelang.compile: unexpected keyword arguments "
+            f"{sorted(frontend_kwargs)} (only the Triton TTIR dispatch path "
+            "forwards extra keywords; PrimFunc inputs must use only the "
+            "declared parameters)"
+        )
 
     # Merge function-level attrs from PrimFunc
     func_attrs = func.attrs

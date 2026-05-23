@@ -172,6 +172,44 @@ def _capture_ttir(
     diagnostic, and ``options`` is the Triton-default ``{4, 2}``.
     """
     _default_options: dict[str, Any] = {"num_warps": 4, "num_stages": 2}
+
+    # Peer guard: if the current interpreter has already loaded a
+    # native LLVM peer that conflicts with ``triton._C.libtriton``
+    # (notably ``jaxlib.mlir._mlir_libs`` -- pulled in by the TTIR
+    # walker's ``local_jaxlib_mlir_ir`` resolver), an in-process
+    # ``make_ir`` will abort. Route the TTIR capture to a fresh
+    # subprocess in that case so the harness keeps working without
+    # killing the host process.
+    from poc.triton_frontend._test_harness.native_import_guard import (
+        triton_import_block_reason,
+    )
+
+    if triton_import_block_reason() is not None:
+        from poc.triton_frontend._test_harness import jit_to_ttir as _jit
+
+        module_name = getattr(kernel_mod, "__name__", None)
+        if not module_name:
+            return None, (
+                "peer LLVM module resident and kernel module has no "
+                "__name__; cannot subprocess-capture TTIR"
+            ), _default_options
+        meta = getattr(kernel_mod, "META_ARGS", {}) or {}
+        sig = getattr(kernel_mod, "TTIR_SIGNATURE", None)
+        try:
+            ttir_text = _jit.triton_jit_to_ttir_subprocess(
+                module_name=module_name,
+                kernel_attr="TRITON_KERNEL",
+                constexprs=dict(meta),
+                signature=dict(sig) if isinstance(sig, dict) else None,
+            )
+        except _jit.TTIRCaptureError as exc:
+            return None, f"subprocess TTIR capture failed: {exc}", _default_options
+        opts = {
+            "num_warps": int(meta.get("num_warps", _default_options["num_warps"])),
+            "num_stages": int(meta.get("num_stages", _default_options["num_stages"])),
+        }
+        return ttir_text, None, opts
+
     try:
         import triton  # type: ignore  # noqa: F401  -- import probe
         from triton.compiler.compiler import ASTSource  # type: ignore
@@ -390,7 +428,9 @@ def _lower_ttir(
     """
     try:
         from poc.triton_frontend import from_ttir  # type: ignore
-        from poc.triton_frontend._mlir_path_setup import bootstrap_jaxlib_alias  # type: ignore
+        from poc.triton_frontend._mlir_path_setup import (  # type: ignore
+            local_jaxlib_mlir_ir,
+        )
         from poc.triton_frontend.mlir_walker import wrap_module_for_walker  # type: ignore
         from poc.triton_frontend.pipeline import (  # type: ignore
             is_custom_form_ttir,
@@ -399,19 +439,26 @@ def _lower_ttir(
     except Exception as exc:  # noqa: BLE001
         return None, f"poc.triton_frontend import failed: {type(exc).__name__}: {exc}"
 
-    # Locate the C++ shim before we try the real MLIR walker. The mlir.ir
-    # alias is wired up lazily after Triton captured TTIR. Importing jaxlib's
-    # MLIR dialect extension before Triton can abort the interpreter due to
-    # process-global nanobind registrations.
+    # Locate the C++ shim before we try the real MLIR walker. We obtain a
+    # LOCAL reference to ``jaxlib.mlir.ir`` instead of publishing the alias
+    # in ``sys.modules``. Publishing the alias collides with native
+    # Triton's ``triton._C`` nanobind extension on the very next ``make_ir``
+    # call and aborts the interpreter mid-suite -- see
+    # ``_mlir_path_setup.local_jaxlib_mlir_ir`` docstring.
     _ensure_cxx_shim_on_syspath()
-    bootstrap_jaxlib_alias()
+    _mlir_ir = local_jaxlib_mlir_ir()
+    if _mlir_ir is None:
+        try:
+            from mlir import ir as _mlir_ir  # type: ignore
+        except Exception:
+            _mlir_ir = None  # type: ignore[assignment]
 
     # Try the real MLIR path first. Convert via the C++ shim's
     # ``to_generic()`` when input is custom-form so a vanilla ``mlir.ir``
     # (without ``tt`` dialect) can still parse the result.
+    if _mlir_ir is None:
+        raise ImportError("no mlir.ir provider available")
     try:
-        from mlir import ir as _mlir_ir  # type: ignore
-
         ctx = _mlir_ir.Context()
         ctx.allow_unregistered_dialects = True
 

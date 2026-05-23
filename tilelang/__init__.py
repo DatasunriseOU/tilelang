@@ -257,6 +257,21 @@ if not env.is_light_import():
     from .math import *  # noqa: F403
     from . import ir  # noqa: F401
     from . import tileop  # noqa: F401
+    # Promote production language frontends (Triton TTIR, ...). The
+    # subpackage registers ``tilelang.frontends.triton`` for both
+    # direct callers and the ``compile()`` TTIR-dispatch helper.
+    try:
+        from . import frontends  # noqa: F401
+        from .frontends.triton import (  # noqa: F401
+            compile_ttir,
+            from_ttir,
+            from_triton_kernel,
+        )
+    except Exception:
+        # Triton frontend is optional; tolerate environments without
+        # the (large) implementation tree.
+        pass
+
 
 del _lazy_extension_imports
 del _import_optional_torch

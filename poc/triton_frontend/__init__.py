@@ -743,7 +743,49 @@ def _compile_to_ttir(
         TTIRCaptureError,
         TritonUnavailable,
         triton_jit_to_ttir,
+        triton_jit_to_ttir_subprocess_from_source,
     )
+    from ._test_harness.native_import_guard import (  # noqa: WPS433
+        triton_import_block_reason,
+    )
+
+    block_reason = triton_import_block_reason()
+    if block_reason is not None:
+        # An LLVM peer (jaxlib MLIR or our C++ shim) is resident in
+        # this interpreter. Calling triton.make_ir here would abort
+        # the process on duplicate cl::opt registration. Recover the
+        # kernel's source text and route TTIR capture through a fresh
+        # subprocess so the call still succeeds end to end.
+        try:
+            import inspect
+
+            underlying = getattr(fn, "fn", fn)
+            source = inspect.getsource(underlying)
+            kernel_name = (
+                getattr(underlying, "__name__", None)
+                or getattr(fn, "__name__", "main")
+            )
+            import textwrap
+
+            source = textwrap.dedent(source)
+            return triton_jit_to_ttir_subprocess_from_source(
+                source=source,
+                kernel_name=kernel_name,
+                constexprs=constexprs,
+                target=target,
+            )
+        except (TTIRCaptureError, TritonUnavailable) as exc:
+            raise RuntimeError(
+                f"Could not stop Triton compilation at the TTIR stage "
+                f"(subprocess fallback): {exc}"
+            ) from exc
+        except (OSError, TypeError, ValueError) as exc:
+            # ``inspect.getsource`` raises ``OSError`` when the source is
+            # unavailable (e.g. kernel defined in an interactive shell).
+            # Fall through to the in-process path, which will likely
+            # surface the same TritonUnavailable below; we want the
+            # consistent error message in that case.
+            del exc
 
     try:
         return triton_jit_to_ttir(fn, constexprs=constexprs, target=target)

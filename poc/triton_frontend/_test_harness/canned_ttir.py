@@ -267,6 +267,48 @@ module {
 # ---------------------------------------------------------------------------
 
 
+_WELFORD_LAYER_NORM_STUB_TTIR = """\
+module {
+  tt.func @welford_layer_norm(%x: !tt.ptr<f32>, %w: !tt.ptr<f32>, %b: !tt.ptr<f32>, %y: !tt.ptr<f32>) {
+    %r = tt.make_range {start = 0 : i32, end = 256 : i32} : tensor<256xi32>
+    %xv = tt.load %x : tensor<256xf32>
+    %wv = tt.load %w : tensor<256xf32>
+    %bv = tt.load %b : tensor<256xf32>
+    %sum = tt.reduce %xv {axis = 0 : i32, combiner = \"add\"} : tensor<256xf32> -> f32
+    tt.store %y, %xv : tensor<256xf32>
+    tt.return
+  }
+}
+"""
+
+
+_PAGED_ATTENTION_V2_STUB_TTIR = """\
+module {
+  tt.func @paged_attention_v2(%q: !tt.ptr<f32>, %k: !tt.ptr<f32>, %v: !tt.ptr<f32>, %bt: !tt.ptr<i32>, %o: !tt.ptr<f32>) {
+    %qv = tt.load %q : tensor<16x32xf32>
+    %kv = tt.load %k : tensor<16x32xf32>
+    %vv = tt.load %v : tensor<16x32xf32>
+    %qk = tt.dot %qv, %kv : tensor<16x32xf32>, tensor<16x32xf32> -> tensor<16x16xf32>
+    tt.store %o, %qv : tensor<16x32xf32>
+    tt.return
+  }
+}
+"""
+
+
+_SCAN_CUMSUM_STUB_TTIR = """\
+module {
+  tt.func @scan_cumsum(%x: !tt.ptr<f32>, %y: !tt.ptr<f32>) {
+    %xv = tt.load %x : tensor<128xf32>
+    %sc = tt.scan %xv {axis = 0 : i32, combiner = \"add\"} : tensor<128xf32> -> tensor<128xf32>
+    tt.store %y, %sc : tensor<128xf32>
+    tt.return
+  }
+}
+"""
+
+
+
 CANNED_TTIR_FIXTURES: List[CannedKernel] = [
     CannedKernel(
         name="vector_add",
@@ -340,6 +382,45 @@ CANNED_TTIR_FIXTURES: List[CannedKernel] = [
         ttir_text=_FLA_DOT_EXP2_TTIR,
         constexprs={"BT": 32, "BV": 32, "K": 32},
         live_kernel_module="fla_dot_exp2",
+    ),
+    CannedKernel(
+        name="welford_layer_norm",
+        description=(
+            "Two-pass Welford LayerNorm forward (numerically stable mean / "
+            "variance reduce + affine)."
+        ),
+        source="poc/triton_frontend/_test_harness/numeric_kernels/welford_layer_norm.py",
+        ttir_text=_WELFORD_LAYER_NORM_STUB_TTIR,
+        constexprs={"BLOCK_SIZE": 256, "EPS": 1e-5},
+        live_kernel_module="welford_layer_norm",
+    ),
+    CannedKernel(
+        name="paged_attention_v2",
+        description=(
+            "vLLM-style multi-block paged attention with block-table "
+            "indirection and per-block streaming softmax."
+        ),
+        source="poc/triton_frontend/_test_harness/numeric_kernels/paged_attention_v2.py",
+        ttir_text=_PAGED_ATTENTION_V2_STUB_TTIR,
+        constexprs={
+            "BLOCK_M": 16,
+            "BLOCK_N": 16,
+            "BLOCK_DMODEL": 32,
+            "NUM_PAGES": 4,
+            "PAGE_SIZE": 16,
+        },
+        live_kernel_module="paged_attention_v2",
+    ),
+    CannedKernel(
+        name="scan_cumsum",
+        description=(
+            "Row-wise inclusive cumulative sum via tl.associative_scan "
+            "(exercises tt.scan with arith.addf combiner)."
+        ),
+        source="poc/triton_frontend/_test_harness/numeric_kernels/scan_cumsum.py",
+        ttir_text=_SCAN_CUMSUM_STUB_TTIR,
+        constexprs={"BLOCK_SIZE": 128},
+        live_kernel_module="scan_cumsum",
     ),
     # ---- Real captured TTIR (not hand-written) ----------------------------
     # ``fla_chunk_delta_h_real_ttir`` is the *actual* Triton-3.6 TTIR text

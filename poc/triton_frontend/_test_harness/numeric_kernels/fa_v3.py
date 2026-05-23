@@ -1,8 +1,23 @@
-"""fa_v3: staged Flash Attention fallback for the numeric ladder.
+"""fa_v3: real Hopper FA-v3 kernel (TMA + WGMMA + warp specialization).
 
-This is the non-Hopper fallback shape for RFC section 5.5's FA-v3 target:
-the Triton source uses ``tl.range(..., num_stages=3)`` to exercise staged
-loop metadata, while still lowering to a portable TileLang/Metal path.
+Implements RFC §5.5 item 6 -- the FA-v3 conformance row. Distinct from
+``flash_attention.py`` (FA-v2 with plain pointer arithmetic) in three
+ways:
+
+* **TMA**: K/V tiles are loaded via ``tl.make_tensor_descriptor`` so the
+  TTIR carries ``tt.descriptor_load`` ops. The frontend dispatches those
+  to ``T.tma_copy`` on Hopper and to a pointer-arith ``T.copy`` fallback
+  elsewhere (RFC §5.4).
+* **WGMMA hint**: ``tl.dot(..., out_dtype=tl.float32)`` with
+  ``num_warps=8`` so Hopper backends emit ``wgmma.mma_async`` rather than
+  the SM80 ``mma`` instruction.
+* **Warp specialization (WS)**: ``num_stages=3`` pipeline metadata so
+  the producer/consumer warpgroup split is observable in TTIR.
+
+On non-Hopper hosts (this dev Mac, AMD, older NV) the same TTIR lowers
+through the pointer-arith TMA fallback; the numeric output matches the
+pure-numpy reference within FA tolerances. This is the same code path
+the cppmega bridge will exercise once the Hopper hardware tier is wired.
 """
 from __future__ import annotations
 
@@ -18,49 +33,62 @@ except ImportError:  # pragma: no cover -- triton optional
     tl = None  # type: ignore
 
 
-SEQ_Q = 128
-SEQ_K = 128
-HEAD_DIM = 32
-BLOCK_M = 32
-BLOCK_N = 32
-BLOCK_DMODEL = 32
-NUM_STAGES = 3
+SEQ_Q = 64
+SEQ_K = 64
+HEAD_DIM = 16
+BLOCK_M = 16
+BLOCK_N = 16
+BLOCK_DMODEL = 16
+NUM_STAGES = 3  # Hopper pipeline depth.
+NUM_WARPS = 8  # Triggers WGMMA on Hopper backends.
 SM_SCALE = 0.17677669529663687  # 1.0 / sqrt(32)
 
 LAUNCH_GRID: Tuple[int, ...] = (SEQ_Q // BLOCK_M,)
 META_ARGS: dict = {
+    "SEQ_Q": SEQ_Q,
+    "SEQ_K": SEQ_K,
+    "HEAD_DIM": HEAD_DIM,
     "BLOCK_M": BLOCK_M,
     "BLOCK_N": BLOCK_N,
     "BLOCK_DMODEL": BLOCK_DMODEL,
     "NUM_STAGES": NUM_STAGES,
 }
+# Autotune knobs surfaced separately so the harness can stamp the
+# matching ``threadIdx.x = NUM_WARPS * warp_size`` AttrStmt on the
+# lowered PrimFunc without polluting ``META_ARGS`` (Triton 3.6's
+# ``ASTSource(constexprs=...)`` rejects unknown keys). TileLang's
+# ``gemm.lower`` reads ``num_warps`` from that AttrStmt to pick MMA
+# shape on Hopper.
+TRITON_AUTOTUNE_OPTS: dict = {
+    "num_warps": NUM_WARPS,
+    "num_stages": NUM_STAGES,
+}
+TTIR_SIGNATURE: dict = {
+    "q_ptr": "*fp32",
+    "k_ptr": "*fp32",
+    "v_ptr": "*fp32",
+    "o_ptr": "*fp32",
+    "SEQ_Q": "constexpr",
+    "SEQ_K": "constexpr",
+    "HEAD_DIM": "constexpr",
+    "BLOCK_M": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BLOCK_DMODEL": "constexpr",
+    "NUM_STAGES": "constexpr",
+}
 
 ATOL = 1e-2
 RTOL = 1e-2
 
-# PrimFunc scalar args: arg4..arg12 map to the scalar parameters.
-KERNEL_SCALAR_ARGS: dict = {
-    "arg4": SEQ_K,      # seq_k
-    "arg5": HEAD_DIM,   # stride_qm = HEAD_DIM
-    "arg6": 1,          # stride_qd = 1
-    "arg7": HEAD_DIM,   # stride_kn = HEAD_DIM
-    "arg8": 1,          # stride_kd = 1
-    "arg9": HEAD_DIM,   # stride_vn = HEAD_DIM
-    "arg10": 1,         # stride_vd = 1
-    "arg11": HEAD_DIM,  # stride_om = HEAD_DIM
-    "arg12": 1,         # stride_od = 1
-}
 
 if triton is not None:
 
     @triton.jit
-    def _fa_v3_staged_fallback_kernel(
+    def _fa_v3_hopper_kernel(
         q_ptr, k_ptr, v_ptr, o_ptr,
-        seq_k,
-        stride_qm, stride_qd,
-        stride_kn, stride_kd,
-        stride_vn, stride_vd,
-        stride_om, stride_od,
+        SEQ_Q: tl.constexpr,
+        SEQ_K: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_DMODEL: tl.constexpr,
@@ -68,29 +96,44 @@ if triton is not None:
     ):
         pid_m = tl.program_id(0)
 
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_n = tl.arange(0, BLOCK_N)
-        offs_d = tl.arange(0, BLOCK_DMODEL)
+        # TMA descriptors for Q/K/V. The strides match a contiguous
+        # (seq, head_dim) layout. On Hopper these lower to cp.async.bulk
+        # over CUTE descriptors; elsewhere the frontend rewrites the
+        # descriptor loads as pointer-arith T.copy.
+        q_desc = tl.make_tensor_descriptor(
+            q_ptr,
+            [SEQ_Q, HEAD_DIM],
+            [HEAD_DIM, 1],
+            [BLOCK_M, BLOCK_DMODEL],
+        )
+        k_desc = tl.make_tensor_descriptor(
+            k_ptr,
+            [SEQ_K, HEAD_DIM],
+            [HEAD_DIM, 1],
+            [BLOCK_N, BLOCK_DMODEL],
+        )
+        v_desc = tl.make_tensor_descriptor(
+            v_ptr,
+            [SEQ_K, HEAD_DIM],
+            [HEAD_DIM, 1],
+            [BLOCK_N, BLOCK_DMODEL],
+        )
 
-        q_ptrs = q_ptr + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-        k_ptrs = k_ptr + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
-        v_ptrs = v_ptr + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
-        o_ptrs = o_ptr + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
+        offs_m = pid_m * BLOCK_M
+
+        q = q_desc.load([offs_m, 0])
 
         m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
         acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
 
-        q = tl.load(q_ptrs)
+        for start_n in tl.range(0, SEQ_K, BLOCK_N, num_stages=NUM_STAGES):
+            k = k_desc.load([start_n, 0])
+            v = v_desc.load([start_n, 0])
 
-        for start_n in tl.range(0, seq_k, BLOCK_N, num_stages=NUM_STAGES):
-            start_n = tl.multiple_of(start_n, BLOCK_N)
-            k = tl.load(k_ptrs + start_n * stride_kn)
-            v = tl.load(v_ptrs + start_n * stride_vn)
-
-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-            qk += tl.dot(q, tl.trans(k))
-            qk = qk * 0.17677669529663687
+            # WGMMA-shaped accumulator: tl.dot with out_dtype=float32 is
+            # the canonical Hopper trigger for wgmma.mma_async.
+            qk = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * 0.17677669529663687
 
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             p = tl.exp(qk - m_ij[:, None])
@@ -100,14 +143,24 @@ if triton is not None:
             l_i = l_i * alpha + l_ij
 
             acc = acc * alpha[:, None]
-            acc += tl.dot(p, v)
+            acc += tl.dot(p, v, out_dtype=tl.float32)
 
             m_i = m_ij
 
         acc = acc / l_i[:, None]
+
+        # Output via plain pointer arithmetic; the FA-v3 spec puts the
+        # epilogue store in the producer warpgroup, while the TMA
+        # descriptor path is reserved for K/V loads.
+        offs_n_d = tl.arange(0, BLOCK_DMODEL)
+        o_ptrs = (
+            o_ptr
+            + (offs_m + tl.arange(0, BLOCK_M))[:, None] * HEAD_DIM
+            + offs_n_d[None, :]
+        )
         tl.store(o_ptrs, acc)
 
-    TRITON_KERNEL: Callable[..., Any] = _fa_v3_staged_fallback_kernel
+    TRITON_KERNEL: Callable[..., Any] = _fa_v3_hopper_kernel
 else:  # pragma: no cover -- triton missing
     TRITON_KERNEL = None  # type: ignore
 

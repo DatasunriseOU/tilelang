@@ -257,10 +257,25 @@ def _detect_via_mlir(op: Any, ctx: Any = None) -> Optional[str]:
     has every helper ``tt.func`` registered) and treat the call as if
     its single-arith-op body had been inlined.
     """
+    # The MLIR Python bindings are usually wired up under ``mlir.ir`` by
+    # ``_mlir_path_setup``. When the host has only jaxlib's bundled
+    # bindings, we obtain them via the LOCAL helper -- publishing them
+    # in ``sys.modules['mlir.ir']`` would collide with native Triton's
+    # nanobind extension on the next ``make_ir`` call. The reference
+    # returned by ``local_jaxlib_mlir_ir`` exposes the same API surface
+    # we need here (we only walk regions/blocks/operations via getattr).
     try:
         import mlir.ir  # type: ignore  # noqa: F401
     except ImportError:
-        return None
+        try:
+            from poc.triton_frontend._mlir_path_setup import (
+                local_jaxlib_mlir_ir,
+            )
+
+            if local_jaxlib_mlir_ir() is None:
+                return None
+        except Exception:
+            return None
     regions = getattr(op, "regions", None) or ()
     for region in regions:
         for block in getattr(region, "blocks", ()) or ():
