@@ -495,11 +495,24 @@ def _build_metal_launcher(
 
 
 def _spec_from_value(val: Any) -> _TensorSpec:
-    """Extract a :class:`_TensorSpec` from a torch.Tensor or FakeTensor."""
-    return _TensorSpec(
-        shape=tuple(int(s) for s in val.shape),
-        dtype=_torch_dtype_to_tl(val.dtype),
-    )
+    """Extract a :class:`_TensorSpec` from a torch.Tensor / FakeTensor / SymInt.
+
+    Joint fwd+bwd captures produced by aot_autograd may pass
+    ``SymInt`` placeholders alongside tensor placeholders (each symbol
+    becomes its own example_input). Represent them as a rank-0 int64
+    spec so the lowering pipeline keeps the slot allocated; the runtime
+    wrapper passes the symbol through unchanged.
+    """
+    if not hasattr(val, "shape") and not hasattr(val, "dtype"):
+        # Symbolic scalar (SymInt / SymFloat) placeholder.
+        return _TensorSpec(shape=(), dtype="int64")
+    if hasattr(val, "shape") and hasattr(val, "dtype"):
+        return _TensorSpec(
+            shape=tuple(int(s) for s in val.shape),
+            dtype=_torch_dtype_to_tl(val.dtype),
+        )
+    # SymInt-like: no ``.shape`` but iterable / int-coercible. Treat as scalar.
+    return _TensorSpec(shape=(), dtype="int64")
 
 
 def _spec_from_node(node: "torch.fx.Node") -> _TensorSpec:
@@ -1992,6 +2005,12 @@ class FXToTileLang:
                 else:
                     h.update(repr(x).encode())
         for spec in self.ctx.input_specs + self.ctx.output_specs:
+            if spec is None:
+                # ``None`` sentinel for non-differentiable bwd output
+                # slots (see ``on_output``). Hash the sentinel rather
+                # than dereferencing ``.shape``.
+                h.update(b"S<none>")
+                continue
             h.update(f"S{spec.shape}|{spec.dtype}".encode())
         h.update(f"O{self._output_container_kind()}".encode())
         for source in self._output_passthrough_sources():
@@ -2159,7 +2178,16 @@ class FXToTileLang:
         else:
             outs = (outs_raw,)
         for out in outs:
-            spec = self.ctx.value_map[out] if out is not None else None
+            # aot_autograd backward graphs frequently produce ``None``
+            # output slots for non-differentiable inputs (constexpr
+            # placeholders, SymInt scalars). PyTorch's autograd
+            # engine expects an aligned ``(grad, ...)`` tuple where
+            # those slots stay ``None``; preserve the alignment by
+            # recording a sentinel ``None`` spec rather than raising.
+            if out is None:
+                self.ctx.output_specs.append(None)
+                continue
+            spec = self.ctx.value_map.get(out)
             if not isinstance(spec, _TensorSpec):
                 raise RuntimeError(
                     f"FX output {out!r} did not resolve to a tensor spec")
