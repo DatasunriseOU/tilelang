@@ -13,6 +13,7 @@ from .decouple_type_cast import DecoupleTypeCast  # noqa: F401
 from .lower_extern_intrinsic import LowerExternIntrinsic  # noqa: F401
 from .metal_scalar_intrinsics import BindMetalScalarIntrinsics  # noqa: F401
 from .metal_merge_round import MetalMergeRoundBarrierCleanup  # noqa: F401
+from .metal_simdgroup_guard import MetalSimdgroupSemanticGuard  # noqa: F401
 
 
 def get_pass_context():

@@ -307,6 +307,8 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     from tilelang.transform.metal_simd_lift import MetalSimdLiftReductions
 
     mod = MetalSimdLiftReductions(mod)
+    if target.kind.name == "metal":
+        mod = tilelang.transform.MetalSimdgroupSemanticGuard(mod)
     # Infer memory layouts for fragments and shared memory
     mod = tilelang.transform.LayoutInference()(mod)
     # Visualize the layout

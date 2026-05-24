@@ -20,6 +20,8 @@ from typing import Any
 from tilelang import tvm as tvm
 from tvm import tir
 
+from tilelang.analysis.reduction_plan import extract_reduction_plans
+from tilelang.transform.metal_simdgroup_guard import validate_metal_simdgroup_intrinsics
 from tilelang.transform import PassConfigKey
 
 
@@ -1515,6 +1517,57 @@ def _assert_single_kernel_region_abi(lowered_module: tvm.IRModule, region: Fusio
     _validate_explicit_schedule_covers_region_abi(entry, region)
 
 
+def _target_kind_name(target: Any) -> str:
+    kind = getattr(getattr(target, "kind", None), "name", None)
+    if kind is not None:
+        return str(kind).lower()
+    with suppress(Exception):
+        target_object = tvm.target.Target(target)
+        kind = getattr(getattr(target_object, "kind", None), "name", None)
+        if kind is not None:
+            return str(kind).lower()
+    text = str(target).lower()
+    if "metal" in text:
+        return "metal"
+    if "cuda" in text or "nvptx" in text:
+        return "cuda"
+    return text
+
+
+def _reduction_plan_uses_cross_cta(plan: Any) -> bool:
+    thread_mapping = getattr(plan, "thread_mapping", None)
+    blocks_per_output = getattr(thread_mapping, "blocks_per_output", 1)
+    memory_plan = getattr(plan, "memory_plan", None)
+    return (
+        getattr(plan, "selected_strategy", None) == "two-pass-global"
+        or getattr(plan, "memory_visibility_scope", None) == "device"
+        or getattr(memory_plan, "visibility_scope", None) == "device"
+        or (isinstance(blocks_per_output, int) and blocks_per_output > 1)
+    )
+
+
+def _validate_cross_cta_reductions(lowered_module: tvm.IRModule, target: Any) -> None:
+    if _target_kind_name(target) != "metal":
+        return
+
+    for global_var, func in lowered_module.functions.items():
+        if not isinstance(func, tir.PrimFunc):
+            continue
+        for index, plan in enumerate(extract_reduction_plans(func)):
+            if not _reduction_plan_uses_cross_cta(plan):
+                continue
+            thread_mapping = getattr(plan, "thread_mapping", None)
+            blocks_per_output = getattr(thread_mapping, "blocks_per_output", None)
+            extents = ",".join(str(axis.extent) for axis in getattr(plan, "axes", ()))
+            raise ValueError(
+                "Metal target does not support cross-CTA reductions at the fusion boundary "
+                f"({global_var.name_hint}: reduction={index}, op={plan.op}, "
+                f"strategy={plan.selected_strategy}, extent={extents}, "
+                f"blocks_per_output={blocks_per_output}). Keep the reduction within one "
+                "threadgroup or route this schedule to a backend with cross-CTA reduction lowering."
+            )
+
+
 def compile_fusion_region(
     region: FusionRegion,
     *,
@@ -1539,6 +1592,8 @@ def compile_fusion_region(
     if require_single_kernel:
         _assert_single_kernel_region(lowered_module, region)
         _assert_single_kernel_region_abi(lowered_module, region)
+    _validate_cross_cta_reductions(lowered_module, target)
+    validate_metal_simdgroup_intrinsics(lowered_module, target=target)
     if lowerer is None:
         from tilelang.engine.lower import lower as lowerer
 

@@ -300,9 +300,12 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         input_param_indices = [
             i for i in range(len(self.params)) if i not in self.result_idx
         ]
+        native_input_param_indices = [
+            i for i in input_param_indices if is_buffer_param[i]
+        ]
         default_metal_dependency_metadata = (
             self._metal_dependency_metadata(
-                input_param_indices=input_param_indices,
+                input_param_indices=native_input_param_indices,
                 param_names=param_names,
                 command_buffer_domain=None,
             )
@@ -337,6 +340,16 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             all(is_buffer_param[i] for i in range(len(self.params)) if i not in self.result_idx)
             and all(is_buffer_param[i] for i in self.result_idx)
         )
+        native_scalar_param_indices = [
+            i for i in input_param_indices if not is_buffer_param[i]
+        ]
+        all_native_params_are_bridge_compatible = (
+            all(is_buffer_param[i] for i in self.result_idx)
+            and all(
+                is_buffer_param[i] or i in native_scalar_param_indices
+                for i in input_param_indices
+            )
+        )
         prepared_native_metal_call = None
         if (
             native_mlx_bridge_available_static
@@ -368,6 +381,18 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 )
             except (AttributeError, MLXTVMFFIBridgeUnavailable):
                 prepared_native_metal_call = None
+
+        def native_scalar_int_values(tensor_values: list[Any]) -> list[int] | None:
+            values: list[int] = []
+            for param_index in native_scalar_param_indices:
+                value = tensor_values[param_index]
+                if isinstance(value, bool):
+                    values.append(int(value))
+                elif isinstance(value, int):
+                    values.append(value)
+                else:
+                    return None
+            return values
 
         def normalize_out_argument(out_arg: Any) -> list[Any] | None:
             if out_arg is None:
@@ -528,8 +553,8 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
 
                     mx.eval(*owner_aliases)
                     if len(self.result_idx) == 1:
-                        return inputs[self.result_idx[0]]
-                    return [inputs[i] for i in self.result_idx]
+                        return owner_aliases[0]
+                    return list(owner_aliases)
                 except MLXTVMFFIBridgeUnavailable:
                     pass
 
@@ -574,7 +599,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 and output_overrides is None
                 and not using_full_abi_args
                 and hasattr(executable, "__getitem__")
-                and all_native_params_are_buffers
+                and all_native_params_are_bridge_compatible
             )
             use_native_mlx_graph = mlx_compact_graph_candidate and native_mlx_bridge_available
             use_native_mlx_owner_outputs = (
@@ -583,7 +608,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 and self.result_idx
                 and owner_outputs_requested
                 and hasattr(executable, "__getitem__")
-                and all_native_params_are_buffers
+                and all_native_params_are_bridge_compatible
                 and native_mlx_bridge_available
             )
             if not (use_native_mlx_graph or use_native_mlx_owner_outputs):
@@ -661,12 +686,13 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             )
 
             graph_outputs = None
+            native_scalar_values = native_scalar_int_values(tensor_list)
             if use_native_mlx_graph:
                 dependency_metadata = (
                     default_metal_dependency_metadata
                     if _tilelang_metal_command_buffer_domain is None
                     else self._metal_dependency_metadata(
-                        input_param_indices=input_param_indices,
+                        input_param_indices=native_input_param_indices,
                         param_names=param_names,
                         command_buffer_domain=_tilelang_metal_command_buffer_domain,
                     )
@@ -678,10 +704,14 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                             inputs=[tensor_list[i] for i in input_param_indices],
                             dependency_metadata=dependency_metadata,
                         )
-                    else:
+                    elif native_scalar_values is not None:
                         graph_outputs = mlx_tvm_ffi_metal_call(
                             executable["main"],
-                            inputs=[tensor_list[i] for i in input_param_indices],
+                            inputs=[
+                                tensor_list[i]
+                                for i in input_param_indices
+                                if is_buffer_param[i]
+                            ],
                             output_shapes=[tensor_list[i].shape for i in self.result_idx],
                             output_dtypes=[tensor_list[i].dtype for i in self.result_idx],
                             result_indices=self.result_idx,
@@ -693,6 +723,8 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                             direct_param_indices=direct_param_indices,
                             direct_module=direct_module,
                             direct_kernel_name=direct_kernel_name,
+                            scalar_param_indices=native_scalar_param_indices,
+                            scalar_int_values=native_scalar_values,
                             dependency_metadata=dependency_metadata,
                             zero_init_output_positions=metal_zero_init_output_positions,
                         )
@@ -707,7 +739,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                     default_metal_dependency_metadata
                     if _tilelang_metal_command_buffer_domain is None
                     else self._metal_dependency_metadata(
-                        input_param_indices=input_param_indices,
+                        input_param_indices=native_input_param_indices,
                         param_names=param_names,
                         command_buffer_domain=_tilelang_metal_command_buffer_domain,
                     )
@@ -755,24 +787,35 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                             [int(dim) for dim in getattr(tensor_list[i], "shape", ())]
                             for i in self.result_idx
                         ]
-                        owner_aliases = mlx_tvm_ffi_metal_call(
-                            executable["main"],
-                            inputs=[tensor_list[i] for i in input_param_indices],
-                            owner_outputs=[tensor_list[i] for i in self.result_idx],
-                            output_shapes=owner_output_shapes,
-                            output_dtypes=[expected_dtype_strs[i] for i in self.result_idx],
-                            result_indices=self.result_idx,
-                            num_params=len(self.params),
-                            param_dtypes=expected_dtype_strs,
-                            param_shapes=native_param_shapes,
-                            direct_func=direct_func,
-                            direct_launch_args=direct_launch_args,
-                            direct_param_indices=direct_param_indices,
-                            direct_module=direct_module,
-                            direct_kernel_name=direct_kernel_name,
-                            dependency_metadata=dependency_metadata,
-                            zero_init_output_positions=metal_zero_init_output_positions,
-                        )
+                        if native_scalar_values is None:
+                            owner_aliases = None
+                        else:
+                            owner_aliases = mlx_tvm_ffi_metal_call(
+                                executable["main"],
+                                inputs=[
+                                    tensor_list[i]
+                                    for i in input_param_indices
+                                    if is_buffer_param[i]
+                                ],
+                                owner_outputs=[tensor_list[i] for i in self.result_idx],
+                                output_shapes=owner_output_shapes,
+                                output_dtypes=[expected_dtype_strs[i] for i in self.result_idx],
+                                result_indices=self.result_idx,
+                                num_params=len(self.params),
+                                param_dtypes=expected_dtype_strs,
+                                param_shapes=native_param_shapes,
+                                direct_func=direct_func,
+                                direct_launch_args=direct_launch_args,
+                                direct_param_indices=direct_param_indices,
+                                direct_module=direct_module,
+                                direct_kernel_name=direct_kernel_name,
+                                scalar_param_indices=native_scalar_param_indices,
+                                scalar_int_values=native_scalar_values,
+                                dependency_metadata=dependency_metadata,
+                                zero_init_output_positions=metal_zero_init_output_positions,
+                            )
+                    if owner_aliases is None:
+                        raise MLXTVMFFIBridgeUnavailable()
                     if _tilelang_mlx_async_owner_outputs:
                         if len(self.result_idx) == 1:
                             return owner_aliases[0]
@@ -781,27 +824,106 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                     import mlx.core as mx  # type: ignore[import-not-found]
 
                     mx.eval(*owner_aliases)
-                    returned_outputs = (
-                        output_overrides
-                        if output_overrides is not None
-                        else tuple(tensor_list[i] for i in self.result_idx)
-                    )
                     if len(self.result_idx) == 1:
-                        return returned_outputs[0]
-                    if output_overrides is not None:
-                        return output_overrides
-                    return list(returned_outputs)
+                        return owner_aliases[0]
+                    return list(owner_aliases)
                 except MLXTVMFFIBridgeUnavailable:
                     pass
 
+            # Resolve compiled parameter names and order to handle alphabetical sorting and pruned parameters
+            compiled_param_names = None
+            if target_kind == "metal":
+                if hasattr(self, "device_kernel_source") and self.device_kernel_source:
+                    try:
+                        match = re.search(r"__global__\s+void\s+(?:__launch_bounds__\([^)]*\)\s+)?([a-zA-Z_0-9]+)\s*\(([^)]+)\)", self.device_kernel_source)
+                        if match:
+                            params_str = match.group(2)
+                            names = []
+                            for param in params_str.split(","):
+                                param = param.strip()
+                                param_match = re.search(r"([a-zA-Z_0-9]+)\s*$", param)
+                                if param_match:
+                                    names.append(param_match.group(1))
+                            compiled_param_names = names
+                    except Exception:
+                        pass
+
+                if compiled_param_names is None and hasattr(self, "device_mod") and self.device_mod:
+                    try:
+                        device_func = retrieve_func_from_module(self.device_mod)
+                        compiled_param_names = [var.name for var in device_func.params]
+                    except Exception:
+                        pass
+
+            if (
+                target_kind == "metal"
+                and compiled_param_names is not None
+                and hasattr(self, "prim_func")
+                and self.prim_func
+                and all_native_params_are_buffers
+            ):
+                try:
+                    param_name_to_tensor = {}
+                    param_name_to_dtype = {}
+                    for i, var in enumerate(self.prim_func.params):
+                        var_name = var.name[:-7] if var.name.endswith("_handle") else var.name
+                        if i < len(tensor_list):
+                            param_name_to_tensor[var_name] = tensor_list[i]
+                        if i < len(expected_dtype_strs):
+                            param_name_to_dtype[var_name] = expected_dtype_strs[i]
+
+                    compiled_tensor_list = []
+                    compiled_dtype_strs = []
+                    for name in compiled_param_names:
+                        if name in param_name_to_tensor:
+                            compiled_tensor_list.append(param_name_to_tensor[name])
+                        if name in param_name_to_dtype:
+                            compiled_dtype_strs.append(param_name_to_dtype[name])
+
+                    if len(compiled_tensor_list) == len(compiled_param_names):
+                        tensor_list_to_use = compiled_tensor_list
+                        expected_dtype_strs_to_use = compiled_dtype_strs
+                    else:
+                        tensor_list_to_use = tensor_list
+                        expected_dtype_strs_to_use = expected_dtype_strs
+                except Exception:
+                    tensor_list_to_use = tensor_list
+                    expected_dtype_strs_to_use = expected_dtype_strs
+            else:
+                tensor_list_to_use = tensor_list
+                expected_dtype_strs_to_use = expected_dtype_strs
+
             exec_tensor_list = (
                 mlx_arrays_to_tvm_tensors(
-                    tensor_list,
-                    expected_dtypes=expected_dtype_strs,
+                    tensor_list_to_use,
+                    expected_dtypes=expected_dtype_strs_to_use,
                 )
                 if uses_mlx_runtime
-                else tensor_list
+                else tensor_list_to_use
             )
+            # Check for dynamic shared memory size and append as a trailing argument if required.
+            # Dynamic shared memory is declared as: extern __shared__ ... buf_dyn_shmem[SIZE] or buf_dyn_shmem[].
+            dyn_shmem_size = 0
+            if target_kind == "metal" and hasattr(self, "device_kernel_source") and self.device_kernel_source:
+                match_size = re.search(
+                    r"extern\s+__shared__\s+.*buf_dyn_shmem\s*\[\s*(\d+)\s*\]",
+                    self.device_kernel_source,
+                )
+                if match_size:
+                    dyn_shmem_size = int(match_size.group(1))
+                else:
+                    is_dynamic = re.search(
+                        r"extern\s+__shared__\s+.*buf_dyn_shmem\s*\[\s*\]",
+                        self.device_kernel_source,
+                    )
+                    if is_dynamic:
+                        if hasattr(self, "prim_func") and self.prim_func:
+                            if self.prim_func.attrs and "dyn_shared_memory_buf" in self.prim_func.attrs:
+                                dyn_shmem_size = int(self.prim_func.attrs["dyn_shared_memory_buf"])
+
+            if target_kind == "metal" and dyn_shmem_size > 0:
+                exec_tensor_list = list(exec_tensor_list) + [dyn_shmem_size]
+
             with maybe_mlx_metal_external_command_buffer(tensor_list):
                 executable(*exec_tensor_list)
 

@@ -157,8 +157,9 @@ def _sync_child_runtime_fallbacks(
 class _TensorSpec:
     """Static shape/dtype carried alongside an FX value during lowering."""
 
-    shape: Tuple[int, ...]
+    shape: Tuple[Any, ...]
     dtype: str  # TileLang dtype string ("float16", "float32", etc.)
+    is_symbolic_scalar: bool = False
 
 
 @dataclass
@@ -505,19 +506,19 @@ def _spec_from_value(val: Any) -> _TensorSpec:
     """
     if not hasattr(val, "shape") and not hasattr(val, "dtype"):
         # Symbolic scalar (SymInt / SymFloat) placeholder.
-        return _TensorSpec(shape=(), dtype="int64")
+        return _TensorSpec(shape=(), dtype="int64", is_symbolic_scalar=True)
     if hasattr(val, "shape") and hasattr(val, "dtype"):
         return _TensorSpec(
-            shape=tuple(int(s) for s in val.shape),
+            shape=tuple(val.shape),
             dtype=_torch_dtype_to_tl(val.dtype),
         )
     # SymInt-like: no ``.shape`` but iterable / int-coercible. Treat as scalar.
-    return _TensorSpec(shape=(), dtype="int64")
+    return _TensorSpec(shape=(), dtype="int64", is_symbolic_scalar=True)
 
 
 def _spec_from_node(node: "torch.fx.Node") -> _TensorSpec:
     """Pull the TensorMetadata FX/Dynamo stamps onto every node."""
-    meta = node.meta.get("tensor_meta") or node.meta.get("val")
+    meta = node.meta["val"] if "val" in node.meta else node.meta.get("tensor_meta")
     if meta is None:
         raise RuntimeError(
             f"FX node {node!r} has no tensor_meta/val — cannot derive shape. "
@@ -526,12 +527,32 @@ def _spec_from_node(node: "torch.fx.Node") -> _TensorSpec:
     return _spec_from_value(meta)
 
 
-def _broadcast_shape(a: Tuple[int, ...], b: Tuple[int, ...]) -> Tuple[int, ...]:
+def _shape_dim_is_one(dim: Any) -> bool:
+    return isinstance(dim, int) and dim == 1
+
+
+def _shape_dim_equal(a: Any, b: Any) -> bool:
+    if a is b:
+        return True
+    if isinstance(a, int) and isinstance(b, int):
+        return a == b
+    return str(a) == str(b)
+
+
+def _shape_dim_to_int(dim: Any) -> int:
+    return int(dim)
+
+
+def _broadcast_shape(a: Tuple[Any, ...], b: Tuple[Any, ...]) -> Tuple[Any, ...]:
     """NumPy-style broadcast of two static shapes."""
-    out: List[int] = []
+    out: List[Any] = []
     for da, db in zip(reversed(a or (1,)), reversed(b or (1,))):
-        if da == db or da == 1 or db == 1:
-            out.append(max(da, db))
+        if _shape_dim_is_one(da):
+            out.append(db)
+        elif _shape_dim_is_one(db):
+            out.append(da)
+        elif _shape_dim_equal(da, db):
+            out.append(da)
         else:
             raise ValueError(f"Cannot broadcast {a} with {b}")
     # tail of the longer shape
@@ -954,7 +975,7 @@ def _emit_view_like(name: str) -> Callable[..., _TensorSpec]:
             target = args[1] if len(args) > 1 else None
         # Resolve -1 entries against the source numel.
         if target is None:
-            new_shape: Tuple[int, ...] = x.shape
+            new_shape: Tuple[Any, ...] = x.shape
         elif isinstance(target, (list, tuple)):
             target_t = tuple(target)
             n_neg = sum(1 for s in target_t if s == -1)
@@ -1537,7 +1558,7 @@ def emit_expand(node, args, ctx: LoweringContext) -> _TensorSpec:
     target = tuple(args[1]) if len(args) > 1 else x.shape
     if not isinstance(x, _TensorSpec):
         raise TypeError("expand requires a tensor input")
-    out_shape: Tuple[int, ...] = tuple(
+    out_shape: Tuple[Any, ...] = tuple(
         s if s != -1 else x.shape[i] for i, s in enumerate(target)
     )
     ctx.op_trace.append(("expand", (node.name, x, target)))
@@ -1552,7 +1573,7 @@ def emit_slice_backward(node, args, ctx: LoweringContext) -> _TensorSpec:
     the output spec lets the existing region fallback replay the real ATen op.
     """
     grad_out = args[0]
-    input_sizes = tuple(int(s) for s in args[1])
+    input_sizes = tuple(_shape_dim_to_int(s) for s in args[1])
     dim = int(args[2]) if len(args) > 2 else 0
     start = int(args[3]) if len(args) > 3 else 0
     end = int(args[4]) if len(args) > 4 else input_sizes[dim]
@@ -2335,6 +2356,19 @@ class FXToTileLang:
     # patterns that defeat tiling.
     _NON_FUSABLE_BOUNDARY_OPS = frozenset({"aten_extern", "print"})
 
+    @staticmethod
+    def _partition_pattern_match(
+        trace: Sequence[Tuple[str, Tuple[Any, ...]]],
+        start: int,
+    ) -> Optional[Tuple[str, List[Tuple[str, Tuple[Any, ...]]], int]]:
+        from ._fusion_patterns import FUSION_PATTERNS  # noqa: WPS433
+
+        for pattern in FUSION_PATTERNS:
+            match = pattern.matcher(trace, start)
+            if match is not None:
+                return match
+        return None
+
     def _partition_fusable_subgraphs(self) -> List[List[Tuple[str, Tuple[Any, ...]]]]:
         """Split ``ctx.op_trace`` into a list of fusable op-trace runs.
 
@@ -2350,17 +2384,45 @@ class FXToTileLang:
         """
         regions: List[List[Tuple[str, Tuple[Any, ...]]]] = []
         current: List[Tuple[str, Tuple[Any, ...]]] = []
-        for entry in self.ctx.op_trace:
+
+        def flush_current() -> None:
+            if current:
+                regions.append(list(current))
+                current.clear()
+
+        trace = self.ctx.op_trace
+        i = 0
+        while i < len(trace):
+            entry = trace[i]
             op_name = entry[0]
             if op_name in self._NON_FUSABLE_BOUNDARY_OPS:
-                if current:
-                    regions.append(current)
-                    current = []
+                flush_current()
                 regions.append([entry])
-            else:
-                current.append(entry)
-        if current:
-            regions.append(current)
+                i += 1
+                continue
+
+            match = self._partition_pattern_match(trace, i)
+            if match is not None and match[2] > i + 1:
+                flush_current()
+                end = match[2]
+                while (
+                    end < len(trace)
+                    and trace[end][0] in self._SEQUENTIAL_VIEW_OPS
+                ):
+                    end += 1
+                regions.append(list(trace[i:end]))
+                i = end
+                continue
+
+            if op_name in self._SEQUENTIAL_MATMUL_OPS:
+                flush_current()
+                regions.append([entry])
+                i += 1
+                continue
+
+            current.append(entry)
+            i += 1
+        flush_current()
         return regions
 
     def _materialize_subgraph(
@@ -3277,7 +3339,7 @@ class FXToTileLang:
         dtype = src_spec.dtype
         n_elem = 1
         for s in shape:
-            n_elem *= int(s)
+            n_elem *= _shape_dim_to_int(s)
         if n_elem <= 0:
             raise NotImplementedError(f"sequential region: degenerate numel from shape {shape}")
 
@@ -3290,7 +3352,7 @@ class FXToTileLang:
         external_inputs: List[str] = []
         external_names_set = set()
 
-        for op_name, payload in compute_ops:
+        for _op_name, payload in compute_ops:
             node_name = payload[0]
             if node_name not in node_map:
                 continue
@@ -3526,7 +3588,7 @@ class FXToTileLang:
         dtype = x_spec.dtype
         n_elem = 1
         for s in in_shape:
-            n_elem *= int(s)
+            n_elem *= _shape_dim_to_int(s)
         if n_elem <= 0:
             raise FxToTileLangUnsupported(
                 f"reduction emitter: degenerate numel from input shape {in_shape}")
@@ -3557,7 +3619,7 @@ class FXToTileLang:
 
         n_out = 1
         for s in out_shape:
-            n_out *= int(s)
+            n_out *= _shape_dim_to_int(s)
         n_out = max(n_out, 1)  # 0-dim full reduction → 1-element flat view.
 
         # Full reduction (every input axis collapses) is the common case for
@@ -3838,16 +3900,19 @@ class FXToTileLang:
         return cache
 
     @staticmethod
-    def _tile_constants(m: int, n: int, k: int) -> Tuple[int, int, int]:
+    def _tile_constants(m: Any, n: Any, k: Any) -> Tuple[int, int, int]:
         """Default tile constants per shape (BLOCK_M=128 for matmul-shaped,
         BLOCK_N=64 for reductions, BLOCK_K=32 default).
 
         Heuristic: cap each block by the corresponding extent so we don't
         emit a kernel whose grid is < 1 block.
         """
-        block_M = 128 if m >= 128 else (64 if m >= 64 else m)
-        block_N = 64 if n >= 64 else n
-        block_K = 32 if k >= 32 else k
+        m_i = _shape_dim_to_int(m)
+        n_i = _shape_dim_to_int(n)
+        k_i = _shape_dim_to_int(k)
+        block_M = 128 if m_i >= 128 else (64 if m_i >= 64 else m_i)
+        block_N = 64 if n_i >= 64 else n_i
+        block_K = 32 if k_i >= 32 else k_i
         return block_M, block_N, block_K
 
     @staticmethod
@@ -3869,7 +3934,7 @@ class FXToTileLang:
         }.get(spec.dtype, 4)
         total = elem_bytes
         for s in spec.shape:
-            total *= s
+            total *= _shape_dim_to_int(s)
         if total <= 2 * 1024:
             return "alloc_fragment"
         if total <= 64 * 1024:
@@ -3891,23 +3956,23 @@ class FXToTileLang:
         single region. Other regions in the same compile keep their real
         TileLang launchers.
 
-        For the POC we approximate per-region replay with a whole-graph FX
-        eager replay, since the alternative (per-region FX subgraph
-        extraction) requires a non-trivial graph-rewriter we haven't built
-        yet. This is correct (FX eager always matches torch eager) but
-        coarser than the cache-resident region boundary the orchestrator
-        plans for. See ``_NON_FUSABLE_BOUNDARY_OPS`` for the planned
-        boundary handling.
+        Region replay interprets only the FX nodes produced by this region
+        so multi-region chains can recover from a backend runtime failure
+        without requiring the original whole-graph input list.
         """
         gm = self.gm
         input_names: List[str] = []
+        output_names: List[str] = []
         try:
             partitions = self._partition_count_cache()
             region_io = self._derive_region_io(partitions)
             if region_io is not None:
-                for candidate, (candidate_inputs, _) in zip(partitions, region_io):
+                for candidate, (candidate_inputs, candidate_outputs) in zip(
+                    partitions, region_io
+                ):
                     if candidate is region or candidate == region:
                         input_names = list(candidate_inputs)
+                        output_names = list(candidate_outputs)
                         break
             runtime_input_names = [
                 n.name
@@ -3916,13 +3981,70 @@ class FXToTileLang:
             ]
         except Exception:  # pragma: no cover - defensive only
             runtime_input_names = []
+        name_to_node = {n.name: n for n in self.gm.graph.nodes}
+        produced_names = [
+            payload[0]
+            for _, payload in region
+            if payload and isinstance(payload[0], str)
+        ]
+
+        def _get_attr(target: str) -> Any:
+            value = gm
+            for part in target.split("."):
+                value = getattr(value, part)
+            return value
+
+        def _resolve(value: Any, env: Dict[str, Any]) -> Any:
+            name = getattr(value, "name", None)
+            if isinstance(name, str) and name in env:
+                return env[name]
+            if isinstance(value, tuple):
+                return tuple(_resolve(item, env) for item in value)
+            if isinstance(value, list):
+                return [_resolve(item, env) for item in value]
+            if isinstance(value, dict):
+                return {key: _resolve(item, env) for key, item in value.items()}
+            return value
+
+        def _replay_region(env: Dict[str, Any]) -> Any:
+            for node_name in produced_names:
+                node = name_to_node[node_name]
+                if node.op == "placeholder":
+                    continue
+                if node.op == "get_attr":
+                    env[node.name] = _get_attr(str(node.target))
+                    continue
+                args = _resolve(node.args, env)
+                kwargs = _resolve(node.kwargs, env)
+                if node.op == "call_function":
+                    env[node.name] = node.target(*args, **kwargs)
+                elif node.op == "call_method":
+                    receiver, *rest = args
+                    env[node.name] = getattr(receiver, str(node.target))(
+                        *rest, **kwargs
+                    )
+                elif node.op == "call_module":
+                    env[node.name] = _get_attr(str(node.target))(*args, **kwargs)
+                else:
+                    raise RuntimeError(
+                        f"region-local fallback cannot replay FX op {node.op!r}"
+                    )
+            outs = output_names or produced_names[-1:]
+            values = [env[name] for name in outs]
+            if len(values) == 1:
+                return values[0]
+            return tuple(values)
 
         # Mark this launcher as the extern fallback so the chain launcher
         # can detect "all regions extern" and short-circuit to a single
         # gm.forward call (the only safe approximation today).
         def _launcher(*runtime_inputs: Any) -> Any:
-            if input_names and runtime_input_names:
+            if input_names:
                 env = dict(zip(input_names, runtime_inputs))
+                if all(name in env for name in input_names):
+                    return _replay_region(env)
+            if runtime_input_names:
+                env = dict(zip(runtime_input_names, runtime_inputs))
                 if all(name in env for name in runtime_input_names):
                     return gm(*(env[name] for name in runtime_input_names))
                 missing = [
@@ -3972,7 +4094,7 @@ class FXToTileLang:
                 node_to_region[n] = r_idx
 
         result: List[Tuple[List[str], List[str]]] = []
-        for r_idx, region in enumerate(regions):
+        for r_idx, _region in enumerate(regions):
             produced = produced_per_region[r_idx]
             produced_set = set(produced)
 

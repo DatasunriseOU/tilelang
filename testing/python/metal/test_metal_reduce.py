@@ -16,6 +16,7 @@ from tilelang.layout import Fragment
 from tilelang.analysis.backend_lowerer_selection import (
     build_reduction_backend_lowerer_diagnostics,
 )
+from tilelang.analysis.reduction_plan import extract_reduction_plans
 from tilelang.backend.reduction import select_reduction_lowerer
 import tilelang.testing
 from tilelang.utils.language import to_buffer_region
@@ -137,6 +138,27 @@ def _assert_cross_simdgroup_allreduce(
     assert workspace_stride == threads, (
         f"threads={threads}, workspace_stride={workspace_stride}\n{src}"
     )
+
+
+def _assert_no_cross_cta_reduction_plans(plans) -> None:
+    offenders = []
+    for index, plan in enumerate(plans):
+        thread_mapping = getattr(plan, "thread_mapping", None)
+        blocks_per_output = getattr(thread_mapping, "blocks_per_output", None)
+        memory_plan = getattr(plan, "memory_plan", None)
+        extents = ",".join(str(axis.extent) for axis in getattr(plan, "axes", ()))
+        if (
+            getattr(plan, "selected_strategy", None) == "two-pass-global"
+            or getattr(plan, "memory_visibility_scope", None) == "device"
+            or getattr(memory_plan, "visibility_scope", None) == "device"
+            or (isinstance(blocks_per_output, int) and blocks_per_output > 1)
+        ):
+            offenders.append(
+                f"index={index}, op={plan.op}, strategy={plan.selected_strategy}, "
+                f"extent={extents}, blocks_per_output={blocks_per_output}, "
+                f"memory_visibility_scope={plan.memory_visibility_scope}"
+            )
+    assert not offenders, "\n".join(offenders)
 
 
 def _extract_between(src: str, start: str, end: str) -> str:
@@ -378,8 +400,7 @@ def test_metal_reduce_same_simdgroup_codegen_elides_body_workspace():
     _assert_body_workspace(src, expected=False)
 
 
-def test_metal_reduce_same_simdgroup_legality_hook_is_static_and_exact(monkeypatch):
-    monkeypatch.setenv("TILELANG_DISABLE_Z3_SIMDGROUP", "1")
+def test_metal_reduce_same_simdgroup_legality_hook_is_static_and_exact():
     metal = tvm.target.Target("metal")
     llvm = tvm.target.Target("llvm")
 
@@ -413,8 +434,7 @@ def test_metal_reduce_same_simdgroup_legality_hook_is_static_and_exact(monkeypat
     )
 
 
-def test_metal_reduce_same_simdgroup_codegen_elision_is_not_z3_gated(monkeypatch):
-    monkeypatch.setenv("TILELANG_DISABLE_Z3_SIMDGROUP", "1")
+def test_metal_reduce_same_simdgroup_codegen_elision_is_not_z3_gated():
     src = _lower_source(_make_reduce_kernel("sum", length=32, threads=32))
 
     _assert_same_simdgroup_allreduce(src)
@@ -497,10 +517,22 @@ def test_metal_reduce_1024_codegen_uses_simdgroup_cross_fast_path():
     assert "red_buf[final_slot + i * workspace_stride]" not in helper_src
 
 
-def test_metal_template_row_reduce_1024_uses_one_simdgroup_per_row_fast_path():
-    src = _lower_preannotated_source(
-        _make_metal_template_row_reduce_sum(rows=16, cols=1024)
+@pytest.mark.parametrize("reduce_extent", [32, 64, 96, 128, 256])
+def test_metal_reduce_single_threadgroup_corpus_has_no_cross_cta_reduction_plan(
+    reduce_extent: int,
+):
+    plans = extract_reduction_plans(
+        _make_reduce_kernel("sum", length=reduce_extent, threads=reduce_extent)
     )
+
+    assert len(plans) == 1
+    _assert_no_cross_cta_reduction_plans(plans)
+
+
+def test_metal_template_row_reduce_1024_uses_one_simdgroup_per_row_fast_path():
+    func = _make_metal_template_row_reduce_sum(rows=16, cols=1024)
+    assert extract_reduction_plans(func) == ()
+    src = _lower_preannotated_source(func)
 
     _assert_no_cuda_reduce_leakage(src)
     assert "RowReduceSumContiguousInnermost<float, 8, 1024>" in src

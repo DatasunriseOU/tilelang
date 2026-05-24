@@ -400,7 +400,12 @@ def is_mlx_array(arg: Any) -> bool:
     """Return whether *arg* is an ``mlx.core.array`` without requiring MLX."""
 
     mx = _mlx_core()
-    return mx is not None and isinstance(arg, mx.array)
+    if mx is None:
+        return False
+    mx_array = getattr(mx, "array", None)
+    if not isinstance(mx_array, type):
+        return False
+    return isinstance(arg, mx_array)
 
 
 def _contains_mlx_array(arg: Any) -> bool:

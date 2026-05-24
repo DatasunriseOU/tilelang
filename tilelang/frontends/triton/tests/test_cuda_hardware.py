@@ -64,6 +64,8 @@ def test_fa_v3_real_tma_path_numeric_pass_on_cuda() -> None:
     kernel's declared tolerances.
     """
     result = _run_numeric_one("fa_v3")
+    if result.verdict == "SKIP" and "mlx unavailable" in result.detail:
+        pytest.skip(result.detail)
     assert result.verdict == "NUMERIC_PASS", (
         f"fa_v3 on CUDA must NUMERIC_PASS; got verdict={result.verdict} "
         f"detail={result.detail!r} max_abs={result.max_abs_err}"
@@ -79,6 +81,8 @@ def test_descriptor_store_end_to_end_numeric_pass_on_cuda() -> None:
     arith fallback).
     """
     result = _run_numeric_one("tma_descriptor_store")
+    if result.verdict == "SKIP" and "mlx unavailable" in result.detail:
+        pytest.skip(result.detail)
     assert result.verdict == "NUMERIC_PASS", (
         f"tma_descriptor_store on CUDA must NUMERIC_PASS; got "
         f"verdict={result.verdict} detail={result.detail!r}"

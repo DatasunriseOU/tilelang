@@ -167,6 +167,52 @@ def _ensure_contiguous_inputs(
     return tuple(tensors)
 
 
+def _is_symbolic_scalar_input_spec(spec: Any) -> bool:
+    return bool(getattr(spec, "is_symbolic_scalar", False))
+
+
+def _split_runtime_inputs(
+    runtime_inputs: Sequence[Any],
+    input_specs: Sequence[Any],
+) -> Tuple[Tuple[Any, ...], Tuple[int, ...]]:
+    tensor_args: List[Any] = []
+    scalar_args: List[int] = []
+    for idx, value in enumerate(runtime_inputs):
+        if idx < len(input_specs) and _is_symbolic_scalar_input_spec(input_specs[idx]):
+            scalar_args.append(int(value))
+        else:
+            tensor_args.append(value)
+    return tuple(tensor_args), tuple(scalar_args)
+
+
+def _merge_runtime_inputs(
+    tensor_args: Sequence[Any],
+    scalar_args: Sequence[int],
+    input_specs: Sequence[Any],
+) -> Tuple[Any, ...]:
+    merged: List[Any] = []
+    tensor_idx = 0
+    scalar_idx = 0
+    for spec in input_specs:
+        if _is_symbolic_scalar_input_spec(spec):
+            if scalar_idx >= len(scalar_args):
+                raise RuntimeError(
+                    "tilelang custom_op missing symbolic scalar runtime input"
+                )
+            merged.append(int(scalar_args[scalar_idx]))
+            scalar_idx += 1
+        else:
+            if tensor_idx >= len(tensor_args):
+                raise RuntimeError(
+                    "tilelang custom_op missing tensor runtime input"
+                )
+            merged.append(tensor_args[tensor_idx])
+            tensor_idx += 1
+    if tensor_idx < len(tensor_args):
+        merged.extend(tensor_args[tensor_idx:])
+    return tuple(merged)
+
+
 @dataclass
 class FusedKernelArtifact:
     """Opaque handle returned by :class:`FXToTileLang.run`.
@@ -541,6 +587,10 @@ def wrap_as_custom_op(
         i for i, source in enumerate(passthrough_sources) if source is None
     )
     op_output_specs = tuple(artifact.output_specs[i] for i in custom_output_indices)
+    input_specs = tuple(artifact.input_specs)
+    has_symbolic_scalar_inputs = any(
+        _is_symbolic_scalar_input_spec(spec) for spec in input_specs
+    )
 
     if not custom_output_indices:
         return _bind_passthrough_only_runtime(
@@ -584,6 +634,26 @@ def wrap_as_custom_op(
         _has_params = bool(param_tensors)
         _bound_launcher = artifact.launcher
 
+        def _call_launcher(
+            tensor_args: Sequence[Any],
+            scalar_args: Sequence[int] = (),
+        ) -> Any:
+            checked_args = _ensure_contiguous_inputs(op_qualname, tensor_args)
+            if has_symbolic_scalar_inputs:
+                runtime_args = _merge_runtime_inputs(
+                    checked_args,
+                    scalar_args,
+                    input_specs,
+                )
+            else:
+                runtime_args = checked_args
+            if _has_params:
+                return _bound_launcher(*runtime_args, *param_tensors)
+            return _bound_launcher(*runtime_args)
+
+        def _fake_device(args: Sequence[Any]) -> Any:
+            return args[0].device if len(args) else "meta"
+
         # Wave-9 #1: unify _impl / _fake return contract per n_outputs.
         # Old code annotated both as ``-> List[Tensor]`` (to satisfy
         # ``torch.library.infer_schema``, wave-7 #4) but the bodies
@@ -598,14 +668,7 @@ def wrap_as_custom_op(
         #   n>1  → -> List[Tensor] (always normalises to ``list(outs)``)
         if n_outputs == 1:
 
-            @custom_op(op_qualname, mutates_args=())
-            def _impl(args: List[torch.Tensor]) -> torch.Tensor:  # type: ignore[name-defined]
-                _check_no_grad(args, allow_grad=allow_grad)
-                checked_args = _ensure_contiguous_inputs(op_qualname, args)
-                if _has_params:
-                    result = _bound_launcher(*checked_args, *param_tensors)
-                else:
-                    result = _bound_launcher(*checked_args)
+            def _finish_single(args: Sequence[Any], result: Any) -> Any:
                 custom_values = _select_custom_op_outputs(
                     result,
                     custom_output_indices=custom_output_indices,
@@ -613,12 +676,10 @@ def wrap_as_custom_op(
                     op_qualname=op_qualname,
                 )
                 result = _ensure_non_aliased_outputs(
-                    checked_args,
+                    args,
                     custom_values[0],
                     materialize_aliases=is_backward,
                 )
-                # Launcher may return a 1-tuple/1-list around the single
-                # tensor — unwrap to match the declared schema.
                 if isinstance(result, (list, tuple)):
                     if len(result) != 1:
                         raise RuntimeError(
@@ -627,25 +688,41 @@ def wrap_as_custom_op(
                     return result[0]
                 return result
 
-            @register_fake(op_qualname)
-            def _fake(args: List[torch.Tensor]) -> torch.Tensor:  # type: ignore[name-defined]
-                spec = op_output_specs[0]
-                return torch.empty(
-                    spec.shape,
-                    dtype=_spec_to_torch_dtype(spec.dtype),
-                    device=args[0].device if len(args) else "meta",
-                )
+            if has_symbolic_scalar_inputs:
+
+                @custom_op(op_qualname, mutates_args=())
+                def _impl(args: List[torch.Tensor], scalar_args: List[int]) -> torch.Tensor:  # type: ignore[name-defined]
+                    _check_no_grad(args, allow_grad=allow_grad)
+                    return _finish_single(args, _call_launcher(args, scalar_args))
+
+                @register_fake(op_qualname)
+                def _fake(args: List[torch.Tensor], scalar_args: List[int]) -> torch.Tensor:  # type: ignore[name-defined]
+                    spec = op_output_specs[0]
+                    return torch.empty(
+                        spec.shape,
+                        dtype=_spec_to_torch_dtype(spec.dtype),
+                        device=_fake_device(args),
+                    )
+
+            else:
+
+                @custom_op(op_qualname, mutates_args=())
+                def _impl(args: List[torch.Tensor]) -> torch.Tensor:  # type: ignore[name-defined]
+                    _check_no_grad(args, allow_grad=allow_grad)
+                    return _finish_single(args, _call_launcher(args))
+
+                @register_fake(op_qualname)
+                def _fake(args: List[torch.Tensor]) -> torch.Tensor:  # type: ignore[name-defined]
+                    spec = op_output_specs[0]
+                    return torch.empty(
+                        spec.shape,
+                        dtype=_spec_to_torch_dtype(spec.dtype),
+                        device=_fake_device(args),
+                    )
 
         else:
 
-            @custom_op(op_qualname, mutates_args=())
-            def _impl(args: List[torch.Tensor]) -> List[torch.Tensor]:  # type: ignore[name-defined]
-                _check_no_grad(args, allow_grad=allow_grad)
-                checked_args = _ensure_contiguous_inputs(op_qualname, args)
-                if _has_params:
-                    result = _bound_launcher(*checked_args, *param_tensors)
-                else:
-                    result = _bound_launcher(*checked_args)
+            def _finish_multi(args: Sequence[Any], result: Any) -> List[Any]:
                 result = _select_custom_op_outputs(
                     result,
                     custom_output_indices=custom_output_indices,
@@ -653,7 +730,7 @@ def wrap_as_custom_op(
                     op_qualname=op_qualname,
                 )
                 result = _ensure_non_aliased_outputs(
-                    checked_args,
+                    args,
                     result,
                     materialize_aliases=is_backward,
                 )
@@ -668,16 +745,41 @@ def wrap_as_custom_op(
                     f"{op_qualname}: n_outputs={n_outputs} launcher "
                     f"returned a non-iterable {type(result).__name__}")
 
-            @register_fake(op_qualname)
-            def _fake(args: List[torch.Tensor]) -> List[torch.Tensor]:  # type: ignore[name-defined]
-                outs = []
-                for spec in op_output_specs:
-                    outs.append(torch.empty(
-                        spec.shape,
-                        dtype=_spec_to_torch_dtype(spec.dtype),
-                        device=args[0].device if len(args) else "meta",
-                    ))
-                return outs
+            if has_symbolic_scalar_inputs:
+
+                @custom_op(op_qualname, mutates_args=())
+                def _impl(args: List[torch.Tensor], scalar_args: List[int]) -> List[torch.Tensor]:  # type: ignore[name-defined]
+                    _check_no_grad(args, allow_grad=allow_grad)
+                    return _finish_multi(args, _call_launcher(args, scalar_args))
+
+                @register_fake(op_qualname)
+                def _fake(args: List[torch.Tensor], scalar_args: List[int]) -> List[torch.Tensor]:  # type: ignore[name-defined]
+                    return [
+                        torch.empty(
+                            spec.shape,
+                            dtype=_spec_to_torch_dtype(spec.dtype),
+                            device=_fake_device(args),
+                        )
+                        for spec in op_output_specs
+                    ]
+
+            else:
+
+                @custom_op(op_qualname, mutates_args=())
+                def _impl(args: List[torch.Tensor]) -> List[torch.Tensor]:  # type: ignore[name-defined]
+                    _check_no_grad(args, allow_grad=allow_grad)
+                    return _finish_multi(args, _call_launcher(args))
+
+                @register_fake(op_qualname)
+                def _fake(args: List[torch.Tensor]) -> List[torch.Tensor]:  # type: ignore[name-defined]
+                    return [
+                        torch.empty(
+                            spec.shape,
+                            dtype=_spec_to_torch_dtype(spec.dtype),
+                            device=_fake_device(args),
+                        )
+                        for spec in op_output_specs
+                    ]
 
         # Phase 2.3 / integration #10:
         #   * autograd-disabled tag stays set on the *bwd* op — aot_autograd
@@ -725,6 +827,10 @@ def _bind_runtime(
 
     allow_grad = is_backward if allow_grad_inputs is None else allow_grad_inputs
     param_tensors = tuple(artifact.param_tensors)
+    input_specs = tuple(artifact.input_specs)
+    has_symbolic_scalar_inputs = any(
+        _is_symbolic_scalar_input_spec(spec) for spec in input_specs
+    )
     if passthrough_sources is None:
         passthrough_sources = _normalise_passthrough_sources(artifact)
     if custom_output_indices is None:
@@ -736,7 +842,14 @@ def _bind_runtime(
 
     def _runner(*runtime_inputs: Any) -> Any:
         _check_no_grad(runtime_inputs, allow_grad=allow_grad)
-        result = op(list(runtime_inputs))
+        if has_symbolic_scalar_inputs:
+            tensor_args, scalar_args = _split_runtime_inputs(
+                runtime_inputs,
+                input_specs,
+            )
+            result = op(list(tensor_args), list(scalar_args))
+        else:
+            result = op(list(runtime_inputs))
         if not has_passthrough:
             return _restore_output_container(result, output_container)
         result = _reconstruct_full_outputs(

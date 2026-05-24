@@ -3,6 +3,7 @@ import pytest
 import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm
+from tvm import tir
 from tilelang.engine import compile_fusion_region as exported_compile_fusion_region
 from tilelang.engine.fusion import (
     BaselineComparison,
@@ -152,6 +153,48 @@ def _internal_scratch_abi_fused_train_block(
         D[0] = packed_post[0]
 
 
+def _make_thread_allreduce_func(extent: int) -> tir.PrimFunc:
+    src = tir.decl_buffer((extent,), "float32", name="src")
+    dst = tir.decl_buffer((1,), "float32", name="dst")
+    lane = tir.Var("lane", "int32")
+    reduce_index = lane % tir.IntImm("int32", extent)
+    reducer = tir.comm_reducer(
+        lambda x, y: x + y,
+        lambda dtype: tir.const(0, dtype=dtype),
+        name="sum",
+    )
+    call = tir.call_intrin(
+        "handle",
+        "tir.tvm_thread_allreduce",
+        tir.const(1, "uint32"),
+        tir.BufferLoad(src, [lane]),
+        tir.const(True, "bool"),
+        tir.BufferLoad(dst, [0]),
+        reduce_index,
+    )
+    body = tir.AttrStmt(
+        reducer,
+        "reduce_scope",
+        tir.reinterpret("handle", tir.const(0, "uint64")),
+        tir.Evaluate(call),
+    )
+    return tir.PrimFunc([], body)
+
+
+def _make_shfl_sync_func() -> tir.PrimFunc:
+    src = tir.decl_buffer((32,), "int32", name="src")
+    lane = tir.Var("lane", "int32")
+    call = tir.call_intrin(
+        "int32",
+        tir.op.Op.get("tl.shfl_sync"),
+        tir.const(0xFFFFFFFF, "uint32"),
+        tir.BufferLoad(src, [lane]),
+        tir.const(31, "int32"),
+        tir.const(32, "int32"),
+    )
+    return tir.PrimFunc([], tir.Evaluate(call))
+
+
 def test_region_compile_uses_one_pre_source_ir_module_with_z3_config():
     assert exported_compile_fusion_region is compile_fusion_region
     assert tilelang.compile_fusion_region is compile_fusion_region
@@ -218,6 +261,47 @@ def test_region_compile_uses_one_pre_source_ir_module_with_z3_config():
     ]
     assert "tl.fusion.region" in called["func_or_mod"].script()
     assert "mamba3_scan" in called["func_or_mod"].script()
+
+
+def test_metal_compile_rejects_cross_cta_reduction_plans():
+    region = build_mamba3_fp8_train_block_region(
+        schedule_template=lambda _: _make_thread_allreduce_func(512),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Metal target does not support cross-CTA reductions.*two-pass-global",
+    ):
+        compile_fusion_region(region, target="metal", lowerer=lambda *args, **kwargs: "compiled")
+
+
+def test_metal_compile_rejects_cuda_warp_shuffle_semantics():
+    region = build_mamba3_fp8_train_block_region(
+        schedule_template=lambda _: _make_shfl_sync_func(),
+    )
+
+    with pytest.raises(ValueError, match="Metal SIMDgroup guard.*tl.shfl_sync"):
+        compile_fusion_region(region, target="metal", lowerer=lambda *args, **kwargs: "compiled")
+
+
+def test_cuda_compile_allows_cross_cta_reduction_plans():
+    region = build_mamba3_fp8_train_block_region(
+        schedule_template=lambda _: _make_thread_allreduce_func(512),
+    )
+
+    result = compile_fusion_region(region, target="cuda", lowerer=lambda *args, **kwargs: "compiled")
+
+    assert result.artifact == "compiled"
+
+
+def test_metal_compile_allows_threadgroup_reduction_plans():
+    region = build_mamba3_fp8_train_block_region(
+        schedule_template=lambda _: _make_thread_allreduce_func(128),
+    )
+
+    result = compile_fusion_region(region, target="metal", lowerer=lambda *args, **kwargs: "compiled")
+
+    assert result.artifact == "compiled"
 
 
 def test_explicit_fused_schedule_keeps_internal_edges_out_of_entry_abi():

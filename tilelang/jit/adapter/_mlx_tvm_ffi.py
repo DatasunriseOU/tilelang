@@ -405,6 +405,8 @@ def metal_call(
     direct_param_indices: Iterable[int] | None = None,
     direct_module: Any | None = None,
     direct_kernel_name: str | None = None,
+    scalar_param_indices: Iterable[int] | None = None,
+    scalar_int_values: Iterable[int] | None = None,
     command_buffer_domain: Any | None = None,
     dependency_metadata: MetalLaunchDependencyMetadata | None = None,
     zero_init_output_positions: Iterable[int] = (),
@@ -434,6 +436,12 @@ def metal_call(
     direct_param_index_list = None
     if direct_param_indices is not None:
         direct_param_index_list = [int(value) for value in direct_param_indices]
+    scalar_param_index_list = None
+    if scalar_param_indices is not None:
+        scalar_param_index_list = [int(value) for value in scalar_param_indices]
+    scalar_int_value_list = None
+    if scalar_int_values is not None:
+        scalar_int_value_list = [int(value) for value in scalar_int_values]
     direct_module_handle = 0
     if direct_module is not None:
         direct_module_handle = _function_handle(direct_module)
@@ -469,6 +477,8 @@ def metal_call(
             param_shapes=param_shape_list,
             direct_launch_args=direct_launch_arg_list,
             direct_param_indices=direct_param_index_list,
+            scalar_param_indices=scalar_param_index_list,
+            scalar_int_values=scalar_int_value_list,
             direct_module_handle=direct_module_handle,
             direct_kernel_name=direct_kernel_name_str,
         )
@@ -488,6 +498,8 @@ def metal_call(
             param_shapes=param_shape_list,
             direct_launch_args=direct_launch_arg_list,
             direct_param_indices=direct_param_index_list,
+            scalar_param_indices=scalar_param_index_list,
+            scalar_int_values=scalar_int_value_list,
             direct_module_handle=direct_module_handle,
             direct_kernel_name=direct_kernel_name_str,
         )

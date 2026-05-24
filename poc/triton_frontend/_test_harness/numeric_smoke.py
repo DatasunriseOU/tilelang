@@ -681,6 +681,9 @@ def _run_mlx(
         if inputs_np:
             args_struct_inline[f"arg{buffer_count}"] = int(inputs_np[0].size)
 
+    input_buffer_names = getattr(kernel_mod, "INPUT_BUFFER_NAMES", None)
+    output_buffer_names = getattr(kernel_mod, "OUTPUT_BUFFER_NAMES", None)
+
     try:
         adapter = wrap_tilelang_metal_kernel(
             artifact,
@@ -688,6 +691,8 @@ def _run_mlx(
             output_count=1,
             name="triton_e2e_kernel",
             args_struct_inline=args_struct_inline,
+            input_buffer_names=input_buffer_names,
+            output_buffer_names=output_buffer_names,
             allow_mx_fast_metal_kernel=True,
         )
     except MLXRuntimeError as exc:

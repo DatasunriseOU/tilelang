@@ -634,7 +634,7 @@ private:
       // fix is to register a side-table of decoded descriptors keyed by
       // the Var; tracked separately.
       LOG(WARNING) << "LowerTMAToPtrArith: failed to decode TMA descriptor "
-                   << "for " << GetRef<Call>(call) << "; leaving call in "
+                   << "for " << tvm::ffi::GetRef<Call>(call) << "; leaving call in "
                    << "place — non-NV codegen will reject it.";
       return std::nullopt;
     }

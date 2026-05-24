@@ -308,7 +308,12 @@ def _resolve_ptrstate_value(ctx: WalkerCtx, value: Any) -> Any:
     """Resolve a PtrAnalysis JSON scalar/symbol into a TIR value."""
     try:
         if value in ctx.value_map:
-            return ctx.value_map[value]
+            resolved = ctx.value_map[value]
+            if isinstance(resolved, tuple) and len(resolved) == 2:
+                # If it resolved to a (buffer, indices) pointer tuple, the actual
+                # numeric offset is the trailing index.
+                return resolved[1][-1]
+            return resolved
     except TypeError:
         pass
     value = _coerce_index_scalar(ctx, value)
@@ -318,10 +323,14 @@ def _resolve_ptrstate_value(ctx: WalkerCtx, value: Any) -> Any:
     for key in candidates:
         try:
             if key in ctx.value_map:
-                return ctx.value_map[key]
+                resolved = ctx.value_map[key]
+                if isinstance(resolved, tuple) and len(resolved) == 2:
+                    return resolved[1][-1]
+                return resolved
         except TypeError:
             pass
     raise EmitError(f"PtrState references unresolved SSA value {value!r}")
+
 
 
 def _resolve_ptrstate_values(ctx: WalkerCtx, values: Sequence[Any]) -> List[Any]:

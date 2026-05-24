@@ -1265,3 +1265,5 @@ def test_tt_histogram_accepts_mlir_short_i32_dtype():
 
     hist_buf = ctx.get(out_ssa)
     assert str(hist_buf.dtype) == "int32"
+
+

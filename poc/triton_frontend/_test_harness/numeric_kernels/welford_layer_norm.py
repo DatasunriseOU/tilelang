@@ -39,6 +39,8 @@ TTIR_SIGNATURE: dict = {
     "BLOCK_SIZE": "constexpr",
     "EPS": "constexpr",
 }
+INPUT_BUFFER_NAMES = ["arg0", "arg1", "arg2"]
+OUTPUT_BUFFER_NAMES = ["arg3"]
 
 # Tolerances loosened slightly because Welford recurrence reorders fp32 adds
 # vs the single-pass mean/var.

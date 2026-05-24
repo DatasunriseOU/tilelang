@@ -118,8 +118,9 @@ public:
     return f;
   }
 
-  Stmt VisitStmt_(const AllocateNode *op) final {
-    Stmt stmt = StmtExprMutator::VisitStmt_(op);
+  Stmt VisitStmt_(const AllocateNode *op) {
+    Stmt mutated_body = this->VisitStmt(op->body);
+    Allocate stmt(op->buffer_var, op->dtype, op->extents, op->condition, mutated_body, op->annotations);
     Array<Stmt> init_stmts;
     for (auto &desc_init : desc_inits_) {
       if (!desc_init.emitted && desc_init.base_var == op->buffer_var.get()) {
@@ -128,7 +129,7 @@ public:
       }
     }
     if (init_stmts.empty()) {
-      return stmt;
+      return std::move(stmt);
     }
 
     auto *alloc = stmt.as<AllocateNode>();
@@ -141,6 +142,13 @@ public:
     auto n = CopyOnWrite(alloc);
     n->body = SeqStmt(seq);
     return Stmt(n);
+  }
+
+  Stmt VisitStmt(const Stmt &stmt) override {
+    if (const auto *op = stmt.as<AllocateNode>()) {
+      return VisitStmt_(op);
+    }
+    return StmtExprMutator::VisitStmt(stmt);
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {

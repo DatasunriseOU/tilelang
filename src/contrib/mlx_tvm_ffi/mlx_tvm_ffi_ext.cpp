@@ -937,6 +937,8 @@ class TVMFFIMetalCall : public mx::Primitive {
       std::vector<std::vector<int64_t>> param_shapes,
       std::vector<int64_t> direct_launch_args,
       std::vector<int64_t> direct_param_indices,
+      std::vector<int64_t> scalar_param_indices,
+      std::vector<int64_t> scalar_int_values,
       uint64_t direct_module_handle,
       std::string direct_kernel_name,
       std::vector<int64_t> zero_init_output_positions,
@@ -952,6 +954,8 @@ class TVMFFIMetalCall : public mx::Primitive {
         param_shapes_(std::move(param_shapes)),
         direct_launch_args_(std::move(direct_launch_args)),
         direct_param_indices_(std::move(direct_param_indices)),
+        scalar_param_indices_(std::move(scalar_param_indices)),
+        scalar_int_values_(std::move(scalar_int_values)),
         direct_module_handle_(reinterpret_cast<TVMFFIObjectHandle>(direct_module_handle)),
         direct_kernel_name_(std::move(direct_kernel_name)),
         zero_init_output_positions_(std::move(zero_init_output_positions)),
@@ -975,6 +979,9 @@ class TVMFFIMetalCall : public mx::Primitive {
         static_cast<int64_t>(param_shapes_.size()) != num_params_) {
       throw std::runtime_error("TVM-FFI parameter shape metadata length mismatch");
     }
+    if (scalar_param_indices_.size() != scalar_int_values_.size()) {
+      throw std::runtime_error("TVM-FFI scalar parameter metadata/value length mismatch");
+    }
     std::sort(result_indices_.begin(), result_indices_.end());
     result_indices_.erase(
         std::unique(result_indices_.begin(), result_indices_.end()),
@@ -987,6 +994,20 @@ class TVMFFIMetalCall : public mx::Primitive {
       if (idx < 0 || idx >= num_params_) {
         throw std::runtime_error("TVM-FFI result index is outside the parameter list");
       }
+    }
+    std::vector<uint8_t> seen_scalar_params(static_cast<size_t>(num_params_), 0);
+    for (int64_t idx : scalar_param_indices_) {
+      if (idx < 0 || idx >= num_params_) {
+        throw std::runtime_error("TVM-FFI scalar parameter index is outside the parameter list");
+      }
+      if (std::binary_search(result_indices_.begin(), result_indices_.end(), idx)) {
+        throw std::runtime_error("TVM-FFI scalar parameter cannot also be an output");
+      }
+      auto& seen = seen_scalar_params[static_cast<size_t>(idx)];
+      if (seen) {
+        throw std::runtime_error("TVM-FFI scalar parameter indices contain duplicates");
+      }
+      seen = 1;
     }
     if (output_shapes_.size() != result_indices_.size()) {
       throw std::runtime_error("TVM-FFI output shape metadata/result_idx length mismatch");
@@ -1022,6 +1043,8 @@ class TVMFFIMetalCall : public mx::Primitive {
     func_handle_ = prepared_->func_handle_ptr;
     num_params_ = prepared_->num_params;
     direct_launch_handle_ = prepared_->direct_launch_handle;
+    scalar_param_indices_.clear();
+    scalar_int_values_.clear();
     if (launch_sync_state_ == nullptr) {
       launch_sync_state_ = make_launch_sync_state();
     }
@@ -1061,7 +1084,23 @@ class TVMFFIMetalCall : public mx::Primitive {
     if (outputs.size() != result_indices.size()) {
       throw std::runtime_error("TVM-FFI bridge output count mismatch");
     }
-    const int64_t expected_inputs = num_params_ - static_cast<int64_t>(result_indices.size());
+    if (scalar_param_indices_.size() != scalar_int_values_.size()) {
+      throw std::runtime_error("TVM-FFI scalar parameter metadata/value length mismatch");
+    }
+    auto scalar_position_for_param = [&](int64_t param_idx) -> int64_t {
+      for (size_t i = 0; i < scalar_param_indices_.size(); ++i) {
+        if (scalar_param_indices_[i] == param_idx) {
+          return static_cast<int64_t>(i);
+        }
+      }
+      return -1;
+    };
+    const int64_t scalar_param_count = static_cast<int64_t>(scalar_param_indices_.size());
+    const int64_t expected_inputs =
+        num_params_ - static_cast<int64_t>(result_indices.size()) - scalar_param_count;
+    if (expected_inputs < 0) {
+      throw std::runtime_error("TVM-FFI scalar/output parameter count exceeds parameter count");
+    }
     const int64_t expected_primitive_inputs =
         expected_inputs +
         (owner_outputs_are_inputs_ ? static_cast<int64_t>(result_indices.size()) : 0);
@@ -1103,7 +1142,8 @@ class TVMFFIMetalCall : public mx::Primitive {
       }
     }
 
-    const bool direct_device_launch = !direct_launch_args.empty();
+    const bool direct_device_launch =
+        !direct_launch_args.empty() && scalar_param_indices_.empty();
     const bool direct_pipeline_launch =
         direct_device_launch &&
         direct_launch_handle_ != nullptr &&
@@ -1292,6 +1332,18 @@ class TVMFFIMetalCall : public mx::Primitive {
           result_indices.begin(),
           result_indices.end(),
           param_idx);
+      const int64_t scalar_pos = scalar_position_for_param(param_idx);
+      const bool is_scalar = scalar_pos >= 0;
+      if (is_scalar) {
+        if (is_output) {
+          throw std::runtime_error("TVM-FFI scalar parameter cannot be an output");
+        }
+        TVMFFIAny& arg = args[static_cast<size_t>(param_idx)];
+        arg.type_index = kTVMFFIInt;
+        arg.zero_padding = 0;
+        arg.v_int64 = scalar_int_values_[static_cast<size_t>(scalar_pos)];
+        continue;
+      }
       const std::vector<int64_t>* shape_override = nullptr;
       const mx::array& array =
           is_output ? outputs.at(output_pos)
@@ -1482,6 +1534,8 @@ class TVMFFIMetalCall : public mx::Primitive {
   std::vector<std::vector<int64_t>> param_shapes_;
   std::vector<int64_t> direct_launch_args_;
   std::vector<int64_t> direct_param_indices_;
+  std::vector<int64_t> scalar_param_indices_;
+  std::vector<int64_t> scalar_int_values_;
   TVMFFIObjectHandle direct_module_handle_{nullptr};
   std::string direct_kernel_name_;
   std::shared_ptr<CachedDirectLaunchHandle> direct_launch_handle_;
@@ -1672,6 +1726,8 @@ std::vector<mx::array> tvm_ffi_metal_call(
     const std::vector<std::vector<int64_t>>& param_shapes,
     const std::vector<int64_t>& direct_launch_args,
     const std::vector<int64_t>& direct_param_indices,
+    const std::vector<int64_t>& scalar_param_indices,
+    const std::vector<int64_t>& scalar_int_values,
     uint64_t direct_module_handle,
     const std::string& direct_kernel_name,
     const std::vector<int64_t>& zero_init_output_positions,
@@ -1704,6 +1760,8 @@ std::vector<mx::array> tvm_ffi_metal_call(
       param_shapes,
       direct_launch_args,
       direct_param_indices,
+      scalar_param_indices,
+      scalar_int_values,
       direct_module_handle,
       direct_kernel_name,
       zero_init_output_positions,
@@ -2184,6 +2242,8 @@ PyObject* c_api_metal_call(
         std::vector<std::vector<int64_t>>{},
         std::vector<int64_t>{},
         std::vector<int64_t>{},
+        std::vector<int64_t>{},
+        std::vector<int64_t>{},
         0,
         std::string{},
         parse_i64_sequence(nb::handle(zero_init)),
@@ -2436,6 +2496,8 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
          nb::handle param_shapes,
          nb::handle direct_launch_args,
          nb::handle direct_param_indices,
+         nb::handle scalar_param_indices,
+         nb::handle scalar_int_values,
          uint64_t direct_module_handle,
          const std::string& direct_kernel_name) {
         std::vector<mx::array> parsed_inputs;
@@ -2446,6 +2508,8 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
         std::vector<std::vector<int64_t>> parsed_param_shapes;
         std::vector<int64_t> parsed_direct_launch_args;
         std::vector<int64_t> parsed_direct_param_indices;
+        std::vector<int64_t> parsed_scalar_param_indices;
+        std::vector<int64_t> parsed_scalar_int_values;
         std::vector<int64_t> parsed_zero_init_output_positions;
         std::shared_ptr<tilelang::mlx_tvm_ffi::MetalLaunchSyncState> parsed_launch_sync_state;
         std::vector<std::shared_ptr<tilelang::mlx_tvm_ffi::MetalSyncEdge>> parsed_wait_edges;
@@ -2497,6 +2561,19 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
               std::string("failed to parse direct device launch args: ") + exc.what());
         }
         try {
+          if (!scalar_param_indices.is_none()) {
+            parsed_scalar_param_indices =
+                tilelang::mlx_tvm_ffi::parse_i64_sequence(scalar_param_indices);
+          }
+          if (!scalar_int_values.is_none()) {
+            parsed_scalar_int_values =
+                tilelang::mlx_tvm_ffi::parse_i64_sequence(scalar_int_values);
+          }
+        } catch (const std::exception& exc) {
+          throw std::runtime_error(
+              std::string("failed to parse scalar parameter args: ") + exc.what());
+        }
+        try {
           parsed_zero_init_output_positions =
               tilelang::mlx_tvm_ffi::parse_i64_sequence(zero_init_output_positions);
         } catch (const std::exception& exc) {
@@ -2526,6 +2603,8 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
                 parsed_param_shapes,
                 parsed_direct_launch_args,
                 parsed_direct_param_indices,
+                parsed_scalar_param_indices,
+                parsed_scalar_int_values,
                 direct_module_handle,
                 direct_kernel_name,
                 parsed_zero_init_output_positions,
@@ -2545,6 +2624,8 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
       "param_shapes"_a = nb::none(),
       "direct_launch_args"_a = nb::none(),
       "direct_param_indices"_a = nb::none(),
+      "scalar_param_indices"_a = nb::none(),
+      "scalar_int_values"_a = nb::none(),
       "direct_module_handle"_a = 0,
       "direct_kernel_name"_a = "");
   m.def(
@@ -2563,6 +2644,8 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
          nb::handle param_shapes,
          nb::handle direct_launch_args,
          nb::handle direct_param_indices,
+         nb::handle scalar_param_indices,
+         nb::handle scalar_int_values,
          uint64_t direct_module_handle,
          const std::string& direct_kernel_name) {
         std::vector<mx::array> parsed_inputs;
@@ -2574,6 +2657,8 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
         std::vector<std::vector<int64_t>> parsed_param_shapes;
         std::vector<int64_t> parsed_direct_launch_args;
         std::vector<int64_t> parsed_direct_param_indices;
+        std::vector<int64_t> parsed_scalar_param_indices;
+        std::vector<int64_t> parsed_scalar_int_values;
         std::vector<int64_t> parsed_zero_init_output_positions;
         std::shared_ptr<tilelang::mlx_tvm_ffi::MetalLaunchSyncState> parsed_launch_sync_state;
         std::vector<std::shared_ptr<tilelang::mlx_tvm_ffi::MetalSyncEdge>> parsed_wait_edges;
@@ -2597,6 +2682,14 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
             parsed_direct_param_indices =
                 tilelang::mlx_tvm_ffi::parse_i64_sequence(direct_param_indices);
           }
+          if (!scalar_param_indices.is_none()) {
+            parsed_scalar_param_indices =
+                tilelang::mlx_tvm_ffi::parse_i64_sequence(scalar_param_indices);
+          }
+          if (!scalar_int_values.is_none()) {
+            parsed_scalar_int_values =
+                tilelang::mlx_tvm_ffi::parse_i64_sequence(scalar_int_values);
+          }
           parsed_zero_init_output_positions =
               tilelang::mlx_tvm_ffi::parse_i64_sequence(zero_init_output_positions);
           parsed_launch_sync_state =
@@ -2618,6 +2711,8 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
                 parsed_param_shapes,
                 parsed_direct_launch_args,
                 parsed_direct_param_indices,
+                parsed_scalar_param_indices,
+                parsed_scalar_int_values,
                 direct_module_handle,
                 direct_kernel_name,
                 parsed_zero_init_output_positions,
@@ -2639,6 +2734,8 @@ NB_MODULE(_tilelang_mlx_tvm_ffi, m) {
       "param_shapes"_a = nb::none(),
       "direct_launch_args"_a = nb::none(),
       "direct_param_indices"_a = nb::none(),
+      "scalar_param_indices"_a = nb::none(),
+      "scalar_int_values"_a = nb::none(),
       "direct_module_handle"_a = 0,
       "direct_kernel_name"_a = "");
   m.def(
