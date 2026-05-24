@@ -951,6 +951,10 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         graph path allocates owner outputs lazily.
         """
 
+        attrs = getattr(self.prim_func, "attrs", None)
+        if attrs and "tilelang_metal_zero_init_output_positions" in attrs:
+            return [int(idx) for idx in attrs["tilelang_metal_zero_init_output_positions"]]
+
         source_parts = [
             source
             for source in (self.device_kernel_source, self.host_kernel_source)

@@ -280,8 +280,8 @@ class PassConfigKey(str, Enum):
     ```
     read = T.allocate([1], T.int32, "local.var")
     write = T.allocate([1], T.int32, "local.var")
-    read_buf = T.Buffer((1,), T.int32, data=read, scope="local.var")
-    write_buf = T.Buffer((1,), T.int32, data=write, scope="local.var")
+    read_buf = T.Tensor((1,), T.int32, data=read, scope="local.var")
+    write_buf = T.Tensor((1,), T.int32, data=write, scope="local.var")
     write_buf[0] = read_buf[0] * 2
     f(write_buf[0])
     ```
@@ -292,7 +292,7 @@ class PassConfigKey(str, Enum):
 
     ```
     read = T.allocate([1], T.int32, "local.var")
-    read_buf = T.Buffer((1,), T.int32, data=read, scope="local.var")
+    read_buf = T.Tensor((1,), T.int32, data=read, scope="local.var")
     read_buf[0] = read_buf[0] * 2
     f(read_buf[0])
     ```
