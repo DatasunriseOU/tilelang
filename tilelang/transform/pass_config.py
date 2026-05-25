@@ -319,8 +319,8 @@ class PassConfigKey(str, Enum):
     TIR_DISABLE_CSE = "tirx.disable_cse_tir"
     """Disable TIR Common Subexpression Elimination. Default: False"""
 
-    TIR_SIMPLIFY = "tir.Simplify"
-    """Enable/disable TIR simplification passes. Default: True"""
+    TIR_SIMPLIFY = "tirx.Simplify"
+    """Configuration for TIR simplification passes. Default: SimplifyConfig defaults"""
 
     TIR_DISABLE_STORAGE_REWRITE = "tir.disable_storage_rewrite"
     """Disable storage rewrite optimization. Default: False"""

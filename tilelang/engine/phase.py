@@ -70,6 +70,58 @@ def allow_tir_cse(pass_ctx: PassContext | None = None) -> bool:
     return not bool(pass_ctx.config.get(tilelang.PassConfigKey.TIR_DISABLE_CSE, False))
 
 
+def _module_disables_tir_simplify(mod: IRModule) -> bool:
+    attrs = getattr(mod, "attrs", None)
+    if attrs and bool(attrs.get("tl.fusion.disable_tir_simplify", False)):
+        return True
+    for _, func in mod.functions.items():
+        attrs = getattr(func, "attrs", None)
+        if attrs and bool(attrs.get("tl.fusion.disable_tir_simplify", False)):
+            return True
+    return False
+
+
+def _mark_module_disable_tir_simplify(mod: IRModule) -> IRModule:
+    for global_var, func in list(mod.functions.items()):
+        if hasattr(func, "with_attr"):
+            mod.update_func(
+                global_var,
+                func.with_attr("tl.fusion.disable_tir_simplify", True),
+            )
+    return mod
+
+
+def allow_tir_simplify(
+    mod: IRModule | None = None,
+    pass_ctx: PassContext | None = None,
+) -> bool:
+    if mod is not None and _module_disables_tir_simplify(mod):
+        return False
+    return True
+
+
+def _maybe_simplify(
+    mod: IRModule,
+    pass_ctx: PassContext | None = None,
+    *,
+    disable: bool = False,
+) -> IRModule:
+    if disable or not allow_tir_simplify(mod, pass_ctx):
+        return mod
+    return tilelang.transform.Simplify()(mod)
+
+
+def _maybe_tir_simplify(
+    mod: IRModule,
+    pass_ctx: PassContext | None = None,
+    *,
+    disable: bool = False,
+) -> IRModule:
+    if disable or not allow_tir_simplify(mod, pass_ctx):
+        return mod
+    return tir.transform.Simplify()(mod)
+
+
 def _apply_metal_hoist_expression(mod: IRModule, pass_ctx: PassContext | None = None) -> IRModule:
     """Run HoistExpression in Metal cleanup without duplicating large flattened bodies."""
 
@@ -233,6 +285,7 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     Returns:
         IRModule: The transformed module, ready for target-specific optimization passes.
     """
+    disable_tir_simplify = _module_disables_tir_simplify(mod)
     # CPPMEGA z3-stack fix-A8 (NEW-2): drop any stale per-thread Z3 prover
     # cache entries before this pass pipeline runs. The prover cache is
     # keyed by `Analyzer*`; a freed Analyzer's address can be reused by a
@@ -277,7 +330,7 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     # Inject assumes to speedup tvm prover
     mod = tilelang.transform.InjectAssumes()(mod)
     # Simplify the IR expressions
-    mod = tilelang.transform.Simplify()(mod)
+    mod = _maybe_simplify(mod, disable=disable_tir_simplify)
     # Set layouts for reducers
     mod = tilelang.transform.LayoutReducer()(mod)
     # Tile-level warp specialization: runs before layout inference so that
@@ -295,7 +348,7 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     # inference so inferred layouts see the final pipelined structure directly.
     mod = tilelang.transform.PipelinePlanning()(mod)
     mod = tilelang.transform.InjectSoftwarePipeline()(mod)
-    mod = tilelang.transform.Simplify()(mod)
+    mod = _maybe_simplify(mod, disable=disable_tir_simplify)
     # On Metal, rewrite local.fragment GEMM accumulators to metal.simdgroup
     # before layout inference (which would otherwise require a layout for them)
     from tilelang.transform.metal_fragment_to_simdgroup import MetalFragmentToSimdgroup
@@ -347,14 +400,17 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     # use an enhanced pass to simplify the dynamic symbolics
     # TODO(lei): return to tir pass when kSymbolicBound simplification
     # is merged into tvm.
-    mod = tilelang.transform.Simplify()(mod)
+    mod = _maybe_simplify(mod, disable=disable_tir_simplify)
     # Hoist any root-block annotations to PrimFunc attrs if pass is available
     mod = tilelang.transform.HoistNonRestrictParams()(mod)
+    if disable_tir_simplify:
+        mod = _mark_module_disable_tir_simplify(mod)
     return mod
 
 
 def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     pass_ctx = tilelang.transform.get_pass_context()
+    disable_tir_simplify = _module_disables_tir_simplify(mod)
     # CPPMEGA z3-stack fix-A8 (NEW-2): also clear here. `LowerAndLegalize`
     # and `OptimizeForTarget` are called as separate phases; either may be
     # invoked in isolation by tools, and the per-thread Z3 prover cache
@@ -395,14 +451,14 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.FuseMBarrierArriveExpectTx()(mod)
     mod = tilelang.transform.HoistGlobalBufferAllocations()(mod)
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
-    mod = tilelang.transform.Simplify()(mod)
+    mod = _maybe_simplify(mod, pass_ctx, disable=disable_tir_simplify)
     mod = tir.transform.NarrowDataType(32)(mod)
 
     mod = tilelang.transform.FlattenBuffer()(mod)
     # ConfigIndexBitwidth must be applied after FlattenBuffer
     # as it will flatten index computing
     mod = tilelang.transform.ConfigIndexBitwidth()(mod)
-    mod = tir.transform.Simplify()(mod)
+    mod = _maybe_tir_simplify(mod, pass_ctx, disable=disable_tir_simplify)
 
     # CPPMEGA: Z3 roadmap idea #4 — drop provable buffer-bound guards before
     # vectorization. Gated by `tl.drop_provable_bound_checks` PassConfig
@@ -418,7 +474,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.LoopUnswitching()(mod)
     mod = tilelang.transform.UnrollLoop()(mod)
     mod = tir.transform.RenormalizeSplitPattern()(mod)
-    mod = tir.transform.Simplify()(mod)
+    mod = _maybe_tir_simplify(mod, pass_ctx, disable=disable_tir_simplify)
     mod = tir.transform.RemoveNoOp()(mod)
     mod = tir.transform.HoistIfThenElse()(mod)
 
@@ -497,11 +553,13 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # inlines those binds when collecting launch args.
     mod = apply_metal_scalar_pipeline(mod, target, pass_ctx)
     mod = tilelang.transform.MakePackedAPI()(mod)
-    mod = tilelang.transform.Simplify()(mod)
+    mod = _maybe_simplify(mod, pass_ctx, disable=disable_tir_simplify)
     mod = apply_metal_scalar_pipeline(mod, target, pass_ctx)
     mod = tilelang.transform.LowerDeviceKernelLaunch()(mod)
 
     # Transform threadblock to persistent threadblock
     mod = tilelang.transform.PersistThreadblock()(mod)
+    if disable_tir_simplify:
+        mod = _mark_module_disable_tir_simplify(mod)
 
     return mod

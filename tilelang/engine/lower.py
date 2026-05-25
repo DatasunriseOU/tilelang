@@ -20,6 +20,8 @@ from tilelang.engine.phase import (
     PreLowerSemanticCheck,
     LowerAndLegalize,
     OptimizeForTarget,
+    _maybe_tir_simplify,
+    _module_disables_tir_simplify,
     apply_metal_scalar_pipeline,
 )
 
@@ -241,6 +243,7 @@ def host_codegen(host_mod: tvm.IRModule, target_host: Target, target: Target | N
 
 
 def device_codegen(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
+    disable_tir_simplify = _module_disables_tir_simplify(device_mod)
     # Lower TileLang's vendored `tilelang.LetStmt` to tirx Bind+SeqStmt before
     # any apache/tvm tirx pass touches the IR.
     device_mod = tilelang.transform.LowerTileLangLetStmt()(device_mod)
@@ -248,7 +251,7 @@ def device_codegen(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
     device_mod = tilelang.transform.LowerDeviceStorageAccessInfo()(device_mod)
     device_mod = tilelang.transform.LowerIntrin()(device_mod)
     device_mod = tilelang.transform.LowerExternIntrinsic(_extern_intrinsic_target_name(target))(device_mod)
-    device_mod = tir.transform.Simplify()(device_mod)
+    device_mod = _maybe_tir_simplify(device_mod, disable=disable_tir_simplify)
     device_mod = tilelang.transform.HoistBroadcastValues()(device_mod)
     device_mod = apply_metal_scalar_pipeline(device_mod, target)
 
@@ -266,13 +269,14 @@ def device_codegen(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
 
 
 def device_codegen_without_compile(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
+    disable_tir_simplify = _module_disables_tir_simplify(device_mod)
     # Lower vendored TileLang LetStmt before apache/tvm tirx passes run.
     device_mod = tilelang.transform.LowerTileLangLetStmt()(device_mod)
     device_mod = tilelang.transform.LowerTileLangAllocate()(device_mod)
     device_mod = tilelang.transform.LowerDeviceStorageAccessInfo()(device_mod)
     device_mod = tilelang.transform.LowerIntrin()(device_mod)
     device_mod = tilelang.transform.LowerExternIntrinsic(_extern_intrinsic_target_name(target))(device_mod)
-    device_mod = tir.transform.Simplify()(device_mod)
+    device_mod = _maybe_tir_simplify(device_mod, disable=disable_tir_simplify)
     device_mod = tilelang.transform.HoistBroadcastValues()(device_mod)
     device_mod = apply_metal_scalar_pipeline(device_mod, target)
 
