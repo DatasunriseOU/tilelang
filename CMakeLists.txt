@@ -264,6 +264,18 @@ endif()
 # from __FILE__ so wheel users don't see CI machine paths in warnings).
 set(USE_CUSTOM_LOGGING ON CACHE BOOL "Use custom logging implementation" FORCE)
 
+# TVM consumes USE_LLVM from its own subdirectory scope.  When TileLang is the
+# top-level project, a command-line -DUSE_LLVM=/path/to/llvm-config can remain
+# as an untyped top-level cache entry and TVM's option helper falls back to OFF.
+# Re-materialize the cache value as a normal variable before add_subdirectory.
+if(DEFINED CACHE{USE_LLVM})
+  get_property(TILELANG_TVM_USE_LLVM CACHE USE_LLVM PROPERTY VALUE)
+  if(NOT "${TILELANG_TVM_USE_LLVM}" STREQUAL "")
+    set(USE_LLVM "${TILELANG_TVM_USE_LLVM}" CACHE STRING "Build TVM with LLVM" FORCE)
+    set(USE_LLVM "${TILELANG_TVM_USE_LLVM}")
+  endif()
+endif()
+
 # Detect release (wheel) builds: in CI (cibuildwheel) or scikit-build-core wheel builds,
 # we strip source paths from LOG(WARNING) etc. for a cleaner user experience.
 # Local dev builds keep full paths for debugging.
