@@ -218,6 +218,9 @@ filterwarnings = ["always"]
 markers = [
     "perf: benchmark and performance API tests skipped by default",
     "slow: long-running correctness sweeps",
+    "gpu: tests requiring GPU capability",
+    "cuda: tests requiring CUDA capability",
+    "metal: tests requiring Metal capability",
     "cuda_hardware: tests requiring real CUDA/Hopper hardware",
 ]
 

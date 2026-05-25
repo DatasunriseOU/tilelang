@@ -410,7 +410,11 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.DropProvableBoundChecks()(mod)
     mod = tilelang.transform.VectorizeLoop(enable_vectorize=allow_vectorize(pass_ctx=pass_ctx))(mod)
 
-    mod = tilelang.transform.StorageRewrite()(mod)
+    disable_storage_rewrite = bool(
+        pass_ctx.config.get("tirx.disable_storage_rewrite", False)
+    ) or bool(pass_ctx.config.get(tilelang.PassConfigKey.TIR_DISABLE_STORAGE_REWRITE, False))
+    if not disable_storage_rewrite:
+        mod = tilelang.transform.StorageRewrite()(mod)
     mod = tilelang.transform.LoopUnswitching()(mod)
     mod = tilelang.transform.UnrollLoop()(mod)
     mod = tir.transform.RenormalizeSplitPattern()(mod)
@@ -463,7 +467,12 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # MergeSharedMemoryAllocations must be applied after SplitHostDevice
     # because the merged allocation site is at the beginning of each device function
     enable_aggressive_merge = should_enable_aggressive_merge(pass_ctx=pass_ctx, target=target)
-    mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge)(mod)
+    # The pass always needs to merge dynamic shared allocations; the
+    # tirx.merge_static_smem PassContext option only controls static shared
+    # buffers inside the pass.
+    mod = tilelang.transform.MergeSharedMemoryAllocations(
+        enable_aggressive_merge=enable_aggressive_merge
+    )(mod)
     # InjectFenceProxy is a no-op on targets that lack the TMA / async-proxy
     # programming model; the pass itself checks the PrimFunc's target.
     mod = tilelang.transform.InjectFenceProxy()(mod)

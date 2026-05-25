@@ -26,10 +26,9 @@ def test_fx_shape_spec_preserves_symbolic_sequence_dim():
     torch._dynamo.mark_dynamic(x, 1)
     exported = torch._dynamo.export(
         fn,
-        x,
         aten_graph=True,
         assume_static_by_default=False,
-    )
+    )(x)
     gm = _exported_graph_module(exported)
     placeholder = next(node for node in gm.graph.nodes if node.op == "placeholder")
 

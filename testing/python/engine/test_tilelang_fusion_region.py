@@ -28,19 +28,19 @@ from tilelang.transform import PassConfigKey
 
 
 @T.prim_func
-def _fused_train_block(A: T.Buffer((4,), "float32"), C: T.Buffer((4,), "float32")):
+def _fused_train_block(A: T.Tensor((4,), "float32"), C: T.Tensor((4,), "float32")):
     with T.Kernel(1, threads=1):
         C[0] = A[0]
 
 
 @T.prim_func
-def _fusion_consumer(C: T.Buffer((4,), "float32"), D: T.Buffer((4,), "float32")):
+def _fusion_consumer(C: T.Tensor((4,), "float32"), D: T.Tensor((4,), "float32")):
     with T.Kernel(1, threads=1):
         D[0] = C[0]
 
 
 @T.prim_func
-def _fused_train_block_with_internal_edge(A: T.Buffer((4,), "float32"), D: T.Buffer((4,), "float32")):
+def _fused_train_block_with_internal_edge(A: T.Tensor((4,), "float32"), D: T.Tensor((4,), "float32")):
     with T.Kernel(1, threads=1):
         packed_post = T.alloc_local((4,), "float32")
         packed_post[0] = A[0]
@@ -49,9 +49,9 @@ def _fused_train_block_with_internal_edge(A: T.Buffer((4,), "float32"), D: T.Buf
 
 @T.prim_func
 def _logical_train_block_with_internal_edges(
-    x: T.Buffer((4,), "float32"),
-    state: T.Buffer((4,), "float32"),
-    train_block_out: T.Buffer((4,), "float32"),
+    x: T.Tensor((4,), "float32"),
+    state: T.Tensor((4,), "float32"),
+    train_block_out: T.Tensor((4,), "float32"),
 ):
     with T.Kernel(1, threads=1):
         mamba3_state = T.alloc_local((4,), "float32")
@@ -71,9 +71,9 @@ def _logical_train_block_with_internal_edges(
 
 @T.prim_func
 def _logical_train_block_missing_internal_edges(
-    x: T.Buffer((4,), "float32"),
-    state: T.Buffer((4,), "float32"),
-    train_block_out: T.Buffer((4,), "float32"),
+    x: T.Tensor((4,), "float32"),
+    state: T.Tensor((4,), "float32"),
+    train_block_out: T.Tensor((4,), "float32"),
 ):
     with T.Kernel(1, threads=1):
         mamba3_state = T.alloc_local((4,), "float32")
@@ -85,9 +85,9 @@ def _logical_train_block_missing_internal_edges(
 
 @T.prim_func
 def _logical_train_block_with_misleading_internal_buffer_names(
-    x: T.Buffer((4,), "float32"),
-    state: T.Buffer((4,), "float32"),
-    train_block_out: T.Buffer((4,), "float32"),
+    x: T.Tensor((4,), "float32"),
+    state: T.Tensor((4,), "float32"),
+    train_block_out: T.Tensor((4,), "float32"),
 ):
     with T.Kernel(1, threads=1):
         mamba3_state = T.alloc_local((4,), "float32")
@@ -112,9 +112,9 @@ def _logical_train_block_with_misleading_internal_buffer_names(
 
 @T.prim_func
 def _logical_train_block_missing_output_abi(
-    x: T.Buffer((4,), "float32"),
-    state: T.Buffer((4,), "float32"),
-    D: T.Buffer((4,), "float32"),
+    x: T.Tensor((4,), "float32"),
+    state: T.Tensor((4,), "float32"),
+    D: T.Tensor((4,), "float32"),
 ):
     with T.Kernel(1, threads=1):
         mamba3_state = T.alloc_local((4,), "float32")
@@ -134,9 +134,9 @@ def _logical_train_block_missing_output_abi(
 
 @T.prim_func
 def _leaky_fused_train_block(
-    A: T.Buffer((4,), "float32"),
-    packed_post: T.Buffer((4,), "float32"),
-    D: T.Buffer((4,), "float32"),
+    A: T.Tensor((4,), "float32"),
+    packed_post: T.Tensor((4,), "float32"),
+    D: T.Tensor((4,), "float32"),
 ):
     with T.Kernel(1, threads=1):
         D[0] = A[0] + packed_post[0]
@@ -144,9 +144,9 @@ def _leaky_fused_train_block(
 
 @T.prim_func
 def _internal_scratch_abi_fused_train_block(
-    A: T.Buffer((4,), "float32"),
-    packed_post: T.Buffer((4,), "float32"),
-    D: T.Buffer((4,), "float32"),
+    A: T.Tensor((4,), "float32"),
+    packed_post: T.Tensor((4,), "float32"),
+    D: T.Tensor((4,), "float32"),
 ):
     with T.Kernel(1, threads=1):
         packed_post[0] = A[0]

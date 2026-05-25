@@ -3462,8 +3462,8 @@ class FXToTileLang:
             def kernel(X: T.Tensor(shape, dtype), Y: T.Tensor(shape, dtype)):
                 if False: _ = shape; _ = dtype
                 with T.Kernel(T.ceildiv(n_elem, BLOCK), threads=BLOCK) as bx:
-                    X_flat = T.Buffer((n_elem,), dtype, data=X.data)
-                    Y_flat = T.Buffer((n_elem,), dtype, data=Y.data)
+                    X_flat = T.Tensor((n_elem,), dtype, data=X.data)
+                    Y_flat = T.Tensor((n_elem,), dtype, data=Y.data)
                     for i in T.Parallel(BLOCK):
                         idx = bx * BLOCK + i
                         if idx < n_elem:
@@ -3474,9 +3474,9 @@ class FXToTileLang:
             def kernel(X0: T.Tensor(shape, dtype), X1: T.Tensor(shape, dtype), Y: T.Tensor(shape, dtype)):
                 if False: _ = shape; _ = dtype
                 with T.Kernel(T.ceildiv(n_elem, BLOCK), threads=BLOCK) as bx:
-                    X0_flat = T.Buffer((n_elem,), dtype, data=X0.data)
-                    X1_flat = T.Buffer((n_elem,), dtype, data=X1.data)
-                    Y_flat = T.Buffer((n_elem,), dtype, data=Y.data)
+                    X0_flat = T.Tensor((n_elem,), dtype, data=X0.data)
+                    X1_flat = T.Tensor((n_elem,), dtype, data=X1.data)
+                    Y_flat = T.Tensor((n_elem,), dtype, data=Y.data)
                     for i in T.Parallel(BLOCK):
                         idx = bx * BLOCK + i
                         if idx < n_elem:
@@ -3487,10 +3487,10 @@ class FXToTileLang:
             def kernel(X0: T.Tensor(shape, dtype), X1: T.Tensor(shape, dtype), X2: T.Tensor(shape, dtype), Y: T.Tensor(shape, dtype)):
                 if False: _ = shape; _ = dtype
                 with T.Kernel(T.ceildiv(n_elem, BLOCK), threads=BLOCK) as bx:
-                    X0_flat = T.Buffer((n_elem,), dtype, data=X0.data)
-                    X1_flat = T.Buffer((n_elem,), dtype, data=X1.data)
-                    X2_flat = T.Buffer((n_elem,), dtype, data=X2.data)
-                    Y_flat = T.Buffer((n_elem,), dtype, data=Y.data)
+                    X0_flat = T.Tensor((n_elem,), dtype, data=X0.data)
+                    X1_flat = T.Tensor((n_elem,), dtype, data=X1.data)
+                    X2_flat = T.Tensor((n_elem,), dtype, data=X2.data)
+                    Y_flat = T.Tensor((n_elem,), dtype, data=Y.data)
                     for i in T.Parallel(BLOCK):
                         idx = bx * BLOCK + i
                         if idx < n_elem:
@@ -3501,11 +3501,11 @@ class FXToTileLang:
             def kernel(X0: T.Tensor(shape, dtype), X1: T.Tensor(shape, dtype), X2: T.Tensor(shape, dtype), X3: T.Tensor(shape, dtype), Y: T.Tensor(shape, dtype)):
                 if False: _ = shape; _ = dtype
                 with T.Kernel(T.ceildiv(n_elem, BLOCK), threads=BLOCK) as bx:
-                    X0_flat = T.Buffer((n_elem,), dtype, data=X0.data)
-                    X1_flat = T.Buffer((n_elem,), dtype, data=X1.data)
-                    X2_flat = T.Buffer((n_elem,), dtype, data=X2.data)
-                    X3_flat = T.Buffer((n_elem,), dtype, data=X3.data)
-                    Y_flat = T.Buffer((n_elem,), dtype, data=Y.data)
+                    X0_flat = T.Tensor((n_elem,), dtype, data=X0.data)
+                    X1_flat = T.Tensor((n_elem,), dtype, data=X1.data)
+                    X2_flat = T.Tensor((n_elem,), dtype, data=X2.data)
+                    X3_flat = T.Tensor((n_elem,), dtype, data=X3.data)
+                    Y_flat = T.Tensor((n_elem,), dtype, data=Y.data)
                     for i in T.Parallel(BLOCK):
                         idx = bx * BLOCK + i
                         if idx < n_elem:
@@ -3516,12 +3516,12 @@ class FXToTileLang:
             def kernel(X0: T.Tensor(shape, dtype), X1: T.Tensor(shape, dtype), X2: T.Tensor(shape, dtype), X3: T.Tensor(shape, dtype), X4: T.Tensor(shape, dtype), Y: T.Tensor(shape, dtype)):
                 if False: _ = shape; _ = dtype
                 with T.Kernel(T.ceildiv(n_elem, BLOCK), threads=BLOCK) as bx:
-                    X0_flat = T.Buffer((n_elem,), dtype, data=X0.data)
-                    X1_flat = T.Buffer((n_elem,), dtype, data=X1.data)
-                    X2_flat = T.Buffer((n_elem,), dtype, data=X2.data)
-                    X3_flat = T.Buffer((n_elem,), dtype, data=X3.data)
-                    X4_flat = T.Buffer((n_elem,), dtype, data=X4.data)
-                    Y_flat = T.Buffer((n_elem,), dtype, data=Y.data)
+                    X0_flat = T.Tensor((n_elem,), dtype, data=X0.data)
+                    X1_flat = T.Tensor((n_elem,), dtype, data=X1.data)
+                    X2_flat = T.Tensor((n_elem,), dtype, data=X2.data)
+                    X3_flat = T.Tensor((n_elem,), dtype, data=X3.data)
+                    X4_flat = T.Tensor((n_elem,), dtype, data=X4.data)
+                    Y_flat = T.Tensor((n_elem,), dtype, data=Y.data)
                     for i in T.Parallel(BLOCK):
                         idx = bx * BLOCK + i
                         if idx < n_elem:
@@ -3532,13 +3532,13 @@ class FXToTileLang:
             def kernel(X0: T.Tensor(shape, dtype), X1: T.Tensor(shape, dtype), X2: T.Tensor(shape, dtype), X3: T.Tensor(shape, dtype), X4: T.Tensor(shape, dtype), X5: T.Tensor(shape, dtype), Y: T.Tensor(shape, dtype)):
                 if False: _ = shape; _ = dtype
                 with T.Kernel(T.ceildiv(n_elem, BLOCK), threads=BLOCK) as bx:
-                    X0_flat = T.Buffer((n_elem,), dtype, data=X0.data)
-                    X1_flat = T.Buffer((n_elem,), dtype, data=X1.data)
-                    X2_flat = T.Buffer((n_elem,), dtype, data=X2.data)
-                    X3_flat = T.Buffer((n_elem,), dtype, data=X3.data)
-                    X4_flat = T.Buffer((n_elem,), dtype, data=X4.data)
-                    X5_flat = T.Buffer((n_elem,), dtype, data=X5.data)
-                    Y_flat = T.Buffer((n_elem,), dtype, data=Y.data)
+                    X0_flat = T.Tensor((n_elem,), dtype, data=X0.data)
+                    X1_flat = T.Tensor((n_elem,), dtype, data=X1.data)
+                    X2_flat = T.Tensor((n_elem,), dtype, data=X2.data)
+                    X3_flat = T.Tensor((n_elem,), dtype, data=X3.data)
+                    X4_flat = T.Tensor((n_elem,), dtype, data=X4.data)
+                    X5_flat = T.Tensor((n_elem,), dtype, data=X5.data)
+                    Y_flat = T.Tensor((n_elem,), dtype, data=Y.data)
                     for i in T.Parallel(BLOCK):
                         idx = bx * BLOCK + i
                         if idx < n_elem:
@@ -3651,8 +3651,8 @@ class FXToTileLang:
             with T.Kernel(1, threads=1) as bx:
                 if False:  # noqa: SIM103
                     _ = bx  # noqa: F841
-                X_flat = T.Buffer((n_elem,), dtype, data=X.data)
-                Y_flat = T.Buffer((1,), dtype, data=Y.data)
+                X_flat = T.Tensor((n_elem,), dtype, data=X.data)
+                Y_flat = T.Tensor((1,), dtype, data=Y.data)
                 acc = T.alloc_local((1,), dtype)
                 acc[0] = T.cast(0, dtype)
                 for i in T.serial(n_elem):

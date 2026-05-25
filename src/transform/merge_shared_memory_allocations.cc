@@ -1036,7 +1036,7 @@ private:
     int alignment{0};                        // required byte alignment.
     int start{0}; // first statement index touching the buf.
     int end{0};   // one-past-last statement index.
-    DataType size_dtype{DataType::Int(32)};
+    DataType size_dtype{DataType::Int(64)};
   };
 
   // Interval describing the liveness window of a (constant-sized) allocation.
@@ -1619,13 +1619,10 @@ private:
       const SharedAllocInfo &alloc = shmem_allocs_.at(var);
       int64_t bytes_per_elem =
           static_cast<int64_t>(alloc.dtype.bytes() * alloc.dtype.lanes());
-      DataType size_dtype = DataType::Int(32);
-      if (!alloc.extents.empty()) {
-        size_dtype = alloc.extents[0].dtype();
-      }
-      if (!size_dtype.is_int() && !size_dtype.is_uint()) {
-        size_dtype = DataType::Int(32);
-      }
+      // Shared-memory arena sizes and offsets are byte counts.  Large fused
+      // kernels can exceed int32 at compile time, so keep the arena math in
+      // int64 even when individual allocation extents are int32.
+      DataType size_dtype = DataType::Int(64);
 
       PrimExpr size_expr = make_const(size_dtype, bytes_per_elem);
       for (const PrimExpr &extent : alloc.extents) {
@@ -1686,8 +1683,7 @@ private:
     }
 
     // Cursor tracks the running byte offset within the merged arena.
-    DataType offset_dtype =
-        buf_infos.empty() ? DataType::Int(32) : buf_infos.front().size_dtype;
+    DataType offset_dtype = DataType::Int(64);
     PrimExpr total_size = make_const(offset_dtype, 0);
     PrimExpr cursor = AlignPrimExpr(
         make_const(offset_dtype, static_cast<int64_t>(arena_size_const)),
