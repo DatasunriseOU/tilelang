@@ -153,6 +153,17 @@ def _internal_scratch_abi_fused_train_block(
         D[0] = packed_post[0]
 
 
+@T.prim_func
+def _aliased_internal_scratch_abi_fused_block(
+    A: T.Tensor((4,), "float32"),
+    scratch_bank: T.Tensor((4,), "float32"),
+    D: T.Tensor((4,), "float32"),
+):
+    with T.Kernel(1, threads=1):
+        scratch_bank[0] = A[0]
+        D[0] = scratch_bank[0]
+
+
 def _make_thread_allreduce_func(extent: int) -> tir.PrimFunc:
     src = tir.decl_buffer((extent,), "float32", name="src")
     dst = tir.decl_buffer((1,), "float32", name="dst")
@@ -345,6 +356,49 @@ def test_explicit_fused_schedule_accepts_marked_internal_scratch_abi():
     assert [buffer.name for buffer in entry.buffer_map.values()] == [
         "A",
         "packed_post",
+        "D",
+    ]
+
+
+def test_fullgraph_compile_accepts_aliased_internal_scratch_abi():
+    def schedule_template(_region):
+        return _aliased_internal_scratch_abi_fused_block.with_attr(
+            "tl.fusion.internal_scratch_abi_aliases",
+            '{"C": {"bank": "scratch_bank", "offset": 0, "shape": [4], "dtype": "float32"}}',
+        )
+
+    region = (
+        FusionRegionBuilder("aliased_scratch_region")
+        .add_prim_func_node(
+            "producer",
+            _fused_train_block,
+            op="toy_producer",
+            inputs=("A",),
+            outputs=("C",),
+        )
+        .add_prim_func_node(
+            "consumer",
+            _fusion_consumer,
+            op="toy_consumer",
+            inputs=("C",),
+            outputs=("D",),
+        )
+        .set_schedule_template(schedule_template)
+        .build()
+    )
+
+    result = compile_fusion_region(
+        region,
+        target="metal",
+        lowerer=lambda *args, **kwargs: "compiled",
+        require_single_kernel=True,
+    )
+
+    entry = result.lowered_module[region.entry_symbol]
+    assert result.artifact == "compiled"
+    assert [buffer.name for buffer in entry.buffer_map.values()] == [
+        "A",
+        "scratch_bank",
         "D",
     ]
 

@@ -1,5 +1,6 @@
 import errno
 from pathlib import Path
+import sys
 import pytest
 
 from tilelang.cache.kernel_cache import KernelCache
@@ -104,6 +105,18 @@ def test_kernel_cache_does_not_publish_incomplete_dir_when_device_source_is_miss
     assert not cache_path.exists()
     assert "Error during atomic cache save" in logged
     assert not staging_root.exists() or not any(staging_root.iterdir())
+
+
+def test_darwin_export_library_cache_args_do_not_force_object_files_to_objcxx():
+    args = KernelCache._get_compile_args()
+
+    if sys.platform != "darwin":
+        assert args == {}
+        return
+
+    options = tuple(args.get("options", ()))
+    assert "-x" not in options
+    assert "objective-c++" not in options
 
 
 def test_nvrtc_kernel_cache_rewrites_dir_missing_launcher(cache_dirs, tmp_path):

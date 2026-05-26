@@ -1256,10 +1256,21 @@ def _validate_internal_edges_materialized_in_entry_ir(func: tir.PrimFunc, region
         return
 
     load_names, store_names = _prim_func_load_store_buffer_names(func)
+    aliases = _internal_scratch_abi_aliases(func)
+
+    def materialized(buffer: str) -> bool:
+        if buffer in load_names and buffer in store_names:
+            return True
+        alias = aliases.get(buffer)
+        if not isinstance(alias, Mapping):
+            return False
+        bank = alias.get("bank")
+        return isinstance(bank, str) and bank in load_names and bank in store_names
+
     missing = [
         buffer
         for buffer in internal_buffers
-        if buffer not in load_names or buffer not in store_names
+        if not materialized(buffer)
     ]
     if not missing:
         return
@@ -1342,6 +1353,17 @@ def _internal_scratch_abi_buffer_names(func: tir.PrimFunc) -> set[str]:
         if isinstance(decoded, Sequence) and not isinstance(decoded, str | bytes):
             return {str(buffer) for buffer in decoded}
     return set()
+
+
+def _internal_scratch_abi_aliases(func: tir.PrimFunc) -> Mapping[str, Any]:
+    raw = _prim_func_string_attr(func, "tl.fusion.internal_scratch_abi_aliases")
+    if raw is None:
+        return {}
+    with suppress(json.JSONDecodeError, TypeError):
+        decoded = json.loads(raw)
+        if isinstance(decoded, Mapping):
+            return decoded
+    return {}
 
 
 def _prim_func_string_attr(func: tir.PrimFunc, key: str) -> str | None:

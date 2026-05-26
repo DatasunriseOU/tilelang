@@ -68,7 +68,12 @@ class KernelCache:
         except Exception:
             pass
 
-        return {"options": ["-x", "objective-c++", "-g", "-std=gnu++17"] + ["-I" + i for i in include_paths]}
+        # export_library receives a mix of generated source files and already
+        # compiled object files.  A global "-x objective-c++" forces clang to
+        # parse those Mach-O objects as text, so cache persistence fails after
+        # an otherwise successful compile.  The JIT path supplies its own
+        # Objective-C++ language override where it compiles source directly.
+        return {"options": ["-g", "-std=gnu++17"] + ["-I" + i for i in include_paths]}
 
     @staticmethod
     @functools.cache
