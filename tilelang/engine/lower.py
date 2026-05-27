@@ -15,6 +15,7 @@ from tilelang.env import COMPOSABLE_KERNEL_INCLUDE_DIR, CUTLASS_INCLUDE_DIR, TIL
 from tilelang.transform import PassConfigKey
 from tilelang.transform.metal import MarkHostMetalContext
 from tilelang.engine.param import KernelParam, CompiledArtifact
+from tilelang.engine.semantic_check import PreLowerSemanticCheck
 from tilelang.utils.target import determine_target, target_get_mcpu
 from tilelang.engine.phase import (
     PreLowerSemanticCheck,
@@ -24,6 +25,7 @@ from tilelang.engine.phase import (
     _module_disables_tir_simplify,
     apply_metal_scalar_pipeline,
 )
+from tilelang.backend.pipeline import resolve_pipeline
 
 
 def is_cpu_device_backend(target: Target):
@@ -335,19 +337,16 @@ def lower_to_host_device_ir(
     _is_host_call = get_host_call(is_device_c=is_cpu_device_backend(target))
     _is_device_call = get_device_call(is_device_c=is_cpu_device_backend(target))
 
-    # Before lowering, do semantic check
+    # Run backend-independent semantic checks before target-specific lowering.
     PreLowerSemanticCheck(mod)
 
-    # CPPMEGA: apache/tvm latest requires an ambient Target context for passes
-    # that invoke the arith analyzer (e.g. LayoutInference -> const_int_bound
-    # calls Target::Current() with allow_not_defined=false). Wrap the lowering
-    # pipeline in `with target` so Target::Current() resolves correctly.
-    with target:
-        # Phase 1: Lower and legalize the IR
-        mod = LowerAndLegalize(mod, target)
-
-        # Phase 2: Optimize the IR for the target
-        mod = OptimizeForTarget(mod, target)
+    # Task 12 / #2189: dispatch to the backend-aware compilation pipeline.
+    # The backend-specific Pipeline (registered by tilelang/backend/{cuda,metal,
+    # rocm,cpu}/pipeline.py) owns the per-target pass sequence. The Metal
+    # pipeline wraps our fork's LowerAndLegalize + OptimizeForTarget in the
+    # required `with target` Target::Current() context internally.
+    pipeline = resolve_pipeline(target)
+    mod = pipeline.lower(mod, target)
 
     host_mod = tir.transform.Filter(_is_host_call)(mod)
     device_mod = tir.transform.Filter(_is_device_call)(mod)
