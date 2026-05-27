@@ -1,0 +1,28 @@
+# Baseline before upstream codegen-reorg absorption
+Branch: merge/upstream-codegen-reorg (off main @ 9a9256a7)
+Date: 2026-05-28
+Python: /Volumes/external/sources/nanochat/.venv/bin/python (3.13)
+Build: cmake --build build -j  => EXIT 0 (green)
+
+## Metal regression baseline (the bar — must not regress)
+Command: python -m pytest testing/python/metal/ -q
+Result: 7 failed, 137 passed, 31 skipped
+
+### KNOWN PRE-EXISTING FAILURES (NOT caused by the merge — do not blame on cherry-picks)
+FAILED testing/python/metal/test_fp8_scaled_matmul_metal.py::test_per_tensor_scale_lowers_on_metal
+FAILED testing/python/metal/test_fp8_scaled_matmul_metal.py::test_e5m2_lowers_on_metal
+FAILED testing/python/metal/test_fp8_scaled_matmul_metal.py::test_mixed_e4m3_e5m2_lowers_on_metal
+FAILED testing/python/metal/test_fp8_scaled_matmul_metal.py::test_m1_non_transposed_b_vecmat_late_lowers_to_simd_sum
+FAILED testing/python/metal/test_fp8_scaled_matmul_metal.py::test_m1_transposed_b_direct_marker_stores_global_column_index
+FAILED testing/python/metal/test_tvm_ffi_metal_stream_dlpack.py::test_tvm_ffi_metal_external_stream_and_compact_strides
+FAILED testing/python/metal/test_tvm_ffi_metal_cached_host_source_restores_launch_config (test_tvm_ffi_metal_stream_dlpack.py)
+
+## CODEGEN_SMOKE decision
+Build-only. On macOS there is no CUDA/ROCm device; host-only CUDA codegen tests
+(testing/python/language, testing/python/cuda) SKIP entirely (verified: 34 skipped).
+Therefore CUDA/ROCm codegen reorg is verified by a green `cmake --build build -j`
+(the C++ codegen emitters must compile). The Metal suite above is the functional bar.
+
+## TVM pin (must remain ours throughout)
+3rdparty/tvm => 66438efa7e046dcee1e7f8697816b9cb99ce1668 (DatasunriseOU/tvm, apache+tirx)
+Never let any cherry-pick move it to upstream's 0be33607.
