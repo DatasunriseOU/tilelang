@@ -15,8 +15,14 @@
 #      site-packages (works with --no-build-isolation).
 
 # --- Try host CUDA first ---
-find_package(CUDAToolkit QUIET)
-if(CUDAToolkit_FOUND)
+# NOTE: full find_package(CUDAToolkit) pulls in FindThreads, which requires an
+# enabled language and fails when this module is included before project().
+# A lightweight nvcc probe is enough to decide "host CUDA present"; project()/
+# enable_language(CUDA) will do the real detection afterwards.
+find_program(_HOST_NVCC nvcc
+  HINTS ENV CUDACXX ENV CUDA_HOME ENV CUDA_PATH /usr/local/cuda/bin
+  PATH_SUFFIXES bin)
+if(_HOST_NVCC)
   return()
 endif()
 
