@@ -128,3 +128,6 @@ maint/host_checks/logs/*
 /poc/triton_frontend/_cxx/build*/
 /lib
 /tvm
+build-appleclang-triton-llvm/lib/*.dylib
+build-appleclang-triton-llvm/lib/libtvm_compiler.dylib.dSYM/Contents/Resources/DWARF/*.dylib
+*.dylib

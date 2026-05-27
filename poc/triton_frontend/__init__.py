@@ -34,6 +34,7 @@ Layout::
 from __future__ import annotations
 
 import re
+import sys
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -749,25 +750,26 @@ def _compile_to_ttir(
         triton_import_block_reason,
     )
 
-    block_reason = triton_import_block_reason()
-    if block_reason is not None:
-        # An LLVM peer (jaxlib MLIR or our C++ shim) is resident in
-        # this interpreter. Calling triton.make_ir here would abort
-        # the process on duplicate cl::opt registration. Recover the
-        # kernel's source text and route TTIR capture through a fresh
-        # subprocess so the call still succeeds end to end.
+    def _capture_ttir_in_subprocess(reason: str) -> Any:
+        # The subprocess helper needs source text because Triton JIT functions
+        # are process-local and not pickleable. This is the same production
+        # seam used when another LLVM peer is already resident.
         try:
             import inspect
+            import textwrap
 
             underlying = getattr(fn, "fn", fn)
-            source = inspect.getsource(underlying)
+            source = textwrap.dedent(inspect.getsource(underlying))
             kernel_name = (
                 getattr(underlying, "__name__", None)
                 or getattr(fn, "__name__", "main")
             )
-            import textwrap
-
-            source = textwrap.dedent(source)
+        except (OSError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Could not capture Triton TTIR safely in a subprocess: "
+                f"kernel source is unavailable ({exc}); reason={reason}"
+            ) from exc
+        try:
             return triton_jit_to_ttir_subprocess_from_source(
                 source=source,
                 kernel_name=kernel_name,
@@ -777,15 +779,26 @@ def _compile_to_ttir(
         except (TTIRCaptureError, TritonUnavailable) as exc:
             raise RuntimeError(
                 f"Could not stop Triton compilation at the TTIR stage "
-                f"(subprocess fallback): {exc}"
+                f"(subprocess fallback; reason={reason}): {exc}"
             ) from exc
-        except (OSError, TypeError, ValueError) as exc:
-            # ``inspect.getsource`` raises ``OSError`` when the source is
-            # unavailable (e.g. kernel defined in an interactive shell).
-            # Fall through to the in-process path, which will likely
-            # surface the same TritonUnavailable below; we want the
-            # consistent error message in that case.
-            del exc
+
+    block_reason = triton_import_block_reason()
+    if block_reason is not None:
+        # An LLVM peer (jaxlib MLIR or our C++ shim) is resident in
+        # this interpreter. Calling triton.make_ir here would abort
+        # the process on duplicate cl::opt registration. Recover the
+        # kernel's source text and route TTIR capture through a fresh
+        # subprocess so the call still succeeds end to end.
+        return _capture_ttir_in_subprocess(block_reason)
+
+    if sys.platform == "darwin":
+        # On macOS the local TileLang dev build loads libtilelang /
+        # libtvm_compiler. If this process has already loaded Triton's native
+        # libtriton while capturing TTIR, the later TileLang import can abort
+        # in dyld/LLVM static initializers ("Option 'basic' already exists!").
+        # Capture TTIR in a fresh child so the parent can load TileLang/TVM
+        # without libtriton.
+        return _capture_ttir_in_subprocess("darwin isolates libtriton from TileLang/TVM")
 
     try:
         return triton_jit_to_ttir(fn, constexprs=constexprs, target=target)
@@ -900,6 +913,22 @@ def _walk_mlir_module(
     # Lazy import to avoid a top-of-file cycle with mlir_walker. We use the
     # per-emitter ``owns_regions`` attribute (H4 Wave-I) but keep the legacy
     # set as a fallback for emitters that forgot to set the attribute.
+    if sys.platform == "darwin" and "tilelang" not in sys.modules:
+        from ._test_harness.native_import_guard import (  # noqa: WPS433
+            triton_native_loaded,
+            triton_native_symbols_are_local,
+        )
+
+        if triton_native_loaded() and not triton_native_symbols_are_local():
+            raise RuntimeError(
+                "triton_frontend cannot import TileLang/TVM in this process: "
+                "triton._C.libtriton is already loaded, and this macOS "
+                "TileLang dev build loads libtilelang/libtvm_compiler with a "
+                "separate LLVM image. Co-loading them aborts in LLVM cl::opt "
+                "registration (for example, Option 'basic' already exists). "
+                "Capture TTIR in a fresh Python process and call from_ttir() "
+                "from a process that has not imported native Triton."
+            )
     import tilelang  # noqa: F401  (setup TVM environment)
 
     from .mlir_walker import (  # noqa: WPS433

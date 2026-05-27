@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 from poc.triton_frontend._test_harness.native_import_guard import (
     triton_import_block_reason,
 )
@@ -12,8 +14,8 @@ def test_triton_import_guard_blocks_when_jaxlib_mlir_peer_loaded_first() -> None
     assert "jaxlib.mlir._mlir_libs" in reason
 
 
-def test_triton_import_guard_does_not_block_when_only_tilelang_resident() -> None:
-    """TileLang/TVM/tvm_ffi must not block Triton -- the cppmega bridge depends on this."""
+def test_triton_import_guard_allows_tilelang_resident_before_darwin_triton_import() -> None:
+    """On Darwin the patched Triton top-level import loads libtriton locally."""
     reason = triton_import_block_reason(
         {
             "tilelang": object(),
@@ -22,6 +24,50 @@ def test_triton_import_guard_does_not_block_when_only_tilelang_resident() -> Non
             "tvm_ffi": object(),
         }
     )
+
+    if sys.platform == "darwin":
+        assert reason is None
+        return
+
+    assert reason is not None
+    assert "tilelang" in reason
+    assert "tvm" in reason
+
+
+def test_triton_import_guard_allows_tilelang_when_libtriton_symbols_are_local() -> None:
+    class TritonModule:
+        _NATIVE_DLOPEN_LOCAL = True
+
+    reason = triton_import_block_reason(
+        {
+            "triton": TritonModule(),
+            "triton._C.libtriton": object(),
+            "tilelang": object(),
+            "tvm": object(),
+        }
+    )
+
+    if sys.platform == "darwin":
+        assert reason is None
+    else:
+        assert reason is not None
+
+
+def test_triton_import_guard_blocks_tilelang_with_global_libtriton() -> None:
+    reason = triton_import_block_reason(
+        {
+            "triton._C.libtriton": object(),
+            "tilelang": object(),
+            "tvm": object(),
+        }
+    )
+
+    assert reason is not None
+    assert "tilelang" in reason
+
+
+def test_triton_import_guard_does_not_block_when_only_tvm_ffi_resident() -> None:
+    reason = triton_import_block_reason({"tvm_ffi": object(), "tvm_ffi.core": object()})
 
     assert reason is None
 

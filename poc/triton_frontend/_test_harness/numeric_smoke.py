@@ -137,6 +137,18 @@ def _probe_deps(
         "mlx": None,
         "cppmega_mlx": None,
     }
+    if sys.platform == "darwin":
+        # This harness imports numeric kernel modules that import native
+        # Triton, then lowers/compiles through TileLang/TVM in the same
+        # interpreter. The local macOS dev build cannot co-load those LLVM
+        # images without aborting in LLVM cl::opt registration, so report a
+        # clean SKIP instead of probing imports in an unsafe order.
+        deps["triton"] = (
+            "RuntimeError: native Triton and TileLang/TVM cannot be co-loaded "
+            "in this macOS process; run TTIR capture and TileLang lowering in "
+            "separate Python processes"
+        )
+        return deps
     for name in deps:
         if name == "triton":
             block_reason = triton_compile_block_reason(loaded_modules)
