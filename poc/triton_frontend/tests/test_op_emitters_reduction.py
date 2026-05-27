@@ -435,16 +435,16 @@ def test_tt_scan_buffers_registered_in_local_buffers():
 # ---------------------------------------------------------------------------
 
 
-def test_tt_dot_emits_gemm_or_3loop_with_mul_add():
-    """tt.dot(M=32, K=32, N=32, fp32) -> explicit 3-loop nest."""
+def test_tt_dot_non_gemm_shape_emits_3loop_with_mul_add():
+    """tt.dot with a non-GEMM shape falls back to an explicit 3-loop nest."""
     import tilelang.language as T
 
     ctx = WalkerCtx()
-    a_ssa = _ssa("A", shape=[32, 32], dtype="float32")
-    b_ssa = _ssa("B", shape=[32, 32], dtype="float32")
-    c_ssa = _ssa("C", shape=[32, 32], dtype="float32")
-    a_buf = tvm.tir.decl_buffer([32, 32], "float32", name="A")
-    b_buf = tvm.tir.decl_buffer([32, 32], "float32", name="B")
+    a_ssa = _ssa("A", shape=[5, 3], dtype="float32")
+    b_ssa = _ssa("B", shape=[3, 7], dtype="float32")
+    c_ssa = _ssa("C", shape=[5, 7], dtype="float32")
+    a_buf = tvm.tir.decl_buffer([5, 3], "float32", name="A")
+    b_buf = tvm.tir.decl_buffer([3, 7], "float32", name="B")
     ctx.bind(a_ssa, a_buf)
     ctx.bind(b_ssa, b_buf)
     op = _op("tt.dot", [a_ssa, b_ssa], [c_ssa])
@@ -458,7 +458,7 @@ def test_tt_dot_emits_gemm_or_3loop_with_mul_add():
 
     handle = handles[0]
     text = str(handle) + " " + str(ctx.stmts)
-    assert "gemm" not in text.lower(), f"fp32 dot should use scalar fallback: {text!r}"
+    assert "gemm" not in text.lower(), f"non-GEMM shape should use scalar fallback: {text!r}"
 
     # Manual fp32 path. We expect at least the compute-loop triplet and a
     # BufferStore on C whose RHS is Add(BufferLoad(C), Mul(...)). The path may
@@ -483,6 +483,31 @@ def test_tt_dot_emits_gemm_or_3loop_with_mul_add():
     assert isinstance(store.value.b, tvm.tir.Mul), (
         f"expected inner Mul for A*B; got {type(store.value.b).__name__}"
     )
+
+
+def test_tt_dot_fp32_gemm_shape_uses_tile_gemm():
+    """FP32 dot with a Metal-compatible tile shape must not scalar explode."""
+    import tilelang.language as T
+
+    ctx = WalkerCtx()
+    a_ssa = _ssa("A", shape=[16, 32], dtype="float32")
+    b_ssa = _ssa("B", shape=[32, 16], dtype="float32")
+    c_ssa = _ssa("C", shape=[16, 16], dtype="float32")
+    a_buf = tvm.tir.decl_buffer([16, 32], "float32", name="A", scope="shared")
+    b_buf = tvm.tir.decl_buffer([32, 16], "float32", name="B", scope="shared")
+    ctx.bind(a_ssa, a_buf)
+    ctx.bind(b_ssa, b_buf)
+    op = _op("tt.dot", [a_ssa, b_ssa], [c_ssa])
+
+    handles = []
+
+    @T.prim_func
+    def _test_func():
+        with T.Kernel(1, threads=128):
+            handles.append(REDUCTION_EMITTERS["tt.dot"](op, ctx))
+
+    text = str(handles[0]) + " " + str(ctx.stmts)
+    assert "gemm" in text.lower(), f"expected tile GEMM path, got {text!r}"
 
 
 def test_tt_dot_uses_shared_scope_for_C_result():
@@ -596,6 +621,38 @@ def test_tt_dot_stages_non_shared_operand_to_shared_before_gemm():
         "tt.dot must stage a non-shared A operand into shared scope before "
         f"calling T.gemm on Metal; shared buffers were {shared_names!r}"
     )
+
+
+def test_tt_dot_stages_folded_transpose_with_physical_shape():
+    """A folded ``tt.trans`` view must stage the source buffer shape."""
+    try:
+        import tilelang.language as T  # noqa: F401
+    except ImportError:
+        pytest.skip("tilelang not importable; gemm path test cannot run")
+
+    ctx = WalkerCtx()
+    a_ssa = _ssa("A", shape=[64, 16], dtype="float16")
+    b_trans_ssa = _ssa("Bt", shape=[16, 32], dtype="float16")
+    c_ssa = _ssa("C", shape=[64, 32], dtype="float32")
+    a_buf = tvm.tir.decl_buffer([64, 16], "float16", name="A", scope="shared")
+    b_buf = tvm.tir.decl_buffer([32, 16], "float16", name="B", scope="local")
+    ctx.bind(a_ssa, a_buf)
+    ctx.bind(b_trans_ssa, b_buf)
+    ctx.transposed_views[b_trans_ssa] = (-2, -1)
+
+    op = _op("tt.dot", [a_ssa, b_trans_ssa], [c_ssa])
+    REDUCTION_EMITTERS["tt.dot"](op, ctx)
+
+    staged_b = [
+        b
+        for b in ctx.local_buffers
+        if hasattr(b, "scope")
+        and callable(b.scope)
+        and b.scope() == "shared"
+        and str(getattr(b, "name", "")).startswith("dot_b_shared")
+    ]
+    assert staged_b, "expected folded transposed B to be staged into shared"
+    assert tuple(int(x) for x in staged_b[0].shape) == (32, 16)
 
 
 def test_tt_dot_fp16_requires_tilelang_or_raises():
@@ -1265,5 +1322,3 @@ def test_tt_histogram_accepts_mlir_short_i32_dtype():
 
     hist_buf = ctx.get(out_ssa)
     assert str(hist_buf.dtype) == "int32"
-
-

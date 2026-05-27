@@ -1719,6 +1719,8 @@ def emit_tt_store(op: Any, ctx: WalkerCtx) -> Any:
         val_expr = val_expr.read_lane(
             ctx, tuple(tir.const(0, "int32") for _ in val_expr.shape)
         )
+    elif isinstance(val_expr, ctx.tvm().tir.Buffer):
+        val_expr = _resolve_lane_operand(ctx, val_expr, [], role="value")
 
     store_stmt: Any = tir.BufferStore(buf, val_expr, indices)
     if mask_ssa is not None:

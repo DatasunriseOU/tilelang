@@ -8,6 +8,7 @@ from poc.triton_frontend.op_emitters.control import (
     CONTROL_EMITTERS,
     map_arith_extsi,
     map_arith_index_cast,
+    map_tensor_collapse_shape,
     map_scf_for,
     map_arith_truncf,
     map_tt_func,
@@ -58,6 +59,30 @@ def test_index_cast_routes_as_integer_cast() -> None:
 
     assert str(out.dtype) == "int32"
     assert ctx.get(dst) is out
+
+
+def test_tensor_collapse_shape_reshapes_lazy_tile() -> None:
+    ctx = WalkerCtx()
+    src = FakeSSA(name="src", shape=(1, 4), dtype="i32")
+    dst = FakeSSA(name="dst", shape=(4,), dtype="i32")
+    source = LazyTileExpr(
+        (1, 4),
+        "int32",
+        lambda _read_ctx, indices: indices[0] * 10 + indices[1],
+        name="source",
+    )
+    ctx.bind(src, source)
+
+    out = map_tensor_collapse_shape(
+        FakeMlirOp("tensor.collapse_shape", [src], [dst]),
+        ctx,
+    )
+
+    assert isinstance(out, LazyTileExpr)
+    assert out.shape == (4,)
+    assert ctx.get(dst) is out
+    lane2 = out.read_lane(ctx, (tvm.tir.const(2, "int32"),))
+    assert "2" in str(lane2)
 
 
 def test_cf_branch_terminators_are_registered() -> None:

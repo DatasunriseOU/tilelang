@@ -1452,7 +1452,18 @@ private:
   }
 
   Range CurrentThreadBounds() const {
-    return ComputeThreadBounds(thread_var_, *analyzer_);
+    Range bounds = ComputeThreadBounds(thread_var_, *analyzer_);
+    if (thread_block_size_ > 1) {
+      const auto *extent = bounds->extent.as<IntImmNode>();
+      if (extent == nullptr || extent->value <= 1) {
+        DataType dtype = thread_var_.defined() ? thread_var_->var.dtype()
+                                               : DataType::Int(32);
+        return Range::FromMinExtent(
+            IntImm(dtype, 0),
+            IntImm(dtype, static_cast<int64_t>(thread_block_size_)));
+      }
+    }
+    return bounds;
   }
 
   Target target_;

@@ -300,6 +300,32 @@ def test_store_with_mask_round_trip() -> None:
     )
 
 
+def test_store_tensor_one_buffer_value_uses_scalar_lane() -> None:
+    """``tensor<1xT>`` values can materialise as buffers but store scalar."""
+    ctx = WalkerCtx(ptr_analysis_shim_available=False)
+    dst = tvm.tir.decl_buffer([16], "float32", name="D")
+    val = tvm.tir.decl_buffer([1], "float32", name="V")
+    ptr_ssa = _ssa("ptr", shape=[1], dtype="float32")
+    val_ssa = _ssa("val", shape=[1], dtype="float32")
+    ctx.bind(ptr_ssa, (dst, [tvm.tir.const(0, "int32")]))
+    ctx.bind(val_ssa, val)
+
+    emit_tt_store(
+        {
+            "name": "tt.store",
+            "operands": [ptr_ssa, val_ssa],
+            "results": [],
+            "attrs": {},
+        },
+        ctx,
+    )
+
+    text = _stringify(ctx.stmts)
+    assert "V[0]" in text or "V[" in text, (
+        f"expected BufferLoad from the rank-1 value buffer; got:\n{text}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Multi-element tile load -- degraded path when no shim is available.
 # ---------------------------------------------------------------------------

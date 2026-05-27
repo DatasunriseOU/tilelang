@@ -103,6 +103,13 @@ inline Range ComputeThreadBounds(const IterVar &thread_var,
     return Range::FromMinExtent(IntImm(dtype, min_value),
                                 IntImm(dtype, extent));
   }
+  if (thread_var.defined() && thread_var->dom.defined()) {
+    auto min = thread_var->dom->min;
+    auto extent = thread_var->dom->extent;
+    if (min.defined() && extent.defined()) {
+      return Range::FromMinExtent(min, extent);
+    }
+  }
   return Range::FromMinExtent(0, 1);
 }
 

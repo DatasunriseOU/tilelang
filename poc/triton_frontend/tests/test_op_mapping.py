@@ -453,7 +453,10 @@ def test_op_table_has_expected_size() -> None:
     # ``tt.scan.return`` as structural no-ops so live reduce/scan TTIR
     # captures don't surface those region terminators as FAILED_OPS
     # in the reducer corpus.
-    EXPECTED = 110
+    # Bumped 110 -> 111 by treating PtrAnalysis-emitted
+    # ``tensor.collapse_shape`` as a metadata-only tile reshape for KDA
+    # Path D masks.
+    EXPECTED = 111
     assert len(OP_TABLE) == EXPECTED, (
         f"OP_TABLE size changed from {EXPECTED} to {len(OP_TABLE)}; "
         f"if intentional, update this constant + the three README "

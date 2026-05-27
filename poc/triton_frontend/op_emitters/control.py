@@ -74,6 +74,7 @@ __all__ = [
     "map_arith_trunci",
     "map_arith_index_cast",
     "map_arith_constant",
+    "map_tensor_collapse_shape",
     "map_tt_advance",
     "map_cf_br",
     "map_cf_cond_br",
@@ -521,6 +522,81 @@ def map_arith_trunci(op: Any, ctx: _om.WalkerCtx) -> Any:
 def map_arith_index_cast(op: Any, ctx: _om.WalkerCtx) -> Any:
     """``arith.index_cast`` (index <-> integer)."""
     return _emit_cast(op, ctx, expect="i2i")
+
+
+# ---------------------------------------------------------------------------
+# tensor shape-only ops emitted by TritonStructured / PtrAnalysis
+# ---------------------------------------------------------------------------
+
+
+def _prod(values: Tuple[int, ...]) -> int:
+    out = 1
+    for value in values:
+        out *= int(value)
+    return out
+
+
+def _flatten_indices(ctx: _om.WalkerCtx, indices: Tuple[Any, ...], shape: Tuple[int, ...]) -> Any:
+    tir = ctx.tir()
+    flat = tir.const(0, "int32")
+    for idx, extent in zip(indices, shape):
+        flat = flat * tir.const(int(extent), "int32") + idx
+    return flat
+
+
+def _unflatten_index(ctx: _om.WalkerCtx, flat: Any, shape: Tuple[int, ...]) -> Tuple[Any, ...]:
+    tir = ctx.tir()
+    out: List[Any] = [tir.const(0, "int32")] * len(shape)
+    cur = flat
+    for axis in range(len(shape) - 1, -1, -1):
+        extent = tir.const(int(shape[axis]), "int32")
+        out[axis] = cur % extent
+        cur = cur // extent
+    return tuple(out)
+
+
+def map_tensor_collapse_shape(op: Any, ctx: _om.WalkerCtx) -> Any:
+    """Lower ``tensor.collapse_shape`` as a metadata-only tile reshape.
+
+    PtrAnalysis rewrites some structured pointer masks from ``tensor<1xNxi1>``
+    to ``tensor<Nxi1>`` before ``tts.load``. TileLang does not need a data copy
+    for that collapse; it only needs subsequent lane reads to address the
+    original producer with the equivalent row-major indices.
+    """
+
+    operands = _om._operands(op)
+    results = _om._results(op)
+    if not operands or not results:
+        raise EmitError("tensor.collapse_shape: expected one operand and one result")
+    src_ssa = operands[0]
+    result = results[0]
+    value = ctx.get(src_ssa)
+
+    dst_shape = _result_shape(op)
+    src_shape = tuple(getattr(value, "shape", ()) or _om._shape_of(src_ssa))
+    if isinstance(value, _om.LazyTileExpr) and src_shape and dst_shape:
+        if _prod(src_shape) != _prod(dst_shape):
+            raise EmitError(
+                "tensor.collapse_shape: source and result extents differ: "
+                f"{src_shape} -> {dst_shape}"
+            )
+
+        def _reader(read_ctx: _om.WalkerCtx, indices: Tuple[Any, ...]) -> Any:
+            flat = _flatten_indices(read_ctx, tuple(indices), dst_shape)
+            return value.read_lane(read_ctx, _unflatten_index(read_ctx, flat, src_shape))
+
+        reshaped = _om.LazyTileExpr(
+            dst_shape,
+            value.dtype,
+            _reader,
+            name=f"{value.name}_collapse" if value.name else "collapse_shape",
+            constant_value=value.constant_value,
+        )
+        ctx.bind(result, reshaped)
+        return reshaped
+
+    ctx.bind(result, value)
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -2643,6 +2719,10 @@ CONTROL_EMITTERS: Dict[str, Callable[..., Any]] = {
     # so downstream uses of ``%c0`` resolve via ctx.get(); raises EmitError
     # on array (``dense<...>``) attrs rather than silently splatting.
     "arith.constant": map_arith_constant,
+    # PtrAnalysis can rewrite tensor-of-mask operands through shape-only
+    # collapses before tts.load/tts.store. This is a metadata reshape, not a
+    # data movement op.
+    "tensor.collapse_shape": map_tensor_collapse_shape,
     # tt.advance (block-pointer)
     "tt.advance": map_tt_advance,
     # tt.func -- structural; seeds block-arg buffers / vars into the ctx so

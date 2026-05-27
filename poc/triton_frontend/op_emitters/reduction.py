@@ -1094,9 +1094,8 @@ def map_tt_dot(
     low_precision_dot = (
         a_dtype in _FP_LOW_PRECISION_DTYPES or b_dtype in _FP_LOW_PRECISION_DTYPES
     )
-    prefer_scalar_fp32 = (
-        a_dtype == "float32" and b_dtype == "float32" and out_dtype == "float32"
-    )
+    can_use_tile_gemm_shape = (M % 8 == 0 and N % 8 == 0 and Ka % 8 == 0)
+    prefer_scalar_dot = (not low_precision_dot) and not can_use_tile_gemm_shape
 
     if gemm is not None:
         # Resolve / allocate accumulator C.
@@ -1384,12 +1383,13 @@ def map_tt_dot(
                 )
                 _emit_copy_stmt(c_orig, c, "c_orig, c")
 
-        a = _stage_operand_to_shared(a, [M, Ka], a_dtype, "a")
-        b = _stage_operand_to_shared(b, [Kb, N], b_dtype, "b")
+        a_stage_shape = [Ka, M] if pre_trans_a else [M, Ka]
+        b_stage_shape = [N, Kb] if pre_trans_b else [Kb, N]
+        a = _stage_operand_to_shared(a, a_stage_shape, a_dtype, "a")
+        b = _stage_operand_to_shared(b, b_stage_shape, b_dtype, "b")
 
-        if prefer_scalar_fp32 or (M <= 16 and N <= 16 and not low_precision_dot):
-            if prefer_scalar_fp32:
-                ctx.requires_single_thread_body = True
+        if prefer_scalar_dot:
+            ctx.requires_single_thread_body = True
             _emit_tiny_dot_loop(a, b, c)
             if result_value is not None:
                 ctx.bind(result_value, c)
