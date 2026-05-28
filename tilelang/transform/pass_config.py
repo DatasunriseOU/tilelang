@@ -98,6 +98,11 @@ class PassConfigKey(str, Enum):
     TL_DISABLE_SAFE_MEMORY_ACCESS = "tl.disable_safe_memory_legalize"
     """Disable safe memory access optimization. Default: False"""
 
+    TL_DISABLE_SHARED_MEMORY_REUSE = "tl.disable_shared_memory_reuse"
+    """Disable shared-memory reuse/aliasing in MergeSharedMemoryAllocations
+    (upstream PR #2228). Read by should_disable_shared_memory_reuse in
+    tilelang/backend/pipeline_utils.py. Default: False"""
+
     TL_DISABLE_VECTORIZE_256 = "tl.disable_vectorize_256"
     """Disable usage of LDG/STG 256. Default: False"""
 

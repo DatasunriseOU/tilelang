@@ -100,6 +100,12 @@ static constexpr const char *kDisableTMALower = "tl.disable_tma_lower";
 static constexpr const char *kTMALegalityZ3 = "tl.tma_legality_z3";
 static constexpr const char *kEnableAggressiveSharedMemoryMerge =
     "tl.enable_aggressive_shared_memory_merge";
+// Disable shared-memory reuse/aliasing in MergeSharedMemoryAllocations
+// (upstream PR #2228). Read by should_disable_shared_memory_reuse in
+// tilelang/backend/pipeline_utils.py and passed as disable_reuse to the
+// MergeSharedMemoryAllocations pass. Default off.
+static constexpr const char *kDisableSharedMemoryReuse =
+    "tl.disable_shared_memory_reuse";
 static constexpr const char *kDisableFastMath = "tl.disable_fast_math";
 static constexpr const char *kEnableFastMath = "tl.enable_fast_math";
 static constexpr const char *kPtxasRegisterUsageLevel =
