@@ -318,6 +318,11 @@ option(TILELANG_BUILD_TESTS "Build test-only FFI helpers (e.g. Z3 bv probes)" OF
 # Guarded by EXISTS so checkouts without dmlc-core still configure cleanly.
 if(EXISTS ${TVM_SOURCE}/3rdparty/dmlc-core/include)
   include_directories(SYSTEM ${TVM_SOURCE}/3rdparty/dmlc-core/include)
+  # Bridge dmlc's logging into TVM's so ICHECK / CHECK / LOG resolve in any
+  # source that pulls <dmlc/logging.h> (e.g. nvbench's l2_cache_flush.h).
+  # Matches the canonical TileLang-fork's TVM build flags.
+  add_compile_definitions(DMLC_USE_LOGGING_LIBRARY=<tvm/runtime/logging.h>)
+  add_compile_definitions(DMLC_USE_FOPEN64=0)
 endif()
 
 # Include tvm after configs have been populated
