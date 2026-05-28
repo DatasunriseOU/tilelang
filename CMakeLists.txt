@@ -310,6 +310,16 @@ option(TILELANG_RELEASE_BUILD "Strip source paths from log messages (for wheel r
 # runs must pass `-DTILELANG_BUILD_TESTS=ON` explicitly.
 option(TILELANG_BUILD_TESTS "Build test-only FFI helpers (e.g. Z3 bv probes)" OFF)
 
+# Some TVM runtime sources include nvbench headers that pull <dmlc/logging.h>
+# (e.g. src/runtime/cuda/l2_cache_flush.cc). Apache TVM exposes a `DMLC_PATH`
+# option for this, but our apache+tirx-based TVM does not, so the dmlc-core
+# include must be propagated into TVM's own targets. Inject it as a SYSTEM
+# include BEFORE add_subdirectory so it inherits into tvm_runtime_objs etc.
+# Guarded by EXISTS so checkouts without dmlc-core still configure cleanly.
+if(EXISTS ${TVM_SOURCE}/3rdparty/dmlc-core/include)
+  include_directories(SYSTEM ${TVM_SOURCE}/3rdparty/dmlc-core/include)
+endif()
+
 # Include tvm after configs have been populated
 add_subdirectory(${TVM_SOURCE} tvm EXCLUDE_FROM_ALL)
 
