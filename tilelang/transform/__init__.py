@@ -564,14 +564,41 @@ def FlattenBuffer():
     return _ffi_api.FlattenBuffer()  # type: ignore
 
 
-def MergeSharedMemoryAllocations(enable_aggressive_merge: bool = False, align_bytes: int = 16):
+def MergeSharedMemoryAllocations(enable_aggressive_merge: bool = False,
+                                 align_bytes: int = 16,
+                                 disable_reuse: bool = False):
     """MergeSharedMemoryAllocations
+
+    Parameters
+    ----------
+    enable_aggressive_merge : bool
+        Aggressively merge shared-memory allocations.
+    align_bytes : int
+        Shared-memory allocation alignment.
+    disable_reuse : bool
+        Disable shared-memory reuse/aliasing (upstream PR #2228). NOTE: our
+        vendored C++ MergeSharedMemoryAllocations pass predates the upstream
+        per-epoch-liveness rewrite (#2185/#2281) that introduced the
+        disable_reuse plumbing, so this flag is accepted for call-site
+        compatibility (the backend-aware CUDA pipeline from #2189 passes it)
+        but is currently a no-op — reuse stays enabled, matching pre-#2228
+        behavior. Wiring it through requires porting the rewritten pass.
 
     Returns
     -------
     fpass : tvm.transform.Pass
         The result pass
     """
+    if disable_reuse:
+        import warnings
+        warnings.warn(
+            "MergeSharedMemoryAllocations(disable_reuse=True) is not yet "
+            "honored: the vendored C++ pass predates the upstream "
+            "per-epoch-liveness rewrite (#2185/#2228). Shared-memory reuse "
+            "remains enabled.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return _ffi_api.MergeSharedMemoryAllocations(enable_aggressive_merge, align_bytes)  # type: ignore
 
 
