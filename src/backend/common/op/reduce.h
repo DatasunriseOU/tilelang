@@ -12,7 +12,8 @@
 #include "layout/utils.h"
 #include "op/builtin.h"
 #include "op/utils.h"
-#include "tir/transforms/ir_utils.h"
+// CPPMEGA: apache+tirx-based 3rdparty/tvm renamed src/tir/transforms/ → src/tirx/transform/
+#include "tirx/transform/ir_utils.h"
 #include "transform/loop_partition.h"
 
 #include <tvm/arith/iter_affine_map.h>
