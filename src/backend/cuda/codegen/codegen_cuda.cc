@@ -4396,6 +4396,35 @@ void CodeGenTileLangCUDA::VisitStmt_(const AllocateNode *op) {
   this->PrintStmt(op->body);
 }
 
+void CodeGenTileLangCUDA::VisitStmt_(const AllocBufferNode *op) {
+  // Only barrier scopes need the special reinterpret_cast declaration so that
+  // the `.init()/.wait()/.arrive()` method-call intrinsics compile. Everything
+  // else falls through to the base CodeGenC implementation unchanged.
+  auto scope = GetPtrStorageScope(op->buffer->data);
+  if (scope != "shared.barrier" && scope != "shared.cluster_barrier") {
+    CodeGenC::VisitStmt_(op);
+    return;
+  }
+  std::string vid = AllocVarID(op->buffer->data.get());
+  this->PrintIndent();
+  size_t constant_size = 1;
+  for (const auto &dim : op->buffer->shape) {
+    const auto *dim_imm = dim.as<IntImmNode>();
+    ICHECK(dim_imm) << "Can only handle constant size barrier allocation";
+    constant_size *= dim_imm->value;
+  }
+  ICHECK_GT(constant_size, 0);
+  // Record the scope so downstream lookups (RegisterHandleType etc.) agree.
+  alloc_storage_scope_[op->buffer->data.get()] = scope;
+  auto v_id_mem = vid + "_mem";
+  stream << "__shared__ __align__(" << barrier_alignment_bytes_ << ") uint64_t "
+         << v_id_mem << "[" << constant_size << "];\n";
+  PrintIndent();
+  stream << "auto " << vid << " = reinterpret_cast<" << mbarrier_dtype_
+         << "*>(" << v_id_mem << ");\n";
+  RegisterHandleType(op->buffer->data.get(), op->buffer->dtype);
+}
+
 void CodeGenTileLangCUDA::VisitStmt_(const EvaluateNode *op) {
   if (is_const_int(op->value))
     return;

@@ -66,6 +66,12 @@ public:
   // method is kept for source compatibility with sites that dispatch to it
   // explicitly via `as<AllocateNode>()`.
   void VisitStmt_(const AllocateNode *op);
+  // Apache-tirx AllocBufferNode (e.g. shared.barrier allocations produced by
+  // the pipeline/WS passes via CreateMBarrierBuffer): emit the
+  // reinterpret_cast<Barrier*>(uint64_t[N]) form so the .init()/.wait()/
+  // .arrive() method-call intrinsics compile. Non-barrier scopes fall through
+  // to CodeGenC. See gb10 investigation (mbarrier mis-scoping codegen bug).
+  void VisitStmt_(const AllocBufferNode *op) override;
   void VisitStmt_(const AttrStmtNode *op) final;
   void VisitExpr_(const BufferLoadNode *op, std::ostream &os) final;
   void VisitStmt_(const BufferStoreNode *op) final;
