@@ -1014,6 +1014,42 @@ void CodeGenTileLangMetal::EmitAtomicAddHelperPrelude() {
       << "      reinterpret_cast<device atomic_uint*>(address), val,\n"
       << "      memory_order_relaxed);\n"
       << "}\n"
+      // Threadgroup (shared-memory) overloads: recurrent backward (e.g. Mamba3)
+      // accumulates gradients into dynamic threadgroup scratch (buf_dyn_shmem),
+      // which is `threadgroup float*` — the device-only overloads above do not
+      // match. These mirror the device variants in threadgroup address space.
+      << "static inline float AtomicAdd(threadgroup float* address, float val,\n"
+      << "                              int memory_order = 0) {\n"
+      << "  (void)memory_order;\n"
+      << "  threadgroup atomic_uint* bits =\n"
+      << "      reinterpret_cast<threadgroup atomic_uint*>(address);\n"
+      << "  uint old_bits = atomic_load_explicit(bits, memory_order_relaxed);\n"
+      << "  while (true) {\n"
+      << "    float old_val = as_type<float>(old_bits);\n"
+      << "    uint new_bits = as_type<uint>(old_val + val);\n"
+      << "    uint expected = old_bits;\n"
+      << "    if (atomic_compare_exchange_weak_explicit(\n"
+      << "            bits, &expected, new_bits, memory_order_relaxed,\n"
+      << "            memory_order_relaxed)) {\n"
+      << "      return old_val;\n"
+      << "    }\n"
+      << "    old_bits = expected;\n"
+      << "  }\n"
+      << "}\n"
+      << "static inline int AtomicAdd(threadgroup int* address, int val,\n"
+      << "                            int memory_order = 0) {\n"
+      << "  (void)memory_order;\n"
+      << "  return atomic_fetch_add_explicit(\n"
+      << "      reinterpret_cast<threadgroup atomic_int*>(address), val,\n"
+      << "      memory_order_relaxed);\n"
+      << "}\n"
+      << "static inline uint AtomicAdd(threadgroup uint* address, uint val,\n"
+      << "                             int memory_order = 0) {\n"
+      << "  (void)memory_order;\n"
+      << "  return atomic_fetch_add_explicit(\n"
+      << "      reinterpret_cast<threadgroup atomic_uint*>(address), val,\n"
+      << "      memory_order_relaxed);\n"
+      << "}\n"
       << "} /* namespace tl */\n\n";
 }
 
