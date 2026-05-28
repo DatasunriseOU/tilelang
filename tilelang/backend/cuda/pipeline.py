@@ -175,16 +175,19 @@ def CUDAPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.LowerLDGSTG()(mod)
     mod = tilelang.cuda.transform.LowerHopperIntrin()(mod)
 
-    # CPPMEGA: lower any vendored `tilelang.LetStmt` produced by the preceding
-    # TileLang passes (e.g. LowerTileOp's pipelined-TMA path, LowerHopperIntrin)
-    # into tirx Bind+SeqStmt BEFORE the first apache/tvm tirx StmtMutator pass
-    # below. AnnotateDeviceRegions / SplitHostDevice traverse via apache's
-    # StmtFunctor vtable, which has no dispatch entry for `tilelang.LetStmt`
-    # and throws 'NodeFunctor calls un-registered function on type
-    # tilelang.LetStmt'. The legacy phase.py path runs LowerTileLangLetStmt at
-    # several points; the backend-aware CUDA pipeline (#2189) omitted it. The
-    # pass is idempotent (no-op when no tilelang.LetStmt is present).
+    # CPPMEGA: lower the vendored `tilelang.LetStmt` and `tilelang.Allocate`
+    # nodes produced by the preceding TileLang passes (e.g. LowerTileOp's
+    # pipelined-TMA path / SIMT path, LowerHopperIntrin) into their tirx
+    # equivalents BEFORE the first apache/tvm tirx StmtMutator pass below.
+    # AnnotateDeviceRegions / SplitHostDevice traverse via apache's StmtFunctor
+    # vtable, which has no dispatch entry for `tilelang.LetStmt` /
+    # `tilelang.Allocate` and throws 'NodeFunctor calls un-registered function
+    # on type tilelang.LetStmt|tilelang.Allocate'. The legacy phase.py path runs
+    # this LetStmt+Allocate pair at several points; the backend-aware CUDA
+    # pipeline (#2189) omitted them. Both passes are idempotent (no-op when the
+    # corresponding vendored node is absent).
     mod = tilelang.transform.LowerTileLangLetStmt()(mod)
+    mod = tilelang.transform.LowerTileLangAllocate()(mod)
 
     mod = tilelang.transform.AnnotateDeviceRegions()(mod)
     mod = tilelang.transform.SplitHostDevice()(mod)
