@@ -48,6 +48,13 @@ namespace {
 
 bool MatchROCmReduceTarget(Target target) { return TargetIsRocm(target); }
 
+// CPPMEGA TODO(merge): superseded by default.Reduce (src/op/reduce.cc), whose
+// MakeDefaultBatchAllReduce has an explicit TargetIsRocm branch reproducing
+// this backend's logic against the new ReduceImpl contract. The legacy
+// rocm::Reduce uses the old {name, match_target, Lower(CRTP)} struct shape and
+// no longer compiles. Disable the redundant registration; ROCm reduce is fully
+// served by default.Reduce. See src/backend/cuda/op/reduce.cc for full context.
+#if 0
 bool RegisterROCmReduce() {
   RegisterReduceImpl(ReduceImpl{
       "rocm.Reduce",
@@ -58,6 +65,9 @@ bool RegisterROCmReduce() {
 }
 
 const bool rocm_reduce_registered = RegisterROCmReduce();
+#else
+[[maybe_unused]] static auto _rocm_reduce_match_unused = &MatchROCmReduceTarget;
+#endif
 
 } // namespace
 
