@@ -29,6 +29,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "target/source/codegen_c.h"
 
@@ -80,6 +81,20 @@ public:
   using CodeGenC::PrintType;
 
 private:
+  // Lazily emit the per-thread MPP fragment-lane decode (`__lane`, `__qid`,
+  // `__base_row`, `__base_col`) and `<MetalPerformancePrimitives/...>`
+  // include the first time a metal.cooperative_tensor buffer or call is
+  // observed.  Keeps non-coop-tensor kernels (M1-M4 default) byte-identical
+  // to the pre-PR output.  See PR tile-ai/tilelang#2252.
+  void EmitCooperativeTensorLanePreambleIfNeeded();
+  // Resolves the Metal address space (`thread`/`threadgroup`/`device`) of an
+  // address_of(...) call, used by coop_tensor_load/store emitters.
+  std::string GetAddrSpaceOf(const PrimExpr &ptr_expr) const;
+  // Ensure a CT buffer's dtype is known to coop_tensor_dtype_, falling back
+  // to RegisteredHandleType when an explicit AllocBuffer was not seen
+  // (codegen-only path).
+  void EnsureCooperativeTensorBuffer(const Var &var);
+
   void EmitBFloat16Helper();
 
   // CPPMEGA: hybrid tl_pr_c granularity + stack-c switch dispatch.
@@ -116,6 +131,13 @@ private:
 
   std::unordered_map<const VarNode *, std::string> simdgroup_dtype_;
   std::unordered_map<const VarNode *, IntImm> unroll_factor_;
+  // Metal M5 cooperative tensor state (PR tile-ai/tilelang#2252).  These are
+  // empty by default; the helpers above populate them lazily so M1-M4
+  // kernels remain byte-identical to the pre-PR output.
+  std::unordered_map<const VarNode *, std::string> cooperative_tensor_dtype_;
+  std::unordered_set<const VarNode *> ct_c_inlined_;
+  bool emitted_frag_lane_vars_{false};
+  bool emitted_mpp_include_{false};
   int thread_index_bits_{32};
   int thread_work_dim_{0};
   Target target_;

@@ -649,6 +649,7 @@ private:
     case StorageRank::kMMAMatrixB:
     case StorageRank::kMMAMatrixC:
     case StorageRank::kMetalSimdGroup:
+    case StorageRank::kMetalCooperativeTensor:
       return true;
     case StorageRank::kGlobal:
     case StorageRank::kShared:

@@ -62,8 +62,13 @@ inline bool IsSIMDGroupBuffer(const Buffer &buffer) {
   return buffer.defined() && buffer.scope() == "metal.simdgroup";
 }
 
+inline bool IsCooperativeTensorBuffer(const Buffer &buffer) {
+  return buffer.defined() && buffer.scope() == "metal.cooperative_tensor";
+}
+
 inline bool IsRegisterBuffer(const Buffer &buffer) {
-  return IsFragmentBuffer(buffer) || IsSIMDGroupBuffer(buffer);
+  return IsFragmentBuffer(buffer) || IsSIMDGroupBuffer(buffer) ||
+         IsCooperativeTensorBuffer(buffer);
 }
 
 // Expand a lower-rank layout by prepending the leading dimensions of `buffer`

@@ -153,6 +153,15 @@ def is_metal_simdgroup(buffer: BufferLikeType) -> bool:
     return buffer.scope() == "metal.simdgroup"
 
 
+def is_metal_cooperative_tensor(buffer: BufferLikeType) -> bool:
+    """Check if the buffer is in the Metal M5 cooperative tensor scope.
+
+    See PR tile-ai/tilelang#2252; only relevant on M5+ silicon with MSL4.
+    """
+    buffer = _get_buffer(buffer)
+    return buffer.scope() == "metal.cooperative_tensor"
+
+
 def is_local_var(buffer: BufferLikeType) -> bool:
     """
     Check if the buffer is in the local.var memory scope.

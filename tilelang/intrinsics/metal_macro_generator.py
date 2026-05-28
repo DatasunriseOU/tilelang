@@ -4,6 +4,11 @@ import tilelang.language as T
 from tvm import tir
 from tvm.tir import Buffer, BufferRegion
 
+# Metal M5 cooperative_tensor operand roles (see PR tile-ai/tilelang#2252).
+OPERAND_LEFT = 0
+OPERAND_RIGHT = 1
+OPERAND_DEST = 2
+
 
 class MPSIntrinEmitter:
     WARP_SIZE = 32
@@ -21,6 +26,10 @@ class MPSIntrinEmitter:
         warp_col_tiles: int = 8,
         chunk: int = 32,
         thread_var: tir.Var | None = None,
+        a_stride_override: int | None = None,
+        b_stride_override: int | None = None,
+        inner_k_steps: int = 1,
+        use_cooperative_tensor: bool = False,
     ):
         self.a_dtype = a_dtype
         self.b_dtype = b_dtype
@@ -33,13 +42,25 @@ class MPSIntrinEmitter:
         self.warp_col_tiles = warp_col_tiles
         self.chunk = chunk
         self.thread_var = thread_var
+        # Cooperative tensor extras (PR tile-ai/tilelang#2252).  Default false
+        # so existing simdgroup callers are unaffected.
+        self.a_stride_override = a_stride_override
+        self.b_stride_override = b_stride_override
+        self.inner_k_steps = inner_k_steps
+        self.use_cooperative_tensor = use_cooperative_tensor
 
-        # Metal simdgroup matrix size (always 8x8)
-        self.micro_size_x = 8
-        self.micro_size_y = 8
-        self.micro_size_k = 8
+        if use_cooperative_tensor:
+            # M5 mpp::tensor_ops::matmul2d minimum 16x32x16 micro tile.
+            self.micro_size_x = 16
+            self.micro_size_y = 32
+            self.micro_size_k = 16
+        else:
+            # Metal simdgroup matrix size (always 8x8).
+            self.micro_size_x = 8
+            self.micro_size_y = 8
+            self.micro_size_k = 8
 
-        # Number of 8x8 tiles per warp
+        # Number of micro tiles per warp.
         self.warp_rows = warp_row_tiles // self.micro_size_x
         self.warp_cols = warp_col_tiles // self.micro_size_y
 
@@ -91,15 +112,19 @@ class MPSIntrinEmitter:
             f"dimensions, got {prefix_rank}"
         )
 
-    def ldmatrix_a(self, A_local_buf, A_shared_buf: Buffer | BufferRegion, ki):
+    def ldmatrix_a(self, A_local_buf, A_shared_buf: Buffer | BufferRegion, ki, k_inner: int = 0):
         warp_rows = self.warp_rows
         micro_size_x = self.micro_size_x
+        micro_size_y = self.micro_size_y
         micro_size_k = self.micro_size_k
         a_transposed = self.a_transposed
+        use_cooperative_tensor = self.use_cooperative_tensor
 
         warp_m, _ = self._get_warp_indices()
 
         buffer, prefix_offsets, offset_m, offset_k, stride = self._parse_buffer_2d(A_shared_buf)
+        if self.a_stride_override is not None:
+            stride = self.a_stride_override
 
         @T.macro
         def _warp_ldmatrix_a(A_local_buf, buffer, offset_m, offset_k, stride, warp_m, ki):
@@ -113,27 +138,46 @@ class MPSIntrinEmitter:
 
                 ptr = T.access_ptr(self._access_2d(buffer, prefix_offsets, row_idx, col_idx), "r")
 
-                T.simdgroup_load(
-                    A_local_buf.data,
-                    i,
-                    ptr,
-                    stride,
-                    micro_size_x,
-                    micro_size_k,
-                    T.bool(a_transposed),
-                )
+                if use_cooperative_tensor:
+                    T.cooperative_tensor_load(
+                        A_local_buf.data,
+                        k_inner * warp_rows + i,
+                        ptr,
+                        stride,
+                        micro_size_x,
+                        micro_size_k,
+                        T.bool(a_transposed),
+                        micro_size_x,
+                        micro_size_y,
+                        micro_size_k,
+                        OPERAND_LEFT,
+                    )
+                else:
+                    T.simdgroup_load(
+                        A_local_buf.data,
+                        i,
+                        ptr,
+                        stride,
+                        micro_size_x,
+                        micro_size_k,
+                        T.bool(a_transposed),
+                    )
 
         return _warp_ldmatrix_a(A_local_buf, buffer, offset_m, offset_k, stride, warp_m, ki)
 
-    def ldmatrix_b(self, B_local_buf, B_shared_buf: Buffer | BufferRegion, ki):
+    def ldmatrix_b(self, B_local_buf, B_shared_buf: Buffer | BufferRegion, ki, k_inner: int = 0):
         warp_cols = self.warp_cols
+        micro_size_x = self.micro_size_x
         micro_size_y = self.micro_size_y
         micro_size_k = self.micro_size_k
         b_transposed = self.b_transposed
+        use_cooperative_tensor = self.use_cooperative_tensor
 
         _, warp_n = self._get_warp_indices()
 
         buffer, prefix_offsets, offset_k, offset_n, stride = self._parse_buffer_2d(B_shared_buf)
+        if self.b_stride_override is not None:
+            stride = self.b_stride_override
 
         @T.macro
         def _warp_ldmatrix_b(B_local_buf, buffer, offset_k, offset_n, stride, warp_n, ki):
@@ -147,35 +191,73 @@ class MPSIntrinEmitter:
 
                 ptr = T.access_ptr(self._access_2d(buffer, prefix_offsets, row_idx, col_idx), "r")
 
-                T.simdgroup_load(
-                    B_local_buf.data,
-                    j,
-                    ptr,
-                    stride,
-                    micro_size_k,
-                    micro_size_y,
-                    T.bool(b_transposed),
-                )
+                if use_cooperative_tensor:
+                    T.cooperative_tensor_load(
+                        B_local_buf.data,
+                        k_inner * warp_cols + j,
+                        ptr,
+                        stride,
+                        micro_size_k,
+                        micro_size_y,
+                        T.bool(b_transposed),
+                        micro_size_x,
+                        micro_size_y,
+                        micro_size_k,
+                        OPERAND_RIGHT,
+                    )
+                else:
+                    T.simdgroup_load(
+                        B_local_buf.data,
+                        j,
+                        ptr,
+                        stride,
+                        micro_size_k,
+                        micro_size_y,
+                        T.bool(b_transposed),
+                    )
 
         return _warp_ldmatrix_b(B_local_buf, buffer, offset_k, offset_n, stride, warp_n, ki)
 
-    def mma(self, A_local_buf, B_local_buf, C_local_buf):
+    def mma(self, A_local_buf, B_local_buf, C_local_buf, k_inner: int = 0):
         warp_rows = self.warp_rows
         warp_cols = self.warp_cols
+        micro_size_x = self.micro_size_x
+        micro_size_y = self.micro_size_y
+        micro_size_k = self.micro_size_k
+        use_cooperative_tensor = self.use_cooperative_tensor
+        a_transposed = self.a_transposed
+        b_transposed = self.b_transposed
 
         @T.macro
         def _warp_mma(A_local_buf, B_local_buf, C_local_buf):
             for i, j in T.grid(warp_rows, warp_cols):
-                T.simdgroup_multiply_accumulate(
-                    C_local_buf.data,
-                    i * warp_cols + j,
-                    A_local_buf.data,
-                    i,
-                    B_local_buf.data,
-                    j,
-                    C_local_buf.data,
-                    i * warp_cols + j,
-                )
+                if use_cooperative_tensor:
+                    T.cooperative_tensor_multiply_accumulate(
+                        C_local_buf.data,
+                        i * warp_cols + j,
+                        A_local_buf.data,
+                        k_inner * warp_rows + i,
+                        B_local_buf.data,
+                        k_inner * warp_cols + j,
+                        C_local_buf.data,
+                        i * warp_cols + j,
+                        micro_size_x,
+                        micro_size_y,
+                        micro_size_k,
+                        T.bool(a_transposed),
+                        T.bool(b_transposed),
+                    )
+                else:
+                    T.simdgroup_multiply_accumulate(
+                        C_local_buf.data,
+                        i * warp_cols + j,
+                        A_local_buf.data,
+                        i,
+                        B_local_buf.data,
+                        j,
+                        C_local_buf.data,
+                        i * warp_cols + j,
+                    )
 
         return _warp_mma(A_local_buf, B_local_buf, C_local_buf)
 
@@ -184,12 +266,15 @@ class MPSIntrinEmitter:
         warp_cols = self.warp_cols
         micro_size_x = self.micro_size_x
         micro_size_y = self.micro_size_y
+        micro_size_k = self.micro_size_k
+        use_cooperative_tensor = self.use_cooperative_tensor
 
         warp_m, warp_n = self._get_warp_indices()
 
         buffer, prefix_offsets, offset_m, offset_n, stride = self._parse_buffer_2d(C_dst)
 
         simd_op = T.simdgroup_store if is_store else T.simdgroup_load
+        ct_op = T.cooperative_tensor_store if is_store else T.cooperative_tensor_load
         access_mode = "w" if is_store else "r"
 
         @T.macro
@@ -200,17 +285,67 @@ class MPSIntrinEmitter:
 
                 index_c = i * warp_cols + j
 
-                simd_op(
-                    C_simd_buf.data,
-                    index_c,
-                    T.access_ptr(self._access_2d(buffer, prefix_offsets, row, col), access_mode),
-                    stride,
-                    micro_size_x,
-                    micro_size_y,
-                    T.bool(False),
-                )
+                if use_cooperative_tensor:
+                    ct_op(
+                        C_simd_buf.data,
+                        index_c,
+                        T.access_ptr(self._access_2d(buffer, prefix_offsets, row, col),
+                                     access_mode),
+                        stride,
+                        micro_size_x,
+                        micro_size_y,
+                        T.bool(False),
+                        micro_size_x,
+                        micro_size_y,
+                        micro_size_k,
+                        OPERAND_DEST,
+                    )
+                else:
+                    simd_op(
+                        C_simd_buf.data,
+                        index_c,
+                        T.access_ptr(self._access_2d(buffer, prefix_offsets, row, col),
+                                     access_mode),
+                        stride,
+                        micro_size_x,
+                        micro_size_y,
+                        T.bool(False),
+                    )
 
         return _simdgroup_copy(C_simd_buf, buffer, offset_m, offset_n, stride, warp_m, warp_n)
+
+    def make_cooperative_tensor_store_layout(self, local_buf):
+        """Construct the fragment layout for an M5 cooperative_tensor C buffer.
+
+        See PR tile-ai/tilelang#2252.  Only used by the cooperative_tensor
+        GEMM path; simdgroup callers should never invoke this.
+        """
+        from tilelang.utils.language import is_fragment
+        from tilelang.cuda.intrinsics.layout.mma_layout import metal_ct_store_index_map
+
+        assert is_fragment(local_buf), f"{local_buf} must be a fragment"
+        shape = local_buf.shape
+        inverse_index_map = metal_ct_store_index_map().inverse([self.WARP_SIZE, 16])
+
+        def forward_thread(i: int, j: int) -> int:
+            warp_m = (i // self.micro_size_x) // self.warp_rows
+            warp_n = (j // self.micro_size_y) // self.warp_cols
+            mma_i = i % self.micro_size_x
+            mma_j = j % self.micro_size_y
+            lane_id, _ = inverse_index_map.map_indices([mma_i, mma_j])
+            return (warp_m * (self.block_col_warps * self.WARP_SIZE) +
+                    warp_n * self.WARP_SIZE + lane_id)
+
+        def forward_index(i: int, j: int) -> int:
+            warp_i = (i // self.micro_size_x) % self.warp_rows
+            warp_j = (j // self.micro_size_y) % self.warp_cols
+            mma_i = i % self.micro_size_x
+            mma_j = j % self.micro_size_y
+            _, local_id = inverse_index_map.map_indices([mma_i, mma_j])
+            return warp_i * (self.warp_cols * 16) + warp_j * 16 + local_id
+
+        return T.Fragment(
+            shape, forward_thread_fn=forward_thread, forward_index_fn=forward_index)
 
     def simd_store(self, C_simd_buf, C_dst):
         return self.simdgroup_copy(C_simd_buf, C_dst, is_store=True)

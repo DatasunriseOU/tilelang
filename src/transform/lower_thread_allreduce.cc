@@ -74,6 +74,13 @@ public:
   // StmtFunctor dispatch table, so a normal `VisitStmt_` override would never
   // fire. Intercept it manually via VisitStmt(const Stmt&).
   void VisitStmt_(const AllocateNode *op) {
+    // Metal M5 cooperative tensor buffers are thread-private register tiles
+    // owned by codegen_metal; allreduce lowering must not try to rewrite them.
+    // See PR tile-ai/tilelang#2252.
+    if (GetPtrStorageScope(op->buffer_var) == "metal.cooperative_tensor") {
+      has_metal_cooperative_tensor_ = true;
+      return;
+    }
     if (IsDynamicSharedMemory(op->buffer_var)) {
       dyn_shmem_allocs_[op->buffer_var.get()] = op;
     } else if (IsStaticSharedMemory(op->buffer_var)) {
@@ -93,6 +100,8 @@ public:
   // The static mapping from the original buffer var to its allocate
   std::unordered_map<const VarNode *, const AllocateNode *>
       static_shmem_allocs_;
+  // Set when any allocation in scope `metal.cooperative_tensor` is seen.
+  bool has_metal_cooperative_tensor_{false};
 };
 
 class ThreadAllreduceBuilder final : public StmtExprMutator {
@@ -1138,6 +1147,12 @@ tvm::transform::Pass LowerThreadAllreduce() {
   auto pass_func = [](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     AllocateCollector collector;
     collector(f->body);
+    // Metal M5 cooperative tensor buffers are register tiles managed by
+    // codegen_metal; skip allreduce lowering entirely when present so the
+    // generic shared-memory machinery doesn't try to rewrite them.
+    if (collector.has_metal_cooperative_tensor_) {
+      return f;
+    }
     bool is_dynamic = collector.dyn_shmem_allocs_.size() > 1;
 
     auto *n = f.CopyOnWrite();

@@ -1,5 +1,8 @@
 from __future__ import annotations
 from typing import Callable
+import os
+import subprocess
+import tempfile
 import tvm_ffi
 from tvm.target import Target
 
@@ -182,3 +185,51 @@ def register_metal_postproc_callback(func: Callable | bool = None, override: boo
         return _register
 
     raise TypeError("Invalid decorator usage")
+
+
+# ===== Metal 4 / M5 cooperative-tensor compile callback (PR #2252) ==========
+# Not auto-registered: enabling -std=metal4.0 unconditionally would break
+# every kernel on M1-M4 silicon, where MSL4 is not supported.  Callers on
+# M5+ hardware should invoke ``register_default_metal_compile_callback()``
+# explicitly to switch the Metal compile pipeline over to MSL4.
+
+def _compile_metal4(source: str, target: Target):
+    """Compile Metal source to metallib with Metal 4 language support.
+
+    Requires Apple M5+ silicon and an Xcode 16 (or newer) toolchain.
+    """
+    del target
+    with tempfile.TemporaryDirectory() as temp_dir:
+        src_path = os.path.join(temp_dir, "tilelang.metal")
+        air_path = os.path.join(temp_dir, "tilelang.air")
+        lib_path = os.path.join(temp_dir, "tilelang.metallib")
+        with open(src_path, "w", encoding="utf-8") as src_file:
+            src_file.write(source)
+        compile_cmd = [
+            "xcrun", "-sdk", "macosx", "metal", "-std=metal4.0", "-O3", "-c", src_path, "-o",
+            air_path,
+        ]
+        lib_cmd = ["xcrun", "-sdk", "macosx", "metallib", air_path, "-o", lib_path]
+        for cmd in (compile_cmd, lib_cmd):
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=False,
+                check=False,
+            )
+            if proc.returncode != 0:
+                output = proc.stdout.decode("utf-8", errors="replace")
+                raise RuntimeError(f"Metal 4 compilation failed: {' '.join(cmd)}\n{output}")
+        with open(lib_path, "rb") as lib_file:
+            return lib_file.read()
+
+
+def register_default_metal_compile_callback(override: bool = False):
+    """Register the MSL4 (Metal 4) compile callback as ``tvm_callback_metal_compile``.
+
+    Only call on Apple M5+ hardware with Xcode 16+; on M1-M4 the resulting
+    callback will fail at ``xcrun metal`` time because MSL4 cooperative-tensor
+    intrinsics are unsupported.
+    """
+    register_metal_postproc(_compile_metal4, override=override)

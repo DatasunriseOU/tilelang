@@ -36,6 +36,57 @@ def matmul_gemm_v2(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dt
     return main
 
 
+def matmul_gemm_v2_shared_c(
+    M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
+    """Shared-C variant used to exercise the Metal M5 cooperative-tensor path
+    (PR tile-ai/tilelang#2252).  Codegen-only — no runtime requirement."""
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((K, N), dtype),
+        C: T.Tensor((M, N), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype, scope="shared")
+            B_shared = T.alloc_shared((block_K, block_N), dtype, scope="shared")
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype, scope="shared")
+
+            T.clear(C_shared)
+
+            for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=0):
+                T.copy(A[by * block_M, ko * block_K], A_shared, coalesced_width=2)
+                T.copy(B[ko * block_K, bx * block_N], B_shared, coalesced_width=2)
+
+                T.gemm(A_shared, B_shared, C_shared)
+
+            T.copy(C_shared, C[by * block_M, bx * block_N], coalesced_width=2)
+
+    return main
+
+
+def assert_metal_gemm_v2_cooperative_tensor_codegen(
+    M,
+    N,
+    K,
+    block_M,
+    block_N,
+    block_K,
+    dtype=T.float16,
+    accum_dtype=T.float32,
+):
+    func = matmul_gemm_v2_shared_c(M, N, K, block_M, block_N, block_K,
+                                   dtype=dtype, accum_dtype=accum_dtype)
+    with tvm.transform.PassContext(), tvm.target.Target("metal"):
+        artifact = tilelang.lower(func, target="metal")
+
+    src_code = artifact.kernel_source
+    assert src_code is not None
+    assert "kernel void" in src_code
+    assert "mpp::tensor_ops::matmul2d" in src_code
+    assert "cooperative_tensor" in src_code
+
+
 def assert_metal_gemm_v2_codegen(
     M,
     N,
@@ -69,6 +120,14 @@ def test_metal_gemm_v2_float32():
 
 def test_metal_gemm_v2_larger():
     assert_metal_gemm_v2_codegen(128, 128, 128, 32, 32, 32, dtype=T.float16)
+
+
+def test_metal_gemm_v2_cooperative_tensor_codegen():
+    """Codegen-only sanity check that the Metal M5 cooperative-tensor path
+    (PR tile-ai/tilelang#2252) emits the expected MPP intrinsics for the
+    shared-C 16x32x16 micro tile."""
+    assert_metal_gemm_v2_cooperative_tensor_codegen(
+        128, 128, 128, 32, 64, 32, dtype=T.float16)
 
 
 def test_metal_gemm_v2_small_blocks():

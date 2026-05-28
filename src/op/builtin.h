@@ -1347,6 +1347,14 @@ TVM_DLL const Op &stg128();
  */
 TVM_DLL const Op &stg256();
 
+// Metal M5 cooperative tensor (mpp::tensor_ops::matmul2d) intrinsics.
+// Declared TileLang-owned so the Metal backend does not depend on extra
+// TVM-fork APIs (see PR tile-ai/tilelang#2252).
+TVM_DLL const Op &cooperative_tensor_fill();
+TVM_DLL const Op &cooperative_tensor_load();
+TVM_DLL const Op &cooperative_tensor_store();
+TVM_DLL const Op &cooperative_tensor_multiply_accumulate();
+
 } // namespace tl
 } // namespace tvm
 

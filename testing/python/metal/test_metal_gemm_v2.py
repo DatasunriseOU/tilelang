@@ -127,6 +127,42 @@ def test_gemm_v2_large():
     assert_gemm_v2(128, 128, 128, 32, 32, 32)
 
 
+def _is_apple_m5_or_newer():
+    """Best-effort detection of M5+ silicon for the Metal cooperative-tensor
+    runtime test.  Returns False on M1-M4 and on non-Apple Silicon so that
+    the cooperative-tensor canary skips cleanly rather than crashing at
+    xcrun metal compile time.  See PR tile-ai/tilelang#2252."""
+    import platform
+    import subprocess
+    if platform.system() != "Darwin":
+        return False
+    try:
+        cpu = subprocess.check_output(
+            ["sysctl", "-n", "machdep.cpu.brand_string"]).decode().strip()
+    except Exception:
+        return False
+    # "Apple M5", "Apple M5 Max", "Apple M6", ... but NOT "Apple M4", M3, M2, M1.
+    import re
+    m = re.search(r"Apple M(\d+)", cpu)
+    if not m:
+        return False
+    return int(m.group(1)) >= 5
+
+
+@tilelang.testing.requires_metal
+def test_gemm_v2_cooperative_tensor_non_square():
+    """Metal M5 cooperative-tensor non-square runtime canary
+    (PR tile-ai/tilelang#2252).  Skips on M1-M4 because the kernel uses
+    ``mpp::tensor_ops::matmul2d`` from Metal 4."""
+    import pytest
+    if not _is_apple_m5_or_newer():
+        pytest.skip("metal.cooperative_tensor T.gemm requires Apple M5+ silicon")
+    # Also requires the MSL4 compile callback to be wired.
+    from tilelang.engine.callback import register_default_metal_compile_callback
+    register_default_metal_compile_callback(override=True)
+    assert_gemm_v2(128, 128, 128, 32, 64, 32)
+
+
 @tilelang.testing.requires_metal
 def test_gemm_v2_1024():
     assert_gemm_v2(1024, 1024, 1024, 16, 16, 16, atol=1.0)

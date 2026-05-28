@@ -58,6 +58,43 @@ using namespace tirx;
 using ::tilelang::tl_tir::LetStmt;
 using ::tilelang::tl_tir::LetStmtNode;
 
+namespace {
+
+// Metal M5 cooperative tensor buffers are register tiles owned by
+// codegen_metal; the generic storage-rewrite pass must skip any function
+// that allocates one. See PR tile-ai/tilelang#2252.
+class MetalCooperativeTensorScopeDetector : public StmtExprVisitor {
+public:
+  static bool Detect(const PrimFunc &func) {
+    MetalCooperativeTensorScopeDetector detector;
+    detector(func->body);
+    return detector.found_;
+  }
+
+private:
+  void VisitStmt_(const AllocBufferNode *op) final {
+    if (op->buffer.scope() == "metal.cooperative_tensor") {
+      found_ = true;
+      return;
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const SBlockNode *op) final {
+    for (const Buffer &buffer : op->alloc_buffers) {
+      if (buffer.scope() == "metal.cooperative_tensor") {
+        found_ = true;
+        return;
+      }
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  bool found_{false};
+};
+
+} // namespace
+
 /*!
  * \brief Perform data type legalization on the given BufferLoadNode pointer.
  * Equal to BufferLoadNode::LegalizeDType, but operates on a pointer.
@@ -2361,6 +2398,9 @@ using namespace tirx::transform;
 namespace transform {
 Pass StorageRewrite() {
   auto pass_func = [](PrimFunc f, const IRModule &m, PassContext ctx) {
+    if (MetalCooperativeTensorScopeDetector::Detect(f)) {
+      return f;
+    }
     bool detect_inplace =
         ctx->GetConfig<Bool>(kStorageRewriteDetectInplace, Bool(false)).value();
     bool enable_reuse = true;

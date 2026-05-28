@@ -778,5 +778,32 @@ TIR_DEFINE_TL_BUILTIN(stg128).set_num_inputs(-1).set_attr<TCallEffectKind>(
 TIR_DEFINE_TL_BUILTIN(stg256).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
+// Metal M5 cooperative tensor (mpp::tensor_ops::matmul2d) builtins.
+// These are TileLang-owned so the Metal backend does not need extra TVM-fork
+// APIs.  Codegen for these ops only runs when a `metal.cooperative_tensor`
+// scoped buffer is in scope; on hardware that lacks Metal 4 the emitted MSL
+// will fail at xcrun compile time, so end-users on M1–M4 should keep using
+// the default simdgroup path (selected automatically in src/backend/metal/op/
+// gemm.cc when the cooperative tensor preconditions don't hold).
+TIR_DEFINE_TL_BUILTIN(cooperative_tensor_fill)
+    .set_num_inputs(5)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(cooperative_tensor_load)
+    .set_num_inputs(11)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(cooperative_tensor_store)
+    .set_num_inputs(11)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(cooperative_tensor_multiply_accumulate)
+    .set_num_inputs(13)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 } // namespace tl
 } // namespace tvm
