@@ -33,6 +33,14 @@
 
 namespace tvm {
 namespace tl {
+// CPPMEGA: apache+tirx-based 3rdparty/tvm has no tvm::tir namespace — only
+// tvm::tirx. Bridge with a local `namespace tir` block matching the pattern
+// already in use in src/transform/cluster_planning.cc, so unqualified
+// tir::... in this header resolves to tirx::...
+namespace tir {
+using namespace ::tvm::tirx;
+}
+
 namespace backend {
 
 using namespace tir;

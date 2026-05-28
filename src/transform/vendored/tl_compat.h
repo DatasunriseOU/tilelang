@@ -14,16 +14,6 @@
 #include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/ffi/extra/structural_hash.h>
 
-// CPPMEGA: apache+tirx-based 3rdparty/tvm exposes the TIR API under
-// `tvm::tirx::` and has no `tvm::tir::` namespace. Some still-not-fully-
-// ported TileLang sources (e.g. src/backend/common/op/reduce.h with
-// `using namespace tir;` + `tir::attr::pragma_unroll_explicit`) reference
-// the old name. Alias `tir` to `tirx` so unqualified `tir::…` resolves.
-namespace tvm {
-namespace tirx {}  // ensure tirx exists before aliasing
-namespace tir = tirx;
-}  // namespace tvm
-
 namespace tvm {
 using Object = ::tvm::ffi::Object;
 using ObjectRef = ::tvm::ffi::ObjectRef;
