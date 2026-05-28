@@ -971,9 +971,9 @@ def sync_threads_partial(mask: int | PrimExpr, n_threads: int | PrimExpr):
         - HIP   → no-op (wavefront is convergent)
         - Metal → ``simdgroup_barrier(mem_flags::mem_threadgroup)``
     """
-    return tir.call_intrin(
+    return tirx.call_intrin(
         "void",
-        tir.op.Op.get("tl.sync_threads_partial"),
+        tirx.op.Op.get("tl.sync_threads_partial"),
         _as_uint32_mask(mask),
         n_threads,
     )
