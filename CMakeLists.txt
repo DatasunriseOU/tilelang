@@ -350,6 +350,20 @@ endif()
 target_include_directories(tilelang_objs PRIVATE ${TILE_LANG_INCLUDES})
 # CPPMEGA: force-include compat shim so old ICHECK macros alias to TVM_FFI_ICHECK family
 target_compile_options(tilelang_objs PRIVATE "-include" "${CMAKE_CURRENT_SOURCE_DIR}/src/transform/vendored/tl_compat.h")
+
+# CPPMEGA: apache+tirx-based 3rdparty/tvm dropped the legacy ICHECK macro
+# family (only TVM_FFI_ICHECK exists), but some TVM runtime sources still
+# use ICHECK (e.g. src/runtime/cuda/l2_cache_flush.cc pulls
+# 3rdparty/nvbench/l2_cache_flush.h which calls ICHECK directly). Force-
+# include the same compat shim into TVM's own runtime targets so they
+# compile against our fork. TARGET checks keep this guarded for builds
+# where the listed targets aren't created (e.g. USE_CUDA=OFF).
+foreach(_tvm_tgt tvm_runtime_objs tvm_objs)
+  if(TARGET ${_tvm_tgt})
+    target_compile_options(${_tvm_tgt} PRIVATE
+      "-include" "${CMAKE_CURRENT_SOURCE_DIR}/src/transform/vendored/tl_compat.h")
+  endif()
+endforeach()
 # CPPMEGA: disable custom logging (incompatible with apache/tvm latest tvm-ffi API)
 # target_compile_definitions(tilelang_objs PRIVATE TVM_LOG_CUSTOMIZE=1)
 if(TILELANG_RELEASE_BUILD)
