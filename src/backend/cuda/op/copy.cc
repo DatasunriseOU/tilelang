@@ -1127,8 +1127,18 @@ Stmt Copy::LowerBulk(const CopyNode &op, const LowerArgs &T,
         is_cluster_barrier = bl->buffer.scope() == "shared.cluster_barrier";
       }
     } else if (GetIsTmaCopy(op)) {
-      LOG(FATAL) << "T.tma_copy() requires a barrier argument. "
-                 << "Use T.tma_copy(src, dst, barrier=mbar[idx]).";
+      // An op marked is_tma_copy that reaches lowering without an explicit
+      // "barrier" annotation is a producer-only TMA load: it relies on the
+      // enclosing pipeline / warp-specialization pass to have threaded in the
+      // barrier (arrive + wait). When that barrier is missing we must NOT
+      // self-allocate one here: a self-allocated barrier is never waited on by
+      // the consumer (and its phase does not match the pipeline), so the
+      // consumer would read uninitialized shared memory. This situation arises
+      // when an upstream pass marks an auto-selected bulk copy as TMA but the
+      // matching barrier management never ran for it (e.g. classification
+      // mismatch on padded / unsupported shapes). Fall back to a correct,
+      // self-contained SIMT copy instead of emitting a broken TMA copy.
+      return LowerNormal(op, T, analyzer);
     } else if (T.AllocMBarrier) {
       barrier_base_id = T.AllocMBarrier(1);
       PrimExpr mbar_idx = IntImm(DataType::Int(32), barrier_base_id);
@@ -1336,8 +1346,10 @@ Stmt Copy::LowerBulk1D(const CopyNode &op, const LowerArgs &T,
       mbar_handle = Downcast<PrimExpr>(user_barrier.value());
       barrier_base_id = 0;
     } else if (GetIsTmaCopy(op)) {
-      LOG(FATAL) << "T.tma_copy() requires a barrier argument. "
-                 << "Use T.tma_copy(src, dst, barrier=mbar[idx]).";
+      // See LowerBulk: a producer-only TMA load missing its pipeline / WS
+      // barrier cannot be safely self-managed; fall back to a correct SIMT
+      // copy instead of throwing.
+      return LowerNormal(op, T, analyzer);
     } else if (T.AllocMBarrier) {
       barrier_base_id = T.AllocMBarrier(1);
       PrimExpr mbar_idx = IntImm(DataType::Int(32), barrier_base_id);
