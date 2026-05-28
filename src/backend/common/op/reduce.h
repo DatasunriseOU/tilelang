@@ -17,9 +17,11 @@
 #include "transform/loop_partition.h"
 
 #include <tvm/arith/iter_affine_map.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/op_attr_types.h>
+// CPPMEGA: apache+tirx-based 3rdparty/tvm exposes the public TIR headers
+// under tvm/tirx/ rather than tvm/tir/.
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/op_attr_types.h>
 
 #include <cmath>
 #include <cstdint>
