@@ -31,6 +31,22 @@ namespace {
 constexpr const char *kCudaMMA = "cuda.mma";
 constexpr const char *kCudaWGMMA = "cuda.wgmma";
 constexpr const char *kCudaTCGEN05 = "cuda.tcgen05";
+constexpr const char *kCudaSIMT = "cuda.simt";
+
+// Consumer Blackwell (sm_120 / sm_121, e.g. RTX 50xx and the GB10 DGX Spark
+// SoC) physically removed the fp64 tensor cores that were present on
+// Ampere / Ada / Hopper / data-center Blackwell. The legacy fp64 DMMA PTX
+// instruction `mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64` still
+// assembles on these architectures (ptxas accepts it), but the resulting
+// hardware behavior is undefined — empirically it silently produces zeros
+// for most lanes. Route fp64 GEMM to a SIMT fallback in this case.
+inline bool RequiresSimtFallback(const GemmNode &op, Target target) {
+  if (!TargetIsSM120(target))
+    return false;
+  return op.a_->dtype == DataType::Float(64) ||
+         op.b_->dtype == DataType::Float(64) ||
+         op.c_->dtype == DataType::Float(64);
+}
 
 bool CheckWgmma(const GemmNode &op) {
   if (op.b_.scope() != "shared.dyn" && op.b_.scope() != "shared") {
@@ -276,6 +292,13 @@ struct Gemm {
       return kCudaTCGEN05;
     }
 
+    // SIMT fallback for dtypes / targets with no usable tensor-core path.
+    // Checked before specialized MMA dispatch so we don't emit a broken
+    // m8n8k4 fp64 PTX on consumer Blackwell (sm_120 / sm_121).
+    if (RequiresSimtFallback(op, target)) {
+      return kCudaSIMT;
+    }
+
     if (AllowTcgen5Mma(op, target)) {
       return kCudaTCGEN05;
     }
@@ -297,6 +320,15 @@ struct Gemm {
     if (gemm_inst == kCudaWGMMA) {
       return ComputeWgmmaWarpPartition(policy, M, N, num_warps);
     }
+    if (gemm_inst == kCudaSIMT) {
+      // SIMT path distributes the (M, N) output tile across all lanes via
+      // T.Parallel; warp-level tiling is not used. Surface a trivial
+      // 1-warp-row / N-warp-col partition so policy callers see a valid
+      // pair.
+      policy.m_warp = 1;
+      policy.n_warp = num_warps;
+      return {1, num_warps};
+    }
     int k_n_per_warp =
         (TargetIsVolta(target) || TargetIsTuring(target)) ? 16 : 8;
     return ComputeDefaultWarpPartition(policy, M, N, num_warps, k_n_per_warp);
@@ -315,6 +347,9 @@ struct Gemm {
     }
     if (gemm_inst == kCudaMMA) {
       return "mma";
+    }
+    if (gemm_inst == kCudaSIMT) {
+      return "simt";
     }
     return "unknown";
   }

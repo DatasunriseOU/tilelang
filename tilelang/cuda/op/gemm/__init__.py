@@ -5,6 +5,7 @@ from __future__ import annotations
 from tilelang.tileop.gemm.registry import register_gemm_impl
 from .gemm_mma import GEMM_INST_MMA, GemmMMA
 from .gemm_mma_sm70 import GemmMMASm70
+from .gemm_simt import GEMM_INST_SIMT, GemmSIMT
 from .gemm_tcgen05 import GEMM_INST_TCGEN05, GemmTCGEN5
 from .gemm_wgmma import GEMM_INST_WGMMA, GemmWGMMA
 from tilelang.utils.target import target_is_cuda, target_is_volta
@@ -26,7 +27,17 @@ def _match_tcgen05(target) -> bool:
     return target_is_cuda(target)
 
 
+def _match_simt(target) -> bool:
+    # The SIMT fallback selection is decided in C++ (RequiresSimtFallback in
+    # src/backend/cuda/op/gemm.cc) — today: fp64 on sm_120 / sm_121, where the
+    # fp64 tensor cores are physically absent. Keep the Python predicate broad
+    # — any CUDA target is eligible to receive a "cuda.simt" selection; the C++
+    # guard decides when one is emitted.
+    return target_is_cuda(target)
+
+
 register_gemm_impl("cuda.mma", GEMM_INST_MMA, _match_mma, GemmMMA)
 register_gemm_impl("cuda.mma_sm70", GEMM_INST_MMA, _match_mma_sm70, GemmMMASm70)
 register_gemm_impl("cuda.wgmma", GEMM_INST_WGMMA, _match_wgmma, GemmWGMMA)
 register_gemm_impl("cuda.tcgen05", GEMM_INST_TCGEN05, _match_tcgen05, GemmTCGEN5)
+register_gemm_impl("cuda.simt", GEMM_INST_SIMT, _match_simt, GemmSIMT)
