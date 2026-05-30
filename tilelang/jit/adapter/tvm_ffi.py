@@ -552,7 +552,22 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
 
                     import mlx.core as mx  # type: ignore[import-not-found]
 
+                    # Synchronous full-ABI owner-output contract: the kernel
+                    # writes in place into the caller-owned output buffers
+                    # (``inputs[i]`` for ``i in result_idx``). The native bridge
+                    # returns fresh MLX wrappers that *alias* those buffers via
+                    # copy_shared_buffer; evaluating the wrappers schedules the
+                    # write into the caller's storage. After eval, return the
+                    # caller's own array objects so the documented owner-output
+                    # reuse contract (``returned is out``) holds identically to
+                    # the non-native route. The wrappers and caller arrays share
+                    # storage, so the returned objects observe the kernel result.
                     mx.eval(*owner_aliases)
+                    if owner_outputs_are_tail_params:
+                        caller_owner_outputs = [inputs[i] for i in self.result_idx]
+                        if len(self.result_idx) == 1:
+                            return caller_owner_outputs[0]
+                        return caller_owner_outputs
                     if len(self.result_idx) == 1:
                         return owner_aliases[0]
                     return list(owner_aliases)
@@ -824,10 +839,18 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
 
                     import mlx.core as mx  # type: ignore[import-not-found]
 
+                    # See the synchronous full-ABI owner-output note above: after
+                    # eval the caller-owned buffers (``tensor_list[i]`` for
+                    # ``i in result_idx``) hold the kernel result, so return the
+                    # caller's own objects to preserve the ``returned is out``
+                    # owner-output reuse contract identically to the non-native
+                    # route. ``provided_outputs``/full-ABI both place the caller's
+                    # output array at ``tensor_list[i]``.
                     mx.eval(*owner_aliases)
+                    caller_owner_outputs = [tensor_list[i] for i in self.result_idx]
                     if len(self.result_idx) == 1:
-                        return owner_aliases[0]
-                    return list(owner_aliases)
+                        return caller_owner_outputs[0]
+                    return caller_owner_outputs
                 except MLXTVMFFIBridgeUnavailable:
                     pass
 

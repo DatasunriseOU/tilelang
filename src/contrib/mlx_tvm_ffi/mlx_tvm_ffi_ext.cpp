@@ -818,6 +818,7 @@ MTL::CommandBuffer* finish_encoding_and_get_command_buffer(mx::Stream stream) {
   return encoder.get_command_buffer();
 }
 
+
 void zero_output_buffer(MTL::CommandBuffer* command_buffer, mx::array& out) {
   if (out.nbytes() == 0) {
     return;
@@ -844,6 +845,35 @@ void maybe_encode_command_buffer_boundary(MTL::CommandBuffer* command_buffer, mx
   if (!env_flag_enabled(kForceCommandBufferBoundaryEnv)) {
     return;
   }
+  encode_command_buffer_boundary(command_buffer, stream);
+}
+
+// Input-producer ordering boundary for the external-command-buffer dispatch
+// paths.
+//
+// finish_encoding_and_get_command_buffer() ends MLX's active compute encoder.
+// MLX's cross-encoder ordering relies on MTLFence: end_encoding() encodes
+// waitForFence() for inputs that are outputs of a prior encoder and
+// updateFence() for this encoder's outputs (see mlx device.cpp). However, the
+// TVM-FFI kernel is dispatched into a *fresh* MTLComputeCommandEncoder created
+// inside TVM (see metal_module.mm: [external_command_buffer computeCommandEncoder]).
+// That TVM encoder never calls waitForFence on the MLX input-producer fences,
+// and MLX's compute encoders use MTL::DispatchTypeConcurrent, so without an
+// explicit ordering point the TVM kernel may read MLX-produced input buffers
+// before the producing kernel has finished -> stale/garbage reads (wrong output
+// or NaN), deterministically when an unrelated MLX graph is eval'd into the same
+// command buffer just before the launch, intermittently otherwise.
+//
+// Encoding a signal+wait on a shared event on this command buffer forces every
+// command encoded before the boundary (the MLX input producers) to complete
+// before anything encoded after it (the TVM dispatch). This restores the
+// producer-before-consumer ordering MLX would otherwise provide via fences.
+// RULE: never silently dispatch a kernel that can read its inputs before their
+// producers finish.
+void encode_input_producer_ordering_boundary(
+    MTL::CommandBuffer* command_buffer, mx::Stream stream) {
+  // Honoring kForceCommandBufferBoundaryEnv would add a redundant second
+  // boundary; the unconditional boundary below already covers it.
   encode_command_buffer_boundary(command_buffer, stream);
 }
 
@@ -1274,7 +1304,10 @@ class TVMFFIMetalCall : public mx::Primitive {
       for (int64_t output_pos : zero_init_output_positions) {
         zero_output_buffer(command_buffer, outputs.at(static_cast<size_t>(output_pos)));
       }
-      maybe_encode_command_buffer_boundary(command_buffer, stream());
+      // Order MLX input producers (and the zero-init blit above) strictly before
+      // the TVM dispatch; the fresh TVM compute encoder does not inherit MLX's
+      // input fences. See encode_input_producer_ordering_boundary().
+      encode_input_producer_ordering_boundary(command_buffer, stream());
       {
         ExternalCommandBufferScope external(command_buffer);
         call_direct();
@@ -1514,8 +1547,14 @@ class TVMFFIMetalCall : public mx::Primitive {
     for (int64_t output_pos : zero_init_output_positions) {
       zero_output_buffer(command_buffer, outputs.at(static_cast<size_t>(output_pos)));
     }
-    encode_host_wrapper_command_buffer_boundary(
-        command_buffer, stream(), direct_device_launch);
+    // Order MLX input producers (and the zero-init blit above) strictly before
+    // the TVM dispatch. For the host-wrapper (non direct_device_launch) case the
+    // boundary above already does this; for the direct_device_launch case it was
+    // gated behind kForceCommandBufferBoundaryEnv, leaving a stale-input race.
+    // See encode_input_producer_ordering_boundary().
+    if (direct_device_launch) {
+      encode_input_producer_ordering_boundary(command_buffer, stream());
+    }
 
     {
       ExternalCommandBufferScope external(command_buffer);
@@ -1717,7 +1756,7 @@ class TVMFFIMetalCall4In1Out : public mx::Primitive {
     }
 
     auto* command_buffer = finish_encoding_and_get_command_buffer(stream());
-    maybe_encode_command_buffer_boundary(command_buffer, stream());
+    encode_input_producer_ordering_boundary(command_buffer, stream());
     {
       ExternalCommandBufferScope external(command_buffer);
       call_direct();
