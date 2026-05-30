@@ -831,7 +831,30 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 except MLXTVMFFIBridgeUnavailable:
                     pass
 
-            # Resolve compiled parameter names and order to handle alphabetical sorting and pruned parameters
+            # Resolve compiled parameter names and order to handle alphabetical
+            # sorting and pruned parameters.
+            #
+            # IMPORTANT: this reorder is ONLY valid when ``executable`` is bound
+            # directly to the *device* kernel ABI (the legacy CUDA ``__global__``
+            # raw-source path, where the parsed names are the device-kernel
+            # parameter order). On the production TVM-FFI metal path
+            # ``executable["main"]`` is the lowered LLVM *host* wrapper
+            # (``__tvm_ffi_<name>``): it consumes arguments in the host PrimFunc
+            # order and performs the host->device parameter permutation itself.
+            # Reordering host-wrapper arguments into the device-lowered
+            # (alphabetically sorted) order silently scrambles the call -- the
+            # host wrapper then validates each tensor's shape/stride against the
+            # wrong buffer, returns a non-zero status without a propagated
+            # message, and the tvm-ffi Python layer surfaces it as
+            # ``SystemError: ffi.Function returned NULL without setting an
+            # exception``. This is a no-op only for kernels whose PrimFunc order
+            # already equals the device-lowered order (e.g. the 5-param FP8
+            # dense signature ``A_fp8,A_scale,B_fp8,B_scale,C``), which is why
+            # exactly those dispatched while every reordered signature
+            # (mamba3/GDN/KDA/#13 cooperative GEMM) ffi-NULLed. Derive the device
+            # order from the *device kernel source* ONLY (CUDA ``__global__``);
+            # never from ``device_mod``, whose param order does not describe the
+            # host wrapper's calling convention.
             compiled_param_names = None
             if target_kind == "metal":
                 if hasattr(self, "device_kernel_source") and self.device_kernel_source:
@@ -846,13 +869,6 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                                 if param_match:
                                     names.append(param_match.group(1))
                             compiled_param_names = names
-                    except Exception:
-                        pass
-
-                if compiled_param_names is None and hasattr(self, "device_mod") and self.device_mod:
-                    try:
-                        device_func = retrieve_func_from_module(self.device_mod)
-                        compiled_param_names = [var.name for var in device_func.params]
                     except Exception:
                         pass
 
