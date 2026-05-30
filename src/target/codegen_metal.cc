@@ -137,8 +137,11 @@ void CodeGenTileLangMetal::InitFuncState(const PrimFunc &f) {
   // sticky: decl_stream is shared across kernels in the same module, so we
   // only want to emit the MPP include once per module.
   emitted_frag_lane_vars_ = false;
+  emitted_pct_op_ = false;
   cooperative_tensor_dtype_.clear();
   ct_c_inlined_.clear();
+  ct_c_inlined_base_.clear();
+  ct_c_inlined_next_ = 0;
   // analyze the data;
   for (Var arg : f->params) {
     if (arg.dtype().is_handle()) {
@@ -1763,24 +1766,35 @@ void CodeGenTileLangMetal::VisitStmt_(const AllocBufferNode *op) {
         elems_per_thread % 16 == 0) {
       int num_c_tiles = elems_per_thread / 16;
       ct_c_inlined_.insert(op->buffer->data.get());
-      this->PrintIndent();
-      stream
-          << "constexpr auto __pct_desc = mpp::tensor_ops::matmul2d_descriptor("
-          << "16, 32, 16, false, false, true, "
-          << "mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);"
-             "\n";
-      this->PrintIndent();
-      stream << "mpp::tensor_ops::matmul2d<__pct_desc, "
-                "metal::execution_simdgroup> __pct_op;\n";
+      // `__pct_desc`/`__pct_op` are identical for every inlined accumulator, so
+      // emit them at most once per kernel; re-emitting per buffer produces an
+      // MSL "redefinition" error when a kernel has >1 cooperative_tensor.
+      if (!emitted_pct_op_) {
+        this->PrintIndent();
+        stream << "constexpr auto __pct_desc = "
+                  "mpp::tensor_ops::matmul2d_descriptor("
+               << "16, 32, 16, false, false, true, "
+               << "mpp::tensor_ops::matmul2d_descriptor::mode::multiply_"
+                  "accumulate);\n";
+        this->PrintIndent();
+        stream << "mpp::tensor_ops::matmul2d<__pct_desc, "
+                  "metal::execution_simdgroup> __pct_op;\n";
+        emitted_pct_op_ = true;
+      }
+      // Give each buffer a unique base into the global `__pct_cN` namespace so
+      // names never collide across multiple accumulators in one kernel.
+      int base = ct_c_inlined_next_;
+      ct_c_inlined_base_[op->buffer->data.get()] = base;
+      ct_c_inlined_next_ += num_c_tiles;
       for (int t = 0; t < num_c_tiles; t++) {
         this->PrintIndent();
-        stream << "auto __pct_c" << t
+        stream << "auto __pct_c" << (base + t)
                << " = __pct_op.get_destination_cooperative_tensor<"
                << "decltype(__pct_op.get_left_input_cooperative_tensor<half, "
                   "half, float>()), "
                << "decltype(__pct_op.get_right_input_cooperative_tensor<half, "
                   "half, float>()), float>(); "
-               << "for (ushort __i = 0; __i < 16; __i++) __pct_c" << t
+               << "for (ushort __i = 0; __i < 16; __i++) __pct_c" << (base + t)
                << "[__i] = 0.0f;\n";
       }
     }
@@ -2059,14 +2073,43 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
     os << "for (ushort __i = 0; __i < " << elems_per_tile << "; __i++) " << var
        << "[" << idx << " * " << elems_per_tile << " + __i] = " << val;
     if (is_inlined && fill_idx_imm) {
+      int fill_base = ct_c_inlined_base_.count(fill_v.get())
+                          ? ct_c_inlined_base_[fill_v.get()]
+                          : 0;
       os << "; for (ushort __i = 0; __i < " << elems_per_tile << "; __i++) "
-         << "__pct_c" << fill_idx_imm->value << "[__i] = " << val;
+         << "__pct_c" << (fill_base + fill_idx_imm->value) << "[__i] = " << val;
     }
   } else if (op->op.same_as(tl::cooperative_tensor_load())) {
     // Load `rows`x`cols` from device/threadgroup pointer into a per-thread
-    // tile slice of the cooperative_tensor at index `idx`.  Emitted as
-    // 16x16 sub-fragments stitched by the (__base_row, __base_col) lane map.
+    // tile slice of the cooperative_tensor at index `idx`.
+    //
+    // LAYOUT-CORRECTNESS FIX: for the A (LEFT) / B (RIGHT) matmul operands we
+    // do NOT stage into a thread-private array via the 8x8 simdgroup
+    // fragment-lane map (__base_row/__base_col) anymore.  The mpp cooperative
+    // input tensor has an opaque, implementation-defined per-lane element
+    // distribution, so a later linear copy from such a staging array scrambles
+    // the operands (observed maxdiff ~22 on M4).  Instead we RECORD the
+    // threadgroup/device source view here and let the matmul2d emission call
+    // mpp's native `cooperative_tensor.load(...)`, which fills the input tensor
+    // in mpp's own internal order.  The DEST (C) operand keeps the legacy
+    // fragment-map path because the C accumulator round-trips through SMEM.
     ICHECK_GE(op->args.size(), 11);
+    int operand_role = op->args[10].as<IntImmNode>()->value;
+    if (operand_role == 0 || operand_role == 1) {
+      // A (LEFT) / B (RIGHT): emit nothing.  The matmul2d emission fills the
+      // mpp input cooperative tensors from the threadgroup/device source views
+      // passed directly into cooperative_tensor_multiply_accumulate, using
+      // mpp's native cooperative_tensor.load (correct element distribution).
+      // The thread-private A_local/B_local staging arrays are now unused by the
+      // coop path and get DCE'd by the Metal compiler.
+      return;
+    }
+    // operand_role == 2 (DEST/C): load the existing C accumulator from the
+    // (row-major, row-stride) SMEM/device tile into the mpp destination
+    // cooperative tensor.  For the inlined __pct_cN accumulator (constant tile
+    // index) this MUST use mpp's native cooperative_tensor.load so the element
+    // distribution matches what __op.run / .store use; the legacy fragment-map
+    // scatter below corrupted the C accumulator on the non-clear path.
     std::string var = PrintExpr(op->args[0]);
     std::string idx = PrintExpr(op->args[1]);
     std::string src_ptr = PrintExpr(op->args[2]);
@@ -2079,6 +2122,33 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
     ICHECK(it != cooperative_tensor_dtype_.end());
     std::string dtype = it->second;
     std::string addr_space = GetAddrSpaceOf(op->args[2]);
+    bool dest_inlined = ct_c_inlined_.count(v.get()) > 0;
+    auto *load_idx_imm = op->args[1].as<IntImmNode>();
+    if (dest_inlined && load_idx_imm) {
+      int nfrag_r_i = rows / 16;
+      int nfrag_c_i = cols / 16;
+      int total_elems_i = nfrag_r_i * nfrag_c_i * 8;
+      int mma_tiles_per_load = total_elems_i / 16;
+      ICHECK(mma_tiles_per_load == 1)
+          << "inlined cooperative_tensor C load expects a single 16x32 "
+             "destination micro-tile per call, got "
+          << mma_tiles_per_load;
+      int buf_base = ct_c_inlined_base_.count(v.get())
+                         ? ct_c_inlined_base_[v.get()]
+                         : 0;
+      int base_pct = buf_base + load_idx_imm->value * mma_tiles_per_load;
+      // mpp C tile: row-major rows x cols (M x N) -> mpp extents (N, M),
+      // strides {1, stride}.
+      os << "{ metal::tensor<" << addr_space << " " << dtype
+         << ", metal::dextents<int32_t, 2>, metal::tensor_inline> __ts_c(("
+         << addr_space << " " << dtype << "*)" << src_ptr
+         << ", metal::dextents<int32_t, 2>(" << cols << ", " << rows
+         << "), metal::array<int32_t, 2>{1, (int32_t)(" << stride << ")}); "
+         << "__pct_c" << base_pct << ".load(__ts_c); }";
+      return;
+    }
+    // Non-inlined fallback: legacy fragment-map gather into the thread-private
+    // C_ct staging array.
     int frag_rows = 16, frag_cols = 16;
     int nfrag_r = rows / frag_rows;
     int nfrag_c = cols / frag_cols;
@@ -2128,15 +2198,38 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
     int total_elems = nfrag_r * nfrag_c * 8;
     bool is_inlined = ct_c_inlined_.count(v.get()) > 0;
     auto *store_idx_imm = op->args[1].as<IntImmNode>();
+    // LAYOUT-CORRECTNESS FIX: for the inlined float accumulator the result
+    // lives in the mpp destination cooperative tensor `__pct_cN`.  Store it
+    // back to the (row-major, row-stride) C SMEM/device tile via mpp's native
+    // `cooperative_tensor.store(metal::tensor<...>)`, which uses mpp's internal
+    // element distribution -- the same one `__op.run` wrote.  The previous
+    // fragment-map scatter (__base_row/__base_col) did NOT match that
+    // distribution and corrupted the C tile.  Each inlined `__pct_cN` is one
+    // `micro_size_x` x `micro_size_y` (16x32) destination tensor, i.e. one
+    // store micro-tile, so total_elems==16 and mma_tiles_per_store==1 here.
     if (is_inlined && store_idx_imm) {
       int mma_tiles_per_store = total_elems / 16;
-      int base_pct = store_idx_imm->value * mma_tiles_per_store;
-      for (int t = 0; t < mma_tiles_per_store; t++) {
-        os << "for (ushort __i = 0; __i < 16; __i++) " << var << "[" << idx
-           << " * " << total_elems << " + " << (t * 16) << " + __i] = "
-           << "__pct_c" << (base_pct + t) << "[__i]; ";
-      }
+      ICHECK(mma_tiles_per_store == 1)
+          << "inlined cooperative_tensor C store expects a single 16x32 "
+             "destination micro-tile per call, got "
+          << mma_tiles_per_store;
+      int buf_base = ct_c_inlined_base_.count(v.get())
+                         ? ct_c_inlined_base_[v.get()]
+                         : 0;
+      int base_pct = buf_base + store_idx_imm->value * mma_tiles_per_store;
+      // mpp C tile: row-major rows x cols (M x N), row stride `stride`.
+      // mpp-order extents are (cols, rows) = (N, M), strides {1, stride}.
+      os << "{ metal::tensor<" << addr_space << " " << dtype
+         << ", metal::dextents<int32_t, 2>, metal::tensor_inline> __ts_c(("
+         << addr_space << " " << dtype << "*)" << dst_ptr
+         << ", metal::dextents<int32_t, 2>(" << cols << ", " << rows
+         << "), metal::array<int32_t, 2>{1, (int32_t)(" << stride << ")}); "
+         << "__pct_c" << base_pct << ".store(__ts_c); }";
+      return;
     }
+    // Non-inlined fallback: legacy fragment-map scatter from the thread-private
+    // C_ct staging array.  (Only reached when the accumulator was not promoted
+    // to an inlined __pct_cN, e.g. non-float dest.)
     os << "{ " << addr_space << " " << dtype << "* __dst = (" << addr_space
        << " " << dtype << "*)" << dst_ptr << "; ";
     int elem_offset = 0;
@@ -2172,10 +2265,6 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
     bool trans_a = op->args[11].as<IntImmNode>()->value != 0;
     bool trans_b = op->args[12].as<IntImmNode>()->value != 0;
 
-    std::string a_var = PrintExpr(op->args[2]);
-    std::string a_idx = PrintExpr(op->args[3]);
-    std::string b_var = PrintExpr(op->args[4]);
-    std::string b_idx = PrintExpr(op->args[5]);
     std::string c_var = PrintExpr(op->args[0]);
     std::string c_idx = PrintExpr(op->args[1]);
 
@@ -2191,8 +2280,6 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
     std::string a_dtype = a_it->second;
     std::string c_dtype = c_it->second;
 
-    int a_elems = M * K / 32;
-    int b_elems = K * N / 32;
     int c_elems = M * N / 32;
 
     ICHECK(M == 32 || N == 32 || K == 32)
@@ -2202,47 +2289,70 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
     bool c_inlined = ct_c_inlined_.count(c_v.get()) > 0;
     auto *c_idx_imm = op->args[1].as<IntImmNode>();
     bool c_idx_const = c_inlined && c_idx_imm != nullptr;
+    int c_buf_base = ct_c_inlined_base_.count(c_v.get())
+                         ? ct_c_inlined_base_[c_v.get()]
+                         : 0;
+
+    // LAYOUT-CORRECTNESS FIX: fill the mpp input cooperative tensors via mpp's
+    // native `cooperative_tensor.load(metal::tensor<...>)`.  This replaces the
+    // previous linear copy from a fragment-map staging array, which scrambled
+    // the operands because the cooperative-tensor per-lane element order is
+    // implementation-defined and unrelated to the 8x8 simdgroup fragment map.
+    //
+    // The A/B threadgroup (or device) source views are passed in directly as
+    // trailing args [13..16] = (a_ptr, a_stride, b_ptr, b_stride), recomputed
+    // by the Python mma macro from the same access pattern the ldmatrix step
+    // used.  This is self-contained -- no fragile cross-call recording across
+    // renamed loop variables.
+    ICHECK_GE(op->args.size(), 17)
+        << "cooperative_tensor_multiply_accumulate requires the trailing "
+           "a_ptr/a_stride/b_ptr/b_stride source-view args for the native-load "
+           "layout fix";
+    std::string a_ptr = PrintExpr(op->args[13]);
+    std::string a_stride = PrintExpr(op->args[14]);
+    std::string b_ptr = PrintExpr(op->args[15]);
+    std::string b_stride = PrintExpr(op->args[16]);
+    std::string a_addr = GetAddrSpaceOf(op->args[13]);
+    std::string b_addr = GetAddrSpaceOf(op->args[15]);
+
+    // Build a rank-2 mpp source tensor view over the (row-major, row-stride)
+    // SMEM/device tile.  Per the MPP matmul2d contract (NN): for A,
+    // extent(0)=K, extent(1)=M; for B, extent(0)=N, extent(1)=K.  The physical
+    // tile is row-major (rows x cols, row stride `stride`), so the mpp-order
+    // extents are (cols, rows) and strides {1, stride}.  A tile is M(rows) x
+    // K(cols); B tile is K(rows) x N(cols).  The descriptor's transpose flags
+    // tell mpp how to interpret it.
+    auto emit_src_tensor = [&](const std::string &name,
+                               const std::string &addr, const std::string &dt,
+                               const std::string &ptr, const std::string &strd,
+                               int extent0, int extent1) {
+      os << "metal::tensor<" << addr << " " << dt
+         << ", metal::dextents<int32_t, 2>, metal::tensor_inline> " << name
+         << "((" << addr << " " << dt << "*)" << ptr
+         << ", metal::dextents<int32_t, 2>(" << extent0 << ", " << extent1
+         << "), metal::array<int32_t, 2>{1, (int32_t)(" << strd << ")}); ";
+    };
+
+    os << "{ "
+       << "constexpr auto __desc = mpp::tensor_ops::matmul2d_descriptor(" << M
+       << ", " << N << ", " << K << ", " << (trans_a ? "true" : "false") << ", "
+       << (trans_b ? "true" : "false") << ", true, "
+       << "mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate); "
+       << "mpp::tensor_ops::matmul2d<__desc, metal::execution_simdgroup> __op; "
+       << "auto __ct_a = __op.get_left_input_cooperative_tensor<" << a_dtype
+       << ", " << a_dtype << ", " << c_dtype << ">(); "
+       << "auto __ct_b = __op.get_right_input_cooperative_tensor<" << a_dtype
+       << ", " << a_dtype << ", " << c_dtype << ">(); ";
+    // A: extent0=K, extent1=M ; B: extent0=N, extent1=K.
+    emit_src_tensor("__ts_a", a_addr, a_dtype, a_ptr, a_stride, K, M);
+    emit_src_tensor("__ts_b", b_addr, a_dtype, b_ptr, b_stride, N, K);
+    os << "__ct_a.load(__ts_a); __ct_b.load(__ts_b); ";
     if (c_idx_const) {
-      os << "{ "
-         << "constexpr auto __desc = mpp::tensor_ops::matmul2d_descriptor(" << M
-         << ", " << N << ", " << K << ", " << (trans_a ? "true" : "false")
-         << ", " << (trans_b ? "true" : "false") << ", true, "
-         << "mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate)"
-            "; "
-         << "mpp::tensor_ops::matmul2d<__desc, metal::execution_simdgroup> "
-            "__op; "
-         << "auto __ct_a = __op.get_left_input_cooperative_tensor<" << a_dtype
-         << ", " << a_dtype << ", " << c_dtype << ">(); "
-         << "auto __ct_b = __op.get_right_input_cooperative_tensor<" << a_dtype
-         << ", " << a_dtype << ", " << c_dtype << ">(); "
-         << "for (ushort __i = 0; __i < " << a_elems << "; __i++) "
-         << "__ct_a[__i] = " << a_var << "[" << a_idx << " * " << a_elems
-         << " + __i]; "
-         << "for (ushort __i = 0; __i < " << b_elems << "; __i++) "
-         << "__ct_b[__i] = " << b_var << "[" << b_idx << " * " << b_elems
-         << " + __i]; "
-         << "__op.run(__ct_a, __ct_b, __pct_c" << c_idx_imm->value << "); }";
+      os << "__op.run(__ct_a, __ct_b, __pct_c"
+         << (c_buf_base + c_idx_imm->value) << "); }";
     } else {
-      os << "{ "
-         << "constexpr auto __desc = mpp::tensor_ops::matmul2d_descriptor(" << M
-         << ", " << N << ", " << K << ", " << (trans_a ? "true" : "false")
-         << ", " << (trans_b ? "true" : "false") << ", true, "
-         << "mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate)"
-            "; "
-         << "mpp::tensor_ops::matmul2d<__desc, metal::execution_simdgroup> "
-            "__op; "
-         << "auto __ct_a = __op.get_left_input_cooperative_tensor<" << a_dtype
-         << ", " << a_dtype << ", " << c_dtype << ">(); "
-         << "auto __ct_b = __op.get_right_input_cooperative_tensor<" << a_dtype
-         << ", " << a_dtype << ", " << c_dtype << ">(); "
-         << "auto __ct_c = __op.get_destination_cooperative_tensor<"
+      os << "auto __ct_c = __op.get_destination_cooperative_tensor<"
          << "decltype(__ct_a), decltype(__ct_b), " << c_dtype << ">(); "
-         << "for (ushort __i = 0; __i < " << a_elems << "; __i++) "
-         << "__ct_a[__i] = " << a_var << "[" << a_idx << " * " << a_elems
-         << " + __i]; "
-         << "for (ushort __i = 0; __i < " << b_elems << "; __i++) "
-         << "__ct_b[__i] = " << b_var << "[" << b_idx << " * " << b_elems
-         << " + __i]; "
          << "for (ushort __i = 0; __i < " << c_elems << "; __i++) "
          << "__ct_c[__i] = " << c_var << "[" << c_idx << " * " << c_elems
          << " + __i]; "

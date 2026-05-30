@@ -1329,28 +1329,43 @@ def cooperative_tensor_multiply_accumulate(
     k: int,
     trans_a,
     trans_b,
+    a_ptr=None,
+    a_stride=None,
+    b_ptr=None,
+    b_stride=None,
 ):
     """Metal M5 cooperative tensor MMA (mpp::tensor_ops::matmul2d).
 
     PR tile-ai/tilelang#2252.
+
+    The trailing ``a_ptr/a_stride/b_ptr/b_stride`` args carry the threadgroup
+    (or device) source views of the A/B operand micro-tiles so the Metal
+    codegen can fill the mpp input cooperative tensors via mpp's *native*
+    ``cooperative_tensor.load`` (correct element distribution) instead of a
+    linear copy from a fragment-map staging array (which scrambles operands).
     """
+    args = [
+        c_data,
+        c_idx,
+        a_data,
+        a_idx,
+        b_data,
+        b_idx,
+        d_data,
+        d_idx,
+        m,
+        n,
+        k,
+        trans_a,
+        trans_b,
+    ]
+    if a_ptr is not None:
+        args += [a_ptr, a_stride, b_ptr, b_stride]
     return evaluate(
         tirx.call_intrin(
             "handle",
             tirx.op.Op.get("tl.cooperative_tensor_multiply_accumulate"),
-            c_data,
-            c_idx,
-            a_data,
-            a_idx,
-            b_data,
-            b_idx,
-            d_data,
-            d_idx,
-            m,
-            n,
-            k,
-            trans_a,
-            trans_b,
+            *args,
         ))
 
 

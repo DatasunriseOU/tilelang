@@ -136,6 +136,12 @@ private:
   // kernels remain byte-identical to the pre-PR output.
   std::unordered_map<const VarNode *, std::string> cooperative_tensor_dtype_;
   std::unordered_set<const VarNode *> ct_c_inlined_;
+  // Per-buffer base index into the global `__pct_cN` namespace, so multiple
+  // inlined cooperative-tensor accumulators in one kernel get unique names
+  // instead of all colliding on `__pct_c0`.
+  std::unordered_map<const VarNode *, int> ct_c_inlined_base_;
+  int ct_c_inlined_next_{0};
+  bool emitted_pct_op_{false};
   bool emitted_frag_lane_vars_{false};
   bool emitted_mpp_include_{false};
   int thread_index_bits_{32};

@@ -309,18 +309,33 @@ class GemmMetal(GemmBase):
             C_ct = T.alloc_local((num_simd_c * c_tile_elems), accum_dtype,
                                   scope="metal.cooperative_tensor")
             if clear_accum:
-                for _i in T.serial(num_simd_c):
+                # Python-unroll so each fill targets a constant __pct_cN tile.
+                for _i in range(int(num_simd_c)):
                     T.cooperative_tensor_fill(C_ct.data, _i, T.cast(0, accum_dtype),
                                               micro_size_x, micro_size_y)
             else:
                 mps_emitter.simd_load(C_ct, C_buf)
-            for k_outer in T.serial(0, (block_K // (micro_size_k * inner_k_steps))):
-                for k_inner in T.serial(0, inner_k_steps):
+            # Python-level (compile-time) unroll over the K reduction so the
+            # cooperative-tensor tile indices (a_idx/b_idx/c_idx) are constants.
+            # This keeps the inlined __pct_cN accumulator fast path active, and
+            # the matmul2d's multiply_accumulate mode correctly accumulates the
+            # mpp destination cooperative tensor across the unrolled k steps.
+            for k_outer in range(int(block_K // (micro_size_k * inner_k_steps))):
+                for k_inner in range(inner_k_steps):
                     ki = k_outer * inner_k_steps + k_inner
                     mps_emitter.ldmatrix_a(A_local, A_region, ki, k_inner)
                     mps_emitter.ldmatrix_b(B_local, B_region, ki, k_inner)
-                for k_inner in T.serial(0, inner_k_steps):
-                    mps_emitter.mma(A_local, B_local, C_ct, k_inner)
+                for k_inner in range(inner_k_steps):
+                    ki = k_outer * inner_k_steps + k_inner
+                    mps_emitter.mma(
+                        A_local,
+                        B_local,
+                        C_ct,
+                        k_inner,
+                        A_shared_buf=A_region,
+                        B_shared_buf=B_region,
+                        ki=ki,
+                    )
             mps_emitter.simd_store(C_ct, C_buf)
 
         return _Simplify(_gemm_with_c_writeback, inline_let=True)

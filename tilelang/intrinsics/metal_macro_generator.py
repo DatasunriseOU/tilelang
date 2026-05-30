@@ -218,7 +218,14 @@ class MPSIntrinEmitter:
 
         return _warp_ldmatrix_b(B_local_buf, buffer, offset_k, offset_n, stride, warp_n, ki)
 
-    def mma(self, A_local_buf, B_local_buf, C_local_buf, k_inner: int = 0):
+    def mma(self,
+            A_local_buf,
+            B_local_buf,
+            C_local_buf,
+            k_inner: int = 0,
+            A_shared_buf: Buffer | BufferRegion | None = None,
+            B_shared_buf: Buffer | BufferRegion | None = None,
+            ki: int = 0):
         warp_rows = self.warp_rows
         warp_cols = self.warp_cols
         micro_size_x = self.micro_size_x
@@ -228,10 +235,47 @@ class MPSIntrinEmitter:
         a_transposed = self.a_transposed
         b_transposed = self.b_transposed
 
-        @T.macro
-        def _warp_mma(A_local_buf, B_local_buf, C_local_buf):
-            for i, j in T.grid(warp_rows, warp_cols):
-                if use_cooperative_tensor:
+        if use_cooperative_tensor:
+            # The cooperative-tensor MMA reconstructs mpp's native input
+            # cooperative_tensor.load from the A/B threadgroup source views, so
+            # we recompute the same per-micro-tile pointers the ldmatrix step
+            # used.  This makes the matmul fully self-contained (no fragile
+            # cross-call recording across renamed loop variables).
+            assert A_shared_buf is not None and B_shared_buf is not None, (
+                "cooperative_tensor mma requires A/B shared regions to derive "
+                "the native source views")
+            warp_m, warp_n = self._get_warp_indices()
+            a_buffer, a_prefix, a_off_m, a_off_k, a_stride = self._parse_buffer_2d(A_shared_buf)
+            if self.a_stride_override is not None:
+                a_stride = self.a_stride_override
+            b_buffer, b_prefix, b_off_k, b_off_n, b_stride = self._parse_buffer_2d(B_shared_buf)
+            if self.b_stride_override is not None:
+                b_stride = self.b_stride_override
+
+            # Emit each micro-tile matmul DIRECTLY (no @T.macro wrapper) so the
+            # Python loops are a true compile-time unroll and the C/A/B tile
+            # indices i*warp_cols+j etc. are IntImm constants.  This keeps the
+            # inlined __pct_cN accumulator + native cooperative_tensor.load/store
+            # fast path active for every micro-tile, including multi-tile
+            # (warp_cols>1) and k-loop cases.  (A `range` inside @T.macro would
+            # instead lower to a runtime `for` loop with a non-constant index,
+            # forcing the scrambled fragment-map fallback.)
+            for i in range(warp_rows):
+                for j in range(warp_cols):
+                    if a_transposed:
+                        a_row = a_off_k + ki * micro_size_k
+                        a_col = a_off_m + warp_m * self.warp_row_tiles + i * micro_size_x
+                    else:
+                        a_row = a_off_m + warp_m * self.warp_row_tiles + i * micro_size_x
+                        a_col = a_off_k + ki * micro_size_k
+                    if b_transposed:
+                        b_row = b_off_n + warp_n * self.warp_col_tiles + j * micro_size_y
+                        b_col = b_off_k + ki * micro_size_k
+                    else:
+                        b_row = b_off_k + ki * micro_size_k
+                        b_col = b_off_n + warp_n * self.warp_col_tiles + j * micro_size_y
+                    a_ptr = T.access_ptr(self._access_2d(a_buffer, a_prefix, a_row, a_col), "r")
+                    b_ptr = T.access_ptr(self._access_2d(b_buffer, b_prefix, b_row, b_col), "r")
                     T.cooperative_tensor_multiply_accumulate(
                         C_local_buf.data,
                         i * warp_cols + j,
@@ -246,18 +290,26 @@ class MPSIntrinEmitter:
                         micro_size_k,
                         T.bool(a_transposed),
                         T.bool(b_transposed),
+                        a_ptr,
+                        a_stride,
+                        b_ptr,
+                        b_stride,
                     )
-                else:
-                    T.simdgroup_multiply_accumulate(
-                        C_local_buf.data,
-                        i * warp_cols + j,
-                        A_local_buf.data,
-                        i,
-                        B_local_buf.data,
-                        j,
-                        C_local_buf.data,
-                        i * warp_cols + j,
-                    )
+            return
+
+        @T.macro
+        def _warp_mma(A_local_buf, B_local_buf, C_local_buf):
+            for i, j in T.grid(warp_rows, warp_cols):
+                T.simdgroup_multiply_accumulate(
+                    C_local_buf.data,
+                    i * warp_cols + j,
+                    A_local_buf.data,
+                    i,
+                    B_local_buf.data,
+                    j,
+                    C_local_buf.data,
+                    i * warp_cols + j,
+                )
 
         return _warp_mma(A_local_buf, B_local_buf, C_local_buf)
 
@@ -277,18 +329,19 @@ class MPSIntrinEmitter:
         ct_op = T.cooperative_tensor_store if is_store else T.cooperative_tensor_load
         access_mode = "w" if is_store else "r"
 
-        @T.macro
-        def _simdgroup_copy(C_simd_buf, buffer, offset_m, offset_n, stride, warp_m, warp_n):
-            for i, j in T.grid(warp_rows, warp_cols):
-                row = offset_m + warp_m * self.warp_row_tiles + i * micro_size_x
-                col = offset_n + warp_n * self.warp_col_tiles + j * micro_size_y
-
-                index_c = i * warp_cols + j
-
-                if use_cooperative_tensor:
+        if use_cooperative_tensor:
+            # Emit each C micro-tile store/load DIRECTLY (no @T.macro wrapper)
+            # so `index_c` is an IntImm constant.  The inlined __pct_cN native
+            # cooperative-tensor store/load fast path (correct mpp element
+            # distribution) requires a constant C tile index; a runtime loop
+            # index falls back to the scrambled fragment-map round-trip.
+            for i in range(warp_rows):
+                for j in range(warp_cols):
+                    row = offset_m + warp_m * self.warp_row_tiles + i * micro_size_x
+                    col = offset_n + warp_n * self.warp_col_tiles + j * micro_size_y
                     ct_op(
                         C_simd_buf.data,
-                        index_c,
+                        i * warp_cols + j,
                         T.access_ptr(self._access_2d(buffer, prefix_offsets, row, col),
                                      access_mode),
                         stride,
@@ -300,17 +353,26 @@ class MPSIntrinEmitter:
                         micro_size_k,
                         OPERAND_DEST,
                     )
-                else:
-                    simd_op(
-                        C_simd_buf.data,
-                        index_c,
-                        T.access_ptr(self._access_2d(buffer, prefix_offsets, row, col),
-                                     access_mode),
-                        stride,
-                        micro_size_x,
-                        micro_size_y,
-                        T.bool(False),
-                    )
+            return
+
+        @T.macro
+        def _simdgroup_copy(C_simd_buf, buffer, offset_m, offset_n, stride, warp_m, warp_n):
+            for i, j in T.grid(warp_rows, warp_cols):
+                row = offset_m + warp_m * self.warp_row_tiles + i * micro_size_x
+                col = offset_n + warp_n * self.warp_col_tiles + j * micro_size_y
+
+                index_c = i * warp_cols + j
+
+                simd_op(
+                    C_simd_buf.data,
+                    index_c,
+                    T.access_ptr(self._access_2d(buffer, prefix_offsets, row, col),
+                                 access_mode),
+                    stride,
+                    micro_size_x,
+                    micro_size_y,
+                    T.bool(False),
+                )
 
         return _simdgroup_copy(C_simd_buf, buffer, offset_m, offset_n, stride, warp_m, warp_n)
 
