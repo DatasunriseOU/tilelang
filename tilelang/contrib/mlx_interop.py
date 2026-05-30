@@ -814,3 +814,71 @@ def maybe_mlx_metal_external_command_buffer(args: Iterable[Any], stream: Any | N
     if has_mlx_arrays(args):
         return mlx_metal_external_command_buffer(stream)
     return nullcontext()
+
+
+def mlx_external_command_buffer_available(stream: Any | None = None) -> bool:
+    """Return True when TVM Metal work can be encoded onto MLX's command buffer.
+
+    The external-command-buffer route borrows MLX's in-flight command buffer via
+    ``mx.metal._current_command_buffer`` so that ``mx.eval``/``mx.synchronize``
+    commits the TVM-encoded work together with MLX's own work. When this API is
+    missing (some MLX builds) or returns a null pointer, TVM falls back to its
+    own internal Metal command buffer, which MLX never commits/syncs -- so the
+    caller must synchronize the TVM Metal stream itself before reading results.
+    """
+
+    mx = _mlx_core()
+    if (
+        mx is None
+        or not hasattr(mx, "metal")
+        or not hasattr(mx.metal, "_current_command_buffer")
+    ):
+        return False
+    if (
+        _metal_func("metal.GetExternalCommandBuffer") is None
+        or _metal_func("metal.SetExternalCommandBuffer") is None
+        or _metal_func("metal.ClearExternalCommandBuffer") is None
+    ):
+        return False
+    try:
+        ptr = (
+            mx.metal._current_command_buffer()
+            if stream is None
+            else mx.metal._current_command_buffer(stream)
+        )
+    except Exception:
+        return False
+    return bool(ptr)
+
+
+def sync_tvm_metal_internal_command_buffer(args: Iterable[Any]) -> None:
+    """Commit+wait TVM's internal Metal command buffer for MLX-owned outputs.
+
+    When :func:`mlx_external_command_buffer_available` is False, TVM encodes the
+    kernel onto its own (per-thread) Metal command buffer instead of MLX's
+    in-flight buffer. That buffer is never committed or synchronized by MLX, so
+    an MLX output array aliasing the same ``MTLBuffer`` reads stale/zeroed
+    memory. Synchronizing the TVM Metal device commits and waits that buffer so
+    the writes are visible before the result is read.
+    """
+
+    if mlx_external_command_buffer_available():
+        return
+    if not has_mlx_arrays(args):
+        return
+    device_ids: set[int] = set()
+    for value in _iter_nested_values(args):
+        if is_mlx_array(value):
+            try:
+                device_type, device_id = _get_dlpack_device(value)
+            except Exception:
+                continue
+            if device_type == DLPACK_DEVICE_METAL:
+                device_ids.add(int(device_id))
+    if not device_ids:
+        device_ids.add(0)
+    for device_id in device_ids:
+        try:
+            tvm.metal(device_id).sync()
+        except Exception:
+            pass

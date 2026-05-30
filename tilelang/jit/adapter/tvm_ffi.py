@@ -35,6 +35,7 @@ from tilelang.contrib.mlx_interop import (
     maybe_mlx_metal_external_command_buffer,
     mlx_arrays_to_tvm_tensors,
     mlx_metal_output,
+    sync_tvm_metal_internal_command_buffer,
     validate_dlpack_inputs_for_target,
 )
 from tilelang.jit.adapter._mlx_tvm_ffi import (
@@ -927,6 +928,15 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             with maybe_mlx_metal_external_command_buffer(tensor_list):
                 executable(*exec_tensor_list)
 
+            # When MLX owns the output buffers but the external-command-buffer
+            # route is unavailable (e.g. this MLX build lacks
+            # ``mx.metal._current_command_buffer``), TVM encoded the kernel onto
+            # its own internal Metal command buffer that MLX never commits/syncs.
+            # Synchronize the TVM Metal stream so the writes are visible before
+            # the MLX-owned result is read; otherwise the output reads as zeros.
+            if uses_mlx_runtime and target_kind == "metal":
+                sync_tvm_metal_internal_command_buffer(tensor_list)
+
             # Return outputs in the requested form
             if len(self.result_idx) == 1:
                 return tensor_list[self.result_idx[0]]
@@ -1125,8 +1135,47 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         adapter.libpath = kernel_lib_path
         adapter.kernel_global_source = device_kernel_source
         adapter.executable = runtime.load_module(kernel_lib_path)
+        # Disk-cache reloads (this from_database path) do not carry the lowered
+        # host/device IRModules, so adapter.device_mod stays None. For Metal that
+        # silently collapses the recovered launch config to (1,1,1)x(1,1,1) on the
+        # MLX-bridge / direct-launch path (the C/LLVM host source the regex
+        # fallback expects is not emitted for cooperative-tensor matmul2d
+        # kernels), running the kernel on a single thread and producing wrong
+        # output. Re-derive device_mod from the reconstructed ir_module via the
+        # same host/device lowering used by the cold compile (lowering only, no
+        # codegen/compile), so the launch-config recovery works identically after
+        # a cache reload. The cold-compile path already sets these attributes.
+        adapter.host_mod = None
+        adapter.device_mod = None
+        adapter.rt_mod = None
+        if adapter.target.kind.name == "metal":
+            adapter._restore_metal_device_mod()
         adapter._post_init()
         return adapter
+
+    def _restore_metal_device_mod(self) -> None:
+        """Repopulate host_mod/device_mod from ir_module after a cache reload.
+
+        Runs only the backend-independent host/device IR split (no codegen and no
+        device compile) so the Metal launch-config recovery in
+        ``_metal_launch_config`` / ``_metal_device_launch_metadata`` finds a real
+        device PrimFunc with ``thread_extent`` instead of falling back to the
+        degenerate (1,1,1)x(1,1,1) grid. Best-effort: failures leave device_mod
+        None and the legacy host-source fallback applies.
+        """
+
+        try:
+            from tilelang.engine.lower import lower_to_host_device_ir
+
+            host_mod, device_mod, _params, _target, _target_host = lower_to_host_device_ir(
+                func_or_mod=self.ir_module,
+                target=self.target,
+                runtime_only=True,
+            )
+            self.host_mod = host_mod
+            self.device_mod = device_mod
+        except Exception:
+            self.device_mod = None
 
     def get_host_source(self):
         """Returns the source code of the host module."""
