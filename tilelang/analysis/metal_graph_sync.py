@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import itertools
 import weakref
 from typing import Any, Literal, Sequence
 
@@ -10,7 +11,23 @@ from tilelang.analysis.metal_sync_proof import plan_metal_buffer_sync
 
 
 _DEFAULT_COMMAND_BUFFER_DOMAIN = ("mlx_tvm_ffi", "default_metal_stream")
-_PRODUCERS: dict[int, tuple[weakref.ref[Any], "MetalProducerRecord"]] = {}
+
+# Producer registry keyed by ``id(array)``. ``id()`` is NOT a stable identity:
+# CPython reuses the id of a freed object for the next allocation of the same
+# type, so a later MLX array can land on the same key as a freed producer.
+#
+# The registry therefore stores, per key, a *generation token* (a process-wide
+# monotonic counter) alongside the weakref + record. The generation token is the
+# stable identity of one ``_remember_producer`` call. Both the weakref finalizer
+# eviction and every lookup are generation-checked: a stale finalizer (for a
+# producer whose array was freed and whose ``id()`` was reused by a newer
+# producer) can only evict the entry it created -- never a newer id-reused
+# record that now legitimately occupies the same key. Without this, the stale
+# finalizer would blindly ``pop`` the key and delete the live producer's record,
+# leaving its consumer with no device-event edge -> the consumer kernel reads the
+# buffer before the producer kernel has finished -> NaN / wrong output.
+_PRODUCER_GENERATION = itertools.count(1)
+_PRODUCERS: dict[int, "_ProducerEntry"] = {}
 
 
 MetalBufferAccessMode = Literal["read", "write"]
@@ -48,6 +65,20 @@ class MetalProducerRecord:
     @property
     def command_buffer_domain(self) -> Any:
         return self.launch_metadata.command_buffer_domain
+
+
+@dataclass(frozen=True)
+class _ProducerEntry:
+    """One registry slot: a generation-stamped producer record.
+
+    ``generation`` is the stable identity of the ``_remember_producer`` call
+    that created this slot, so neither a stale weakref finalizer nor an
+    id-reusing lookup can ever act on a slot that a newer call has replaced.
+    """
+
+    ref: "weakref.ref[Any]"
+    record: MetalProducerRecord
+    generation: int
 
 
 @dataclass(frozen=True)
@@ -140,10 +171,23 @@ def _lookup_producer(array: Any) -> MetalProducerRecord | None:
     entry = _PRODUCERS.get(key)
     if entry is None:
         return None
-    ref, record = entry
-    if ref() is array:
-        return record
-    _PRODUCERS.pop(key, None)
+    # Identity guard: ``id()`` can collide with a freed producer whose slot has
+    # not been evicted yet. Only honour the record when the stored weakref still
+    # resolves to *this exact* array; otherwise the slot belongs to a dead (or
+    # different) object and must not be attributed to ``array``.
+    if entry.ref() is array:
+        return entry.record
+    # The slot is stale relative to ``array`` (the weakref is dead, or resolves
+    # to a different object that happens to share this id). Evict only if the
+    # weakref is actually dead; if it resolves to a live different object, that
+    # object's own (correctly-keyed) slot must be left intact. Either way,
+    # ``array`` has no producer.
+    if entry.ref() is None:
+        # Generation-checked eviction so we never drop a slot a newer
+        # ``_remember_producer`` has installed at this key in the meantime.
+        current = _PRODUCERS.get(key)
+        if current is not None and current.generation == entry.generation:
+            _PRODUCERS.pop(key, None)
     return None
 
 
@@ -155,11 +199,31 @@ def has_mlx_tvm_ffi_producer(array: Any) -> bool:
 
 def _remember_producer(array: Any, record: MetalProducerRecord) -> None:
     key = id(array)
+    generation = next(_PRODUCER_GENERATION)
 
-    def remove(_ref: weakref.ref[Any], *, stale_key: int = key) -> None:
-        _PRODUCERS.pop(stale_key, None)
+    # Bind the registry dict into the closure so the finalizer never touches the
+    # module global ``_PRODUCERS`` -- during interpreter shutdown module globals
+    # are reset to ``None`` while weakref callbacks can still fire, and a stale
+    # ``_PRODUCERS.get`` on a torn-down global would raise. The closed-over
+    # reference keeps the exact dict alive for the finalizer's lifetime.
+    producers = _PRODUCERS
 
-    _PRODUCERS[key] = (weakref.ref(array, remove), record)
+    def remove(_ref: weakref.ref[Any], *, stale_key: int = key, gen: int = generation) -> None:
+        # Generation-checked eviction. When this producer's array is finalized
+        # CPython may already have reused ``stale_key`` for a *newer* producer
+        # array (the id()-reuse hazard). Popping unconditionally would delete
+        # that live producer's record and leave its consumer with no
+        # device-event edge -> NaN. Only evict when the slot still carries our
+        # own generation, i.e. nothing newer has taken this key.
+        entry = producers.get(stale_key)
+        if entry is not None and entry.generation == gen:
+            producers.pop(stale_key, None)
+
+    _PRODUCERS[key] = _ProducerEntry(
+        ref=weakref.ref(array, remove),
+        record=record,
+        generation=generation,
+    )
 
 
 def _fallback_metadata(

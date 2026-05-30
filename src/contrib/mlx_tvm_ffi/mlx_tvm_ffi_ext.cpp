@@ -183,7 +183,7 @@ nb::dict debug_state() {
   state["force_output_barrier_enabled"] =
       env_flag_enabled(kForceOutputBarrierEnv);
   state["use_active_compute_encoder_enabled"] =
-      env_flag_enabled_by_default(kUseActiveComputeEncoderEnv);
+      env_flag_enabled(kUseActiveComputeEncoderEnv);
   return state;
 }
 
@@ -1231,8 +1231,27 @@ class TVMFFIMetalCall : public mx::Primitive {
               (error == nullptr ? "unknown error" : error));
         }
       };
+      // The active-compute-encoder fast path dispatches this opaque TVM-FFI
+      // launch directly onto MLX's *currently active* compute encoder. That is
+      // sound only for a standalone launch: when several TVM-FFI launches are
+      // chained in one lazy MLX graph (a multi-stage pipeline -- e.g. GDN Path D
+      // kkt -> recompute_w_u -> chunk_delta_h -> chunk_o, where each stage's
+      // output buffer feeds the next), MLX may flush/rotate the active encoder
+      // or its command buffer between stages. The consumer stage then dispatches
+      // onto an encoder that is NOT ordered after the producer stage's writes,
+      // so it reads the producer's buffer before the producer kernel has
+      // finished -> NaN / wrong output (deterministically for >=2 chunks or
+      // multi-head shapes, intermittently otherwise depending on eval/liveness
+      // timing). The external-command-buffer path below finalizes prior encoding
+      // via finish_encoding_and_get_command_buffer() before this dispatch, which
+      // enforces producer-before-consumer ordering correctly. The fast path is
+      // therefore an unsound optimization for chained launches and is OFF by
+      // default (opt-in via TILELANG_MLX_TVM_FFI_USE_ACTIVE_COMPUTE_ENCODER=1
+      // for single-launch workloads that can prove no opaque producer feeds
+      // them). RULE: never silently produce wrong output to save an encoder
+      // finalize.
       const bool can_launch_on_active_compute_encoder =
-          env_flag_enabled_by_default(kUseActiveComputeEncoderEnv) &&
+          env_flag_enabled(kUseActiveComputeEncoderEnv) &&
           zero_init_output_positions.empty() &&
           wait_edges_.empty() &&
           signal_edges.empty() &&
@@ -1466,9 +1485,12 @@ class TVMFFIMetalCall : public mx::Primitive {
         result.v_obj = nullptr;
       }
     };
+    // Active-compute-encoder fast path is unsound for chained opaque launches
+    // (see the detailed note on the owner-output eval_gpu variant above); OFF
+    // by default, opt-in via TILELANG_MLX_TVM_FFI_USE_ACTIVE_COMPUTE_ENCODER=1.
     const bool can_launch_on_active_compute_encoder =
         direct_device_launch &&
-        env_flag_enabled_by_default(kUseActiveComputeEncoderEnv) &&
+        env_flag_enabled(kUseActiveComputeEncoderEnv) &&
         zero_init_output_positions.empty() &&
         wait_edges_.empty() &&
         signal_edges.empty() &&
@@ -1675,8 +1697,11 @@ class TVMFFIMetalCall4In1Out : public mx::Primitive {
       }
     };
 
+    // Active-compute-encoder fast path is unsound for chained opaque launches
+    // (see the detailed note on the owner-output eval_gpu variant above); OFF
+    // by default, opt-in via TILELANG_MLX_TVM_FFI_USE_ACTIVE_COMPUTE_ENCODER=1.
     const bool can_launch_on_active_compute_encoder =
-        env_flag_enabled_by_default(kUseActiveComputeEncoderEnv) &&
+        env_flag_enabled(kUseActiveComputeEncoderEnv) &&
         signal_edges.empty() &&
         !env_flag_enabled(kDebugCompletionEnv) &&
         !env_flag_enabled(kForceCommandBufferBoundaryEnv);
