@@ -984,6 +984,11 @@ void CodeGenTileLangMetal::CollectReferencedLowPrecisionDtypes(
 void CodeGenTileLangMetal::EmitAtomicAddHelperPrelude() {
   if (!uses_atomic_add_ || emitted_atomic_add_helper_) return;
   emitted_atomic_add_helper_ = true;
+  // The bf16 AtomicAdd overloads below reference the `tvm_bfloat16` storage
+  // struct. PrintType emits it lazily, but the kernel body that triggers that
+  // is generated AFTER this prelude — so force-emit the struct now (idempotent)
+  // to guarantee it precedes the overload that uses it.
+  EmitBFloat16Helper();
   decl_stream
       << "namespace tl {\n"
       << "static inline float AtomicAdd(device float* address, float val,\n"
@@ -1052,6 +1057,67 @@ void CodeGenTileLangMetal::EmitAtomicAddHelperPrelude() {
       << "  return atomic_fetch_add_explicit(\n"
       << "      reinterpret_cast<threadgroup atomic_uint*>(address), val,\n"
       << "      memory_order_relaxed);\n"
+      << "}\n"
+      // bfloat16 overloads. Apple GPUs have no native bf16 atomic, so we run a
+      // 32-bit-word CAS loop on the containing aligned word: the bf16 element is
+      // 16-bit (tvm_bfloat16::bits is a ushort), so we align the byte address
+      // down to a 4-byte boundary, pick which 16-bit half holds our element,
+      // decode old bf16 -> float, add val (float), re-encode to bf16 with the
+      // SAME round-to-nearest-even used by tvm_bfloat16(float), splice it back
+      // into the correct half, and CAS the whole word. Returns the pre-add
+      // float value. This is numerically correct for scatter/gradient
+      // accumulation (each addend lands at bf16 precision, like a serial bf16
+      // sum). Mirrors the float CAS loop above for both address spaces.
+      << "static inline ushort __tl_bf16_round(float value) {\n"
+      << "  uint raw = as_type<uint>(value);\n"
+      << "  uint lsb = (raw >> 16) & 1u;\n"
+      << "  return ushort((raw + 0x7fffu + lsb) >> 16);\n"
+      << "}\n"
+      << "static inline float AtomicAdd(device tvm_bfloat16* address, float val,\n"
+      << "                              int memory_order = 0) {\n"
+      << "  (void)memory_order;\n"
+      << "  uintptr_t addr = reinterpret_cast<uintptr_t>(address);\n"
+      << "  uint shift = uint(addr & 2u) * 8u;  // 0 for low half, 16 for high\n"
+      << "  device atomic_uint* word = reinterpret_cast<device atomic_uint*>(\n"
+      << "      addr & ~uintptr_t(3u));\n"
+      << "  uint old_word = atomic_load_explicit(word, memory_order_relaxed);\n"
+      << "  while (true) {\n"
+      << "    ushort old_bits = ushort((old_word >> shift) & 0xffffu);\n"
+      << "    float old_val = as_type<float>(uint(old_bits) << 16);\n"
+      << "    ushort new_bits = __tl_bf16_round(old_val + val);\n"
+      << "    uint new_word = (old_word & ~(0xffffu << shift)) |\n"
+      << "                    (uint(new_bits) << shift);\n"
+      << "    uint expected = old_word;\n"
+      << "    if (atomic_compare_exchange_weak_explicit(\n"
+      << "            word, &expected, new_word, memory_order_relaxed,\n"
+      << "            memory_order_relaxed)) {\n"
+      << "      return old_val;\n"
+      << "    }\n"
+      << "    old_word = expected;\n"
+      << "  }\n"
+      << "}\n"
+      << "static inline float AtomicAdd(threadgroup tvm_bfloat16* address,\n"
+      << "                              float val, int memory_order = 0) {\n"
+      << "  (void)memory_order;\n"
+      << "  uintptr_t addr = reinterpret_cast<uintptr_t>(address);\n"
+      << "  uint shift = uint(addr & 2u) * 8u;\n"
+      << "  threadgroup atomic_uint* word =\n"
+      << "      reinterpret_cast<threadgroup atomic_uint*>(addr & ~uintptr_t(3u));\n"
+      << "  uint old_word = atomic_load_explicit(word, memory_order_relaxed);\n"
+      << "  while (true) {\n"
+      << "    ushort old_bits = ushort((old_word >> shift) & 0xffffu);\n"
+      << "    float old_val = as_type<float>(uint(old_bits) << 16);\n"
+      << "    ushort new_bits = __tl_bf16_round(old_val + val);\n"
+      << "    uint new_word = (old_word & ~(0xffffu << shift)) |\n"
+      << "                    (uint(new_bits) << shift);\n"
+      << "    uint expected = old_word;\n"
+      << "    if (atomic_compare_exchange_weak_explicit(\n"
+      << "            word, &expected, new_word, memory_order_relaxed,\n"
+      << "            memory_order_relaxed)) {\n"
+      << "      return old_val;\n"
+      << "    }\n"
+      << "    old_word = expected;\n"
+      << "  }\n"
       << "}\n"
       << "} /* namespace tl */\n\n";
 }
