@@ -1245,11 +1245,28 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
   size_t num_buffer = 0;
   size_t limit =
       target_->GetAttr<Integer>("max_function_args").value().IntValue();
-  if (func->params.size() > limit) {
-    LOG(WARNING) << "Probably you won't be able to execute your kernel due to "
-                    "high number of "
-                    "buffers in the kernel";
+  // RULE #1 (cppmega Path-C auto-split, design §6.5): an over-budget kernel must
+  // NEVER silently reach newComputePipelineState. Count only handle (buffer-
+  // binding) params -- the ABI-correct metric the Python auto-split planner uses
+  // (_kernel_parameter_count_for_target counts buffer_map entries only); scalar
+  // by-value params consume no buffer-argument slot. If the buffer-binding count
+  // exceeds the device buffer-argument limit, FAIL LOUD here instead of emitting
+  // a kernel the Metal driver will crash on. The Python planner is guaranteed to
+  // pre-empt this (it breaks/raises at the accept/reject point), so reaching this
+  // throw means the pre-empt was bypassed -- surface it, do not degrade.
+  size_t num_buffer_binding_params = 0;
+  for (size_t i = 0; i < func->params.size(); ++i) {
+    if (func->params[i].dtype().is_handle()) {
+      ++num_buffer_binding_params;
+    }
   }
+  ICHECK_LE(num_buffer_binding_params, limit)
+      << "Metal kernel binds " << num_buffer_binding_params
+      << " buffer arguments, exceeding the device max_function_args limit of "
+      << limit
+      << ". This over-budget kernel would crash newComputePipelineState; the "
+         "Path-C auto-split planner must split it before codegen (RULE #1: fail "
+         "loud, never emit a kernel that silently fails on the device).";
   std::unordered_map<std::string, const VarNode *> external_buffer_aliases;
   MetalBodyBufferWriteCollector write_collector;
   write_collector(func->body);
