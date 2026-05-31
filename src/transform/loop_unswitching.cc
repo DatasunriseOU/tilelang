@@ -583,6 +583,84 @@ public:
 };
 
 /*!
+ * \brief Alpha-rename every variable bound *inside* a statement to a fresh Var.
+ *
+ * When LoopUnswitching duplicates a loop body into the then/else arms of a
+ * hoisted predicate, both clones share the SAME bound-variable objects for any
+ * loop var (ForNode::loop_var) and any Let/Bind-bound var defined inside the
+ * cloned body. The else clone separately substitutes the *outer* loop var, so
+ * after substitution the two clones contain bindings with identical Var names
+ * but values that reference *different* parent loop vars, e.g.:
+ *
+ *   then: state_flat = _tmp  * 1024 + lane
+ *   else: state_flat = _tmp' * 1024 + lane     (_tmp' is the renamed loop var)
+ *
+ * Downstream analyzers (RenormalizeSplitPattern -> RewriteSimplifier::Update)
+ * bind each Var to its value and ICHECK that re-binding the same Var is
+ * structurally equal. The two `state_flat` clones share one Var object but bind
+ * it to structurally-different values, so the check aborts codegen.
+ *
+ * The fix is the standard semantics-preserving one: when cloning a loop body,
+ * alpha-rename ALL inner bound vars (loop vars, tirx::Bind vars, and the
+ * vendored LetStmt vars) to fresh Var objects so the two clones are fully
+ * SSA-distinct. This mutator rewrites both binding sites AND uses (plain
+ * Substitute only rewrites uses, never binding sites, which is why the original
+ * code had to reconstruct the else For manually).
+ */
+class BoundVarRenamer : public StmtExprMutator {
+public:
+  // Seed remaps (e.g. the outer loop var -> its already-allocated else copy).
+  explicit BoundVarRenamer(
+      const std::unordered_map<const VarNode *, Var> &seed) {
+    for (const auto &kv : seed) {
+      remap_[kv.first] = kv.second;
+    }
+  }
+
+  PrimExpr VisitExpr_(const VarNode *op) final {
+    auto it = remap_.find(op);
+    if (it != remap_.end()) {
+      return it->second;
+    }
+    return StmtExprMutator::VisitExpr_(op);
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    Var fresh(op->loop_var->name_hint, op->loop_var->dtype);
+    remap_[op->loop_var.get()] = fresh;
+    PrimExpr min = VisitExpr(op->min);
+    PrimExpr extent = VisitExpr(op->extent);
+    Stmt body = VisitStmt(op->body);
+    return For(fresh, min, extent, op->kind, body, op->thread_binding,
+               op->annotations);
+  }
+
+  Stmt VisitStmt_(const BindNode *op) final {
+    Var fresh(op->var->name_hint, op->var->dtype);
+    remap_[op->var.get()] = fresh;
+    PrimExpr value = VisitExpr(op->value);
+    return Bind(fresh, value, op->span);
+  }
+
+  // The pipeline at this stage still carries the vendored 3-arg LetStmt node,
+  // whose Var must also be renamed. apache StmtFunctor's vtable does not
+  // dispatch on it, so handle it in the generic VisitStmt override.
+  Stmt VisitStmt(const Stmt &stmt) final {
+    if (const auto *op = stmt.as<LetStmtNode>()) {
+      Var fresh(op->var->name_hint, op->var->dtype);
+      remap_[op->var.get()] = fresh;
+      PrimExpr value = VisitExpr(op->value);
+      Stmt body = VisitStmt(op->body);
+      return LetStmt(fresh, value, body, op->span);
+    }
+    return StmtExprMutator::VisitStmt(stmt);
+  }
+
+private:
+  std::unordered_map<const VarNode *, Var> remap_;
+};
+
+/*!
  * \brief Main pass: Loop Unswitching
  */
 class LoopUnswitcher : public StmtExprMutator {
@@ -671,9 +749,18 @@ public:
       return result;
     }
 
-    // Create new loop_var for else_loop to maintain SSA form
+    // Create new loop_var for else_loop to maintain SSA form, AND alpha-rename
+    // every variable bound *inside* the else clone (nested loop vars,
+    // tirx::Bind vars, vendored LetStmt vars). Without this, the then/else
+    // clones share inner bound-var objects whose values now reference different
+    // parent loop vars, which makes downstream analyzers
+    // (RenormalizeSplitPattern -> RewriteSimplifier::Update) abort on a
+    // non-structurally-equal Var re-bind. Seeding the renamer with the outer
+    // loop var keeps the else loop's own var fresh as well.
     Var else_loop_var(op->loop_var->name_hint, op->loop_var->dtype);
-    else_body = Substitute(else_body, {{op->loop_var, else_loop_var}});
+    std::unordered_map<const VarNode *, Var> else_seed;
+    else_seed[op->loop_var.get()] = else_loop_var;
+    else_body = BoundVarRenamer(else_seed)(else_body);
 
     For then_loop(op->loop_var, op->min, op->extent, op->kind, then_body,
                   op->thread_binding, op->annotations);
