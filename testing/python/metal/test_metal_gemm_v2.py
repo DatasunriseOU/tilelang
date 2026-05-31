@@ -112,6 +112,57 @@ def assert_gemm_v2(
     )
 
 
+def matmul_gemm_rs(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
+    """A in a register fragment (after an elementwise op), B in shared, C in shared.
+
+    Exercises the Metal RS->staged-shared GEMM lowering in
+    tilelang/tileop/gemm/gemm_metal.py (GemmMetalSimdGroup): the A fragment is
+    copied into a temporary shared buffer before the simdgroup matmul.  This is
+    the operand combination used by the chunked mamba scan kernel
+    (T.gemm(cb_local, x_shared, acc_o)).
+    """
+
+    @T.prim_func
+    def gemm_kernel(
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((K, N), dtype),
+        C: T.Tensor((M, N), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype, scope="shared")
+            A_frag = T.alloc_fragment((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype, scope="shared")
+            C_local = T.alloc_shared((block_M, block_N), accum_dtype, scope="shared")
+
+            T.clear(C_local)
+
+            for ko in T.serial(T.ceildiv(K, block_K)):
+                T.copy(A[by * block_M, ko * block_K], A_shared)
+                T.copy(A_shared, A_frag)
+                for i, j in T.Parallel(block_M, block_K):
+                    A_frag[i, j] = A_frag[i, j] * T.cast(2.0, dtype)
+                T.copy(B[ko * block_K, bx * block_N], B_shared)
+                T.gemm(A_frag, B_shared, C_local)
+
+            T.copy(C_local, C[by * block_M, bx * block_N])
+
+    return gemm_kernel
+
+
+@tilelang.testing.requires_metal
+def test_gemm_rs_staged_shared_16x16x16():
+    M = N = K = 64
+    block_M = block_N = block_K = 16
+    jit_kernel = tilelang.compile(
+        matmul_gemm_rs(M, N, K, block_M, block_N, block_K), target="metal", out_idx=None)
+    a = torch.randn(M, K, dtype=torch.float16, device="mps")
+    b = torch.randn(K, N, dtype=torch.float16, device="mps")
+    c = torch.zeros(M, N, dtype=torch.float32, device="mps")
+    jit_kernel(a, b, c)
+    ref = (a.float() * 2.0) @ b.float()
+    assert torch.allclose(ref, c, atol=1e-2), f"RS staged-shared mismatch: max diff {(ref - c).abs().max().item()}"
+
+
 @tilelang.testing.requires_metal
 def test_gemm_v2_16x16x16():
     assert_gemm_v2(128, 128, 128, 16, 16, 16)

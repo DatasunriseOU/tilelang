@@ -52,6 +52,12 @@ class GemmMetalSimdGroup(GemmBase):
     def is_gemm_ss(self) -> bool:
         return is_shared(self.A) and is_shared(self.B)
 
+    def is_gemm_rs(self) -> bool:
+        # A in register fragment, B in shared. The simdgroup path can only load
+        # A from threadgroup memory, so we stage the A fragment into a temporary
+        # shared buffer (see lower()) and then run the standard SS path.
+        return is_fragment(self.A) and is_shared(self.B)
+
     def infer_layout(self, target: Target, thread_nums: int):
         return {}
 
@@ -122,44 +128,71 @@ class GemmMetalSimdGroup(GemmBase):
             raise ValueError(
                 f"Metal GEMM requires C in local.fragment, metal.simdgroup, or shared scope, got {C_buf.scope()}")
 
-        if self.is_gemm_ss():
-            if c_in_simdgroup_reg:
-
-                @T.prim_func
-                def _gemm_ss_simdgroup() -> None:
-                    A_local = T.alloc_local((warp_rows * 64), in_dtype, scope="metal.simdgroup")
-                    B_local = T.alloc_local((warp_cols * 64), in_dtype, scope="metal.simdgroup")
-                    if clear_accum:
-                        for _i in T.serial(num_simd_c):
-                            T.make_filled_simdgroup_matrix(C_buf.data, _i, T.cast(0, accum_dtype))
-                    for ki in T.serial(0, (block_K // micro_size_k)):
-                        mps_emitter.ldmatrix_a(A_local, A_region, ki)
-                        mps_emitter.ldmatrix_b(B_local, B_region, ki)
-                        mps_emitter.mma(A_local, B_local, C_buf)
-
-                return _Simplify(_gemm_ss_simdgroup, inline_let=True)
-            else:
-
-                @T.prim_func
-                def _gemm_ss_shared() -> None:
-                    A_local = T.alloc_local((warp_rows * 64), in_dtype, scope="metal.simdgroup")
-                    B_local = T.alloc_local((warp_cols * 64), in_dtype, scope="metal.simdgroup")
-                    C_simd = T.alloc_local((num_simd_c * 64), accum_dtype, scope="metal.simdgroup")
-                    if clear_accum:
-                        for _i in T.serial(num_simd_c):
-                            T.make_filled_simdgroup_matrix(C_simd.data, _i, T.cast(0, accum_dtype))
-                    else:
-                        mps_emitter.simd_load(C_simd, C_buf)
-                    for ki in T.serial(0, (block_K // micro_size_k)):
-                        mps_emitter.ldmatrix_a(A_local, A_region, ki)
-                        mps_emitter.ldmatrix_b(B_local, B_region, ki)
-                        mps_emitter.mma(A_local, B_local, C_simd)
-
-                    mps_emitter.simd_store(C_simd, C_buf)
-
-                return _Simplify(_gemm_ss_shared, inline_let=True)
-        else:
+        # The simdgroup ldmatrix_a path issues simdgroup_load against a
+        # threadgroup-memory pointer, so A must live in shared memory.  When A
+        # arrives in a register fragment (the RS variant, e.g. an elementwise-
+        # decayed operand fed straight into T.gemm), we stage it into a
+        # temporary shared buffer first and then run the unchanged SS lowering.
+        # This is a pure data movement: the staged values equal the fragment
+        # values, so numerics are preserved exactly.
+        stage_a_from_fragment = self.is_gemm_rs()
+        if not (self.is_gemm_ss() or stage_a_from_fragment):
             raise ValueError(f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}")
+
+        a_rows = int(self.M)
+        a_cols = int(self.chunk)
+        if self.trans_A:
+            a_shared_shape = (a_cols, a_rows)
+        else:
+            a_shared_shape = (a_rows, a_cols)
+
+        if c_in_simdgroup_reg:
+
+            @T.prim_func
+            def _gemm_ss_simdgroup() -> None:
+                A_local = T.alloc_local((warp_rows * 64), in_dtype, scope="metal.simdgroup")
+                B_local = T.alloc_local((warp_cols * 64), in_dtype, scope="metal.simdgroup")
+                if stage_a_from_fragment:
+                    A_staged = T.alloc_shared(a_shared_shape, in_dtype, scope="shared.dyn")
+                    T.copy(A_region, A_staged)
+                    A_operand = A_staged
+                else:
+                    A_operand = A_region
+                if clear_accum:
+                    for _i in T.serial(num_simd_c):
+                        T.make_filled_simdgroup_matrix(C_buf.data, _i, T.cast(0, accum_dtype))
+                for ki in T.serial(0, (block_K // micro_size_k)):
+                    mps_emitter.ldmatrix_a(A_local, A_operand, ki)
+                    mps_emitter.ldmatrix_b(B_local, B_region, ki)
+                    mps_emitter.mma(A_local, B_local, C_buf)
+
+            return _Simplify(_gemm_ss_simdgroup, inline_let=True)
+        else:
+
+            @T.prim_func
+            def _gemm_ss_shared() -> None:
+                A_local = T.alloc_local((warp_rows * 64), in_dtype, scope="metal.simdgroup")
+                B_local = T.alloc_local((warp_cols * 64), in_dtype, scope="metal.simdgroup")
+                C_simd = T.alloc_local((num_simd_c * 64), accum_dtype, scope="metal.simdgroup")
+                if stage_a_from_fragment:
+                    A_staged = T.alloc_shared(a_shared_shape, in_dtype, scope="shared.dyn")
+                    T.copy(A_region, A_staged)
+                    A_operand = A_staged
+                else:
+                    A_operand = A_region
+                if clear_accum:
+                    for _i in T.serial(num_simd_c):
+                        T.make_filled_simdgroup_matrix(C_simd.data, _i, T.cast(0, accum_dtype))
+                else:
+                    mps_emitter.simd_load(C_simd, C_buf)
+                for ki in T.serial(0, (block_K // micro_size_k)):
+                    mps_emitter.ldmatrix_a(A_local, A_operand, ki)
+                    mps_emitter.ldmatrix_b(B_local, B_region, ki)
+                    mps_emitter.mma(A_local, B_local, C_simd)
+
+                mps_emitter.simd_store(C_simd, C_buf)
+
+            return _Simplify(_gemm_ss_shared, inline_let=True)
 
 
 class GemmMetal(GemmBase):
