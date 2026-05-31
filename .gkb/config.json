@@ -27,8 +27,8 @@
   "store": ".gkb/store",
   "code": {
     "roots": [
-      "src",
-      "tilelang"
-    ]
+      "."
+    ],
+    "include_vendored": true
   }
 }
