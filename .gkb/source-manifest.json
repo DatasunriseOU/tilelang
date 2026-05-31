@@ -1,0 +1,150 @@
+{
+  "authority_hierarchy": [
+    "live_api",
+    "code",
+    "doc",
+    "policy"
+  ],
+  "detector_versions": {
+    "bd": "bd version 1.0.3 (Homebrew)",
+    "git": "git version 2.50.1 (Apple Git-155)",
+    "http": "requests/2.34.2",
+    "node": "v25.9.0",
+    "python": "3.11.13"
+  },
+  "drift_annotations_vocabulary": [
+    "CODE_ABSENT",
+    "API_INACCESSIBLE",
+    "API_ABSENT",
+    "UNDOCUMENTED",
+    "API_NARROWER_THAN_CODE",
+    "VERSION_SKEW",
+    "UNVERIFIABLE"
+  ],
+  "generated_at": "2026-05-31T20:43:48Z",
+  "manifest_version": 2,
+  "repo": "/Volumes/external/sources/tilelang",
+  "schema": "gkb.source_capability_manifest/v1",
+  "sources": {
+    "bd": {
+      "capability": null,
+      "detected_at": "2026-05-31T20:43:48Z",
+      "evidence": {
+        "command": "ls .beads/*.jsonl",
+        "observation": "no .beads/*.jsonl — no bd tier"
+      },
+      "present": false
+    },
+    "codebase": {
+      "capability": {
+        "all_source": 575,
+        "ast_reachability": false,
+        "axiom_extraction": {
+          "note": "primary lang 'py' has NO as-built axiom/reachability extractor; only TS/JS are wired (@babel -> compile_axioms). Adapter-A needed: Python axiom compiler (stdlib ast) + C++/CUDA/Metal AST extractor (clang/tree-sitter). Code tier NOT used for grounding until then (no false code-grounded verdict).",
+          "primary_wired": false,
+          "unparsable_langs": [
+            "c",
+            "cpp",
+            "cuda",
+            "py"
+          ],
+          "wired_langs": []
+        },
+        "degraded_langs": [],
+        "file_counts": {
+          "all_source": 575,
+          "js_jsx": 0,
+          "py": 311,
+          "ts_tsx": 0
+        },
+        "langs": {
+          "c": 115,
+          "cpp": 148,
+          "cuda": 1,
+          "py": 311
+        },
+        "missing_configured_roots": [],
+        "native_provenance": {
+          "clang_langs_present": [
+            "c",
+            "cpp",
+            "cuda"
+          ],
+          "compile_commands": "build/compile_commands.json",
+          "engine": "libclang(version-call-failed:AttributeError)",
+          "libclang_available": true
+        },
+        "parsable": false,
+        "parse_status": {
+          "c": "native:libclang",
+          "cpp": "native:libclang",
+          "cuda": "native:libclang",
+          "py": "native:stdlib-ast(provenance)"
+        },
+        "primary_lang": "py",
+        "roots": [
+          "src",
+          "tilelang"
+        ],
+        "symbol_provenance_langs": [
+          "c",
+          "cpp",
+          "cuda",
+          "py"
+        ]
+      },
+      "detected_at": "2026-05-31T20:43:48Z",
+      "evidence": {
+        "command": "scan ['src', 'tilelang'] (cfg.code.roots) by extension",
+        "observation": "langs[py:311 cpp:148 c:115 cuda:1] all=575 primary=py parsable(axiom)=False native_provenance=libclang (wired=none; provenance=['c', 'cpp', 'cuda', 'py']; degraded=none)"
+      },
+      "present": true
+    },
+    "docs": {
+      "capability": {
+        "breakdown": {
+          "docs": 38,
+          "other": 247,
+          "planning": 0,
+          "root": 10
+        },
+        "corpus_files": 295,
+        "globs": [
+          "docs/**/*.md",
+          "*.md",
+          "**/*.md"
+        ]
+      },
+      "detected_at": "2026-05-31T20:43:48Z",
+      "evidence": {
+        "command": "corpus globs ['docs/**/*.md', '*.md', '**/*.md'] | wc -l",
+        "observation": "295 files (docs=38 root=10 planning=0 other=247)"
+      },
+      "present": true
+    },
+    "git": {
+      "capability": {
+        "depth": 1804,
+        "head_sha": "5952468a0c4860e089a790520e4ed8b7646d9697",
+        "provenance": "full",
+        "shallow": false
+      },
+      "detected_at": "2026-05-31T20:43:48Z",
+      "evidence": {
+        "command": "git rev-parse --is-inside-work-tree; git rev-list --count HEAD",
+        "observation": "true; 1804 (head 5952468a0c48)"
+      },
+      "present": true
+    },
+    "live_api": {
+      "capability": null,
+      "detected_at": "2026-05-31T20:43:48Z",
+      "evidence": {
+        "command": "curl /api/health; scan code for served-API",
+        "observation": "no base_url configured in gkb config nor playwright; no served-API defined in code; tier dropped"
+      },
+      "present": false
+    }
+  },
+  "warnings": []
+}

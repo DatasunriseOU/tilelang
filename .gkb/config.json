@@ -1,0 +1,34 @@
+{
+  "corpus": {
+    "include": [
+      "docs/**/*.md",
+      "*.md",
+      "**/*.md"
+    ],
+    "exclude": [
+      "**/node_modules/**",
+      "**/3rdparty/**",
+      "**/vendor/**",
+      "**/third_party/**",
+      "**/.git/**",
+      "**/build/**",
+      "**/.gkb/**"
+    ],
+    "max_files": 0
+  },
+  "embedder": {
+    "provider": "google",
+    "dim": 768
+  },
+  "extractor": {
+    "provider": "gemini",
+    "model": "gemini-flash-latest"
+  },
+  "store": ".gkb/store",
+  "code": {
+    "roots": [
+      "src",
+      "tilelang"
+    ]
+  }
+}

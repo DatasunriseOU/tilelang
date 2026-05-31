@@ -1,0 +1,4 @@
+store/
+logs-compacted/
+*.gkb
+ingest-catalog.json
