@@ -29,6 +29,7 @@ from tilelang.language.dtypes import dtype
 from tilelang.contrib.mlx_interop import (
     DLPackDeviceError,
     MLX_OUTPUT_WRITE_ONLY,
+    dlpack_devices_for_target,
     first_mlx_array_device,
     has_mlx_arrays,
     is_mlx_array,
@@ -597,10 +598,19 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 dlpack_args = inputs + tuple(output_overrides)
             target_kind = target_kind_static
             uses_mlx_runtime = has_mlx_arrays(dlpack_args)
-            if uses_mlx_runtime and target_kind != "metal":
-                raise DLPackDeviceError(
-                    f"MLX arrays export Metal DLPack buffers, but this kernel targets {target_kind!r}."
-                )
+            if uses_mlx_runtime:
+                # MLX arrays carry a DLPack device that must match the kernel
+                # target. Metal arrays export kDLMetal; MLX-on-CUDA exports
+                # kDLCUDA/kDLCUDAManaged. Accept any MLX array whose DLPack
+                # device family matches target_kind (metal↔kDLMetal,
+                # cuda↔kDLCUDA), so zero-copy works on both backends. The actual
+                # device check is enforced by first_mlx_array_device() below,
+                # which raises DLPackDeviceError on a true mismatch.
+                if not dlpack_devices_for_target(target_kind):
+                    raise DLPackDeviceError(
+                        f"MLX arrays cannot be consumed zero-copy by a {target_kind!r} kernel: "
+                        f"no DLPack device family is registered for this target."
+                    )
             owner_outputs_requested = output_overrides is not None or using_full_abi_args
             native_mlx_bridge_available = (
                 uses_mlx_runtime
@@ -630,7 +640,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             if not (use_native_mlx_graph or use_native_mlx_owner_outputs):
                 validate_dlpack_inputs_for_target(dlpack_args, target_kind)
                 if uses_mlx_runtime:
-                    first_mlx_array_device(dlpack_args)
+                    first_mlx_array_device(dlpack_args, target_kind)
 
             # Resolve the device used for outputs. Prefer the first tensor input's device
             # if available, otherwise use PyTorch's current device.
@@ -937,6 +947,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 mlx_arrays_to_tvm_tensors(
                     tensor_list_to_use,
                     expected_dtypes=expected_dtype_strs_to_use,
+                    target_kind=target_kind,
                 )
                 if uses_mlx_runtime
                 else tensor_list_to_use

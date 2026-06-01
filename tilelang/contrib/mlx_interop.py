@@ -32,13 +32,31 @@ DLPACK_DEVICE_CPU = 1
 DLPACK_DEVICE_CUDA = 2
 DLPACK_DEVICE_METAL = 8
 DLPACK_DEVICE_ROCM = 10
+# MLX on a CUDA host advertises kDLCUDAManaged (13) from __dlpack_device__
+# (unified/managed memory), not plain kDLCUDA (2). tvm-ffi from_dlpack accepts
+# both; treat 13 as CUDA-family for target matching.
+DLPACK_DEVICE_CUDA_MANAGED = 13
 
 _DLPACK_DEVICE_NAMES = {
     DLPACK_DEVICE_CPU: "kDLCPU",
     DLPACK_DEVICE_CUDA: "kDLCUDA",
     DLPACK_DEVICE_METAL: "kDLMetal",
     DLPACK_DEVICE_ROCM: "kDLROCM",
+    DLPACK_DEVICE_CUDA_MANAGED: "kDLCUDAManaged",
 }
+
+# DLPack device types each TileLang target_kind can legitimately consume.
+_TARGET_KIND_TO_DLPACK_DEVICES = {
+    "metal": (DLPACK_DEVICE_METAL,),
+    "cuda": (DLPACK_DEVICE_CUDA, DLPACK_DEVICE_CUDA_MANAGED),
+    "rocm": (DLPACK_DEVICE_ROCM,),
+}
+
+
+def dlpack_devices_for_target(target_kind: str) -> tuple[int, ...]:
+    """Return the DLPack device types a target backend can consume zero-copy."""
+
+    return _TARGET_KIND_TO_DLPACK_DEVICES.get(target_kind, ())
 
 
 class _DLDevice(ctypes.Structure):
@@ -511,19 +529,32 @@ def _get_dlpack_device(arg: Any) -> tuple[int, int]:
 def validate_dlpack_device(
     arg: Any,
     *,
-    expected_device_type: int | None = None,
+    expected_device_type: int | tuple[int, ...] | None = None,
     expected_device_id: int | None = None,
     owner_name: str = "DLPack producer",
 ) -> tuple[int, int]:
-    """Validate a DLPack producer's reported device before consuming it."""
+    """Validate a DLPack producer's reported device before consuming it.
+
+    ``expected_device_type`` may be a single DLPack device type or a tuple of
+    acceptable types (e.g. CUDA + CUDA-managed are both valid for a ``cuda``
+    target). The validated ``device_type`` is still returned as-is.
+    """
 
     device_type, device_id = _get_dlpack_device(arg)
-    if expected_device_type is not None and device_type != expected_device_type:
-        raise DLPackDeviceError(
-            f"{owner_name} is on {_format_dlpack_device(device_type, device_id)}, "
-            f"but this path requires "
-            f"{_format_dlpack_device(expected_device_type, expected_device_id or 0)}"
+    if expected_device_type is not None:
+        accepted = (
+            (expected_device_type,)
+            if isinstance(expected_device_type, int)
+            else tuple(expected_device_type)
         )
+        if device_type not in accepted:
+            expected_str = " or ".join(
+                _format_dlpack_device(t, expected_device_id or 0) for t in accepted
+            )
+            raise DLPackDeviceError(
+                f"{owner_name} is on {_format_dlpack_device(device_type, device_id)}, "
+                f"but this path requires {expected_str}"
+            )
     if expected_device_id is not None and device_id != expected_device_id:
         raise DLPackDeviceError(
             f"{owner_name} is on {_format_dlpack_device(device_type, device_id)}, "
@@ -535,29 +566,30 @@ def validate_dlpack_device(
 def validate_dlpack_inputs_for_target(args: Iterable[Any], target_kind: str) -> None:
     """Fail early when DLPack inputs cannot be consumed by the target backend."""
 
-    expected_device_type = None
-    if target_kind == "metal":
-        expected_device_type = DLPACK_DEVICE_METAL
-    if expected_device_type is None:
+    expected_device_types = dlpack_devices_for_target(target_kind)
+    if not expected_device_types:
         return
 
     for arg in _iter_nested_values(args):
         if hasattr(arg, "__dlpack_device__") or _is_py_capsule(arg):
             validate_dlpack_device(
                 arg,
-                expected_device_type=expected_device_type,
+                expected_device_type=expected_device_types,
                 owner_name=type(arg).__name__,
             )
 
 
-def first_mlx_array_device(args: Iterable[Any]) -> tuple[int, int] | None:
-    """Return the first MLX array's DLPack device, if any."""
+def first_mlx_array_device(
+    args: Iterable[Any], target_kind: str = "metal"
+) -> tuple[int, int] | None:
+    """Return the first MLX array's DLPack device, validated for *target_kind*."""
 
+    expected_device_types = dlpack_devices_for_target(target_kind) or None
     for arg in _iter_nested_values(args):
         if is_mlx_array(arg):
             return validate_dlpack_device(
                 arg,
-                expected_device_type=DLPACK_DEVICE_METAL,
+                expected_device_type=expected_device_types,
                 owner_name="MLX array",
             )
     return None
@@ -641,14 +673,21 @@ def _view_tvm_tensor_for_expected_dtype(tensor: Any, arg: Any, expected_dtype: A
     )
 
 
-def mlx_array_to_tvm_tensor(arg: Any, *, expected_dtype: Any | None = None):
-    """Import an MLX Metal array as a TVM tensor view without copying."""
+def mlx_array_to_tvm_tensor(
+    arg: Any, *, expected_dtype: Any | None = None, target_kind: str = "metal"
+):
+    """Import an MLX array as a TVM tensor view without copying.
+
+    ``target_kind`` selects the acceptable DLPack device family (metal↔kDLMetal,
+    cuda↔kDLCUDA/kDLCUDAManaged), so the same path serves both Metal and CUDA.
+    """
 
     if not is_mlx_array(arg):
         raise TypeError(f"expected mlx.core.array, got {type(arg).__name__}")
+    expected_device_types = dlpack_devices_for_target(target_kind) or None
     tensor = dlpack_to_tvm_tensor(
         arg,
-        expected_device_type=DLPACK_DEVICE_METAL,
+        expected_device_type=expected_device_types,
         owner_name="MLX array",
     )
     return _view_tvm_tensor_for_expected_dtype(tensor, arg, expected_dtype)
@@ -658,6 +697,7 @@ def mlx_arrays_to_tvm_tensors(
     args: Iterable[Any],
     *,
     expected_dtypes: Iterable[Any | None] | None = None,
+    target_kind: str = "metal",
 ) -> list[Any]:
     """Convert MLX array arguments to TVM Tensor views with DLPack.
 
@@ -680,7 +720,11 @@ def mlx_arrays_to_tvm_tensors(
     converted = []
     for arg, expected_dtype in zip(arg_list, expected_list, strict=True):
         if is_mlx_array(arg):
-            converted.append(mlx_array_to_tvm_tensor(arg, expected_dtype=expected_dtype))
+            converted.append(
+                mlx_array_to_tvm_tensor(
+                    arg, expected_dtype=expected_dtype, target_kind=target_kind
+                )
+            )
         else:
             converted.append(arg)
     return converted
