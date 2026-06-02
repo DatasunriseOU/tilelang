@@ -923,8 +923,17 @@ void ArgBinder::BindDLTensors(
           Call(DataType::Bool(1), builtin::isnullptr(), {buf_strides->data});
 
       if (buffer->strides.empty()) {
-        // Assert the buffer is compact
-        DataType stype = buffer->DefaultIndexType();
+        // Assert the buffer is compact.
+        //
+        // The running compact-stride product is a flattened element count that
+        // can exceed 2^31 for large static buffers (e.g. the sparse-MLA KV
+        // tensors). DefaultIndexType() is int32 for int32-shaped buffers, so
+        // accumulating the product in that type produces an int32 IntImm that
+        // overflows when CodeGenCPU materializes the AssertStmt constant via
+        // ConstantInt::get (APInt isIntN(32) abort). Force the accumulator and
+        // the compared shape values to int64 so the byte/element-count asserts
+        // never overflow int32 on the static-shape host path.
+        DataType stype = DataType::Int(64);
         PrimExpr expect_stride = make_const(stype, 1);
         ffi::Array<PrimExpr> conds;
         for (size_t i = buffer->shape.size(); i != 0; --i) {
@@ -937,9 +946,10 @@ void ArgBinder::BindDLTensors(
                          << "buffer strides calculation. "
                          << "Relaxing check for " << stride_handle_name();
           }
-          conds.push_back(buffer->shape[k] == 1 || expect_stride == svalue ||
-                          expect_stride == 0);
-          expect_stride = expect_stride * buffer->shape[k];
+          conds.push_back(cast(stype, buffer->shape[k]) == make_const(stype, 1) ||
+                          expect_stride == svalue ||
+                          expect_stride == make_const(stype, 0));
+          expect_stride = expect_stride * cast(stype, buffer->shape[k]);
         }
         std::ostringstream stride_err_msg;
         stride_err_msg

@@ -4401,6 +4401,27 @@ void CodeGenTileLangCUDA::VisitStmt_(const AllocBufferNode *op) {
   // the `.init()/.wait()/.arrive()` method-call intrinsics compile. Everything
   // else falls through to the base CodeGenC implementation unchanged.
   auto scope = GetPtrStorageScope(op->buffer->data);
+  if (scope == "shared.dyn") {
+    // Dynamic shared memory must be emitted as an UNSIZED `extern __shared__`
+    // declaration so that ptxas treats its footprint as *dynamic* (set at
+    // launch via cuFuncSetAttribute) rather than static. The base
+    // CodeGenC::VisitStmt_(AllocBufferNode) always emits a sized
+    // `[constant_size]`, which makes ptxas count the whole buffer as STATIC
+    // shared memory; the runtime then also sets the dynamic attr to the same
+    // size, and static+dynamic overflows the device cap (the GB10 95216 B
+    // sparse-MLA launch failure). Mirror the AllocateNode shared.dyn path.
+    std::string vid = AllocVarID(op->buffer->data.get());
+    this->PrintIndent();
+    alloc_storage_scope_[op->buffer->data.get()] = scope;
+    PrintStorageScope(scope, stream);
+    PrintType(op->buffer->dtype, stream);
+    stream << ' ' << vid << "[];\n";
+    RegisterHandleType(op->buffer->data.get(), op->buffer->dtype);
+    if (op->annotations.count(tirx::attr::kVolatile)) {
+      MarkVolatile(op->buffer->data.get());
+    }
+    return;
+  }
   if (scope != "shared.barrier" && scope != "shared.cluster_barrier") {
     CodeGenC::VisitStmt_(op);
     return;
