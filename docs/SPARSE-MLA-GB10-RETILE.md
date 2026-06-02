@@ -100,11 +100,101 @@ is unchanged.
 
 ## Parity
 
-See the "Parity" run section appended below once the GB10 GPU is idle. The
-fitting configs above (fwd block_I=16/ns=1, bwd threads=128/bs=16) build to real
-`JITKernel`s, so `test_sparse_mla_fwd(..., gb10=True)` /
-`test_sparse_mla_bwd(...)` (both call `assert_tensors_similar(eps=1e-2 fwd /
-1e-4 bwd)`) can run for a rel-err check.
+**STATUS 2026-06-02 (measured on gb10, libtilelang.so/libtvm_compiler.so relinked
+11:47, branch `merge/upstream-codegen-reorg` @ `5c21aeff`, submodule tvm
+`62cc0314`): fwd compiles the DEVICE cubin through real sm_121a ptxas, but is
+blocked by TWO downstream bugs before a parity number can be produced.** No
+fabrication -- exact measured errors below. Fused sparse-MLA does NOT yet RUN
+e2e on GB10; the device kernel is proven to fit but the host launch path fails.
+
+### Device-side: CONFIRMED GOOD (ptxas fits 99 KiB)
+
+`tilelang.set_pass_config(TL_ENABLE_PTXAS_VERBOSE_OUTPUT)` + the auto-gb10 path
+(`_select_gb10(None) -> True` on cap (12,1)) compiled `main_kernel` to a real
+sm_121a cubin. Recompiling the cached `device_kernel.cu` with
+`nvcc -arch=sm_121a --cubin --ptxas-options=--verbose`:
+
+```
+ptxas info : Used 248 registers, used 3 barriers, 95216 bytes smem
+cuobjdump -res-usage main_kernel: REG:248 SHARED:96240 (= 95216 + 1024 driver)
+```
+
+**95216 B = 93.0 KiB dynamic smem, ptxas SUCCEEDS** (vs the num_stages=2
+0x38400 = 225 KiB overflow). `shared_memory_per_block_optin` on this GB10 =
+**101376 B (99 KiB)**, `reserved=1024`. The re-tile fits with 5 KiB to spare.
+This is the hardware proof the device kernel budgets correctly.
+
+### BLOCKER 1 (runtime launch) -- dynamic smem emitted as STATIC
+
+`test_sparse_mla_fwd(..., gb10=None)` compiles, then throws at the FIRST launch:
+
+```
+tvm.error.InternalError: Failed to set the allowed dynamic shared memory size to 95216
+  (3rdparty/tvm/src/runtime/cuda/cuda_module.cc:218, cuFuncSetAttribute)
+```
+
+Root-caused by replaying the exact driver call on the cached cubin
+(`/tmp/replay` -> `cuModuleLoad` + `cuFuncGetAttribute`):
+
+```
+static SHARED_SIZE_BYTES = 95216    <-- the 95216 B is STATIC, not dynamic
+MAX_DYNAMIC (before)     = 6160      (= 101376 - 95216, all that's left)
+cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES, 95216) -> CUDA_ERROR_INVALID_VALUE
+```
+
+The generated `device_kernel.cu` declares
+`extern __shared__ __align__(1024) uchar buf_dyn_shmem[95216];` -- WITH an
+explicit compile-time `[95216]` size. ptxas therefore counts it as **static**
+shared memory, consuming the full 95216 B statically; the TVM runtime then ALSO
+tries to set the *dynamic* attribute to 95216, but static+dynamic would be
+190432 > 101376, so the driver rejects it. (A control nvcc kernel with a TRUE
+unsized `extern __shared__ char s[]` accepts `cudaFuncSetAttribute(95216..101376)`
+fine on this GB10 -- so the device/driver is healthy; the bug is the sized
+declaration.) Both active codegens
+(`src/backend/cuda/codegen/codegen_cuda.cc:4335`, `3rdparty/tvm/.../codegen_cuda.cc:1387`)
+emit `vid[];` (unsized) ONLY for `scope == "shared.dyn"` -- so the merged
+`buf_dyn_shmem` reaches codegen with scope `"shared"` (static) instead of
+`"shared.dyn"`, hitting the `[constant_size]` branch. The merge pass declares
+the var with `shared.dyn` scope (`merge_shared_memory_allocations.cc:1793`), so
+the scope is being dropped between the AllocBuffer and codegen. **Fix target:
+preserve the `shared.dyn` PointerType scope on the merged dynamic buffer so
+codegen emits `buf_dyn_shmem[]` (unsized) and the 95216 flows only to the
+dynamic launch attribute.**
+
+### BLOCKER 2 (host LLVM build) -- int32 IntImm overflow in AssertStmt
+
+The full JIT/AOT build path (`get_kernel_source` / `LLVMModuleNode::Init`)
+aborts in host CPU codegen (gdb backtrace):
+
+```
+python: llvm/include/llvm/ADT/APInt.h:121: APInt::APInt(...):
+  Assertion `llvm::isIntN(BitWidth, val) && "Value is not an N-bit signed value"' failed.
+#6  llvm::APInt::APInt
+#7  llvm::ConstantInt::get(llvm::Type*, unsigned long, bool, bool)
+#8  tvm::codegen::CodeGenCPU::VisitStmt_(tvm::tirx::AssertStmtNode const*)
+#13 tvm::codegen::LLVMModuleNode::Init
+```
+
+A 64-bit constant in a host-wrapper **AssertStmt** (the DLTensor shape/stride
+bind checks built in `src/transform/arg_binder.cc`) is materialized through
+`ConstantInt::get` with an int32 width that the value overflows -- a flattened
+byte/element count product computed at int32 for the static-shape path. The
+prim_func body itself has NO overflowing int32 IntImm before the host split
+(scanned), so the bad constant is introduced during host arg-binding /
+`make_packed_api`. `tilelang.lower(mod)` alone does NOT crash; only the host
+LLVM module build does. **Fix target: build the arg-binder shape/stride
+byte-count asserts in int64 (or cast the IntImm to int64 before
+`ConstantInt::get`) on the static-shape path.** This is independent of Blocker 1
+and was the bug behind the earlier LLVM APInt crash.
+
+### Why the 12:18 cubin compiled but launch failed
+
+The device cubin is JIT-compiled by `tilelang_callback_cuda_compile`
+(`--cubin -arch=sm_121a`) and that path does NOT run CodeGenCPU, so Blocker 2
+does not fire there -- the device kernel builds clean to 93.0 KiB. Blocker 1
+(static-vs-dynamic smem) only manifests at the runtime `cuFuncSetAttribute`, and
+Blocker 2 only manifests on the host LLVM module build. Both must be fixed before
+`assert_tensors_similar(eps=1e-2 fwd / 1e-4 bwd)` can yield a rel-err number.
 
 ## vs Megatron / cppmega tiling
 
