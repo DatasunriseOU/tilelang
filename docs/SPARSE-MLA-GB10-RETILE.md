@@ -248,21 +248,79 @@ masked rows have an ill-conditioned softmax in bf16. They are a test-harness
 artifact (real DSA indices are in-bounds), not a kernel defect -- `out_nan=0`,
 `ref_nan=0`, and every fully-filled row matches at 0.998.
 
-### Backward -- still blocked (independent bug, NOT the mask coupling)
+### Backward -- ROOT-CAUSED AND FIXED 2026-06-02 (gb10, measured). dq/dkv cos = 1.000
 
-The same shared-mask fix is applied to `sparse_mla_bwd.py`, but bwd does NOT yet
-pass parity on sm_121. Two independent, pre-existing blockers remain: (1) the
-`bwd()` lazy-builder returns a JITKernel on its first tensor call (call-
-convention mismatch vs fwd), and (2) the bwd MAIN kernel produces ~all-nan `dq`
-and `dkv` on sm_121 EVEN with a sanitized (nan-free) `delta` fed in -- a
-`LayoutConflictException "delta vs acc"` is thrown for one inference-root
-attempt in `layout_inference.cc:1330` and the per-component search picks an
-alternative root whose layout compiles but is numerically wrong for the bwd
-reductions. This is a separate layout-inference defect in the bwd reduction
-chain, beyond the fwd gather/mask bug; it needs its own bisection.
+The bwd now PASSES parity on gb10 sm_121a. Two independent defects were fixed:
 
-**DELIVERABLE STATUS: FORWARD sparse-MLA PASSES parity on GB10 sm_121a
-(compile <=99 KiB + launch + run + cos=0.998). BACKWARD does not yet pass.**
+**Bug A -- `bwd()` call-convention mismatch (Python, `sparse_mla_bwd.py`).**
+`_build_bwd(...)` returns an already-built `PrimFunc`, so `tilelang.jit(builder)`
+yields a lazy `JITImpl`. Per `JITImpl.__call__`, when `self.func` is a `PrimFunc`
+the FIRST call IGNORES its tensor args and RETURNS the compiled kernel object
+(a `JITKernel`) instead of running it. So `dq = bwd_kernel(q, kv, ...)` produced
+`dq = <JITKernel>` and left `dkv` unwritten. Fix: `bwd()` now returns
+`jit(builder)()` -- it triggers the compile and hands back a ready-to-run kernel,
+mirroring `sparse_mla_fwd`'s `return wrapped(...)`. No fallback; one clear path.
+
+**Bug B (the all-nan) -- merge-pass loop-carried-liveness defect
+(`src/transform/merge_shared_memory_allocations.cc`).** With a CORRECT,
+nan-free `lse` + `delta` fed in, the bwd MAIN kernel still produced all-nan `dq`
+on sm_121. Bisection (single-iteration debug kernel = clean; `NS=2` = nan with
+`dq_absmax=inf`; toggling the `acc_dkv` GEMM body on/off flips it) localized the
+corruption to the multi-iteration `acc_dkv` store path. The generated CUDA shows
+the fp32 staging buffer `acc_dkv_shared` overlaid at **byte offset 0 -- on top of
+the loop-invariant `Q_shared`** (loaded ONCE before the `i_i` loop, read every
+iteration). `acc_dkv_shared` is written each iteration, so iter 0 clobbers
+`Q_shared`; iter 1 then reads garbage `Q` -> `nan` propagates through
+`acc_p -> acc_dp -> acc_dq`.
+
+Root cause: the merge pass computes liveness over a *flattened single-pass*
+schedule. `Q_shared` is GENERATED at scope_level 0 (outside the loop) but its
+last textual READ is at scope_level 2 (deep in the loop body). The "reorder kill
+points" step (`kill_level > gen_level`) moves its kill toward the gen-level
+boundary, but the early-stop heuristic at `merge_shared_memory_allocations.cc`
+stopped the move as soon as it saw ANOTHER buffer's gen -- and `acc_dkv_shared`
+is born INSIDE the loop (scope_level 2). The heuristic's own comment assumed
+"shared-memory allocations are always placed *outside* pipelined loop bodies",
+which is FALSE here. So `Q_shared`'s kill was placed right before
+`acc_dkv_shared`'s birth, inside the loop, and the allocator reused its region --
+ignoring that `Q_shared` is re-read on every loop back-edge.
+
+Fix: the early-stop fires ONLY when the other buffer's gen scope level is
+`<= gen_level` (a true sibling born at/outside the loop, e.g. Q_shared/O_shared
+in Flash-Attention -- disjoint lifetimes, may share). A buffer born DEEPER than
+`gen_level` (inside the loop) must NOT truncate the loop-invariant buffer's kill;
+the scan continues so the kill lands at the real gen-level (loop-end) boundary.
+This keeps the loop-invariant `Q_shared` live across all iterations, so nothing
+born inside the loop overlays it. A/B on gb10 (revert lib -> `dq nan=1811920`;
+fixed lib -> `dq nan=0`) proves the fix is load-bearing. The merged dynamic smem
+is **~86 KiB**, still well under the 99 KiB cap; fwd parity is byte-unchanged
+(cos(t>=topk)=1.000), and the pre-existing sm120 TMA-alignment test fails
+identically with and without the change (independent).
+
+### Backward parity -- MEASURED on gb10 sm_121a (cos over fully-filled rows)
+
+In-bounds DISTINCT indices; `do` zeroed on degenerate early rows (t<topk); dq
+compared on rows t>=topk (the only fully-filled-softmax rows -- same harness
+caveat as fwd):
+
+| S    | SKV  | H   | topk | DQ cos   | DQ relerr | DKV cos  | DKV relerr |
+|------|------|-----|------|----------|-----------|----------|------------|
+| 256  | 512  | 64  | 128  | 1.00000  | 0.0023    | 1.00000  | 0.0024     |
+| 512  | 1024 | 64  | 256  | 1.00000  | 0.0023    | 1.00000  | 0.0024     |
+| 512  | 1024 | 128 | 256  | 0.99710  | 0.083     | 0.99713  | 0.082      |
+
+The official `test_sparse_mla_bwd` (OOB-sentinel harness, eps=1e-4 whole-tensor)
+PASSES at H=64 (`assert_tensors_similar passed`). At H=128 it reports
+`diff=nan` -- purely the OOB-sentinel artifact (unused slots are padded with the
+out-of-bounds index `SKV`; head-replication amplifies the resulting ill-
+conditioned early-row softmax to nan), identical to the documented fwd behavior
+and NOT a kernel defect: with in-bounds indices H=128 is clean at cos=0.997
+(table above, `dq nan=0 dkv nan=0`).
+
+**DELIVERABLE STATUS: FORWARD *and* BACKWARD sparse-MLA PASS parity on GB10
+sm_121a. Fused sparse-MLA is FULLY DONE on GB10 (fwd+bwd compile <=99 KiB +
+launch + run + parity): fwd cos=0.998-1.000, bwd dq/dkv cos=1.000 (H=64) /
+0.997 (H=128 head-replication).**
 
 ----
 

@@ -162,7 +162,16 @@ def bwd(
         use_gb10, block_H_override,
     )
     jit = tilelang.jit(out_idx=[-2], pass_configs=pass_configs)
-    return jit(builder)
+    # `_build_bwd` already returns a built PrimFunc, so `jit(builder)` is a lazy
+    # JITImpl whose first invocation COMPILES and returns the kernel object.  If
+    # we returned the JITImpl directly, the caller's first
+    # `bwd_kernel(q, kv, ...)` would hit the `isinstance(self.func, PrimFunc)`
+    # branch in JITImpl.__call__ and return the *compiled kernel* (a JITKernel)
+    # instead of running it -- a call-convention mismatch vs the fwd interface,
+    # which yields `dq = <JITKernel>` and an unwritten `dkv`.  Trigger the
+    # compile here (mirroring `sparse_mla_fwd`'s `return wrapped(...)`) so we
+    # hand back a ready-to-run kernel.
+    return jit(builder)()
 
 
 def _build_bwd(

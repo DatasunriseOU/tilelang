@@ -1451,10 +1451,25 @@ private:
               last_stmt_at_level = stmt_it->stmt;
               break;
             }
-            // Stop if the next statement births a different shared buffer.
+            // Stop if the next statement births a different shared buffer --
+            // but ONLY when that buffer is born at a scope no deeper than
+            // `buffer`'s own gen scope.  A sibling born at `gen_level` (e.g.
+            // Q_shared / O_shared in Flash-Attention, both declared outside the
+            // pipelined loop) has a disjoint lifetime and may legitimately reuse
+            // the region, so we stop and let it share.  But a buffer born at a
+            // level DEEPER than gen_level is born *inside* the loop body, while
+            // `buffer` (gen at gen_level, outside the loop) stays live across
+            // EVERY iteration via the loop back-edge.  Stopping `buffer`'s kill
+            // there would let the inner buffer overlay storage that the next
+            // iteration still reads (e.g. the loop-invariant Q_shared overlaid
+            // by the per-iteration fp32 acc_dkv_shared staging buffer in
+            // sparse-MLA backward), corrupting results.  In that case we must
+            // NOT stop -- continue scanning so the kill is pushed to the real
+            // gen_level boundary (the end of the loop).
             auto next_event_it = event_map_.find(next_it->stmt);
             if (next_event_it != event_map_.end() &&
                 !next_event_it->second.gen.empty()) {
+              int next_level = stmt_attrs.at(next_it->stmt).level;
               bool has_other_gen = false;
               for (const VarNode *gen_buf : next_event_it->second.gen) {
                 if (gen_buf != buffer) {
@@ -1462,7 +1477,7 @@ private:
                   break;
                 }
               }
-              if (has_other_gen) {
+              if (has_other_gen && next_level <= gen_level) {
                 last_stmt_at_level = stmt_it->stmt;
                 break;
               }
