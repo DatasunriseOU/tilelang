@@ -148,9 +148,25 @@ private:
     // CSE/LICM may introduce Bind nodes before thread_extent AttrStmts.
     // Kernel launch arguments must be expressible from PrimFunc parameters,
     // so inline local Bind definitions while collecting launch geometry.
-    PrimExpr value =
-        bind_map_.size() ? Substitute(op->value, bind_map_) : op->value;
-    bind_map_.Set(op->var, value);
+    //
+    // Only record scalar (non-pointer) bindings.  Launch geometry (thread
+    // extents and dynamic shared-memory sizes) is always integer/float scalar.
+    // Handle-typed binds in the MakePackedAPI host wrapper define buffer
+    // backing pointers (e.g. `main_A_shape = tvm_struct_get(handle, ...)`,
+    // the DLTensor shape array).  A later scalar bind such as
+    // `seq = main_A_shape[0]` is a BufferLoad whose backing-allocation Var is
+    // that handle.  If the handle binding were in `bind_map_`, Substitute would
+    // rewrite the buffer's `data` Var into the tvm_struct_get expression, and
+    // tirx::IRSubstitute::GetRemappedBuffer asserts the backing allocation must
+    // remain a Var (dynamic-symbolic-shape regression).  Pointer bindings are
+    // never part of launch geometry, so excluding them is both correct and
+    // sufficient to keep symbolic-shape vars (loaded from the shape array)
+    // intact for the launch site.
+    if (!op->var.dtype().is_handle()) {
+      PrimExpr value =
+          bind_map_.size() ? Substitute(op->value, bind_map_) : op->value;
+      bind_map_.Set(op->var, value);
+    }
     StmtVisitor::VisitStmt_(op);
   }
 
