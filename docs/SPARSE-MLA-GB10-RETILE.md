@@ -100,12 +100,72 @@ is unchanged.
 
 ## Parity
 
-**STATUS 2026-06-02 (measured on gb10, libtilelang.so/libtvm_compiler.so relinked
-11:47, branch `merge/upstream-codegen-reorg` @ `5c21aeff`, submodule tvm
-`62cc0314`): fwd compiles the DEVICE cubin through real sm_121a ptxas, but is
-blocked by TWO downstream bugs before a parity number can be produced.** No
-fabrication -- exact measured errors below. Fused sparse-MLA does NOT yet RUN
-e2e on GB10; the device kernel is proven to fit but the host launch path fails.
+**STATUS 2026-06-02 UPDATE (measured on gb10, libtilelang.so relinked 12:38,
+branch `merge/upstream-codegen-reorg` @ `ce315509`, submodule tvm `62cc0314`):
+BLOCKER 1 and BLOCKER 2 are BOTH FIXED and PROVEN. The re-tiled sparse_mla_fwd
+now COMPILES, LAUNCHES, and RUNS e2e on GB10/sm_121a -- the
+`cuFuncSetAttribute(95216)` dynamic-smem reject is GONE (Blocker 1) and the host
+LLVM `CodeGenCPU` build no longer aborts (Blocker 2). bwd's three kernels
+(preprocess / `sparse_mla_bwd_kernel` with `AtomicAddx4` / postprocess) also
+compile + launch clean on sm_121a. A THIRD, pre-existing bug -- a layout-
+inference conflict in the `block_I=16` re-tile -- now blocks NUMERIC PARITY (see
+BLOCKER 3 below); it is independent of the two codegen fixes (which cannot alter
+numerics) and was simply masked until the kernel could finally launch.**
+
+### The two fixes (commit `ce315509`, tilelang `src/`, no tvm submodule change)
+
+**Blocker 1 fix -- `src/backend/cuda/codegen/codegen_cuda.cc`
+`CodeGenTileLangCUDA::VisitStmt_(AllocBufferNode)`:** the merge pass
+(`MergeSharedMemoryAllocations`) lowers the merged dynamic buffer as an
+`AllocBuffer` (NOT an `Allocate`) and the var DOES keep its correct
+`shared.dyn` PointerType scope -- the scope was never dropped. The bug was that
+the tilelang CUDA codegen forwarded every non-barrier `AllocBuffer` to the base
+`CodeGenC::VisitStmt_(AllocBufferNode)`, which ALWAYS emits a SIZED
+`extern __shared__ __align__(1024) uchar buf_dyn_shmem[95216];`. Only the
+`AllocateNode` path had the `scope=="shared.dyn"` -> unsized `[]` special case;
+the `AllocBufferNode` path did not. Fix: special-case `scope=="shared.dyn"` in
+the tilelang `AllocBufferNode` visitor to emit the UNSIZED
+`extern __shared__ __align__(1024) uchar buf_dyn_shmem[];`. VERIFIED in the
+generated source: the declaration is now `buf_dyn_shmem[]` (unsized), ptxas
+treats the 95216 B as DYNAMIC, and the runtime `cuFuncSetAttribute(95216)`
+succeeds -> `LAUNCH_OK`.
+
+**Blocker 2 fix -- `src/transform/arg_binder.cc` compact-stride assert:** the
+DLTensor "compact array" stride check built its running stride product (a
+flattened element count) in `buffer->DefaultIndexType()` = int32. For large
+static shapes the product exceeds 2^31, so the int32 IntImm overflowed when
+`CodeGenCPU` materialized the `AssertStmt` constant via `ConstantInt::get`
+(APInt `isIntN(32)` abort). Fix: accumulate the compact stride product and its
+compared shape values in int64. VERIFIED: the full host JIT build now completes
+with no APInt abort (fwd + all bwd kernels build on the static-shape path).
+
+### BLOCKER 3 (numeric parity) -- pre-existing layout-inference conflict
+
+With both codegen bugs fixed, the kernel runs but the output is WRONG. Measured
+on gb10 (S=1024, SKV=2048, topk=512, H=128): the fwd global similarity is only
+**0.50-0.72** (target ~1.0), rel-err-mean ~4.6 -- across `gb10=True` (direct
+acc_o store), `gb10=False` staged-store at the same small tile, H=64 (no head
+replication) AND H=128. Compilation prints **61x** `parallel.cc:619 "Layout
+infer conflict between sumexp and None in T.Parallel loop"` -- the online-softmax
+`sumexp` fragment gets two incompatible layouts (`(64,)->(1,) replicate:4` from
+the reduction loops vs `(64,)->(2,) replicate:8` from the GEMM-induced layout)
+and the pass proceeds with an inconsistent layout instead of throwing
+(`throw_on_error=false`), corrupting the softmax normalization. The bwd shows the
+analogous `LayoutConflictException "delta vs acc"` during the preprocess delta
+reduction. This is a TileLang layout-inference defect surfaced by the
+`block_I=16` / `H_per_block=64` / `threads=256` re-tile, NOT a codegen/argbinder
+bug; it must be fixed (correct the `sumexp` reduction layout for the small-BI
+tile, or flip `throw_on_error` so it fails loud) before a parity rel-err can
+pass `eps=1e-2`. Both Blocker-1/2 fixes are unrelated to it (pure codegen).
+
+----
+
+**PRIOR STATUS 2026-06-02 (superseded -- kept for the device-fit proof below;
+libtilelang.so/libtvm_compiler.so relinked 11:47, branch
+`merge/upstream-codegen-reorg` @ `5c21aeff`, submodule tvm `62cc0314`): fwd
+compiles the DEVICE cubin through real sm_121a ptxas, but was blocked by TWO
+downstream bugs before a parity number could be produced.** No fabrication --
+exact measured errors below.
 
 ### Device-side: CONFIRMED GOOD (ptxas fits 99 KiB)
 
