@@ -317,7 +317,13 @@ def sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, return_p_sum: bool =
 
     # static_shape=True bakes concrete (batch, seq_len, seq_len_kv) into the
     # prim_func -- required on branches where tirx dynamic shapes regress.
-    ss = (batch, seq_len, seq_len_kv) if static_shape else None
+    # On the GB10 (sm_12x) path the dynamic-symbolic build CRASHES the compiler
+    # (LLVM APInt assertion "Value is not an N-bit signed value" -> core dump
+    # during layout inference on merge/upstream-codegen-reorg), so we force
+    # static shapes there. Callers that explicitly pass static_shape=True keep
+    # it; the Hopper path (gb10 resolves False) keeps the dynamic build.
+    use_static = bool(static_shape) or _select_gb10(gb10)
+    ss = (batch, seq_len, seq_len_kv) if use_static else None
     kernel = sparse_mla_fwd(
         heads, dim, tail_dim, topk, kv_group, sm_scale, is_casual, block_I=block_I, num_stages=num_stages, threads=threads, gb10=gb10, static_shape=ss
     )
