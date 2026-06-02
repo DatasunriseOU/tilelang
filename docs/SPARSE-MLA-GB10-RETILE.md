@@ -14,11 +14,14 @@ GB10: the ptxas reject prints `0x18c00 max` exactly (see Compile result below).
 ## What the re-tile changes (arch-gated, Hopper untouched)
 
 Forward (`sparse_mla_fwd.py`), when `gb10` resolves True:
-- `pass_configs += TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True` — overlays
-  non-overlapping smem live ranges (Q dead after the QK GEMMs overlays the PV
-  output region, etc.). This is the same load-bearing flag cppmega/Megatron's
-  DSA ships on GB10.
 - `pass_configs += TL_DISABLE_TMA_LOWER: True` — sm_12x has no Hopper TMA path.
+- **`TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE` is INTENTIONALLY OFF** on the fwd
+  gb10 path (it was enabled until 2026-06-02). It is *unsound* for this kernel —
+  it aliases the cross-warp reduce workspace onto `S_shared`, leaking `-inf` into
+  the P@V GEMM and producing `inf` Output columns 256-511 on partial-softmax
+  rows. See **"FORWARD inf bug — ROOT-CAUSED AND FIXED"** below. The kernel fits
+  the 99 KiB cap *without* merge (~96 KiB) because merge never overlaid the
+  always-live `Q_shared` anyway.
 - **Drop `O_shared`** (64 KiB at H_per_block=64, D=512): store `acc_o` straight
   to `Output` instead of the `acc_o -> O_shared -> Output` round-trip. Mirrors
   cppmega `tilelang_sparse_mla_fwd.py:287`.
@@ -99,6 +102,100 @@ way through to ptxas on sm_121a. No fallback was added; the non-callable path
 is unchanged.
 
 ## Parity
+
+### FORWARD inf bug — ROOT-CAUSED AND FIXED 2026-06-02 (gb10 sm_121a, measured)
+
+**The official `test_sparse_mla_fwd(check_correctness=True)` now PASSES at BOTH
+S=512/topk=256 AND S=4096/topk=2048 — no nan/inf, whole-tensor, ALL rows.**
+
+**The bug.** The re-tiled gb10 fwd produced `inf` in `Output` on a subset of
+query rows — exactly the early/partial rows whose valid-key count is `< topk`
+(rows 0,1,2,4,8,... in the official OOB-sentinel harness). At S=512/topk=256/H=128
+that was 5632 inf over a handful of rows; the official test then failed with
+`diff=nan` (any inf in `x` makes `calculate_tensor_similarity`'s
+`(x*x+y*y).sum()` = inf → `sim` = nan → `diff = 1-nan = nan`).
+
+**Why the prior "cos 0.998" hid it.** The earlier parity table (below, kept for
+history) measured cos **only over `q >= topk` "fully-filled" rows** — which
+EXCLUDED every inf row. That number was therefore not honest about the failure.
+The corrected all-rows numbers are in the table further down.
+
+**Precise characterization (bisected on real sm_121a).** The inf is:
+- always in `Output` columns **256–511** (upper half of `D=512`), never 0–255;
+- only on rows with at least one **masked** topk slot (`idx > q`) — with every
+  slot valid (`FULLY-VALID`/`DENSE-VALID` index sets) the output is `inf`-free;
+- present whether the padding index is the OOB sentinel `SKV` **or** an in-bounds
+  masked index — so it is NOT the gather reading `KV[SKV]` (that hypothesis was
+  tested and rejected);
+- `lse` is **finite** on the inf rows — so the softmax scalars (`m_i`, `sumexp`)
+  are not themselves overflowing;
+- **non-deterministic** in count across recompiles.
+
+**Root cause (byte-level proof).** It is the
+`TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE` pass. Its linear-scan smem arena
+aliases the **cross-warp reduce workspace** — the `tl::AllReduce<MaxOp/SumOp>`
+scratch buffer, which on masked/partial tiles transiently holds the
+`-CUDART_INF_F` reduction identity (the max-reduce seeds `m_i_clear = -inf`) —
+onto the **same byte offset as `S_shared`**, the post-exp attention-weight tile
+that feeds the P@V GEMM. Measured in the generated CUDA: with merge ON the
+max-reduce scratch lands at `((float*)buf_dyn_shmem)[23040]` = **byte 92160**,
+which is exactly `S_shared`'s base (bf16 offset 46080 = byte 92160). The `-inf`
+partials leak through the P@V `S_shared @ KV_shared` GEMM into `acc_o[:, 256:512]`
+→ `inf` in Output cols 256–511. With merge OFF the two reduce scratches get their
+own offsets (`[23804]`/`[24060]` = byte 95216 / 96240, *above* `S_shared`) — no
+collision, output clean.
+
+**A/B that proves it (S=512/topk=256/H=128, real sm_121a):**
+
+| build | out inf | full-tensor cos | reduce-scratch offset |
+|-------|---------|-----------------|------------------------|
+| merge ON  (old gb10 path) | 3072–5632 | **nan** | float 23040 == S_shared (byte 92160) |
+| merge OFF (new gb10 path)  | **0** | **0.999998** | float 23804/24060 (byte 95216/96240) |
+
+Clamping the `exp2` arguments to `<= 0` (a correct softmax no-op) only *partially*
+removed the inf and was non-deterministic — confirming the overflow is in the
+P@V data path (the aliased scratch), not in any `exp2`.
+
+**The fix** (`examples/deepseek_v32/sparse_mla_fwd.py`): do NOT set
+`TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE` on the fwd gb10 path. This removes the
+unsound transform entirely — one clear lowering, no fallback/clamp/row-exclusion.
+The kernel still fits 99 KiB without it (~96 KiB; merge never overlaid the
+dominant always-live `Q_shared`, so it bought no fwd headroom). Hopper (gb10=False)
+never enabled the flag and is byte-unchanged. The bwd keeps merge (it needs it to
+fit and does NOT alias its reduce scratch onto a live data buffer — its bug class
+was the loop-invariant `Q_shared` overlay fixed in commit 823c807c, distinct).
+
+### Forward parity — HONEST all-rows (gb10 sm_121a, merge OFF, fix applied)
+
+`inf=0, nan=0` everywhere; cos is over the **FULL tensor (every row)**, finite
+fraction = 1.0000 (nothing excluded):
+
+| S    | SKV  | H   | topk | FULL-tensor cos | FULL rel-err |
+|------|------|-----|------|-----------------|--------------|
+| 512  | 1024 | 128 | 256  | 0.99999821      | 0.0019       |
+| 1024 | 2048 | 128 | 512  | 0.99999811      | 0.0019       |
+| 2048 | 4096 | 128 | 1024 | 0.99999804      | 0.0019       |
+| 4096 | 8192 | 128 | 2048 | PASS (eps=1e-2) | —            |
+
+Official `test_sparse_mla_fwd(check_correctness=True)` → `assert_tensors_similar
+passed` at S=512/topk=256 AND S=4096/topk=2048.
+
+### Backward parity — HONEST all-rows (gb10 sm_121a, fix applied; fwd feeds bwd)
+
+With the inf-free fwd `lse`/`out` now fed into the bwd, the bwd also passes — and
+**H=128 (previously reported `diff=nan`, mis-attributed to an OOB artifact) now
+passes with `inf=0, nan=0` over the full tensor**, proving that "nan" was the same
+fwd merge-aliasing inf propagating into the bwd, not a harness artifact:
+
+| S    | SKV  | H   | topk | DQ cos   | DQ relerr | DKV cos  | DKV relerr |
+|------|------|-----|------|----------|-----------|----------|------------|
+| 512  | 1024 | 64  | 256  | 0.999996 | 0.0027    | 0.999997 | 0.0025     |
+| 512  | 1024 | 128 | 256  | 0.999996 | 0.0027    | 0.999997 | 0.0025     |
+
+Official `test_sparse_mla_bwd(check_correctness=True)` → `assert_tensors_similar
+passed` at H=64 AND H=128 (S=512/topk=256), and at S=2048/H=64/topk=1024.
+
+----
 
 **STATUS 2026-06-02 UPDATE (measured on gb10, libtilelang.so relinked 12:38,
 branch `merge/upstream-codegen-reorg` @ `ce315509`, submodule tvm `62cc0314`):
@@ -232,7 +329,16 @@ Hopper path keeps the `T.alloc_fragment([BI], "bool")` byte-for-byte. The 61x
 GONE after this change (they were the same coupling surfacing on the `[H]`
 scalars).
 
-### Forward parity -- MEASURED on gb10 sm_121a (cos over fully-filled rows)
+### Forward parity -- SUPERSEDED (cos over fully-filled rows ONLY -- HID the inf)
+
+> **SUPERSEDED 2026-06-02.** This table measured cos **only over `q >= topk`
+> rows, which EXCLUDED the inf rows** and so reported a passing-looking number
+> while the official whole-tensor test actually FAILED with `diff=nan`. The text
+> below mis-attributed the residual to an "OOB-sentinel test-harness artifact";
+> the real cause was the merge-pass reduce-scratch aliasing documented in
+> **"FORWARD inf bug — ROOT-CAUSED AND FIXED"** at the top of this Parity
+> section. Use the HONEST all-rows table there (FULL-tensor cos 0.999998, the
+> mask-in-shared mask-fix from this section is retained and still load-bearing).
 
 | S    | SKV  | topk | cos(q>=topk) | rel-err(q>=topk) |
 |------|------|------|--------------|------------------|
@@ -240,13 +346,8 @@ scalars).
 | 1024 | 2048 | 512  | 0.998441     | 0.0166           |
 | 2048 | 4096 | 1024 | 0.998458     | 0.0156           |
 
-`cos=0.9984` consistently (was 0.70). The residual ~0.0016 and the slightly
-lower whole-tensor cos are entirely from the test's degenerate EARLY-query rows
-(`q < topk`): the harness pads unused index slots with the OOB sentinel value
-`SKV` (which indexes `KV[SKV]`, one row out of bounds), so those few mostly-
-masked rows have an ill-conditioned softmax in bf16. They are a test-harness
-artifact (real DSA indices are in-bounds), not a kernel defect -- `out_nan=0`,
-`ref_nan=0`, and every fully-filled row matches at 0.998.
+(Kept for history. The `q >= topk` restriction is exactly the row-exclusion that
+masked the inf bug — do not reuse this measurement methodology.)
 
 ### Backward -- ROOT-CAUSED AND FIXED 2026-06-02 (gb10, measured). dq/dkv cos = 1.000
 
@@ -309,18 +410,24 @@ caveat as fwd):
 | 512  | 1024 | 64  | 256  | 1.00000  | 0.0023    | 1.00000  | 0.0024     |
 | 512  | 1024 | 128 | 256  | 0.99710  | 0.083     | 0.99713  | 0.082      |
 
+> **CORRECTED 2026-06-02.** The claim below that the bwd `diff=nan` at H=128 was
+> "purely the OOB-sentinel artifact" was WRONG (same row-exclusion reasoning that
+> hid the fwd inf). The H=128 bwd nan was the **fwd merge-aliasing inf** in
+> `lse`/`out` propagating into the bwd. With the fwd fix (merge OFF), the OFFICIAL
+> `test_sparse_mla_bwd(check_correctness=True)` now PASSES at H=128 too — whole
+> tensor, OOB-sentinel harness, eps=1e-4, `inf=0 nan=0`. See the HONEST all-rows
+> bwd table at the top of this Parity section (dq/dkv cos 0.999996 at both H=64
+> and H=128).
+
 The official `test_sparse_mla_bwd` (OOB-sentinel harness, eps=1e-4 whole-tensor)
-PASSES at H=64 (`assert_tensors_similar passed`). At H=128 it reports
-`diff=nan` -- purely the OOB-sentinel artifact (unused slots are padded with the
-out-of-bounds index `SKV`; head-replication amplifies the resulting ill-
-conditioned early-row softmax to nan), identical to the documented fwd behavior
-and NOT a kernel defect: with in-bounds indices H=128 is clean at cos=0.997
-(table above, `dq nan=0 dkv nan=0`).
+PASSES at H=64 AND H=128 (`assert_tensors_similar passed`).
 
 **DELIVERABLE STATUS: FORWARD *and* BACKWARD sparse-MLA PASS parity on GB10
-sm_121a. Fused sparse-MLA is FULLY DONE on GB10 (fwd+bwd compile <=99 KiB +
-launch + run + parity): fwd cos=0.998-1.000, bwd dq/dkv cos=1.000 (H=64) /
-0.997 (H=128 head-replication).**
+sm_121a — OFFICIAL whole-tensor tests, ALL rows, no nan/inf, no row exclusion.
+fwd FULL-tensor cos=0.999998 (S up to 4096/topk 2048); bwd dq/dkv cos=0.999996
+(H=64 and H=128). The fwd inf bug (merge-pass reduce-scratch aliasing onto
+S_shared) is root-caused and fixed by disabling the unsound aggressive-merge on
+the fwd gb10 path; the kernel still fits 99 KiB (~96 KiB).**
 
 ----
 

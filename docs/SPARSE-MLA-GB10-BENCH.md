@@ -1,9 +1,18 @@
 # Fused Sparse-MLA (DeepSeek-V3.2 / DSA) — GB10 sm_121a kernel benchmark
 
 **Kernel-level** speed + memory benchmark of the re-tiled fused sparse-MLA
-forward and backward kernels (the GB10 path fixed and proven in commit
-`823c807c`, fwd cos 0.998–1.000 / bwd dq,dkv cos 1.000) **vs the O(n²) dense
-MLA reference** they replace, at the `local_gb10_quarter` model shapes.
+forward and backward kernels (the GB10 path fixed and proven; fwd FULL-tensor
+all-rows cos **0.999998** / bwd dq,dkv cos **0.999996**, OFFICIAL whole-tensor
+tests PASS with no nan/inf — see `SPARSE-MLA-GB10-RETILE.md` "FORWARD inf bug")
+**vs the O(n²) dense MLA reference** they replace, at the `local_gb10_quarter`
+model shapes.
+
+> **PARITY CORRECTION 2026-06-02.** Earlier revisions of this doc cited
+> "fwd cos 0.998–1.000" measured **only over `q >= topk` rows**, which EXCLUDED
+> the early/partial rows that were silently producing `inf` (a merge-pass
+> reduce-scratch aliasing bug, now fixed by disabling aggressive-merge on the fwd
+> gb10 path). The honest ALL-rows numbers are cos 0.999998 (fwd) / 0.999996 (bwd)
+> with `out_nan=out_inf=0` everywhere. Speed/memory numbers below are unaffected.
 
 > **Scope — read this first.** Every number below is a **single attention
 > operator** measured in isolation on the GPU. This is **NOT** a full-model
@@ -43,7 +52,10 @@ which is what the GEMMs run over.)
   distorted by the degenerate early-row artifact the parity harness uses.
 
 Parity re-confirmed at the model head count: **H=28, S=1024, topk=512 →
-cos=0.999998, rel-err=0.0022**, `out_nan=0` (fully-filled rows, fused vs dense).
+cos=0.999998, rel-err=0.0022**, `out_nan=out_inf=0`. After the fwd inf fix this
+holds over the **FULL tensor (all rows)**, not just `q >= topk` — the official
+whole-tensor `assert_tensors_similar` passes at S=512/topk=256 and
+S=4096/topk=2048 (see `SPARSE-MLA-GB10-RETILE.md`).
 
 ## Results — fused sparse-MLA vs O(n²) dense reference (S=4096, S_kv=4096, H=28)
 
@@ -84,8 +96,8 @@ ptxas on real sm_121a:
 
 | kernel | config | dynamic smem | vs 99 KiB cap |
 |--------|--------|-------------:|---------------|
-| **fwd** | `block_I=16, num_stages=1, drop-O, aggressive-merge` | **93.0 KiB** (95216 B) | FITS (5 KiB spare) |
-| **bwd** | `threads=128, block_size=16, block_H=32` | **89.0 KiB** (merged ~86 KiB live) | FITS (10 KiB spare) |
+| **fwd** | `block_I=16, num_stages=1, drop-O, merge OFF` | **~96 KiB** (reduce scratch at byte 95216/96240) | FITS (~5 KiB spare) |
+| **bwd** | `threads=128, block_size=16, block_H=32, aggressive-merge` | **89.0 KiB** (merged ~86 KiB live) | FITS (10 KiB spare) |
 
 Both fit; the `AtomicAddx4` dKV path is preserved (verified in generated CUDA).
 
@@ -140,8 +152,9 @@ at <1 GB peak each.
    attention intermediate per A-layer**, but the >118 GB eager OOM is elsewhere
    and must be addressed separately (graph segmentation / path_c fusion).
 
-**Bottom line:** the fused sparse-MLA kernel is real, correct (cos 0.998–1.000),
-and on GB10/sm_121a is **8–53× faster** and uses **21–26× less memory** than the
+**Bottom line:** the fused sparse-MLA kernel is real, correct (FULL-tensor
+all-rows cos 0.999998 fwd / 0.999996 bwd, official whole-tensor tests PASS with
+no nan/inf), and on GB10/sm_121a is **8–53× faster** and uses **21–26× less memory** than the
 O(n²) dense reference at the model's S=4096/H=28 shapes. Translating that into a
 full-model tok/s vs Megatron requires steps 1–2 above; this document delivers the
 kernel-level number, not the full-model number.

@@ -82,9 +82,15 @@ def sparse_mla_fwd(
     """Build the sparse-MLA forward kernel.
 
     Arch-aware: when ``gb10`` resolves True (sm_120/sm_121, or explicit), emit
-    the 99 KiB-fitting variant -- aggressive smem merge + TMA-lower disabled +
-    ``O_shared`` dropped (store ``acc_o`` straight to ``Output``).  Otherwise
-    emit the original Hopper kernel byte-for-byte.
+    the 99 KiB-fitting variant -- TMA-lower disabled + ``O_shared`` dropped
+    (store ``acc_o`` straight to ``Output``) + the boolean KV mask kept in shared
+    memory.  Otherwise emit the original Hopper kernel byte-for-byte.
+
+    NOTE: the aggressive-shared-memory-merge pass is deliberately NOT used on the
+    gb10 path -- it unsoundly aliases the cross-warp reduce workspace (holding the
+    -inf reduction identity) onto ``S_shared``, leaking inf into the P@V GEMM
+    output (Output cols 256-511) on partial-softmax rows.  See the pass_configs
+    block below for the full root cause and the measured all-rows parity.
 
     ``static_shape``: optional ``(batch, seq_len, seq_len_kv)`` tuple.  On the
     merge/upstream-codegen-reorg branch the tir->tirx migration regresses
@@ -96,13 +102,15 @@ def sparse_mla_fwd(
 
     if use_gb10:
         # MEASURED 99 KiB fit on real sm_121a ptxas (CUDA 13.3, GB10).
-        # The aggressive-merge pass does NOT overlay the always-live Q_shared
-        # (64 KiB at H_per_block=64,D=512) with anything, so the peak smem is
-        # essentially the naive single-stage buffer sum.  Measured ptxas budget
-        # by block_I at num_stages=1, drop-O, aggressive-merge:
-        #   block_I=64 -> 152.0 KiB (overflow)   block_I=32 -> 112.0 KiB (overflow)
-        #   block_I=16 ->  93.0 KiB (FITS, 0x173f0 <= 0x18c00)
-        # and num_stages=2 double-buffers the KV/S tiles -> 225 KiB (overflow).
+        # Without the (unsound) aggressive-merge pass the peak smem is the naive
+        # single-stage buffer sum -- the always-live Q_shared (64 KiB at
+        # H_per_block=64,D=512) dominates and merge could never overlay it, so
+        # dropping merge costs no real headroom.  Measured ptxas budget by block_I
+        # at num_stages=1, drop-O, merge OFF:
+        #   block_I=64 -> overflow   block_I=32 -> overflow
+        #   block_I=16 -> ~96 KiB (FITS <= 0x18c00; reduce scratch at byte 95216/
+        #                          96240, just above S_shared, no collision)
+        # and num_stages=2 double-buffers the KV/S tiles -> overflow.
         # So the GB10 path forces block_I=16, num_stages=1 unless the caller
         # passed explicit non-default values (which we honor and let fail loud).
         if block_I == 64:
@@ -115,10 +123,30 @@ def sparse_mla_fwd(
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     }
     if use_gb10:
-        # GB10 sm_121 99 KiB cap: overlay non-overlapping smem buffers and
-        # disable the Hopper TMA lowering (sm_12x has no Hopper TMA path).
-        pass_configs[tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE] = True
+        # GB10 sm_121 99 KiB cap: disable the Hopper TMA lowering (sm_12x has no
+        # Hopper TMA path).
         pass_configs[tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER] = True
+        # NOTE: TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE is INTENTIONALLY NOT set
+        # on the fwd gb10 path.  It is UNSOUND for this kernel: the merge pass'
+        # linear-scan arena aliases the cross-warp reduce *workspace* buffer (the
+        # `tl::AllReduce<MaxOp/SumOp>` scratch, which transiently holds the
+        # -CUDART_INF_F reduction identity on masked/partial tiles) onto the SAME
+        # byte offset as `S_shared` -- the post-exp attention-weight tile feeding
+        # the P@V GEMM.  MEASURED on real sm_121a (CUDA 13.3): with merge ON the
+        # max-reduce scratch lands at float offset 23040 == S_shared base
+        # (byte 92160); the -inf partials leak through the P@V GEMM into
+        # acc_o[:, 256:512], producing `inf` in Output columns 256-511 on exactly
+        # the early/partial-softmax rows (valid_key_count < topk).  This made the
+        # official test fail with diff=nan (the prior cos=0.998 number had SILENTLY
+        # EXCLUDED these inf rows by measuring only q>=topk).  With merge OFF the
+        # two reduce scratches get their own offsets (23804/24060, byte 95216/
+        # 96240, above S_shared) -- no collision.  The kernel still fits the 99 KiB
+        # cap WITHOUT merge: block_I=16/num_stages=1 lowers to ~96 KiB (the merge
+        # pass never overlaid the always-live Q_shared anyway, so it bought no
+        # headroom for fwd).  Verified inf=0, FULL-tensor (ALL rows) cos=0.999998,
+        # official assert_tensors_similar(eps=1e-2) PASS at S=512/topk=256 AND
+        # S=4096/topk=2048.  Hopper (gb10=False) is unaffected -- it never enabled
+        # this flag.
 
     # Apply the dynamically-built jit decorator to the (uncalled) lazy builder
     # -- it must RETURN a PrimFunc so tilelang.jit infers "lazy" mode.  Calling
