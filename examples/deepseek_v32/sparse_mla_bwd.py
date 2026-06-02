@@ -236,7 +236,19 @@ def _build_bwd(
             KV_shared = T.alloc_shared([BS, D], dtype)
             KV_tail_shared = T.alloc_shared([BS, D_tail], dtype)
             dO_shared = T.alloc_shared([block_H, D], dtype)
-            mask = T.alloc_fragment([BS], "bool")
+            # GB10 (sm_121) layout-inference fix (mirrors sparse_mla_fwd.py): keep
+            # the boolean KV `mask` in SHARED memory.  When `mask` is a [BS]
+            # fragment broadcast-read across the head axis inside the
+            # [block_H, BS] masked-init `T.Parallel` that writes the GEMM
+            # accumulator `acc_p`, the layout solver gives `mask` a thread->
+            # element layout inconsistent with `acc_p`'s mma accumulator layout
+            # on sm_121, scrambling the masked-init.  Reading the mask from
+            # shared memory removes the fragment-layout coupling.  Hopper keeps
+            # the fragment path byte-identical.
+            if use_gb10:
+                mask = T.alloc_shared([BS], "bool", scope="shared")
+            else:
+                mask = T.alloc_fragment([BS], "bool")
 
             P_shared_cast = T.alloc_shared([block_H, BS], dtype)
             dP_shared_cast = T.alloc_shared([block_H, BS], dtype)

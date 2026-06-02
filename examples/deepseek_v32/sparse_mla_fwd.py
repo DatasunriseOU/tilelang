@@ -214,7 +214,25 @@ def _build_sparse_mla_fwd(
             if not use_gb10:
                 O_shared = T.alloc_shared([H_per_block, D], dtype)
             Lse_shared = T.alloc_shared([H_per_block], accum_dtype)
-            mask = T.alloc_fragment([BI], "bool")
+            # GB10 (sm_121) layout-inference fix: keep the boolean KV `mask` in
+            # SHARED memory instead of a per-thread fragment.  When `mask` is a
+            # [BI] fragment that is broadcast-read across the H axis inside the
+            # [H_per_block, BI] masked-init `T.Parallel` that writes the GEMM
+            # accumulator `acc_s`, the layout solver assigns `mask` a thread->
+            # element layout that is INCONSISTENT with `acc_s`'s wgmma/mma
+            # accumulator layout on sm_121 (FullRow, threads=256, H=64).  The
+            # masked-init values then land in the wrong lanes -> the attention
+            # scores are scrambled (cos~0.70, output direction wrong).  Reading
+            # the mask from shared memory removes the fragment-layout coupling
+            # (every thread reads mask[bi_i] by absolute index), so the init is
+            # correct on every arch.  Bisected to cos=1.000 vs 0.70 on real
+            # sm_121a (examples/deepseek_v32/repro_gather_rescale.py).  Hopper is
+            # kept byte-identical via the fragment path (it lowers acc_s to a
+            # coincidentally-matching layout, so it was never wrong there).
+            if use_gb10:
+                mask = T.alloc_shared([BI], "bool", scope="shared")
+            else:
+                mask = T.alloc_fragment([BI], "bool")
 
             acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
             acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)

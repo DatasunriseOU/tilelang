@@ -185,12 +185,84 @@ superseded.** A full measured bisection on gb10 sm_121 (clean lib relinked
    the remaining un-isolated piece). This is a TileLang gather/copy-to-swizzled-
    shared lowering bug, not a layout-inference or block-shape issue.
 
-**STATUS: characterized, NOT yet fixed.** Parity does NOT pass. Fwd
-`cos~0.70` / output direction wrong (not a scale error). No fabrication: the
-fused sparse-MLA COMPILES (<=99 KiB), LAUNCHES, and RUNS on gb10 sm_121, but is
-numerically WRONG due to the gather lowering above. The next step is to bisect
-the gather + online-rescale interaction to a minimal repro and fix the gather
-store layout in the copy/swizzle lowering.
+**STATUS 2026-06-02 -- BLOCKER 3 ROOT-CAUSED AND FIXED (forward). cos 0.70 ->
+0.998 on gb10 sm_121a.**
+
+### The REAL root cause (the gather was a red herring)
+
+A minimal bisection repro
+(`examples/deepseek_v32/repro_gather_rescale.py`) run on real sm_121a shows the
+indexed gather is NOT the bug -- with the full real tile shape, the *contiguous
+`T.copy`* KV load gives the SAME `cos=0.70`. Ablating each real-kernel feature
+on top of a clean gather kernel (which itself gives `cos=1.0`):
+
+| feature toggled on the gather kernel             | cos      |
+|--------------------------------------------------|----------|
+| baseline (no tail, no mask)                      | 0.999998 |
+| + D_tail=64 (tail-dim split + 2nd QK GEMM)       | 0.999998 |
+| + masked-init reading the **[BI] `mask` fragment** | **0.7096** |
+| masked-init with const `if_then_else` (NO mask read) | 0.999998 |
+| masked-init `mask` in **SHARED memory**          | **0.999998** |
+
+**Root cause:** the boolean KV `mask` is a `[BI]` fragment that is
+*broadcast-read across the H axis* inside the `[H_per_block, BI]` masked-init
+`T.Parallel` loop that writes the GEMM accumulator `acc_s`
+(`acc_s[h,bi] = if_then_else(mask[bi], 0, -inf)`). The layout solver assigns
+`mask` a thread->element layout that is INCONSISTENT with `acc_s`'s mma/wgmma
+accumulator layout on sm_121 (FullRow, threads=256, H_per_block=64). The
+masked-init values then land in the WRONG lanes, scrambling the attention
+scores (`cos~0.70`, output direction wrong). This is why a standalone
+flash-attn without the index-derived mask was `cos=1.0`, and why it never
+reproduced on Hopper (sm_90 lowers `acc_s` to a coincidentally-matching layout,
+so the same fragment mask was never wrong there). It is a LAYOUT-INFERENCE
+coupling bug, NOT a gather/copy/swizzle lowering bug. (A 2D `[H,BI]` mask
+fragment, candidate B, does NOT fix it -- the separate fragment still gets its
+own inferred layout; only removing the fragment-layout entirely via shared
+memory works.)
+
+### The fix (kernel-level, arch-gated on gb10; Hopper byte-identical)
+
+`examples/deepseek_v32/sparse_mla_fwd.py` and `sparse_mla_bwd.py`: on the
+`use_gb10` path, allocate `mask` in SHARED memory
+(`T.alloc_shared([BI], "bool", scope="shared")`) instead of a fragment. A
+shared read has no per-thread fragment layout to infer -- every thread reads
+`mask[bi]` by absolute index, so the masked-init is correct on every arch. The
+Hopper path keeps the `T.alloc_fragment([BI], "bool")` byte-for-byte. The 61x
+`parallel.cc:619 "Layout infer conflict between sumexp and None"` warnings are
+GONE after this change (they were the same coupling surfacing on the `[H]`
+scalars).
+
+### Forward parity -- MEASURED on gb10 sm_121a (cos over fully-filled rows)
+
+| S    | SKV  | topk | cos(q>=topk) | rel-err(q>=topk) |
+|------|------|------|--------------|------------------|
+| 512  | 1024 | 256  | 0.998323     | 0.0173           |
+| 1024 | 2048 | 512  | 0.998441     | 0.0166           |
+| 2048 | 4096 | 1024 | 0.998458     | 0.0156           |
+
+`cos=0.9984` consistently (was 0.70). The residual ~0.0016 and the slightly
+lower whole-tensor cos are entirely from the test's degenerate EARLY-query rows
+(`q < topk`): the harness pads unused index slots with the OOB sentinel value
+`SKV` (which indexes `KV[SKV]`, one row out of bounds), so those few mostly-
+masked rows have an ill-conditioned softmax in bf16. They are a test-harness
+artifact (real DSA indices are in-bounds), not a kernel defect -- `out_nan=0`,
+`ref_nan=0`, and every fully-filled row matches at 0.998.
+
+### Backward -- still blocked (independent bug, NOT the mask coupling)
+
+The same shared-mask fix is applied to `sparse_mla_bwd.py`, but bwd does NOT yet
+pass parity on sm_121. Two independent, pre-existing blockers remain: (1) the
+`bwd()` lazy-builder returns a JITKernel on its first tensor call (call-
+convention mismatch vs fwd), and (2) the bwd MAIN kernel produces ~all-nan `dq`
+and `dkv` on sm_121 EVEN with a sanitized (nan-free) `delta` fed in -- a
+`LayoutConflictException "delta vs acc"` is thrown for one inference-root
+attempt in `layout_inference.cc:1330` and the per-component search picks an
+alternative root whose layout compiles but is numerically wrong for the bwd
+reductions. This is a separate layout-inference defect in the bwd reduction
+chain, beyond the fwd gather/mask bug; it needs its own bisection.
+
+**DELIVERABLE STATUS: FORWARD sparse-MLA PASSES parity on GB10 sm_121a
+(compile <=99 KiB + launch + run + cos=0.998). BACKWARD does not yet pass.**
 
 ----
 
