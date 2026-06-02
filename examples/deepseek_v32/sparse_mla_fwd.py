@@ -1,14 +1,69 @@
 # ruff: noqa
+import os
 import torch
 import tilelang
 from tilelang import language as T
 from utils import assert_tensors_similar
 
 
-@tilelang.jit(
-    out_idx=[-2, -1],
-    pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True, tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-)
+# ---------------------------------------------------------------------------
+# Arch-aware shared-memory budgeting (GB10 / sm_121 re-tile).
+#
+# Consumer Blackwell (sm_120 / sm_121, e.g. GB10) caps *dynamic* shared memory
+# at 99 KiB per block (101376 B), vs Hopper sm_90 (227 KiB) and B200 sm_100
+# (228 KiB).  The deepseek_v32 sparse-MLA tile authored for Hopper allocates
+# ~216 KiB of smem (Q/KV/O each 64 KiB at H_per_block=64,D=512) and, when
+# double-buffered by num_stages=2, lowers to ~180-296 KiB -- which ptxas
+# rejects on sm_121 ("too much shared data" / cuFuncSetAttribute reject).
+#
+# `_select_gb10` returns True when we should emit the GB10-fitting variant.
+# It is driven by an explicit `gb10=` kwarg (preferred) or, when unset, auto-
+# detected from the live device compute-capability.  The Hopper path is fully
+# preserved: pass gb10=False (the default on non-sm_12x devices) to get the
+# byte-identical original kernel.
+# ---------------------------------------------------------------------------
+
+# Compute-capability (major, minor) -> max dynamic smem (KiB).
+_SMEM_CAP_KIB = {
+    (7, 0): 96, (7, 5): 64, (8, 0): 163, (8, 6): 99, (8, 9): 99,
+    (9, 0): 228, (10, 0): 228, (10, 1): 228, (12, 0): 99, (12, 1): 99,
+}
+# Caps where the 99 KiB-fitting (aggressive-merge + drop-O_shared) variant is required.
+_GB10_CAPS = frozenset({(12, 0), (12, 1)})
+
+
+def _detect_cap():
+    """Return the live CUDA compute-capability (major, minor), or None."""
+    env = os.getenv("TILELANG_COMPUTE_CAP")  # e.g. "12.1" for offline builds
+    if env:
+        try:
+            major, minor = env.split(".")
+            return (int(major), int(minor))
+        except (ValueError, TypeError):
+            pass
+    try:
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_capability()
+    except Exception:
+        pass
+    return None
+
+
+def _select_gb10(gb10):
+    """Resolve the gb10 flag: explicit kwarg wins, else auto-detect sm_12x."""
+    if gb10 is not None:
+        return bool(gb10)
+    cap = _detect_cap()
+    return cap in _GB10_CAPS
+
+
+def smem_cap_kib(cap=None):
+    """Max dynamic smem (KiB) for a compute-cap; pessimistic 99 default."""
+    if cap is None:
+        cap = _detect_cap()
+    return _SMEM_CAP_KIB.get(cap, 99)
+
+
 def sparse_mla_fwd(
     heads,
     dim,
@@ -21,6 +76,59 @@ def sparse_mla_fwd(
     block_I=64,
     num_stages=2,
     threads=256,
+    gb10=None,
+    static_shape=None,
+):
+    """Build the sparse-MLA forward kernel.
+
+    Arch-aware: when ``gb10`` resolves True (sm_120/sm_121, or explicit), emit
+    the 99 KiB-fitting variant -- aggressive smem merge + TMA-lower disabled +
+    ``O_shared`` dropped (store ``acc_o`` straight to ``Output``).  Otherwise
+    emit the original Hopper kernel byte-for-byte.
+
+    ``static_shape``: optional ``(batch, seq_len, seq_len_kv)`` tuple.  On the
+    merge/upstream-codegen-reorg branch the tir->tirx migration regresses
+    symbolic dynamic shapes (stmt_functor.cc:694 -> "is not a callable
+    object"), so static shapes are required to lower there.  Pass concrete
+    ints to bake them into the prim_func; leave None for the dynamic build.
+    """
+    use_gb10 = _select_gb10(gb10)
+
+    pass_configs = {
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    }
+    if use_gb10:
+        # GB10 sm_121 99 KiB cap: overlay non-overlapping smem buffers and
+        # disable the Hopper TMA lowering (sm_12x has no Hopper TMA path).
+        pass_configs[tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE] = True
+        pass_configs[tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER] = True
+
+    # Apply the dynamically-built jit decorator to the (uncalled) lazy builder
+    # -- it must RETURN a PrimFunc so tilelang.jit infers "lazy" mode.  Calling
+    # the wrapped builder triggers compilation and returns the kernel object.
+    jit_decorator = tilelang.jit(out_idx=[-2, -1], pass_configs=pass_configs)
+    wrapped = jit_decorator(_build_sparse_mla_fwd)
+    return wrapped(
+        heads, dim, tail_dim, topk, kv_group, sm_scale, is_causal, CP0,
+        block_I, num_stages, threads, use_gb10, static_shape,
+    )
+
+
+def _build_sparse_mla_fwd(
+    heads,
+    dim,
+    tail_dim,
+    topk,
+    kv_group,
+    sm_scale,
+    is_causal,
+    CP0,
+    block_I,
+    num_stages,
+    threads,
+    use_gb10,
+    static_shape=None,
 ):
     assert dim == tilelang.math.next_power_of_2(dim), f"haven't check padding correctness yet, dim={dim}"
     assert tail_dim == tilelang.math.next_power_of_2(tail_dim), f"haven't check padding correctness yet, dim={tail_dim}"
@@ -31,9 +139,12 @@ def sparse_mla_fwd(
     else:
         sm_scale = sm_scale * 1.44269504  # log2(e)
 
-    batch = T.dynamic("batch")
-    seq_len = T.dynamic("seq_len")
-    seq_len_kv = T.dynamic("seq_len_kv")
+    if static_shape is not None:
+        batch, seq_len, seq_len_kv = static_shape
+    else:
+        batch = T.dynamic("batch")
+        seq_len = T.dynamic("seq_len")
+        seq_len_kv = T.dynamic("seq_len_kv")
 
     head_kv = heads // kv_group
     q_shape = [batch, seq_len, heads, dim + tail_dim]
@@ -82,7 +193,10 @@ def sparse_mla_fwd(
             Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
             KV_shared = T.alloc_shared([BI, D], dtype)
             K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
-            O_shared = T.alloc_shared([H_per_block, D], dtype)
+            # GB10: drop O_shared (64 KiB at H=64,D=512); store acc_o directly
+            # to Output.  Hopper keeps the staged O_shared for vectorized store.
+            if not use_gb10:
+                O_shared = T.alloc_shared([H_per_block, D], dtype)
             Lse_shared = T.alloc_shared([H_per_block], accum_dtype)
             mask = T.alloc_fragment([BI], "bool")
 
@@ -158,14 +272,18 @@ def sparse_mla_fwd(
             for h_i in T.Parallel(H_per_block):
                 sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
 
-            T.copy(acc_o, O_shared)
-            T.copy(O_shared, Output[b_i, s_i, H0:H1, :])
+            if use_gb10:
+                # Direct store: acc_o -> Output (no O_shared round-trip).
+                T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
+            else:
+                T.copy(acc_o, O_shared)
+                T.copy(O_shared, Output[b_i, s_i, H0:H1, :])
             T.copy(sumexp, Lse[b_i, s_i, H0:H1])
 
     return main
 
 
-def sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, return_p_sum: bool = False, d_v=512, block_I=64, num_stages=2, threads=256):
+def sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, return_p_sum: bool = False, d_v=512, block_I=64, num_stages=2, threads=256, gb10=None, static_shape=False):
     is_casual = True
     assert return_p_sum == False, "This kernel file is for fwd only"
     assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
@@ -181,8 +299,11 @@ def sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, return_p_sum: bool =
     _, _, _, topk = indices.shape
     assert indices.shape == (batch, seq_len, kv_group, topk)
 
+    # static_shape=True bakes concrete (batch, seq_len, seq_len_kv) into the
+    # prim_func -- required on branches where tirx dynamic shapes regress.
+    ss = (batch, seq_len, seq_len_kv) if static_shape else None
     kernel = sparse_mla_fwd(
-        heads, dim, tail_dim, topk, kv_group, sm_scale, is_casual, block_I=block_I, num_stages=num_stages, threads=threads
+        heads, dim, tail_dim, topk, kv_group, sm_scale, is_casual, block_I=block_I, num_stages=num_stages, threads=threads, gb10=gb10, static_shape=ss
     )
     out, lse = kernel(q, kv, indices)
     return out, lse
@@ -239,6 +360,7 @@ def test_sparse_mla_fwd(
     block_I=64,
     num_stages=2,
     threads=256,
+    gb10=None,
 ):
     torch.random.manual_seed(0)
     q = torch.randn((B, S, H, DQK), dtype=dtype, device="cuda").requires_grad_(True)
@@ -251,7 +373,7 @@ def test_sparse_mla_fwd(
                 i_i = torch.randperm(max(1, t))[:topk]
                 indices[b, t, h, : len(i_i)] = i_i
 
-    tl_out, tl_lse = sparse_mla_fwd_interface(q, kv, indices, block_I=block_I, num_stages=num_stages, threads=threads)
+    tl_out, tl_lse = sparse_mla_fwd_interface(q, kv, indices, block_I=block_I, num_stages=num_stages, threads=threads, gb10=gb10)
 
     if check_correctness:
         # otherwise may cause out of memory
@@ -260,7 +382,7 @@ def test_sparse_mla_fwd(
         print("assert_tensors_similar passed")
 
     def fn():
-        return sparse_mla_fwd_interface(q, kv, indices, block_I=block_I, num_stages=num_stages, threads=threads)
+        return sparse_mla_fwd_interface(q, kv, indices, block_I=block_I, num_stages=num_stages, threads=threads, gb10=gb10)
 
     from tilelang.profiler import do_bench
 
@@ -275,7 +397,7 @@ def test_sparse_mla_fwd(
 
 
 def run_regression_perf(
-    B=1, S=4096, SKV=8192, H=128, HKV=1, DQK=576, DV=512, topk=2048, dtype=torch.bfloat16, block_I=64, num_stages=2, threads=256
+    B=1, S=4096, SKV=8192, H=128, HKV=1, DQK=576, DV=512, topk=2048, dtype=torch.bfloat16, block_I=64, num_stages=2, threads=256, gb10=None
 ):
     torch.random.manual_seed(0)
     q = torch.randn((B, S, H, DQK), dtype=dtype, device="cuda").requires_grad_(True)
@@ -294,7 +416,7 @@ def run_regression_perf(
     dim = 512
     tail_dim = dim_plus_tail_dim - dim
     _, _, _, topk = indices.shape
-    kernel = sparse_mla_fwd(heads, dim, tail_dim, topk, kv_group, None, is_casual, block_I=block_I, num_stages=num_stages, threads=threads)
+    kernel = sparse_mla_fwd(heads, dim, tail_dim, topk, kv_group, None, is_casual, block_I=block_I, num_stages=num_stages, threads=threads, gb10=gb10)
 
     def run_kernel_only():
         kernel(q, kv, indices)

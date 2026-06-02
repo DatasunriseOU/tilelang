@@ -1,8 +1,42 @@
 # ruff: noqa
+import os
 import tilelang
 from tilelang import language as T
 import torch
 from utils import assert_tensors_similar
+
+
+# ---------------------------------------------------------------------------
+# Arch-aware shared-memory budgeting (GB10 / sm_121 re-tile).  See
+# sparse_mla_fwd.py for the rationale.  The bwd kernel is heavier than fwd
+# (four full-D buffers: Q, dO, dQ, + fp32 dkv accumulators).  It already ships
+# with TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE on; the GB10 variant *also*
+# disables the Hopper TMA lowering and halves block_H (64 -> 32), which cuts
+# the three dominant 64 KiB Q/dO/dQ buffers in half.
+# ---------------------------------------------------------------------------
+_GB10_CAPS = frozenset({(12, 0), (12, 1)})
+
+
+def _detect_cap():
+    env = os.getenv("TILELANG_COMPUTE_CAP")
+    if env:
+        try:
+            major, minor = env.split(".")
+            return (int(major), int(minor))
+        except (ValueError, TypeError):
+            pass
+    try:
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_capability()
+    except Exception:
+        pass
+    return None
+
+
+def _select_gb10(gb10):
+    if gb10 is not None:
+        return bool(gb10)
+    return _detect_cap() in _GB10_CAPS
 
 
 @tilelang.jit(out_idx=[-1])
@@ -73,13 +107,6 @@ def postprocess(
     return postprocess_kernel
 
 
-@tilelang.jit(
-    out_idx=[-2],
-    pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
-    },
-)
 def bwd(
     B,
     S,
@@ -97,6 +124,51 @@ def bwd(
     indices_dtype=T.int32,
     dtype=T.bfloat16,
     accum_dtype=T.float32,
+    gb10=None,
+    block_H_override=None,
+):
+    """Build the sparse-MLA backward kernel.
+
+    Arch-aware: when ``gb10`` resolves True (sm_120/sm_121), disable the Hopper
+    TMA lowering and halve block_H (64 -> 32) so the three dominant 64 KiB
+    Q/dO/dQ buffers are cut in half.  The aggressive smem merge pass is always
+    on.  The Hopper path (gb10=False) keeps block_H = min(64, padded_H).
+    """
+    use_gb10 = _select_gb10(gb10)
+    pass_configs = {
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
+    }
+    if use_gb10:
+        pass_configs[tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER] = True
+    builder = _build_bwd(
+        B, S, S_kv, H, D, D_tail, topk, kv_group, sm_scale, is_causal,
+        block_size, num_stages, threads, indices_dtype, dtype, accum_dtype,
+        use_gb10, block_H_override,
+    )
+    jit = tilelang.jit(out_idx=[-2], pass_configs=pass_configs)
+    return jit(builder)
+
+
+def _build_bwd(
+    B,
+    S,
+    S_kv,
+    H,
+    D,
+    D_tail,
+    topk,
+    kv_group,
+    sm_scale,
+    is_causal,
+    block_size,
+    num_stages,
+    threads,
+    indices_dtype,
+    dtype,
+    accum_dtype,
+    use_gb10,
+    block_H_override,
 ):
     assert is_causal == True, "non-casual is not supported now"
     assert topk % block_size == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
@@ -121,7 +193,10 @@ def bwd(
 
     H = H_kv
     padded_H = max(tilelang.math.next_power_of_2(H_kv), 16)
-    block_H = min(64, padded_H)
+    # GB10 sm_121: halve block_H (64 -> 32) to cut the three dominant 64 KiB
+    # Q/dO/dQ buffers in half.  An explicit override wins over the arch default.
+    default_block_H = min(32 if use_gb10 else 64, padded_H)
+    block_H = block_H_override if block_H_override is not None else default_block_H
     assert padded_H % block_H == 0
     NH = padded_H // block_H
     BS = block_size
@@ -243,7 +318,7 @@ def bwd(
     return sparse_mla_bwd_kernel
 
 
-def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None, is_casual=True, return_kernel=False, delta=None):
+def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None, is_casual=True, return_kernel=False, delta=None, gb10=None):
     assert q.is_contiguous()
     assert kv.is_contiguous()
     assert indices.is_contiguous()
@@ -262,7 +337,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None, is_casual=True, re
 
     # Get kernels
     preprocess_kernel = preprocess(B, S, H, D)
-    bwd_kernel = bwd(B, S, S_kv, H, D, D_tail, topk, kv_group, sm_scale, is_casual)
+    bwd_kernel = bwd(B, S, S_kv, H, D, D_tail, topk, kv_group, sm_scale, is_casual, gb10=gb10)
     postprocess_kernel = postprocess(B, S_kv, D, D_tail, kv_group)
 
     if delta is None:
