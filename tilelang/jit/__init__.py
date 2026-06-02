@@ -389,7 +389,9 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
     def initialize_jit_mode(self, *args: _P.args, **kwargs: _P.kwargs) -> Literal["lazy", "eager"]:
         if self.mode == "auto":
             self.mode = self._infer_jit_mode(*args, **kwargs)
-        self.func.set_mode(self.mode)
+        # `set_mode` only exists on JITFunc; a raw PrimFunc input is implicitly lazy.
+        if isinstance(self.func, JITFunc):
+            self.func.set_mode(self.mode)
         if self.mode == "eager" and self.out_idx is not None:
             raise ValueError("out_idx is only supported in lazy mode. In eager mode, use T.empty() to declare output tensors instead.")
         return self.mode
@@ -507,6 +509,18 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
 
         kwargs.update(kwargs.pop("__tune_params", {}))
 
+        # A raw PrimFunc input is always lazy and has a fixed body: there is no
+        # `set_mode`/`parse_args` (those live on JITFunc). The compiled kernel does
+        # not depend on call args, so use a constant cache key.
+        if isinstance(self.func, PrimFunc):
+            self.mode = "lazy"
+            key = ((), ())
+            kernel = self._kernel_cache.get(key, None)
+            if kernel is None:
+                kernel = self.compile()
+                self._kernel_cache[key] = kernel
+            return kernel
+
         with self._target_elaboration_context():
             # infer mode early, before parse_args needs it
             if self.mode == "auto":
@@ -598,7 +612,22 @@ def jit(
         compile_flags=compile_flags,
     )
 
-    def decorator(func: Callable[_P, _T]):
+    def decorator(func: Callable[_P, _T] | PrimFunc):
+        # `jit` accepts an already-built PrimFunc (the lazy result of a builder) as
+        # well as a Python callable. After the tir->tirx migration a `tirx.PrimFunc`
+        # is NOT a callable object, so feeding it to `prim_func(...)`/`inspect.signature`
+        # raises `TypeError: <TVMScript> is not a callable object`. Handle the PrimFunc
+        # input explicitly here (mirroring `compile()` and `JITImpl.get_tir`, both of
+        # which already branch on `isinstance(..., PrimFunc)`), in lazy mode.
+        if isinstance(func, PrimFunc):
+            return JITImpl(
+                func=func,
+                **compile_args,
+                func_source=func.script(),
+                signature=inspect.Signature(),
+                mode="lazy",
+            )
+
         mode = "auto"
         pf: JITFunc[_P, _T] = prim_func(func, eager_jit=True)
         func_source = inspect.getsource(pf.orig_func)
