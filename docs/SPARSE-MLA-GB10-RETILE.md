@@ -139,7 +139,62 @@ static shapes the product exceeds 2^31, so the int32 IntImm overflowed when
 compared shape values in int64. VERIFIED: the full host JIT build now completes
 with no APInt abort (fwd + all bwd kernels build on the static-shape path).
 
-### BLOCKER 3 (numeric parity) -- pre-existing layout-inference conflict
+### BLOCKER 3 (numeric parity) -- ROOT CAUSE CORRECTED 2026-06-02 (gb10, measured)
+
+**The earlier "layout-inference conflict" attribution below is WRONG and is
+superseded.** A full measured bisection on gb10 sm_121 (clean lib relinked
+14:0x, branch `merge/upstream-codegen-reorg`) establishes:
+
+1. The `61x parallel.cc:619 "Layout infer conflict between sumexp and None"`
+   warnings are **cosmetic, not the bug**. Instrumenting
+   `ValidateCandidateAgainstFragments` shows all 61 are `throw_on_error=0 READ`
+   conflicts emitted while `ChooseBestCandidate` VALIDATES (and rejects) the
+   under-replicated `replicate:4` PlanLoopPartition candidate; it then correctly
+   returns the `replicate:8` buffer candidate (`buf_ok && !plan_ok` branch). The
+   buffer fragment ends up `replicate:8` (the acc_o/reduce layout) -- consistent.
+   Pinning `sumexp` to a hand `replicate:8` layout via `T.annotate_layout`
+   removed the warnings but did NOT change parity; forcing the scalars
+   fully-replicated produced a *hard* `Layout may conflict with ReduceOp
+   (m_i vs acc_s)` (good -- fail-loud) but still not the fix. So the softmax
+   normalization is NOT corrupted by a silent layout pick.
+
+2. The defect is **NOT `block_I`-specific.** At `H=16, threads=32` BOTH
+   `block_I=16` AND `block_I=64` give the same wrong `cos=0.728` -- the campaign
+   never tested `block_I=64` on gb10 (it can't fit 99 KiB at H_per_block=64, so
+   it was assumed-good from Hopper, never measured). `block_I`, `num_stages`,
+   `threads` (64/128/256, i.e. n_warp=1 vs 2), the aggressive-merge pass, and the
+   drop-O direct store are ALL exonerated by direct A/B (each toggled
+   independently, parity unchanged at ~0.7).
+
+3. **Real root cause: the indexed KV gather feeding the attention is
+   miscompiled in this kernel's full structure.** A standalone flash-attention
+   fwd with the identical online-softmax + stmatrix + reduce + two-GEMM +
+   tail-dim-split + masked-init pattern gives `cos=1.000000` on sm_121 when KV is
+   loaded with a contiguous `T.copy`. Swapping ONLY that load for the sparse-MLA
+   gather (`Ks[bi,d]=K[Idx[bi],d]`, the exact deepseek pattern) drops it to
+   `cos=0.70` -- WITH IDENTICAL KEYS (arange indices). i.e.
+   `gather-vs-contiguous, same keys -> cos 0.699` (reproducible). The generated
+   gather store address into the swizzled `Ks` is byte-identical to the working
+   `cp_async_gs` store, the cp.async sync/commit/wait is identical, and the
+   4-operand `cp.async.cg ...,16` predication is NOT the cause (patching it to the
+   3-operand form or to always-copy left parity unchanged). An *isolated* gather
+   (gather -> swizzled shared -> single or double GEMM -> +softmax -> per-query
+   multi-block) reproduces CORRECTLY (`cos=1.0`); the corruption only appears in
+   the full kernel, so the trigger is the gather combined with the rest of the
+   online-softmax loop (the multi-iteration `alpha`/`m_i_prev` running rescale is
+   the remaining un-isolated piece). This is a TileLang gather/copy-to-swizzled-
+   shared lowering bug, not a layout-inference or block-shape issue.
+
+**STATUS: characterized, NOT yet fixed.** Parity does NOT pass. Fwd
+`cos~0.70` / output direction wrong (not a scale error). No fabrication: the
+fused sparse-MLA COMPILES (<=99 KiB), LAUNCHES, and RUNS on gb10 sm_121, but is
+numerically WRONG due to the gather lowering above. The next step is to bisect
+the gather + online-rescale interaction to a minimal repro and fix the gather
+store layout in the copy/swizzle lowering.
+
+----
+
+#### Superseded (incorrect) Blocker-3 note kept for history
 
 With both codegen bugs fixed, the kernel runs but the output is WRONG. Measured
 on gb10 (S=1024, SKV=2048, topk=512, H=128): the fwd global similarity is only
