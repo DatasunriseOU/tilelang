@@ -94,6 +94,22 @@ def sparse_mla_fwd(
     """
     use_gb10 = _select_gb10(gb10)
 
+    if use_gb10:
+        # MEASURED 99 KiB fit on real sm_121a ptxas (CUDA 13.3, GB10).
+        # The aggressive-merge pass does NOT overlay the always-live Q_shared
+        # (64 KiB at H_per_block=64,D=512) with anything, so the peak smem is
+        # essentially the naive single-stage buffer sum.  Measured ptxas budget
+        # by block_I at num_stages=1, drop-O, aggressive-merge:
+        #   block_I=64 -> 152.0 KiB (overflow)   block_I=32 -> 112.0 KiB (overflow)
+        #   block_I=16 ->  93.0 KiB (FITS, 0x173f0 <= 0x18c00)
+        # and num_stages=2 double-buffers the KV/S tiles -> 225 KiB (overflow).
+        # So the GB10 path forces block_I=16, num_stages=1 unless the caller
+        # passed explicit non-default values (which we honor and let fail loud).
+        if block_I == 64:
+            block_I = 16
+        if num_stages == 2:
+            num_stages = 1
+
     pass_configs = {
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,

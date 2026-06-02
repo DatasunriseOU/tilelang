@@ -135,6 +135,21 @@ def bwd(
     on.  The Hopper path (gb10=False) keeps block_H = min(64, padded_H).
     """
     use_gb10 = _select_gb10(gb10)
+
+    if use_gb10:
+        # MEASURED 99 KiB fit on real sm_121a ptxas (CUDA 13.3, GB10).
+        # block_H cannot go below 32 (GEMM "warp_row_tiles must be > 16"); at the
+        # default threads=256 the smallest valid block_size is also 32, which
+        # gives 108.0 KiB (overflow).  Dropping to threads=128 (4 warps) relaxes
+        # the warp-row-tiles constraint so block_size=16 becomes valid, halving
+        # KV_shared / P / dP / acc_dkv_shared.  Measured ptxas budget:
+        #   threads=256, block_size=32 -> 108.0 KiB (overflow)
+        #   threads=128, block_size=16 ->  89.0 KiB (FITS)  -- atomic_addx4 kept.
+        if threads == 256:
+            threads = 128
+        if block_size == 32:
+            block_size = 16
+
     pass_configs = {
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,

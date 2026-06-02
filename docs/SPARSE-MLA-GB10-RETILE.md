@@ -37,90 +37,74 @@ The original tile dims are otherwise unchanged: `block_I=64`, `dim=512`,
 `tail_dim=64`, `threads=256`, `topk` a multiple of `block_I` — matching the
 production tile that cppmega's DSA fits on GB10.
 
-## Smem math (analytical, heads=128 -> H_per_block=64, D=512, D_tail=64, bf16=2B/fp32=4B)
+## GB10 compile result (sm_121a, real ptxas) -- MEASURED, FINAL
 
-Forward GB10 variant (O_shared dropped), single-stage buffer set:
+Environment: gb10, `/home/dave/cppmega-venv/bin/python` (py3.13), CUDA 13.3
+ptxas (`release 13.3, V13.3.33`), branch `merge/upstream-codegen-reorg` @
+`72e10529`+ (eager-builder PrimFunc fix landed), submodule 3rdparty/tvm @
+`62cc0314`, `cap (12, 1)`, `-arch=sm_121a`.
 
-| buffer        | shape    | bytes  |
-|---------------|----------|--------|
-| Q_shared      | [64,512] | 65536  |
-| Q_tail_shared | [64,64]  |  8192  |
-| KV_shared     | [64,512] | 65536  |
-| K_tail_shared | [64,64]  |  8192  |
-| S_shared      | [64,64]  |  8192  |
-| Lse_shared    | [64]     |   256  |
-| naive sum (stages=1)                | **155904 B = 152.2 KiB** |
+The smem budget is dominated by the **always-live `Q_shared` tile**
+(`[H_per_block=64, D=512]` bf16 = 64 KiB) which the aggressive-merge pass
+canNOT overlay (it is read by the QK GEMM on every iteration). So the lowered
+footprint is essentially the naive single-stage buffer sum -- the earlier
+"merge overlays Q -> ~88 KiB" estimate was analytical optimism and did NOT
+hold at ptxas. The fit was found empirically by shrinking the index tile.
 
-The aggressive-merge pass overlays the non-simultaneously-live buffers. The
-binding live set is the PV GEMM `S_shared @ KV_shared -> acc_o`:
-`KV_shared(64K) + S_shared(8K) + K_tail(8K) + Q_tail(8K) + Lse(0.25K) ~= 88.2 KiB`,
-which fits 99 KiB **at num_stages=1**. At **num_stages=2** the Pipelined loop
-double-buffers KV_shared/K_tail/S_shared, pushing the lowered footprint to
-**225 KiB**, which overflows (see below).
+### Forward -- ptxas budget vs `block_I` (num_stages=1, drop-O, merge on)
 
-Backward GB10 variant: `block_H=32` drops the naive sum from 288 KiB
-(block_H=64) to **180 KiB**; the merge pass overlays Q/dO/dQ (non-overlapping
-lifetimes) plus the per-split-store `acc_dkv` reuse to land under 99 KiB. The
-`acc_dkv*` accumulators must stay fp32 (they are the `atomic_addx4` targets).
+| block_I | smem used        | vs 99 KiB (0x18c00) |
+|---------|------------------|---------------------|
+| 64      | 0x26000 = 152.0 KiB | OVERFLOW          |
+| 32      | 0x1c000 = 112.0 KiB | OVERFLOW          |
+| **16**  | **0x173f0 = 93.0 KiB** | **FITS, compiles** |
 
-## GB10 compile result (sm_121a, real ptxas)
+`num_stages=2` double-buffers KV/K_tail/S -> 225 KiB (0x38400) overflow, so the
+GB10 path also forces `num_stages=1`. **FINAL fwd GB10 config: `block_I=16,
+num_stages=1`** (auto-applied when `gb10` resolves True and the caller left the
+Hopper defaults). 93.0 KiB, full compile to a `JITKernel` -- no ptxas reject.
 
-Environment: gb10, `/home/dave/cppmega-venv/bin/python`, torch
-2.13.0.dev+cu132, tilelang 0.1.9+cuda.git1d5473a5, branch
-`merge/upstream-codegen-reorg`, `cap (12, 1)`.
+### Backward -- ptxas budget (block_H, block_size, threads)
 
-- The re-tiled fwd **lowers all the way through to ptxas on `-arch=sm_121a`**
-  (no TMA/warp-spec reject; the kernel body, GEMMs, online-softmax, direct
-  acc_o store all codegen). This confirms the arch targeting is correct.
-- At `block_I=64, num_stages=2, gb10=True` ptxas reports:
-  ```
-  ptxas error : Entry function 'main_kernel' uses too much shared data
-                (0x38400 bytes, 0x18c00 max)
-  ```
-  = **used 0x38400 = 230400 B = 225.0 KiB** vs **max 0x18c00 = 101376 B =
-  99 KiB**. So num_stages=2 still overflows: the aggressive-merge + drop-O
-  reclaims O_shared but cannot defeat the 2x double-buffering of the staged
-  KV/K_tail/S buffers. **num_stages=1 (or block_I=32) is required to fit.**
+`block_H` cannot drop below 32 and `block_size` cannot drop below 32 *at
+threads=256* -- both trip the GEMM constraint `warp_row_tiles must be greater
+than 16`. At the minimum valid `threads=256, block_H=32, block_size=32` the
+kernel is **108.0 KiB (0x1b000)** -- overflow by 9 KiB. Dropping to
+**`threads=128`** (4 warps) relaxes the warp-row-tiles constraint so
+`block_size=16` becomes valid, halving KV_shared / P_shared_cast /
+dP_shared_cast / acc_dkv_shared:
 
-## REMAINING BLOCKER (honest): branch-wide tirx eager-builder regression
+| threads | block_H | block_size | smem used        | result   |
+|---------|---------|-----------|------------------|----------|
+| 256     | 32      | 32        | 0x1b000 = 108.0 KiB | OVERFLOW |
+| 128     | 32      | 16        | **0x163e0 = 89.0 KiB** | **FITS** |
 
-The configs that the smem math says fit (num_stages=1, and/or block_I=32) are
-**blocked by a pre-existing regression on `merge/upstream-codegen-reorg`**, NOT
-by this re-tile:
+**FINAL bwd GB10 config: `threads=128, block_size=16, block_H=32`**
+(auto-applied on the gb10 path). The `acc_dkv*` accumulators stay fp32 and the
+codegen emits `AtomicAddx4(...)` for both `dKV` and `dKV_tail` (verified in the
+generated `tvm_kernels.cu`) -- the `atomic_addx4` path is preserved, not
+degraded.
 
-```
-TypeError: '# from tvm.script import tirx as T  @T.prim_func def main(...) ...'
-           is not a callable object
-  at tilelang/language/eager/builder.py:1256 (inspect.signature(func))
-  via  tilelang/jit/__init__.py:603 (prim_func(func, eager_jit=True))
-```
+## tirx eager-builder regression -- RESOLVED
 
-The new `tilelang.jit` eager-builder calls `inspect.signature` /
-`inspect.getsource` on the prim_func, and on this branch the tir->tirx
-migration makes that receive the printed TVMScript instead of a function for
-the sparse-MLA kernel. Evidence this is branch-wide and not the re-tile:
-- A trivial tilelang kernel compiles fine on the same branch.
-- The **Hopper path (`gb10=False`) of the SAME sparse-MLA fwd also fails** with
-  the identical tirx TypeError — so the failure is independent of the GB10
-  flags.
-- The failure is intermittent vs the JIT cache: a clean first compile of
-  `block_I=64,num_stages=2,gb10=True` reached ptxas (the 225 KiB number above);
-  cached / repeated builds re-enter the buggy eager-builder path and raise the
-  tirx TypeError before ptxas.
-
-STATIC shapes (the new `static_shape=` option) were applied to dodge the
-dynamic-symbolic part of the regression and DID get the kernel past TIR
-lowering to ptxas once — but the eager-builder `inspect.signature` issue is the
-deeper, dominant blocker and must be fixed in the branch's
-`tilelang/language/eager/builder.py` / `tilelang/jit/__init__.py` before the
-sub-99 KiB configs can be reliably built and a numeric parity check can run.
+The prior blocker ("`<TVMScript> is not a callable object`" at
+`inspect.signature` in the eager builder) was a real branch-wide bug: a
+`tirx.PrimFunc` has no `__call__`, so feeding the already-built PrimFunc to
+`tilelang.jit()` crashed. **Fixed in commit `72e10529`** (`fix(jit): handle
+PrimFunc input in tilelang.jit`): `tilelang.jit`'s decorator now branches on
+`isinstance(func, PrimFunc)` (lazy mode, `func.script()` source, empty
+signature), mirroring `compile()`/`get_tir`. With that fix both the fwd
+(lazy-builder-wrapped path) and bwd (`jit(builder)` PrimFunc path) lower all the
+way through to ptxas on sm_121a. No fallback was added; the non-callable path
+is unchanged.
 
 ## Parity
 
-NOT YET RUN. A re-tiled-fwd-vs-reference rel-err check requires a fitting
-config (num_stages=1) to build, which is gated by the tirx regression above.
-Once that branch bug is fixed, run `test_sparse_mla_fwd(..., num_stages=1,
-gb10=True)` which calls `assert_tensors_similar(tl_out, ref_out, eps=1e-2)`.
+See the "Parity" run section appended below once the GB10 GPU is idle. The
+fitting configs above (fwd block_I=16/ns=1, bwd threads=128/bs=16) build to real
+`JITKernel`s, so `test_sparse_mla_fwd(..., gb10=True)` /
+`test_sparse_mla_bwd(...)` (both call `assert_tensors_similar(eps=1e-2 fwd /
+1e-4 bwd)`) can run for a rel-err check.
 
 ## vs Megatron / cppmega tiling
 
