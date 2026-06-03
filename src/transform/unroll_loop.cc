@@ -142,7 +142,7 @@ private:
     return new_var;
   }
 
-  Map<Var, Var> var_remap_;
+  ffi::Map<Var, Var> var_remap_;
 };
 
 class LoopUnroller : public StmtExprMutator {
