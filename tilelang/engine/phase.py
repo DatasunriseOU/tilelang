@@ -360,6 +360,19 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     from tilelang.transform.metal_simd_lift import MetalSimdLiftReductions
 
     mod = MetalSimdLiftReductions(mod)
+    # Track B (Metal-GEMM auto-pass): detect the canonical serial-reduction
+    # contraction nest (F0 summary_states/cb shape) and rewrite it to a
+    # tile-level T.gemm, which LowerTileOp below lowers to matmul2d via the
+    # Metal gemm.cc selector. Default OFF — gated by PassConfig key
+    # ``tl.auto_gemmify_reductions``. Built-in z3 proves the rewrite preserves
+    # the reduction semantics + is race-free; on any unprovable/ambiguous
+    # pattern it LEAVES the serial loop (RULE #1, no wrong rewrite). Slotted
+    # BEFORE LayoutInference()/LowerTileOp() so the emitted GEMM fragment/shared
+    # layouts are assigned and the tile-op is lowered, exactly like the
+    # MetalSimdLift slot above.
+    from tilelang.transform.auto_gemmify_reductions import AutoGemmifyReductions
+
+    mod = AutoGemmifyReductions(mod)
     if target.kind.name == "metal":
         mod = tilelang.transform.MetalSimdgroupSemanticGuard(mod)
     # Infer memory layouts for fragments and shared memory

@@ -14,6 +14,7 @@ from .lower_extern_intrinsic import LowerExternIntrinsic  # noqa: F401
 from .metal_scalar_intrinsics import BindMetalScalarIntrinsics  # noqa: F401
 from .metal_merge_round import MetalMergeRoundBarrierCleanup  # noqa: F401
 from .metal_simdgroup_guard import MetalSimdgroupSemanticGuard  # noqa: F401
+from .auto_gemmify_reductions import AutoGemmifyReductions  # noqa: F401
 
 
 def get_pass_context():
