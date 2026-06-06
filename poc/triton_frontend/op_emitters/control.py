@@ -828,6 +828,38 @@ def _func_block_args(op: Any) -> List[Any]:
     return []
 
 
+def _is_trivial_noop_body(body_stmt: Any, ctx: _om.WalkerCtx) -> bool:
+    """Return True iff ``body_stmt`` carries NO real compute.
+
+    The MLIR region walker returns ``tir.Evaluate(0)`` (an ``Evaluate`` of a
+    constant) for an empty region. At the ``tt.func`` top level that means the
+    walker produced a do-nothing kernel and we must RAISE (RULE #1) instead of
+    assembling a runnable empty PrimFunc. We treat the body as trivial when it
+    is a single ``tir.Evaluate`` whose value is a constant (the ``Evaluate(0)``
+    sentinel). Any ``BufferStore`` / ``For`` / ``SeqStmt`` / ``IfThenElse`` /
+    ``LetStmt`` / ``AttrStmt`` / ``AllocBuffer`` -- i.e. any actual statement --
+    makes the body non-trivial and the check returns False.
+    """
+    try:
+        tir = ctx.tir()
+    except Exception:
+        return False
+    Evaluate = getattr(tir, "Evaluate", None)
+    if Evaluate is None or not isinstance(body_stmt, Evaluate):
+        return False
+    # A bare Evaluate wraps an expression in ``.value``. The empty-region
+    # sentinel is ``Evaluate(const(0))``; a real Evaluate (e.g. an extern
+    # call / Call that performs a side effect) wraps a Call and is NOT
+    # trivial. Treat only Evaluate-of-IntImm/FloatImm as the empty sentinel.
+    value = getattr(body_stmt, "value", None)
+    IntImm = getattr(tir, "IntImm", None)
+    FloatImm = getattr(tir, "FloatImm", None)
+    const_types = tuple(t for t in (IntImm, FloatImm) if t is not None)
+    if const_types and isinstance(value, const_types):
+        return True
+    return False
+
+
 def map_tt_func(op: Any, ctx: _om.WalkerCtx) -> Any:
     """Build a ``tvm.tir.PrimFunc`` from a ``tt.func`` op.
 
@@ -926,6 +958,29 @@ def map_tt_func(op: Any, ctx: _om.WalkerCtx) -> Any:
 
     if tir_mod is None:
         return None
+
+    # RULE #1 (no silent fallback): refuse to build a do-nothing kernel.
+    # ``_emit_region`` returns ``tir.Evaluate(0)`` for an empty region. At a
+    # ``scf.if`` branch that is a legitimate no-op, but at the ``tt.func``
+    # top level it means the walker produced NO compute (every body op was
+    # skipped or silently dropped) -- assembling a PrimFunc from it ships a
+    # runnable kernel that does nothing (``tilelang.compile`` would accept it
+    # WITHOUT raising). That is the exact silent-stub failure mode we must
+    # never emit. Raise loudly naming the kernel and the walked-op count so
+    # the caller can see WHERE the lowering went empty.
+    if _is_trivial_noop_body(body_stmt, ctx):
+        _sym = _func_sym_name(op) or getattr(ctx, "kernel_name", "main")
+        raise RuntimeError(
+            "triton_frontend.map_tt_func: the MLIR walker produced an EMPTY "
+            f"body for tt.func {_sym!r} -- the assembled PrimFunc body is a "
+            "bare `T.evaluate(0)` (no buffer stores, no loops, no compute). "
+            "Refusing to return a runnable do-nothing kernel (RULE #1: no "
+            "silent fallback / no empty stub that tilelang.compile would "
+            "accept). This means every op in the tt.func body region was "
+            "skipped or dropped without emitting a TIR statement. Inspect the "
+            "TTIR body ops and their OP_TABLE emitters; a real kernel must "
+            "emit at least one BufferStore / For / compute statement."
+        )
 
     # Assemble PrimFunc
     buffer_map: Dict[Any, Any] = {}

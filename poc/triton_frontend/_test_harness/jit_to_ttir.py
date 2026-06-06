@@ -282,17 +282,56 @@ def triton_jit_to_ttir_subprocess_from_source(
     # defined in a Python file")`` — see triton/runtime/jit.py:__init__.
     script = textwrap.dedent(
         """
-        import importlib, importlib.util, json, os, sys, tempfile, traceback
+        import ast, importlib, importlib.util, json, os, sys, tempfile, traceback
         payload = json.loads(sys.argv[1])
+
+        def _strip_non_jit_decorators(src):
+            \"\"\"Drop @triton.autotune / @triton.heuristics (and any non-jit
+            decorator) from the kernel source so exec'ing it does not
+            NameError on module-level refs (init_to_zero, autotune_configs,
+            ...) that live only in Tri-Dao's original module. TTIR capture
+            supplies constexprs explicitly, so autotune metadata is unneeded.
+            We KEEP @triton.jit. If the source cannot be parsed we return it
+            unchanged and let the real exec error surface (no silent paper).
+            \"\"\"
+            def _dec_name(node):
+                tgt = node.func if isinstance(node, ast.Call) else node
+                parts = []
+                while isinstance(tgt, ast.Attribute):
+                    parts.append(tgt.attr)
+                    tgt = tgt.value
+                if isinstance(tgt, ast.Name):
+                    parts.append(tgt.id)
+                return \".\".join(reversed(parts))
+            try:
+                tree = ast.parse(src)
+            except SyntaxError:
+                return src
+            changed = False
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    kept = []
+                    for dec in node.decorator_list:
+                        name = _dec_name(dec)
+                        if name.split(\".\")[-1] == \"jit\":
+                            kept.append(dec)
+                        else:
+                            changed = True
+                    node.decorator_list = kept
+            if not changed:
+                return src
+            return ast.unparse(tree)
+
         try:
             import triton
             import triton.language as tl  # noqa: F401
             header = \"import triton\\nimport triton.language as tl\\n\\n\"
             src_dir = tempfile.mkdtemp(prefix=\"triton_ttir_src_\")
             src_path = os.path.join(src_dir, \"_subprocess_kernel.py\")
+            sanitized = _strip_non_jit_decorators(payload[\"source\"])
             with open(src_path, \"w\") as fh:
                 fh.write(header)
-                fh.write(payload[\"source\"])
+                fh.write(sanitized)
             spec = importlib.util.spec_from_file_location(
                 \"_subprocess_kernel\", src_path
             )

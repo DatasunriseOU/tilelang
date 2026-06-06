@@ -353,15 +353,24 @@ class WalkerCtx:
         return f"{prefix}_{self._tmp_counter}"
 
     def tvm(self) -> Any:
-        """Lazy-import ``tvm`` and cache the module handle."""
+        """Lazy-import ``tvm`` and cache the module handle.
+
+        We import ``tilelang`` FIRST so that ``import tvm`` resolves to
+        TileLang's vendored TVM (``3rdparty/tvm/python/tvm``) on hosts (gb10)
+        where a bare top-level ``tvm`` is not on ``sys.path``. Without this,
+        ``import tvm`` would raise ``ModuleNotFoundError`` whenever the
+        frontend is driven before ``import tilelang`` happened to run.
+        """
         if self._tvm is None:
+            import tilelang  # noqa: F401,WPS433 (wires vendored TVM onto path)
             import tvm  # noqa: WPS433 (intentional lazy import)
 
             self._tvm = tvm
         return self._tvm
 
     def tir(self) -> Any:
-        """Shortcut to ``tvm.tir``."""
+        """Shortcut to ``tvm.tir`` (via TileLang's vendored TVM)."""
+        import tilelang  # noqa: F401,WPS433 (wires vendored TVM onto path)
         from tvm import tir
 
         return tir
@@ -1977,6 +1986,7 @@ def _is_nv_target() -> bool:
     when no target is active (e.g. during dict-shaped unit tests).
     """
     try:
+        import tilelang  # noqa: F401  (wires vendored TVM onto path)
         import tvm  # type: ignore
     except ImportError:  # pragma: no cover
         return False
