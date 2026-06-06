@@ -204,21 +204,57 @@ def _flat_extent_for_indices(
     # pid Vars for their max.
     expr = None
     for entry in offset_indices:
-        if isinstance(entry, tvm_mod.tir.Buffer) or isinstance(entry, LazyTileExpr):
-            # A rank-N offset tile (matmul's C pointer tile, the grid-scaled
-            # ``dprev_states`` flat-address tile, and similar block-pointer
-            # paths) has already materialised the flat address expression
-            # into a buffer / LazyTileExpr, so we cannot inspect the original
-            # pid/stride expression here. The sound conservative bound is the
-            # per-program tile footprint multiplied by every launch-grid
-            # extent. This is intentionally an upper bound: over-declaring a
-            # PrimFunc parameter shape only weakens LegalizeSafeMemoryAccess
-            # guards, while under-declaring drops valid stores outside the
-            # first tile (the truncation bug we are fixing).
+        if isinstance(entry, LazyTileExpr):
+            # WRITE (grid-scaled output) path -- e.g. the ``dprev_states``
+            # flat-address tile. Each launch-grid block writes a DISJOINT
+            # per-program tile, so the union of all stores tiles the whole
+            # output exactly: ``flat_tile_extent * gridDim_product`` is the
+            # true, tight output extent. Over-declaring only weakens a guard;
+            # under-declaring drops stores outside the first tile (the
+            # truncation bug FIX#1 cured). Keep grid-scaling for writes.
             extent_expr = tir.const(int(flat_tile_extent), "int32")
             for _var, _axis, extent in program_id_vars:
                 extent_expr = extent_expr * extent
             return [extent_expr]
+        if isinstance(entry, tvm_mod.tir.Buffer):
+            # READ (strided multi-K-trip input) path -- e.g. the ``dout`` /
+            # ``C`` / ``dA_cumsum`` flat-address carry tiles threaded through
+            # the chunk K-loop. Here ``flat_tile_extent * gridDim_product``
+            # is the WRONG extent: every program reads the SAME tensor at a
+            # per-program seqlen-strided base AND advances across multiple
+            # K-trips, so the per-program read regions OVERLAP and span far
+            # more than one tile-per-block. ``flat_tile_extent * grid``
+            # therefore UNDER-counts the true seqlen-strided tensor (e.g.
+            # 2048*grid=131072 vs the real dout 262144), which made
+            # LegalizeSafeMemoryAccess bake an ``idx < 131072`` guard that
+            # masks every chunk c>0 read to 0 (the MMA then consumes zeros)
+            # AND mismatches the real DLTensor the caller passes (the FFI
+            # marshaling SIGSEGV). RULE #1: a too-small strided-read extent
+            # is a truncation bug -- we must size the buffer to the TRUE
+            # tensor, not silently mask valid reads to 0.
+            #
+            # The true seqlen-strided extent is symbolic (it depends on the
+            # runtime strides/dims). The native Triton read mask is the
+            # per-row/col bound (``offs_m<hdim`` & ``offs_k<chunk_rem``) with
+            # NO whole-buffer clamp; the per-block base pointer already lives
+            # in the carry index. We therefore declare the read buffer with a
+            # FRESH SYMBOLIC extent Var bound by MakePackedAPI from the
+            # passed DLTensor's real element count. That makes any
+            # LegalizeSafeMemoryAccess bound ``idx < <real_numel>`` -- which
+            # the in-mask reads always satisfy (never masked) and which
+            # matches the real allocation (no FFI OOB). This drops the
+            # under-bound flat clamp exactly as FIX#1 did for the output.
+            try:
+                size_name = (str(getattr(entry, "name", "buf")) or "buf") + "_numel"
+                extent_var = tir.Var(ctx.fresh(size_name), "int64")
+            except Exception:
+                # Fall back to grid-scaling only if a fresh Var cannot be
+                # minted; never fall back to the under-counted constant.
+                extent_expr = tir.const(int(flat_tile_extent), "int32")
+                for _var, _axis, extent in program_id_vars:
+                    extent_expr = extent_expr * extent
+                return [extent_expr]
+            return [extent_var]
         scalar = _scalar_form(entry)
         expr = scalar if expr is None else (expr + scalar)
 
