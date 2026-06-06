@@ -204,16 +204,17 @@ def _flat_extent_for_indices(
     # pid Vars for their max.
     expr = None
     for entry in offset_indices:
-        if isinstance(entry, tvm_mod.tir.Buffer):
-            # A rank-N offset tile (matmul's C pointer tile, and similar
-            # block-pointer paths) has already materialised the flat address
-            # expression into a local buffer, so we cannot inspect the
-            # original pid/stride expression here. The sound conservative
-            # bound is the per-program tile footprint multiplied by every
-            # launch-grid extent. This is intentionally an upper bound:
-            # over-declaring a PrimFunc parameter shape only weakens
-            # LegalizeSafeMemoryAccess guards, while under-declaring drops
-            # valid stores outside the first tile.
+        if isinstance(entry, tvm_mod.tir.Buffer) or isinstance(entry, LazyTileExpr):
+            # A rank-N offset tile (matmul's C pointer tile, the grid-scaled
+            # ``dprev_states`` flat-address tile, and similar block-pointer
+            # paths) has already materialised the flat address expression
+            # into a buffer / LazyTileExpr, so we cannot inspect the original
+            # pid/stride expression here. The sound conservative bound is the
+            # per-program tile footprint multiplied by every launch-grid
+            # extent. This is intentionally an upper bound: over-declaring a
+            # PrimFunc parameter shape only weakens LegalizeSafeMemoryAccess
+            # guards, while under-declaring drops valid stores outside the
+            # first tile (the truncation bug we are fixing).
             extent_expr = tir.const(int(flat_tile_extent), "int32")
             for _var, _axis, extent in program_id_vars:
                 extent_expr = extent_expr * extent
@@ -251,6 +252,65 @@ def _flat_extent_for_indices(
     return [extent_expr]
 
 
+def _decl_shape_exceeds_buffer(ctx: Any, decl_shape: Any, buf: Any) -> bool:
+    """True iff ``decl_shape`` flat extent provably exceeds ``buf``'s extent.
+
+    Used to decide whether a strided per-block store has outgrown a
+    caller-seeded ("fixed") function-arg buffer. The grid-scaled extent
+    returned by :func:`_flat_extent_for_indices` is typically
+    ``flat_tile_extent * gridDim_x * gridDim_y * ...`` -- all integer
+    constants -- so we fold it to an int and compare against the buffer's
+    current static extent. When either side is non-constant we return True
+    (grow): under-declaring drops valid stores, which is the bug we are
+    fixing; over-declaring only weakens a bounds guard.
+    """
+    try:
+        tvm_mod = ctx.tvm()
+    except Exception:
+        return False
+
+    def _as_int(expr: Any) -> Optional[int]:
+        if isinstance(expr, int):
+            return expr
+        try:
+            v = int(expr)
+            return v
+        except Exception:
+            pass
+        # Constant-fold a PrimExpr DAG (Mul/Add of IntImm) via the analyzer.
+        try:
+            ana = tvm_mod.arith.Analyzer()
+            folded = ana.simplify(expr)
+            IntImm = tvm_mod.tir.IntImm
+            if isinstance(folded, IntImm):
+                return int(folded.value)
+        except Exception:
+            pass
+        return None
+
+    decl_flat = 1
+    for d in (decl_shape or [1]):
+        di = _as_int(d)
+        if di is None:
+            return True  # symbolic -> grow to be safe (never truncate)
+        decl_flat *= di
+
+    try:
+        cur_rank = len(buf.shape)
+        cur_flat = 1
+        for d in buf.shape:
+            di = _as_int(d)
+            if di is None:
+                return True
+            cur_flat *= di
+    except Exception:
+        return True
+
+    if cur_rank != 1:
+        return True
+    return decl_flat > cur_flat
+
+
 def _redecl_input_buffer(
     ctx: Any,
     buf: Any,
@@ -258,6 +318,7 @@ def _redecl_input_buffer(
     dtype: str,
     *,
     offset_indices: Any = None,
+    grow_fixed: bool = False,
 ) -> Any:
     """Re-declare an input buffer with the right tile shape.
 
@@ -290,14 +351,32 @@ def _redecl_input_buffer(
             break
     if target_key is None:
         return buf
-    fixed_keys = getattr(ctx, "fixed_arg_buffer_keys", set()) or set()
-    if target_key in fixed_keys or str(name) in fixed_keys:
-        return buf
 
     if offset_indices is not None:
         decl_shape = _flat_extent_for_indices(ctx, offset_indices, shape)
     else:
         decl_shape = list(shape) or [1]
+
+    fixed_keys = getattr(ctx, "fixed_arg_buffer_keys", set()) or set()
+    is_fixed = target_key in fixed_keys or str(name) in fixed_keys
+    if is_fixed:
+        # A caller-seeded ("fixed") function-arg buffer is authoritative
+        # ONLY when it is large enough to hold every store this kernel
+        # makes. A program_id-strided store (grid-scaled output, e.g.
+        # ``dprev_states``) reaches up to ``(gridDim-1)*stride+tile`` --
+        # well past a single-tile seed. Honoring a too-small seed here
+        # silently truncates the output to the FIRST tile (every later
+        # grid block is dropped by LegalizeSafeMemoryAccess's
+        # ``idx < seed`` guard). RULE #1: that is a truncation bug, not a
+        # contract -- so we OVERRIDE the seed and grow to the grid-scaled
+        # extent. When the seed already covers the writes (the contract
+        # case) we keep it untouched.
+        grow_required = (
+            grow_fixed and offset_indices is not None
+            and _decl_shape_exceeds_buffer(ctx, decl_shape, buf)
+        )
+        if not grow_required:
+            return buf
 
     try:
         new_buf = tir.decl_buffer(shape=decl_shape, dtype=dtype, name=name)
@@ -531,23 +610,6 @@ def _emit_tile_store_to_input_buffer(
     tvm_mod = ctx.tvm()
     from .op_emitters.memory import _resolve_lane_operand, _read_vector_lane, _vector_lanes
 
-    scope_fn = getattr(val_expr, "scope", None)
-    try:
-        val_scope = scope_fn() if callable(scope_fn) else scope_fn
-    except Exception:
-        val_scope = None
-    if val_scope in {"local.fragment", "metal.simdgroup"}:
-        import tilelang.language as T  # type: ignore
-
-        handle = T.copy(val_expr, dst_buf)
-        if isinstance(handle, tvm_mod.tir.PrimExpr):
-            stmt = tir.Evaluate(handle)
-            ctx.emit(stmt)
-            return stmt
-        if handle is not None:
-            ctx.emit(handle)
-        return handle
-
     loop_vars: List[Any] = []
     for axis, _extent in enumerate(val_shape or [1]):
         loop_vars.append(tir.Var(ctx.fresh(f"i{axis}"), "int32"))
@@ -566,14 +628,81 @@ def _emit_tile_store_to_input_buffer(
     ):
         single_offset_buf = offset_indices[0]
 
-    dst_indices: List[Any] = []
+    # Grid-scaled output sizing (RULE #1): a strided per-block store carries a
+    # ``single_offset_buf`` flat-address tile whose per-program base offset
+    # (``pid_b*stride_b + ... + offs*stride``) reaches across the WHOLE launch
+    # grid. Grow the function-arg destination to the grid-scaled extent
+    # (``flat_tile_extent * gridDim_product`` via ``_flat_extent_for_indices``)
+    # -- even past a too-small caller ("fixed") seed, because a seed below the
+    # grid extent provably truncates the output to the first tile. We do the
+    # redecl HERE (before the T.copy fast-path decision) and detect whether it
+    # actually grew the buffer.
+    # Restrict grid-scaling to a 1D FLAT function-arg destination addressed by
+    # a single rank-N flat-address offset tile (the ``dprev_states`` pattern:
+    # ``arg2`` is a flat buffer, ``single_offset_buf`` holds the flat linear
+    # address ``offs_m*stride_m + offs_n*stride_n``). A genuinely multi-dim
+    # destination (e.g. fla_dot_exp2's 2D ``arg2``) is NOT a flat grid-scaled
+    # output and keeps the original same-shaped ``T.copy`` epilogue -- diverting
+    # it to the 1D per-lane path would index a 2D buffer with one index and
+    # trip ``buffer->shape.size() == indices.size()``.
+    dst_is_flat_1d = False
+    try:
+        dst_is_flat_1d = len(getattr(dst_buf, "shape", []) or []) == 1
+    except Exception:
+        dst_is_flat_1d = False
+
+    grid_scaled = False
     if single_offset_buf is not None:
-        if len(getattr(dst_buf, "shape", []) or []) != 1:
+        dst_dtype = str(getattr(dst_buf, "dtype", "float32"))
+        if dst_is_flat_1d:
+            # Flat 1D function-arg destination: apply grid-scaling (grow even a
+            # too-small fixed seed) so the per-block strided writes land
+            # in-bounds for EVERY grid block.
+            prev_buf = dst_buf
+            dst_buf = _redecl_input_buffer(
+                ctx,
+                dst_buf,
+                list(val_shape),
+                dst_dtype,
+                offset_indices=[single_offset_buf],
+                grow_fixed=True,
+            )
+            grid_scaled = dst_buf is not prev_buf
+        elif len(getattr(dst_buf, "shape", []) or []) != 1:
+            # Original behaviour: a multi-dim destination indexed by a single
+            # flat-address tile is flattened to 1D (tile footprint) so the
+            # single linear-address BufferStore below is rank-matched. NOT a
+            # grid-scaled output -- keep the same-shaped tile semantics.
             flat_extent = 1
             for _e in val_shape:
                 flat_extent *= int(_e)
-            dst_dtype = str(getattr(dst_buf, "dtype", "float32"))
             dst_buf = _redecl_input_buffer(ctx, dst_buf, [flat_extent], dst_dtype)
+
+    # ``T.copy`` fast path: valid for a same-shaped tile destination. Only a
+    # destination we just GREW for grid-scaling needs the per-lane / region
+    # epilogue below; a normal same-shaped tile store (e.g. fla_dot_exp2's
+    # in-place fragment store, where the buffer was NOT grown) keeps the fast
+    # ``T.copy``. Diverting those to the per-lane path regresses them, so we
+    # gate the skip strictly on ``grid_scaled``.
+    scope_fn = getattr(val_expr, "scope", None)
+    try:
+        val_scope = scope_fn() if callable(scope_fn) else scope_fn
+    except Exception:
+        val_scope = None
+    if val_scope in {"local.fragment", "metal.simdgroup"} and not grid_scaled:
+        import tilelang.language as T  # type: ignore
+
+        handle = T.copy(val_expr, dst_buf)
+        if isinstance(handle, tvm_mod.tir.PrimExpr):
+            stmt = tir.Evaluate(handle)
+            ctx.emit(stmt)
+            return stmt
+        if handle is not None:
+            ctx.emit(handle)
+        return handle
+
+    dst_indices: List[Any] = []
+    if single_offset_buf is not None:
         if isinstance(single_offset_buf, LazyTileExpr):
             dst_indices.append(single_offset_buf.read_lane(ctx, tuple(loop_vars)))
         else:
@@ -608,6 +737,107 @@ def _emit_tile_store_to_input_buffer(
                 dst_indices.append(_read_vector_lane(ctx, base, lv))
             else:
                 dst_indices.append(base + lv)
+
+    # Stage an MMA fragment value through a same-shaped shared tile before a
+    # strided per-block store. A loop-carried GEMM accumulator
+    # (``local.fragment``) carries the tensor-core MMA store layout; reading
+    # it with arbitrary per-lane indices in this serial store loop makes
+    # TileLang's layout inference see two incompatible layouts for the same
+    # buffer ("Get different layout for <carry>"). Native Triton likewise
+    # materialises ``out = acc.to(dtype)`` into a fresh value before the
+    # store. We mirror that: ``T.copy(fragment -> staging)`` (the only
+    # consumer of the fragment, so its MMA layout is unambiguous), then read
+    # the store lanes from the staging tile.
+    val_scope_now = None
+    try:
+        _sf = getattr(val_expr, "scope", None)
+        val_scope_now = _sf() if callable(_sf) else _sf
+    except Exception:
+        val_scope_now = None
+    fragment_epilogue = (
+        single_offset_buf is not None
+        and isinstance(val_expr, tvm_mod.tir.Buffer)
+        and val_scope_now in {"local.fragment", "metal.simdgroup"}
+    )
+    if fragment_epilogue:
+        # MMA-C fragment epilogue -> grid-scaled global output.
+        #
+        # The accumulator is a tensor-core fragment whose physical lane
+        # layout the codegen owns; a hand-rolled per-lane serial store loop
+        # reads it at LOGICAL [i,j] and therefore captures only one lane's
+        # data (sparse / wrong output). The correct lowering is TileLang's
+        # own layout-aware ``T.copy``:
+        #   1. ``T.copy(fragment -> shared)``  -- register->smem, MMA-layout
+        #      aware (verified to match A@B in a standalone GEMM).
+        #   2. ``T.copy(shared -> arg2_region)`` -- smem->global over the
+        #      per-block contiguous tile region ``[base : base+tile_numel]``.
+        # The per-program base offset is ``dst_indices[0]`` evaluated with
+        # every store loop var set to 0 (the within-tile ``offs`` collapse to
+        # the tile origin). dprev_states is contiguous in (hdim,dstate), so
+        # the per-block tile IS a contiguous flat slice and the rank-N tile
+        # maps row-major onto it. The native tile mask (offs_m<hdim &
+        # offs_n<dstate) is a no-op here because BLOCK==(hdim,dstate); when
+        # they differ TileLang's region copy clamps to the in-bounds extent.
+        import tilelang.language as T  # type: ignore
+
+        # Per-block base = store index with all tile loop vars -> 0 (the
+        # within-tile ``offs`` collapse to the tile origin). dprev_states is
+        # contiguous in (hdim,dstate), so the per-block tile IS a contiguous
+        # flat slice ``[base : base+tile_numel]`` and the rank-N fragment maps
+        # row-major onto it.
+        zero = tir.const(0, "int32")
+        substitute = tvm_mod.tir.stmt_functor.substitute
+        base_expr = substitute(dst_indices[0], {lv: zero for lv in loop_vars})
+        tile_numel = 1
+        for _e in val_shape:
+            tile_numel *= int(_e)
+        # The fragment is rank-N (e.g. 2D 64x64); the destination region must
+        # match that rank. arg2 is a flat 1D function-arg buffer, so we expose
+        # a 2D row-major view ``[grid_rows, tile_cols]`` of the SAME data and
+        # take a rank-N region at the per-block tile origin. The per-block
+        # base is contiguous so ``base = row0 * tile_cols`` -> the 2D region
+        # origin is ``(base // tile_cols, 0)`` with extent ``val_shape``.
+        if len(val_shape) >= 2:
+            tile_cols = int(val_shape[-1])
+            total = 1
+            for d in dst_buf.shape:
+                total *= int(d)
+            view_rows = total // tile_cols
+            # 2D row-major VIEW of arg2 that ALIASES its data Var (same
+            # ``data`` pointer, zero elem_offset). A tir.Buffer has no
+            # ``reshape``, so we declare a fresh 2D buffer over the same data.
+            view2d = tir.decl_buffer(
+                [view_rows, tile_cols],
+                str(getattr(dst_buf, "dtype", "float32")),
+                name=str(getattr(dst_buf, "name", "out")) + "_2d",
+                data=dst_buf.data,
+                elem_offset=tir.const(0, "int32"),
+            )
+            row0 = tvm_mod.tir.floordiv(base_expr, tir.const(tile_cols, "int32"))
+            ranges = [
+                tvm_mod.ir.Range.from_min_extent(row0, tir.const(int(val_shape[0]), "int32")),
+                tvm_mod.ir.Range.from_min_extent(zero, tir.const(tile_cols, "int32")),
+            ]
+            region = tvm_mod.tir.BufferRegion(view2d, ranges)
+        else:
+            region = tvm_mod.tir.BufferRegion(
+                dst_buf,
+                [tvm_mod.ir.Range.from_min_extent(base_expr, tir.const(int(tile_numel), "int32"))],
+            )
+        # Single layout-aware ``T.copy(fragment -> global_region)``: the
+        # standard GEMM-C epilogue. The fragment's MMA store layout maps onto
+        # the contiguous per-block global slice; the global buffer supplies
+        # the destination layout, so no intermediate shared tile (which would
+        # need a frame-registered layout we cannot create at emission time)
+        # is required. RULE #1: if this still cannot lower, it RAISES at
+        # compile -- it never falls back to a per-lane serial store that reads
+        # the fragment at LOGICAL indices and produces sparse/wrong output.
+        copy_handle = T.copy(val_expr, region)
+        if isinstance(copy_handle, tvm_mod.tir.PrimExpr):
+            ctx.emit(tir.Evaluate(copy_handle))
+        elif copy_handle is not None:
+            ctx.emit(copy_handle)
+        return copy_handle
 
     # Pull the per-lane value from val_expr. val_expr is typically a tile
     # Buffer (alloced as the result of a prior tt.load / arith op).

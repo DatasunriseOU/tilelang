@@ -2466,6 +2466,48 @@ def _sanitize_printf_format(fmt: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _program_id_axis(op: Any, attrs: Dict[str, Any]) -> int:
+    """Resolve the grid axis of a ``tt.get_program_id`` op.
+
+    Triton's MLIR spells the axis two ways:
+
+    * an ``axis = N : i32`` integer attribute (older / generic form), or
+    * a bare ``x`` / ``y`` / ``z`` keyword in the op text
+      (``tt.get_program_id x``) -- the form emitted by Triton 3.x, where
+      the axis is an enum operand, NOT an attribute. The legacy
+      ``attrs.get("axis", 0)`` silently returned 0 for ALL three program
+      ids in that case, collapsing every grid extent to ``gridDim[0]`` and
+      truncating grid-scaled outputs to the first tile (RULE #1: the wrong
+      default is the truncation bug). We parse the keyword explicitly.
+
+    Raises when neither form is present (no silent axis-0 default).
+    """
+    if "axis" in attrs:
+        try:
+            return int(attrs["axis"])
+        except Exception:
+            pass
+    try:
+        text = str(op)
+    except Exception:
+        text = ""
+    m = re.search(r"tt\.get_program_id\s+([xyz])\b", text)
+    if m is None:
+        m = re.search(r"tt\.(?:get_)?program_id\s*\(\s*([xyz])\s*\)", text)
+    if m is not None:
+        return {"x": 0, "y": 1, "z": 2}[m.group(1)]
+    # Generic-form integer axis embedded in the printed op
+    m = re.search(r"axis\s*=\s*(\d+)", text)
+    if m is not None:
+        return int(m.group(1))
+    raise EmitError(
+        "tt.get_program_id: cannot determine grid axis -- no `axis` "
+        "attribute and no `x`/`y`/`z` keyword found in op text "
+        f"{text.strip()[:120]!r}. Refusing to default to axis 0 (RULE #1: "
+        "a wrong axis collapses the grid extent and truncates output)."
+    )
+
+
 def map_tt_program_id(op: Any, ctx: WalkerCtx) -> Any:
     """Lower ``tt.get_program_id(axis=N)`` to a block-binding ``Var``.
 
@@ -2478,7 +2520,7 @@ def map_tt_program_id(op: Any, ctx: WalkerCtx) -> Any:
     keeps going; downstream codegen replaces it with the real binding.
     """
     attrs = _attrs_with_properties_shared(op)
-    axis = int(attrs.get("axis", 0))
+    axis = _program_id_axis(op, attrs)
     if axis < 0 or axis > 2:
         raise EmitError(f"tt.program_id: axis must be in [0, 2]; got {axis}")
 

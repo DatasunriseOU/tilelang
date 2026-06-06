@@ -483,8 +483,20 @@ def _redeclare_ctx_buffer_1d(
     buf: Any,
     dtype: str,
     min_extent: int,
+    *,
+    grow_fixed: bool = False,
 ) -> Any:
-    """Replace a placeholder function-arg buffer with a 1D flat view."""
+    """Replace a placeholder function-arg buffer with a 1D flat view.
+
+    ``grow_fixed`` -- when True, a caller-seeded ("fixed") function-arg
+    buffer whose current extent is *provably too small* to hold the
+    addressed region (``current_extent < min_extent``) is still grown.
+    This is the output-buffer grid-scaling fix (RULE #1: a too-small
+    seed on a strided per-block write target is a truncation bug, not a
+    contract we honor -- silently keeping the small buffer would drop
+    every grid block past the first tile). The seeded shape is only
+    authoritative when it is large enough to cover the writes.
+    """
     try:
         rank = len(buf.shape)
         current_extent = int(buf.shape[0]) if rank == 1 else 0
@@ -502,7 +514,8 @@ def _redeclare_ctx_buffer_1d(
     if target_key is None:
         return buf
     fixed_keys = getattr(ctx, "fixed_arg_buffer_keys", set()) or set()
-    if target_key in fixed_keys or str(name) in fixed_keys:
+    is_fixed = target_key in fixed_keys or str(name) in fixed_keys
+    if is_fixed and not grow_fixed:
         return buf
     new_buf = ctx.tir().decl_buffer(
         [max(int(min_extent), 1)], dtype, name=str(name)
@@ -546,6 +559,47 @@ def _flat_min_extent(shape: Sequence[int]) -> int:
         except Exception:
             extent *= 1024
     return max(extent, 1024 * 1024)
+
+
+def _tile_numel(shape: Sequence[int]) -> int:
+    """Numeric element count of a (store) tile shape; 1 for empty."""
+    numel = 1
+    for dim in shape or [1]:
+        try:
+            numel *= max(int(dim), 1)
+        except Exception:
+            return 0
+    return numel
+
+
+def _grid_scaled_store_extent(ctx: WalkerCtx, val_shape: Sequence[int]) -> int:
+    """Lower bound on the flat extent a strided per-block store addresses.
+
+    A ``tt.store`` whose destination pointer carries a per-program base
+    offset (``pid_b*stride_b + pid_c*stride_c + pid_h*stride_h + ...``)
+    writes a distinct tile for every point in the launch grid. The output
+    buffer must therefore span ALL grid blocks, not a single tile. The
+    exact extent depends on the (runtime) destination strides, but a sound
+    lower bound is ``grid_product * tile_numel`` -- the dense-packing floor
+    that every contiguous grid layout meets or exceeds. We use it to refuse
+    a caller seed that is smaller than even this floor (the truncation bug
+    the prior single-tile ``(4096,)`` seed exhibited).
+
+    Returns 0 when the grid is unknown (no scaling claim can be made).
+    """
+    grid = getattr(ctx, "launch_grid", None)
+    if not grid:
+        return 0
+    grid_prod = 1
+    for ext in grid:
+        try:
+            grid_prod *= max(int(ext), 1)
+        except Exception:
+            return 0
+    tile_numel = _tile_numel(val_shape)
+    if tile_numel <= 0:
+        return 0
+    return grid_prod * tile_numel
 
 
 def _ssa_name(value: Any) -> Optional[str]:
@@ -1138,13 +1192,31 @@ def _emit_ptrstate_tile_store_tir(
     mask_ssa: Any,
     dynamic_mask_dims: Sequence[Any] = (),
 ) -> Any:
-    """Store a PtrState tile to a flat function-arg buffer using strides."""
+    """Store a PtrState tile to a flat function-arg buffer using strides.
+
+    Output-buffer grid-scaling (RULE #1): this is a strided per-block write
+    (the destination pointer carries a per-program base offset), so the
+    target buffer must span the WHOLE launch grid, not a single tile. We
+    grow the function-arg buffer to at least the grid-scaled floor
+    ``grid_product * tile_numel`` -- and we do so even when the caller
+    seeded a smaller ("fixed") shape, because a seed below that floor is a
+    provable truncation that would drop every block past the first tile.
+    The per-block base + tile mask already live in the flat index / store
+    guard below (mirroring the native ``tl.store`` mask
+    ``(offs_m<hdim)&(offs_n<dstate)``); there is NO whole-buffer clamp.
+    """
     tir = ctx.tir()
     dtype = _normalize_mlir_dtype(
         str(getattr(val_expr, "dtype", _dtype_of(_operands(op)[1]) or "float32"))
     )
+    grid_floor = _grid_scaled_store_extent(ctx, val_shape)
+    min_extent = max(_flat_min_extent(val_shape), grid_floor)
+    # A strided per-block store that addresses beyond a too-small caller
+    # seed must grow the buffer (grow_fixed=True). When the seed already
+    # covers the grid extent (the contract case) this is a no-op because
+    # current_extent >= min_extent short-circuits inside the helper.
     dst_buf = _redeclare_ctx_buffer_1d(
-        ctx, dst_buf, dtype, _flat_min_extent(val_shape)
+        ctx, dst_buf, dtype, min_extent, grow_fixed=True,
     )
     loop_vars = [
         tir.Var(ctx.fresh(f"i{axis}"), "int32")
