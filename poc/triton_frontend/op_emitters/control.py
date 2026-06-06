@@ -1016,7 +1016,12 @@ def map_tt_func(op: Any, ctx: _om.WalkerCtx) -> Any:
     num_warps = int(getattr(ctx, "num_warps", 4) or 4)
     num_stages = int(getattr(ctx, "num_stages", 2) or 2)
     threads_per_block = num_warps * 32
-    tid_var = tir_mod.Var("threadIdx_x", "int32")
+    # Reuse the SAME canonical ``threadIdx.x`` Var that body emitters used for
+    # any local lane-0 guards (e.g. scalar atomic-rmw loops). If none was
+    # created, ``thread_idx_var()`` mints it now. Using one shared Var keeps a
+    # local ``if threadIdx_x == 0`` guard referring to the same thread index as
+    # this outer block thread binding.
+    tid_var = ctx.thread_idx_var()
     tid_extent = tir_mod.const(threads_per_block, "int32")
     if getattr(ctx, "requires_single_thread_body", False):
         body_stmt = tir_mod.IfThenElse(
@@ -1451,6 +1456,11 @@ def _emit_region(
     child.requires_single_thread_body = bool(
         getattr(ctx, "requires_single_thread_body", False)
     )
+    # Share the ONE canonical ``threadIdx.x`` Var with the root ctx so a
+    # lane-0 guard emitted inside this region (scalar atomic-rmw) and the
+    # outer block ``threadIdx.x`` thread_extent binding (stamped by
+    # ``map_tt_func`` on the root ctx) reference the SAME Var object.
+    child._thread_var_root = getattr(ctx, "_thread_var_root", None) or ctx
     child._tmp_counter = ctx._tmp_counter
     child._tvm = ctx._tvm
     child._T = ctx._T

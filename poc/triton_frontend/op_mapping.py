@@ -344,6 +344,25 @@ class WalkerCtx:
         # per-tile fallback.
         self.arg_buffer_shapes: Dict[Any, Sequence[int]] = {}
         self.fixed_arg_buffer_keys: set = set()
+        # Canonical ``threadIdx.x`` TIR Var shared between body emitters and
+        # ``map_tt_func`` PrimFunc assembly. Emitters that need a *local*
+        # single-lane guard (scalar atomic-rmw serial loops) wrap only THEIR
+        # own statement in ``if threadIdx_x == 0`` using this exact Var, while
+        # ``map_tt_func`` reuses the same Var for the outer
+        # ``threadIdx.x`` ``thread_extent`` AttrStmt. This keeps the whole-block
+        # thread binding (extent ``num_warps*32``) wrapping a real ``T.gemm``
+        # intact -- a collective warp-level MMA must see all 128 threads, so it
+        # must NOT be nested under a single-lane guard (doing so collapses the
+        # gemm's ``thread_bounds`` extent to 0 and trips
+        # ``m_warp*n_warp==num_warps`` with ``num_warps=0`` in ``gemm.lower``).
+        self._thread_var: Any = None
+        # When this ctx is a region child (``_emit_region``), point at the
+        # root ctx so ``thread_idx_var()`` resolves to the ONE Var that
+        # ``map_tt_func`` will bind for the block ``threadIdx.x`` thread_extent.
+        # Without this, a child-emitted lane-0 guard would mint a *second*
+        # ``threadIdx_x`` Var that ``MakePackedAPI`` then flags as
+        # "used, but not passed in" (it is not the thread-env-bound one).
+        self._thread_var_root: Any = None
 
     # ---- helpers --------------------------------------------------------
 
@@ -351,6 +370,21 @@ class WalkerCtx:
         """Return a unique name suitable for a buffer / variable."""
         self._tmp_counter += 1
         return f"{prefix}_{self._tmp_counter}"
+
+    def thread_idx_var(self) -> Any:
+        """Return the shared canonical ``threadIdx.x`` TIR Var (lazily made).
+
+        Used by both per-lane scalar emitters (for a LOCAL lane-0 guard around
+        their own statement) and ``map_tt_func`` (for the outer
+        ``threadIdx.x`` ``thread_extent`` binding). Sharing one Var means a
+        local guard and the block thread binding refer to the same thread
+        index without the whole-body single-thread wrap that would gate an
+        adjacent ``T.gemm``.
+        """
+        root = self._thread_var_root or self
+        if root._thread_var is None:
+            root._thread_var = root.tir().Var("threadIdx_x", "int32")
+        return root._thread_var
 
     def tvm(self) -> Any:
         """Lazy-import ``tvm`` and cache the module handle.
@@ -561,28 +595,48 @@ def _results(op: Any) -> Tuple[Any, ...]:
     return tuple(op.results)
 
 
-def _result_is_consumed(result: Any) -> bool:
+def _result_is_consumed(result: Any, ctx: Any = None) -> bool:
     """Return whether a real MLIR result has downstream users.
 
     Triton generic-form ``tt.atomic_rmw`` prints a result even when source
     code discards the return value of ``tl.atomic_add``. Requesting
     ``return_prev=True`` for those unused results forces TileLang's
-    tile-region atomic path into an unsupported mode. Real MLIR results expose
-    a ``uses`` iterator; dict/fake results do not, so keep the conservative
-    "consumed" answer for test-only shapes with no use-def data.
+    tile-region atomic path into an unsupported mode that emits an
+    ``address_of(BufferLoad)`` whose load is later rewritten, tripping
+    ``loop_unswitching``'s ``address_of argument must be a BufferLoad`` ICHECK.
+
+    Resolution order (authoritative-first, RULE #1 -- no silent over-broad
+    default that papers over a discarded result):
+
+    1. ``ctx.ssa_users`` -- the module pre-pass in ``_walk_mlir_module``
+       records, for every operand SSA name, the set of ops that consume it.
+       A result whose printed SSA name is NOT a key there has zero users and
+       is definitively unused. This is the use-def source of truth for the
+       libtriton textual-TTIR path, whose ``Value.uses`` iterator is ``None``.
+    2. ``result.uses`` -- when libtriton DOES populate a uses iterator.
+    3. Conservative ``True`` -- only for test-only dict/fake results that
+       expose neither a ctx users-map entry nor a real uses iterator.
     """
+    # 1. Authoritative use-def map seeded by the pre-pass.
+    if ctx is not None:
+        ssa_users = getattr(ctx, "ssa_users", None)
+        name = _printed_ssa_name(result)
+        if ssa_users is not None and name:
+            return name in ssa_users
+    # 2. Real libtriton uses iterator, when present.
     uses = getattr(result, "uses", None)
-    if uses is None:
-        return True
-    try:
-        return any(True for _ in uses)
-    except Exception:
-        return True
+    if uses is not None:
+        try:
+            return any(True for _ in uses)
+        except Exception:
+            return True
+    # 3. Test-only shapes with no use-def data.
+    return True
 
 
-def _has_consumed_result(op: Any) -> bool:
+def _has_consumed_result(op: Any, ctx: Any = None) -> bool:
     """Return True when any SSA result of ``op`` is actually consumed."""
-    return any(_result_is_consumed(result) for result in _results(op))
+    return any(_result_is_consumed(result, ctx) for result in _results(op))
 
 
 def _attrs(op: Any) -> Dict[str, Any]:
@@ -1523,7 +1577,24 @@ def _emit_tile_atomic_rmw(
             tir.ForKind.SERIAL,
             body,
         )
-    ctx.requires_single_thread_body = True
+    # This serial scalar atomic loop iterates EVERY tile element; if all 128
+    # lanes ran it we would issue 128x duplicate atomics (intra-block race /
+    # over-accumulation). Serialise it onto lane 0 -- but LOCALLY, wrapping
+    # only this loop in ``if threadIdx_x == 0`` rather than flipping a
+    # ctx-global flag that would nest the ENTIRE PrimFunc body (including any
+    # adjacent collective ``T.gemm``) under the guard. Gating a gemm on a
+    # single lane collapses its ``thread_bounds`` extent to 0, which trips
+    # ``gemm.lower``'s ``m_warp*n_warp==num_warps`` ICHECK with ``num_warps=0``
+    # (the exact failure on ``_chunk_scan_bwd_dx`` /
+    # ``_chunk_state_bwd_ddAcs_stable``, which carry both an atomic_rmw AND a
+    # real TF32 gemm). The shared ``threadIdx_x`` Var matches the one
+    # ``map_tt_func`` binds for the outer block thread_extent.
+    tid_var = ctx.thread_idx_var()
+    body = tir.IfThenElse(
+        tir.EQ(tid_var, tir.const(0, "int32")),
+        body,
+        None,
+    )
     ctx.emit(body)
     if return_prev and result_buf is not None:
         ctx.bind(_results(op)[0], result_buf)
@@ -1569,7 +1640,7 @@ def map_tt_atomic_rmw(op: Any, ctx: WalkerCtx) -> Any:
     # ``atomic_add`` / ``atomic_max`` / ``atomic_min`` accept a Buffer; we
     # pass the underlying buffer with the indices encoded in ``val_expr``
     # by way of BufferLoad / BufferStore semantics handled inside TileLang.
-    return_prev = _has_consumed_result(op)
+    return_prev = _has_consumed_result(op, ctx)
 
     tile_shape = _atomic_tile_shape(val_ssa, val_expr, list(indices), mask_expr)
     mask_is_effective = mask_expr is not None and _constant_tile_bool(mask_expr) is not True

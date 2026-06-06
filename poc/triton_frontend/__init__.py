@@ -379,7 +379,20 @@ def _redecl_input_buffer(
             return buf
 
     try:
-        new_buf = tir.decl_buffer(shape=decl_shape, dtype=dtype, name=name)
+        # Reuse the ORIGINAL buffer's backing data ``Var`` for the re-declared
+        # buffer. ``decl_buffer`` defaults to minting a fresh data Var named
+        # after ``name`` ("arg4"); doing so here would leave the kernel with
+        # TWO distinct Vars both named "arg4" -- the param's (bound by
+        # MakePackedAPI) and this redecl's. Any use of the original buffer
+        # already emitted into the body BEFORE this redecl (a load/store in a
+        # region walked earlier) keeps the original data Var, while the param
+        # buffer_map carries the new one, so MakePackedAPI sees a free Var and
+        # raises "variables (arg4,) are used, but are not passed in". Binding
+        # the SAME data Var makes every reference -- old emitted stmts, the new
+        # grid-scaled buffer, and the param buffer_map -- resolve to one Var.
+        new_buf = tir.decl_buffer(
+            shape=decl_shape, dtype=dtype, name=name, data=buf.data,
+        )
     except Exception:
         return buf
     ctx.buffers[target_key] = new_buf
