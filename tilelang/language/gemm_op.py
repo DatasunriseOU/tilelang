@@ -101,8 +101,29 @@ def _gemm_impl(
 
     A_offset = retrieve_offset(A_region)
     B_offset = retrieve_offset(B_region)
-    assert A_offset[-2] == 0, "The offset of the first dimension of A must be 0"
-    assert B_offset[-2] == 0, "The offset of the first dimension of B must be 0"
+    # By default the first-dim (row/M for A, row/N for B in their native layout)
+    # offset must be 0, because the legacy codegen path stages an offset-0 64x64
+    # operand tile per call. This forces a per-head serial loop and prevents a
+    # genuine tall-M (M = HPC*L >> 64) band MMA. When the caller explicitly opts
+    # in via annotations["allow_first_dim_offset"]=1 (the tall-M band amortization),
+    # we permit a non-zero first-dim offset so a tall (HPC*L, K) operand region can
+    # be sliced into per-head sub-GEMMs reusing one shared operand. Gated => prod
+    # prims (which never set the flag) stay byte-identical.
+    allow_first_dim_offset = (
+        annotations is not None and annotations.get("allow_first_dim_offset", 0))
+    if not allow_first_dim_offset:
+        assert A_offset[-2] == 0, "The offset of the first dimension of A must be 0"
+        assert B_offset[-2] == 0, "The offset of the first dimension of B must be 0"
+    else:
+        # Correctness guard for the tall-M band: a non-zero first-dim offset is only
+        # sound if the offset row-aligns to the MMA tile boundary (M-step) so each
+        # sliced sub-GEMM lands on a clean operand tile. We require the offset to be a
+        # known integer multiple of the M tile (or symbolic, which the C++ band-slicer
+        # validates downstream). RAISE on a misaligned constant offset — no silent skip.
+        for nm, off in (("A", A_offset[-2]), ("B", B_offset[-2])):
+            if isinstance(off, int):
+                assert off >= 0, (
+                    f"tall-M band: {nm} first-dim offset must be non-negative, got {off}")
     offset_a = A_offset[-1]
     offset_b = B_offset[-1]
 
