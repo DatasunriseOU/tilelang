@@ -1479,6 +1479,12 @@ def _emit_region(
     if not hasattr(ctx, "local_buffers"):
         ctx.local_buffers = []
     child.local_buffers = ctx.local_buffers
+    # FRAMEFIX: share the MMA-C fragment registry so a tt.dot emitted in a
+    # child region surfaces its fragment to the parent ctx, whose prim_func is
+    # the one ``from_ttir`` runs the post-walk layout re-registration on.
+    if not hasattr(ctx, "mma_c_fragments"):
+        ctx.mma_c_fragments = []
+    child.mma_c_fragments = ctx.mma_c_fragments
     if not hasattr(ctx, "runtime_args"):
         ctx.runtime_args = []
     child.runtime_args = ctx.runtime_args

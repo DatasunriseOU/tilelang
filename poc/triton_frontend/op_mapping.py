@@ -330,6 +330,23 @@ class WalkerCtx:
         # ``threadIdx.x`` wrapper, run the whole block body on lane 0 to avoid
         # intra-block races.
         self.requires_single_thread_body: bool = False
+        # FRAMEFIX (post-walk fragment-layout re-registration). The walker
+        # builds a flat TIR PrimFunc with raw ``decl_buffer`` fragments BEFORE
+        # any ``T.Kernel`` frame exists, so TileLang's LayoutInference never
+        # gets a STRICT entry for the tensor-core C accumulator's MMA store
+        # layout. A subsequent ``T.copy(fragment -> shared)`` then claims the
+        # fragment with its own SIMT (identity) layout and OVERRIDES the gemm
+        # layout, producing a layout-blind store that materialises only the
+        # per-thread-resident slots (32/4096 per tile). ``map_tt_dot`` records
+        # each CUDA grid-scaled MMA-C fragment here as
+        # ``{"buffer": Buffer, "M": int, "N": int, "K": int,
+        #    "trans_A": bool, "trans_B": bool}`` so the post-walk pass
+        # (``register_mma_fragment_layouts``) can re-register the fragment's
+        # ``make_mma_store_layout`` as a STRICT block ``layout_map`` annotation
+        # before LowerLDSM -- exactly the annotation a native ``T.alloc_fragment``
+        # + ``T.gemm`` inside ``T.Kernel`` emits. Empty on Metal / non-MMA
+        # paths so the gate (CUDA + non-empty) leaves fla_dot_exp2 untouched.
+        self.mma_c_fragments: List[Dict[str, Any]] = []
         # Printed SSA name -> op names that consume it. Seeded by the MLIR
         # module pre-pass when available. Emitters use this only for layout
         # choices where downstream composability matters (for example

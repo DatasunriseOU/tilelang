@@ -982,6 +982,30 @@ def _install_tile_load_store_wrappers() -> None:
 _install_tile_load_store_wrappers()
 
 
+def _frame_register_mma_fragments(ctx: Any) -> Any:
+    """FRAMEFIX: re-register CUDA MMA-C fragment layouts on the walked PrimFunc.
+
+    Gated to the CUDA tensor-core path: ``ctx.mma_c_fragments`` is only
+    populated by ``map_tt_dot`` when the gemm C accumulator is a
+    ``local.fragment`` on an explicit CUDA target (the grid-scaled MMA-C case).
+    On Metal / non-MMA paths the list is empty and the PrimFunc is returned
+    unchanged, so fla_dot_exp2 and the rest of the suite are untouched.
+
+    RULE #1: when fragments ARE recorded, the re-registration must succeed --
+    ``register_mma_fragment_layouts`` RAISES on a missing fragment rather than
+    silently returning a layout-blind PrimFunc.
+    """
+    prim_func = getattr(ctx, "prim_func", None)
+    if prim_func is None:
+        return None
+    fragments = list(getattr(ctx, "mma_c_fragments", None) or [])
+    if not fragments:
+        return prim_func
+    from .frame_register import register_mma_fragment_layouts
+
+    return register_mma_fragment_layouts(prim_func, fragments)
+
+
 # Sentinel type alias. The real return type is ``tvm.tir.PrimFunc``;
 # we keep an opaque alias here so callers can type-hint without dragging
 # in TVM during scaffold review.
@@ -1520,7 +1544,7 @@ def from_ttir(
         parsed = parse_ttir(ttir_text_for_parse)
         if parsed is not None:
             _walk_mlir_module(parsed, ctx)
-            return getattr(ctx, "prim_func", None)
+            return _frame_register_mma_fragments(ctx)
         if not _allow_text_ttir:
             raise TypeError(
                 "from_ttir: textual TTIR is no longer the default path; "
@@ -1628,4 +1652,4 @@ def from_ttir(
                     stacklevel=2,
                 )
         _walk_mlir_module(ttir_module, ctx)
-    return getattr(ctx, "prim_func", None)
+    return _frame_register_mma_fragments(ctx)

@@ -1460,6 +1460,24 @@ def map_tt_dot(
                 ctx.emit(tir_mod.Evaluate(handle))
             else:
                 ctx.emit(handle)
+        # FRAMEFIX: record this CUDA MMA-C fragment so the post-walk pass can
+        # re-register its ``make_mma_store_layout`` as a STRICT block layout_map
+        # annotation (see WalkerCtx.mma_c_fragments doc). Only the
+        # tensor-core (local.fragment) C case on CUDA needs it -- a shared C
+        # (Metal/default) is materialised by GemmMetal and a SIMT C never goes
+        # through the MMA store layout. Gating here keeps fla_dot_exp2 (shared
+        # C) and the rest of the suite out of the re-registration path.
+        if _is_cuda_target(ctx) and _scope_of(c) == "local.fragment":
+            frags = getattr(ctx, "mma_c_fragments", None)
+            if frags is not None and hasattr(c, "shape"):
+                frags.append({
+                    "buffer": c,
+                    "M": int(M),
+                    "N": int(N),
+                    "K": int(Ka),
+                    "trans_A": bool(transpose_A),
+                    "trans_B": bool(transpose_B),
+                })
         # FRAGMENT EPILOGUE FIX (RULE #1 -- correctness, not a silent downgrade).
         # On CUDA the gemm accumulator ``c`` lives in ``local.fragment`` scope:
         # its 64x64 logical result is DISTRIBUTED across the 128 threads in the
