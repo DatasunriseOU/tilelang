@@ -1003,7 +1003,22 @@ def _frame_register_mma_fragments(ctx: Any) -> Any:
         return prim_func
     from .frame_register import register_mma_fragment_layouts
 
-    return register_mma_fragment_layouts(prim_func, fragments)
+    # BUG 2 FIX (RULE #1 -- determinism, not a silent skip). The SBlock
+    # wrapping (alloc_buffers) is STILL required: it hosts the flat-emitted tile
+    # buffers so LowerOpaqueBlock allocates them and the epilogue store
+    # materialises (without it the routed output stays all-zeros). What we DROP
+    # is the conflicting C ``layout_map`` PIN: ``_build_c_fragment_layout``
+    # re-derived a ``make_mma_store_layout`` that did NOT exactly equal the
+    # gemm's own InferLayout (a +1 warp-partition/offset skew), colliding
+    # NON-DETERMINISTICALLY -> ``InternalError: Get different layout for
+    # dot_c_frag`` (~3/3 repeat runs aborted). With BUG 1 fixed the gemm A/B
+    # operands are staged as DISTRIBUTED fragments via cooperative ``T.copy``
+    # (ldmatrix-matching), so ``T.gemm``'s InferLayout and the epilogue
+    # ``T.copy(C_frag -> shared)`` CONVERGE on one C layout natively -- the pin
+    # is obsolete and can only conflict. ``pin_c_layout=False`` keeps the
+    # alloc-hosting SBlock but lets native LayoutInference own C's layout
+    # (probe: 3/3 DETERMINISTIC compiles unpinned vs 3/3 conflict pinned).
+    return register_mma_fragment_layouts(prim_func, fragments, pin_c_layout=False)
 
 
 # Sentinel type alias. The real return type is ``tvm.tir.PrimFunc``;

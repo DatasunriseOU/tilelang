@@ -1230,8 +1230,75 @@ def map_tt_dot(
         ) -> Any:
             if _is_shared_scope(buf):
                 return buf
+            # BUG 1 FIX (RULE #1 -- correctness AND ~2000x speed): a
+            # ``LazyTileExpr`` A/B operand (e.g. the ``dout*exp`` fragment that
+            # feeds the dstates gemm) must NOT be staged to shared by
+            # ``_emit_copy_stmt``'s ForKind.SERIAL logical-index BufferStore
+            # loop. That serial fill keys its destination swizzle on the LOOP
+            # index (``for i_j_fused in 0..512``: every thread re-executes all
+            # 512 iterations), so the swizzle it writes is INCONSISTENT with the
+            # cooperative ``threadIdx.x``-parametrized ``ptx_ldmatrix`` read the
+            # T.gemm issues -> the gemm consumes a PERMUTED operand (values
+            # structurally wrong) and the serial loop is the measured bottleneck.
+            #
+            # The PROVEN-correct native pattern is ``T.copy(A, As)`` (cooperative
+            # vectorized stage, threadIdx-keyed swizzle that MATCHES ldmatrix +
+            # fast). To reach that path we FIRST materialise the LazyTileExpr to
+            # a plain logical-layout buffer (a normal elementwise fill -- cheap),
+            # then issue the SAME cooperative ``T.copy`` the real-buffer operand
+            # path below uses. The materialised buffer carries the operand's
+            # logical [.,.] layout, so T.copy + LayoutInference own the
+            # ldmatrix-consistent swizzle transition (not our hand-built loop).
+            # BUG 1 FIX (RULE #1 -- correctness AND ~2000x speed). The operand
+            # that feeds the gemm is typically a ``local`` full-per-thread tile
+            # (the ``dout*exp`` elementwise result, eagerly materialised by
+            # ``_emit_tile_binop`` -> ``materialize_lazy_tile`` in plain ``local``
+            # scope) -- or a still-lazy ``LazyTileExpr``. ``T.copy`` straight from
+            # such a source to the gemm-consumed swizzled shared tile lowers
+            # SERIALLY (``for i_j_fused in 0..512`` per-thread fill keyed on the
+            # LOOP index, INCONSISTENT with the cooperative
+            # ``threadIdx.x``-parametrized ``ptx_ldmatrix`` read -> permuted
+            # operand + 2400ms bottleneck).
+            #
+            # probe_copy_scope proves: ``T.copy`` whose SOURCE is a ``shared``
+            # tile lowers COOPERATIVELY into the swizzled shared tile (0 serial
+            # ``i_j_fused`` loops, threadIdx-keyed swizzle that MATCHES ldmatrix).
+            # A ``local.fragment`` source does NOT work here: ``T.copy(local ->
+            # fragment)`` gives the fragment an IDENTITY (non-MMA) layout from the
+            # local source, so the follow-on ``fragment -> shared`` copy is FLAT
+            # (no swizzle) and the gemm reads a permuted/broadcast operand
+            # (measured: every output row identical). So we stage through a
+            # SHARED logical tile: materialise the operand into ``shared`` once,
+            # then ``T.copy(shared -> swizzled shared)`` is the cooperative
+            # ldmatrix-matching stage -- mirroring native ``T.copy(A, As)``.
+            if isinstance(buf, LazyTileExpr):
+                buf = _materialize_lazy_tile(
+                    ctx,
+                    buf,
+                    shape=shape,
+                    dtype=dtype,
+                    name=f"dot_{label}_logical",
+                    scope="shared",
+                    loop_var_prefix=f"dot_{label}_stage",
+                )
             if not hasattr(buf, "shape"):
                 return buf
+            if not _is_shared_scope(buf):
+                # Plain ``local`` full-per-thread real buffer (e.g. the
+                # ``tile_binop`` = ``dout*exp`` result). Copy it into a shared
+                # logical tile so the gemm-stage copy below is the cooperative
+                # shared->shared path. (This local->shared copy is per-thread but
+                # writes the SAME logical tile; the gemm-stage copy that follows
+                # is the ldmatrix-matching cooperative one.)
+                logical = _alloc_tile_buffer(
+                    ctx,
+                    shape,
+                    dtype,
+                    name=ctx.fresh(f"dot_{label}_logical"),
+                    scope="shared",
+                )
+                _emit_copy_stmt(buf, logical, f"{label}, logical shared operand")
+                buf = logical
             staged = _alloc_tile_buffer(
                 ctx,
                 shape,

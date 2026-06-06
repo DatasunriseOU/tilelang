@@ -102,7 +102,8 @@ def _build_c_fragment_layout(tir_buffer: Any, M: int, N: int, K: int,
     return emitter.make_mma_store_layout(tir_buffer)
 
 
-def register_mma_fragment_layouts(prim_func: Any, fragments: List[Dict[str, Any]]) -> Any:
+def register_mma_fragment_layouts(prim_func: Any, fragments: List[Dict[str, Any]],
+                                  pin_c_layout: bool = True) -> Any:
     """Wrap ``prim_func``'s body in an SBlock that STRICTLY pins each recorded
     MMA-C fragment to its ``make_mma_store_layout`` (FRAMEFIX, approach b).
 
@@ -162,6 +163,14 @@ def register_mma_fragment_layouts(prim_func: Any, fragments: List[Dict[str, Any]
                 "tensor-core store layout would stay unregistered and the "
                 "epilogue copy would materialise a layout-blind partial tile."
             )
+        if not pin_c_layout:
+            # BUG 2 FIX: keep the SBlock wrapping (alloc_buffers) so the flat
+            # tile buffers allocate + the epilogue store materialises, but DO
+            # NOT pin C -- native LayoutInference owns it deterministically now
+            # that the operands are cooperatively-staged fragments. We still
+            # VALIDATE every recorded fragment is live (the RAISE above), so a
+            # missing fragment is never silently skipped.
+            continue
         lay = _build_c_fragment_layout(
             live,
             int(entry["M"]),
