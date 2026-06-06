@@ -326,14 +326,29 @@ bool CheckBulkStore1D(const CopyNode &op, Target target,
                          analyzer);
 }
 
-bool CheckLDSMCopy(const CopyNode &op, Target target) {
+bool CheckLDSMCopy(const CopyNode &op, Target target,
+                  const LayoutMap &layout_map) {
+  // ldmatrix lowering dereferences layout_map[fragment] (the dst here) and
+  // layout_map.at(shared) -- both MUST be registered by LayoutInference. A
+  // hand-built fragment<->shared copy emitted outside the natural T.gemm
+  // epilogue (e.g. the triton frontend's mma accumulator materialisation)
+  // has no such layout; selecting ldmatrix there throws KeyError at
+  // lowering. When the matrix layout is absent the SIMT (Normal) copy is the
+  // correct lowering. RULE #1: a real correctness route, not a degraded
+  // fallback -- ldmatrix is simply inapplicable without its layout.
   return TargetHasLdmatrix(target) && IsSharedBuffer(op.src) &&
-         IsFragmentBuffer(op.dst);
+         IsFragmentBuffer(op.dst) && layout_map.count(op.dst) &&
+         layout_map.count(op.src);
 }
 
-bool CheckSTSMCopy(const CopyNode &op, Target target) {
+bool CheckSTSMCopy(const CopyNode &op, Target target,
+                  const LayoutMap &layout_map) {
+  // See CheckLDSMCopy: stmatrix lowering needs layout_map[fragment] (src)
+  // and layout_map.at(shared) (dst); when absent, fall through to the SIMT
+  // Normal copy instead of crashing.
   return TargetHasStmatrix(target) && IsFragmentBuffer(op.src) &&
-         IsSharedBuffer(op.dst);
+         IsSharedBuffer(op.dst) && layout_map.count(op.src) &&
+         layout_map.count(op.dst);
 }
 
 bool CheckTMemLoad(const CopyNode &op, Target target) {
@@ -578,8 +593,8 @@ CopyFacts AnalyzeCopyFacts(const CopyNode &op, const CopyAnalysisContext &ctx) {
   }
 
   facts.can_cp_async = CheckCPAsyncCopy(op, ctx.target, layout_map, analyzer);
-  facts.can_ldsm = CheckLDSMCopy(op, ctx.target);
-  facts.can_stsm = CheckSTSMCopy(op, ctx.target);
+  facts.can_ldsm = CheckLDSMCopy(op, ctx.target, layout_map);
+  facts.can_stsm = CheckSTSMCopy(op, ctx.target, layout_map);
   facts.can_tmem_load = CheckTMemLoad(op, ctx.target);
   facts.can_tmem_store = CheckTMemStore(op, ctx.target);
   return facts;

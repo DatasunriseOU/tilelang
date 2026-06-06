@@ -1460,6 +1460,52 @@ def map_tt_dot(
                 ctx.emit(tir_mod.Evaluate(handle))
             else:
                 ctx.emit(handle)
+        # FRAGMENT EPILOGUE FIX (RULE #1 -- correctness, not a silent downgrade).
+        # On CUDA the gemm accumulator ``c`` lives in ``local.fragment`` scope:
+        # its 64x64 logical result is DISTRIBUTED across the 128 threads in the
+        # mma.1688 register layout, so element [i,j] does NOT live at flat
+        # offset ``i*N+j`` of any single thread's ``dot_c_frag`` array. The
+        # downstream Tri-Dao epilogue (``acc[i,j] += dot[i,j]`` then store) reads
+        # the result with LOGICAL [i,j] indexing -- valid for a shared/local
+        # tile, but WRONG for a fragment: it reads each thread's own register
+        # slot at the logical offset, so only the ~32 fragment-resident slots
+        # per thread carry meaning and the rest are stale/zero. The measured
+        # symptom was 32/4096 correct elements per output tile (row-0-only,
+        # numerically wrong) -- a real correctness defect, not the input-read
+        # extent FIX#3 cured. The fix is the layout-aware materialisation a
+        # hand-written TileLang kernel performs: ``T.copy(c_frag, c_logical)``,
+        # which distributes the per-thread fragment registers to a logical
+        # SHARED tile at the correct [i,j] positions using the fragment's
+        # inferred thread-layout. We then bind the result to ``c_logical`` so
+        # every non-gemm consumer reads layout-correct data. Only triggered when
+        # C is a fragment AND the result feeds a non-gemm op (a fragment
+        # consumed only by another gemm as its accumulator must stay a fragment
+        # -- no copy).
+        #
+        # This hand-built copy lives OUTSIDE the natural T.gemm epilogue, so
+        # LayoutInference never registers an ldmatrix/stmatrix swizzle layout
+        # for the fragment/shared pair. The CUDA copy selector now SKIPS STSM/
+        # LDSM when the fragment+shared layouts are absent from the layout map
+        # (CheckSTSMCopy/CheckLDSMCopy gate, src/backend/cuda/op/copy_analysis.cc)
+        # and lowers this copy through the SIMT (Normal) path, which distributes
+        # the per-thread fragment registers to the shared tile via the
+        # fragment's inferred thread-layout -- the same path Metal always uses
+        # and which our Metal parity already validates. RULE #1: a real
+        # correctness route, not a degraded fallback.
+        if (
+            result_value is not None
+            and _is_cuda_target(ctx)
+            and _scope_of(c) == "local.fragment"
+            and _result_needs_shared_c()
+        ):
+            c_logical = _alloc_tile_buffer(
+                ctx, [M, N], acc_dtype,
+                name=ctx.fresh("dot_c_logical"),
+                scope="shared",
+            )
+            _emit_copy_stmt(c, c_logical, "c_frag, c_logical (mma store layout)")
+            ctx.bind(result_value, c_logical)
+            return c_logical
         if result_value is not None:
             ctx.bind(result_value, c)
         return handle
