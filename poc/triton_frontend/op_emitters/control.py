@@ -1399,6 +1399,11 @@ def _emit_region(
     child._tmp_counter = ctx._tmp_counter
     child._tvm = ctx._tvm
     child._T = ctx._T
+    # Propagate the codegen target so target-sensitive emitters inside the
+    # region (e.g. tt.dot accumulator scope -- fragment-C on CUDA vs
+    # shared-C on Metal) see the same target as the top-level walk.
+    if getattr(ctx, "target", None) is not None:
+        child.target = ctx.target
     if hasattr(ctx, "launch_grid"):
         child.launch_grid = ctx.launch_grid
 
@@ -2156,6 +2161,8 @@ def map_scf_while(op: Any, ctx: _om.WalkerCtx) -> Any:
         child._tmp_counter = ctx._tmp_counter
         child._tvm = ctx._tvm
         child._T = ctx._T
+        if getattr(ctx, "target", None) is not None:
+            child.target = ctx.target
         if hasattr(ctx, "launch_grid"):
             child.launch_grid = ctx.launch_grid
         for ssa, var in iter_pairs:
@@ -2482,7 +2489,13 @@ def _func_sym_name(func_op: Any) -> Optional[str]:
     if isinstance(func_op, dict):
         attrs = func_op.get("attrs") or {}
         sym = attrs.get("sym_name") or func_op.get("sym_name")
-        return str(sym) if sym else None
+        # Normalise dotted symbols to underscores so the key matches the
+        # one ``_parse_callee_attr`` produces (it always applies the same
+        # ``.replace('.', '_')``). Without this, a real ``sym_name`` attr
+        # carrying ``triton.language.standard.cdiv`` would be registered
+        # with dots while the call site looks it up with underscores --
+        # the two never match and tt.call raises "unknown callee".
+        return str(sym).replace(".", "_") if sym else None
     # Try op.attributes first.
     attrs_obj = getattr(func_op, "attributes", None)
     if attrs_obj is not None:
@@ -2492,7 +2505,9 @@ def _func_sym_name(func_op: Any) -> Optional[str]:
                     raw = str(a.attr).strip()
                     if raw.startswith('"') and raw.endswith('"'):
                         raw = raw[1:-1]
-                    return raw or None
+                    # Same dotted -> underscore normalisation as the call
+                    # site (``_parse_callee_attr``) so the keys match.
+                    return raw.replace(".", "_") or None
         except Exception:
             pass
     # Fall back to the printed property string.

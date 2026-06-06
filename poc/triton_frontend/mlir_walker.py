@@ -220,7 +220,47 @@ def parse_ttir(text: str) -> Optional[Any]:
     Returns ``None`` when ``mlir.ir`` isn't importable or when parsing
     fails (e.g. the text is malformed); callers fall back to the
     regex walker in either case.
+
+    Provider order:
+    0. **Triton-native** (``triton_native_parse``) -- if Triton's own
+       MLIR build is importable it parses custom-form ``tt.*`` TTIR
+       directly (the canonical parser) and we adapt its canonical printed
+       text into mlir.ir-shaped ops. This is the only provider that needs
+       no foreign MLIR build and no C++ shim, so it is tried FIRST on
+       hosts (e.g. gb10) that have Triton but neither mlir_core/IREE nor a
+       built shim. It RAISES (TtirParseError) on a structural surprise
+       rather than returning a partial module.
+    1+. mlir_core / IREE / jaxlib generic-form parse (custom->generic via
+        the C++ shim when present).
     """
+    # Provider 0: Triton's own MLIR parser (handles custom-form directly).
+    try:
+        from poc.triton_frontend.triton_native_parse import (
+            parse_ttir_via_triton,
+            triton_native_available,
+        )
+
+        if triton_native_available():
+            native = parse_ttir_via_triton(text)
+            if native is not None:
+                return native
+    except Exception as exc:
+        # A structural parse failure here is a real bug in OUR adapter
+        # (RULE #1: do not silently fall through to a degraded path that
+        # ships a wrong/empty kernel). Surface it loudly. Provider
+        # *unavailability* (triton not importable) returns None above and
+        # falls through to the mlir.ir providers below.
+        from .triton_native_parse import TtirParseError
+
+        if isinstance(exc, TtirParseError):
+            raise
+        warnings.warn(
+            f"mlir_walker.parse_ttir: Triton-native provider errored "
+            f"({exc!r}); falling through to mlir.ir providers.",
+            UserWarning,
+            stacklevel=2,
+        )
+
     ir = _try_import_mlir_quiet()
     if ir is None:
         # Resolve jaxlib's MLIR bindings WITHOUT publishing them under

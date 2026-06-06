@@ -72,6 +72,38 @@ from ..op_mapping import (
 EmitContext = Any  # poc.triton_frontend.op_mapping.WalkerCtx
 
 
+def _is_cuda_target(ctx: Any = None) -> bool:
+    """Return True iff the codegen target is explicitly CUDA / NVIDIA.
+
+    Prefers ``ctx.target`` (set by ``from_ttir``) because emission runs
+    BEFORE the tilelang lowering passes establish
+    ``tvm.target.Target.current()``. Falls back to the ambient target, then
+    to False (e.g. dict-shaped unit tests / no target).
+
+    Used ONLY to FORCE the tt.dot accumulator into ``local.fragment``: the
+    CUDA tensor-core MMA store layout (``make_mma_store_layout``) asserts a
+    fragment C and aborts on shared C. We restrict the override to an
+    EXPLICIT cuda target so the existing Metal-default behaviour (shared C,
+    which composes with follow-up scalar exprs and is what GemmMetal wants)
+    is preserved whenever the target is Metal or unspecified.
+    """
+    ctx_target = getattr(ctx, "target", None) if ctx is not None else None
+    if ctx_target:
+        t = str(ctx_target).lower()
+        return "cuda" in t or "nvidia" in t or t.startswith("sm_") or "nvptx" in t
+    try:
+        import tvm  # noqa: WPS433
+
+        target = tvm.target.Target.current(allow_none=True)
+    except Exception:
+        return False
+    if target is None:
+        return False
+    kind = str(getattr(getattr(target, "kind", None), "name", "") or "").lower()
+    tstr = str(target).lower()
+    return "cuda" in kind or "nvidia" in tstr or "cuda" in tstr
+
+
 __all__ = [
     "REDUCTION_EMITTERS",
     "EmitError",
@@ -1325,6 +1357,19 @@ def map_tt_dot(
 
         clear_accum = False
         prefer_shared_c = _result_needs_shared_c()
+        # Target gate: shared-C is the DEFAULT (Metal/unspecified) -- GemmMetal
+        # stores its simdgroup accumulator back to a shared tile, and a
+        # follow-up scalar expr like ``dot * scale`` needs C readable as a
+        # shared tile. But on an EXPLICIT CUDA target the tensor-core MMA path
+        # REQUIRES the accumulator in ``local.fragment``:
+        # ``mma_macro_generator.make_mma_store_layout`` asserts
+        # ``is_fragment(C)`` and aborts on a shared C (``local_buf ... must be
+        # a fragment, but got shared``). So we force fragment-C ONLY when the
+        # target is explicitly CUDA, leaving the Metal/unspecified default
+        # untouched. (RULE #1: a real target-correctness fix, not a silent
+        # downgrade -- a shared-C MMA simply does not codegen on CUDA.)
+        if prefer_shared_c and _is_cuda_target(ctx):
+            prefer_shared_c = False
         c_scope = "shared" if prefer_shared_c else "local.fragment"
         c_prefix = "dot_c_shared" if prefer_shared_c else "dot_c_frag"
         if c is None:

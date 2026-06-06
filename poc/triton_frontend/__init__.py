@@ -1172,6 +1172,14 @@ def from_ttir(
     except Exception:
         pass
     ctx = WalkerCtx()
+    # Thread the requested codegen target onto the ctx so target-sensitive
+    # emitters (e.g. tt.dot accumulator scope: shared-C on Metal vs
+    # local.fragment on CUDA) can pick the right lowering at emission time.
+    # Emission happens BEFORE the tilelang lowering passes set
+    # ``tvm.target.Target.current()``, so the emitter cannot rely on the
+    # ambient target -- it must read ``ctx.target``.
+    if target is not None:
+        ctx.target = str(target)
     # Plumb optional ``num_warps`` / ``num_stages`` overrides supplied by
     # the harness (which captures them from Triton's compile options) so
     # ``map_tt_func`` can stamp the right ``threadIdx.x`` extent and
@@ -1243,16 +1251,35 @@ def from_ttir(
         if not _FALLBACK_WARNED:
             _FALLBACK_WARNED = True
             warnings.warn(_DEGRADED_WARNING_MESSAGE, UserWarning, stacklevel=2)
-        _walk_text_ttir(ttir_module, ctx)
-        # Dummy fallback for coverage-only walker
-        import tvm
-        from tvm import tir
-        func = tir.PrimFunc(params=[], body=tir.Evaluate(0))
-        func = func.with_attr("global_symbol", name)
-        func = func.with_attr("tir.noalias", True)
-        func = func.with_attr("num_warps", num_warps if num_warps is not None else 4)
-        func = func.with_attr("num_stages", num_stages if num_stages is not None else 2)
-        return func
+        # RULE #1 (no silent fallback): the text walker is coverage-only --
+        # it confirms every op is in OP_TABLE but DOES NOT populate
+        # ctx.value_map / ctx.buffers and therefore cannot build a real
+        # PrimFunc body. Previously this path returned a PrimFunc whose body
+        # was ``T.evaluate(0)`` (an empty, do-nothing kernel) which
+        # ``tilelang.compile`` accepted WITHOUT raising -- a silent fallback
+        # that ships zeros instead of the kernel. We now run the coverage
+        # walk (so an unsupported op still raises NotImplementedError with a
+        # precise op name) and then RAISE LOUDLY rather than emit a stub.
+        #
+        # The cure is to make ``parse_ttir`` succeed (a real mlir.ir module
+        # provider on this host) so the MLIR walker above populates a real
+        # body; this branch only fires when NO mlir.ir provider can parse the
+        # TTIR. It must never produce a runnable kernel.
+        visited_ops = _walk_text_ttir(ttir_module, ctx)
+        raise RuntimeError(
+            "triton_frontend.from_ttir: no mlir.ir provider could parse this "
+            "TTIR (custom-form tt.* dialect) on this host, so only the "
+            "coverage-only text walker ran. The text walker confirmed all "
+            f"{len(visited_ops)} ops are in OP_TABLE but CANNOT build a real "
+            "PrimFunc body (it does not populate value_map/buffers). Refusing "
+            "to return an empty `T.evaluate(0)` stub PrimFunc (that would be a "
+            "silent do-nothing kernel). To route this kernel: provide an "
+            "mlir.ir binding that parses Triton custom-form TTIR -- either a "
+            "Triton-aware MLIR build, or build the PtrAnalysis/to_generic C++ "
+            "shim (`python -m poc.triton_frontend.build_cxx --build`) so "
+            "custom-form TTIR is converted to generic form that jaxlib's "
+            "mlir.ir can parse. See parse_ttir() for the provider probe order."
+        )
     else:
         # Pre-pass: run microsoft/triton-shared PtrAnalysis to rewrite
         # tt.* pointer arithmetic into ``tts.make_tptr`` ops and seed
