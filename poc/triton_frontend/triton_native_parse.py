@@ -152,6 +152,16 @@ class _Value:
     def type(self) -> _Type:
         return self._type
 
+    def set_type(self, type_str: str) -> None:
+        """Re-assign the SSA value's type.
+
+        Used for generic-form region-bearing ops (tt.reduce / tt.scan)
+        whose result type is printed on the region CLOSING line
+        (``}) : (...) -> R``), not on the header where the result Value is
+        first created.
+        """
+        self._type = _Type(type_str)
+
     def __str__(self) -> str:
         return self._name
 
@@ -319,7 +329,7 @@ _LHS_RE = re.compile(
 # Op name: either custom form ``dialect.op`` or generic form ``"dialect.op"``
 # (quoted). Generic form appears for ops Triton prints generically -- e.g.
 # ``tt.reduce`` with a combiner region: ``%0 = "tt.reduce"(%a) <{...}> ({...})``.
-_OPNAME_RE = re.compile(r'^"?([A-Za-z_][\w]*\.[A-Za-z_][\w]*)"?')
+_OPNAME_RE = re.compile(r'^"?([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)"?')
 # SSA value token. Includes the ``#N`` result-index suffix so a reference
 # to the Nth result of a multi-result op (``%266#3``) is captured whole --
 # without ``#`` the operand would resolve to the unbound base ``%266``.
@@ -340,9 +350,63 @@ _FUNC_RE = re.compile(
 _POSITIONAL_KEYWORD_ATTRS: Dict[str, str] = {
     "arith.cmpi": "predicate",
     "arith.cmpf": "predicate",
+    # tt.atomic_rmw custom form: ``tt.atomic_rmw fadd, acq_rel, gpu, %ptr,
+    # %val, %mask : ...``. The FIRST bare keyword (``fadd`` / ``max`` /
+    # ``min`` / ``xchg`` / ...) is the RMW op; map_tt_atomic_rmw reads it as
+    # the ``rmw_op`` attribute. The memory-ordering (``acq_rel``) and scope
+    # (``gpu``) tokens that follow are not needed by the emitter.
+    "tt.atomic_rmw": "rmw_op",
 }
 
 _LEADING_KW_RE = re.compile(r"^\s*([A-Za-z_][\w]*)\b")
+
+# Generic-form properties block ``<{key = val, ...}>`` (e.g. tt.reduce's
+# ``<{axis = 1 : i32}>``). Distinct from the regular ``{...}`` attr block.
+_PROPS_BLOCK_RE = re.compile(r"<\{([^{}]*)\}>")
+# Generic-form region block label ``^bb0(%arg0: f32, %arg1: f32):``.
+_BB_LABEL_RE = re.compile(r"^\s*\^[\w$.\-]+\s*(?:\((.*)\))?\s*:\s*$")
+# Closing line of a generic inline region: ``}) : (T1, ...) -> R`` (the
+# operand-type tuple and the result type). May also be just ``})``.
+_GENERIC_REGION_CLOSE_RE = re.compile(r"^\s*\}\)\s*(?::\s*(.*))?$")
+
+
+def _parse_props_attrs(header: str) -> List[_NamedAttr]:
+    """Parse the generic-form ``<{key = val, ...}>`` properties block.
+
+    Triton prints inherent attributes (e.g. ``tt.reduce``'s ``axis``) in a
+    ``<{...}>`` properties block rather than the trailing ``{...}`` attr
+    block. We parse the same ``key = literal`` pairs ``_parse_attrs`` does.
+    """
+    attrs: List[_NamedAttr] = []
+    for block in _PROPS_BLOCK_RE.findall(header):
+        for k, v in _ATTR_PAIR_RE.findall(block):
+            if v == "true":
+                val: Any = True
+            elif v == "false":
+                val = False
+            elif v.startswith('"'):
+                val = v[1:-1]
+            else:
+                try:
+                    val = int(v)
+                except ValueError:
+                    val = v
+            attrs.append(_NamedAttr(k, val))
+    return attrs
+
+
+def _bb_block_args(label_line: str) -> List[Tuple[str, str]]:
+    """Parse ``^bb0(%arg0: f32, %arg1: f32):`` -> [(name, type), ...]."""
+    m = _BB_LABEL_RE.match(label_line)
+    if m is None or m.group(1) is None:
+        return []
+    out: List[Tuple[str, str]] = []
+    for part in _split_top_level(m.group(1)):
+        part = re.sub(r"loc\(.*?\)", "", part).strip()
+        am = re.match(r"(%[\w$.\-]+)\s*:\s*(.+)$", part)
+        if am is not None:
+            out.append((am.group(1), am.group(2).strip()))
+    return out
 
 
 def _leading_keyword(rhs_after_op: str) -> Optional[str]:
@@ -573,6 +637,75 @@ def _build_block(cur: _Cursor, value_by_name: Dict[str, _Value],
         _emit_line(cur, line, value_by_name, block)
 
 
+def _build_generic_region(
+    cur: _Cursor,
+    value_by_name: Dict[str, _Value],
+    adapted: _Op,
+) -> None:
+    """Build the INLINE region of a generic-form region-bearing op.
+
+    Handles the combiner region Triton prints for ``tt.reduce`` / ``tt.scan``::
+
+        %0 = "tt.reduce"(%input) <{axis = 1 : i32}> ({
+        ^bb0(%arg0: f32, %arg1: f32):
+          %2 = arith.addf %arg0, %arg1 : f32
+          tt.reduce.return %2 : f32
+        }) : (tensor<64x64xf32>) -> tensor<64xf32>
+
+    The closing ``}) : (...) -> R`` line carries the op's result type, which
+    is NOT on the header (where the result Value was created). We parse it
+    here and rewrite the result Value's type so ``map_tt_reduce`` reads the
+    right output dtype.
+
+    The combiner detector (``op_emitters.reduction._detect_via_mlir``) walks
+    ``op.regions[].blocks[].operations[]`` and reads the inner ``arith.*``
+    op name, so we materialise that exact structure.
+    """
+    region = _Region()
+    child = _Block()
+    region.blocks.append(child)
+    adapted.regions.append(region)
+    while True:
+        raw = cur.peek()
+        if raw is None:
+            raise TtirParseError(
+                "triton_native_parse: unexpected EOF inside a generic inline "
+                "region (missing ``})`` close)"
+            )
+        line = raw.strip()
+        close = _GENERIC_REGION_CLOSE_RE.match(line)
+        if close is not None:
+            cur.next()
+            # The closing line carries ``: (operandTypes) -> resultType``.
+            sig = close.group(1)
+            if sig and "->" in sig and adapted.results:
+                result_sig = sig.rsplit("->", 1)[1].strip()
+                # A multi-result reducer (e.g. welford) prints
+                # ``-> (R0, R1, R2)``; split and assign per result.
+                rs = result_sig.strip()
+                if rs.startswith("(") and rs.endswith(")"):
+                    parts = _split_top_level(rs[1:-1])
+                else:
+                    parts = [rs]
+                for k, rv in enumerate(adapted.results):
+                    if k < len(parts):
+                        rv.set_type(parts[k].strip())
+            return
+        if line.startswith("^"):
+            # Block label with combiner block args (``^bb0(%a: f32, %b: f32):``).
+            cur.next()
+            for argname, type_str in _bb_block_args(line):
+                bv = _Value(argname, type_str)
+                child.arguments.append(bv)
+                value_by_name[argname] = bv
+            continue
+        if not line:
+            cur.next()
+            continue
+        cur.next()
+        _emit_line(cur, line, value_by_name, child)
+
+
 def _emit_line(cur: _Cursor, line: str, value_by_name: Dict[str, _Value],
                block: _Block) -> None:
     result_names: List[str] = []
@@ -607,8 +740,17 @@ def _emit_line(cur: _Cursor, line: str, value_by_name: Dict[str, _Value],
     # A region-opening op (scf.for/scf.if) ends its header with `` {``;
     # strip that before reading the type signature.
     header = rhs_after_op
-    opens_region = header.rstrip().endswith("{")
-    if opens_region:
+    # A generic-form region-bearing op (tt.reduce / tt.scan combiner) ends
+    # its header with ``({`` -- the open of an INLINE region. Its result
+    # type signature lives on the CLOSING ``}) : (...) -> R`` line, not the
+    # header. Detect this BEFORE the scf ``{`` test so we don't confuse the
+    # two: scf.for opens a region with a bare `` {`` and carries result
+    # types in a ``-> (...)`` clause on the header itself.
+    opens_generic_region = header.rstrip().endswith("({")
+    opens_region = (not opens_generic_region) and header.rstrip().endswith("{")
+    if opens_generic_region:
+        header = header.rstrip()[:-2].rstrip()
+    elif opens_region:
         header = header.rstrip()[:-1].rstrip()
     if " : " in header:
         type_sig = header.rsplit(" : ", 1)[1].strip()
@@ -616,6 +758,11 @@ def _emit_line(cur: _Cursor, line: str, value_by_name: Dict[str, _Value],
 
     adapted = _Op(op_name, line)
     adapted._attrs.extend(_parse_attrs(line))
+    # Generic-form ops carry inherent attrs (e.g. tt.reduce's ``axis``) in a
+    # ``<{...}>`` properties block; surface them as named attrs so the
+    # emitter's ``_attrs(op)`` finds ``axis``.
+    if opens_generic_region:
+        adapted._attrs.extend(_parse_props_attrs(line))
 
     # Positional keyword attributes (custom form puts these as bare tokens
     # right after the op name, e.g. ``arith.cmpi sle, %a, %b``). The
@@ -718,6 +865,10 @@ def _emit_line(cur: _Cursor, line: str, value_by_name: Dict[str, _Value],
         region.blocks.append(child)
         adapted.regions.append(region)
         _build_block(cur, value_by_name, child, stop_at_brace=True)
+
+    if opens_generic_region:
+        # Inline combiner region of a generic-form op (tt.reduce / tt.scan).
+        _build_generic_region(cur, value_by_name, adapted)
 
 
 # ---------------------------------------------------------------------------
