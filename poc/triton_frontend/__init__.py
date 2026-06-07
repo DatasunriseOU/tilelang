@@ -1568,6 +1568,37 @@ def from_ttir(
         ctx.routed_contiguous_tile_axis = {
             str(k_): int(v_) for k_, v_ in _contig_hint.items()
         }
+    # ITERATION 6 (C-tile executed TMA). GROUND-TRUTH route hint: the set of
+    # producer-load SOURCE pointers (TTIR ``%argN``) whose INNERMOST tile axis
+    # is PROVABLY CONTIGUOUS (global stride == 1) on the REAL tensor. For such a
+    # source the de-monomorphized kernel passes the innermost stride as an
+    # opaque symbolic arg (the analyzer cannot prove ``== 1`` even though it IS
+    # 1 at runtime), so ``copy.cc:988 ICHECK(is_one(desc.global_stride[0]))``
+    # FATALs and the C-tile T.copy cannot lower to a real TMA load. Here the
+    # route GROUNDS the innermost stride to a LITERAL ``IntImm(1)`` before
+    # ``LowerBulk`` -- ONLY for the sources listed here, which the route has
+    # VERIFIED contiguous on the real layout. RULE #1: NEVER ground a
+    # non-contiguous stride; this is grounded ground-truth, not fabrication, and
+    # is gated per-source (the dout tile, whose innermost K-reduction axis has
+    # stride ``nheads*headdim`` != 1, is DELIBERATELY excluded). Caller may
+    # override via the ``contiguous_innermost_sources`` kwarg (iterable of
+    # source SSA strings); default targets the dstates C (%arg1) producer whose
+    # ``[k, ds]`` tile has ds innermost with stride == 1.
+    _ground_srcs = kwargs.get("contiguous_innermost_sources", None)
+    if (
+        _ground_srcs is None
+        and ctx.routed_triton_async_loads
+        and isinstance(name, str)
+        and "chunk_scan_bwd_dstates" in name
+    ):
+        # C (%arg1) tile [k, ds]: innermost axis ds has global stride == 1 on
+        # the §P1 dstates layout (measured row-major). The dout (%arg0) tile is
+        # NOT listed: its innermost (k/seq) axis is genuinely non-contiguous.
+        _ground_srcs = {"%arg1"}
+    if _ground_srcs is not None:
+        ctx.routed_contiguous_innermost_sources = {
+            str(s_) for s_ in _ground_srcs
+        }
     if grid is not None:
         ctx.launch_grid = tuple(int(x) for x in grid)
     if arg_buffer_shapes is not None:

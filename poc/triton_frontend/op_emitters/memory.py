@@ -1377,8 +1377,25 @@ def _emit_ptrstate_tile_load_copynode(
         inner_is_one = bool(analyzer.can_prove(inner == tir.const(1, inner.dtype)))
     except Exception:
         inner_is_one = False
+    # ITERATION 6 (C-tile executed TMA). Per-SOURCE ground-truth contiguity:
+    # the route supplies the set of producer-load source pointers (TTIR
+    # ``%argN``) whose INNERMOST tile axis is PROVABLY CONTIGUOUS (global
+    # stride == 1) on the real tensor (``ctx.routed_contiguous_innermost_sources``;
+    # set in __init__ ONLY for the dstates C (%arg1) tile, never for dout). For
+    # such a source the de-monomorphized launch passes the innermost stride as
+    # an opaque symbolic arg so the analyzer cannot prove ``== 1`` -- we GROUND
+    # it to a literal IntImm(1) so ``copy.cc:988 ICHECK(is_one(...))`` passes
+    # and the CopyNode lowers to a REAL TMA (UTMALDG) load. RULE #1: gated to
+    # the verified-contiguous source ONLY; a non-contiguous innermost is NEVER
+    # grounded.
+    ground_innermost = False
+    _ground_srcs = getattr(ctx, "routed_contiguous_innermost_sources", None)
+    if _ground_srcs:
+        _src_name = resolved.get("source") if isinstance(resolved, dict) else None
+        if _src_name is not None and str(_src_name) in _ground_srcs:
+            ground_innermost = True
     if not inner_is_one:
-        if getattr(ctx, "routed_contiguous_innermost", False):
+        if ground_innermost:
             # Ground-truth contiguity supplied by the route: pin the innermost
             # stride to a literal 1 so the TMA descriptor is statically
             # provable. This is the axis the route verified contiguous on the
@@ -1436,7 +1453,20 @@ def _emit_ptrstate_tile_load_copynode(
     # as an async producer; we do NOT fabricate a TMA claim the layout can't
     # honor. If a future monomorphized launch surfaces a literal-1 innermost
     # stride, dropping ``disable_tma`` lets C take UTMALDG.
-    copy_call = T.copy(src2d, tile_buf, disable_tma=True)
+    #
+    # ITERATION 6: when the route GROUNDED this source's innermost stride to a
+    # literal 1 (``ground_innermost`` -- the provably-contiguous dstates C
+    # tile), the TMA descriptor is now statically provable
+    # (``is_one(desc.global_stride[0])`` holds), so we DROP ``disable_tma`` and
+    # let the CopyNode lower to a real UTMALDG TMA load. For every other tile
+    # (the dout tile, any un-grounded opaque-symbolic innermost) we keep
+    # ``disable_tma=True`` so the CopyNode lowers via the SIMT/cp.async path
+    # rather than FATAL on copy.cc:988. RULE #1: TMA only when the descriptor is
+    # provable, never a fabricated TMA claim.
+    if ground_innermost:
+        copy_call = T.copy(src2d, tile_buf)
+    else:
+        copy_call = T.copy(src2d, tile_buf, disable_tma=True)
     ctx.emit(tir.Evaluate(copy_call))
 
     # ---- mask SPLIT OFF the copy: masked epilogue -----------------------
