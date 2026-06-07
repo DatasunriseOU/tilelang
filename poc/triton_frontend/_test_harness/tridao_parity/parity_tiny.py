@@ -26,7 +26,7 @@ args=[a_dout,a_C,dprev,a_dA,torch.zeros(1,device=dev,dtype=torch.float32),
       hd,ds,cs,b,s,nc,nh//ng,
       sd[0],sd[1],sd[2],sd[3], sc[0],sc[1],sc[2],sc[3],
       sp[0],sp[1],sp[2],sp[3],sp[4], sa[0],sa[2],sa[1],sa[3], 0,0,
-      gd1,gd2,gd0,gd01]
+      gd2,gd1,gd0]  # canonical 34-param tail gridDim_2,gridDim_1,gridDim_0
 kernel(*args); torch.cuda.synchronize()
 routed=dprev[:b*nc*nh*hd*ds].view(b,nc,nh,hd,ds)
 nz_r=int((routed.abs()>0).sum());nz_n=int((native.abs()>0).sum())
