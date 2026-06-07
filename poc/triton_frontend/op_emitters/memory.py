@@ -1224,6 +1224,267 @@ def _emit_tile_store_tir(
     return body
 
 
+def _ptrstate_block_base_and_strides(
+    ctx: WalkerCtx,
+    resolved: Dict[str, Any],
+    out_shape: Sequence[int],
+) -> Tuple[Any, List[Any]]:
+    """Split the PtrState flat address into (per-block base, per-axis strides).
+
+    :func:`_ptrstate_flat_index` collapses the whole address into ONE scalar
+    per lane::
+
+        flat = sum_axis(off[axis] + lv[axis]*stride[axis]) + trips*advance
+
+    For a *real* 2D ``T.copy`` CopyNode we must instead keep the 2D structure
+    explicit -- the global source has to be a 2D ``tir.Buffer`` whose
+    ``strides=[stride0, stride1]`` preserve axis contiguity (so the lowering
+    sees a contiguous innermost axis and can pick TMA/UTMALDG). The part of
+    the address that does NOT depend on the per-lane tile coords ``lv`` is the
+    block ``elem_offset``::
+
+        elem_offset = sum_axis(off[axis]) + trips*advance       (constant/block)
+        strides     = [stride[axis] for axis in tile]           (per-axis)
+
+    RULE #1: the per-axis stride must resolve to a real PrimExpr (the symbolic
+    arg stride). A missing stride is a bug, not a default-to-1 -- we raise
+    rather than silently fabricate contiguity that the tensor does not have.
+    """
+    tir = ctx.tir()
+    offsets = _resolve_ptrstate_values(ctx, resolved.get("offsets") or [])
+    strides_in = _resolve_ptrstate_values(ctx, resolved.get("strides") or [])
+    rank = len(out_shape or [])
+    # Per-block base: only the loop-independent terms (off[axis]) summed,
+    # scalarized exactly like _ptrstate_flat_index does (any axis-indexed
+    # off is reduced to its block origin -- off carries no lv dependence).
+    base: Any = tir.const(0, "int64")
+    for axis in range(rank):
+        off = offsets[axis] if axis < len(offsets) else tir.const(0, "int32")
+        off = _scalarize_tile_index_base(ctx, off, [], out_shape)
+        off = _cast_index_like(ctx, off, base)
+        base = base + off
+    # Loop-carried pointer advance (multi-K-trip slide) -- same math as the
+    # 1D path: trips * advance, added to the block base.
+    carry = resolved.get("_carry_flat") if isinstance(resolved, dict) else None
+    if carry:
+        advance = _carry_resolve(ctx, carry.get("advance"))
+        induction = _carry_resolve(ctx, carry.get("induction"))
+        lb = _carry_resolve(ctx, carry.get("lb"))
+        step = _carry_resolve(ctx, carry.get("step"))
+        advance = _cast_index_like(ctx, advance, base)
+        induction = _cast_index_like(ctx, induction, base)
+        lb = _cast_index_like(ctx, lb, base)
+        step = _cast_index_like(ctx, step, base)
+        trips = tir.FloorDiv(induction - lb, step)
+        base = base + trips * advance
+    # Per-axis strides (preserve the 2D contiguity). RULE #1: raise on a
+    # missing stride rather than default to 1 (that would claim contiguity
+    # the source layout does not have and silently mis-address / mis-TMA).
+    strides: List[Any] = []
+    for axis in range(rank):
+        if axis >= len(strides_in):
+            raise EmitError(
+                "CopyNode conversion: PtrState has %d strides but tile rank is "
+                "%d; refusing to default the missing axis stride to 1 (would "
+                "fabricate contiguity). resolved.strides=%r"
+                % (len(strides_in), rank, resolved.get("strides"))
+            )
+        stride = _scalarize_tile_index_base(ctx, strides_in[axis], [], out_shape)
+        stride = _cast_index_like(ctx, stride, base)
+        strides.append(stride)
+    return base, strides
+
+
+def _emit_ptrstate_tile_load_copynode(
+    op: Any,
+    ctx: WalkerCtx,
+    src_buf: Any,
+    resolved: Dict[str, Any],
+    out_shape: Sequence[int],
+    out_dtype: str,
+    mask_ssa: Any,
+    other_ssa: Any,
+    dynamic_mask_dims: Sequence[Any],
+    tile_buf: Any,
+    loop_vars: Sequence[Any],
+) -> bool:
+    """Emit a REAL 2D-strided ``T.copy`` CopyNode for the K-loop producer.
+
+    Iteration-4 (CopyNode conversion). The 1D-flattened predicated ``tir.For``
+    (``shared[i,j] = if_then_else(mask, global[flat_idx], other)``) is NOT
+    recognized as a proven copy by ``pipeline_planning.cc`` (the global read is
+    hidden inside an ``if_then_else`` condition-guarded subtree, and there is
+    no ``tl.tileop.copy`` CallNode for ``ParseOperator`` to match). So
+    ``num_stages`` alone yields no async stage.
+
+    Here we instead:
+      (a) declare the global source as a 2D ``tir.Buffer`` aliasing the flat
+          arg's backing ``data`` Var, with ``strides=[stride0, stride1]`` (the
+          symbolic per-axis arg strides) and ``elem_offset`` = the per-block
+          flat base -- so the 2D axis-contiguity (innermost stride) survives;
+      (b) emit ``T.copy(src2d, shared_tile)`` as a real ``tl.tileop.copy``
+          CallNode (recognized as a CopyNode by ParseOperator/PipelinePlanning);
+      (c) SPLIT the bounds mask OFF the copy into a separate masked epilogue
+          (zero the out-of-bounds shared lanes AFTER the bulk copy) instead of
+          guarding the producer with ``if_then_else``.
+
+    Returns True on success (CopyNode emitted). RULE #1: this is gated to the
+    routed-triton async path; on any structural mismatch it RAISES (no silent
+    fallback to a predicated-For dressed up as a coalesced copy).
+    """
+    tir = ctx.tir()
+    try:
+        import tilelang.language as T  # type: ignore
+    except Exception as exc:  # pragma: no cover - TileLang must be importable here
+        raise EmitError(
+            "CopyNode conversion requires tilelang.language (T.copy) to build a "
+            "real CopyNode; import failed: %r" % (exc,)
+        )
+    base, strides = _ptrstate_block_base_and_strides(ctx, resolved, out_shape)
+    data_var = getattr(src_buf, "data", None)
+    if data_var is None:
+        raise EmitError(
+            "CopyNode conversion: flat source buffer %r has no backing data Var "
+            "to alias into a 2D strided view" % (getattr(src_buf, "name", "?"),)
+        )
+
+    # ---- TMA-eligibility gate (RULE #1) ---------------------------------
+    # Once this CopyNode is scheduled as a pipeline producer, the CUDA copy
+    # lowering classifies a global->shared LOAD as a TMA bulk load and the
+    # bulk path HARD-REQUIRES a statically-provable contiguous innermost
+    # global stride (``ICHECK(is_one(desc.global_stride[0]))`` in
+    # src/backend/cuda/op/copy.cc). ``desc.global_stride`` is the REVERSED
+    # buffer strides, so the gate is on the LAST element of ``strides`` (the
+    # innermost tile axis). We must NOT emit a CopyNode that the core will
+    # then FATAL on -- and we must NOT silently fabricate contiguity. So:
+    #   * if the innermost stride is provably 1 -> TMA-eligible, emit;
+    #   * elif the route has GROUND-TRUTH-verified the innermost is contiguous
+    #     (``ctx.routed_contiguous_innermost``, set only when the caller knows
+    #     the real tensor's innermost stride == 1) -> substitute a LITERAL 1
+    #     for that axis so the static TMA descriptor is provable (genuine
+    #     UTMALDG, not a guess);
+    #   * else -> RAISE the exact reason (non-contiguous / opaque-symbolic
+    #     innermost; TMA needs the innermost axis contiguous). No predicated-
+    #     For dressed up as a coalesced copy.
+    if not strides:
+        raise EmitError(
+            "CopyNode conversion: empty strides for tile %r (rank %d)"
+            % (getattr(src_buf, "name", "?"), len(out_shape or []))
+        )
+    inner = strides[-1]
+    try:
+        analyzer = ctx.tvm().arith.Analyzer()
+        inner_is_one = bool(analyzer.can_prove(inner == tir.const(1, inner.dtype)))
+    except Exception:
+        inner_is_one = False
+    if not inner_is_one:
+        if getattr(ctx, "routed_contiguous_innermost", False):
+            # Ground-truth contiguity supplied by the route: pin the innermost
+            # stride to a literal 1 so the TMA descriptor is statically
+            # provable. This is the axis the route verified contiguous on the
+            # real tensor -- grounded, not fabricated.
+            strides = list(strides[:-1]) + [tir.const(1, "int64")]
+            inner_is_one = True
+        else:
+            # NOT TMA-eligible: the innermost global stride is not provably 1
+            # (de-monomorphized kernel passes it as an opaque runtime arg; and
+            # for the dout tile the innermost axis is the genuinely
+            # non-contiguous K-reduction (seq) axis, stride nheads*headdim).
+            # Signal the caller to keep this load on the existing
+            # (non-pipelined) predicated-For path rather than emit a CopyNode
+            # that the CUDA bulk-copy lowering would FATAL on. RULE #1: this is
+            # NOT a coalesced-copy claim -- the caller does NOT annotate the
+            # K-loop with num_stages for this load. The exact reason is
+            # surfaced via the return value so it is visible end-to-end.
+            return False
+    src_name = (getattr(src_buf, "name", None) or "src") + "_2d"
+    # 2D (rank-N) strided view over the SAME global allocation. The strides
+    # carry the symbolic arg strides; elem_offset carries the per-block base.
+    # Aliasing src_buf.data keeps MakePackedAPI's bound param handle -- no new
+    # free Var. scope is global (inherit from the flat arg buffer).
+    # Scope: the flat arg buffer is a global function param; mirror it so the
+    # 2D view aliases global memory (the copy is global->shared).
+    try:
+        src_scope = src_buf.scope()
+    except Exception:
+        src_scope = "global"
+    src2d = tir.decl_buffer(
+        list(out_shape),
+        out_dtype,
+        name=ctx.fresh(src_name),
+        data=data_var,
+        strides=list(strides),
+        elem_offset=base,
+        scope=src_scope or "global",
+    )
+    # Real CopyNode: T.copy(src2d[full] -> shared_tile). Both are full-extent
+    # buffer args; copy_op derives extents from shape and encodes tl.region.
+    #
+    # TMA-eligibility (RULE #1, measured on sm_121): the CUDA bulk-copy
+    # (UTMALDG) lowering REQUIRES a statically-provable contiguous innermost
+    # GLOBAL stride -- ``ICHECK(is_one(desc.global_stride[0]))`` in
+    # src/backend/cuda/op/copy.cc. Our per-axis strides are SYMBOLIC runtime
+    # args (the de-monomorphized kernel passes ``stride_*`` as params), so the
+    # analyzer can neither prove ``== 1`` (-> the bulk lowering ICHECK FATALs)
+    # nor, for the dout tile, is the innermost axis even contiguous at runtime
+    # (dout tile is ``[hd, k]`` -> innermost = K-reduction axis, stride
+    # ``nheads*headdim`` = 7168, genuinely != 1; only C's ``[k, ds]`` tile has
+    # a runtime-contiguous innermost, but still opaque-symbolic so unprovable).
+    # We therefore set ``disable_tma`` so the CopyNode lowers via the SIMT /
+    # cp.async coalesced path instead of FATAL-ing on the unprovable TMA
+    # descriptor. It is STILL a real CopyNode -> PipelinePlanning schedules it
+    # as an async producer; we do NOT fabricate a TMA claim the layout can't
+    # honor. If a future monomorphized launch surfaces a literal-1 innermost
+    # stride, dropping ``disable_tma`` lets C take UTMALDG.
+    copy_call = T.copy(src2d, tile_buf, disable_tma=True)
+    ctx.emit(tir.Evaluate(copy_call))
+
+    # ---- mask SPLIT OFF the copy: masked epilogue -----------------------
+    # The bounds mask is NOT inside the producer (that would re-hide the read
+    # and defeat CopyNode recognition). After the bulk copy populates the
+    # shared tile, overwrite the out-of-bounds lanes with ``other`` (default
+    # 0) in a separate predicated For. In-bounds lanes keep the copied value.
+    pred = None
+    other_lane: Any = tir.const(0, out_dtype)
+    if mask_ssa is not None:
+        try:
+            mask_expr = ctx.get(mask_ssa)
+        except KeyError:
+            mask_expr = None
+        if mask_expr is not None:
+            if other_ssa is not None:
+                try:
+                    other_expr = ctx.get(other_ssa)
+                except KeyError:
+                    other_expr = tir.const(0, out_dtype)
+            else:
+                other_expr = tir.const(0, out_dtype)
+            mask_lane = _resolve_lane_operand(ctx, mask_expr, loop_vars, role="mask")
+            other_lane = _resolve_lane_operand(ctx, other_expr, loop_vars, role="other")
+            # Epilogue writes ``other`` where the lane is OUT of bounds:
+            # predicate is the NEGATION of the in-bounds mask.
+            pred = tir.Not(mask_lane)
+    dyn = _dynamic_tts_mask_expr(ctx, loop_vars, dynamic_mask_dims)
+    if dyn is not None:
+        dyn_oob = tir.Not(dyn)
+        pred = dyn_oob if pred is None else tir.Or(pred, dyn_oob)
+    if pred is not None:
+        store = tir.BufferStore(
+            tile_buf, other_lane, list(loop_vars) or [tir.const(0, "int32")]
+        )
+        epi: Any = tir.IfThenElse(pred, store, None)
+        for axis in range(len(loop_vars) - 1, -1, -1):
+            epi = tir.For(
+                loop_vars[axis],
+                tir.const(0, "int32"),
+                tir.const(int(out_shape[axis]), "int32"),
+                tir.ForKind.SERIAL,
+                epi,
+            )
+        ctx.emit(epi)
+    return True
+
+
 def _emit_ptrstate_tile_load_tir(
     op: Any,
     ctx: WalkerCtx,
@@ -1252,6 +1513,49 @@ def _emit_ptrstate_tile_load_tir(
         tir.Var(ctx.fresh(f"i{axis}"), "int32")
         for axis, _extent in enumerate(out_shape or [1])
     ]
+    # ITERATION 4 (CopyNode conversion): on the routed-triton async path, a
+    # rank>=2 global->shared producer (the K-loop dout/C tile) is emitted as a
+    # REAL 2D-strided ``T.copy`` CopyNode instead of the 1D-flattened
+    # predicated ``tir.For``. PipelinePlanning then recognizes it as a proven
+    # copy and InjectSoftwarePipeline schedules it as an async stage ->
+    # UTMALDG (TMA) on sm_121. The bounds mask is SPLIT OFF into a separate
+    # masked epilogue (not inside the producer). Gated tightly; the GEMM
+    # cooperative path is untouched. RULE #1: convert or RAISE -- no silent
+    # predicated-For dressed up as a coalesced copy.
+    if (
+        getattr(ctx, "routed_triton_async_loads", False)
+        and len(out_shape or []) >= 2
+    ):
+        converted = _emit_ptrstate_tile_load_copynode(
+            op,
+            ctx,
+            src_buf,
+            resolved,
+            out_shape,
+            out_dtype,
+            mask_ssa,
+            other_ssa,
+            dynamic_mask_dims,
+            tile_buf,
+            loop_vars,
+        )
+        if converted:
+            # Real CopyNode emitted -> count it so ``map_scf_for`` stamps
+            # ``num_stages`` on the enclosing K-loop (the producer is now a
+            # proven copy -> InjectSoftwarePipeline schedules it async ->
+            # UTMALDG on sm_121).
+            shared_copies = getattr(ctx, "_gmem_shared_copies", None)
+            if isinstance(shared_copies, list):
+                shared_copies.append(1)
+            if result_value is not None:
+                ctx.bind(result_value, tile_buf)
+            return tile_buf
+        # NOT TMA-eligible (innermost stride not provably 1). Fall through to
+        # the existing predicated-For load path WITHOUT counting it as a
+        # shared async copy -- so the K-loop is NOT mis-annotated as pipelined
+        # for a load that cannot become a coalesced async copy. RULE #1: no
+        # silent coalesced claim.
+
     flat_idx = _ptrstate_flat_index(ctx, resolved, loop_vars, out_shape)
     load_expr: Any = tir.BufferLoad(src_buf, [flat_idx])
     if mask_ssa is not None:
@@ -1286,24 +1590,15 @@ def _emit_ptrstate_tile_load_tir(
             body,
         )
     ctx.emit(body)
-    # ITERATION 3 (coalesced async loads): this strided PtrState load is the
-    # actual K-loop global->shared producer for the dstates/dc/... kernels
-    # (tile_buf is shared when rank>=2). Record it on ctx._gmem_shared_copies so
-    # ``map_scf_for`` stamps ``num_stages`` on the enclosing K-loop. See the
-    # measured note in iteration-3: PipelinePlanning recognizes a *CopyNode*
-    # producer (T.copy global->shared); a predicated manual ``tir.For`` grid
-    # (``shared[i,j] = T.if_then_else(mask, global[...], other)``) is explicitly
-    # NOT treated as a proven copy (pipeline_planning.cc:370), so num_stages on
-    # its own does not yield cp.async here -- the producer must first be routed
-    # through a clean CopyNode. We still count it so the pipeline annotation is
-    # present and the eligibility is visible end-to-end.
-    if (
-        getattr(ctx, "routed_triton_async_loads", False)
-        and len(out_shape or []) >= 2
-    ):
-        shared_copies = getattr(ctx, "_gmem_shared_copies", None)
-        if isinstance(shared_copies, list):
-            shared_copies.append(1)
+    # NOTE (iteration 4): reaching here on the routed async path means the
+    # CopyNode conversion returned False (the tile is NOT TMA-eligible -- its
+    # innermost global stride is not provably 1). We deliberately do NOT count
+    # this predicated-For load on ``_gmem_shared_copies``: a manual predicated
+    # ``tir.For`` is NOT a proven copy (pipeline_planning.cc), so annotating the
+    # K-loop with ``num_stages`` for it would only stamp an INERT pipeline (the
+    # iteration-3 finding). RULE #1: do not claim a coalesced/async pipeline for
+    # a load that cannot become a real CopyNode. Eligible tiles take the
+    # CopyNode early-return above and ARE counted there.
     if result_value is not None:
         ctx.bind(result_value, tile_buf)
     return tile_buf
