@@ -82,6 +82,7 @@ from ..op_mapping import (
     _results,
     _shape_of,
     materialize_lazy_tile,
+    should_fold_addressing,
 )
 
 
@@ -2284,6 +2285,13 @@ def emit_tt_expand_dims(op: Any, ctx: WalkerCtx) -> Any:
             ),
             name=ctx.fresh("expand_expr"),
         )
+        # FULL TRANSFORM 1: fold-eligible expand_dims (consumed only as
+        # addressing/mask) stays lazy -- folds into the load/store loop body,
+        # so no [N] expand_* array is materialized.
+        if should_fold_addressing(ctx, op):
+            if result_value is not None:
+                ctx.bind(result_value, lazy)
+            return lazy
         out = materialize_lazy_tile(
             ctx,
             lazy,
@@ -2425,6 +2433,14 @@ def emit_tt_broadcast(op: Any, ctx: WalkerCtx) -> Any:
             return src
 
         lazy = LazyTileExpr(out_shape, dtype, _broadcast_reader, name=ctx.fresh("bcast_expr"))
+        # FULL TRANSFORM 1: fold-eligible broadcasts (consumed only as
+        # addressing/mask) stay lazy -- the per-lane broadcast read folds into
+        # the load/store loop body, so no [2048]/[4096] bcast_* array is
+        # materialized (no local spill).
+        if should_fold_addressing(ctx, op):
+            if result_value is not None:
+                ctx.bind(result_value, lazy)
+            return lazy
         out_buf = materialize_lazy_tile(
             ctx,
             lazy,

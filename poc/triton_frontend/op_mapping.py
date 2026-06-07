@@ -48,6 +48,7 @@ __all__ = [
     "EmitFn",
     "WalkerCtx",
     "materialize_lazy_tile",
+    "should_fold_addressing",
     # Memory ops
     "map_tt_atomic_rmw",
     # Compute ops
@@ -367,6 +368,22 @@ class WalkerCtx:
         # transforms (1)/(3) can ship under ``routed_triton_prologue_opt``
         # without coupling to the conditional thread-distribution.
         self.routed_triton_thread_distribute: bool = False
+        # FULL TRANSFORM 1 (Coalesce-style addressing fold). Set of MLIR
+        # result ``Value`` objects (by identity/hash) whose tile result is
+        # consumed ONLY as addressing/mask for a
+        # tt.load/tt.store (directly or transitively through other
+        # addressing/mask ops). Populated by ``build_addressing_fold_set`` in
+        # the walker pre-pass. When ``routed_triton_prologue_opt`` is on and a
+        # feeder (``_emit_tile_binop`` / ``emit_tt_broadcast`` /
+        # ``emit_tt_expand_dims``) is about to ``materialize_lazy_tile`` a tile
+        # whose result SSA is in this set, it instead binds the lane-indexable
+        # ``LazyTileExpr`` directly -- the per-lane index/predicate folds into
+        # the load/store loop body (region indices + predicate) and the
+        # [64]/[2048]/[4096] array is never materialized in ANY scope (no local
+        # spill, no shared overflow, nothing to thread-distribute). The
+        # cooperative T.copy/T.gemm operand tiles are NEVER in this set (their
+        # results feed tt.dot), so the GEMM path stays byte-identical.
+        self.fold_addressing_ssa: set = set()
         # Some scalar fallback emitters implement tile-level semantics with
         # serial read-modify-write loops. When one is used under the synthetic
         # ``threadIdx.x`` wrapper, run the whole block body on lane 0 to avoid
@@ -1160,6 +1177,65 @@ def _alloc_tile_buffer(
             buf = tir.decl_buffer(shape_list, dtype, name=name)
     ctx.local_buffers.append(buf)
     return buf
+
+
+def _result_ssa_name(op: Any) -> Optional[str]:
+    """Printed RESULT SSA name of ``op``'s first result (fold lookup key)."""
+    results = _results(op)
+    if not results:
+        return None
+    value = results[0]
+    for attr in ("get_name", "name"):
+        getter = getattr(value, attr, None)
+        if callable(getter):
+            try:
+                out = str(getter())
+                if out:
+                    return out
+            except Exception:
+                pass
+        elif isinstance(getter, str) and getter:
+            return getter
+    try:
+        s = str(value).strip()
+        if s:
+            head = s.split()[0]
+            if head.startswith("%"):
+                return head
+    except Exception:
+        pass
+    return None
+
+
+def should_fold_addressing(ctx: "WalkerCtx", op: Any) -> bool:
+    """Return True iff ``op``'s tile result should be kept lazy (transform 1).
+
+    The result is folded into the consuming tt.load/tt.store region indices +
+    predicate (Coalesce-style) instead of being materialized into a spilled
+    addressing/mask array. Gated to the routed-triton prologue-opt path; the
+    fold set (``build_addressing_fold_set``) holds eligible RESULT SSA names --
+    the cooperative GEMM operand tiles (whose results feed tt.dot) are never in
+    it, so the GEMM path stays byte-identical.
+
+    Match is by RESULT-position SSA name. The use GRAPH was reconstructed by
+    Value identity in the pre-pass (reliable); the lookup KEY is a name because
+    in-loop ops reach the emitter via a region-child ``WalkerCtx``
+    (``_emit_region``) whose Value wrappers are not identity-stable across the
+    child boundary, while result->result name spelling IS consistent.
+    """
+    if not getattr(ctx, "routed_triton_prologue_opt", False):
+        return False
+    fold_set = getattr(ctx, "fold_addressing_ssa", None)
+    if not fold_set:
+        return False
+    name = _result_ssa_name(op)
+    if name is None:
+        return False
+    return (
+        name in fold_set
+        or name.lstrip("%") in fold_set
+        or f"%{name.lstrip('%')}" in fold_set
+    )
 
 
 def materialize_lazy_tile(

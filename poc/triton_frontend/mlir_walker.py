@@ -54,6 +54,7 @@ __all__ = [
     "parse_ttir",
     "try_import_mlir",
     "walk_module",
+    "build_addressing_fold_set",
     "wrap_module_for_walker",
 ]
 
@@ -459,6 +460,363 @@ def walk_module(module: Any, visitor: OpVisitor) -> None:
                     _recurse(child)
 
     _recurse(top)
+
+
+# ---------------------------------------------------------------------------
+# Addressing/mask FOLD analysis (full transform 1 -- Coalesce-style)
+# ---------------------------------------------------------------------------
+#
+# Triton's Coalesce.cpp never materializes the make_range / broadcast / splat
+# addressing arithmetic -- it is absorbed into the per-thread slice of ONE
+# coalesced load. Our frontend, by contrast, MATERIALIZES every
+# ``tile_binop_*`` / ``bcast_*`` / ``expand_*`` tile into a standalone
+# ``[64]`` / ``[2048]`` / ``[4096]`` buffer (``materialize_lazy_tile``); those
+# arrays spill to local memory and every lane re-runs the address arithmetic.
+#
+# This pre-pass identifies the SSA results that are consumed ONLY as
+# ADDRESSING or MASK for a ``tt.load`` / ``tt.store`` (directly, or
+# transitively through other addressing/mask ops). Those results are
+# "fold-eligible": ``materialize_lazy_tile`` keeps them as the lane-indexable
+# ``LazyTileExpr`` instead of allocating a buffer, so the per-lane index /
+# predicate is threaded INTO the load/store loop body (the copy region indices
+# + predicate) rather than being precomputed into a spilled array.
+#
+# A result is fold-eligible iff EVERY use of it is one of:
+#   * a ``tt.load`` / ``tt.store`` (consuming it as a pointer-arithmetic
+#     operand or a mask -- never as the stored VALUE, see below), OR
+#   * another op that is itself a pure addressing/mask producer AND whose
+#     own result is fold-eligible (transitive closure: e.g. an
+#     ``arith.muli`` whose result only feeds an ``arith.addi`` that only
+#     feeds a ``tt.load`` mask).
+#
+# We are deliberately conservative: any use by ``tt.dot`` / ``tt.reduce`` /
+# ``tt.store`` value-operand / a yield / a return / any op outside the
+# addressing-producer allowlist DISQUALIFIES the result. That keeps the
+# cooperative GEMM ``T.copy`` / ``T.gemm`` path byte-identical (its operand
+# tiles are real data buffers, never folded) -- RULE #1.
+
+# Op names that are pure addressing/mask PRODUCERS: they take tile operands
+# and produce a tile that is itself only addressing/mask. Their result may be
+# folded if (recursively) all ITS uses are fold-safe.
+_ADDR_PRODUCER_OPS = frozenset({
+    "tt.broadcast",
+    "tt.expand_dims",
+    "tt.splat",
+    "tt.make_range",
+    "tt.addptr",
+    "tt.bitcast",
+    # Structured-pointer producer emitted by the PtrAnalysis pre-pass
+    # (``tts.make_tptr``): its dynamic offset/stride operands are pure
+    # addressing, and its result is consumed only by ``tts.load`` / ``tts.store``
+    # (the structured analogues of the sinks). Treating it as an addressing
+    # producer lets the offset/stride binop chains feeding it stay lazy.
+    "tts.make_tptr",
+    "arith.bitcast",
+    "arith.muli",
+    "arith.addi",
+    "arith.subi",
+    "arith.cmpi",
+    "arith.cmpf",
+    "arith.andi",
+    "arith.ori",
+    "arith.xori",
+    "arith.extsi",
+    "arith.extui",
+    "arith.trunci",
+    "arith.index_cast",
+    "arith.remsi",
+    "arith.remui",
+    "arith.divsi",
+    "arith.divui",
+    "arith.maxsi",
+    "arith.minsi",
+    "arith.select",
+    # Pure shape rebinds of an addressing/mask tile (no data movement): a
+    # reshaped mask/index is still addressing. The PtrAnalysis pre-pass emits
+    # ``tensor.collapse_shape`` / ``tensor.expand_shape`` when flattening a 2D
+    # mask into the structured load's predicate.
+    "tensor.collapse_shape",
+    "tensor.expand_shape",
+})
+
+# Op names that consume a tile as addressing/mask and TERMINATE the chain
+# (the fold target). The fold is justified precisely because these are the
+# load/store ops whose region indices + predicate absorb the addressing.
+_ADDR_SINK_OPS = frozenset({
+    "tt.load",
+    "tt.store",
+    # Structured load/store emitted by the PtrAnalysis pre-pass. The mask /
+    # dynamic-dim operands they consume are addressing/mask, absorbed into the
+    # strided copy region + predicate -- exactly the fold target.
+    "tts.load",
+    "tts.store",
+})
+
+
+def _value_ssa_key(value: Any) -> Optional[str]:
+    """Best-effort printed SSA name for an MLIR value (mirrors _ssa_name)."""
+    if value is None:
+        return None
+    for attr in ("get_name", "name"):
+        getter = getattr(value, attr, None)
+        if callable(getter):
+            try:
+                out = str(getter())
+                if out:
+                    return out
+            except Exception:
+                pass
+        elif isinstance(getter, str) and getter:
+            return getter
+    try:
+        s = str(value).strip()
+        if s:
+            head = s.split()[0]
+            if head.startswith("%"):
+                return head
+    except Exception:
+        pass
+    return None
+
+
+def build_addressing_fold_set(module: Any) -> set:
+    """Return the set of result SSA names consumed ONLY as addressing/mask.
+
+    See the module-level comment above for the eligibility contract. The
+    returned set is keyed by printed RESULT SSA name -- the exact spelling the
+    feeder emitter sees on ``_results(op)[0].get_name()`` -- so the lookup in
+    ``should_fold_addressing`` matches at emit time. A feeder consults it (via
+    ``WalkerCtx.fold_addressing_ssa``) to decide whether to keep a tile lazy
+    instead of materializing it.
+
+    Use-def reconstruction
+    ----------------------
+    The walk builds the use map by MLIR ``Value`` *identity*, NOT by printed
+    name: in mlir.ir the SAME value prints a DIFFERENT name when it appears as
+    an OPERAND vs as the defining op's RESULT (operand spelling carries a
+    global value id, result spelling a block-relative number), so a
+    name-keyed map silently fails to connect a load's mask operand back to the
+    ``arith.cmpi`` that produced it. ``Value`` is hashable and exposes
+    ``.owner`` (its defining op), giving an exact use->def edge.
+
+    A result Value is fold-eligible iff EVERY use of it is either an addressing
+    SINK (``tt.load`` / ``tt.store`` pointer or mask operand -- NOT the store
+    VALUE operand) or an addressing PRODUCER op whose own result(s) are
+    themselves eligible (transitive fixpoint).
+    """
+    if module is None:
+        return set()
+    module = wrap_module_for_walker(module)
+    body = getattr(module, "body", None)
+    top = body if body is not None else getattr(module, "operation", module)
+
+    # Value (by identity/hash) -> list of (consumer_op, operand_index).
+    uses_of: dict = {}
+    all_ops: list = []
+
+    def _recurse(op: Any) -> None:
+        all_ops.append(op)
+        operands = list(getattr(op, "operands", ()) or ())
+        for opnd_idx, operand in enumerate(operands):
+            try:
+                uses_of.setdefault(operand, []).append((op, opnd_idx))
+            except TypeError:
+                # Unhashable operand (block arg in some providers) -- skip; it
+                # cannot be a producer-result fold candidate anyway.
+                continue
+        for region in getattr(op, "regions", ()) or ():
+            for block in getattr(region, "blocks", ()) or ():
+                for child in getattr(block, "operations", ()) or ():
+                    _recurse(child)
+
+    _recurse(top)
+
+    def _use_is_sink(consumer_op: Any, opnd_idx: int) -> bool:
+        """True iff this use absorbs the value as load/store addressing/mask."""
+        cname = _op_name(consumer_op)
+        if cname not in _ADDR_SINK_OPS:
+            return False
+        # ``tt.store(ptr, value, mask)`` / ``tts.store(ptr, value, mask, dim)``:
+        # operand #1 is the stored VALUE -- real data, never addressing.
+        # RULE #1: never fold a data tile into addressing.
+        if cname in ("tt.store", "tts.store") and opnd_idx == 1:
+            return False
+        return True
+
+    # ----- scf.for loop-carried pointer transparency -----------------------
+    # The dominant remaining arrays are the 2D pointer-offset tiles
+    # (``offs_m[:,None]*sd + offs_k[None,:]``) that feed ``tt.addptr`` to build
+    # a pointer TILE carried as an scf.for iter-arg, then advanced each K-trip.
+    # Those iter-args are pure addressing EXCEPT the accumulator (an f32 data
+    # tile). We make scf.for/scf.yield TRANSPARENT for an iter-arg iff the
+    # carried value is a pointer/integer (NOT the float accumulator) AND every
+    # use of the loop block-argument is itself eligible/sink AND the matching
+    # scf.yield operand is eligible. Concretely, scf.for operand ``3+i`` <->
+    # block-arg ``1+i`` <-> yield operand ``i`` <-> result ``i`` (the leading
+    # 3 operands are lb/ub/step; block-arg 0 is the induction var).
+    #
+    # Implementation: precompute, per scf.for, the iter-arg structure. During
+    # the fixpoint, a use of a candidate value as an scf.for iter-init operand
+    # is treated like a PRODUCER edge whose "result" is the loop block-arg --
+    # which we ADD to the candidate universe as a transparent node and require
+    # (a) the yield operand for that slot is a candidate and (b) all uses of
+    # the block-arg are eligible. Block-arg eligibility participates in the
+    # same fixpoint.
+    scf_iter_map: dict = {}  # scf.for op -> list of (init_operand, blockarg, yield_operand)
+    for op in all_ops:
+        if _op_name(op) != "scf.for":
+            continue
+        operands = list(getattr(op, "operands", ()) or [])
+        regions = getattr(op, "regions", ()) or []
+        if not regions:
+            continue
+        blocks = getattr(regions[0], "blocks", ()) or []
+        if not blocks:
+            continue
+        block = blocks[0]
+        bargs = list(getattr(block, "arguments", ()) or [])
+        body_ops = list(getattr(block, "operations", ()) or [])
+        yld = body_ops[-1] if body_ops else None
+        yld_operands = list(getattr(yld, "operands", ()) or []) if yld is not None else []
+        # operands[3:] are the iter inits; bargs[1:] the carried block args.
+        inits = operands[3:]
+        carried = bargs[1:]
+        entries = []
+        for i, init in enumerate(inits):
+            barg = carried[i] if i < len(carried) else None
+            yop = yld_operands[i] if i < len(yld_operands) else None
+            entries.append((init, barg, yop))
+        scf_iter_map[op] = entries
+
+    def _is_float_pointerlike(value: Any) -> bool:
+        """True iff the carried value is the f32 accumulator (a DATA tile)."""
+        t = str(getattr(value, "type", "") or "")
+        # Pointer tiles print ``!tt.ptr``; the accumulator prints ``xf32>``
+        # (no ``ptr``). Integer index tiles are ``xi32``/``xi64``. Only the
+        # non-pointer float tile is data.
+        if "!tt.ptr" in t:
+            return False
+        return "f32" in t or "f16" in t or "bf16" in t
+
+    # Build, per scf.for, fast lookups: init-operand-value -> slot index.
+    scf_for_of_init: dict = {}  # value -> list of (scf_op, slot_idx)
+    scf_yield_of_slot: dict = {}  # (scf_op, slot) -> yield operand value
+    scf_barg_of_slot: dict = {}   # (scf_op, slot) -> block arg value
+    # yield operand VALUE -> set of carried block-args it feeds (for precise
+    # yield-use eligibility: a value yielded into a non-candidate slot must be
+    # disqualified).
+    scf_yield_target_barg: dict = {}
+    for scf_op, entries in scf_iter_map.items():
+        for slot, (init, barg, yop) in enumerate(entries):
+            try:
+                scf_for_of_init.setdefault(init, []).append((scf_op, slot))
+            except TypeError:
+                pass
+            scf_yield_of_slot[(id(scf_op), slot)] = yop
+            scf_barg_of_slot[(id(scf_op), slot)] = barg
+            if yop is not None and barg is not None:
+                try:
+                    scf_yield_target_barg.setdefault(yop, set()).add(barg)
+                except TypeError:
+                    pass
+
+    # Optimistic candidate set: every result Value of an addressing-producer
+    # op, PLUS the loop block-args for non-float (pointer/int) carried slots.
+    candidate: set = set()
+    for op in all_ops:
+        if _op_name(op) in _ADDR_PRODUCER_OPS:
+            for r in getattr(op, "results", ()) or ():
+                try:
+                    candidate.add(r)
+                except TypeError:
+                    pass
+    for scf_op, entries in scf_iter_map.items():
+        for slot, (init, barg, yop) in enumerate(entries):
+            if barg is None:
+                continue
+            if _is_float_pointerlike(barg):
+                continue  # the accumulator slot -- never transparent
+            try:
+                candidate.add(barg)
+            except TypeError:
+                pass
+
+    def _value_ok(value: Any) -> bool:
+        """One eligibility step for ``value`` given the current candidate set."""
+        uses = uses_of.get(value, [])
+        if not uses:
+            return False  # an unconsumed tile is not a fold target
+        for consumer_op, opnd_idx in uses:
+            if _use_is_sink(consumer_op, opnd_idx):
+                continue
+            cname = _op_name(consumer_op)
+            if cname in _ADDR_PRODUCER_OPS:
+                results = list(getattr(consumer_op, "results", ()) or [])
+                if results and all(r in candidate for r in results):
+                    continue
+                return False
+            if cname == "scf.for":
+                # Transparent iff this operand maps to a carried slot whose
+                # block-arg is still a candidate (i.e. pointer/int slot whose
+                # in-loop uses + yield are eligible) AND the matching yield
+                # operand is eligible.
+                matched = False
+                for scf_op, slot in scf_for_of_init.get(value, []):
+                    if scf_op is not consumer_op:
+                        continue
+                    barg = scf_barg_of_slot.get((id(scf_op), slot))
+                    yop = scf_yield_of_slot.get((id(scf_op), slot))
+                    if (
+                        barg is not None
+                        and barg in candidate
+                        and (yop is None or yop in candidate)
+                    ):
+                        matched = True
+                        break
+                if matched:
+                    continue
+                return False
+            if cname == "scf.yield":
+                # A yield use is eligible iff EVERY carried slot this value
+                # feeds is a candidate block-arg (the loop-carried pointer
+                # advance). A value yielded into the accumulator slot (excluded
+                # from candidate) is disqualified -- it is data. When the
+                # block-arg for a slot drops out of the candidate set, this
+                # check removes the yielded value too on the next iteration.
+                targets = scf_yield_target_barg.get(value)
+                if targets and all(b in candidate for b in targets):
+                    continue
+                return False
+            # tt.dot / tt.reduce / tt.return / store-value / collapse_shape /...
+            return False
+        return True
+
+    changed = True
+    while changed:
+        changed = False
+        for value in list(candidate):
+            if not _value_ok(value):
+                candidate.discard(value)
+                changed = True
+
+    # Project eligible Values to their RESULT-name spelling (the emit-time
+    # lookup key). The use GRAPH was reconstructed by Value IDENTITY (.owner /
+    # hashable operand) -- which is reliable -- but the returned KEY is the
+    # result name, because the emitter receives ops through a region CHILD
+    # ``WalkerCtx`` (``_emit_region``) whose op/Value wrappers are NOT
+    # identity-stable with this build traversal across the child boundary.
+    # ``should_fold_addressing`` consults ONLY the result-position name
+    # (``_results(op)[0]``), and result->result name spelling IS consistent
+    # (verified), so a result-name set matches at emit time on both the
+    # top-level and in-loop (region-child) ops once the set is propagated into
+    # the child ctx.
+    out: set = set()
+    for value in candidate:
+        name = _value_ssa_key(value)
+        if name:
+            out.add(name)
+            out.add(name.lstrip("%"))
+    return out
 
 
 # ---------------------------------------------------------------------------

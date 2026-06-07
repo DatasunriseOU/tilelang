@@ -68,6 +68,7 @@ from ..op_mapping import (
     _constant_tile_bool,
     EmitError,
     materialize_lazy_tile,
+    should_fold_addressing,
 )
 
 # We import op_mapping lazily inside emitters when we need to reach into
@@ -387,6 +388,14 @@ def _emit_tile_binop(
         ),
         name=ctx.fresh("tile_expr"),
     )
+    # FULL TRANSFORM 1 (Coalesce-style addressing fold): when this binop's
+    # result is consumed ONLY as addressing/mask for a tt.load/tt.store, keep
+    # it lazy so its per-lane value folds into the load/store loop body instead
+    # of being materialized into a spilled [N] array. Consumers
+    # (``_resolve_lane_operand`` / ``_scalarize_tile_index_base`` /
+    # ``_read_lane`` / strided store rhs) already read a LazyTileExpr per-lane.
+    if should_fold_addressing(ctx, op):
+        return _bind_result(op, ctx, lazy)
     out = materialize_lazy_tile(
         ctx,
         lazy,

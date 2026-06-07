@@ -1578,6 +1578,13 @@ def _emit_region(
     child.routed_triton_thread_distribute = bool(
         getattr(ctx, "routed_triton_thread_distribute", False)
     )
+    # FULL TRANSFORM 1 (Coalesce-style addressing fold): the bulk of the
+    # addressing/mask binops/broadcasts live INSIDE the scf.for K-loop body.
+    # Without propagating the fold set into the region child, those tiles would
+    # be materialized into spilled [N] arrays (the child's default empty set
+    # disables the fold). Share the SAME set object so in-loop feeders keep
+    # fold-eligible tiles lazy exactly like the top-level prologue.
+    child.fold_addressing_ssa = getattr(ctx, "fold_addressing_ssa", set())
     child.num_warps = int(getattr(ctx, "num_warps", 4) or 4)
     child.num_stages = int(getattr(ctx, "num_stages", 2) or 2)
     # Share the ONE canonical ``threadIdx.x`` Var with the root ctx so a

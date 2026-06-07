@@ -59,6 +59,7 @@ from .mlir_walker import (
     DEGRADED_WARNING_MESSAGE as _DEGRADED_WARNING_MESSAGE,
     MLIR_WALKER_AVAILABLE,
     TTIRWalker,
+    build_addressing_fold_set,
     parse_ttir,
     try_import_mlir,
     walk_module,
@@ -1577,6 +1578,24 @@ def from_ttir(
 
         parsed = parse_ttir(ttir_text_for_parse)
         if parsed is not None:
+            # FULL TRANSFORM 1 (Coalesce-style addressing fold) pre-pass:
+            # compute the set of SSA results consumed ONLY as addressing/mask
+            # so the feeders keep them lazy instead of materializing spilled
+            # arrays. Only meaningful under the routed prologue-opt gate; the
+            # set is empty (no-op) otherwise. Failure here must not silently
+            # disable correctness -- but an empty set merely reverts to the
+            # pre-fold serial materialization, so a best-effort guard keeps the
+            # walker robust to provider drift while never producing wrong IR.
+            if ctx.routed_triton_prologue_opt:
+                try:
+                    ctx.fold_addressing_ssa = build_addressing_fold_set(parsed)
+                except Exception as exc:  # provider use-map drift
+                    raise RuntimeError(
+                        "FULL TRANSFORM 1: build_addressing_fold_set failed; "
+                        "refusing to silently fall back to the spilled-array "
+                        "prologue under the routed prologue-opt gate (RULE #1). "
+                        f"cause={exc!r}"
+                    ) from exc
             _walk_mlir_module(parsed, ctx)
             return _frame_register_mma_fragments(ctx)
         if not _allow_text_ttir:
