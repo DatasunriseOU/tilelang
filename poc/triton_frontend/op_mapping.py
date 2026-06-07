@@ -346,6 +346,27 @@ class WalkerCtx:
         # options or kernel autotune-config when available.
         self.num_warps: int = 4
         self.num_stages: int = 2
+        # PROLOGUE-OPT gate (routed-triton path only). When True, the
+        # convergence-point tile materializer (``materialize_lazy_tile``)
+        # THREAD-DISTRIBUTES the elementwise prologue across the block's
+        # ``num_warps*32`` lanes (transform 2) instead of emitting a SERIAL
+        # ``tir.For`` that every lane re-runs redundantly (classic
+        # ReduceDataDuplication waste). It also lets ``arith.cmpi`` fold the
+        # always-true int32-overflow guards to a constant tile (transform 3)
+        # and keeps addressing binops lazy so they fold into consumers
+        # (transform 1). Gated so the cooperative ``T.copy``/``T.gemm`` half
+        # and the dict-shaped unit-test paths stay byte-identical: only the
+        # routed Tri-Dao chunk kernels (which set this in ``from_ttir``) opt
+        # in. RULE #1: structural thread-binding or RAISE -- never a silent
+        # serial fallback.
+        self.routed_triton_prologue_opt: bool = False
+        # Sub-gate for transform (2) thread-distribution. OFF by default: it is
+        # only correct for SHARED-scope cooperative tiles (see
+        # ``materialize_lazy_tile``). Local prologue tiles keep the serial
+        # fill. Kept as a distinct flag so the always-correct fold/guard-drop
+        # transforms (1)/(3) can ship under ``routed_triton_prologue_opt``
+        # without coupling to the conditional thread-distribution.
+        self.routed_triton_thread_distribute: bool = False
         # Some scalar fallback emitters implement tile-level semantics with
         # serial read-modify-write loops. When one is used under the synthetic
         # ``threadIdx.x`` wrapper, run the whole block body on lane 0 to avoid
@@ -423,6 +444,18 @@ class WalkerCtx:
         if root._thread_var is None:
             root._thread_var = root.tir().Var("threadIdx_x", "int32")
         return root._thread_var
+
+    def num_threads(self) -> int:
+        """Return the block thread extent (``num_warps*32``).
+
+        This is the SAME extent ``_make_prim_func`` binds for the canonical
+        ``threadIdx.x`` ``thread_extent`` AttrStmt wrapping the whole body, so
+        a prologue loop that strides by ``num_threads()`` and offsets by
+        ``thread_idx_var()`` partitions its work over exactly the lanes that
+        AttrStmt declares.
+        """
+        root = self._thread_var_root or self
+        return int(getattr(root, "num_warps", 4) or 4) * 32
 
     def tvm(self) -> Any:
         """Lazy-import ``tvm`` and cache the module handle.
@@ -1144,12 +1177,33 @@ def materialize_lazy_tile(
     tir = ctx.tir()
     dst_shape = list(shape or expr.shape or [1])
     dst_dtype = _normalize_mlir_dtype(str(dtype or expr.dtype or "float32"))
+
+    # PROLOGUE-OPT transform (2) decision (made BEFORE allocation so the tile
+    # can be promoted to SHARED scope for the cooperative fill). See the long
+    # comment below for the correctness contract.
+    _total = 1
+    for _extent in dst_shape or [1]:
+        _total *= int(_extent)
+    _nthreads = ctx.num_threads() if ctx else 0
+    thread_distribute = (
+        bool(getattr(ctx, "routed_triton_prologue_opt", False))
+        and bool(getattr(ctx, "routed_triton_thread_distribute", False))
+        and _nthreads > 0
+        and _total > 1
+        and not getattr(ctx, "requires_single_thread_body", False)
+    )
+    # When distributing, the buffer MUST be shared: the 128 lanes cooperatively
+    # fill ONE buffer and then read it back through a ``__syncthreads`` barrier.
+    # A thread-local buffer would leave 127/128 slots of each lane's private
+    # copy uninitialized. RULE #1: shared+sync or the serial fill, never a
+    # silently-wrong distributed write into local memory.
+    alloc_scope = "shared" if thread_distribute else scope
     dst = _alloc_tile_buffer(
         ctx,
         dst_shape,
         dst_dtype,
         ctx.fresh(name),
-        scope=scope,
+        scope=alloc_scope,
     )
     loop_vars = [
         tir.Var(
@@ -1158,6 +1212,88 @@ def materialize_lazy_tile(
         )
         for axis, _extent in enumerate(dst_shape or [1])
     ]
+
+    # PROLOGUE-OPT transform (2): THREAD-DISTRIBUTE the elementwise tile.
+    # When the routed-triton gate is on, partition the flat lane space over
+    # the block's ``num_warps*32`` threads instead of emitting a SERIAL
+    # ``tir.For`` that every lane re-runs. ``flat = i_local*nthreads + tid``;
+    # the multi-dim store/read indices are recovered from ``flat`` by the
+    # row-major divmod of ``dst_shape``. A trailing ``flat < total`` guard
+    # covers the remainder when ``total`` is not a multiple of ``nthreads``.
+    total = _total
+    nthreads = _nthreads
+
+    if thread_distribute:
+        tid = ctx.thread_idx_var()
+        flat_var = tir.Var(ctx.fresh(f"{name}_flat"), "int32")
+        flat = flat_var * tir.const(int(nthreads), "int32") + tid
+        # Recover per-axis indices from the flattened thread-strided index.
+        dist_loop_vars: list = []
+        rem = flat
+        strides = []
+        acc = 1
+        for extent in reversed(dst_shape or [1]):
+            strides.append(acc)
+            acc *= int(extent)
+        strides = list(reversed(strides))  # row-major stride per axis
+        shape_axes = dst_shape or [1]
+        for axis, extent in enumerate(shape_axes):
+            stride_c = tir.const(int(strides[axis]), "int32")
+            # Row-major decode: idx[axis] = (flat // stride[axis]) % extent.
+            # stride is 1 for the innermost axis, so the innermost reduces to
+            # ``flat % extent``. The outermost axis' mod is redundant (flat <
+            # total) but harmless; we apply mod on every non-unit axis.
+            idx_axis = tir.floordiv(rem, stride_c) if int(strides[axis]) != 1 else rem
+            if int(extent) != 1:
+                idx_axis = tir.floormod(idx_axis, tir.const(int(extent), "int32"))
+            dist_loop_vars.append(idx_axis)
+
+        rank = len(expr.shape)
+        if rank:
+            if len(dist_loop_vars) >= rank:
+                src_indices = list(dist_loop_vars[-rank:])
+            else:
+                src_indices = [tir.const(0, "int32")] * (rank - len(dist_loop_vars)) + list(dist_loop_vars)
+            for axis, extent in enumerate(expr.shape):
+                if int(extent) == 1:
+                    src_indices[axis] = tir.const(0, "int32")
+            value = expr.read_lane(ctx, tuple(src_indices))
+        else:
+            value = expr.read_lane(ctx, ())
+
+        store = tir.BufferStore(dst, value, list(dist_loop_vars))
+        # Per-lane bound: skip the tail lanes when total < n_iter*nthreads.
+        if total % int(nthreads) != 0:
+            store = tir.IfThenElse(
+                flat < tir.const(int(total), "int32"), store, None
+            )
+        n_iter = (total + int(nthreads) - 1) // int(nthreads)
+        body = tir.For(
+            flat_var,
+            tir.const(0, "int32"),
+            tir.const(int(n_iter), "int32"),
+            tir.ForKind.SERIAL,
+            store,
+        )
+        ctx.emit(body)
+        # Barrier: all lanes must finish their cooperative writes before ANY
+        # lane reads the shared tile back. Without this a downstream per-lane
+        # read of a slot owned by another lane races. ``tvm_storage_sync`` maps
+        # to ``__syncthreads`` on CUDA.
+        try:
+            sync = tir.call_intrin(
+                "int32",
+                tir.op.Op.get("tir.tvm_storage_sync"),
+                tir.StringImm("shared"),
+            )
+            ctx.emit(tir.Evaluate(sync))
+        except Exception as exc:  # pragma: no cover -- intrin registry drift
+            raise RuntimeError(
+                "PROLOGUE-OPT transform (2): could not emit tvm_storage_sync "
+                "barrier after the cooperative shared fill; refusing to emit a "
+                "race-prone distributed tile (RULE #1)."
+            ) from exc
+        return dst
 
     rank = len(expr.shape)
     if rank:

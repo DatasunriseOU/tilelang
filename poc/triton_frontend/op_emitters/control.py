@@ -1567,6 +1567,19 @@ def _emit_region(
     child.requires_single_thread_body = bool(
         getattr(ctx, "requires_single_thread_body", False)
     )
+    # PROLOGUE-OPT: propagate the thread-distribution gate + warp count into
+    # the region child so tiles materialized inside scf.for/scf.if regions
+    # (transforms 1/2/3) get the SAME thread binding as the top-level
+    # prologue. ``num_threads()`` resolves via ``_thread_var_root`` (the root
+    # ctx) but we mirror ``num_warps``/``num_stages`` for any direct reads.
+    child.routed_triton_prologue_opt = bool(
+        getattr(ctx, "routed_triton_prologue_opt", False)
+    )
+    child.routed_triton_thread_distribute = bool(
+        getattr(ctx, "routed_triton_thread_distribute", False)
+    )
+    child.num_warps = int(getattr(ctx, "num_warps", 4) or 4)
+    child.num_stages = int(getattr(ctx, "num_stages", 2) or 2)
     # Share the ONE canonical ``threadIdx.x`` Var with the root ctx so a
     # lane-0 guard emitted inside this region (scalar atomic-rmw) and the
     # outer block ``threadIdx.x`` thread_extent binding (stamped by

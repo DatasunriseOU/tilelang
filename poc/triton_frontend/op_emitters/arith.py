@@ -65,6 +65,7 @@ from typing import Any, Callable, Dict, Tuple
 from ..op_mapping import (
     LazyTileExpr,
     _attrs_with_properties_shared,
+    _constant_tile_bool,
     EmitError,
     materialize_lazy_tile,
 )
@@ -634,6 +635,19 @@ def _emit_andi(op: Any, ctx: EmitContext) -> Any:
     if _is_float_dtype(dt):
         raise EmitError(f"arith.andi on float type {dt!r}")
     tir = ctx.tir()
+    # PROLOGUE-OPT transform (3) cont.: ``guard_true & x`` -> ``x``. The
+    # int32-overflow guards (folded to constant-true tiles in ``_emit_cmpi``)
+    # would otherwise materialize a bool[] AND loop here. Folding the identity
+    # keeps the real predicate lazy and removes the loop. Gated.
+    if getattr(ctx, "routed_triton_prologue_opt", False):
+        a_true = _constant_tile_bool(a) is True
+        b_true = _constant_tile_bool(b) is True
+        if a_true and not b_true:
+            return _bind_result(op, ctx, b)
+        if b_true and not a_true:
+            return _bind_result(op, ctx, a)
+        if a_true and b_true:
+            return _bind_result(op, ctx, a)
     tile = _maybe_tile_binop(op, ctx, a, b,
                              lambda x, y: tir.bitwise_and(x, y),
                              "arith.andi", dt)
@@ -908,6 +922,137 @@ def _emit_cmpf(op: Any, ctx: EmitContext) -> Any:
     return _bind_result(op, ctx, cls(a, b))
 
 
+_INT32_MAX = 2147483647
+_INT32_MIN = -2147483648
+
+
+def _imm_int(value: Any) -> Any:
+    """Return the python int for an IntImm-like scalar PrimExpr, else ``None``."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    # ``tir.Broadcast`` of an IntImm: peel one ``.value`` layer.
+    raw = getattr(value, "value", None)
+    if raw is not None and hasattr(raw, "dtype") and not hasattr(raw, "value"):
+        raw = None
+    if raw is not None and hasattr(raw, "value") and not hasattr(getattr(raw, "value"), "dtype"):
+        try:
+            return int(raw.value)
+        except Exception:
+            pass
+    raw = getattr(value, "value", None)
+    if raw is not None and not hasattr(raw, "dtype"):
+        try:
+            return int(raw)
+        except Exception:
+            return None
+    return None
+
+
+def _const_int_operand(value: Any) -> Any:
+    """Return the python int for a scalar/splat constant operand, else ``None``.
+
+    Recognizes a raw python int, a ``tir.IntImm``, a ``tir.Broadcast`` of an
+    IntImm, AND a constant-splat ``LazyTileExpr`` (Triton's ``tt.splat`` of an
+    int literal -- e.g. the int32 overflow bound widened to a tile). For the
+    LazyTileExpr case we probe ``read_lane`` with a zero index: a constant
+    splat's reader returns the same IntImm regardless of lane, so the value is
+    safe to fold. A genuine per-lane expression returns a non-constant and is
+    correctly rejected.
+    """
+    direct = _imm_int(value)
+    if direct is not None:
+        return direct
+    if isinstance(value, LazyTileExpr):
+        cv = getattr(value, "constant_value", None)
+        if cv is not None and not isinstance(cv, bool):
+            try:
+                return int(cv)
+            except Exception:
+                return None
+        # Probe the reader at lane 0 with a throwaway minimal ctx; a constant
+        # splat ignores ``read_ctx``/indices and returns its IntImm.
+        try:
+            import tvm  # noqa: WPS433
+
+            class _Probe:
+                @staticmethod
+                def tir():
+                    return tvm.tir
+
+            zero = (tvm.tir.const(0, "int32"),) * max(len(value.shape), 1)
+            lane = value.read_lane(_Probe, zero)
+            return _imm_int(lane)
+        except Exception:
+            return None
+    return None
+
+
+def _is_int32_overflow_guard(ctx: EmitContext, pred: str, a: Any, b: Any) -> bool:
+    """Recognize Triton's always-true int64<->int32 overflow bounds.
+
+    PROLOGUE-OPT transform (3). Triton emits, around every int64 address
+    expression, the pair ``addr <= 2147483647`` (``sle``) and
+    ``-2147483648 <= addr`` (``sle`` with the const on the LHS). For the
+    Tri-Dao chunk shapes these are statically TRUE, but the walker would
+    otherwise materialize them as ``bool[64]`` / ``bool[4096]`` arrays plus a
+    serial loop each, then ``&`` them together. We canonicalize the pair to a
+    constant-true tile so neither the array nor the loop is emitted.
+
+    Returns True only for the SLE/SGE bound forms whose constant operand is
+    exactly the int32 extreme on the side that makes the predicate vacuous.
+    Gated to the routed-triton path so non-routed parity stays byte-identical.
+    """
+    if not getattr(ctx, "routed_triton_prologue_opt", False):
+        return False
+    if pred not in ("sle", "sge"):
+        return False
+    ca = _const_int_operand(a)
+    cb = _const_int_operand(b)
+    # The "address" side is any NON-constant integer expression: a tile
+    # (Buffer / LazyTileExpr / Ramp), OR a scalar ``int64`` address PrimExpr
+    # (``Mul``/``Add``/``Sub`` of blockIdx-scaled offsets) read per-lane
+    # inside ``materialize_lazy_tile``. Either way Triton's guard against it
+    # is vacuous for the Tri-Dao chunk shapes. We require the OTHER side to be
+    # exactly the int32 extreme and this side to NOT be a python int constant.
+    def _is_addr_side(value: Any, const: Any) -> bool:
+        if const is not None:
+            return False  # a literal constant is never the address side
+        if _is_tile_operand(ctx, value):
+            return True
+        dt = str(getattr(value, "dtype", ""))
+        # scalar int address expression (no vector lanes suffix).
+        return dt.startswith("int") and "x" not in dt
+    if pred == "sle":
+        # ``addr <= INT32_MAX``  -> always true.
+        if cb == _INT32_MAX and _is_addr_side(a, ca):
+            return True
+        # ``INT32_MIN <= addr``  -> always true.
+        if ca == _INT32_MIN and _is_addr_side(b, cb):
+            return True
+    if pred == "sge":
+        # ``addr >= INT32_MIN``  -> always true.
+        if cb == _INT32_MIN and _is_addr_side(a, ca):
+            return True
+        # ``INT32_MAX >= addr``  -> always true.
+        if ca == _INT32_MAX and _is_addr_side(b, cb):
+            return True
+    return False
+
+
+def _const_true_tile(ctx: EmitContext, shape: Any) -> Any:
+    """Build a constant-true ``bool`` LazyTileExpr over ``shape`` (no buffer)."""
+    tir = ctx.tir()
+    return LazyTileExpr(
+        tuple(int(s) for s in shape) or (1,),
+        "bool",
+        lambda read_ctx, indices: read_ctx.tir().const(True, "bool"),
+        name=ctx.fresh("guard_true"),
+        constant_value=True,
+    )
+
+
 def _emit_cmpi(op: Any, ctx: EmitContext) -> Any:
     a, b = _resolve_two(op, ctx)
     dt = _tile_dtype(ctx, a)
@@ -924,6 +1069,17 @@ def _emit_cmpi(op: Any, ctx: EmitContext) -> Any:
     cls_name = _CMPI_PREDICATES[pred]
     tir = ctx.tir()
     cls = getattr(tir, cls_name)
+    # PROLOGUE-OPT transform (3): fold always-true int32-overflow guards to a
+    # constant-true tile (no bool[] array, no serial loop). ``_emit_andi``
+    # then drops them when ``&``-ing with a real predicate.
+    if _is_int32_overflow_guard(ctx, pred, a, b):
+        # Tile operand -> constant-true tile (folds the bool[] array + loop).
+        # Scalar address operand (read per-lane inside materialize_lazy_tile)
+        # -> scalar ``True`` so the per-lane guard body collapses to a const.
+        if _is_tile_operand(ctx, a) or _is_tile_operand(ctx, b):
+            out_shape = _tile_shape(ctx, a) if _is_tile_operand(ctx, a) else _tile_shape(ctx, b)
+            return _bind_result(op, ctx, _const_true_tile(ctx, out_shape))
+        return _bind_result(op, ctx, tir.const(True, "bool"))
     tile = _maybe_tile_binop(op, ctx, a, b, lambda x, y: cls(x, y),
                              "arith.cmpi", "bool")
     if tile is not None:

@@ -1449,6 +1449,7 @@ def from_ttir(
     arg_buffer_shapes: Optional[Any] = None,
     num_warps: Optional[int] = None,
     num_stages: Optional[int] = None,
+    prologue_opt: bool = True,
     _allow_text_ttir: bool = False,
     **kwargs: Any,
 ) -> TileLangPrimFunc:
@@ -1506,6 +1507,24 @@ def from_ttir(
         ctx.num_warps = int(num_warps)
     if num_stages is not None:
         ctx.num_stages = int(num_stages)
+    # PROLOGUE-OPT gate (transforms 1/2/3). The routed-triton path opts in by
+    # default; pass ``prologue_opt=False`` to reproduce the pre-opt serial
+    # prologue for A/B comparison. This ONLY affects the elementwise prologue
+    # (address/mask arrays) -- the cooperative T.copy/T.gemm half is untouched.
+    ctx.routed_triton_prologue_opt = bool(prologue_opt)
+    # Transform (2) thread-distribution sub-gate. OFF by default: the
+    # materializer can promote a distributed tile to shared scope + a
+    # __syncthreads barrier (race-free), but promoting ALL prologue addressing
+    # /mask tiles to shared EXCEEDS the per-block shared-memory budget (the
+    # routed dstates prologue alone holds dozens of [2048]/[4096] arrays).
+    # The correct fix is full transform (1): FOLD the addressing into the
+    # T.copy region indices/predicate so these tiles are never materialized in
+    # ANY scope -- then the small residue can be thread-distributed in shared.
+    # Until address-folding lands, distribution is gated off to avoid both a
+    # racy local write (RULE #1) and a shared-budget overflow. The machinery is
+    # exercised by ``thread_distribute=True`` for development. Transforms (1
+    # partial: guard/and folding) + (3) ship ON under ``prologue_opt``.
+    ctx.routed_triton_thread_distribute = bool(kwargs.get("thread_distribute", False))
     if grid is not None:
         ctx.launch_grid = tuple(int(x) for x in grid)
     if arg_buffer_shapes is not None:
