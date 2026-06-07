@@ -92,21 +92,55 @@ message(STATUS "Using TRITON_INSTALL_DIR = ${TRITON_INSTALL_DIR}")
 include_directories(${TRITON_INSTALL_DIR}/include)
 link_directories(${TRITON_INSTALL_DIR}/lib)
 
-find_library(TRITON_IR_LIB
-  NAMES TritonIR
-  PATHS ${TRITON_INSTALL_DIR}/lib
-  NO_DEFAULT_PATH
-  REQUIRED)
-list(APPEND TL_PA_LINK_LIBS ${TRITON_IR_LIB})
-foreach(_optlib TritonAnalysis TritonTransforms TritonGPUIR)
-  find_library(TRITON_${_optlib}_LIB
-    NAMES ${_optlib}
-    PATHS ${TRITON_INSTALL_DIR}/lib
-    NO_DEFAULT_PATH)
-  if(TRITON_${_optlib}_LIB)
-    list(APPEND TL_PA_LINK_LIBS ${TRITON_${_optlib}_LIB})
+# ---------------------------------------------------------------------------
+# Triton MLIR dialect symbols: link against the *installed* triton wheel's
+# `libtriton.so` (one shared object, the SAME binary the triton runtime loads).
+#
+# Why not the static `libTritonIR.a` etc.?  The core `tt` dialect
+# (`mlir::triton::TritonDialect`) is NOT self-contained: `libTritonIR.a`
+# references `mlir::triton::gpu::MemDescType`'s TypeID (lives in TritonGPUIR),
+# TritonGPUIR in turn references `mlir::inferDstEncoding` (TritonGPUTransforms,
+# which cannot build standalone without the nvidia-backend NVWS TableGen),
+# `mlir::triton::ml(LinearLayout,...)` (TritonTools), and the NvidiaGPU
+# `TensorMemoryEncodingAttr` TypeID. Stitching that whole web from individually
+# `ar`-archived object dirs is brittle AND risks *duplicate* MLIR TypeID
+# storage (two `TritonDialect` TypeIDs -> registry mismatch at runtime).
+#
+# The triton wheel already ships the complete, internally-consistent closure in
+# `triton/_C/libtriton.so` with default-visibility (global `T`) exports for
+# every symbol the shim + vendored triton-shared need (verified: of the Triton
+# symbols our objects reference, the only two NOT exported by libtriton.so are
+# the vendored `tts` functions we build ourselves). Linking it gives a single
+# TypeID source identical to the runtime's, so dialect registration is
+# guaranteed consistent. The staged `${TRITON_INSTALL_DIR}/include` headers are
+# still required for *compilation* (the wheel ships no MLIR headers).
+find_library(TRITON_RUNTIME_SO
+  NAMES triton libtriton
+  PATHS ${TRITON_INSTALL_DIR}/lib ${TRITON_RUNTIME_LIBDIR}
+  NO_DEFAULT_PATH)
+if(NOT TRITON_RUNTIME_SO)
+  # Locate triton/_C/libtriton.so from the active Python's triton install.
+  execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c
+      "import triton,os,sys;p=os.path.join(os.path.dirname(triton.__file__),'_C','libtriton.so');print(p if os.path.exists(p) else '',end='')"
+    OUTPUT_VARIABLE _TRITON_SO_PATH)
+  if(_TRITON_SO_PATH AND EXISTS "${_TRITON_SO_PATH}")
+    set(TRITON_RUNTIME_SO "${_TRITON_SO_PATH}")
   endif()
-endforeach()
+endif()
+if(NOT TRITON_RUNTIME_SO)
+  message(FATAL_ERROR
+    "Could not locate libtriton.so. Set -DTRITON_RUNTIME_LIBDIR=<dir containing "
+    "libtriton.so> or ensure the active Python (${Python3_EXECUTABLE}) imports "
+    "`triton` with a built `_C/libtriton.so`. (No silent stub fallback.)")
+endif()
+message(STATUS "Using Triton runtime .so = ${TRITON_RUNTIME_SO}")
+set(TL_PA_TRITON_RUNTIME_LIB "${TRITON_RUNTIME_SO}")
+# `find_package(MLIR)` above already pulled the static MLIR archives into the
+# link; the shim links those for the core dialects it registers. No Triton
+# static archives and no --whole-archive are needed: libtriton.so resolves the
+# Triton-dialect symbols + TypeIDs at link and load time.
+set(TL_PA_WHOLE_ARCHIVE_LIBS "")
 
 # ---- Vendored triton-shared sources ----------------------------------
 
@@ -168,6 +202,38 @@ target_include_directories(_triton_frontend_cxx PRIVATE
   ${VENDORED_DIR}/include
 )
 target_link_libraries(_triton_frontend_cxx PRIVATE ${TL_PA_LINK_LIBS})
+
+# Triton-dialect symbols + TypeIDs come from the installed wheel's libtriton.so
+# (resolved above into TL_PA_TRITON_RUNTIME_LIB). Link it directly and bake an
+# RPATH to its directory so the symbols resolve at module-load time. Because the
+# triton runtime is a shared object, the linker keeps it as a NEEDED dependency
+# (no --whole-archive games, no duplicate TypeID storage).
+if(TL_PA_TRITON_RUNTIME_LIB)
+  target_link_libraries(_triton_frontend_cxx PRIVATE "${TL_PA_TRITON_RUNTIME_LIB}")
+  get_filename_component(_TRITON_SO_DIR "${TL_PA_TRITON_RUNTIME_LIB}" DIRECTORY)
+  set_property(TARGET _triton_frontend_cxx APPEND PROPERTY
+    BUILD_RPATH "${_TRITON_SO_DIR}")
+  set_property(TARGET _triton_frontend_cxx APPEND PROPERTY
+    INSTALL_RPATH "${_TRITON_SO_DIR}")
+endif()
+
+# The vendored tts dialect (TritonStructuredDialect) registers its own dialect /
+# op / attr TypeIDs that MLIR only reaches through the runtime registry, so its
+# archive members must be force-retained or the import dies with
+# `undefined symbol: ..TypeIDResolver<..tts..>::id`. Force-load just this one
+# archive (GNU ld / lld `--whole-archive` on ELF; `-force_load` on Mach-O).
+if(NOT TRITON_FRONTEND_STUB_BUILD)
+  if(APPLE)
+    target_link_options(_triton_frontend_cxx PRIVATE
+      "LINKER:-force_load,$<TARGET_FILE:TritonStructuredDialect>")
+  else()
+    target_link_options(_triton_frontend_cxx PRIVATE
+      "LINKER:--whole-archive"
+      "$<TARGET_FILE:TritonStructuredDialect>"
+      "LINKER:--no-whole-archive")
+  endif()
+endif()
+
 if(TARGET TritonStructuredVendoredTableGen)
   add_dependencies(_triton_frontend_cxx TritonStructuredVendoredTableGen)
 endif()

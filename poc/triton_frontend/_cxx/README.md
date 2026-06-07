@@ -43,6 +43,80 @@ Add the build directory to `PYTHONPATH` (or copy/symlink the `.so` into
 `poc/triton_frontend/`) so that `ptr_analysis.py`'s lazy `importlib` lookup
 succeeds.
 
+### aarch64-linux (NVIDIA GB10 / Grace-Blackwell) full build recipe
+
+This is the verified recipe used to build the shim on `gb10` against the
+`cppmega-venv` (py3.13, torch 2.13 `_GLIBCXX_USE_CXX11_ABI=True`, triton
+`3.7.0+gitb4e20bbe`). It produces a fully-functional shim where both
+`shim_available()` **and** `dialects_available()` are `True` and a `tt.func`
+round-trip lowers to `tts.*` strided pointers.
+
+Key insight: the triton **wheel ships only `triton/_C/libtriton.so` and no MLIR
+headers**, while the vendored `poc/triton_frontend/vendored/triton/lib/*.a` are
+**macOS Mach-O** (useless on aarch64-linux). So we (1) build *headers + the core
+`libTritonIR.a`* from a triton source checkout pinned to the wheel's git rev, and
+(2) link the final shim against the wheel's `libtriton.so` for the complete,
+internally-consistent Triton-dialect symbol + TypeID closure (one definition
+source identical to the runtime — avoids duplicate-TypeID registry mismatches).
+
+```bash
+# --- 0. paths (gb10) -------------------------------------------------------
+VENV=/home/dave/cppmega-venv;            source $VENV/bin/activate
+LLVM=$HOME/.triton/llvm/llvm-ac5dc54d-almalinux-arm64   # vendored by triton
+TRITON_REV=b4e20bbe   # == `python -c "import triton;print(triton.__version__)"` git suffix
+STAGE=$HOME/source/triton-aarch64-install               # our staged install tree
+
+# --- 1. triton source @ the exact wheel rev (for HEADERS + libTritonIR) ----
+git clone --filter=blob:none https://github.com/triton-lang/triton \
+    $HOME/source/triton-src
+git -C $HOME/source/triton-src fetch --depth 50 origin $TRITON_REV
+git -C $HOME/source/triton-src checkout $TRITON_REV
+
+# --- 2. configure triton's MLIR build against the vendored LLVM (no python) -
+cmake -S $HOME/source/triton-src -B $HOME/source/triton-src/build-aarch64 -GNinja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_DIR=$LLVM/lib/cmake/llvm -DMLIR_DIR=$LLVM/lib/cmake/mlir \
+  -DLLD_DIR=$LLVM/lib/cmake/lld \
+  -DTRITON_BUILD_PYTHON_MODULE=OFF -DTRITON_BUILD_PROTON=OFF -DTRITON_BUILD_UT=OFF \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DLLVM_ENABLE_ZLIB=OFF
+
+# generate TableGen headers (*.h.inc / *.cpp.inc) + the core IR object lib
+ninja -C $HOME/source/triton-src/build-aarch64 \
+  mlir-tablegen-targets TritonTableGen TritonGPUTableGen TritonNvidiaGPUTableGen \
+  GluonTableGen TritonInstrumentTableGen TritonIR
+
+# --- 3. stage headers + libTritonIR.a into $STAGE -------------------------
+mkdir -p $STAGE/lib $STAGE/include
+cp -r $HOME/source/triton-src/include/*               $STAGE/include/   # source hdrs
+cp -r $HOME/source/triton-src/build-aarch64/include/* $STAGE/include/   # generated *.inc
+ar rcs $STAGE/lib/libTritonIR.a \
+  $(find $HOME/source/triton-src/build-aarch64 -path '*TritonIR.dir*' -name '*.o')
+#  (libTritonIR.a is only needed so the vendored triton_shared CMake's
+#   `-lTritonIR` link + headers resolve at *compile* time; the final shim's
+#   Triton symbols/TypeIDs come from libtriton.so — see CMakeLists.txt.)
+
+# --- 4. configure + build the shim ---------------------------------------
+cmake -S poc/triton_frontend/_cxx -B poc/triton_frontend/_cxx/build-port -GNinja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_DIR=$LLVM/lib/cmake/llvm -DMLIR_DIR=$LLVM/lib/cmake/mlir \
+  -DTRITON_INSTALL_DIR=$STAGE \
+  -Dpybind11_DIR=$(python -c "import pybind11;print(pybind11.get_cmake_dir())") \
+  -DPython3_EXECUTABLE=$(which python) \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+ninja -C poc/triton_frontend/_cxx/build-port
+
+# --- 5. verify -----------------------------------------------------------
+PYTHONPATH=$PWD python -c \
+ "from poc.triton_frontend.ptr_analysis import shim_available,dialects_available; \
+  print('shim',shim_available(),'dialects',dialects_available())"
+#   -> shim True dialects True
+```
+
+The build does **not** require the GPU (only later parity/measure runs do). The
+staged `$STAGE` tree and the triton source checkout are build artifacts and are
+**not** committed (large binaries); only this recipe + `CMakeLists.txt` glue is
+version-controlled.
+
 ## API surface
 
 ```python

@@ -1129,6 +1129,40 @@ def _parse_value_attr(value_attr: Any) -> Tuple[str, Any]:
                     f"in {value_attr!r}"
                 ) from exc
 
+    # Real MLIR ``Attribute`` (generic base type from mlir-python-bindings) that
+    # does NOT surface a Python-native ``.value``/``.type`` pair -- e.g. an
+    # ``IntegerAttr`` that the bindings only expose in its textual form. This is
+    # exactly the shape that the PtrAnalysis -> ``tts.*`` lowering produces for
+    # the unmasked-load sentinel ``arith.constant 2147483647 : i64`` (INT_MAX).
+    # Its ``str()`` is the canonical generic-syntax ``"<value> : <type>"``, so we
+    # reuse the same scalar parser as the string branch above. We must do this
+    # explicitly (rather than silently): an ArrayAttr / DenseElementsAttr also
+    # stringifies, and those would change semantics if folded to a scalar -- so
+    # we reject anything whose text looks array-shaped, mirroring the str branch.
+    _attr_text = None
+    try:
+        _attr_text = str(value_attr)
+    except Exception:  # pragma: no cover - defensive
+        _attr_text = None
+    if _attr_text is not None:
+        s = _attr_text.strip()
+        low = s.lower()
+        if "dense" in low or "array" in low or s.startswith("["):
+            raise EmitError(
+                f"arith.constant with array attr unsupported; got: {value_attr!r}"
+            )
+        if ":" in s:
+            val_part, dt_part = s.rsplit(":", 1)
+            val_part = val_part.strip()
+            dtype_str = dt_part.strip()
+            try:
+                return dtype_str, int(val_part)
+            except ValueError:
+                try:
+                    return dtype_str, float(val_part)
+                except ValueError:
+                    pass  # fall through to the hard error below
+
     raise EmitError(
         f"arith.constant with unsupported attr type {type(value_attr).__name__}; "
         f"got: {value_attr!r}"
@@ -1158,14 +1192,57 @@ def _normalize_dtype(dtype_str: str) -> str:
     return s
 
 
+def _maybe_downcast_dense(value_attr: Any) -> Any:
+    """Downcast a generic MLIR ``Attribute`` to its concrete dense subclass.
+
+    Some MLIR Python bindings (notably jaxlib's
+    ``jaxlib.mlir._mlir_libs._mlir.ir``) hand the walker the *generic*
+    ``Attribute`` base type rather than the concrete ``DenseElementsAttr`` /
+    ``DenseIntElementsAttr`` / ``DenseFPElementsAttr``. The base type does NOT
+    expose ``is_splat`` / ``get_splat_value``, so a naive ``hasattr`` probe
+    misses dense splats such as the ``dense<2147483647> : tensor<64xi64>``
+    unmasked-load sentinel that the PtrAnalysis -> ``tts.*`` lowering emits.
+
+    We resolve the bindings' ``ir`` module from the attribute's own type module
+    and use ``<DenseClass>.isinstance(attr)`` + ``<DenseClass>(attr)`` to cast.
+    Returns the downcast attribute when it is a dense elements attr, else the
+    original ``value_attr`` unchanged. Never raises (cast failures fall through
+    to the caller's existing logic).
+    """
+    # Already concrete (real upstream MLIR bindings expose is_splat directly).
+    if hasattr(value_attr, "is_splat"):
+        return value_attr
+    tymod = getattr(type(value_attr), "__module__", "") or ""
+    if "mlir" not in tymod and "ir" not in tymod:
+        return value_attr
+    try:
+        import importlib  # noqa: WPS433
+        ir = importlib.import_module(tymod)
+    except Exception:
+        return value_attr
+    for _clsname in ("DenseIntElementsAttr", "DenseFPElementsAttr", "DenseElementsAttr"):
+        cls = getattr(ir, _clsname, None)
+        if cls is None:
+            continue
+        try:
+            if cls.isinstance(value_attr):
+                return cls(value_attr)
+        except Exception:
+            continue
+    return value_attr
+
+
 def _is_dense_attr(value_attr: Any) -> bool:
     """Detect an MLIR ``DenseElementsAttr`` (FP or integer variant).
 
     We check for the trio of accessors the real bindings expose
     (``is_splat`` / ``get_splat_value`` / ``type.shape``) rather than
     importing the MLIR class directly so the test harness's dict / list
-    fakes don't false-positive here.
+    fakes don't false-positive here. A generic ``Attribute`` is first run
+    through :func:`_maybe_downcast_dense` so bindings that hand us the base
+    type (jaxlib) still resolve dense splats.
     """
+    value_attr = _maybe_downcast_dense(value_attr)
     if not (hasattr(value_attr, "is_splat") and hasattr(value_attr, "type")):
         return False
     return getattr(value_attr.type, "shape", None) is not None
@@ -1251,6 +1328,11 @@ def map_arith_constant(op: Any, ctx: _om.WalkerCtx) -> Any:
         raise EmitError(
             "arith.constant: missing 'value' attribute"
         )
+
+    # Bindings that hand us the generic ``Attribute`` base (jaxlib) need an
+    # explicit downcast so the dense-elements branch below sees ``is_splat`` /
+    # ``get_splat_value``. No-op for concrete-binding / dict / str inputs.
+    value_attr = _maybe_downcast_dense(value_attr)
 
     tir = ctx.tir()
     results = _om._results(op)
