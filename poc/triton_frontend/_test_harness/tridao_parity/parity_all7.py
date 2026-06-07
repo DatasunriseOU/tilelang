@@ -264,7 +264,13 @@ def run_one(name, native_fn):
     if ngd < 0:
         print("MARSHAL_FAIL %s ngd=%d -- routed wants FEWER params than native non-constexpr" % (name, ngd), flush=True)
         return ("MARSHAL_FAIL ngd<0", float("nan"), False)
-    trailing = [g1, g2, g0, 1][:ngd]
+    # Canonical PrimFunc grid-param TAIL order is (gridDim_2, gridDim_1,
+    # gridDim_0): axis2<-g2, axis1<-g1, axis0<-g0. Passing [g1,g2,g0] SWAPS
+    # gridDim_2/gridDim_1 -> the strided per-block base for chunk/head axes is
+    # computed from the wrong block count, so only a subset of blocks runs and
+    # half the output stays zero (the nz=65536/131072 symptom). Align with the
+    # §P1 prod harness (which passes gd2,gd1,gd0).
+    trailing = [g2, g1, g0, 1][:ngd]
     args = routed + trailing
     try:
         kernel(*args); torch.cuda.synchronize()

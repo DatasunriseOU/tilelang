@@ -491,25 +491,35 @@ def _redeclare_ctx_buffer_1d(
     *,
     grow_fixed: bool = False,
 ) -> Any:
-    """Replace a placeholder function-arg buffer with a 1D flat view.
+    """Replace a placeholder function-arg buffer with a flat SYMBOLIC view.
 
-    ``grow_fixed`` -- when True, a caller-seeded ("fixed") function-arg
-    buffer whose current extent is *provably too small* to hold the
-    addressed region (``current_extent < min_extent``) is still grown.
-    This is the output-buffer grid-scaling fix (RULE #1: a too-small
-    seed on a strided per-block write target is a truncation bug, not a
-    contract we honor -- silently keeping the small buffer would drop
-    every grid block past the first tile). The seeded shape is only
-    authoritative when it is large enough to cover the writes.
+    A strided per-block load/store addresses a region whose true flat
+    extent is the real DLTensor element count -- which is a *runtime*
+    quantity (it depends on seqlen / grid / strides). Declaring the flat
+    arg buffer with a baked numeric extent (the old ``max(numel, 1<<20)``
+    floor) MONOMORPHIZES the kernel: the compiled PrimFunc only fits one
+    launch shape, and a larger launch (the §P1 grid (1,64,112), 29.36M-elem
+    ``dout``) addresses past the baked ``1048576`` extent and SEGFAULTS at
+    launch (declared extent << real). RULE #1: a buffer sized below the real
+    tensor is a truncation/OOB bug, not a contract.
+
+    We therefore declare the flat buffer with a FRESH SYMBOLIC int64 extent
+    ``Var`` (one per arg key, cached on ``ctx.flat_arg_extent_vars``).
+    Because the buffer lives in the PrimFunc ``buffer_map``, MakePackedAPI
+    binds that extent Var from the passed DLTensor's real element count at
+    launch -- so the SAME compiled kernel runs at ANY grid/seqlen. The
+    per-block base + tile mask in the flat index / store guard already bound
+    every reachable element to the in-tensor region (mirroring the native
+    ``tl.store`` row/col mask); the whole-buffer extent only has to MATCH the
+    real allocation, which a symbolic-bound Var does exactly.
+
+    ``grow_fixed`` -- a caller-seeded ("fixed") function-arg buffer is only
+    authoritative when it already carries a real (non-placeholder) extent we
+    must not override. We keep honoring such a seed (early-return) unless a
+    strided per-block write needs the symbolic span; ``min_extent`` is no
+    longer used to size the buffer (kept for signature/back-compat) -- the
+    symbolic Var supersedes any numeric floor.
     """
-    try:
-        rank = len(buf.shape)
-        current_extent = int(buf.shape[0]) if rank == 1 else 0
-    except Exception:
-        rank = 0
-        current_extent = 0
-    if rank == 1 and current_extent >= min_extent:
-        return buf
     name = getattr(buf, "name", None) or "buf"
     target_key: Any = None
     for key, value in (getattr(ctx, "buffers", {}) or {}).items():
@@ -518,14 +528,47 @@ def _redeclare_ctx_buffer_1d(
             break
     if target_key is None:
         return buf
+
+    # Already symbolic for this key -> idempotent; reuse the cached buffer so
+    # every load/store of this arg resolves to ONE extent Var (bound once).
+    extent_cache = getattr(ctx, "flat_arg_extent_vars", None)
+    if extent_cache is None:
+        extent_cache = {}
+        ctx.flat_arg_extent_vars = extent_cache
+    cached_buf = extent_cache.get(target_key)
+    if cached_buf is not None and ctx.buffers.get(target_key) is cached_buf:
+        return cached_buf
+
     fixed_keys = getattr(ctx, "fixed_arg_buffer_keys", set()) or set()
     is_fixed = target_key in fixed_keys or str(name) in fixed_keys
     if is_fixed and not grow_fixed:
         return buf
-    new_buf = ctx.tir().decl_buffer(
-        [max(int(min_extent), 1)], dtype, name=str(name)
-    )
+
+    tir = ctx.tir()
+    # Fresh symbolic flat extent bound by MakePackedAPI from the real tensor.
+    try:
+        extent_var = tir.Var(ctx.fresh(str(name) + "_numel"), "int64")
+    except Exception:
+        # Never fall back to a baked under-counted constant (RULE #1): if a
+        # symbol cannot be minted, surface the failure rather than silently
+        # monomorphizing the kernel to a too-small extent.
+        raise RuntimeError(
+            "could not mint symbolic flat extent Var for buffer %r; refusing "
+            "to bake a monomorphized numeric extent (would segfault at a "
+            "larger launch)" % (str(name),)
+        )
+    # Reuse the ORIGINAL placeholder's backing data Var so the param handle
+    # (bound by MakePackedAPI) and this flat view resolve to ONE Var -- minting
+    # a fresh data Var would leave a free variable MakePackedAPI rejects.
+    data_var = getattr(buf, "data", None)
+    if data_var is not None:
+        new_buf = tir.decl_buffer(
+            [extent_var], dtype, name=str(name), data=data_var,
+        )
+    else:
+        new_buf = tir.decl_buffer([extent_var], dtype, name=str(name))
     ctx.buffers[target_key] = new_buf
+    extent_cache[target_key] = new_buf
     for key, value in list(getattr(ctx, "value_map", {}).items()):
         if value is buf:
             ctx.value_map[key] = new_buf

@@ -244,6 +244,15 @@ class WalkerCtx:
         self.stmts: List[Any] = []
         # Param name -> tvm.tir.Buffer (for tt.func arguments).
         self.buffers: Dict[str, Any] = {}
+        # Buffer-key -> fresh symbolic int64 extent Var used when a flat
+        # function-arg buffer is re-declared for a strided per-block
+        # load/store. One Var per arg key so every redecl of the same arg
+        # resolves to the SAME extent symbol, which MakePackedAPI then binds
+        # from the real DLTensor's element count at launch. This keeps the
+        # compiled kernel monomorphization-free: the SAME PrimFunc runs at any
+        # grid / seqlen, because the buffer extent is symbolic, not a baked
+        # constant. See ``_redeclare_ctx_buffer_1d``.
+        self.flat_arg_extent_vars: Dict[Any, Any] = {}
         # Auto-generated temp counter for fresh names.
         self._tmp_counter: int = 0
         # Lazy-loaded TVM modules.
