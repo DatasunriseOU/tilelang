@@ -1286,6 +1286,24 @@ def _emit_ptrstate_tile_load_tir(
             body,
         )
     ctx.emit(body)
+    # ITERATION 3 (coalesced async loads): this strided PtrState load is the
+    # actual K-loop global->shared producer for the dstates/dc/... kernels
+    # (tile_buf is shared when rank>=2). Record it on ctx._gmem_shared_copies so
+    # ``map_scf_for`` stamps ``num_stages`` on the enclosing K-loop. See the
+    # measured note in iteration-3: PipelinePlanning recognizes a *CopyNode*
+    # producer (T.copy global->shared); a predicated manual ``tir.For`` grid
+    # (``shared[i,j] = T.if_then_else(mask, global[...], other)``) is explicitly
+    # NOT treated as a proven copy (pipeline_planning.cc:370), so num_stages on
+    # its own does not yield cp.async here -- the producer must first be routed
+    # through a clean CopyNode. We still count it so the pipeline annotation is
+    # present and the eligibility is visible end-to-end.
+    if (
+        getattr(ctx, "routed_triton_async_loads", False)
+        and len(out_shape or []) >= 2
+    ):
+        shared_copies = getattr(ctx, "_gmem_shared_copies", None)
+        if isinstance(shared_copies, list):
+            shared_copies.append(1)
     if result_value is not None:
         ctx.bind(result_value, tile_buf)
     return tile_buf

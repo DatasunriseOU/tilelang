@@ -368,6 +368,31 @@ class WalkerCtx:
         # transforms (1)/(3) can ship under ``routed_triton_prologue_opt``
         # without coupling to the conditional thread-distribution.
         self.routed_triton_thread_distribute: bool = False
+        # ITERATION 3 (coalesced async loads). When True (set together with
+        # ``routed_triton_prologue_opt`` on the routed Tri-Dao chunk path), the
+        # ``scf.for`` K-loop emitter stamps a ``num_stages`` annotation on the
+        # serial K-loop ``tir.For`` whenever the loop body emitted at least one
+        # global->shared cooperative ``T.copy`` (``_emit_load_copy``). That
+        # annotation is exactly what TileLang's ``T.Pipelined`` would stamp;
+        # ``PipelinePlanning`` + ``InjectSoftwarePipeline`` then schedule the
+        # global->shared copies as async producers and ``LowerPTXAsyncCopy``
+        # emits ``cp.async`` (SASS LDGSTS) instead of plain per-lane LDG. The
+        # copy region itself is already a coalesced cooperative T.copy (the same
+        # high-level surface the GEMM operands use); software-pipelining is the
+        # missing trigger that routes it through the cp.async path. RULE #1:
+        # once a K-loop carries a cp.async-eligible global->shared copy we
+        # pipeline it (coalesce) -- we never leave it as a silent uncoalesced
+        # serial LDG. The GEMM cooperative path is untouched: it does not run
+        # under ``routed_triton_prologue_opt`` and its operand copies already
+        # lower to ldmatrix/cp.async via the existing GEMM staging.
+        self.routed_triton_async_loads: bool = False
+        # Shared single-element counter list: ``_emit_load_copy`` appends a 1 for
+        # every global->shared cooperative copy it emits. ``map_scf_for`` reads
+        # the delta across its body emission to decide whether the K-loop is
+        # cp.async-eligible (has at least one such copy). A list (not an int) so
+        # the region-child ctx shares the SAME object by reference, exactly like
+        # ``local_buffers`` -- in-loop copies surface to the parent.
+        self._gmem_shared_copies: List[int] = []
         # FULL TRANSFORM 1 (Coalesce-style addressing fold). Set of MLIR
         # result ``Value`` objects (by identity/hash) whose tile result is
         # consumed ONLY as addressing/mask for a
@@ -1469,6 +1494,22 @@ def _emit_load_copy(op: Any, ctx: "WalkerCtx", resolved: Dict[str, Any], mask_ss
         except Exception:  # pragma: no cover -- API drift
             src_slice = src_buf
     T.copy(src_slice, frag)
+
+    # ITERATION 3 (coalesced async loads). Record that this body emitted a
+    # global->shared cooperative copy. ``frag`` lives in shared scope
+    # (``alloc_shared`` above) and ``src_slice`` is the global operand buffer,
+    # so this is a cp.async-eligible producer. ``map_scf_for`` reads the delta
+    # on ``ctx._gmem_shared_copies`` across its body emission to decide whether
+    # the enclosing serial K-loop should carry the ``num_stages`` software-
+    # pipeline annotation that routes these copies through ``LowerPTXAsyncCopy``
+    # (cp.async / SASS LDGSTS). Only counted when the alloc actually landed in
+    # shared scope -- the ``alloc_fragment`` fallback (Metal gemm-ss path) is
+    # not cp.async-eligible. RULE #1: count the real shared producer or nothing
+    # -- never claim a coalesced copy that did not get a shared destination.
+    if getattr(ctx, "routed_triton_async_loads", False) and alloc_fn is getattr(T, "alloc_shared", None):
+        shared_copies = getattr(ctx, "_gmem_shared_copies", None)
+        if isinstance(shared_copies, list):
+            shared_copies.append(1)
 
     # Mask is applied lane-wise after the copy via T.if_then_else when
     # downstream consumers need it; the SSA bound to ``result`` is the

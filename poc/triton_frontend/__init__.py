@@ -1451,6 +1451,7 @@ def from_ttir(
     num_warps: Optional[int] = None,
     num_stages: Optional[int] = None,
     prologue_opt: bool = True,
+    async_loads: bool = True,
     _allow_text_ttir: bool = False,
     **kwargs: Any,
 ) -> TileLangPrimFunc:
@@ -1526,6 +1527,15 @@ def from_ttir(
     # exercised by ``thread_distribute=True`` for development. Transforms (1
     # partial: guard/and folding) + (3) ship ON under ``prologue_opt``.
     ctx.routed_triton_thread_distribute = bool(kwargs.get("thread_distribute", False))
+    # ITERATION 3 (coalesced async loads). ON by default on the routed-triton
+    # path: the ``scf.for`` K-loop emitter stamps ``num_stages`` on a serial
+    # K-loop carrying global->shared cooperative copies so PipelinePlanning +
+    # InjectSoftwarePipeline + LowerPTXAsyncCopy route those copies through
+    # ``cp.async`` (SASS LDGSTS) instead of plain per-lane LDG. Pass
+    # ``async_loads=False`` to reproduce the pre-iteration-3 plain-LDG K-loop
+    # for A/B comparison. Gated on the prologue-opt path so the GEMM
+    # cooperative path and dict-shaped unit tests stay byte-identical.
+    ctx.routed_triton_async_loads = bool(async_loads) and bool(prologue_opt)
     if grid is not None:
         ctx.launch_grid = tuple(int(x) for x in grid)
     if arg_buffer_shapes is not None:

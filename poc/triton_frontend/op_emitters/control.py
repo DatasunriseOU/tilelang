@@ -1578,6 +1578,18 @@ def _emit_region(
     child.routed_triton_thread_distribute = bool(
         getattr(ctx, "routed_triton_thread_distribute", False)
     )
+    # ITERATION 3 (coalesced async loads): propagate the async-load gate AND
+    # share the SAME counter-list object so a global->shared ``T.copy`` emitted
+    # by ``_emit_load_copy`` inside this region surfaces to the parent's
+    # ``map_scf_for`` (which reads the delta to decide cp.async eligibility).
+    child.routed_triton_async_loads = bool(
+        getattr(ctx, "routed_triton_async_loads", False)
+    )
+    if not hasattr(ctx, "_gmem_shared_copies") or not isinstance(
+        getattr(ctx, "_gmem_shared_copies", None), list
+    ):
+        ctx._gmem_shared_copies = []
+    child._gmem_shared_copies = ctx._gmem_shared_copies
     # FULL TRANSFORM 1 (Coalesce-style addressing fold): the bulk of the
     # addressing/mask binops/broadcasts live INSIDE the scf.for K-loop body.
     # Without propagating the fold set into the region child, those tiles would
@@ -2426,6 +2438,57 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
             body = tir.SeqStmt([body] + scalar_updates)
         return body, yielded
 
+    # ITERATION 3 (coalesced async loads). Snapshot the cooperative
+    # global->shared copy counter BEFORE emitting the body so we can detect
+    # whether this K-loop carries any cp.async-eligible producer.
+    _async_enabled = bool(getattr(ctx, "routed_triton_async_loads", False))
+    if not hasattr(ctx, "_gmem_shared_copies") or not isinstance(
+        getattr(ctx, "_gmem_shared_copies", None), list
+    ):
+        ctx._gmem_shared_copies = []
+    _gmem_copies_before = len(ctx._gmem_shared_copies)
+
+    def _maybe_pipeline(for_node: Any) -> Any:
+        """Stamp ``num_stages`` on a serial K-loop with global->shared copies.
+
+        Mirrors the annotation ``T.Pipelined(..., num_stages=N)`` would stamp.
+        ``PipelinePlanning`` (which CHECKs ``ForKind::kSerial`` -- our loop is
+        serial) reads ``num_stages`` off the loop, schedules the global->shared
+        copies as async producers, and ``LowerPTXAsyncCopy`` lowers them to
+        ``cp.async`` (SASS LDGSTS). Gated on the routed-triton async-load path
+        AND on the body having emitted at least one cooperative shared copy --
+        annotating a copy-free loop would make ``PipelinePlanning`` schedule an
+        empty pipeline. RULE #1: pipeline (coalesce) when eligible, else leave
+        the loop exactly as the serial path produced it; no silent half-state.
+        """
+        if not _async_enabled:
+            return for_node
+        if len(ctx._gmem_shared_copies) <= _gmem_copies_before:
+            return for_node
+        if not isinstance(for_node, tir.For) or for_node.kind != tir.ForKind.SERIAL:
+            return for_node
+        # PipelinePlanning requires the loop body to reduce to a SeqStmt
+        # (producer copy + consumer) -- a lone-statement body would LOG(FATAL)
+        # there. A K-loop carrying a global->shared copy AND its gemm/carry
+        # consumer is always a SeqStmt; if it somehow is not, leave the loop
+        # serial rather than stamp an annotation that would crash planning.
+        if not isinstance(for_node.body, tir.SeqStmt):
+            return for_node
+        num_stages = int(getattr(ctx, "num_stages", 2) or 2)
+        if num_stages < 1:
+            return for_node
+        anns = dict(for_node.annotations or {})
+        anns["num_stages"] = tir.const(num_stages, "int32")
+        return tir.For(
+            for_node.loop_var,
+            for_node.min,
+            for_node.extent,
+            for_node.kind,
+            for_node.body,
+            for_node.thread_binding,
+            anns,
+        )
+
     # Compute extent = ub - lb. step == 1 is the common case; for non-unit
     # step we either unroll or scale the induction var.
     UNROLL_LIMIT = 8
@@ -2458,8 +2521,10 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
             )
         body_induction = lb + loop_var * step
         body, yielded = _emit_body(body_induction)
-        for_stmt = tir.For(loop_var, tir.const(0, "int32"), extent_expr,
-                           tir.ForKind.SERIAL, body)
+        for_stmt = _maybe_pipeline(
+            tir.For(loop_var, tir.const(0, "int32"), extent_expr,
+                    tir.ForKind.SERIAL, body)
+        )
     else:
         # step == 1 (or symbolic step that ptr_analysis has folded to 1):
         # emit the natural ``for i in range(lb, ub)`` form.
@@ -2471,8 +2536,10 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
             # If lb is already a PrimExpr we forward it; otherwise wrap.
             min_expr = lb if hasattr(lb, "dtype") else tir.const(lb_i or 0, "int32")
         body, yielded = _emit_body(loop_var)
-        for_stmt = tir.For(loop_var, min_expr, extent_expr,
-                           tir.ForKind.SERIAL, body)
+        for_stmt = _maybe_pipeline(
+            tir.For(loop_var, min_expr, extent_expr,
+                    tir.ForKind.SERIAL, body)
+        )
 
     ctx.emit(for_stmt)
 
