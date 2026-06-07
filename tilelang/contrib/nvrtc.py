@@ -47,9 +47,27 @@ def compile_cuda(
         # Target arch could be a str like "80", "90", "90a", etc.
         major, minor = parse_compute_version(get_target_compute_version(Target.current(allow_none=True)))
         arch = major * 10 + minor
-    prefix = "compute" if target_format == "ptx" else "sm"
-    suffix = "a" if arch >= 90 else ""
-    arch_option = f"--gpu-architecture={prefix}_{arch}{suffix}"
+    # Architecture target selection.
+    #
+    # For CC 12.x Blackwell (sm_120 / sm_121, e.g. NVIDIA GB10 = CC 12.1) we
+    # target the FAMILY arch (the `f`-suffix) rather than the arch-specific
+    # `a`-suffix. The family target enables the full 12.x feature set
+    # (incl. cp.async.bulk.tensor TMA) portably across CC 12.0/12.1, which is
+    # required for the bulk-tensor TMA ops to be validly enabled on GB10.
+    #
+    # NVRTC 13.x maps the family virtual arch to compute_120f (a subset of
+    # 120a/121a) while the cubin SASS target is sm_121f. Verified accepted by
+    # NVRTC 13.2 on GB10: sm_121f -> "code for sm_121"; compute_120f ->
+    # ".target sm_120f".
+    if arch in (120, 121):
+        if target_format == "ptx":
+            arch_option = "--gpu-architecture=compute_120f"
+        else:
+            arch_option = "--gpu-architecture=sm_121f"
+    else:
+        prefix = "compute" if target_format == "ptx" else "sm"
+        suffix = "a" if arch >= 90 else ""
+        arch_option = f"--gpu-architecture={prefix}_{arch}{suffix}"
 
     file_name = "tvm_kernels"
     if target_format not in ["cubin", "ptx"]:
