@@ -14,14 +14,18 @@ dout=io["dout"].to(dev).contiguous();C=io["C"].to(dev).contiguous();dA=io["dA_cu
 native=io["dprev_native"].to(dev)
 gd0=triton.cdiv(hd,BM)*triton.cdiv(ds,BN); gd1=b*nc; gd2=nh; gd01=1
 G=gd0*gd1*gd2*gd01
-# size buffers EXACTLY to declared extents (pack real data); dout/C true=grid*2048 here (cs=BK)
-def pack(mult, real):
-    t=torch.zeros(G*mult,device=dev,dtype=torch.float32); t[:real.numel()]=real.reshape(-1); return t
-a_dout=pack(2048,dout); a_C=pack(2048,C); a_dA=pack(32,dA)
-dprev=torch.zeros(G*4096,device=dev,dtype=torch.float32)
+# tvm_ffi validates each passed DLTensor against the kernel's DECLARED buffer
+# extent; an UNDER-sized tensor segfaults host-side inside the marshaller. The
+# routed dstates PrimFunc declares arg0..arg3 at a fixed flat extent, so size
+# every buffer to that declared numel (pack the real strided data at offset 0).
+DECL=int(kernel.params[0].shape[0])
+def pack(real):
+    t=torch.zeros(DECL,device=dev,dtype=torch.float32); t[:real.numel()]=real.reshape(-1); return t
+a_dout=pack(dout); a_C=pack(C); a_dA=pack(dA)
+dprev=torch.zeros(DECL,device=dev,dtype=torch.float32)
 sd=[int(x) for x in dout.stride()];sc=[int(x) for x in C.stride()];sa=[int(x) for x in dA.stride()]
 sp=[nc*nh*hd*ds,nh*hd*ds,hd*ds,ds,1]
-print("G=%d declared dout=%d real_dout=%d declared_dA=%d real_dA=%d"%(G,G*2048,dout.numel(),G*32,dA.numel()),flush=True)
+print("G=%d declared_extent=%d real_dout=%d real_dA=%d"%(G,DECL,dout.numel(),dA.numel()),flush=True)
 args=[a_dout,a_C,dprev,a_dA,torch.zeros(1,device=dev,dtype=torch.float32),
       hd,ds,cs,b,s,nc,nh//ng,
       sd[0],sd[1],sd[2],sd[3], sc[0],sc[1],sc[2],sc[3],

@@ -189,16 +189,50 @@ def register_mma_fragment_layouts(prim_func: Any, fragments: List[Dict[str, Any]
 
     from tvm.tir.stmt_functor import ir_transform  # noqa: WPS433
 
-    new_body = ir_transform(prim_func.body, None, _strip, None)
+    stripped = ir_transform(prim_func.body, None, _strip, None)
+
+    # GLOBAL-BUFFER-LIFT FIX (RULE #1 -- correctness, not a workaround). The
+    # walked body is wrapped OUTERMOST by the kernel-launch ``thread_extent``
+    # AttrStmts (threadIdx.x, blockIdx.x/y/z -- emitted by ``_make_prim_func``
+    # in control.py). If we host the alloc_buffers on an SBlock that wraps the
+    # WHOLE body (i.e. ABOVE the launch attrs), every local/shared tile buffer
+    # is declared at FUNCTION-ROOT scope. ``PlanAndUpdateBufferAllocationLocation``
+    # then cannot sink it below the (non-block) thread-extent attrs, so
+    # SplitHostDevice LIFTS each one as a GLOBAL kernel parameter backed by a
+    # host workspace allocation. That global scratch is SHARED across every
+    # grid block -> the per-thread tiles RACE: all blocks overwrite one global
+    # ``carry_tile``/``tile_binop`` and the stored result is whichever block
+    # won (non-deterministic; dstates MAXDIFF ~1e2, value flips run-to-run).
+    #
+    # Fix: place the SBlock (and its alloc_buffers) INSIDE the innermost
+    # thread-launch attr, wrapping ONLY the compute body. The alloc_buffers
+    # then live in DEVICE/kernel scope -> per-block ``__shared__`` and
+    # per-thread ``local`` arrays, never lifted to global params, no race.
+    # Peel the leading thread_extent AttrStmts, wrap the inner body, re-apply.
+    launch_attrs: List[Any] = []
+    inner = stripped
+    while (
+        type(inner).__name__ == "AttrStmt"
+        and getattr(inner, "attr_key", None) == "thread_extent"
+    ):
+        launch_attrs.append(inner)
+        inner = inner.body
 
     block = tirx.SBlock(
         iter_vars=[],
         reads=[],
         writes=[],
         name_hint="root",
-        body=new_body,
+        body=inner,
         alloc_buffers=alloc_bufs,
         annotations={"layout_map": layout_map},
     )
     realize = tirx.SBlockRealize([], tvm.tir.const(True, "bool"), block)
-    return prim_func.with_body(realize)
+
+    # Re-wrap the launch attrs OUTSIDE the SBlock, innermost-first.
+    new_body = realize
+    for attr in reversed(launch_attrs):
+        new_body = tir.AttrStmt(
+            attr.node, attr.attr_key, attr.value, new_body
+        )
+    return prim_func.with_body(new_body)
