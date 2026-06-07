@@ -1454,19 +1454,30 @@ def _emit_ptrstate_tile_load_copynode(
     # honor. If a future monomorphized launch surfaces a literal-1 innermost
     # stride, dropping ``disable_tma`` lets C take UTMALDG.
     #
-    # ITERATION 6: when the route GROUNDED this source's innermost stride to a
-    # literal 1 (``ground_innermost`` -- the provably-contiguous dstates C
-    # tile), the TMA descriptor is now statically provable
-    # (``is_one(desc.global_stride[0])`` holds), so we DROP ``disable_tma`` and
-    # let the CopyNode lower to a real UTMALDG TMA load. For every other tile
-    # (the dout tile, any un-grounded opaque-symbolic innermost) we keep
-    # ``disable_tma=True`` so the CopyNode lowers via the SIMT/cp.async path
-    # rather than FATAL on copy.cc:988. RULE #1: TMA only when the descriptor is
-    # provable, never a fabricated TMA claim.
-    if ground_innermost:
-        copy_call = T.copy(src2d, tile_buf)
-    else:
-        copy_call = T.copy(src2d, tile_buf, disable_tma=True)
+    # ITERATION 7 (SIDESTEP TMA -- SIMT COALESCED): the sm_90 TMA template
+    # (cp.async.bulk.tensor.2d) does NOT execute on sm_121 (Blackwell GB10):
+    # iter-6 got C to lower to a real UTMALDG and the kernel LAUNCHED, but the
+    # TMA FAULTED at runtime (compute-sanitizer: illegal instruction at
+    # tl::tma_load copy_sm90.h:96). So TMA is a dead end on this target. We now
+    # route the C AND dout K-loop global->shared loads as SIMT cooperative
+    # VECTORIZED COALESCED loads (plain LDG.E.128, thread-distributed over the
+    # contiguous axis) -- no tensorMap, no cp.async.bulk.tensor, no sm_90 TMA
+    # template. This avoids the sm_121 TMA fault entirely.
+    #
+    # The lever: set ``disable_tma=True`` on the CopyNode so Copy::Lower
+    # (src/backend/cuda/op/copy.cc) takes the SIMT branch (vectorized LDG) via
+    # SelectCopyInstForLowering instead of LowerBulk (TMA). This annotation now
+    # actually reaches the CopyNode because the per-Call annotations channel was
+    # restored (3rdparty/tvm tirx::Call 5-arg ctor + call_intrin; previously the
+    # kwarg was silently dropped by ``del annotations`` in tvm/tirx/op.py).
+    #
+    # ``ground_innermost`` (the route-verified contiguous innermost stride for
+    # the dstates C tile) is STILL pinned to a literal 1 above: that contiguity
+    # is what lets the SIMT vectorizer prove a 128-bit coalesced LDG.E.128 over
+    # the ds axis (stride 1). It is no longer used to enable TMA. For the dout
+    # tile and any un-grounded source the same disable_tma=True applies. RULE #1:
+    # one clear SIMT path; no fabricated TMA claim, no faulting bulk copy.
+    copy_call = T.copy(src2d, tile_buf, disable_tma=True)
     ctx.emit(tir.Evaluate(copy_call))
 
     # ---- mask SPLIT OFF the copy: masked epilogue -----------------------
