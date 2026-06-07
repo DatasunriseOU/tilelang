@@ -305,7 +305,12 @@ def _scalarize_tile_index_base(
 
 
 def _resolve_ptrstate_value(ctx: WalkerCtx, value: Any) -> Any:
-    """Resolve a PtrAnalysis JSON scalar/symbol into a TIR value."""
+    """Resolve a PtrAnalysis JSON scalar/symbol into a TIR value.
+
+    The loop-carried pointer advance is handled in :func:`_ptrstate_flat_index`
+    via the resolved dict's ``_carry_flat`` field, not in the per-axis offset,
+    so this resolver stays a single scalar/symbol path.
+    """
     try:
         if value in ctx.value_map:
             resolved = ctx.value_map[value]
@@ -548,7 +553,54 @@ def _ptrstate_flat_index(
         off = _cast_index_like(ctx, off, lv)
         stride = _cast_index_like(ctx, stride, lv)
         flat = flat + (off + lv) * stride
+    # FORWARDPTR: loop-carried pointer advance. A scf.for block-arg forwarded
+    # by ``map_scf_for`` advances its base pointer by ``advance`` elements each
+    # trip; after ``trips = (induction - lb) / step`` trips the total flat
+    # shift is ``trips * advance``. Adding it here makes the strided in-loop
+    # load slide exactly like the native multi-K-trip kernel -- no carry_index
+    # scalar gather, and no per-axis stride-name matching required.
+    carry = resolved.get("_carry_flat") if isinstance(resolved, dict) else None
+    if carry:
+        advance = _carry_resolve(ctx, carry.get("advance"))
+        induction = _carry_resolve(ctx, carry.get("induction"))
+        lb = _carry_resolve(ctx, carry.get("lb"))
+        step = _carry_resolve(ctx, carry.get("step"))
+        advance = _cast_index_like(ctx, advance, flat)
+        induction = _cast_index_like(ctx, induction, flat)
+        lb = _cast_index_like(ctx, lb, flat)
+        step = _cast_index_like(ctx, step, flat)
+        trips = tir.FloorDiv(induction - lb, step)
+        flat = flat + trips * advance
     return flat
+
+
+def _carry_resolve(ctx: WalkerCtx, ref: Any) -> Any:
+    """Resolve a carry-flat field (PrimExpr / SSA name / int) to a scalar.
+
+    ``advance`` is already a resolved PrimExpr (from forwarding time);
+    ``induction`` / ``lb`` / ``step`` are SSA names bound by ``_emit_region``
+    (the loop bounds + induction var) or synthetic constant names. RULE #1:
+    an unresolved name raises.
+    """
+    tir = ctx.tir()
+    if ref is None:
+        return tir.const(0, "int32")
+    if isinstance(ref, int):
+        return tir.const(ref, "int32")
+    if not isinstance(ref, str):
+        return ref  # already a PrimExpr
+    for key in (ref, ref.lstrip("%"), f"%{ref.lstrip('%')}"):
+        try:
+            if key in ctx.value_map:
+                val = ctx.value_map[key]
+                if isinstance(val, tuple) and len(val) == 2:
+                    return val[1][-1]
+                return val
+        except TypeError:
+            pass
+    raise EmitError(
+        f"FORWARDPTR carry-advance references unresolved field {ref!r}"
+    )
 
 
 def _flat_min_extent(shape: Sequence[int]) -> int:

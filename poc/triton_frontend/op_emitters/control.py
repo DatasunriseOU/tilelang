@@ -58,6 +58,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .. import op_mapping as _om
 from ..op_mapping import EmitError
 
+# ``_op_name`` lives in the walker; import lazily-safe so a missing walker
+# (unit-test stubs) degrades to ``None`` rather than an import error.
+try:  # pragma: no cover - import wiring
+    from .. import mlir_walker as _wk
+except Exception:  # pragma: no cover
+    _wk = None  # type: ignore
+
 __all__ = [
     "CONTROL_EMITTERS",
     "EmitError",
@@ -1109,6 +1116,8 @@ def _parse_value_attr(value_attr: Any) -> Tuple[str, Any]:
             raise EmitError(
                 f"arith.constant with array attr unsupported; got: {value_attr!r}"
             )
+        if s.lower() in ("true", "false"):
+            return "i1", (1 if s.lower() == "true" else 0)
         if ":" not in s:
             raise EmitError(
                 f"arith.constant: cannot parse value attr {value_attr!r} "
@@ -1151,6 +1160,12 @@ def _parse_value_attr(value_attr: Any) -> Tuple[str, Any]:
             raise EmitError(
                 f"arith.constant with array attr unsupported; got: {value_attr!r}"
             )
+        # Boolean ``i1`` constant: MLIR prints ``true`` / ``false`` with no
+        # ``: i1`` type suffix. Map to a ``bool`` scalar (1 / 0). Without this
+        # the ``: in s`` parse below misses and we hit the hard error -- the
+        # exact ``Attribute(true)`` gap that blocked _chunk_state_bwd_dx.
+        if low in ("true", "false"):
+            return "i1", (1 if low == "true" else 0)
         if ":" in s:
             val_part, dt_part = s.rsplit(":", 1)
             val_part = val_part.strip()
@@ -1781,6 +1796,406 @@ def _scf_for_iter_args(op: Any) -> List[Any]:
     return list(_om._operands(op)[3:])
 
 
+def _region_body_ops(region: Any) -> List[Any]:
+    """Return the flat op list of a region (dict-fake or real MLIR)."""
+    if isinstance(region, dict):
+        return list(region.get("ops", ()))
+    ops: List[Any] = []
+    for block in getattr(region, "blocks", ()) or ():
+        for inner in getattr(block, "operations", ()) or ():
+            ops.append(inner)
+    return ops
+
+
+def _is_ptr_tensor(value: Any) -> bool:
+    """True iff ``value``'s MLIR type is a (tensor of) ``!tt.ptr``.
+
+    Covers both scalar pointers (``!tt.ptr<f32>``) and the block-pointer
+    tile form (``tensor<64x32x!tt.ptr<f32>>``) that scf.for iter_args carry.
+    """
+    try:
+        ts = _type_string(value)
+    except Exception:
+        return False
+    return "!tt.ptr<" in ts or "tt.ptr<" in ts
+
+
+def _dedupe_states(states_map: Dict[str, Any]) -> List[Any]:
+    """Stable, id-deduplicated list of PtrState objects from a states map."""
+    seen = set()
+    out: List[Any] = []
+    for st in states_map.values():
+        if id(st) in seen:
+            continue
+        seen.add(id(st))
+        out.append(st)
+    out.sort(key=lambda s: str(getattr(s, "result_ssa", "") or ""))
+    return out
+
+
+def _build_def_map(ops: List[Any]) -> Dict[str, Any]:
+    """Map each op's result SSA name -> the defining op (for use-def tracing)."""
+    defs: Dict[str, Any] = {}
+    for inner in ops:
+        for res in _om._results(inner):
+            nm = _ssa_name(res)
+            if nm:
+                defs[nm] = inner
+    return defs
+
+
+def _trace_scalar_through(defs: Dict[str, Any], name: Optional[str]) -> Optional[str]:
+    """Strip ``index_cast`` / ``bitcast`` / ``extsi`` wrappers off ``name``.
+
+    Returns the printed SSA name of the underlying integer scalar (e.g. the
+    raw ``%argK`` stride argument) so a ``tt.addptr`` per-trip advance can be
+    matched to the PtrState stride that shares the same source scalar.
+    """
+    seen = set()
+    cur = name
+    while cur and cur not in seen:
+        seen.add(cur)
+        op = defs.get(cur)
+        if op is None:
+            return cur
+        opname = _wk._op_name(op) if _wk is not None else ""
+        if opname in ("arith.index_cast", "arith.bitcast", "arith.extsi",
+                      "arith.trunci", "arith.sitofp"):
+            operands = _om._operands(op)
+            cur = _ssa_name(operands[0]) if operands else None
+            continue
+        return cur
+    return cur
+
+
+def _ptr_state_offsets_are_scalar(
+    ctx: _om.WalkerCtx, offsets: List[Any], strides: List[Any]
+) -> bool:
+    """True iff every PtrState offset/stride resolves to a SCALAR value.
+
+    A scalar resolves to a TIR ``PrimExpr`` (or int / int-literal string).
+    Tile-shaped offsets (matmul's ``offs_m[:,None]*K`` index tensors) resolve
+    to an ``ffi.Map`` / ``Buffer`` / ``(buffer, indices)`` tuple instead --
+    those must NOT take the scalar-strided forwarding path. Unresolvable
+    names are treated as scalar (they're typically pre-loop SSA the load
+    resolves later); the load path re-resolves and raises loudly if wrong.
+    """
+    def _is_scalar(ref: Any) -> bool:
+        if ref is None or isinstance(ref, int):
+            return True
+        if isinstance(ref, (list, tuple)):
+            return False
+        if isinstance(ref, str):
+            val = _resolve_ssa_to_tir(ctx, ref)
+            if val is None:
+                # Numeric literal spelled as a string is scalar; an unbound
+                # symbolic name is assumed scalar (resolved at load time).
+                return True
+            ref = val
+        tn = type(ref).__name__
+        if tn in ("Map", "Array", "Buffer", "BufferRegion"):
+            return False
+        if isinstance(ref, (list, tuple)):
+            return False
+        return True
+    return all(_is_scalar(o) for o in offsets) and all(_is_scalar(s) for s in strides)
+
+
+def _unwrap_tir_cast(expr: Any) -> Any:
+    """Strip TIR ``Cast`` wrappers so a stride ``Cast(int64, argK)`` compares
+    structurally-equal to a bare ``argK`` factor from the addptr increment."""
+    seen = 0
+    cur = expr
+    while cur is not None and type(cur).__name__ == "Cast" and seen < 8:
+        nxt = getattr(cur, "value", None)
+        if nxt is None:
+            break
+        cur = nxt
+        seen += 1
+    return cur
+
+
+def _resolve_ssa_to_tir(ctx: _om.WalkerCtx, name: Optional[str]) -> Any:
+    """Best-effort resolve an SSA name to its bound TIR value (or None)."""
+    if not name:
+        return None
+    for key in (name, name.lstrip("%"), f"%{name.lstrip('%')}"):
+        try:
+            if key in ctx.value_map:
+                return ctx.value_map[key]
+        except TypeError:
+            pass
+    return None
+
+
+def _addptr_per_trip_flat(
+    ctx: _om.WalkerCtx,
+    defs: Dict[str, Any],
+    yielded_ssa: Optional[str],
+    blk_arg_name: Optional[str],
+) -> Any:
+    """Return the per-iteration *flat* pointer advance as a resolved TIR scalar.
+
+    The carried pointer is yielded as ``addptr(<blk_arg>, splat(<scalar>))``.
+    ``<scalar>`` is the per-trip flat advance in elements -- either a bare
+    kernel-arg stride (``splat(%strideK)``) or ``muli(step, %strideK)``. Every
+    leaf resolves to a kernel-arg / pre-loop value (stable across the
+    shim-vs-walker SSA renumbering), so we resolve it to TIR *here* (at
+    forwarding time, before the loop body) and the load folds
+    ``trips * scalar`` into the flat index. RULE #1: a non-uniform-splat
+    advance, or a leaf that does not resolve, raises rather than mis-striding.
+    """
+    op = defs.get(yielded_ssa) if yielded_ssa else None
+    opname = _wk._op_name(op) if (op is not None and _wk is not None) else None
+    if op is None or opname != "tt.addptr":
+        raise EmitError(
+            "map_scf_for: loop-carried pointer iter_arg "
+            f"{blk_arg_name!r} is not yielded by a tt.addptr "
+            f"(got {opname!r}); cannot forward strided PtrState across the loop."
+        )
+    operands = _om._operands(op)
+    if len(operands) < 2:
+        raise EmitError(f"map_scf_for: malformed tt.addptr for {blk_arg_name!r}")
+    incr_op = defs.get(_ssa_name(operands[1]))
+    incr_opname = _wk._op_name(incr_op) if (incr_op is not None and _wk is not None) else None
+    if incr_opname != "tt.splat":
+        raise EmitError(
+            "map_scf_for: loop-carried tt.addptr advance for "
+            f"{blk_arg_name!r} is not a uniform tt.splat (got {incr_opname!r}). "
+            "RULE #1: refusing a non-uniform per-trip advance."
+        )
+    sp_ops = _om._operands(incr_op)
+    scalar_name = _ssa_name(sp_ops[0]) if sp_ops else None
+    scalar_op = defs.get(scalar_name)
+    scalar_opname = _wk._op_name(scalar_op) if (scalar_op is not None and _wk is not None) else None
+
+    def _resolve_leaf(nm: Optional[str]) -> Any:
+        traced = _trace_scalar_through(defs, nm)
+        val = _resolve_ssa_to_tir(ctx, traced)
+        if val is None:
+            val = _resolve_ssa_to_tir(ctx, nm)
+        if val is None:
+            d = defs.get(traced)
+            dn = _wk._op_name(d) if (d is not None and _wk is not None) else None
+            if dn == "arith.constant":
+                cst = _const_value_of(d)
+                if cst is not None:
+                    return ctx.tir().const(int(cst), "int32")
+            raise EmitError(
+                "map_scf_for: loop-carried advance leaf "
+                f"{nm!r} for {blk_arg_name!r} does not resolve to a kernel-arg "
+                "/ constant. RULE #1: refusing to forward."
+            )
+        return _unwrap_tir_cast(val)
+
+    if scalar_opname == "arith.muli":
+        factors = [_resolve_leaf(_ssa_name(o)) for o in _om._operands(scalar_op)]
+        acc = factors[0]
+        for f in factors[1:]:
+            acc = acc * f
+        return acc
+    # Bare scalar advance (step folded into the stride or step == 1).
+    return _resolve_leaf(scalar_name)
+
+
+def _const_value_of(op: Any) -> Optional[int]:
+    """Extract an integer value from an ``arith.constant`` op (best-effort).
+
+    The value lives in the op's *inherent* attribute (``<{value = 32 :
+    i32}>``), not the discardable attribute dict, so we try (1) the attrs
+    dict, then (2) parse the printed op form ``value = <N> : i<bits>``.
+    """
+    try:
+        attrs = _om._attrs(op) if hasattr(_om, "_attrs") else {}
+    except Exception:
+        attrs = {}
+    val = attrs.get("value") if isinstance(attrs, dict) else None
+    for cand in (val, getattr(op, "value", None)):
+        if cand is None:
+            continue
+        try:
+            return int(cand)
+        except (TypeError, ValueError):
+            pass
+        v = getattr(cand, "value", None)
+        if v is not None:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                pass
+    # Parse the printed inherent attribute: ``<{value = 32 : i32}>``.
+    try:
+        import re  # noqa: WPS433
+        m = re.search(r"value\s*=\s*(-?\d+)\s*:\s*i\d+", str(op))
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def _forward_loop_ptr_states(
+    ctx: _om.WalkerCtx,
+    region: Any,
+    iter_arg_block_ssas: List[Any],
+    iter_arg_ssas: List[Any],
+    induction_ssa: Any,
+    lb_ssa: Any,
+    step_ssa: Any,
+) -> Dict[str, Any]:
+    """Forward each ptr iter_arg's PtrState onto its ``scf.for`` block-arg.
+
+    For every iter_arg whose INIT operand carries a strided PtrState (the
+    shim already recovered it for the pre-loop ``tts.make_tptr`` + pre-loop
+    ``tt.addptr``), register ``ctx.ptr_states[<block_arg_name>]`` with the
+    same source/sizes/strides but with the per-iteration advance folded into
+    the offset of the advancing axis: ``offset[axis] = init_offset +
+    induction_var``. The in-loop ``tt.load`` on the block-arg then resolves
+    via ``_lookup_ptr_state`` to the strided ``_emit_ptrstate_tile_load_tir``
+    path instead of the scalar ``carry_index`` gather.
+
+    Returns a ``dict[block_arg_name -> tagged-dict]`` for the forwarded
+    carries (the tagged-dict is what the block-arg is bound to so in-loop
+    ``tt.load`` / ``tt.addptr`` consume the strided state directly). RULE #1:
+    if an init has a PtrState but the advance cannot be identified,
+    :func:`_addptr_advance_axis` raises rather than silently dropping to the
+    scalar gather.
+    """
+    states_map = getattr(ctx, "ptr_states", None)
+    if states_map is None:
+        return {}
+    ops = _region_body_ops(region)
+    defs = _build_def_map(ops)
+    # Find scf.yield and its operands (the yielded value per iter_arg).
+    yield_operands: List[Any] = []
+    for inner in ops:
+        if _wk is not None and _wk._op_name(inner) == "scf.yield":
+            yield_operands = list(_om._operands(inner))
+            break
+    induction_name = _ssa_name(induction_ssa) if induction_ssa is not None else None
+    def _bound_name(ref: Any, tag: str) -> str:
+        if isinstance(ref, int):
+            nm = f"__{tag}_const__"
+            ctx.value_map[nm] = ctx.tir().const(int(ref), "int32")
+            return nm
+        return _ssa_name(ref)
+    lb_name = _bound_name(lb_ssa, "lb")
+    step_name = _bound_name(step_ssa, "step")
+    # Build a sizes -> [states] index. The shim keys states by the REWRITTEN
+    # SSA numbering, but ``parse_ttir`` re-numbers (or falls through to a
+    # provider that parses the original IR), so an exact init-SSA-name match
+    # misses. We instead match each iter_arg to its recovered PtrState by tile
+    # SIZES (the iter_arg's MLIR tensor type), mirroring the source+shape
+    # reconciliation the top-level loads already use
+    # (``_compatible_ptr_state_for_base``). RULE #1: when sizes are ambiguous
+    # we still forward deterministically (round-robin per sizes key) and the
+    # advance-axis match below guards correctness.
+    sizes_index: Dict[Tuple[int, ...], List[Any]] = {}
+    for st in _dedupe_states(states_map):
+        try:
+            key = tuple(int(s) for s in (getattr(st, "sizes", ()) or ()))
+        except (TypeError, ValueError):
+            continue
+        if not key:
+            continue
+        if not (getattr(st, "strides", ()) or ()):
+            continue
+        sizes_index.setdefault(key, []).append(st)
+    consumed: Dict[Tuple[int, ...], int] = {}
+    forwarded: Dict[str, Any] = {}
+    for idx, (blk_ssa, init_ssa) in enumerate(zip(iter_arg_block_ssas, iter_arg_ssas)):
+        # Only forward POINTER-typed iter_args (``tensor<...x!tt.ptr<..>>``).
+        # Non-pointer carries (e.g. the float ``acc`` accumulator yielded by
+        # ``arith.addf``) keep the existing buffer-carry path -- forwarding a
+        # PtrState onto them by size-match alone would be a category error.
+        if not _is_ptr_tensor(init_ssa) and not _is_ptr_tensor(blk_ssa):
+            continue
+        try:
+            tile_shape = tuple(int(s) for s in _om._shape_of(init_ssa))
+        except (TypeError, ValueError):
+            tile_shape = ()
+        if not tile_shape and blk_ssa is not None:
+            try:
+                tile_shape = tuple(int(s) for s in _om._shape_of(blk_ssa))
+            except (TypeError, ValueError):
+                tile_shape = ()
+        candidates = sizes_index.get(tile_shape, [])
+        if not candidates:
+            continue
+        pick = consumed.get(tile_shape, 0)
+        if pick >= len(candidates):
+            pick = len(candidates) - 1
+        consumed[tile_shape] = pick + 1
+        state = candidates[pick]
+        strides = list(getattr(state, "strides", ()) or ())
+        sizes = list(getattr(state, "sizes", ()) or ())
+        offsets = list(getattr(state, "offsets", ()) or ())
+        if not strides or not sizes:
+            continue
+        blk_name = _ssa_name(blk_ssa)
+        if not blk_name:
+            continue
+        # SCALAR-OFFSET GUARD: only forward the strided ``make_tptr`` tile-load
+        # when every offset/stride resolves to a SCALAR (per-program base +
+        # induction). The Tri-Dao chunk kernels are exactly this shape. A loop
+        # whose pointer offsets are TILE-shaped index tensors (e.g. plain
+        # matmul ``a_ptrs = a_ptr + offs_m[:,None]*K + offs_k[None,:]``) keeps
+        # its existing ``(buffer, indices)`` tuple-carry path -- forwarding a
+        # scalar-offset PtrState onto it would feed an ``ffi.Map`` into the
+        # flat-index arithmetic (TypeError). RULE #1: forward only the case we
+        # can prove is scalar-strided; otherwise leave the proven-correct path.
+        if not _ptr_state_offsets_are_scalar(ctx, offsets, strides):
+            continue
+        yielded_ssa = (
+            _ssa_name(yield_operands[idx]) if idx < len(yield_operands) else None
+        )
+        # Per-iteration flat advance (resolved TIR scalar) the source
+        # ``tt.addptr`` applies each trip. The load folds ``trips * advance``
+        # into the flat index (``trips = (induction - lb) / step``), so the
+        # in-loop strided load slides exactly like the native multi-K-trip
+        # kernel. Numbering-independent: the advance leaves are kernel-args.
+        flat_advance = _addptr_per_trip_flat(ctx, defs, yielded_ssa, blk_name)
+        # Register under the block-arg name so ``_lookup_ptr_state`` (the
+        # ``ptr_ssa``-keyed branch) also resolves it, AND build the tagged-dict
+        # the in-loop ``tt.load`` / ``tt.addptr`` consume directly when the
+        # block-arg is bound to it. The dict shape mirrors ``seed_ptr_states``.
+        states_map[blk_name] = state
+        tagged = {
+            "_ptrstate": state,
+            "source": state.source,
+            "offsets": list(offsets),
+            "sizes": list(sizes),
+            "strides": list(strides),
+            "shape": list(state.shape) if state.shape is not None else None,
+            "_carry_flat": {
+                "advance": flat_advance,
+                "induction": induction_name,
+                "lb": lb_name,
+                "step": step_name,
+            },
+        }
+        forwarded[blk_name] = tagged
+    return forwarded
+
+
+def _replace_ptr_state_offsets(state: Any, new_offsets: Tuple[Any, ...]) -> Any:
+    """Return a copy of ``state`` with ``offsets`` replaced (dataclass-safe)."""
+    try:
+        import dataclasses  # noqa: WPS433
+        return dataclasses.replace(state, offsets=new_offsets)
+    except Exception:
+        # Fallback for non-dataclass PtrState shims: shallow clone.
+        import copy  # noqa: WPS433
+        clone = copy.copy(state)
+        try:
+            clone.offsets = new_offsets
+        except Exception as exc:  # pragma: no cover
+            raise EmitError(
+                f"map_scf_for: cannot set forwarded offsets on PtrState: {exc}"
+            ) from exc
+        return clone
+
+
 def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
     """Lower ``scf.for(lb, ub, step) iter_args(...) { body }`` to ``tir.For``.
 
@@ -1861,6 +2276,17 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
     induction_ssa = block_args[0] if block_args else None
     iter_arg_block_ssas = block_args[1:1 + len(iter_arg_ssas)] if len(block_args) > 1 else []
 
+    # FORWARDPTR: thread loop-carried strided PtrState across the scf.for so
+    # in-loop ``tt.load``s on the block-args resolve to a strided make_tptr
+    # tile-load (NOT the scalar carry_index gather). Registers
+    # ``ctx.ptr_states[<block_arg>]`` with the per-iteration advance folded
+    # into the offset. Must run BEFORE the iter_arg materialisation loop so
+    # the gather path below sees the forwarded state and steps aside.
+    forwarded_tagged: Dict[str, Any] = _forward_loop_ptr_states(
+        ctx, region, iter_arg_block_ssas, iter_arg_ssas, induction_ssa,
+        lb_ssa, step_ssa,
+    )
+
     # Materialise iter_args. Scalar carries get a fresh tir.Var bound via
     # ``tir.LetStmt(var, init, body)``; buffer / tuple carries (e.g. a
     # ``T.gemm`` accumulator tile, surfaced as ``(buffer, shape)``) cannot
@@ -1877,6 +2303,16 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
             init_val = ctx.get(init_ssa)
         except KeyError:
             init_val = init_ssa
+        # FORWARDPTR: this block-arg has a forwarded strided PtrState. Bind it
+        # to the tagged-dict (``{"_ptrstate": ...}``) so the in-loop
+        # ``tt.load`` resolves through the strided ``make_tptr`` tile-load and
+        # the in-loop ``tt.addptr`` composes harmlessly -- NOT the scalar
+        # ``carry_index`` gather. The per-iteration advance is already folded
+        # into the forwarded offset, so no loop-carry copy is needed.
+        _blk_name = _ssa_name(blk_ssa)
+        if _blk_name in forwarded_tagged:
+            iter_arg_pairs.append((blk_ssa, forwarded_tagged[_blk_name]))
+            continue
         if isinstance(init_val, _om.LazyTileExpr):
             shape = list(init_val.shape or (1,))
             carry_buf = _om._alloc_tile_buffer(
