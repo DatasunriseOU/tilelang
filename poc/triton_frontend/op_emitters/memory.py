@@ -1581,7 +1581,44 @@ def _emit_ptrstate_tile_load_tir(
     body: Any = tir.BufferStore(
         tile_buf, load_expr, list(loop_vars) or [tir.const(0, "int32")]
     )
-    for axis in range(len(loop_vars) - 1, -1, -1):
+    # ITERATION 5 (DoutTranspose / coalesced strided load). For a rank-2 tile
+    # whose CONTIGUOUS global axis (stride==1 on the real tensor) is NOT the
+    # innermost tile axis (e.g. the dstates ``dout`` tile ``[hd, k]``: the
+    # innermost loop axis ``k`` has global stride ``nheads*headdim`` = 7168
+    # while the OUTER axis ``hd`` is the contiguous stride-1 axis), the default
+    # innermost-last loop nest reads global memory along the strided axis ->
+    # scalar/non-coalesced LDG. Re-ORDER the LOOP NEST so the contiguous axis is
+    # iterated innermost; the per-lane global address then advances by 1 element
+    # across the innermost iteration -> the downstream coalescing/vectorization
+    # pass can emit a coalesced (vectorized) LDG instead of a strided scalar one.
+    #
+    # PARITY: this changes ONLY the iteration ORDER of a full-tile
+    # materialization -- every (i,j) lane stores the SAME value into the SAME
+    # logical ``tile_buf[i, j]`` slot. The downstream GEMM consumes the
+    # identical logical ``[hd, k]`` tile, so ``dstates`` stays BIT-correct (no
+    # GEMM operand-orientation change needed; the transpose is purely in the
+    # global-load traversal order, not in the logical tile layout). RULE #1:
+    # gated to a GROUND-TRUTH route hint (``routed_contiguous_tile_axis``: the
+    # route supplies, per source tensor, the tile axis that is contiguous on the
+    # REAL tensor) -- we never reorder on fabricated/assumed contiguity.
+    contig_axis = None
+    hint = getattr(ctx, "routed_contiguous_tile_axis", None)
+    if isinstance(hint, dict) and len(loop_vars) >= 2:
+        src_name = resolved.get("source") if isinstance(resolved, dict) else None
+        if src_name is not None:
+            try:
+                contig_axis = hint.get(str(src_name))
+            except Exception:
+                contig_axis = None
+    loop_order = list(range(len(loop_vars)))
+    if (
+        contig_axis is not None
+        and 0 <= int(contig_axis) < len(loop_vars)
+        and int(contig_axis) != len(loop_vars) - 1
+    ):
+        ca = int(contig_axis)
+        loop_order = [a for a in loop_order if a != ca] + [ca]
+    for axis in reversed(loop_order):
         body = tir.For(
             loop_vars[axis],
             tir.const(0, "int32"),

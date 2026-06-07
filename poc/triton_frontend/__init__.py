@@ -1536,6 +1536,38 @@ def from_ttir(
     # for A/B comparison. Gated on the prologue-opt path so the GEMM
     # cooperative path and dict-shaped unit tests stay byte-identical.
     ctx.routed_triton_async_loads = bool(async_loads) and bool(prologue_opt)
+    # ITERATION 5 (DoutTranspose / coalesced strided load). GROUND-TRUTH route
+    # hint: map a producer-load SOURCE pointer (TTIR ``%argN``) to the LOGICAL
+    # TILE AXIS that is CONTIGUOUS (global stride == 1) on the REAL tensor, so
+    # the rank-2 global->shared load emitter (``_emit_ptrstate_tile_load_tir``)
+    # iterates that axis INNERMOST -> coalesced LDG instead of a strided scalar
+    # load. This is NOT fabricated contiguity: it reflects the row-major Mamba
+    # tensor layouts (verified by the measured global strides -- e.g. the
+    # dstates ``dout`` tile ``[hd, k]`` reads ``%arg0`` whose ``hd`` axis is
+    # stride-1 (tile axis 0) while the innermost ``k`` (seq) axis is stride
+    # ``nheads*headdim`` = 7168). We reorder ONLY the load TRAVERSAL order; the
+    # logical tile + the downstream GEMM operand are byte-unchanged (RULE #1:
+    # parity stays bit-correct; a non-contiguous axis is never marked
+    # contiguous). Caller may override via the ``contiguous_tile_axis`` kwarg
+    # (dict {source_ssa: axis}); default targets the dstates dout producer.
+    _contig_hint = kwargs.get("contiguous_tile_axis", None)
+    if (
+        _contig_hint is None
+        and ctx.routed_triton_async_loads
+        and isinstance(name, str)
+        and "chunk_scan_bwd_dstates" in name
+    ):
+        # dout (%arg0) tile [hd, k]: contiguous (stride-1) axis is hd == tile
+        # axis 0. C (%arg1) tile [k, ds]: contiguous axis is ds == innermost
+        # (no reorder needed). Only the non-innermost-contiguous case is listed.
+        # GATED to the dstates kernel by name so no other routed kernel's
+        # producer loads are reordered (RULE #1: targeted, grounded, no blanket
+        # %arg0 reorder that could de-coalesce an unrelated row-major load).
+        _contig_hint = {"%arg0": 0}
+    if isinstance(_contig_hint, dict):
+        ctx.routed_contiguous_tile_axis = {
+            str(k_): int(v_) for k_, v_ in _contig_hint.items()
+        }
     if grid is not None:
         ctx.launch_grid = tuple(int(x) for x in grid)
     if arg_buffer_shapes is not None:

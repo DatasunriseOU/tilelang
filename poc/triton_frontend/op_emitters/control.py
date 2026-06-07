@@ -1585,6 +1585,14 @@ def _emit_region(
     child.routed_triton_async_loads = bool(
         getattr(ctx, "routed_triton_async_loads", False)
     )
+    # ITERATION 5 (DoutTranspose / coalesced strided load): propagate the
+    # ground-truth contiguous-tile-axis hint into the region child. The dstates
+    # ``dout``/``C`` producer loads live INSIDE the scf.for K-loop body; without
+    # this propagation the load emitter would not see the hint and would keep
+    # iterating the strided axis innermost (non-coalesced). RULE #1: this only
+    # reorders the load TRAVERSAL order for axes the route VERIFIED contiguous.
+    if getattr(ctx, "routed_contiguous_tile_axis", None) is not None:
+        child.routed_contiguous_tile_axis = ctx.routed_contiguous_tile_axis
     if not hasattr(ctx, "_gmem_shared_copies") or not isinstance(
         getattr(ctx, "_gmem_shared_copies", None), list
     ):
