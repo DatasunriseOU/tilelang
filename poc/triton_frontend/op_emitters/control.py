@@ -1593,6 +1593,14 @@ def _emit_region(
     # reorders the load TRAVERSAL order for axes the route VERIFIED contiguous.
     if getattr(ctx, "routed_contiguous_tile_axis", None) is not None:
         child.routed_contiguous_tile_axis = ctx.routed_contiguous_tile_axis
+    # ITERATION 6 (C-tile executed TMA): propagate the per-source innermost
+    # ground-truth-contiguity set so the CopyNode emitter inside the scf.for
+    # K-loop body grounds the C (%arg1) innermost stride to literal 1 and lowers
+    # to a real TMA load. RULE #1: same gated ground-truth set, never fabricated.
+    if getattr(ctx, "routed_contiguous_innermost_sources", None) is not None:
+        child.routed_contiguous_innermost_sources = (
+            ctx.routed_contiguous_innermost_sources
+        )
     if not hasattr(ctx, "_gmem_shared_copies") or not isinstance(
         getattr(ctx, "_gmem_shared_copies", None), list
     ):
