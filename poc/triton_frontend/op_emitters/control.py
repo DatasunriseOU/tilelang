@@ -1011,7 +1011,21 @@ def map_tt_func(op: Any, ctx: _om.WalkerCtx) -> Any:
     program_id_vars = list(getattr(ctx, "program_id_vars", []) or [])
     if program_id_vars:
         thread_tags = ("blockIdx.x", "blockIdx.y", "blockIdx.z")
-        for var, axis, extent in program_id_vars:
+        # Wrap the blockIdx.* ``thread_extent`` AttrStmts in CANONICAL axis
+        # order (x, y, z). TVM's CUDA host codegen packs the launch grid tuple
+        # in the nesting/declaration order of these AttrStmts, NOT by the
+        # blockIdx tag. Triton TTIR emits ``get_program_id`` in source order
+        # (e.g. y=program_id(1) then z=program_id(2) then x=program_id(0) for
+        # the Tri-Dao chunk kernels), so wrapping in encounter order makes the
+        # host pack grid as (x, z, y) -> CUDA grid.y/grid.z get SWAPPED extents
+        # -> only a wrong subset of blocks runs. Sorting by axis aligns the
+        # host grid tuple (grid.x<-axis0, grid.y<-axis1, grid.z<-axis2) with
+        # the in-kernel blockIdx.<axis> usage. Wrap innermost-first so axis 0
+        # ends up outermost. RULE #1: a deterministic canonical grid order or
+        # the launch silently degenerates.
+        for var, axis, extent in sorted(
+            program_id_vars, key=lambda t: t[1], reverse=True
+        ):
             tag = thread_tags[axis] if 0 <= axis < len(thread_tags) else f"blockIdx.{axis}"
             iter_var = tir_mod.IterVar(
                 (0, extent), var, tir_mod.IterVar.ThreadIndex, tag,

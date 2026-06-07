@@ -311,6 +311,18 @@ class WalkerCtx:
         # tuple; extent defaults to a symbolic placeholder when grid info is
         # not available at lowering time.
         self.program_id_vars: List[Tuple[Any, int, Any]] = []
+        # Per-axis cache of the block-binding Var created for
+        # ``tt.get_program_id(axis=N)``. Triton kernels frequently read the
+        # SAME ``program_id(0)`` more than once and split it locally, e.g.
+        #     pid   = tl.program_id(0)
+        #     pid_m = pid // num_pid_n
+        #     pid_n = pid %  num_pid_n
+        # which lowers to TWO ``tt.get_program_id x`` ops in the TTIR. Each
+        # must resolve to the SAME blockIdx.x binding (one launch_thread with
+        # one extent), NOT two separate ``blockIdx.x`` env-threads -- emitting
+        # two collapses the host grid mapping (a duplicate gridDim_0 param) so
+        # only blockIdx.(0,0,0) ever runs. Keyed by axis -> the recorded Var.
+        self.program_id_axis_var: Dict[int, Any] = {}
         # TileLang's ``gemm.lower`` derives ``num_warps = block_size /
         # warp_size`` from the ``threadIdx.x`` ``thread_extent`` AttrStmt
         # wrapping the kernel body. Triton TTIR doesn't carry this
@@ -2629,6 +2641,18 @@ def map_tt_program_id(op: Any, ctx: WalkerCtx) -> Any:
         var = None
 
     if var is None:
+        # Reuse the binding already created for this axis: a kernel that reads
+        # ``program_id(axis)`` more than once (the canonical pid_m/pid_n split
+        # off ``program_id(0)``) must map every read to the SAME blockIdx.<axis>
+        # env-thread. Creating a fresh Var + a second launch_thread per read
+        # produces a duplicate ``gridDim_<axis>`` and breaks the host grid
+        # mapping so only block (0,0,0) executes. RULE #1: one axis -> one
+        # binding, or the grid silently degenerates.
+        cached = ctx.program_id_axis_var.get(axis)
+        if cached is not None:
+            if _results(op):
+                ctx.bind(_results(op)[0], cached)
+            return cached
         tir = ctx.tir()
         var = tir.Var(ctx.fresh(f"pid{axis}"), "int32")
         # Record so ``_make_prim_func`` can wrap the body in a
@@ -2646,6 +2670,7 @@ def map_tt_program_id(op: Any, ctx: WalkerCtx) -> Any:
         else:
             extent = tir.Var(f"gridDim_{axis}", "int32")
         ctx.program_id_vars.append((var, axis, extent))
+        ctx.program_id_axis_var[axis] = var
 
     if _results(op):
         ctx.bind(_results(op)[0], var)

@@ -552,7 +552,20 @@ def _ptrstate_flat_index(
         stride = _scalarize_tile_index_base(ctx, stride, loop_vars, shape)
         off = _cast_index_like(ctx, off, lv)
         stride = _cast_index_like(ctx, stride, lv)
-        flat = flat + (off + lv) * stride
+        # The PtrAnalysis shim recovers per-axis ``offsets`` that are ALREADY
+        # flat element offsets from the buffer base -- i.e. the FULL pointer
+        # arithmetic ``base + pid_b*stride_b + pid_c*stride_chunk + ... +
+        # blk_origin*stride_axis`` collapsed into one symbol per axis (each
+        # term already carries its own stride). The per-lane tile coordinate
+        # ``lv`` (0..tile_extent) is the ONLY part that still needs the axis
+        # stride applied. The previous ``(off + lv) * stride`` re-multiplied
+        # the already-flat ``off`` by ``stride[axis]`` -- a stride^2
+        # double-count that placed every program block (and even the in-tile
+        # rows) at the wrong flat address. Correct decomposition:
+        #     flat += off[axis]              (already flat, add once)
+        #     flat += lv * stride[axis]      (tile coordinate -> flat)
+        # RULE #1: one correct flat address, not a stride-squared placement.
+        flat = flat + off + lv * stride
     # FORWARDPTR: loop-carried pointer advance. A scf.for block-arg forwarded
     # by ``map_scf_for`` advances its base pointer by ``advance`` elements each
     # trip; after ``trips = (induction - lb) / step`` trips the total flat
