@@ -1489,15 +1489,37 @@ def _emit_ptrstate_tile_load_copynode(
     # committed SIMT route. RULE #1: env-gated experiment, no silent change.
     import os as _os
     _tma_route = _os.environ.get("TL_TMA_ROUTE") == "1"
+    # ARCH GATE (measured): cp.async.bulk.tensor TMA works on Hopper (sm_90) but
+    # FAULTS on GB10 / consumer-Blackwell sm_120/sm_121 (cudaErrorIllegalInstruction
+    # at copy_sm90.h:96, confirmed under sm_121a/sm_121f and a CTA non-cluster
+    # barrier). Native Triton uses cp.async/LDGSTS on GB10 (measured: 75 LDGSTS,
+    # 0 UTMALDG). So: keep TMA on HOPPER (it works there); force cp.async
+    # (disable_tma) on sm_120/sm_121 and by default everywhere else.
+    _is_hopper = False
+    try:
+        from tvm.target import Target as _Tgt
+        from tilelang.contrib.nvcc import (
+            get_target_compute_version as _gtcv,
+            parse_compute_version as _pcv,
+        )
+        _cur = _Tgt.current(allow_none=True)
+        if _cur is not None:
+            _mj, _mn = _pcv(_gtcv(_cur))
+            _is_hopper = (_mj == 9)
+    except Exception:
+        _is_hopper = False
     if _os.environ.get("TL_TMA_DEBUG") == "1":
         _sn = resolved.get("source") if isinstance(resolved, dict) else None
         import sys as _sys
-        print("TMA_DEBUG src=%r tma_route=%s ground_innermost=%s inner_is_one=%s ground_srcs=%r" % (
-            _sn, _tma_route, ground_innermost, inner_is_one,
+        print("TMA_DEBUG src=%r tma_route=%s ground_innermost=%s inner_is_one=%s is_hopper=%s ground_srcs=%r" % (
+            _sn, _tma_route, ground_innermost, inner_is_one, _is_hopper,
             getattr(ctx, "routed_contiguous_innermost_sources", None)), file=_sys.stderr, flush=True)
-    if _tma_route and ground_innermost:
+    if _is_hopper and _tma_route and ground_innermost:
+        # Hopper: real cp.async.bulk.tensor TMA load (works on sm_90).
         copy_call = T.copy(src2d, tile_buf)
     else:
+        # GB10 / consumer-Blackwell + default: cp.async / LDGSTS coalesced async
+        # copy (the path native Triton uses on GB10), NOT the faulting bulk TMA.
         copy_call = T.copy(src2d, tile_buf, disable_tma=True)
     ctx.emit(tir.Evaluate(copy_call))
 
