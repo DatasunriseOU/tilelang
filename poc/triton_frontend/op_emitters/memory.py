@@ -1520,7 +1520,40 @@ def _emit_ptrstate_tile_load_copynode(
     else:
         # GB10 / consumer-Blackwell + default: cp.async / LDGSTS coalesced async
         # copy (the path native Triton uses on GB10), NOT the faulting bulk TMA.
-        copy_call = T.copy(src2d, tile_buf, disable_tma=True)
+        #
+        # ASYNCIMPL lever (c): ``disable_tma`` alone routes the CopyNode through
+        # SelectCopyInstForLowering -> SelectSyncLikeInst -> kNormal == PLAIN
+        # synchronous LDG (measured: 66-96 LDG, 0 LDGSTS in SASS). This is the
+        # CORRECT, parity-clean default (§P1 MAXDIFF 4.88e-04): a synchronous LDG
+        # needs no async wait-barrier so the masked-OOB epilogue + GEMM read valid
+        # data unconditionally.
+        #
+        # The ``is_async_copy`` annotation (GetIsAsyncCopy, copy.cc:95) makes
+        # ``facts.explicit_cp_async`` true so SelectCopyInstForLowering picks
+        # CopyInst::kCPAsync (copy_analysis.cc:617-619) -> Copy::LowerCPAsync emits
+        # GENUINE cp.async/LDGSTS (MEASURED on gb10: cp_async=2 in CUDA, LDGSTS=16
+        # in SASS, UTMALDG=0, HMMA=32 intact -- vs 0 LDGSTS for plain LDG). BUT a
+        # bare explicit cp.async emits a commit_group WITHOUT an inserted
+        # cp.async.wait before the GEMM consumer: correctness requires the
+        # num_stages software pipeline to schedule the wait-barrier. The pipeline
+        # currently mis-schedules this kernel's masked-OOB epilogue (a predicated
+        # second writer to the producer's shared tile creates a cross-stage local
+        # dependency, ``B_local`` undefined). So the cp.async path is presently
+        # FAST-but-RACY (§P1 MAXDIFF 1.28e+03). RULE #1: do NOT silently ship a
+        # racy/wrong default. The cp.async/LDGSTS emission is therefore opt-in via
+        # ``TL_FORCE_CP_ASYNC=1`` for MEASURED SASS/codegen verification, while the
+        # committed default stays the bit-correct synchronous LDG. The async path
+        # is honestly gated, never a silent fallback.
+        import os as _os_async
+        if _os_async.environ.get("TL_FORCE_CP_ASYNC") == "1":
+            copy_call = T.copy(
+                src2d,
+                tile_buf,
+                disable_tma=True,
+                annotations={"is_async_copy": 1},
+            )
+        else:
+            copy_call = T.copy(src2d, tile_buf, disable_tma=True)
     ctx.emit(tir.Evaluate(copy_call))
 
     # ---- mask SPLIT OFF the copy: masked epilogue -----------------------

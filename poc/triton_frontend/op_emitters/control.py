@@ -2479,6 +2479,20 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
         """
         if not _async_enabled:
             return for_node
+        import os as _os_pipe
+        if (_os_pipe.environ.get("TL_NO_NUM_STAGES") == "1"
+                or _os_pipe.environ.get("TL_FORCE_CP_ASYNC") == "1"):
+            # ASYNCIMPL: when the routed copy is emitted as an explicit cp.async
+            # producer (``TL_FORCE_CP_ASYNC=1`` sets is_async_copy in memory.py),
+            # Copy::LowerCPAsync emits genuine cp.async/LDGSTS at LowerTileOp time,
+            # INDEPENDENT of the software pipeline. We DROP the num_stages pipeline
+            # annotation so PipelinePlanning skips this loop entirely and its
+            # overlapping-write check (producer copy + masked OOB-zero epilogue both
+            # write the shared tile) is never triggered. NOTE: without the pipeline
+            # there is no auto-inserted cp.async.wait before the GEMM consumer, so
+            # this path is FAST-but-RACY -- it exists for MEASURED SASS/codegen
+            # verification of LDGSTS, not as a correct default (see memory.py).
+            return for_node
         if len(ctx._gmem_shared_copies) <= _gmem_copies_before:
             return for_node
         if not isinstance(for_node, tir.For) or for_node.kind != tir.ForKind.SERIAL:
