@@ -33,6 +33,7 @@ Adding a new mapping
 
 from __future__ import annotations
 
+import os as _os
 import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -1187,6 +1188,21 @@ def _alloc_tile_buffer(
     """
     tir = ctx.tir()
     shape_list = list(shape) if shape else [1]
+    # DYNSHARED routing (env-gated, experiment-only): on Blackwell family
+    # targets (sm_121f) the ptxas STATIC __shared__ cap is 48KB, so a >48KB
+    # staging tile (the routed dstates C-tile TMA kernel emits ~98KB) is
+    # rejected by ptxas under compute_120f. Routing the shared tile to the
+    # ``shared.dyn`` scope makes it a DYNAMIC allocation: the
+    # MergeDynamicSharedMemoryAllocations pass folds it into the single
+    # ``buf_dyn_shmem`` extern __shared__, ptxas no longer counts it against
+    # the static cap, and the TVM CUDA runtime raises the dynamic limit via
+    # cuFuncSetAttribute(MaxDynamicSharedMemorySize). This is the PROPER
+    # dynamic opt-in (no hack): it only flips the storage scope; the
+    # downstream merge + codegen + runtime opt-in already handle shared.dyn.
+    # Gated behind TL_FORCE_DYN_SHARED=1 so the SAFE default (static shared,
+    # global sm_121a) and path_c production are untouched.
+    if scope == "shared" and _os.environ.get("TL_FORCE_DYN_SHARED") == "1":
+        scope = "shared.dyn"
     try:
         # Force ``elem_offset=0`` so TVM doesn't auto-create a free
         # ``\u003cname\u003e_elem_offset`` Var that MakePackedAPI would flag as
