@@ -62,7 +62,7 @@ def compile_cuda(
     import os as _os
     _suf = _os.environ.get("TL_ARCH_SUFFIX")  # experiment override: "a"/"f"/""
     if arch in (120, 121):
-        _s = _suf if _suf is not None else "f"
+        _s = _suf if _suf is not None else "a"  # default sm_121a (full >48KB shared); f-family TMA faults on GB10
         if target_format == "ptx":
             arch_option = f"--gpu-architecture=compute_12{0 if _s=='f' else arch%10}{_s}"
         else:

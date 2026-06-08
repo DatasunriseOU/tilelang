@@ -439,12 +439,14 @@ def get_target_arch(compute_version: str | tuple[int, int]) -> str:
     target_arch = str(sm)
     import os as _os
     _suf = _os.environ.get("TL_ARCH_SUFFIX")  # experiment override: "a"/"f"/""
-    # CC 12.x Blackwell (sm_120 / sm_121, e.g. NVIDIA GB10 = CC 12.1): use the
-    # FAMILY arch (`f`-suffix) so the full 12.x feature set incl.
-    # cp.async.bulk.tensor TMA is validly enabled portably across CC 12.0/12.1.
-    # Other CC >= 9.0 keep the arch-specific `a`-suffix.
+    # CC 12.x Blackwell (sm_120 / sm_121, GB10 = CC 12.1): DEFAULT to the
+    # arch-specific `a`-suffix (sm_121a). The `f` FAMILY target caps static shared
+    # at 48KB and ptxas-rejects our >48KB kernels (path_c mamba3 uses ~57-99KB);
+    # `f` was tried for cp.async.bulk.tensor TMA but executed TMA FAULTS on GB10
+    # (illegal instruction) anyway, so `a` (full Blackwell shared) is correct.
+    # Override via TL_ARCH_SUFFIX. Other CC >= 9.0 keep the `a`-suffix.
     if sm in (120, 121):
-        target_arch += (_suf if _suf is not None else "f")
+        target_arch += (_suf if _suf is not None else "a")
     elif major >= 9:
         target_arch += "a"
     return target_arch
