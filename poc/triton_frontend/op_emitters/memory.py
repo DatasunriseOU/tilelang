@@ -1477,7 +1477,28 @@ def _emit_ptrstate_tile_load_copynode(
     # the ds axis (stride 1). It is no longer used to enable TMA. For the dout
     # tile and any un-grounded source the same disable_tma=True applies. RULE #1:
     # one clear SIMT path; no fabricated TMA claim, no faulting bulk copy.
-    copy_call = T.copy(src2d, tile_buf, disable_tma=True)
+    #
+    # ITERATION 8 (sm_121f ArchFix re-test, env-gated): the ArchFix commit makes
+    # CC 12.x compile to the sm_121f FAMILY arch, under which cp.async.bulk.tensor
+    # TMA is validly enabled. When ``TL_TMA_ROUTE=1`` AND the route grounded this
+    # source's innermost stride to a literal 1 (the provably-contiguous dstates C
+    # tile, ``ground_innermost``), we DROP ``disable_tma`` and let the CopyNode
+    # lower to a real UTMALDG TMA load -- the iter-6 behavior -- to MEASURE whether
+    # the C-tile TMA now EXECUTES (no copy_sm90.h:96 fault) under sm_121f and
+    # whether the coalesced TMA load drops ms. Default (env unset) keeps the
+    # committed SIMT route. RULE #1: env-gated experiment, no silent change.
+    import os as _os
+    _tma_route = _os.environ.get("TL_TMA_ROUTE") == "1"
+    if _os.environ.get("TL_TMA_DEBUG") == "1":
+        _sn = resolved.get("source") if isinstance(resolved, dict) else None
+        import sys as _sys
+        print("TMA_DEBUG src=%r tma_route=%s ground_innermost=%s inner_is_one=%s ground_srcs=%r" % (
+            _sn, _tma_route, ground_innermost, inner_is_one,
+            getattr(ctx, "routed_contiguous_innermost_sources", None)), file=_sys.stderr, flush=True)
+    if _tma_route and ground_innermost:
+        copy_call = T.copy(src2d, tile_buf)
+    else:
+        copy_call = T.copy(src2d, tile_buf, disable_tma=True)
     ctx.emit(tir.Evaluate(copy_call))
 
     # ---- mask SPLIT OFF the copy: masked epilogue -----------------------

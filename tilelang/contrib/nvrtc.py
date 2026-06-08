@@ -59,11 +59,14 @@ def compile_cuda(
     # 120a/121a) while the cubin SASS target is sm_121f. Verified accepted by
     # NVRTC 13.2 on GB10: sm_121f -> "code for sm_121"; compute_120f ->
     # ".target sm_120f".
+    import os as _os
+    _suf = _os.environ.get("TL_ARCH_SUFFIX")  # experiment override: "a"/"f"/""
     if arch in (120, 121):
+        _s = _suf if _suf is not None else "f"
         if target_format == "ptx":
-            arch_option = "--gpu-architecture=compute_120f"
+            arch_option = f"--gpu-architecture=compute_12{0 if _s=='f' else arch%10}{_s}"
         else:
-            arch_option = "--gpu-architecture=sm_121f"
+            arch_option = f"--gpu-architecture=sm_12{arch%10}{_s}"
     else:
         prefix = "compute" if target_format == "ptx" else "sm"
         suffix = "a" if arch >= 90 else ""
