@@ -132,6 +132,13 @@ def tilelang_callback_cuda_compile(code, target, pass_config=None):
         "-I" + TILELANG_TEMPLATE_PATH,
         "-I" + CUTLASS_INCLUDE_DIR,
     ]
+    # Experiment gate (GB10 sm_121 TMA route): TL_USE_CTA_BARRIER=1 makes the
+    # device-side `Barrier` alias resolve to tl::CtaTransactionBarrier, a
+    # CTA-scoped (.shared::cta) transaction mbarrier with NO cluster ops. Default
+    # off -> cutlass ClusterTransactionBarrier (prod sm_121a SIMT route untouched).
+    import os as _os
+    if _os.environ.get("TL_USE_CTA_BARRIER") == "1":
+        options.append("-DTL_USE_CTA_BARRIER=1")
     # Merge extra device compiler flags from pass config, if provided
     extra_flags = cfg.get(PassConfigKey.TL_DEVICE_COMPILE_FLAGS, None)
     if extra_flags:

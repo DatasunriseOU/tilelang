@@ -98,6 +98,15 @@ class LibraryGenerator:
             command += [
                 "-I" + CUTLASS_INCLUDE_DIR,
             ]
+            # Experiment gate (GB10 sm_121 TMA route): when TL_USE_CTA_BARRIER=1
+            # the device-side `Barrier` alias in tl_templates/cuda/barrier.h
+            # resolves to tl::CtaTransactionBarrier, a CTA-scoped (.shared::cta)
+            # transaction mbarrier with NO cluster ops (no mapa / mbarrier.cluster
+            # / barrier.cluster.arrive / elect.sync). Default off -> prod sm_121a
+            # SIMT route keeps the cutlass ClusterTransactionBarrier untouched.
+            import os as _os
+            if _os.environ.get("TL_USE_CTA_BARRIER") == "1":
+                command += ["-DTL_USE_CTA_BARRIER=1"]
 
         elif is_hip_target(target):
             from tilelang.env import COMPOSABLE_KERNEL_INCLUDE_DIR

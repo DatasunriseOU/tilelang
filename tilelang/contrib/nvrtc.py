@@ -81,6 +81,11 @@ def compile_cuda(
         final_options += ["-pch"]
     if arch is not None:
         final_options += [arch_option]
+    # Experiment gate (GB10 sm_121 TMA route): TL_USE_CTA_BARRIER=1 selects the
+    # CTA-scoped (.shared::cta) transaction mbarrier in barrier.h (no cluster
+    # ops). Default off -> cutlass ClusterTransactionBarrier (prod path).
+    if _os.environ.get("TL_USE_CTA_BARRIER") == "1":
+        final_options += ["-DTL_USE_CTA_BARRIER=1"]
 
     if options:
         if isinstance(options, str):

@@ -3,8 +3,108 @@
 #include "common.h"
 #include <cutlass/arch/barrier.h>
 
-// Reuse cutlass advanced barrier abstraction
+namespace tl {
+
+// ---------------------------------------------------------------------------
+// CtaTransactionBarrier (experiment-gated, TL_USE_CTA_BARRIER)
+//
+// A drop-in replacement for cutlass::arch::ClusterTransactionBarrier whose
+// every method emits ONLY thread-block-CTA-scoped (.shared::cta) mbarrier PTX.
+// It carries NO cluster dependence: no mapa, no mbarrier.*.cluster, no
+// barrier.cluster.arrive, no elect.sync. This is for the routed GB10 sm_121
+// TMA path, where the bulk-tensor load is .shared::cta and the completion
+// handshake (arrive.expect_tx bytes -> try_wait.parity) must stay correct but
+// must not reference any cluster-scoped instruction.
+//
+// Interface mirrors the subset of ClusterTransactionBarrier that TileLang
+// codegen actually emits: init / arrive / arrive_and_expect_tx /
+// expect_transaction / wait / try_wait. The completion semantics are identical
+// to the cutlass CTA path: arrive_and_expect_tx atomically (a) arrives once and
+// (b) sets the expected transaction-byte count; the async bulk-tensor copy then
+// decrements that count on completion; wait() spins on try_wait.parity until the
+// phase flips. The cluster-multicast overloads of ClusterTransactionBarrier are
+// intentionally absent — the single-CTA TMA route never calls them, and a
+// cluster arrive on GB10 is exactly what we are removing.
+// ---------------------------------------------------------------------------
+struct CtaTransactionBarrier {
+  uint64_t barrier_;
+
+  // mbarrier.init.shared::cta.b64
+  TL_DEVICE void init(uint32_t arrive_count) {
+    uint32_t smem_int_ptr = smem_ptr_to_uint(&barrier_);
+    asm volatile("mbarrier.init.shared::cta.b64 [%1], %0;"
+                 :
+                 : "r"(arrive_count), "r"(smem_int_ptr));
+  }
+
+  // mbarrier.arrive.shared::cta.b64
+  TL_DEVICE void arrive() {
+    uint32_t smem_int_ptr = smem_ptr_to_uint(&barrier_);
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];"
+                 :
+                 : "r"(smem_int_ptr));
+  }
+
+  // mbarrier.arrive.expect_tx.shared::cta.b64  (atomic arrive + set expected tx)
+  TL_DEVICE void arrive_and_expect_tx(uint32_t transaction_bytes) {
+    uint32_t smem_int_ptr = smem_ptr_to_uint(&barrier_);
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %0;"
+                 :
+                 : "r"(transaction_bytes), "r"(smem_int_ptr));
+  }
+
+  // mbarrier.expect_tx.shared::cta.b64  (set expected tx without arriving)
+  TL_DEVICE void expect_transaction(uint32_t transaction_bytes) {
+    uint32_t smem_int_ptr = smem_ptr_to_uint(&barrier_);
+    asm volatile("mbarrier.expect_tx.shared::cta.b64 [%1], %0;"
+                 :
+                 : "r"(transaction_bytes), "r"(smem_int_ptr));
+  }
+
+  // mbarrier.try_wait.parity.shared::cta.b64 -> 1 if phase complete, else 0
+  TL_DEVICE uint32_t try_wait(uint32_t phase) {
+    uint32_t smem_int_ptr = smem_ptr_to_uint(&barrier_);
+    uint32_t waitComplete;
+    asm volatile("{\n\t"
+                 ".reg .pred P1; \n\t"
+                 "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2; \n\t"
+                 "selp.b32 %0, 1, 0, P1; \n\t"
+                 "}"
+                 : "=r"(waitComplete)
+                 : "r"(smem_int_ptr), "r"(phase));
+    return waitComplete;
+  }
+
+  // Spin on try_wait.parity until the phase flips. CTA scope only.
+  TL_DEVICE void wait(uint32_t phase) {
+    uint32_t smem_int_ptr = smem_ptr_to_uint(&barrier_);
+    // Arbitrarily large timer value after which try-wait expires and re-tries.
+    uint32_t ticks = 0x989680;
+    asm volatile("{\n\t"
+                 ".reg .pred       P1; \n\t"
+                 "LAB_WAIT_CTA: \n\t"
+                 "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1, %2; \n\t"
+                 "@P1 bra DONE_CTA; \n\t"
+                 "bra     LAB_WAIT_CTA; \n\t"
+                 "DONE_CTA: \n\t"
+                 "}"
+                 :
+                 : "r"(smem_int_ptr), "r"(phase), "r"(ticks));
+  }
+};
+
+} // namespace tl
+
+// Barrier abstraction. By default reuse the cutlass cluster-transaction barrier
+// (correct on Hopper / SM100 and on SM121 where cutlass already lowers it to
+// .shared::cta for a size-1 cluster). Under the GB10 TMA experiment gate
+// (-DTL_USE_CTA_BARRIER=1) use the explicit CTA-scoped barrier above so the
+// emitted PTX provably carries NO cluster-scoped op anywhere in the handshake.
+#if defined(TL_USE_CTA_BARRIER) && (TL_USE_CTA_BARRIER)
+using Barrier = tl::CtaTransactionBarrier;
+#else
 using Barrier = cutlass::arch::ClusterTransactionBarrier;
+#endif
 
 namespace tl {
 
