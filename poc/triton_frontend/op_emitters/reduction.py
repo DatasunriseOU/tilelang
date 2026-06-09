@@ -1627,8 +1627,27 @@ def map_tt_dot(
         # fragment's inferred thread-layout -- the same path Metal always uses
         # and which our Metal parity already validates. RULE #1: a real
         # correctness route, not a degraded fallback.
+        #
+        # FRAGMENTCARRY: when this dot's C is a loop-carried fragment
+        # accumulator (``acc = acc + dot`` folded so the dot writes the
+        # K-loop carry) and its RESULT is yielded back as the SAME
+        # accumulator, the result MUST stay the fragment ``c`` so the next
+        # iteration accumulates IN PLACE. Applying the fragment->shared
+        # epilogue here would bind the yield to a fresh shared tile, breaking
+        # in-place accumulation -- ``_append_loop_carry_copies`` would then
+        # serial-scalar-copy the shared result back into the swizzled fragment
+        # (ignoring the mma layout -> wrong numbers) and trip a var-use-def
+        # error. ``map_scf_for`` records those in-place dot-result SSAs in
+        # ``ctx.frag_carry_dot_results``; the swizzle-correct fragment->shared
+        # materialisation happens ONCE after the loop instead.
+        _is_inplace_frag_carry = (
+            result_value is not None
+            and _ssa_name(result_value)
+            in (getattr(ctx, "frag_carry_dot_results", set()) or set())
+        )
         if (
             result_value is not None
+            and not _is_inplace_frag_carry
             and _is_cuda_target(ctx)
             and _scope_of(c) == "local.fragment"
             and _result_needs_shared_c()
