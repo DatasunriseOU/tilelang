@@ -118,6 +118,48 @@ def _infer_signature(fn, constexprs) -> Dict[str, str]:
     return sig
 
 
+def _fold_ttir(module, gpu_target):
+    """Run Triton's own ``make_ttir`` optimization passes on the captured
+    module before serialization.
+
+    ``ASTSource.make_ir`` returns the *pre-optimization* TTIR. Triton's real
+    pipeline then runs ``make_ttir`` (inliner + canonicalizer + combine + cse +
+    ...), and it is the **canonicalizer** — backed by MLIR int-range analysis —
+    that folds away the i32->i64 overflow-guard chain (``arith.extsi`` +
+    ``arith.cmpi sle 2147483647`` + ``arith.andi``). Those guards are provably
+    always-true for the kernel's index ranges, so folding them is a real
+    semantic-preserving simplification (identical to what native Triton emits in
+    its cached ``.ttir``), not a dropped check.
+
+    We replicate the exact ``make_ttir`` pass list from Triton's nvidia backend.
+    The leading ``add_inliner`` is a genuine no-op for our single-kernel capture
+    (there is nothing to inline) and aborts the standalone PassManager because
+    the module has no enclosing call graph; we therefore run the remaining
+    passes — which include the canonicalizer that does the actual fold — and
+    raise loudly if *those* fail (no silent fallback). If the optimized pipeline
+    raises, the caller surfaces the error rather than consuming unfolded TTIR.
+    """
+    from triton._C.libtriton import ir as _libir, passes
+
+    capability = gpu_target.arch if isinstance(gpu_target.arch, int) else 80
+    pm = _libir.pass_manager(module.context)
+    pm.enable_debug()
+    # add_inliner is skipped intentionally: it is a no-op for a single captured
+    # kernel and fails a standalone PassManager (no enclosing call graph). All
+    # guard-folding is done by add_canonicalizer below.
+    passes.ttir.add_rewrite_tensor_pointer(pm)
+    if capability // 10 < 9:
+        passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
+    passes.common.add_canonicalizer(pm)
+    passes.ttir.add_combine(pm)
+    passes.ttir.add_reorder_broadcast(pm)
+    passes.common.add_cse(pm)
+    passes.common.add_symbol_dce(pm)
+    passes.ttir.add_loop_unroll(pm)
+    pm.run(module, "make_ttir_fold")
+    return module
+
+
 def _try_triton_3_6(fn, constexprs, signature, target):
     """Triton 3.6+: ASTSource(constexprs=...) + make_ir.
 
@@ -166,6 +208,7 @@ def _try_triton_3_6(fn, constexprs, signature, target):
             )
             src = ASTSource(fn=fn, signature=sig, constexprs=constexprs or {})
             module = src.make_ir(gpu_target, opts, codegen, module_map, ctx)
+            module = _fold_ttir(module, gpu_target)
             return str(module)
         except Exception as exc:
             last_err = exc
