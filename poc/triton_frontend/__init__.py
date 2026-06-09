@@ -70,6 +70,7 @@ from .ptr_analysis import PtrAnalysis, shim_available
 __all__ = [
     "from_triton_kernel",
     "from_ttir",
+    "autotune_winning_block_config",
     "TileLangPrimFunc",
     "MLIR_WALKER_AVAILABLE",
 ]
@@ -1498,6 +1499,54 @@ def _read_ttir_warp_config(
     num_warps = _lookup(("ttg.num-warps", "num-warps", "num_warps"))
     num_stages = _lookup(("ttg.num-stages", "num-stages", "num_stages"))
     return num_warps, num_stages
+
+
+def autotune_winning_block_config(autotuned_kernel: Any) -> Dict[str, Any]:
+    """Return the autotune-WINNING tile/launch config for a Triton kernel.
+
+    Capture-side sibling of :func:`_read_ttir_warp_config`. Where the TTIR
+    reader recovers ``num_warps`` / ``num_stages`` from the *already-captured*
+    module attributes, this reads the kernel's autotune ``Config`` list BEFORE
+    capture so the harness can supply the WINNING ``BLOCK_SIZE_*`` constexprs at
+    TTIR-capture time (the block dims live in the ``tt.dot`` operand shapes, not
+    as module attrs, so they must be pinned at capture). The winning config is
+    the first entry of ``Autotuner.configs`` -- the one Triton's autotuner
+    selects for the kernel's shape (verified for ``_chunk_scan_bwd_dstates`` to
+    equal the cached ``.json`` ``num_warps`` / ``num_stages``).
+
+    GENERIC + backend-agnostic: any ``@triton.autotune`` kernel is honoured by
+    reading its own declared config list; no per-kernel hardcoded block size.
+    The returned ``BLOCK_SIZE_*`` flow into the captured TTIR's GEMM tile, which
+    on CUDA drives ``T.gemm``'s warp partition and on Metal the threadgroup
+    partition alike.
+
+    Returns a dict ``{<block kwargs...>, "num_warps": int, "num_stages": int}``.
+
+    RULE #1 (fail loud): if the object carries no ``configs`` list we RAISE
+    rather than silently returning an empty/default block config -- a caller
+    that asked for the autotune-winning tile must get a real one or a clear
+    error, never a silent fall-back to the smallest tile.
+    """
+    configs = getattr(autotuned_kernel, "configs", None)
+    if not configs:
+        raise ValueError(
+            "autotune_winning_block_config: object %r carries no non-empty "
+            "'configs' list; cannot recover the autotune-winning BLOCK_SIZE. "
+            "Pass a @triton.autotune-wrapped kernel (the Autotuner), not the "
+            "bare JITFunction. Refusing to silently default to the smallest "
+            "tile (RULE #1)." % (getattr(autotuned_kernel, "__name__", autotuned_kernel),)
+        )
+    best = configs[0]
+    kwargs = dict(getattr(best, "kwargs", {}) or {})
+    if not kwargs:
+        raise ValueError(
+            "autotune_winning_block_config: winning Config has empty kwargs; "
+            "no BLOCK_SIZE_* to honour (RULE #1)."
+        )
+    out: Dict[str, Any] = dict(kwargs)
+    out["num_warps"] = int(getattr(best, "num_warps", 4))
+    out["num_stages"] = int(getattr(best, "num_stages", 2))
+    return out
 
 
 def from_ttir(
