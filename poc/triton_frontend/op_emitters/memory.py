@@ -1416,15 +1416,39 @@ def _emit_ptrstate_tile_load_copynode(
             return False
     src_name = (getattr(src_buf, "name", None) or "src") + "_2d"
     # 2D (rank-N) strided view over the SAME global allocation. The strides
-    # carry the symbolic arg strides; elem_offset carries the per-block base.
-    # Aliasing src_buf.data keeps MakePackedAPI's bound param handle -- no new
-    # free Var. scope is global (inherit from the flat arg buffer).
+    # carry the symbolic arg strides; the per-block base must reach the LOWERED
+    # address. Aliasing src_buf.data keeps MakePackedAPI's bound param handle --
+    # no new free Var. scope is global (inherit from the flat arg buffer).
     # Scope: the flat arg buffer is a global function param; mirror it so the
     # 2D view aliases global memory (the copy is global->shared).
     try:
         src_scope = src_buf.scope()
     except Exception:
         src_scope = "global"
+    # ITERATION 9 (cp.async elem_offset DROP fix). MEASURED root cause of the
+    # §P1 cp.async MAXDIFF 1.28e3: a ``decl_buffer`` whose ``elem_offset`` is a
+    # SYMBOLIC per-block base and whose ``data`` ALIASES another buffer's Var
+    # has its ``elem_offset`` DROPPED by the CopyNode SIMT lowering
+    # (CopyNode::MakeSIMTLoop -> BufferLoad -> LowerParallelLoop/tvm_access_ptr):
+    # the lowered cp.async source address is ``threadIdx*..+i*..*stride`` with NO
+    # per-block base term, so every CTA reads block 0's slice -> wrong GEMM
+    # operand (verified by dumping the lowered TIR: ``arg1_1.data`` offset omits
+    # the ``pid*arg16 + ...`` base).
+    #
+    # Folding ``base`` into the innermost REGION MIN does flow through
+    # ``MakeIndices``/``OffsetOf`` into the address, BUT it ALSO makes
+    # ``CopyNode::MakePredicate`` emit a bounds check ``base + iv < shape`` that
+    # is almost always false (base >> shape) -> the copy becomes a
+    # ``cp_async_gs_conditional`` that skips nearly every element (MEASURED:
+    # output nonzero collapses to 57344/29360128). So the region-min channel is
+    # WRONG for a flat per-block base.
+    #
+    # The correct carrier is ``elem_offset`` -- which is structurally an offset,
+    # NOT a coordinate, so it does NOT feed MakePredicate -- combined with the
+    # core fix (src/op/copy.cc MakeSIMTLoop) that re-attaches ``src->elem_offset``
+    # to the BufferLoad's flattened address so the SIMT-loop lowering stops
+    # dropping it. RULE #1: exact per-block base, no fabricated contiguity, no
+    # spurious OOB predicate.
     src2d = tir.decl_buffer(
         list(out_shape),
         out_dtype,
@@ -1434,8 +1458,9 @@ def _emit_ptrstate_tile_load_copynode(
         elem_offset=base,
         scope=src_scope or "global",
     )
-    # Real CopyNode: T.copy(src2d[full] -> shared_tile). Both are full-extent
-    # buffer args; copy_op derives extents from shape and encodes tl.region.
+    src2d_region = src2d
+    # Real CopyNode: T.copy(src2d -> shared_tile). The source carries the
+    # per-block base in elem_offset; copy_op encodes tl.region.
     #
     # TMA-eligibility (RULE #1, measured on sm_121): the CUDA bulk-copy
     # (UTMALDG) lowering REQUIRES a statically-provable contiguous innermost
@@ -1516,7 +1541,7 @@ def _emit_ptrstate_tile_load_copynode(
             getattr(ctx, "routed_contiguous_innermost_sources", None)), file=_sys.stderr, flush=True)
     if _is_hopper and _tma_route and ground_innermost:
         # Hopper: real cp.async.bulk.tensor TMA load (works on sm_90).
-        copy_call = T.copy(src2d, tile_buf)
+        copy_call = T.copy(src2d_region, tile_buf)
     else:
         # GB10 / consumer-Blackwell + default: cp.async / LDGSTS coalesced async
         # copy (the path native Triton uses on GB10), NOT the faulting bulk TMA.
@@ -1547,13 +1572,13 @@ def _emit_ptrstate_tile_load_copynode(
         import os as _os_async
         if _os_async.environ.get("TL_FORCE_CP_ASYNC") == "1":
             copy_call = T.copy(
-                src2d,
+                src2d_region,
                 tile_buf,
                 disable_tma=True,
                 annotations={"is_async_copy": 1},
             )
         else:
-            copy_call = T.copy(src2d, tile_buf, disable_tma=True)
+            copy_call = T.copy(src2d_region, tile_buf, disable_tma=True)
     ctx.emit(tir.Evaluate(copy_call))
 
     # ---- mask SPLIT OFF the copy: masked epilogue -----------------------

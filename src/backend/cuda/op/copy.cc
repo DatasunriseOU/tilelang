@@ -525,9 +525,26 @@ Stmt Copy::LowerCPAsync(const CopyNode &op, const LowerArgs &T,
     return cp_async_loop;
   }
   if (GetIsAsyncCopy(op)) {
+    // Explicit single-stage cp.async (NOT pipeline-managed: the
+    // ``no_implicit_commit_wait`` branch above returns early and lets the
+    // software pipeline schedule the commit/wait across stages). For a bare
+    // ``is_async_copy`` copy there is no pipeline to insert the completion
+    // barrier, so the consumer (e.g. the GEMM reading the shared tile) would
+    // race the in-flight async copy -> wrong result. We therefore close the
+    // async group out-of-line right here: commit the group, then
+    // ``cp.async.wait_group<0>`` to wait for ALL outstanding async copies to
+    // land, then a CTA barrier so every thread's lane is visible before any
+    // thread reads another lane. This keeps the load on the genuine
+    // cp.async/LDGSTS hardware path while being race-free (RULE #1: no racy
+    // async copy shipped; explicit cp.async is correct-by-construction).
     Stmt commit_group =
         Evaluate(Call(DataType::Handle(), builtin::ptx_commit_group(), {}));
-    return SeqStmt({cp_async_loop, commit_group});
+    Stmt wait_group =
+        Evaluate(Call(DataType::Handle(), builtin::ptx_wait_group(),
+                      {IntImm(DataType::Int(32), 0)}));
+    Stmt cta_sync = Evaluate(Call(DataType::Int(32), builtin::tvm_storage_sync(),
+                                  {StringImm("shared")}));
+    return SeqStmt({cp_async_loop, commit_group, wait_group, cta_sync});
   }
   return cp_async_loop;
 }

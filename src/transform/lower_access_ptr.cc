@@ -93,6 +93,19 @@ PrimExpr LinearOffsetFromLoad(const BufferLoad &load) {
     PrimExpr idx = BaseIndexForOffset(load->indices[i]);
     offset = offset + idx * strides[i];
   }
+  // Include the buffer's per-block base ``elem_offset``. A buffer that ALIASES
+  // another allocation's ``data`` Var with a non-zero (often symbolic)
+  // ``elem_offset`` -- e.g. the routed-triton 2D strided global view
+  // ``arg_2d`` whose ``elem_offset`` carries the per-CTA tile base -- otherwise
+  // has that base SILENTLY DROPPED here: the lowered ``tvm_access_ptr`` offset
+  // would be purely ``sum(idx*stride)`` and every CTA would read block 0's
+  // slice (MEASURED: §P1 dstates cp.async MAXDIFF 1.28e3, output reads the wrong
+  // global region). ``Buffer.OffsetOf`` includes ``elem_offset``; this lowering
+  // must match it. For the common ``elem_offset == 0`` buffer this adds a
+  // constant 0 (no-op after Simplify), so existing kernels are byte-unchanged.
+  if (buffer->elem_offset.defined() && !is_zero(buffer->elem_offset)) {
+    offset = offset + cast(idx_dtype, buffer->elem_offset);
+  }
   return offset;
 }
 
