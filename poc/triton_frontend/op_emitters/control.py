@@ -2104,6 +2104,8 @@ def _forward_loop_ptr_states(
     induction_ssa: Any,
     lb_ssa: Any,
     step_ssa: Any,
+    lb_const: Optional[int] = None,
+    step_const: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Forward each ptr iter_arg's PtrState onto its ``scf.for`` block-arg.
 
@@ -2135,14 +2137,26 @@ def _forward_loop_ptr_states(
             yield_operands = list(_om._operands(inner))
             break
     induction_name = _ssa_name(induction_ssa) if induction_ssa is not None else None
-    def _bound_name(ref: Any, tag: str) -> str:
+    def _bound_name(ref: Any, tag: str, const_val: Optional[int]) -> str:
+        # Numbering-independent constant binding. The K-loop's lower bound and
+        # step are ``arith.constant`` SSA values (e.g. ``%c0_i32`` / ``%c32_i32``).
+        # Triton's make_ttir canonicalizer/CSE renames + renumbers SSA results,
+        # so a positional ``_ssa_name(ref)`` (``%0``) can COLLIDE with an
+        # unrelated op (a ``tt.splat`` tile) in the folded TTIR's value_map,
+        # which then resolves the "lb" carry leaf to a float32 tile (a category
+        # error caught downstream as ``Cast(... ffi.OpaquePyObject)``). When the
+        # caller has already int-folded the bound (same ``_to_int`` the loop
+        # frame uses for ``lb_i``/``step_i``), bind that constant under a
+        # synthetic name -- identical semantics, independent of SSA numbering.
         if isinstance(ref, int):
+            const_val = int(ref)
+        if const_val is not None:
             nm = f"__{tag}_const__"
-            ctx.value_map[nm] = ctx.tir().const(int(ref), "int32")
+            ctx.value_map[nm] = ctx.tir().const(int(const_val), "int32")
             return nm
         return _ssa_name(ref)
-    lb_name = _bound_name(lb_ssa, "lb")
-    step_name = _bound_name(step_ssa, "step")
+    lb_name = _bound_name(lb_ssa, "lb", lb_const)
+    step_name = _bound_name(step_ssa, "step", step_const)
     # Build a sizes -> [states] index. The shim keys states by the REWRITTEN
     # SSA numbering, but ``parse_ttir`` re-numbers (or falls through to a
     # provider that parses the original IR), so an exact init-SSA-name match
@@ -2346,7 +2360,7 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
     # the gather path below sees the forwarded state and steps aside.
     forwarded_tagged: Dict[str, Any] = _forward_loop_ptr_states(
         ctx, region, iter_arg_block_ssas, iter_arg_ssas, induction_ssa,
-        lb_ssa, step_ssa,
+        lb_ssa, step_ssa, lb_const=lb_i, step_const=step_i,
     )
 
     # Materialise iter_args. Scalar carries get a fresh tir.Var bound via

@@ -1164,6 +1164,27 @@ def map_tt_dot(
             return s in ("local.fragment", "metal.simdgroup", "shared",
                          "shared.dyn")
 
+        def _is_strict_fragment_scope(buf: Any) -> bool:
+            # The CUDA tensor-core MMA store layout requires C in a TRUE
+            # fragment (``mma_macro_generator.make_mma_store_layout`` asserts
+            # ``is_fragment(C)`` and rejects shared). ``_is_fragment_scope``
+            # above intentionally also accepts ``shared`` because Metal GEMM
+            # stores its accumulator to a shared tile -- but that acceptance
+            # MUST NOT leak into the CUDA-fragment decision below, or a shared
+            # loop-carried accumulator (which Triton's folded TTIR produces when
+            # the canonicalizer fuses ``acc + dot`` so the GEMM accumulates
+            # directly into the carried tile) is handed to the MMA path as C and
+            # aborts at LayoutInference. RULE #1: a real scope-correctness gate,
+            # not a silent downgrade.
+            scope_fn = getattr(buf, "scope", None)
+            if scope_fn is None:
+                return False
+            try:
+                s = scope_fn() if callable(scope_fn) else scope_fn
+            except Exception:
+                return False
+            return s in ("local.fragment", "metal.simdgroup")
+
         def _scope_of(buf: Any) -> str:
             scope_fn = getattr(buf, "scope", None)
             if scope_fn is None:
@@ -1467,7 +1488,14 @@ def map_tt_dot(
                     scope=c_scope,
                 )
                 _emit_copy_stmt(c_orig, c, "c_orig, c")
-        elif not _is_fragment_scope(c):
+        elif (not _is_fragment_scope(c)) or (
+            not prefer_shared_c and not _is_strict_fragment_scope(c)
+        ):
+            # Two cases reach here:
+            #  * C is in a scope the GEMM rejects outright (plain ``local``).
+            #  * C is ``shared`` but this is the CUDA MMA path (prefer_shared_c
+            #    forced False above), which needs a TRUE fragment -- a shared
+            #    loop-carried accumulator from the folded TTIR lands here.
             if _is_zero_constant_tile(c):
                 c = _alloc_tile_buffer(
                     ctx, [M, N], acc_dtype,
@@ -1476,17 +1504,39 @@ def map_tt_dot(
                 )
                 clear_accum = True
             else:
+                # RULE #1 fail-loud: a SHARED loop-carried accumulator on the
+                # CUDA tensor-core MMA path cannot be lowered correctly here.
+                # Triton's *folded* TTIR fuses ``acc = acc + dot(...)`` so the
+                # GEMM accumulates directly into the loop-carried tile. On CUDA
+                # the MMA C must live in a swizzled ``local.fragment``, but the
+                # loop-carry snapshot/commit (``_append_loop_carry_copies``) and
+                # the seeding copy below are SERIAL SCALAR element copies that
+                # index the tile linearly -- they do NOT respect the mma store
+                # swizzle. Routing the carry through this scalar round-trip
+                # SILENTLY corrupts the accumulator (observed MAXDIFF ~1.5e3 vs
+                # native on the §P1 dstates kernel). Correctly lowering this
+                # fused form needs a layout-aware T.copy (or a fragment-resident
+                # carry with swizzle-correct commit), which the current frontend
+                # does not yet emit. We RAISE rather than ship wrong numbers.
+                # The unfolded TTIR avoids this branch: its GEMM C is a fresh
+                # fragment and the accumulation is a separate add into a
+                # linearly-copied shared carry, so it lowers correctly.
+                if _is_cuda_target(ctx) and _is_shared_scope(c):
+                    raise EmitError(
+                        "tt.dot: CUDA MMA accumulator C is a SHARED loop-carried "
+                        "tile (%r). The fused GEMM-accumulate-into-carry form "
+                        "(produced by Triton's folded/canonicalized TTIR) cannot "
+                        "be lowered correctly via the serial scalar loop-carry "
+                        "copies, which ignore the mma fragment swizzle and "
+                        "silently corrupt the accumulator. A layout-aware "
+                        "fragment-resident carry is required. Refusing to emit "
+                        "numerically-wrong code (RULE #1)."
+                        % getattr(c, "name", c)
+                    )
                 # The bound C buffer was allocated in plain ``local`` scope
                 # (typically by ``arith.constant`` materialising a zero tile).
-                # ``tilelang.tileop.gemm`` rejects that scope on Metal:
-                #   "Metal GEMM requires C in local.fragment, metal.simdgroup,
-                #    or shared scope, got local"
-                # Allocate a fresh shared tile and seed it from the original tile via
-                # ``T.copy`` (a TileLang surface call lowered through the proper
-                # tile-op pipeline), so the new C tile carries any
-                # pre-loaded values into the gemm. We avoid hand-built
-                # ``tir.BufferStore`` here so copy lowering owns the layout
-                # transition instead of ad-hoc scalar indexing.
+                # Seed a fresh ``c_scope`` tile from the bound tile via T.copy so
+                # the carried values reach the gemm.
                 c_orig = c
                 c = _alloc_tile_buffer(
                     ctx, [M, N], acc_dtype,
