@@ -1564,6 +1564,11 @@ def _emit_region(
     child.fixed_arg_buffer_keys = getattr(ctx, "fixed_arg_buffer_keys", set())
     child.constant_tile_values = getattr(ctx, "constant_tile_values", {})
     child.loop_carry_buffers = dict(getattr(ctx, "loop_carry_buffers", {}))
+    # FRAGMENTCARRY: share the in-place fused-dot result SSA set so a tt.dot
+    # emitted in this region keeps its result == the fragment carry (no
+    # fragment->shared epilogue), accumulating in place across the K-loop.
+    if getattr(ctx, "frag_carry_dot_results", None):
+        child.frag_carry_dot_results = ctx.frag_carry_dot_results
     child.requires_single_thread_body = bool(
         getattr(ctx, "requires_single_thread_body", False)
     )
@@ -2272,6 +2277,121 @@ def _replace_ptr_state_offsets(state: Any, new_offsets: Tuple[Any, ...]) -> Any:
         return clone
 
 
+def _frag_scope_of(buf: Any) -> str:
+    """Return the storage scope string of a TIR buffer (``""`` if unknown)."""
+    scope_fn = getattr(buf, "scope", None)
+    if scope_fn is None:
+        return ""
+    try:
+        return str(scope_fn() if callable(scope_fn) else scope_fn)
+    except Exception:
+        return ""
+
+
+def _is_zero_constant_lazy(init_val: Any) -> bool:
+    """True iff ``init_val`` is a ``LazyTileExpr`` carrying a literal-0 constant.
+
+    The fused-dot accumulator carry is seeded from ``acc = zeros(...)`` -- a
+    zero-constant lazy tile. Allocating that seed into a ``local.fragment`` is
+    only swizzle-correct because zero maps to zero under any layout permutation
+    (see the call site). A non-zero init would need a layout-aware seed copy,
+    so we gate the fragment carry on a proven-zero init.
+    """
+    if not isinstance(init_val, _om.LazyTileExpr):
+        return False
+    try:
+        return float(init_val.constant_value) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _dot_accumulator_iter_arg_slots(
+    region: Any,
+    iter_arg_block_ssas: List[Any],
+) -> Tuple[Dict[int, Tuple[int, int]], List[str]]:
+    """Return ``{iter_arg_idx: (M, N)}`` for fused-dot accumulator carries.
+
+    Triton's folded/canonicalized TTIR fuses ``acc = acc + dot(a, b)`` into a
+    single ``tt.dot %a, %b, %acc_blockarg`` whose RESULT is yielded back into
+    the SAME iter_arg slot -- the accumulator threads through the K-loop as a
+    loop-carried tile. This is the fused-GEMM-accumulate-into-carry form.
+
+    On CUDA that carry MUST be a swizzled ``local.fragment`` (the tensor-core
+    MMA store layout asserts a fragment C). If it is materialised as a plain
+    ``shared`` carry, ``map_tt_dot`` either aborts at LayoutInference (shared C
+    on the MMA path) or -- if round-tripped through the serial-scalar
+    loop-carry copies -- silently corrupts the accumulator because the linear
+    element copies ignore the mma fragment swizzle. The fix is to allocate
+    those carries DIRECTLY as ``local.fragment`` so ``map_tt_dot`` finds a real
+    fragment C, accumulates IN PLACE across iterations, and the yielded value
+    IS the carry buffer (so ``_append_loop_carry_copies`` skips the corrupting
+    scalar copy via its ``_same_tir_buffer`` short-circuit). This is exactly
+    how a hand-written TileLang kernel carries a ``T.alloc_fragment`` GEMM
+    accumulator across a K-loop -- a real fragment-resident, swizzle-correct
+    carry, not a serial-scalar round-trip.
+
+    Detection is purely structural (use-def on the region's own ops + the
+    scf.yield operand order); it does not depend on SSA numbering. Returns
+    ``(slots, dot_result_ssas)`` where ``slots`` maps each accumulator
+    iter-arg index to its ``(M, N)`` logical tile shape (so the carry is
+    allocated at the right extent) and ``dot_result_ssas`` lists the SSA names
+    of the in-place fused-dot RESULTS. ``map_tt_dot`` consults the latter to
+    keep the result == the fragment carry (no in-loop fragment->shared
+    epilogue), so the accumulation stays in place across iterations.
+    """
+    if not iter_arg_block_ssas:
+        return {}, []
+    ops = _region_body_ops(region)
+    if not ops:
+        return {}, []
+    # scf.yield operand order maps 1:1 onto iter_arg slots.
+    yield_operands: List[Any] = []
+    for inner in ops:
+        if _wk is not None and _wk._op_name(inner) == "scf.yield":
+            yield_operands = list(_om._operands(inner))
+            break
+    if not yield_operands:
+        return {}, []
+    blk_names = [_ssa_name(b) for b in iter_arg_block_ssas]
+    blk_index = {nm: i for i, nm in enumerate(blk_names) if nm}
+    slots: Dict[int, Tuple[int, int]] = {}
+    dot_result_ssas: List[str] = []
+    for inner in ops:
+        if _wk is None or _wk._op_name(inner) != "tt.dot":
+            continue
+        dot_operands = _om._operands(inner)
+        if len(dot_operands) < 3:
+            continue
+        c_name = _ssa_name(dot_operands[2])
+        if c_name not in blk_index:
+            continue
+        slot = blk_index[c_name]
+        # The dot's result must be yielded back into the SAME slot -- this is
+        # the accumulate-in-place carry. A dot whose C is a block-arg but whose
+        # result flows elsewhere is NOT a fused carry and keeps its own path.
+        results = _om._results(inner)
+        if not results:
+            continue
+        res_name = _ssa_name(results[0])
+        if slot >= len(yield_operands):
+            continue
+        if _ssa_name(yield_operands[slot]) != res_name:
+            continue
+        # Recover the accumulator (M, N) from the dot's A (M x Ka) and
+        # B (Kb x N) operand tile shapes.
+        try:
+            a_shape = [int(s) for s in _om._shape_of(dot_operands[0])]
+            b_shape = [int(s) for s in _om._shape_of(dot_operands[1])]
+        except (TypeError, ValueError):
+            continue
+        if len(a_shape) != 2 or len(b_shape) != 2:
+            continue
+        slots[slot] = (a_shape[0], b_shape[1])
+        if res_name:
+            dot_result_ssas.append(res_name)
+    return slots, dot_result_ssas
+
+
 def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
     """Lower ``scf.for(lb, ub, step) iter_args(...) { body }`` to ``tir.For``.
 
@@ -2363,6 +2483,35 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
         lb_ssa, step_ssa, lb_const=lb_i, step_const=step_i,
     )
 
+    # FRAGMENTCARRY: detect iter_arg slots that are fused-dot accumulators
+    # (``acc = acc + dot(a, b)`` folded so the dot writes the loop-carried
+    # tile). On CUDA those carries MUST be allocated as a swizzled
+    # ``local.fragment`` -- the tensor-core MMA store layout asserts a fragment
+    # C, and a serial-scalar loop-carry copy of a fragment ignores the mma
+    # swizzle and silently corrupts the accumulator. Allocating the carry as a
+    # fragment lets ``map_tt_dot`` accumulate IN PLACE (the yielded value IS the
+    # carry, so the corrupting copy is skipped) -- a real fragment-resident,
+    # swizzle-correct carry exactly like a hand-written TileLang K-loop. Empty
+    # on Metal/unspecified targets, where shared-C GEMM is the correct path.
+    _frag_carry_slots: Dict[int, Tuple[int, int]] = {}
+    try:
+        from .reduction import _is_cuda_target as _frag_is_cuda  # noqa: WPS433
+    except Exception:  # pragma: no cover - reduction always importable here
+        _frag_is_cuda = None
+    if _frag_is_cuda is not None and _frag_is_cuda(ctx):
+        _frag_carry_slots, _frag_dot_results = _dot_accumulator_iter_arg_slots(
+            region, iter_arg_block_ssas
+        )
+        # Record the in-place fused-dot result SSAs so ``map_tt_dot`` keeps the
+        # result == the fragment carry (skips its fragment->shared epilogue),
+        # leaving the accumulation in place across the K-loop. The set is shared
+        # onto the region child below (which is where the dot is actually
+        # emitted) via the explicit propagation in ``_emit_region``.
+        if _frag_dot_results:
+            existing = set(getattr(ctx, "frag_carry_dot_results", set()) or set())
+            existing.update(_frag_dot_results)
+            ctx.frag_carry_dot_results = existing
+
     # Materialise iter_args. Scalar carries get a fresh tir.Var bound via
     # ``tir.LetStmt(var, init, body)``; buffer / tuple carries (e.g. a
     # ``T.gemm`` accumulator tile, surfaced as ``(buffer, shape)``) cannot
@@ -2391,14 +2540,39 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
             continue
         if isinstance(init_val, _om.LazyTileExpr):
             shape = list(init_val.shape or (1,))
+            # FRAGMENTCARRY: a fused-dot accumulator carry on CUDA is allocated
+            # as a swizzled ``local.fragment`` (not ``shared``), so ``map_tt_dot``
+            # finds a real fragment C and accumulates IN PLACE across the K-loop
+            # (swizzle-correct, exactly like a hand-written TileLang accumulator).
+            is_frag_carry = (
+                idx in _frag_carry_slots and _is_zero_constant_lazy(init_val)
+            )
+            carry_scope = "local.fragment" if is_frag_carry else "shared"
             carry_buf = _om._alloc_tile_buffer(
                 ctx,
                 shape,
                 init_val.dtype,
                 ctx.fresh("carry_tile"),
-                scope="shared",
+                scope=carry_scope,
             )
-            ctx.emit(_copy_buffer_stmt(ctx, init_val, carry_buf))
+            if is_frag_carry:
+                # Zero the fragment with the layout-AWARE ``T.fill`` (a
+                # ``tl.tileop.fill`` that participates in LayoutInference), NOT
+                # the serial-scalar ``_copy_buffer_stmt``. A scalar zero-fill
+                # imposes a FLAT (replicate, _i*N+_j) fragment layout that
+                # CONFLICTS with the gemm's mma store layout ("Get different
+                # layout for carry_tile"). ``T.fill`` zeroes the fragment under
+                # WHATEVER layout inference assigns it -- the mma store layout
+                # the gemm requires -- so there is no conflict and the seed
+                # stays swizzle-correct (0 maps to 0 under any permutation).
+                import tilelang.language as _Tfrag  # noqa: WPS433
+                fill_handle = _Tfrag.fill(carry_buf, tir.const(0, init_val.dtype))
+                if isinstance(fill_handle, tir.PrimExpr):
+                    ctx.emit(tir.Evaluate(fill_handle))
+                else:
+                    ctx.emit(fill_handle)
+            else:
+                ctx.emit(_copy_buffer_stmt(ctx, init_val, carry_buf))
             iter_arg_pairs.append((blk_ssa, carry_buf))
             continue
         if (
@@ -2609,7 +2783,39 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
                     or (hasattr(carry, "shape") and hasattr(carry, "dtype"))
                 )
                 if is_tile_like_carry and not is_pointer_like_carry:
-                    ctx.bind(result_ssa, carry)
+                    # FRAGMENTCARRY EPILOGUE: a fused-dot accumulator carried as
+                    # a swizzled ``local.fragment`` must be materialised to a
+                    # logical ``shared`` tile BEFORE any non-gemm consumer (the
+                    # post-loop ``tt.store``) reads it. The fragment's per-thread
+                    # registers hold the mma store layout (NOT a flat [i,j]
+                    # tile), so a logical-indexed store read would impose a flat
+                    # layout that CONFLICTS with the gemm's mma layout
+                    # ("Get different layout for carry_tile"). The cooperative
+                    # ``T.copy(C_frag -> C_logical_shared)`` distributes the
+                    # per-thread fragment registers to the shared tile via the
+                    # fragment's inferred thread-layout -- the SAME swizzle-correct
+                    # epilogue a hand-written TileLang kernel uses, and the path
+                    # our Metal parity already validates. Bind the loop result to
+                    # the shared logical tile so the store reads layout-correct
+                    # data. Only the genuine fragment carry takes this path.
+                    carry_scope = _frag_scope_of(carry)
+                    if idx in _frag_carry_slots and carry_scope == "local.fragment":
+                        c_logical = _om._alloc_tile_buffer(
+                            ctx,
+                            list(getattr(carry, "shape", []) or [1]),
+                            str(getattr(carry, "dtype", "float32")),
+                            ctx.fresh("carry_logical"),
+                            scope="shared",
+                        )
+                        import tilelang.language as _Tepi  # noqa: WPS433
+                        copy_handle = _Tepi.copy(carry, c_logical)
+                        if isinstance(copy_handle, tir.PrimExpr):
+                            ctx.emit(tir.Evaluate(copy_handle))
+                        else:
+                            ctx.emit(copy_handle)
+                        ctx.bind(result_ssa, c_logical)
+                    else:
+                        ctx.bind(result_ssa, carry)
                 elif yielded and idx < len(yielded):
                     ctx.bind(result_ssa, yielded[idx])
                 else:
