@@ -356,6 +356,89 @@ def _loop_carry_target(ctx: EmitContext, op: Any, value: Any) -> Any:
     return None
 
 
+def _ctx_is_cuda_target(ctx: EmitContext) -> bool:
+    """True iff the codegen target is explicitly CUDA / NVIDIA.
+
+    Mirrors ``reduction._is_cuda_target`` -- prefers ``ctx.target`` (set by
+    ``from_ttir`` before the tilelang lowering passes establish
+    ``Target.current()``), then the ambient target, then False. Used to gate
+    the REGSCALECOLLAPSE register-resident A-operand path to the CUDA
+    tensor-core MMA target (the Metal simdgroup path applies the analogous
+    fragment scale via its own emitter, the SIMT/scalar paths never use it).
+    """
+    ctx_target = getattr(ctx, "target", None) if ctx is not None else None
+    if ctx_target:
+        t = str(ctx_target).lower()
+        return "cuda" in t or "nvidia" in t or t.startswith("sm_") or "nvptx" in t
+    try:
+        import tvm  # noqa: WPS433
+
+        target = tvm.target.Target.current(allow_none=True)
+    except Exception:
+        return False
+    if target is None:
+        return False
+    kind = str(getattr(getattr(target, "kind", None), "name", "") or "").lower()
+    tstr = str(target).lower()
+    return "cuda" in kind or "nvidia" in tstr or "cuda" in tstr
+
+
+def _feeds_tensorcore_dot_as_register_a(
+    ctx: EmitContext, op: Any, out_shape: Tuple[int, ...], out_dtype: str
+) -> bool:
+    """True iff this binop's result feeds a tensor-core ``tt.dot`` EXCLUSIVELY.
+
+    REGSCALECOLLAPSE gate (RULE #1: scoped + fail-closed). Returns True only
+    when ALL of:
+      * CUDA / NVIDIA target (tensor-core MMA; gemm_rs reads A from registers).
+      * The result SSA's recorded consumers are EXACTLY ``{"tt.dot"}`` -- the
+        product is consumed only by the GEMM, so keeping it lazy starves no
+        other reader. (``ctx.ssa_users`` is the module-prepass use-def map; it
+        bridges scf.for iter-args, so an in-loop ``dout*exp -> dot`` is caught.)
+      * The result is a rank-2 tile whose M/K are MMA-tileable (``% 8 == 0``):
+        the same ``can_use_tile_gemm_shape`` gate the dot emitter uses to pick
+        the tensor-core path. A non-MMA shape would route to the scalar dot,
+        which cannot consume a fragment A operand.
+
+    When True, the binop stays lazy; ``reduction._stage_operand_to_shared``
+    then materialises it straight into a ``local.fragment`` (MMA-A layout), so
+    the scale is a register op on the A fragment -- native's
+    ``ldmatrix -> *scale in registers -> mma`` with no shared round-trip.
+    """
+    if not _ctx_is_cuda_target(ctx):
+        return False
+    # Rank-2 MMA-tileable result only (matches the dot emitter's
+    # ``can_use_tile_gemm_shape`` so the dot actually takes the MMA path).
+    if len(out_shape) != 2:
+        return False
+    try:
+        m, k = int(out_shape[0]), int(out_shape[1])
+    except Exception:
+        return False
+    if m % 8 != 0 or k % 8 != 0:
+        return False
+    ssa_users = getattr(ctx, "ssa_users", None)
+    if not ssa_users:
+        return False
+    from ..op_mapping import _result_ssa_name  # noqa: WPS433
+
+    name = _result_ssa_name(op)
+    if name is None:
+        return False
+    users = (
+        ssa_users.get(name)
+        or ssa_users.get(name.lstrip("%"))
+        or ssa_users.get(f"%{name.lstrip('%')}")
+    )
+    if not users:
+        return False
+    # EXCLUSIVELY consumed by tt.dot: no other op reads the scaled product, so
+    # keeping it lazy (folding the scale into the fragment fill) starves no
+    # reader. RULE #1: fail-closed -- any non-dot consumer keeps the
+    # materialise-to-shared path.
+    return set(users) == {"tt.dot"}
+
+
 def _emit_tile_binop(
     op: Any,
     ctx: EmitContext,
@@ -395,6 +478,23 @@ def _emit_tile_binop(
     # (``_resolve_lane_operand`` / ``_scalarize_tile_index_base`` /
     # ``_read_lane`` / strided store rhs) already read a LazyTileExpr per-lane.
     if should_fold_addressing(ctx, op):
+        return _bind_result(op, ctx, lazy)
+    # REGSCALECOLLAPSE (register/fragment-resident A-operand scale, native
+    # mirror): when this elementwise binop's result feeds a tensor-core GEMM
+    # as its A operand (e.g. the Mamba ``dout * exp(dA)`` decay scale that feeds
+    # ``tt.dot``), keep it LAZY instead of materialising the scaled product into
+    # a ``local`` tile + a cooperative SHARED round-trip (``dot_a_logical``).
+    # The GEMM emitter (``reduction._stage_operand_to_shared``) then materialises
+    # this lazy expr DIRECTLY into a ``local.fragment`` in the MMA-A load layout:
+    # the fragment-fill reads the raw operand from SHARED (the cp.async-staged
+    # ``dout``) and applies the per-K scale per-element, so the scaled value
+    # lives in the A fragment REGISTERS at MMA time -- exactly native's
+    # ``ldmatrix dout -> *exp(dA) in registers -> mma`` (gemm_rs). This removes
+    # the ``dout_a_logical`` shared buffer AND the ``__syncthreads`` its write
+    # needed, per K-step. RULE #1: only kept lazy when the result feeds a
+    # tensor-core dot EXCLUSIVELY (proven below) so no other consumer is
+    # starved; otherwise materialise as before.
+    if _feeds_tensorcore_dot_as_register_a(ctx, op, out_shape, out_dtype):
         return _bind_result(op, ctx, lazy)
     out = materialize_lazy_tile(
         ctx,

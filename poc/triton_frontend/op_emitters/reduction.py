@@ -1243,6 +1243,95 @@ def map_tt_dot(
             except Exception as e:
                 raise EmitError(f"T.copy({label}) failed: {e}") from e
 
+        def _materialize_into(ctx_local: Any, lazy: Any, frag: Any) -> None:
+            """REGSCALECOLLAPSE: fill the MMA A ``frag`` from ``lazy`` with a
+            SPATIAL (``ForKind.PARALLEL``) loop nest.
+
+            The fill reads the lazy expr's per-element value (the raw SHARED
+            operand multiplied by the per-K scale) and stores it into the A
+            fragment. The loop MUST be PARALLEL, not SERIAL: LayoutInference's
+            ParallelLoopTransformer distributes a *spatial* loop's iteration
+            space onto the fragment's MMA thread layout (each thread writes only
+            its register-resident slots, reading the matching SHARED lane -- the
+            ldmatrix). A SERIAL nest would have every thread execute the whole
+            [M,K] space, which LayoutInference rejects for a fragment
+            (``CanProveEqual(abs(scale),1)`` fails) -- so PARALLEL is required
+            for correctness, not a perf nicety. Mirrors a hand-written
+            ``for i,j in T.Parallel(M,K): A_frag[i,j] = A_sh[i,j]*exp(S[j])``
+            (PROVEN bit-identical to the gemm_ss shared-scale path on gb10).
+            """
+            tir_mod = ctx_local.tir()
+            frag_shape = list(getattr(frag, "shape", []) or lazy.shape or [1])
+            loop_vars: List[Any] = [
+                tir_mod.Var(ctx_local.fresh(f"dot_a_frag_i{axis}"), "int32")
+                for axis, _extent in enumerate(frag_shape or [1])
+            ]
+
+            def _src_indices() -> Tuple[Any, ...]:
+                rank = len(lazy.shape)
+                if len(loop_vars) >= rank:
+                    idx = list(loop_vars[-rank:])
+                else:
+                    idx = [tir_mod.const(0, "int32")] * (rank - len(loop_vars)) + list(loop_vars)
+                for axis, extent in enumerate(lazy.shape):
+                    if int(extent) == 1:
+                        idx[axis] = tir_mod.const(0, "int32")
+                return tuple(idx)
+
+            store = tir_mod.BufferStore(
+                frag,
+                lazy.read_lane(ctx_local, _src_indices()),
+                list(loop_vars) or [tir_mod.const(0, "int32")],
+            )
+            body: Any = store
+            for var, extent in zip(reversed(loop_vars), reversed(frag_shape or [1])):
+                body = tir_mod.For(
+                    var,
+                    tir_mod.const(0, "int32"),
+                    tir_mod.const(int(extent), "int32"),
+                    tir_mod.ForKind.PARALLEL,
+                    body,
+                )
+            ctx_local.emit(body)
+
+        def _stage_operand_to_register_a(
+            buf: Any,
+            shape: List[int],
+            dtype: str,
+        ) -> Any:
+            """REGSCALECOLLAPSE: materialise a lazy A operand straight into a
+            ``local.fragment`` (MMA-A load layout) so T.gemm dispatches to
+            ``gemm_rs`` and reads A from REGISTERS -- native's register-resident
+            decay scale.
+
+            ``buf`` is the still-lazy ``dout*exp`` (kept lazy by
+            ``arith._feeds_tensorcore_dot_as_register_a``): its ``read_lane``
+            reads the raw operand from the cp.async-staged SHARED tile and
+            multiplies by the per-K scale. Materialising that lazy expr into a
+            ``local.fragment`` fills the A fragment by reading SHARED + scaling
+            per-element -- exactly ``ldmatrix(dout) -> *exp(dA) in registers``.
+            The follow-on ``T.gemm(A_frag, B_shared, C_frag)`` sees
+            ``is_fragment(A) and is_shared(B)`` -> ``gemm_rs`` (``body_rs``),
+            which consumes ``A_frag`` directly from rmem. NO second shared
+            buffer (``dot_a_logical``) and NO ``__syncthreads`` for its write.
+
+            T.gemm's ``is_gemm_rs`` ``infer_layout`` assigns A the
+            ``make_mma_load_layout(matrix="A")`` Fragment; LayoutInference
+            propagates it back to this fill loop (the SHARED read is the
+            ldmatrix, the fragment write is register-resident). RULE #1: only
+            reached for a still-lazy A operand proven to feed a tensor-core dot;
+            a non-lazy / non-CUDA A keeps the shared-stage path below.
+            """
+            frag = _alloc_tile_buffer(
+                ctx,
+                shape,
+                dtype,
+                name=ctx.fresh("dot_a_frag"),
+                scope="local.fragment",
+            )
+            _materialize_into(ctx, buf, frag)
+            return frag
+
         def _stage_operand_to_shared(
             buf: Any,
             shape: List[int],
@@ -1548,7 +1637,31 @@ def map_tt_dot(
 
         a_stage_shape = [Ka, M] if pre_trans_a else [M, Ka]
         b_stage_shape = [N, Kb] if pre_trans_b else [Kb, N]
-        a = _stage_operand_to_shared(a, a_stage_shape, a_dtype, "a")
+        # REGSCALECOLLAPSE: route a still-lazy A operand (the ``dout*exp`` decay
+        # scale kept lazy by ``arith._feeds_tensorcore_dot_as_register_a``)
+        # straight into a ``local.fragment`` (MMA-A load layout) instead of a
+        # cooperative SHARED round-trip. T.gemm then sees ``is_fragment(A)`` ->
+        # ``gemm_rs`` and reads A from REGISTERS, applying the scale on the
+        # fragment after the (T.copy-equivalent) ldmatrix fill. This removes the
+        # ``dot_a_logical`` shared buffer + its ``__syncthreads`` per K-step --
+        # native's register-resident A operand. Gated (RULE #1, fail-closed) to:
+        #   * CUDA target + tensor-core MMA path (``not prefer_scalar_dot``),
+        #   * A still LAZY (so the raw operand + scale are recoverable; a
+        #     materialised local/shared A keeps the shared path),
+        #   * untransposed A (the parallel fill writes the [M,Ka] logical A; a
+        #     transposed A would need the [Ka,M] fragment layout -- not yet
+        #     proven, so it keeps the shared-stage path).
+        _use_register_a = (
+            _is_cuda_target(ctx)
+            and not prefer_scalar_dot
+            and not transpose_A
+            and not pre_trans_a
+            and isinstance(a, LazyTileExpr)
+        )
+        if _use_register_a:
+            a = _stage_operand_to_register_a(a, a_stage_shape, a_dtype)
+        else:
+            a = _stage_operand_to_shared(a, a_stage_shape, a_dtype, "a")
         b = _stage_operand_to_shared(b, b_stage_shape, b_dtype, "b")
 
         if prefer_scalar_dot:
