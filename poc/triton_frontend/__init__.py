@@ -1441,6 +1441,65 @@ def from_triton_kernel(
     )
 
 
+def _read_ttir_warp_config(
+    ttir_module: Any,
+) -> Tuple[Optional[int], Optional[int]]:
+    """Read ``(num_warps, num_stages)`` from a TTIR module's MLIR attrs.
+
+    Triton stamps the (autotuned) compile config onto the module operation
+    as integer attributes once the ``num_warps`` / ``num_stages`` from the
+    selected ``triton.Config`` are bound. The exact attribute key differs by
+    Triton version / dialect (``ttg.num-warps`` after the TritonGPU
+    conversion, plain ``num-warps`` / ``num_warps`` on the raw TTIR module),
+    so we probe the known spellings. Returns ``(None, None)`` when the module
+    is a text-TTIR stand-in or carries no warp attrs (callers keep their
+    defaults / explicit overrides).
+
+    RULE #1 (fail loud): a warp attr that is present but cannot be parsed to
+    a positive int RAISES -- we never silently treat a malformed autotune
+    annotation as "absent" and fall back to the 4-warp default.
+    """
+    # Text-TTIR / non-MLIR stand-ins have no queryable operation attrs.
+    op = getattr(ttir_module, "operation", None)
+    if op is None:
+        return None, None
+    attrs = getattr(op, "attributes", None)
+    if attrs is None:
+        return None, None
+
+    def _lookup(keys: Tuple[str, ...]) -> Optional[int]:
+        for key in keys:
+            try:
+                raw = attrs[key]  # mlir NamedAttribute access
+            except (KeyError, TypeError, IndexError):
+                continue
+            # mlir IntegerAttr exposes ``.value``; fall back to str() parse.
+            val = getattr(raw, "value", raw)
+            try:
+                ival = int(val)
+            except (TypeError, ValueError):
+                try:
+                    ival = int(str(val).strip().split()[0])
+                except (ValueError, IndexError):
+                    raise ValueError(
+                        "TTIR module carries warp-config attr %r=%r that is "
+                        "not a parseable integer; refusing to silently fall "
+                        "back to the default warp count (RULE #1)."
+                        % (key, val)
+                    )
+            if ival <= 0:
+                raise ValueError(
+                    "TTIR module warp-config attr %r=%d is non-positive; a "
+                    "valid autotune config must be > 0." % (key, ival)
+                )
+            return ival
+        return None
+
+    num_warps = _lookup(("ttg.num-warps", "num-warps", "num_warps"))
+    num_stages = _lookup(("ttg.num-stages", "num-stages", "num_stages"))
+    return num_warps, num_stages
+
+
 def from_ttir(
     ttir_module: Any,
     *,
@@ -1505,6 +1564,27 @@ def from_ttir(
     # the harness (which captures them from Triton's compile options) so
     # ``map_tt_func`` can stamp the right ``threadIdx.x`` extent and
     # PrimFunc attrs. Falsy values keep the WalkerCtx defaults intact.
+    #
+    # GENERIC AUTOTUNE-HONOURING (TileFix): when the caller does NOT pass an
+    # explicit ``num_warps`` / ``num_stages``, read them from the TTIR
+    # MODULE attributes that Triton stamps after applying the kernel's
+    # (autotuned) compile config -- ``"ttg.num-warps"`` / ``"num-warps"`` and
+    # ``"ttg.num-stages"`` / ``"num-stages"``. This makes the cooperative
+    # ``T.gemm`` tile over the SAME warp count Triton autotuned to (e.g.
+    # num_warps=8 -> 256-thread block -> 8-way warp partition -> 256 HMMA on
+    # the dstates dot) instead of silently defaulting to 4 warps and tiling
+    # the single ``tt.dot`` 8x smaller. This is BACKEND-AGNOSTIC (the warp
+    # count flows into ``gemm.lower``'s ``computeWarpPartition`` on CUDA and
+    # the threadgroup partition on Metal alike) and NOT a per-kernel hack:
+    # any TTIR carrying these standard module attrs is honoured. RULE #1: if
+    # the module carries a malformed warp attr we RAISE rather than silently
+    # falling back to the default. Explicit kwargs always win.
+    if num_warps is None or num_stages is None:
+        attr_nw, attr_ns = _read_ttir_warp_config(ttir_module)
+        if num_warps is None and attr_nw is not None:
+            num_warps = attr_nw
+        if num_stages is None and attr_ns is not None:
+            num_stages = attr_ns
     if num_warps is not None:
         ctx.num_warps = int(num_warps)
     if num_stages is not None:

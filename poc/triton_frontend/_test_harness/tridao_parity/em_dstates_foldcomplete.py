@@ -42,8 +42,15 @@ def build(ttir, prologue_opt, force_cp_async):
         os.environ["TL_FORCE_CP_ASYNC"] = "1"
     else:
         os.environ.pop("TL_FORCE_CP_ASYNC", None)
+    # Honor the Triton autotune config for this kernel: the native
+    # _chunk_scan_bwd_dstates_kernel autotunes to num_warps=8 / num_stages=3
+    # (Triton's selected triton.Config), so the cooperative T.gemm must tile
+    # over an 8-warp (256-thread) block to match the 256 HMMA Triton emits.
+    # Text-TTIR carries no module attrs, so we surface the autotuned config
+    # explicitly here (the generic MLIR path reads it from module attrs).
     pf = from_ttir(ttir, name="_chunk_scan_bwd_dstates_kernel", target="cuda",
-                   _allow_text_ttir=True, prologue_opt=prologue_opt)
+                   _allow_text_ttir=True, prologue_opt=prologue_opt,
+                   num_warps=8, num_stages=3)
     return tilelang.compile(pf, target="cuda")
 
 
