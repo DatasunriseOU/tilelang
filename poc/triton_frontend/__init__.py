@@ -850,10 +850,36 @@ def _emit_tile_store_to_input_buffer(
         # origin is ``(base // tile_cols, 0)`` with extent ``val_shape``.
         if len(val_shape) >= 2:
             tile_cols = int(val_shape[-1])
-            total = 1
+            # ``total`` (and therefore ``view_rows``) may be SYMBOLIC: when the
+            # autotune-winning tile re-declares the function-arg output buffer,
+            # a flattened dim can be a tir.Mul (e.g. grid_rows*tile_cols) rather
+            # than a Python int, so int(d) would crash. Track a plain int while
+            # every dim is a concrete constant; the moment a non-constant dim
+            # appears, fall over to a TIR PrimExpr product so the symbolic dim
+            # is preserved. ``view_rows`` is then a valid (possibly symbolic)
+            # extent for the 2D row-major view; ``row0`` (the per-block origin)
+            # is already symbolic, so the region stays correct either way.
+            def _const_int(_d):
+                if isinstance(_d, int):
+                    return _d
+                _v = getattr(_d, "value", None)
+                return _v if isinstance(_v, int) else None
+            total_int = 1
+            total_expr = None  # set once a non-constant dim is seen
             for d in dst_buf.shape:
-                total *= int(d)
-            view_rows = total // tile_cols
+                ci = _const_int(d)
+                if ci is not None and total_expr is None:
+                    total_int *= ci
+                else:
+                    if total_expr is None:
+                        total_expr = tir.const(int(total_int), "int32")
+                    total_expr = total_expr * (
+                        tir.const(int(ci), "int32") if ci is not None else d
+                    )
+            if total_expr is None:
+                view_rows = total_int // tile_cols
+            else:
+                view_rows = tvm_mod.tir.floordiv(total_expr, tir.const(tile_cols, "int32"))
             # 2D row-major VIEW of arg2 that ALIASES its data Var (same
             # ``data`` pointer, zero elem_offset). A tir.Buffer has no
             # ``reshape``, so we declare a fresh 2D buffer over the same data.
