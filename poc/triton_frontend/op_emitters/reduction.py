@@ -1594,6 +1594,7 @@ def map_tt_dot(
                     "K": int(Ka),
                     "trans_A": bool(transpose_A),
                     "trans_B": bool(transpose_B),
+                    "num_warps": int(getattr(ctx, "num_warps", 4) or 4),
                 })
         # FRAGMENT EPILOGUE FIX (RULE #1 -- correctness, not a silent downgrade).
         # On CUDA the gemm accumulator ``c`` lives in ``local.fragment`` scope:

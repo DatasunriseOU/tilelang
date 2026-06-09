@@ -65,6 +65,42 @@ try:  # pragma: no cover - import wiring
 except Exception:  # pragma: no cover
     _wk = None  # type: ignore
 
+import os as _os  # noqa: WPS433
+
+
+# DIRECT-FRAGMENT->GLOBAL EPILOGUE (named generic capability).
+# ----------------------------------------------------------------------------
+# A loop-carried MMA-C accumulator lives in a swizzled ``local.fragment`` (the
+# tensor-core store layout). The post-loop ``tt.store`` of that accumulator must
+# reach global memory. The PRIOR epilogue staged the whole MxN fp32 accumulator
+# through a freshly-allocated ``shared`` tile (``carry_logical``) and then did a
+# second shared->global store -- 128KB of shared for a 128x256 fp32 tile, which
+# pushed the autotune-winning tile over the GB10 opt-in shared cap (101376 B).
+#
+# Native Triton stores the MMA-C fragment DIRECTLY to global, per-warp-tile,
+# layout-aware -- it never materialises the accumulator in shared at the
+# epilogue. TileLang's ``T.copy(fragment, global)`` lowers to exactly that: the
+# CopyNode picks the fragment (highest scope-level) as the iteration base and
+# ``InferLayout`` propagates the fragment's registered ``make_mma_store_layout``
+# to the parallel store loop, emitting a direct layout-aware fragment->global
+# store with no shared staging.
+#
+# This is a GENERIC, BACKEND-AGNOSTIC frontend capability: it binds the loop
+# result to the fragment itself so EVERY fragment-carry epilogue (all tiles, any
+# backend whose copy lowering supports fragment->global -- CUDA tensor-core and
+# Metal simdgroup alike) skips the shared staging buffer. RULE #1: it is a
+# correctness route, NOT a degraded fallback -- the parity gate below proves the
+# direct store is bit-correct; if it ever regressed it must RAISE, never
+# silently revert to staging.
+#
+# The env override exists ONLY for same-session A/B measurement of the shared
+# budget and parity; it defaults to the direct store. Set
+# ``TL_FRAG_GLOBAL_EPILOGUE=0`` to force the legacy shared-staging path for a
+# controlled comparison.
+_DIRECT_FRAG_GLOBAL_EPILOGUE_ENABLED = (
+    _os.environ.get("TL_FRAG_GLOBAL_EPILOGUE", "1") != "0"
+)
+
 __all__ = [
     "CONTROL_EMITTERS",
     "EmitError",
@@ -2800,20 +2836,40 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
                     # data. Only the genuine fragment carry takes this path.
                     carry_scope = _frag_scope_of(carry)
                     if idx in _frag_carry_slots and carry_scope == "local.fragment":
-                        c_logical = _om._alloc_tile_buffer(
-                            ctx,
-                            list(getattr(carry, "shape", []) or [1]),
-                            str(getattr(carry, "dtype", "float32")),
-                            ctx.fresh("carry_logical"),
-                            scope="shared",
-                        )
-                        import tilelang.language as _Tepi  # noqa: WPS433
-                        copy_handle = _Tepi.copy(carry, c_logical)
-                        if isinstance(copy_handle, tir.PrimExpr):
-                            ctx.emit(tir.Evaluate(copy_handle))
+                        if _DIRECT_FRAG_GLOBAL_EPILOGUE_ENABLED:
+                            # DIRECT FRAGMENT->GLOBAL EPILOGUE (named capability,
+                            # see module docstring). Bind the loop result to the
+                            # MMA-C fragment ITSELF -- no shared ``carry_logical``
+                            # staging tile. The downstream ``tt.store`` lowers to
+                            # ``T.copy(fragment, global)``: the CopyNode iterates
+                            # over the fragment (highest scope-level) and
+                            # ``InferLayout`` propagates the fragment's registered
+                            # ``make_mma_store_layout`` to the store loop, so the
+                            # per-warp register tile is written DIRECTLY to global
+                            # at the correct [i,j] positions -- the same
+                            # layout-aware fragment->global store native Triton
+                            # emits, with the MxN fp32 shared buffer eliminated.
+                            # RULE #1: this is the correctness path; the parity
+                            # gate proves it bit-correct. A wrong result must RAISE
+                            # (parity harness FAIL), never silently re-stage.
+                            ctx.bind(result_ssa, carry)
                         else:
-                            ctx.emit(copy_handle)
-                        ctx.bind(result_ssa, c_logical)
+                            # Legacy shared-staging epilogue, kept ONLY for
+                            # same-session A/B measurement (TL_FRAG_GLOBAL_EPILOGUE=0).
+                            c_logical = _om._alloc_tile_buffer(
+                                ctx,
+                                list(getattr(carry, "shape", []) or [1]),
+                                str(getattr(carry, "dtype", "float32")),
+                                ctx.fresh("carry_logical"),
+                                scope="shared",
+                            )
+                            import tilelang.language as _Tepi  # noqa: WPS433
+                            copy_handle = _Tepi.copy(carry, c_logical)
+                            if isinstance(copy_handle, tir.PrimExpr):
+                                ctx.emit(tir.Evaluate(copy_handle))
+                            else:
+                                ctx.emit(copy_handle)
+                            ctx.bind(result_ssa, c_logical)
                     else:
                         ctx.bind(result_ssa, carry)
                 elif yielded and idx < len(yielded):

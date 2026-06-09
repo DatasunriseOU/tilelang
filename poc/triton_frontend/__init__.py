@@ -1020,7 +1020,31 @@ def _frame_register_mma_fragments(ctx: Any) -> Any:
     # is obsolete and can only conflict. ``pin_c_layout=False`` keeps the
     # alloc-hosting SBlock but lets native LayoutInference own C's layout
     # (probe: 3/3 DETERMINISTIC compiles unpinned vs 3/3 conflict pinned).
-    return register_mma_fragment_layouts(prim_func, fragments, pin_c_layout=False)
+    # DIRECT FRAGMENT->GLOBAL EPILOGUE: when the loop-carried MMA-C accumulator
+    # is stored DIRECTLY to global (no shared ``carry_logical`` staging --
+    # control.py ``_DIRECT_FRAG_GLOBAL_EPILOGUE_ENABLED``), the global-store
+    # ``T.copy(fragment, global)`` has NO shared/fragment pair to anchor on. In
+    # free-inference it would over-replicate the fragment to a flat
+    # ``(_i*256+_j, replicate=256)`` layout and register THAT before the gemm's
+    # MMA store layout, colliding ("Get different layout for carry_tile"). We
+    # therefore STRICTLY PIN the C fragment to its gemm-exact
+    # ``make_mma_store_layout`` (now derived with the gemm's true warp partition
+    # via ``_square_warp_partition`` -- the partition skew that made the old pin
+    # conflict is fixed). The pinned layout seeds ``strict_layout_map`` first, so
+    # the gemm AND the direct global store both ADOPT it: the store loop is then
+    # built FROM the fragment's MMA layout (layout-aware, per-warp, no shared).
+    # When the legacy shared-staging epilogue is selected
+    # (TL_FRAG_GLOBAL_EPILOGUE=0), keep unpinned -- the through-shared copy
+    # converges natively and the pin is unnecessary there.
+    try:
+        from .op_emitters.control import (
+            _DIRECT_FRAG_GLOBAL_EPILOGUE_ENABLED as _direct_epi,
+        )
+    except Exception:  # pragma: no cover - control always importable here
+        _direct_epi = True
+    return register_mma_fragment_layouts(
+        prim_func, fragments, pin_c_layout=bool(_direct_epi)
+    )
 
 
 # Sentinel type alias. The real return type is ``tvm.tir.PrimFunc``;
