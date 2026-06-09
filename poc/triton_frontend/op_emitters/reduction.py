@@ -1307,10 +1307,8 @@ def map_tt_dot(
             if not _is_shared_scope(buf):
                 # Plain ``local`` full-per-thread real buffer (e.g. the
                 # ``tile_binop`` = ``dout*exp`` result). Copy it into a shared
-                # logical tile so the gemm-stage copy below is the cooperative
-                # shared->shared path. (This local->shared copy is per-thread but
-                # writes the SAME logical tile; the gemm-stage copy that follows
-                # is the ldmatrix-matching cooperative one.)
+                # logical tile so the gemm reads a SHARED logical operand whose
+                # ldmatrix swizzle T.gemm + LayoutInference own.
                 logical = _alloc_tile_buffer(
                     ctx,
                     shape,
@@ -1320,15 +1318,18 @@ def map_tt_dot(
                 )
                 _emit_copy_stmt(buf, logical, f"{label}, logical shared operand")
                 buf = logical
-            staged = _alloc_tile_buffer(
-                ctx,
-                shape,
-                dtype,
-                name=ctx.fresh(f"dot_{label}_shared"),
-                scope="shared",
-            )
-            _emit_copy_stmt(buf, staged, f"{label}, staged shared operand")
-            return staged
+            # STAGING COLLAPSE (RULE #1 -- correctness + shared-budget): the
+            # operand now lives in ONE plain-logical SHARED buffer. Hand it to
+            # T.gemm DIRECTLY -- exactly the native single-#shared model and the
+            # SAME path the real-shared B operand (``tile_load_69``) already
+            # takes (it hits the early ``_is_shared_scope(buf): return buf``
+            # above). T.gemm + LayoutInference assign the ldmatrix swizzle to
+            # THIS shared buffer and propagate it back to its producer fill, so
+            # there is NO separate ``dot_{label}_shared`` swizzle round-trip.
+            # That kills the 3rd A buffer: A goes from
+            # tile_load(raw shared)+dot_a_logical(shared)+dot_a_shared(swizzled)
+            # = 96KB down to a single ~32KB shared operand, matching native.
+            return buf
 
         def _ssa_name(value: Any) -> str:
             try:

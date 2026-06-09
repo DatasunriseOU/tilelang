@@ -1627,6 +1627,59 @@ def _emit_ptrstate_tile_load_copynode(
     return True
 
 
+# Op-name prefixes that consume a tile ELEMENTWISE (the value flows through
+# unchanged in layout: a per-lane arithmetic / math / cast / compare). A rank>=2
+# load consumed ONLY by these is re-staged into a downstream gemm-operand or
+# store tile, so its own shared staging is redundant (see the A-staging collapse
+# in ``_emit_ptrstate_tile_load_tir``).
+_ELEMENTWISE_CONSUMER_PREFIXES = (
+    "arith.",
+    "math.",
+    "tt.mulhiui",
+    "tt.fp_to_fp",
+    "tt.bitcast",
+    "tt.int_to_ptr",
+    "tt.precise_",
+)
+# Consumers for which the load tile MUST stay shared (they read it cooperatively
+# in a layout-sensitive way, or directly off a function buffer): a gemm operand,
+# a store source, an atomic, a transpose/reduce/broadcast view, another load's
+# pointer base, etc. Fail-closed: ANY consumer not provably elementwise keeps
+# the load in shared (RULE #1 -- never silently demote a layout-sensitive tile).
+
+
+def _rank2_load_feeds_only_elementwise(ctx: WalkerCtx, result_value: Any) -> bool:
+    """True iff EVERY consumer of ``result_value`` is a per-lane elementwise op.
+
+    Used to demote a redundant rank>=2 load tile from ``shared`` to ``local``:
+    when the load feeds only elementwise ops (e.g. ``dout`` scaled by
+    ``exp(dA)``), the result is re-staged into the swizzled gemm-operand shared
+    tile anyway, so the raw load needs no shared buffer of its own. Fail-closed:
+    returns False (keep shared) when the use-graph is unavailable, the result is
+    unnamed, the consumer set is empty, or ANY consumer is not an elementwise
+    op -- never silently demote a tile a ``tt.dot`` / store / transpose reads.
+    """
+    ssa_users = getattr(ctx, "ssa_users", None)
+    if not ssa_users:
+        return False
+    name = None
+    try:
+        getter = getattr(result_value, "get_name", None)
+        name = getter() if callable(getter) else getattr(result_value, "name", None)
+    except Exception:
+        name = None
+    if not name:
+        return False
+    consumers = ssa_users.get(str(name)) or ssa_users.get(str(name).lstrip("%"))
+    if not consumers:
+        return False
+    for c in consumers:
+        cs = str(c)
+        if not any(cs.startswith(p) for p in _ELEMENTWISE_CONSUMER_PREFIXES):
+            return False
+    return True
+
+
 def _emit_ptrstate_tile_load_tir(
     op: Any,
     ctx: WalkerCtx,
@@ -1644,12 +1697,36 @@ def _emit_ptrstate_tile_load_tir(
     src_buf = _redeclare_ctx_buffer_1d(
         ctx, src_buf, out_dtype, _flat_min_extent(out_shape)
     )
+    # A-STAGING COLLAPSE (RULE #1 -- correctness + shared budget, generic +
+    # backend-agnostic): a rank>=2 tile load is staged to SHARED so that a
+    # downstream ``tt.dot`` can read it cooperatively. But when this load feeds
+    # an ELEMENTWISE op (e.g. the ``dout`` that is scaled by ``exp(dA)`` to
+    # build the GEMM A operand in the SSD/dstates chunk kernels) -- and NOT a
+    # ``tt.dot`` / ``tt.store`` directly -- its shared tile is REDUNDANT: the
+    # elementwise result is re-staged into the swizzled gemm-operand shared tile
+    # anyway (``_stage_operand_to_shared``), so the raw load lives in shared
+    # only to be read once by the mul. That is the duplicate A buffer
+    # (``tile_load`` raw + ``dot_a`` swizzled = 64KB) vs native's single 32KB
+    # #shared operand. Stage such loads in ``local`` instead: the elementwise op
+    # reads the per-thread tile (exactly as the existing ``tile_binop`` result
+    # is already a per-thread local tile on this MVP path) and the SINGLE
+    # swizzled gemm-operand shared tile is the only A-sized shared buffer. A
+    # load that DOES feed a ``tt.dot`` directly (the B operand) keeps its shared
+    # tile -- the gemm reads it directly, native single-#shared. Gated to the
+    # routed prologue-opt path; every other path is byte-identical.
+    load_scope = "shared" if len(out_shape or []) >= 2 else "local"
+    if (
+        load_scope == "shared"
+        and getattr(ctx, "routed_triton_prologue_opt", False)
+        and _rank2_load_feeds_only_elementwise(ctx, result_value)
+    ):
+        load_scope = "local"
     tile_buf = _alloc_tile_buffer(
         ctx,
         list(out_shape) or [1],
         out_dtype,
         ctx.fresh("tile_load"),
-        scope="shared" if len(out_shape or []) >= 2 else "local",
+        scope=load_scope,
     )
     loop_vars = [
         tir.Var(ctx.fresh(f"i{axis}"), "int32")
@@ -1667,6 +1744,7 @@ def _emit_ptrstate_tile_load_tir(
     if (
         getattr(ctx, "routed_triton_async_loads", False)
         and len(out_shape or []) >= 2
+        and load_scope in ("shared", "shared.dyn")
     ):
         converted = _emit_ptrstate_tile_load_copynode(
             op,

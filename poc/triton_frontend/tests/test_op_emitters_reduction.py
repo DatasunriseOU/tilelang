@@ -617,7 +617,17 @@ def test_tt_dot_stages_non_shared_operand_to_shared_before_gemm():
         for b in ctx.local_buffers
         if hasattr(b, "scope") and callable(b.scope) and b.scope() == "shared"
     ]
-    assert any(n.startswith("dot_a_shared") for n in shared_names), (
+    # A-staging collapse: the non-shared A operand is staged into ONE shared
+    # logical buffer (``dot_a_logical``) that is handed DIRECTLY to T.gemm --
+    # T.gemm + LayoutInference own the ldmatrix swizzle on that buffer (the
+    # native single-#shared model, matching the real-shared B operand path),
+    # so there is no longer a redundant second ``dot_a_shared`` swizzle buffer.
+    # The capability under test (a non-shared operand reaches shared scope
+    # before the gemm) is unchanged.
+    assert any(
+        n.startswith("dot_a_logical") or n.startswith("dot_a_shared")
+        for n in shared_names
+    ), (
         "tt.dot must stage a non-shared A operand into shared scope before "
         f"calling T.gemm on Metal; shared buffers were {shared_names!r}"
     )
@@ -643,13 +653,20 @@ def test_tt_dot_stages_folded_transpose_with_physical_shape():
     op = _op("tt.dot", [a_ssa, b_trans_ssa], [c_ssa])
     REDUCTION_EMITTERS["tt.dot"](op, ctx)
 
+    # A-staging collapse: the folded-transpose B operand is staged into ONE
+    # shared logical buffer (``dot_b_logical``) passed directly to T.gemm; the
+    # redundant ``dot_b_shared`` swizzle round-trip is gone. The physical
+    # (pre-transpose) source shape (32, 16) must still be the staged extent.
     staged_b = [
         b
         for b in ctx.local_buffers
         if hasattr(b, "scope")
         and callable(b.scope)
         and b.scope() == "shared"
-        and str(getattr(b, "name", "")).startswith("dot_b_shared")
+        and (
+            str(getattr(b, "name", "")).startswith("dot_b_logical")
+            or str(getattr(b, "name", "")).startswith("dot_b_shared")
+        )
     ]
     assert staged_b, "expected folded transposed B to be staged into shared"
     assert tuple(int(x) for x in staged_b[0].shape) == (32, 16)
