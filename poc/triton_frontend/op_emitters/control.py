@@ -1753,6 +1753,17 @@ def _emit_region(
     ctx._tmp_counter = child._tmp_counter
     if getattr(child, "requires_single_thread_body", False):
         ctx.requires_single_thread_body = True
+    # ASYNCIMPL: the routed global->shared K-loop CopyNode emitter (memory.py)
+    # sets ``routed_explicit_cp_async`` on the WALKING ctx when it stamps an
+    # explicit self-contained cp.async (``is_async_copy``). Inside a region that
+    # ctx is THIS ``child``, which is discarded on return, so the flag would be
+    # lost before ``map_scf_for._maybe_pipeline`` (which runs on the PARENT ctx)
+    # reads it -> the K-loop would be (wrongly) stamped with num_stages and
+    # PipelinePlanning would FATAL on the masked-OOB second writer. Bubble the
+    # flag up so the parent skips the num_stages stamp. RULE #1: the wait lives
+    # in the copy itself; this only prevents a double-managed (crashing) stage.
+    if getattr(child, "routed_explicit_cp_async", False):
+        ctx.routed_explicit_cp_async = True
     # Propagate tile-scoped buffers allocated inside the region back to the
     # parent context. ``_alloc_tile_buffer`` registers each buffer in
     # ``ctx.local_buffers``; when ``ctx`` is the child, those buffers are
@@ -2705,17 +2716,23 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
             return for_node
         import os as _os_pipe
         if (_os_pipe.environ.get("TL_NO_NUM_STAGES") == "1"
-                or _os_pipe.environ.get("TL_FORCE_CP_ASYNC") == "1"):
-            # ASYNCIMPL: when the routed copy is emitted as an explicit cp.async
-            # producer (``TL_FORCE_CP_ASYNC=1`` sets is_async_copy in memory.py),
-            # Copy::LowerCPAsync emits genuine cp.async/LDGSTS at LowerTileOp time,
-            # INDEPENDENT of the software pipeline. We DROP the num_stages pipeline
-            # annotation so PipelinePlanning skips this loop entirely and its
-            # overlapping-write check (producer copy + masked OOB-zero epilogue both
-            # write the shared tile) is never triggered. NOTE: without the pipeline
-            # there is no auto-inserted cp.async.wait before the GEMM consumer, so
-            # this path is FAST-but-RACY -- it exists for MEASURED SASS/codegen
-            # verification of LDGSTS, not as a correct default (see memory.py).
+                or _os_pipe.environ.get("TL_FORCE_CP_ASYNC") == "1"
+                or getattr(ctx, "routed_explicit_cp_async", False)):
+            # ASYNCIMPL (COMMITTED DEFAULT): the routed global->shared K-loop copy
+            # is emitted as an EXPLICIT, SELF-CONTAINED cp.async producer
+            # (``is_async_copy`` in memory.py -> Copy::LowerCPAsync at copy.cc:527
+            # appends cp.async.commit_group + cp.async.wait_group<0> + a CTA
+            # __syncthreads). The cp.async/LDGSTS is emitted at LowerTileOp time,
+            # INDEPENDENT of the software pipeline, AND the out-of-line wait makes
+            # it race-free (MEASURED §P1 MAXDIFF 4.882812e-04 = 2^-11, bit-correct).
+            # We therefore DROP the num_stages pipeline annotation so
+            # PipelinePlanning skips this loop entirely and its overlapping-write
+            # check (producer copy + masked OOB-zero epilogue both write the SAME
+            # shared tile -- a legitimate sequenced pair, not a pipeline hazard) is
+            # never triggered. ``ctx.routed_explicit_cp_async`` is set by the
+            # CopyNode emitter whenever it stamps ``is_async_copy``; the env flags
+            # remain as explicit overrides. RULE #1: the wait is ALWAYS present (in
+            # the copy itself), never a silent racy half-state.
             return for_node
         if len(ctx._gmem_shared_copies) <= _gmem_copies_before:
             return for_node

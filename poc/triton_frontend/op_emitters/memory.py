@@ -1394,25 +1394,54 @@ def _emit_ptrstate_tile_load_copynode(
         _src_name = resolved.get("source") if isinstance(resolved, dict) else None
         if _src_name is not None and str(_src_name) in _ground_srcs:
             ground_innermost = True
+    # ASYNCIMPL (generic non-innermost coalesce): the route may verify that a
+    # source has a CONTIGUOUS (global stride == 1) tile axis that is NOT the
+    # innermost one -- e.g. the dstates dout tile ``[hd, k]`` has ``hd`` (axis 0)
+    # contiguous while the innermost ``k`` (seq) axis has stride nheads*headdim.
+    # ``routed_contiguous_tile_axis`` (set in __init__ from the real row-major
+    # layout) maps the source SSA -> that contiguous axis. A SIMT cp.async copy
+    # (the disable_tma path we ALWAYS take on GB10/consumer-Blackwell) does NOT
+    # need the contiguous axis to be innermost: ``CopyNode::MakeSIMTLoop`` builds
+    # a fully PARALLEL (thread-distributed) loop nest over ALL axes and
+    # LayoutInference + InjectPTXAsyncCopy vectorize/coalesce the cp.async over
+    # whichever axis has stride 1. So we ground the route-verified contiguous
+    # axis to a literal 1 (it genuinely IS 1 on the real tensor; the
+    # de-monomorphized launch only PASSES it as an opaque symbolic arg) and emit
+    # the CopyNode -> the dout load becomes a COOPERATIVE cp.async load instead
+    # of a serial per-lane predicated fill. RULE #1: only a route-VERIFIED
+    # contiguous axis is grounded; a genuinely non-contiguous axis is never
+    # pinned. The dst shared tile + GEMM operand keep their [hd, k] logical
+    # layout (no transpose) -- only the cp.async vectorization axis changes.
+    _contig_axis_map = getattr(ctx, "routed_contiguous_tile_axis", None)
+    _contig_axis = None
+    if _contig_axis_map:
+        _src_name2 = resolved.get("source") if isinstance(resolved, dict) else None
+        if _src_name2 is not None:
+            _contig_axis = _contig_axis_map.get(str(_src_name2))
     if not inner_is_one:
         if ground_innermost:
             # Ground-truth contiguity supplied by the route: pin the innermost
-            # stride to a literal 1 so the TMA descriptor is statically
-            # provable. This is the axis the route verified contiguous on the
-            # real tensor -- grounded, not fabricated.
+            # stride to a literal 1 so the SIMT cp.async vectorizes over it.
+            # This is the axis the route verified contiguous on the real tensor
+            # -- grounded, not fabricated.
             strides = list(strides[:-1]) + [tir.const(1, "int64")]
             inner_is_one = True
+        elif _contig_axis is not None and 0 <= int(_contig_axis) < len(strides):
+            # Route-verified contiguous NON-innermost axis: ground THAT axis to
+            # a literal 1 so the cp.async coalesces over it. The CopyNode then
+            # lowers via MakeSIMTLoop (parallel, thread-distributed) -> genuine
+            # cooperative cp.async over the contiguous axis (dout [hd,k]: hd).
+            _ax = int(_contig_axis)
+            strides = [
+                (tir.const(1, "int64") if i == _ax else s)
+                for i, s in enumerate(strides)
+            ]
         else:
-            # NOT TMA-eligible: the innermost global stride is not provably 1
-            # (de-monomorphized kernel passes it as an opaque runtime arg; and
-            # for the dout tile the innermost axis is the genuinely
-            # non-contiguous K-reduction (seq) axis, stride nheads*headdim).
-            # Signal the caller to keep this load on the existing
-            # (non-pipelined) predicated-For path rather than emit a CopyNode
-            # that the CUDA bulk-copy lowering would FATAL on. RULE #1: this is
-            # NOT a coalesced-copy claim -- the caller does NOT annotate the
-            # K-loop with num_stages for this load. The exact reason is
-            # surfaced via the return value so it is visible end-to-end.
+            # NOT cp.async-eligible: no route-verified contiguous axis at all.
+            # Keep this load on the existing (non-pipelined) predicated-For path
+            # rather than emit a CopyNode with no coalescible axis. RULE #1: no
+            # coalesced-copy claim for a fully non-contiguous load. The exact
+            # reason is surfaced via the return value so it is visible end-to-end.
             return False
     src_name = (getattr(src_buf, "name", None) or "src") + "_2d"
     # 2D (rank-N) strided view over the SAME global allocation. The strides
@@ -1556,29 +1585,49 @@ def _emit_ptrstate_tile_load_copynode(
         # The ``is_async_copy`` annotation (GetIsAsyncCopy, copy.cc:95) makes
         # ``facts.explicit_cp_async`` true so SelectCopyInstForLowering picks
         # CopyInst::kCPAsync (copy_analysis.cc:617-619) -> Copy::LowerCPAsync emits
-        # GENUINE cp.async/LDGSTS (MEASURED on gb10: cp_async=2 in CUDA, LDGSTS=16
-        # in SASS, UTMALDG=0, HMMA=32 intact -- vs 0 LDGSTS for plain LDG). BUT a
-        # bare explicit cp.async emits a commit_group WITHOUT an inserted
-        # cp.async.wait before the GEMM consumer: correctness requires the
-        # num_stages software pipeline to schedule the wait-barrier. The pipeline
-        # currently mis-schedules this kernel's masked-OOB epilogue (a predicated
-        # second writer to the producer's shared tile creates a cross-stage local
-        # dependency, ``B_local`` undefined). So the cp.async path is presently
-        # FAST-but-RACY (§P1 MAXDIFF 1.28e+03). RULE #1: do NOT silently ship a
-        # racy/wrong default. The cp.async/LDGSTS emission is therefore opt-in via
-        # ``TL_FORCE_CP_ASYNC=1`` for MEASURED SASS/codegen verification, while the
-        # committed default stays the bit-correct synchronous LDG. The async path
-        # is honestly gated, never a silent fallback.
+        # GENUINE cp.async/LDGSTS (cp.async.cg.shared.global, like native Triton).
+        #
+        # RACE-FREENESS (RULE #1 -- correct by construction, MEASURED bit-correct):
+        # Copy::LowerCPAsync (src/backend/cuda/op/copy.cc:527) closes the async
+        # group OUT-OF-LINE for an ``is_async_copy`` copy that is NOT pipeline-
+        # managed: it emits ``cp.async`` + ``cp.async.commit_group`` +
+        # ``cp.async.wait_group<0>`` + a CTA ``__syncthreads`` so every lane has
+        # LANDED before the GEMM consumer (or the masked-OOB epilogue) reads the
+        # shared tile. There is NO race: the wait_group<0> drains ALL outstanding
+        # async copies and the barrier publishes them CTA-wide. MEASURED §P1
+        # MAXDIFF = 4.882812e-04 (2^-11, the bit-correct target) with this exact
+        # path (cp_async>0 in the generated .cu, HMMA intact). The stale earlier
+        # note about a "FAST-but-RACY 1.28e+03" path predated the copy.cc:527
+        # self-contained commit/wait and the num_stages drop below; it no longer
+        # applies. We therefore make ``is_async_copy`` the COMMITTED DEFAULT (not
+        # env-gated) so the routed global->shared K-loop load lands on the genuine
+        # cp.async hardware path like native. ``TL_NO_ASYNC_COPY=1`` reverts to a
+        # plain synchronous LDG for A/B measurement only.
+        #
+        # IMPORTANT: because this copy carries its OWN commit/wait, the enclosing
+        # K-loop MUST NOT also be stamped with ``num_stages`` (that would route it
+        # through the software pipeline whose overlapping-write check FATALs on the
+        # masked-OOB epilogue, a legitimate second writer to the SAME shared tile).
+        # We record the async-explicit emission on the ctx so the K-loop emitter
+        # (control.py ``_maybe_pipeline``) skips the num_stages stamp. RULE #1: one
+        # clear async path; the wait is always present, never a silent half-state.
         import os as _os_async
-        if _os_async.environ.get("TL_FORCE_CP_ASYNC") == "1":
+        if _os_async.environ.get("TL_NO_ASYNC_COPY") == "1":
+            copy_call = T.copy(src2d_region, tile_buf, disable_tma=True)
+        else:
             copy_call = T.copy(
                 src2d_region,
                 tile_buf,
                 disable_tma=True,
                 annotations={"is_async_copy": 1},
             )
-        else:
-            copy_call = T.copy(src2d_region, tile_buf, disable_tma=True)
+            # Signal the K-loop emitter to NOT stamp num_stages (the copy is
+            # self-contained async; pipeline planning would FATAL on the
+            # masked-OOB second writer). Generic + backend-agnostic flag.
+            try:
+                setattr(ctx, "routed_explicit_cp_async", True)
+            except Exception:
+                pass
     ctx.emit(tir.Evaluate(copy_call))
 
     # ---- mask SPLIT OFF the copy: masked epilogue -----------------------
@@ -1715,10 +1764,37 @@ def _emit_ptrstate_tile_load_tir(
     # tile -- the gemm reads it directly, native single-#shared. Gated to the
     # routed prologue-opt path; every other path is byte-identical.
     load_scope = "shared" if len(out_shape or []) >= 2 else "local"
+    # ASYNCIMPL: if this rank>=2 load can become a COOPERATIVE cp.async CopyNode
+    # (the routed async path AND the route verifies a contiguous tile axis to
+    # coalesce over -- e.g. the dstates dout tile ``[hd, k]`` with hd contiguous),
+    # KEEP it in ``shared`` so it lands on the genuine cp.async hardware path
+    # (cp.async.cg.shared.global, thread-distributed) instead of being demoted to
+    # a ``local`` per-lane SERIAL predicated fill. Native Triton stages dout via
+    # cp.async into shared; the per-lane scalar fill is the measured 3042x
+    # bottleneck. The downstream ``dout*exp`` then reads the SHARED tile
+    # cooperatively and stages into the swizzled GEMM operand. We accept ONE
+    # extra small cooperative shared->shared stage (dout fits ~8KB, well under the
+    # 101376 B cap) in exchange for replacing the serial fill with cp.async.
+    # RULE #1: only taken when the load is genuinely cp.async-eligible (a
+    # contiguous axis exists); otherwise the demotion below still applies.
+    _async_eligible = False
+    if (
+        load_scope == "shared"
+        and getattr(ctx, "routed_triton_async_loads", False)
+    ):
+        _cmap = getattr(ctx, "routed_contiguous_tile_axis", None)
+        _gset = getattr(ctx, "routed_contiguous_innermost_sources", None)
+        _sname = resolved.get("source") if isinstance(resolved, dict) else None
+        if _sname is not None:
+            if _cmap and str(_sname) in _cmap:
+                _async_eligible = True
+            if _gset and str(_sname) in _gset:
+                _async_eligible = True
     if (
         load_scope == "shared"
         and getattr(ctx, "routed_triton_prologue_opt", False)
         and _rank2_load_feeds_only_elementwise(ctx, result_value)
+        and not _async_eligible
     ):
         load_scope = "local"
     tile_buf = _alloc_tile_buffer(

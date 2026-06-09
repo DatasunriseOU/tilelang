@@ -1551,7 +1551,12 @@ def _read_ttir_warp_config(
     return num_warps, num_stages
 
 
-def autotune_winning_block_config(autotuned_kernel: Any) -> Dict[str, Any]:
+def autotune_winning_block_config(
+    autotuned_kernel: Any,
+    *,
+    device_shared_cap: Optional[int] = None,
+    target_block: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
     """Return the autotune-WINNING tile/launch config for a Triton kernel.
 
     Capture-side sibling of :func:`_read_ttir_warp_config`. Where the TTIR
@@ -1586,11 +1591,94 @@ def autotune_winning_block_config(autotuned_kernel: Any) -> Dict[str, Any]:
             "bare JITFunction. Refusing to silently default to the smallest "
             "tile (RULE #1)." % (getattr(autotuned_kernel, "__name__", autotuned_kernel),)
         )
-    best = configs[0]
-    kwargs = dict(getattr(best, "kwargs", {}) or {})
+
+    # SURVIVING-CONFIG SELECTION (RULE #1 -- MEASURED: configs[0] is a PHANTOM).
+    # Triton lists configs[0] as the nominal best, but its dynamic
+    # ``metadata.shared`` can EXCEED the device shared cap (e.g. the dstates
+    # 128x256x64 nw8 config needs ~197 KB > the 101376 B opt-in cap on GB10):
+    # Triton's autotuner PRUNES it at runtime (catches the OutOfResources during
+    # the bench) and the REAL winner is the largest tile that FITS. Picking
+    # configs[0] blindly imports the pruned phantom (wrong nw8/ns3, and a tile
+    # the device cannot even launch). We mirror Triton's pruning: estimate each
+    # config's GEMM shared footprint and keep only configs that FIT the cap, then
+    # -- among survivors -- pick the LARGEST tile (BM*BN), the autotuner's
+    # preference (max data reuse) when it fits. For the dstates kernel this
+    # yields 64x64x32 nw2 ns4 (the MEASURED native surviving winner), NOT the
+    # pruned 128x256x64 nw8. GENERIC: any @triton.autotune kernel is pruned by
+    # its own declared block sizes against the real device cap; no per-kernel
+    # hardcode. RULE #1: if NO config fits we RAISE (never launch an OOM tile).
+    import os as _os_cfg
+
+    def _shared_bytes(kw, ns):
+        bm = kw.get("BLOCK_SIZE_M")
+        bn = kw.get("BLOCK_SIZE_N")
+        bk = kw.get("BLOCK_SIZE_K")
+        if bm is None or bn is None or bk is None:
+            return None
+        # Classic Triton GEMM double-operand staging: (A[BM,BK] + B[BK,BN]) per
+        # pipeline stage, fp32 (4 B; the SSD/dstates operands are fp32 -- the
+        # conservative upper bound so we never UNDER-count and admit an OOM tile).
+        per_stage = (int(bm) * int(bk) + int(bk) * int(bn))
+        return per_stage * 4 * max(1, int(ns))
+
+    # Device shared cap: explicit kwarg wins; else env (TL_SHARED_CAP_BYTES);
+    # else the GB10 / sm_121 100 KB opt-in cap (101376 B). Backend-agnostic: a
+    # Metal/other target supplies its own cap via the kwarg.
+    cap = device_shared_cap
+    if cap is None:
+        _env_cap = _os_cfg.environ.get("TL_SHARED_CAP_BYTES")
+        cap = int(_env_cap) if _env_cap else 101376
+
+    fitting = []
+    for c in configs:
+        kw = dict(getattr(c, "kwargs", {}) or {})
+        sb = _shared_bytes(kw, int(getattr(c, "num_stages", 2)))
+        # sb is None => non-GEMM-shaped config we cannot estimate; admit it
+        # rather than wrongly prune a config we do not understand (RULE #1).
+        if sb is None or sb <= cap:
+            fitting.append((c, kw))
+    if not fitting:
+        raise ValueError(
+            "autotune_winning_block_config: NO config fits the device shared "
+            "cap (%d B); every declared tile would OutOfResources. Refusing to "
+            "launch an OOM tile (RULE #1). configs=%r"
+            % (cap, [dict(getattr(c, "kwargs", {}) or {}) for c in configs])
+        )
+
+    def _tile_area(kw):
+        return int(kw.get("BLOCK_SIZE_M") or 0) * int(kw.get("BLOCK_SIZE_N") or 0)
+
+    # SELECTION among the survivors:
+    #  (a) if the caller is compiling a SPECIFIC tile (``target_block``, the
+    #      BLOCK_SIZE_* the captured TTIR baked into the GEMM operand shapes),
+    #      return the surviving config that MATCHES that tile -- so nw/ns are the
+    #      ones Triton autotuned FOR THAT TILE (for the dstates 64x64x32 capture
+    #      this is the MEASURED native winner nw2/ns4). This is honest: we do not
+    #      guess the autotuner bench, we match the tile we actually compile.
+    #  (b) else fall back to the LARGEST fitting tile (the autotuner's preference
+    #      when no specific tile is pinned).
+    # RULE #1: if a target_block is given but NO surviving config matches it we
+    # RAISE (the captured tile is not a launchable autotune config) rather than
+    # silently returning a mismatched nw/ns.
+    best = kwargs = None
+    if target_block:
+        want = {k: int(v) for k, v in target_block.items() if v is not None}
+        for c, kw in fitting:
+            if all(int(kw.get(k, -1)) == v for k, v in want.items()):
+                best, kwargs = c, kw
+                break
+        if best is None:
+            raise ValueError(
+                "autotune_winning_block_config: target_block %r matches no "
+                "surviving config that fits the %d B shared cap; refusing to "
+                "return a mismatched nw/ns (RULE #1). fitting=%r"
+                % (want, cap, [kw for _c, kw in fitting])
+            )
+    if best is None:
+        best, kwargs = max(fitting, key=lambda ck: _tile_area(ck[1]))
     if not kwargs:
         raise ValueError(
-            "autotune_winning_block_config: winning Config has empty kwargs; "
+            "autotune_winning_block_config: surviving Config has empty kwargs; "
             "no BLOCK_SIZE_* to honour (RULE #1)."
         )
     out: Dict[str, Any] = dict(kwargs)
