@@ -1614,6 +1614,25 @@ def _emit_ptrstate_tile_load_copynode(
         import os as _os_async
         if _os_async.environ.get("TL_NO_ASYNC_COPY") == "1":
             copy_call = T.copy(src2d_region, tile_buf, disable_tma=True)
+        elif _os_async.environ.get("TL_PIPELINE_CP_ASYNC") == "1":
+            # PIPELINENS4 (TRUE multi-stage software pipeline): emit a PLAIN
+            # global->shared CopyNode with NO ``is_async_copy`` annotation. Because
+            # GetIsAsyncCopy is false, CheckPipelineManagedCPAsyncCopy
+            # (inject_pipeline.cc:83) returns TRUE -> InjectSoftwarePipeline takes
+            # OWNERSHIP of this copy: it multi-versions (double/quad-buffers) the
+            # shared tile across ``num_stages`` and schedules the cp.async
+            # commit_group + wait_group<N> (N = num_stages-2 in-flight) so stage
+            # k+1 loads OVERLAP stage k MMA -- exactly like native ns4. We do NOT
+            # set ``routed_explicit_cp_async`` (the copy is NOT self-contained);
+            # ``_maybe_pipeline`` (control.py) STAMPS ``num_stages`` on the K-loop
+            # so PipelinePlanning schedules the pipeline. Race-freeness is
+            # guaranteed by the pipeline-inserted wait_group<N> ordering (the
+            # GEMM consumer waits for its producer stage). RULE #1: the
+            # masked-OOB epilogue is a SECOND writer to the SAME private per-stage
+            # shared tile in the SAME iteration -- not a cross-stage overlap;
+            # pipeline_planning.cc treats it as part of the producer stage (see
+            # the AnalyzeCopyLastUse same-buffer-consumer carve-out).
+            copy_call = T.copy(src2d_region, tile_buf, disable_tma=True)
         else:
             copy_call = T.copy(
                 src2d_region,
@@ -1660,10 +1679,30 @@ def _emit_ptrstate_tile_load_copynode(
         dyn_oob = tir.Not(dyn)
         pred = dyn_oob if pred is None else tir.Or(pred, dyn_oob)
     if pred is not None:
-        store = tir.BufferStore(
-            tile_buf, other_lane, list(loop_vars) or [tir.const(0, "int32")]
-        )
-        epi: Any = tir.IfThenElse(pred, store, None)
+        import os as _os_epi
+        _idx = list(loop_vars) or [tir.const(0, "int32")]
+        if _os_epi.environ.get("TL_PIPELINE_CP_ASYNC") == "1":
+            # PIPELINENS4 race-free masked fixup: emit the OOB-zeroing as an
+            # UNCONDITIONAL read-modify-write -- tile_buf[idx] = select(oob,
+            # other, tile_buf[idx]). Because this READS tile_buf (the cp.async
+            # producer's output), InjectSoftwarePipeline classifies it as a
+            # CONSUMER of the async group and inserts cp.async.wait_group<N>
+            # BEFORE it. The masked fixup therefore runs only AFTER its stage's
+            # async load has LANDED -> no WAW race with the in-flight cp.async
+            # (RULE #1: race-free by the pipeline's wait ordering, not a hope).
+            # In-bounds lanes copy the loaded value back (a no-op); OOB lanes get
+            # other -- identical result to the predicated store, but now a
+            # genuine read-after-async-load consumer.
+            cur = tir.BufferLoad(tile_buf, list(_idx))
+            store = tir.BufferStore(
+                tile_buf,
+                tir.Select(pred, other_lane, cur),
+                list(_idx),
+            )
+            epi: Any = store
+        else:
+            store = tir.BufferStore(tile_buf, other_lane, list(_idx))
+            epi = tir.IfThenElse(pred, store, None)
         for axis in range(len(loop_vars) - 1, -1, -1):
             epi = tir.For(
                 loop_vars[axis],

@@ -135,6 +135,31 @@ public:
     return new_buffer;
   }
 
+  // PIPELINENS4 (UnrollLoop alias-view fix, RULE #1 -- correctness):
+  // When the pipeline-unrolled body contains a fresh ALLOC of a local buffer
+  // (e.g. the gemm B-operand ldmatrix-staging ``B_local``, freshened to a new
+  // data Var by VisitBufferDef/alloc_data=true above) AND a separate alias-view
+  // Buffer over that same ``data`` (``B_local_1 = decl_buffer(data=B_local.data)``
+  // used directly in BufferStore / ptx_mma), the base ``VisitBufferUse`` does
+  // NOT remap the view's underlying ``data`` Var. So the alloc gets a fresh Var
+  // while every use of the view still points at the ORIGINAL Var -> after the
+  // SeqStmt::Flatten of the unrolled copies one Var is left undefined (it is
+  // promoted to a kernel API argument and MakePackedAPI fails:
+  // "variables (B_local,) are used, but are not passed in as API arguments").
+  // Rebuild any USED buffer whose ``data`` Var was freshened so the view tracks
+  // its alloc per unrolled copy. This is a pure consistency repair of the
+  // alias, never a fallback.
+  Buffer VisitBufferUse(const Buffer &buffer) final {
+    Buffer remapped = StmtExprMutator::VisitBufferUse(buffer);
+    auto it = var_remap_.find(remapped->data);
+    if (it == var_remap_.end()) {
+      return remapped;
+    }
+    Buffer rebuilt = remapped;
+    rebuilt.CopyOnWrite()->data = (*it).second;
+    return rebuilt;
+  }
+
 private:
   Var FreshVar(const Var &var) {
     Var new_var = Var(make_object<VarNode>(*var.get()));

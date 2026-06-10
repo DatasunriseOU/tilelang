@@ -2715,7 +2715,16 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
         if not _async_enabled:
             return for_node
         import os as _os_pipe
-        if (_os_pipe.environ.get("TL_NO_NUM_STAGES") == "1"
+        # PIPELINENS4: when TRUE multi-stage software pipelining is requested,
+        # the routed copy was emitted PLAIN (no is_async_copy, so
+        # routed_explicit_cp_async is NOT set) and InjectSoftwarePipeline manages
+        # the cp.async commit/wait across stages. We MUST keep the num_stages
+        # stamp (do NOT drop it) so the pipeline actually overlaps stage k+1 loads
+        # with stage k MMA. TL_NO_NUM_STAGES still forces a serial loop for A/B.
+        _pipeline_cp_async = (_os_pipe.environ.get("TL_PIPELINE_CP_ASYNC") == "1")
+        if _pipeline_cp_async:
+            pass  # fall through to the num_stages stamp below
+        elif (_os_pipe.environ.get("TL_NO_NUM_STAGES") == "1"
                 or _os_pipe.environ.get("TL_FORCE_CP_ASYNC") == "1"
                 or getattr(ctx, "routed_explicit_cp_async", False)):
             # ASYNCIMPL (COMMITTED DEFAULT): the routed global->shared K-loop copy
