@@ -1976,6 +1976,149 @@ def _emit_ptrstate_tile_load_tir(
     return tile_buf
 
 
+def _frag_store_scope(val_expr: Any) -> Optional[str]:
+    """Return the memory scope string of ``val_expr`` if it is a Buffer."""
+    scope_fn = getattr(val_expr, "scope", None)
+    if scope_fn is None:
+        return None
+    try:
+        return scope_fn() if callable(scope_fn) else scope_fn
+    except Exception:
+        return None
+
+
+def _emit_ptrstate_fragment_store_copynode(
+    op: Any,
+    ctx: WalkerCtx,
+    dst_buf: Any,
+    resolved: Dict[str, Any],
+    frag_buf: Any,
+    val_shape: Sequence[int],
+    dtype: str,
+    mask_ssa: Any,
+    dynamic_mask_dims: Sequence[Any],
+) -> Any:
+    """Emit a mask-aware DIRECT ``local.fragment`` -> global ``T.copy`` store.
+
+    REGCARRYCOLLAPSE epilogue (the §P1 dstates store). When the loop-carried
+    MMA-C accumulator is bound DIRECTLY to the post-loop ``tt.store`` (no shared
+    ``carry_logical`` staging tile), the value is a swizzled ``local.fragment``.
+    A per-lane serial scalar store reading the fragment at LOGICAL ``[i, j]``
+    indices would impose a flat layout that CONFLICTS with the tensor-core MMA
+    store layout ("Get different layout for carry_tile"). Native Triton instead
+    emits a single layout-aware fragment->global masked store (``tt.store(ptrs,
+    acc, mask)``). We mirror that with TileLang's own layout-aware ``T.copy``:
+
+      1. Build a 2D-strided global VIEW of the flat function-arg buffer
+         (``data`` aliases the arg's backing Var, ``strides`` = the per-axis arg
+         strides, ``elem_offset`` = the per-block base) -- the SAME construction
+         the K-loop LOAD CopyNode uses (``_emit_ptrstate_tile_load_copynode``).
+      2. ``T.copy(frag_region -> view2d_region)``: the CopyNode iterates over the
+         fragment (highest scope-level) and ``InferLayout`` propagates the
+         fragment's registered ``make_mma_store_layout`` to the global store
+         loop, so the per-warp register tile is written DIRECTLY to global at
+         the correct ``[i, j]`` positions -- the MxN fp32 shared stage and its
+         re-traffic are eliminated.
+
+    Mask-awareness (RULE #1 -- correct for general non-mult-of-64 shapes). The
+    native store mask ``(offs_m < hdim) & (offs_n < dstate)`` is, per axis, the
+    bound ``offs_axis < dim_axis`` with ``offs_axis = block_base + arange(BLK)``.
+    Since ``offs`` is monotone from ``block_base``, the in-bounds lane set is the
+    CONTIGUOUS prefix ``[0, dim_axis - block_base)`` -- exactly the clamped
+    extent ``min(BLK, dim_axis - block_base)`` already carried per axis by the
+    ``tts.store`` ``dynamic_mask_dims`` (verified: each dim resolves to
+    ``min(max(min(BLK+base, dim), base) - base, BLK)``). We clamp the copy
+    region to that per-axis extent, so the copy writes EXACTLY the in-bounds
+    lanes -- provably identical to the masked store, never an out-of-bounds /
+    full-tile write. For §P1 (hdim=dstate=64=BLK, single tile) the extent folds
+    to a constant 64 (mask always-true); for a partial trailing tile it clamps.
+    RULE #1: if the per-axis clamped extent cannot be recovered (no
+    ``dynamic_mask_dims`` and no resolvable ``mask_ssa`` bound), we RAISE rather
+    than emit a maskless full-tile write that is wrong for general shapes.
+    """
+    tir = ctx.tir()
+    if len(val_shape) != 2:
+        raise EmitError(
+            "direct fragment->global store: expected rank-2 MMA-C tile, got "
+            "shape %r" % (list(val_shape),)
+        )
+    # Grow the flat arg buffer to the grid-scaled floor (same contract as the
+    # serial store path), then alias its backing data Var into a 2D view.
+    grid_floor = _grid_scaled_store_extent(ctx, val_shape)
+    min_extent = max(_flat_min_extent(val_shape), grid_floor)
+    dst_buf = _redeclare_ctx_buffer_1d(ctx, dst_buf, dtype, min_extent, grow_fixed=True)
+    data_var = getattr(dst_buf, "data", None)
+    if data_var is None:
+        raise EmitError(
+            "direct fragment->global store: flat dst buffer %r has no backing "
+            "data Var to alias into a 2D strided view"
+            % (getattr(dst_buf, "name", "?"),)
+        )
+    base, strides = _ptrstate_block_base_and_strides(ctx, resolved, val_shape)
+    try:
+        dst_scope = dst_buf.scope()
+    except Exception:
+        dst_scope = "global"
+    view2d = tir.decl_buffer(
+        list(val_shape),
+        dtype,
+        name=ctx.fresh((getattr(dst_buf, "name", None) or "out") + "_2d"),
+        data=data_var,
+        strides=list(strides),
+        elem_offset=base,
+        scope=dst_scope or "global",
+    )
+    # Per-axis clamped in-bounds extents (== the native store mask). Prefer the
+    # ``tts.store`` dynamic mask dims (each already the clamped extent); fall
+    # back to a resolvable ``mask_ssa`` only if it yields per-axis bounds. RULE
+    # #1: no recoverable bound -> RAISE (never a maskless full-tile store).
+    extents: List[Any] = []
+    if dynamic_mask_dims:
+        rank = len(val_shape)
+        start_axis = max(0, rank - len(dynamic_mask_dims))
+        # Full extent for any leading axis the mask does not constrain.
+        for axis in range(start_axis):
+            extents.append(tir.const(int(val_shape[axis]), "int32"))
+        for i, dim in enumerate(dynamic_mask_dims):
+            axis = start_axis + i
+            if axis >= rank:
+                break
+            dim_expr = _resolved_or_none(ctx, dim)
+            if dim_expr is None:
+                dim_expr = _coerce_index_scalar(ctx, dim)
+            # Each dynamic dim is the clamped in-bounds extent for this axis.
+            ext = _cast_index_like(ctx, dim_expr, tir.const(0, "int32"))
+            extents.append(ext)
+    if len(extents) != len(val_shape):
+        raise EmitError(
+            "direct fragment->global store: could not recover a per-axis "
+            "in-bounds extent for every tile axis (got %d of %d); refusing to "
+            "emit a maskless full-tile store that is wrong for non-multiple-of-"
+            "block shapes. dynamic_mask_dims=%r mask_ssa=%r"
+            % (len(extents), len(val_shape), dynamic_mask_dims, mask_ssa)
+        )
+    import tilelang.language as T  # type: ignore
+
+    tvm_mod = ctx.tvm()
+    zero = tir.const(0, "int32")
+    src_ranges = [
+        tvm_mod.ir.Range.from_min_extent(zero, ext) for ext in extents
+    ]
+    dst_ranges = [
+        tvm_mod.ir.Range.from_min_extent(zero, ext) for ext in extents
+    ]
+    src_region = tvm_mod.tir.BufferRegion(frag_buf, src_ranges)
+    dst_region = tvm_mod.tir.BufferRegion(view2d, dst_ranges)
+    copy_handle = T.copy(src_region, dst_region)
+    if isinstance(copy_handle, tir.PrimExpr):
+        stmt = tir.Evaluate(copy_handle)
+        ctx.emit(stmt)
+        return stmt
+    if copy_handle is not None:
+        ctx.emit(copy_handle)
+    return copy_handle
+
+
 def _emit_ptrstate_tile_store_tir(
     op: Any,
     ctx: WalkerCtx,
@@ -2003,6 +2146,23 @@ def _emit_ptrstate_tile_store_tir(
     dtype = _normalize_mlir_dtype(
         str(getattr(val_expr, "dtype", _dtype_of(_operands(op)[1]) or "float32"))
     )
+    # REGCARRYCOLLAPSE DIRECT FRAGMENT->GLOBAL EPILOGUE. When the post-loop
+    # ``tt.store`` value is bound DIRECTLY to the loop-carried MMA-C accumulator
+    # (a ``local.fragment``; control.py drops the shared ``carry_logical`` stage
+    # for the unfolded-recurrence slot when TL_FRAG_GLOBAL_EPILOGUE != 0), emit a
+    # single layout-aware, mask-clamped ``T.copy(fragment -> global_2d_view)``
+    # instead of a per-lane serial scalar store. The serial scalar store would
+    # read the fragment at LOGICAL [i, j] and impose a flat layout conflicting
+    # with the MMA store layout; the CopyNode propagates the fragment's
+    # make_mma_store_layout and writes registers DIRECTLY to global, eliminating
+    # the 16 KB shared stage + its re-traffic. RULE #1: the helper RAISES if it
+    # cannot recover the per-axis in-bounds (mask) extent -- never a maskless
+    # full-tile store that is wrong for non-multiple-of-block shapes.
+    if _frag_store_scope(val_expr) in {"local.fragment", "metal.simdgroup"}:
+        return _emit_ptrstate_fragment_store_copynode(
+            op, ctx, dst_buf, resolved, val_expr, list(val_shape), dtype,
+            mask_ssa, dynamic_mask_dims,
+        )
     grid_floor = _grid_scaled_store_extent(ctx, val_shape)
     min_extent = max(_flat_min_extent(val_shape), grid_floor)
     # A strided per-block store that addresses beyond a too-small caller

@@ -3014,39 +3014,41 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
                     carry_scope = _frag_scope_of(carry)
                     if idx in _frag_carry_slots and carry_scope == "local.fragment":
                         # REGCARRYCOLLAPSE: an UNFOLDED-recurrence carry feeds a
-                        # masked strided ``tt.store`` (not a CopyNode). Binding
-                        # the fragment directly to that serial store imposes a
-                        # flat [i,j] layout that CONFLICTS with the gemm MMA
-                        # store layout ("Get different layout for carry_tile").
-                        # So stage the fragment through ONE shared logical tile
-                        # via a layout-aware ``T.copy`` AFTER the loop -- the
-                        # carry recurrence still lives REGISTER/FRAGMENT-resident
-                        # across the whole chunk loop (the per-iteration
-                        # dot_c_logical + carry_next + carry_tile shared
-                        # round-trips are eliminated); only this single post-loop
-                        # MxN shared stage remains, and the masked store reads it
-                        # flat-safely. PROVEN bit-EXACT (MAXDIFF 0.0) vs native.
-                        # RULE #1: the direct path is correct ONLY for a
-                        # CopyNode-able (unmasked) store; choosing the shared
-                        # stage here is the correct path for a masked store, not
-                        # a degraded fallback.
-                        _force_shared_stage = idx in _frag_unfold_slots
-                        if _DIRECT_FRAG_GLOBAL_EPILOGUE_ENABLED and not _force_shared_stage:
+                        # MASKED strided ``tt.store``. The post-loop store emitter
+                        # (``_emit_ptrstate_fragment_store_copynode``) now lowers a
+                        # ``local.fragment`` value to a single MASK-CLAMPED
+                        # ``T.copy(fragment -> global_2d_view)`` -- a layout-aware
+                        # fragment->global store (the CopyNode propagates the MMA
+                        # store layout, no flat-[i,j] conflict) whose copy region
+                        # is clamped per-axis to the in-bounds extent carried by
+                        # the ``tts.store`` dynamic_mask_dims (== the native
+                        # ``(offs_m<hdim)&(offs_n<dstate)`` mask). So we can bind
+                        # the UNFOLDED-recurrence carry DIRECTLY to the store too,
+                        # dropping the post-loop ``carry_logical`` shared stage
+                        # (16 KB) and its store re-traffic -- not just the
+                        # per-iteration round-trips. RULE #1: the store helper
+                        # RAISES if the mask extent cannot be recovered (never a
+                        # maskless full-tile store wrong for non-mult-of-block
+                        # shapes); the parity gate proves bit-correctness. Set
+                        # TL_FRAG_GLOBAL_EPILOGUE=0 to force the legacy shared
+                        # stage for same-session A/B measurement.
+                        if _DIRECT_FRAG_GLOBAL_EPILOGUE_ENABLED:
                             # DIRECT FRAGMENT->GLOBAL EPILOGUE (named capability,
                             # see module docstring). Bind the loop result to the
                             # MMA-C fragment ITSELF -- no shared ``carry_logical``
                             # staging tile. The downstream ``tt.store`` lowers to
-                            # ``T.copy(fragment, global)``: the CopyNode iterates
-                            # over the fragment (highest scope-level) and
-                            # ``InferLayout`` propagates the fragment's registered
-                            # ``make_mma_store_layout`` to the store loop, so the
-                            # per-warp register tile is written DIRECTLY to global
-                            # at the correct [i,j] positions -- the same
-                            # layout-aware fragment->global store native Triton
-                            # emits, with the MxN fp32 shared buffer eliminated.
-                            # RULE #1: this is the correctness path; the parity
-                            # gate proves it bit-correct. A wrong result must RAISE
-                            # (parity harness FAIL), never silently re-stage.
+                            # the mask-clamped ``T.copy(fragment, global_2d_view)``
+                            # (memory.py ``_emit_ptrstate_fragment_store_copynode``):
+                            # the CopyNode iterates over the fragment (highest
+                            # scope-level) and ``InferLayout`` propagates the
+                            # fragment's registered ``make_mma_store_layout`` to the
+                            # store loop, so the per-warp register tile is written
+                            # DIRECTLY to global at the correct [i,j] positions --
+                            # the same layout-aware masked fragment->global store
+                            # native Triton emits, with the MxN fp32 shared buffer
+                            # eliminated. RULE #1: this is the correctness path; the
+                            # parity gate proves it bit-correct. A wrong result must
+                            # RAISE (parity harness FAIL), never silently re-stage.
                             ctx.bind(result_ssa, carry)
                         else:
                             # Legacy shared-staging epilogue, kept ONLY for
