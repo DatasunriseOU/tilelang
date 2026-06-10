@@ -101,6 +101,18 @@ _DIRECT_FRAG_GLOBAL_EPILOGUE_ENABLED = (
     _os.environ.get("TL_FRAG_GLOBAL_EPILOGUE", "1") != "0"
 )
 
+# REGCARRYCOLLAPSE gate (named capability). When ON (default), the UNFOLDED
+# GEMM-accumulate recurrence ``dot(a,b,zero) -> addf(carry, dot) -> yield`` is
+# collapsed to an in-place MMA-fragment accumulation: the chunk-loop carry lives
+# REGISTER/FRAGMENT-resident across the loop, eliminating the redundant
+# ``carry_tile`` + ``dot_c_logical`` + ``carry_next`` shared buffers (native's
+# register-resident dstates recurrence). Set ``TL_REGCARRY_COLLAPSE=0`` to force
+# the legacy shared-carry path for a controlled same-session A/B measurement.
+# RULE #1: both paths are bit-correct; the gate isolates the lever's
+# contribution, it is NOT a degraded fallback. The env var is read DYNAMICALLY
+# at the ``map_scf_for`` call site (NOT cached here) so a single process can
+# build both A and B by toggling the var between compiles.
+
 __all__ = [
     "CONTROL_EMITTERS",
     "EmitError",
@@ -1605,6 +1617,13 @@ def _emit_region(
     # fragment->shared epilogue), accumulating in place across the K-loop.
     if getattr(ctx, "frag_carry_dot_results", None):
         child.frag_carry_dot_results = ctx.frag_carry_dot_results
+    # REGCARRYCOLLAPSE: share the unfolded-recurrence maps so the dot (C ->
+    # carry fragment, in-place accumulate) and the following addf (no-op rebind
+    # to the carry) emit the register/fragment-resident carry inside the region.
+    if getattr(ctx, "frag_carry_unfold_dot", None):
+        child.frag_carry_unfold_dot = ctx.frag_carry_unfold_dot
+    if getattr(ctx, "frag_carry_unfold_add", None):
+        child.frag_carry_unfold_add = ctx.frag_carry_unfold_add
     child.requires_single_thread_body = bool(
         getattr(ctx, "requires_single_thread_body", False)
     )
@@ -2355,13 +2374,36 @@ def _is_zero_constant_lazy(init_val: Any) -> bool:
 def _dot_accumulator_iter_arg_slots(
     region: Any,
     iter_arg_block_ssas: List[Any],
-) -> Tuple[Dict[int, Tuple[int, int]], List[str]]:
+) -> Tuple[Dict[int, Tuple[int, int]], List[str], Dict[str, str], Dict[str, str], set]:
     """Return ``{iter_arg_idx: (M, N)}`` for fused-dot accumulator carries.
 
     Triton's folded/canonicalized TTIR fuses ``acc = acc + dot(a, b)`` into a
     single ``tt.dot %a, %b, %acc_blockarg`` whose RESULT is yielded back into
     the SAME iter_arg slot -- the accumulator threads through the K-loop as a
     loop-carried tile. This is the fused-GEMM-accumulate-into-carry form.
+
+    REGCARRYCOLLAPSE also detects the **UNFOLDED** recurrence that Triton's
+    *un-canonicalized* TTIR emits (the §P1 Mamba dstates form)::
+
+        %z   = arith.constant dense<0.0>          # fresh zero dot-C
+        %d   = tt.dot %a, %b, %z                   # dot into fresh zero
+        %acc = arith.addf %acc_blockarg, %d        # SEPARATE add into the carry
+        scf.yield %acc                             # yield the add result
+
+    Mathematically ``acc = acc + dot(a, b)`` -- identical to the folded form,
+    just split across a ``tt.dot`` (whose C is a fresh zero) and a following
+    ``arith.addf`` (carry + dot result). Native carries this recurrence in the
+    MMA fragment / registers (no shared ``carry_tile`` / ``dot_c_logical`` /
+    ``carry_next``). We collapse it to the SAME in-place fragment accumulation
+    as the folded form: the carry is allocated ``local.fragment``, the dot
+    accumulates DIRECTLY into that carry fragment (``clear_accum=False``, C =
+    the carry, not the fresh zero), and the ``arith.addf`` becomes a no-op
+    rebind to the carry (the MMA already added the dot into it). The yielded
+    add-result then IS the carry fragment, so ``_append_loop_carry_copies``
+    short-circuits (no ``carry_next``) and the final store reads the fragment
+    directly. RULE #1: only fires when the structural use-def below proves the
+    exact ``dot(zero)->addf(carry,dot)->yield(addf)`` chain; any deviation
+    keeps the shared-carry path.
 
     On CUDA that carry MUST be a swizzled ``local.fragment`` (the tensor-core
     MMA store layout asserts a fragment C). If it is materialised as a plain
@@ -2386,11 +2428,23 @@ def _dot_accumulator_iter_arg_slots(
     keep the result == the fragment carry (no in-loop fragment->shared
     epilogue), so the accumulation stays in place across iterations.
     """
+    # ``unfold_dot``: {dot_result_ssa -> carry_blockarg_ssa} so ``map_tt_dot``
+    # routes the unfolded dot's C to the carry fragment (accumulate in place).
+    # ``unfold_add``: {addf_result_ssa -> carry_blockarg_ssa} so ``_emit_addf``
+    # rebinds the add result to the carry (the MMA already added the dot).
+    unfold_dot: Dict[str, str] = {}
+    unfold_add: Dict[str, str] = {}
+    # Slots whose carry came from the UNFOLDED recurrence: their result feeds a
+    # masked strided ``tt.store`` (not a CopyNode), so the post-loop epilogue
+    # must stage the fragment through ONE shared logical tile rather than bind
+    # the fragment to a serial store that would impose a flat layout conflicting
+    # with the MMA store layout.
+    unfold_slots: set = set()
     if not iter_arg_block_ssas:
-        return {}, []
+        return {}, [], unfold_dot, unfold_add, unfold_slots
     ops = _region_body_ops(region)
     if not ops:
-        return {}, []
+        return {}, [], unfold_dot, unfold_add, unfold_slots
     # scf.yield operand order maps 1:1 onto iter_arg slots.
     yield_operands: List[Any] = []
     for inner in ops:
@@ -2398,34 +2452,48 @@ def _dot_accumulator_iter_arg_slots(
             yield_operands = list(_om._operands(inner))
             break
     if not yield_operands:
-        return {}, []
+        return {}, [], unfold_dot, unfold_add, unfold_slots
     blk_names = [_ssa_name(b) for b in iter_arg_block_ssas]
     blk_index = {nm: i for i, nm in enumerate(blk_names) if nm}
     slots: Dict[int, Tuple[int, int]] = {}
     dot_result_ssas: List[str] = []
+    # Index every op's result SSA so the unfolded-form scan can resolve the
+    # producing op of an addf's operands (purely structural use-def).
+    op_by_result: Dict[str, Any] = {}
+    for inner in ops:
+        for res in _om._results(inner):
+            rn = _ssa_name(res)
+            if rn:
+                op_by_result[rn] = inner
+
+    def _is_zero_dense_const(producer: Any) -> bool:
+        """True iff ``producer`` is an ``arith.constant dense<0.0>`` tile."""
+        if producer is None or _wk is None:
+            return False
+        if _wk._op_name(producer) != "arith.constant":
+            return False
+        try:
+            for v in _om._attrs(producer).values():
+                txt = str(v)
+                if "dense" in txt and ("0.0" in txt or "0.000" in txt):
+                    return True
+            return "0.0" in str(producer) or "dense<0" in str(producer)
+        except Exception:
+            return False
+
     for inner in ops:
         if _wk is None or _wk._op_name(inner) != "tt.dot":
             continue
         dot_operands = _om._operands(inner)
         if len(dot_operands) < 3:
             continue
-        c_name = _ssa_name(dot_operands[2])
-        if c_name not in blk_index:
-            continue
-        slot = blk_index[c_name]
-        # The dot's result must be yielded back into the SAME slot -- this is
-        # the accumulate-in-place carry. A dot whose C is a block-arg but whose
-        # result flows elsewhere is NOT a fused carry and keeps its own path.
         results = _om._results(inner)
         if not results:
             continue
         res_name = _ssa_name(results[0])
-        if slot >= len(yield_operands):
-            continue
-        if _ssa_name(yield_operands[slot]) != res_name:
-            continue
+        c_name = _ssa_name(dot_operands[2])
         # Recover the accumulator (M, N) from the dot's A (M x Ka) and
-        # B (Kb x N) operand tile shapes.
+        # B (Kb x N) operand tile shapes (shared by both folded + unfolded).
         try:
             a_shape = [int(s) for s in _om._shape_of(dot_operands[0])]
             b_shape = [int(s) for s in _om._shape_of(dot_operands[1])]
@@ -2433,10 +2501,59 @@ def _dot_accumulator_iter_arg_slots(
             continue
         if len(a_shape) != 2 or len(b_shape) != 2:
             continue
-        slots[slot] = (a_shape[0], b_shape[1])
-        if res_name:
-            dot_result_ssas.append(res_name)
-    return slots, dot_result_ssas
+
+        # --- FOLDED form: dot C IS the carry block-arg, dot result yielded. ---
+        if c_name in blk_index:
+            slot = blk_index[c_name]
+            if slot >= len(yield_operands):
+                continue
+            if _ssa_name(yield_operands[slot]) != res_name:
+                continue
+            slots[slot] = (a_shape[0], b_shape[1])
+            if res_name:
+                dot_result_ssas.append(res_name)
+            continue
+
+        # --- UNFOLDED form: dot C is a fresh zero; a following
+        #     ``arith.addf %carry_blockarg, %dot_result`` is yielded. ---
+        if not _is_zero_dense_const(op_by_result.get(c_name)):
+            continue
+        # Find the addf that consumes this dot result + a carry block-arg and
+        # is yielded back into that block-arg's slot.
+        for cand in ops:
+            if _wk._op_name(cand) not in ("arith.addf", "tt.fadd"):
+                continue
+            add_ops = _om._operands(cand)
+            if len(add_ops) != 2:
+                continue
+            n0 = _ssa_name(add_ops[0])
+            n1 = _ssa_name(add_ops[1])
+            # one operand is the dot result, the other is a carry block-arg
+            if res_name == n0 and n1 in blk_index:
+                carry_blk = n1
+            elif res_name == n1 and n0 in blk_index:
+                carry_blk = n0
+            else:
+                continue
+            slot = blk_index[carry_blk]
+            add_results = _om._results(cand)
+            if not add_results:
+                continue
+            add_res = _ssa_name(add_results[0])
+            if slot >= len(yield_operands):
+                continue
+            if _ssa_name(yield_operands[slot]) != add_res:
+                continue
+            # PROVEN unfolded accumulate-in-place recurrence on slot ``slot``.
+            slots[slot] = (a_shape[0], b_shape[1])
+            if res_name:
+                dot_result_ssas.append(res_name)
+                unfold_dot[res_name] = carry_blk
+            if add_res:
+                unfold_add[add_res] = carry_blk
+            unfold_slots.add(slot)
+            break
+    return slots, dot_result_ssas, unfold_dot, unfold_add, unfold_slots
 
 
 def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
@@ -2545,10 +2662,31 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
         from .reduction import _is_cuda_target as _frag_is_cuda  # noqa: WPS433
     except Exception:  # pragma: no cover - reduction always importable here
         _frag_is_cuda = None
+    _frag_unfold_slots: set = set()
+    _frag_unfold_dot: Dict[str, str] = {}
+    _frag_unfold_add: Dict[str, str] = {}
     if _frag_is_cuda is not None and _frag_is_cuda(ctx):
-        _frag_carry_slots, _frag_dot_results = _dot_accumulator_iter_arg_slots(
+        (_frag_carry_slots, _frag_dot_results,
+         _frag_unfold_dot, _frag_unfold_add,
+         _frag_unfold_slots) = _dot_accumulator_iter_arg_slots(
             region, iter_arg_block_ssas
         )
+        # REGCARRYCOLLAPSE A/B gate: when forced OFF, drop the UNFOLDED-form maps
+        # so the recurrence keeps the legacy shared carry_tile/dot_c_logical/
+        # carry_next path (the FOLDED-form detection above is unaffected -- it
+        # remains a real fragment carry). This isolates the lever for same-session
+        # measurement; both paths are bit-correct (RULE #1).
+        if _os.environ.get("TL_REGCARRY_COLLAPSE", "1") == "0":
+            # Remove ONLY the unfolded slots from the fragment-carry set + clear
+            # the unfold maps, so map_tt_dot / _emit_addf take the shared path.
+            for _s in _frag_unfold_slots:
+                _frag_carry_slots.pop(_s, None)
+            _frag_dot_results = [
+                r for r in _frag_dot_results if r not in _frag_unfold_dot
+            ]
+            _frag_unfold_dot = {}
+            _frag_unfold_add = {}
+            _frag_unfold_slots = set()
         # Record the in-place fused-dot result SSAs so ``map_tt_dot`` keeps the
         # result == the fragment carry (skips its fragment->shared epilogue),
         # leaving the accumulation in place across the K-loop. The set is shared
@@ -2558,6 +2696,19 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
             existing = set(getattr(ctx, "frag_carry_dot_results", set()) or set())
             existing.update(_frag_dot_results)
             ctx.frag_carry_dot_results = existing
+        # REGCARRYCOLLAPSE: record the UNFOLDED-recurrence maps so ``map_tt_dot``
+        # routes the dot's C to the carry fragment (in-place accumulate) and
+        # ``_emit_addf`` rebinds the separate add to the carry (the MMA already
+        # added the dot). These collapse carry_tile / dot_c_logical / carry_next
+        # to a single register/fragment-resident carry (native's recurrence).
+        if _frag_unfold_dot:
+            ed = dict(getattr(ctx, "frag_carry_unfold_dot", {}) or {})
+            ed.update(_frag_unfold_dot)
+            ctx.frag_carry_unfold_dot = ed
+        if _frag_unfold_add:
+            ea = dict(getattr(ctx, "frag_carry_unfold_add", {}) or {})
+            ea.update(_frag_unfold_add)
+            ctx.frag_carry_unfold_add = ea
 
     # Materialise iter_args. Scalar carries get a fresh tir.Var bound via
     # ``tir.LetStmt(var, init, body)``; buffer / tuple carries (e.g. a
@@ -2862,7 +3013,25 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
                     # data. Only the genuine fragment carry takes this path.
                     carry_scope = _frag_scope_of(carry)
                     if idx in _frag_carry_slots and carry_scope == "local.fragment":
-                        if _DIRECT_FRAG_GLOBAL_EPILOGUE_ENABLED:
+                        # REGCARRYCOLLAPSE: an UNFOLDED-recurrence carry feeds a
+                        # masked strided ``tt.store`` (not a CopyNode). Binding
+                        # the fragment directly to that serial store imposes a
+                        # flat [i,j] layout that CONFLICTS with the gemm MMA
+                        # store layout ("Get different layout for carry_tile").
+                        # So stage the fragment through ONE shared logical tile
+                        # via a layout-aware ``T.copy`` AFTER the loop -- the
+                        # carry recurrence still lives REGISTER/FRAGMENT-resident
+                        # across the whole chunk loop (the per-iteration
+                        # dot_c_logical + carry_next + carry_tile shared
+                        # round-trips are eliminated); only this single post-loop
+                        # MxN shared stage remains, and the masked store reads it
+                        # flat-safely. PROVEN bit-EXACT (MAXDIFF 0.0) vs native.
+                        # RULE #1: the direct path is correct ONLY for a
+                        # CopyNode-able (unmasked) store; choosing the shared
+                        # stage here is the correct path for a masked store, not
+                        # a degraded fallback.
+                        _force_shared_stage = idx in _frag_unfold_slots
+                        if _DIRECT_FRAG_GLOBAL_EPILOGUE_ENABLED and not _force_shared_stage:
                             # DIRECT FRAGMENT->GLOBAL EPILOGUE (named capability,
                             # see module docstring). Bind the loop result to the
                             # MMA-C fragment ITSELF -- no shared ``carry_logical``

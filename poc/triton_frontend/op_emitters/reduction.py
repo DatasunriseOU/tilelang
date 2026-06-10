@@ -1141,6 +1141,50 @@ def map_tt_dot(
                 c = None
         else:
             c = None
+        # REGCARRYCOLLAPSE: the UNFOLDED recurrence ``dot(a,b,zero) ->
+        # addf(carry, dot) -> yield`` has its dot-C operand bound to a FRESH
+        # ZERO tile (``%acc_529``), not the loop carry. ``map_scf_for`` proved
+        # (structural use-def) that this dot accumulates into the carry, and
+        # recorded {dot_result -> carry_blockarg_ssa} in ``frag_carry_unfold_dot``.
+        # Override C to the carry FRAGMENT so the MMA accumulates IN PLACE
+        # (clear_accum stays False below since c is non-None), exactly like the
+        # folded fragment-carry form and native's register-resident dstates
+        # recurrence. The carry was allocated ``local.fragment`` + T.fill-zeroed
+        # before the loop, so the first iteration's accumulate starts from zero.
+        # RULE #1: only when the result SSA is in the proven unfold map.
+        _unfold_dot = getattr(ctx, "frag_carry_unfold_dot", None) or {}
+        if result_value is not None and _unfold_dot:
+            # Inline SSA-name extraction (the nested ``_ssa_name`` below is
+            # local-scoped to the gemm branch and not yet defined here; this
+            # mirrors its ``get_name()`` preference so the key MATCHES the name
+            # ``map_scf_for`` recorded in ``frag_carry_unfold_dot``).
+            _rv = None
+            _getter = getattr(result_value, "get_name", None)
+            if callable(_getter):
+                try:
+                    _rv = str(_getter()) or None
+                except Exception:
+                    _rv = None
+            if _rv is None and isinstance(result_value, dict):
+                _rv = str(result_value.get("name") or "") or None
+            _carry_ssa = _unfold_dot.get(_rv) if _rv else None
+            if _carry_ssa is not None:
+                try:
+                    _carry_buf = ctx.get(_carry_ssa)
+                except KeyError:
+                    _carry_buf = (getattr(ctx, "loop_carry_buffers", {}) or {}).get(
+                        _carry_ssa
+                    )
+                if _carry_buf is None:
+                    raise EmitError(
+                        "tt.dot REGCARRYCOLLAPSE: unfolded-recurrence carry "
+                        f"block-arg {_carry_ssa!r} for dot result {_rv!r} is not "
+                        "bound to a buffer. map_scf_for must allocate it as a "
+                        "local.fragment carry and bind the block-arg before the "
+                        "body walks. Refusing to fall back to a fresh shared C "
+                        "(RULE #1)."
+                    )
+                c = _carry_buf
         # Triton accumulates fp16/bf16 inputs into fp32 by convention.
         acc_dtype = (
             "float32" if a_dtype in {"float16", "f16", "bfloat16", "bf16"} else out_dtype

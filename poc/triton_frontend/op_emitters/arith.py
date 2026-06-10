@@ -562,6 +562,39 @@ def _maybe_tile_binop(
 
 
 def _emit_addf(op: Any, ctx: EmitContext) -> Any:
+    # REGCARRYCOLLAPSE: the UNFOLDED dstates recurrence emits a SEPARATE
+    # ``%acc = arith.addf %carry_blockarg, %dot_result`` after the dot. By the
+    # time we reach this addf, ``map_tt_dot`` has already accumulated the dot
+    # IN PLACE into the carry fragment (C = the carry, clear_accum=False), so
+    # the carry fragment ALREADY holds ``carry + dot``. Both operands here are
+    # bound to that same carry fragment, so emitting ``carry + carry`` would
+    # DOUBLE the accumulator. ``map_scf_for`` recorded this addf's result SSA in
+    # ``frag_carry_unfold_add`` after proving the structural recurrence; rebind
+    # the add result straight to the carry fragment (no compute) so the yielded
+    # value IS the carry -> ``_append_loop_carry_copies`` short-circuits (no
+    # carry_next) and there is no shared dot_c_logical / tile_binop. RULE #1:
+    # only the proven unfold-add result reaches this no-op rebind.
+    _unfold_add = getattr(ctx, "frag_carry_unfold_add", None) or {}
+    if _unfold_add:
+        from ..op_mapping import _result_ssa_name  # noqa: WPS433
+        _add_res = _result_ssa_name(op)
+        _carry_ssa = _unfold_add.get(_add_res) if _add_res else None
+        if _carry_ssa is not None:
+            try:
+                _carry_buf = ctx.get(_carry_ssa)
+            except KeyError:
+                _carry_buf = (getattr(ctx, "loop_carry_buffers", {}) or {}).get(
+                    _carry_ssa
+                )
+            if _carry_buf is None:
+                raise EmitError(
+                    "arith.addf REGCARRYCOLLAPSE: unfolded-recurrence carry "
+                    f"block-arg {_carry_ssa!r} for add result {_add_res!r} is "
+                    "not bound to a fragment buffer; the dot must have routed "
+                    "its in-place accumulate into this carry first. Refusing to "
+                    "emit a doubling carry+carry add (RULE #1)."
+                )
+            return _bind_result(op, ctx, _carry_buf)
     a, b = _resolve_two(op, ctx)
     dt = _tile_dtype(ctx, a)
     if not _is_float_dtype(dt):
