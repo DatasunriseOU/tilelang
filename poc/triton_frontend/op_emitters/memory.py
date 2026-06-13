@@ -1542,6 +1542,90 @@ def _emit_oob_zero_partition(
     return emitted_any
 
 
+
+def _build_coalesced_copy_loop_layout(ctx, out_shape, contig_axis, dtype):
+    """Build a parallel-loop ``Fragment`` that maps CONSECUTIVE threads (lanes)
+    to CONSECUTIVE elements along ``contig_axis`` (the GLOBAL-contiguous tile
+    axis) so the cooperative cp.async global load COALESCES.
+
+    LoadCoalesce (MEASURED root cause): the CopyNode loop layout is otherwise
+    inferred from the SHARED-write tile, whose innermost axis is the K (strided
+    global) axis -> the 32 warp lanes scatter across the strided global axis
+    (dout: lane * stride_seqlen = lane * 7168) => 6.2x L1TEX sector inflation.
+
+    This Fragment instead pins the lane/vector axis to the route-verified
+    CONTIGUOUS global axis (dout: headdim, stride 1) -- IDENTICAL global access
+    pattern to native Triton (consecutive lanes read consecutive addresses).
+    The shared WRITE follows the dst buffer's own (swizzled) layout, decoupled
+    from the thread mapping; the MMA fragment read is a SEPARATE access, so the
+    GEMM operand is unchanged. RULE #1: returns None (keep the inferred layout)
+    if the tile cannot be cleanly partitioned -- never a silent wrong mapping.
+
+    Returns a ``tilelang.layout.Fragment`` or ``None``.
+    """
+    try:
+        from tilelang.layout import Fragment  # type: ignore
+    except Exception:
+        return None
+    shp = [int(s) for s in (out_shape or [])]
+    if len(shp) < 2 or contig_axis is None:
+        return None
+    a = int(contig_axis)
+    if not (0 <= a < len(shp)):
+        return None
+    nwarps = int(getattr(ctx, "num_warps", 0) or 0)
+    if nwarps <= 0:
+        return None
+    nthreads = nwarps * 32
+    total = 1
+    for s in shp:
+        total *= int(s)
+    if total <= 0 or total % nthreads != 0:
+        return None  # cannot evenly distribute -> keep inferred layout (no degrade)
+    import re as _re
+    m = _re.search(r"(\d+)", str(dtype) or "")
+    bits = int(m.group(1)) if m else 32
+    vec = max(1, 128 // bits) if bits in (8, 16, 32, 64) else 1
+    ca = int(shp[a])
+    while vec > 1 and (ca % vec != 0):
+        vec //= 2
+    while vec > 1 and ((total // vec) % nthreads != 0):
+        vec //= 2
+    cells = total // vec
+    if cells % nthreads != 0:
+        return None
+    ndim = len(shp)
+    other_axes = [i for i in range(ndim) if i != a]
+    stride_cells = [0] * ndim
+    stride_cells[a] = 1
+    acc = shp[a] // vec
+    for ax in reversed(other_axes):
+        stride_cells[ax] = acc
+        acc *= shp[ax]
+
+    def _cell(idx):
+        c = 0
+        for ax in range(ndim):
+            term = idx[ax]
+            if ax == a:
+                term = idx[ax] // vec
+            c = c + term * int(stride_cells[ax])
+        return c
+
+    def _forward_thread(*idx):
+        return _cell(idx) % nthreads
+
+    def _forward_index(*idx):
+        outer = _cell(idx) // nthreads
+        return outer * vec + (idx[a] % vec)
+
+    try:
+        return Fragment(list(shp), forward_thread_fn=_forward_thread,
+                        forward_index_fn=_forward_index)
+    except Exception:
+        return None
+
+
 def _emit_ptrstate_tile_load_copynode(
     op: Any,
     ctx: WalkerCtx,
@@ -1859,6 +1943,16 @@ def _emit_ptrstate_tile_load_copynode(
         # (control.py ``_maybe_pipeline``) skips the num_stages stamp. RULE #1: one
         # clear async path; the wait is always present, never a silent half-state.
         import os as _os_async
+        # LoadCoalesce: explicit parallel-loop layout mapping lanes to the
+        # route-verified CONTIGUOUS global axis (``_contig_axis``) so the
+        # cooperative cp.async global load COALESCES (consecutive lanes ->
+        # consecutive global addresses), instead of the shared-write-inferred
+        # layout that scatters lanes across the strided K axis. Gated to the
+        # async/default path; disabled via TL_NO_COALESCE_LAYOUT=1 for A/B.
+        _coalesce_ll = None
+        if _os_async.environ.get("TL_NO_COALESCE_LAYOUT") != "1" and _contig_axis is not None:
+            _coalesce_ll = _build_coalesced_copy_loop_layout(
+                ctx, out_shape, _contig_axis, out_dtype)
         if _os_async.environ.get("TL_NO_ASYNC_COPY") == "1":
             copy_call = T.copy(src2d_region, tile_buf, disable_tma=True)
         elif _os_async.environ.get("TL_PIPELINE_CP_ASYNC") == "1":
@@ -1886,6 +1980,7 @@ def _emit_ptrstate_tile_load_copynode(
                 tile_buf,
                 disable_tma=True,
                 annotations={"is_async_copy": 1},
+                loop_layout=_coalesce_ll,
             )
             # Signal the K-loop emitter to NOT stamp num_stages (the copy is
             # self-contained async; pipeline planning would FATAL on the
