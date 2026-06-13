@@ -915,6 +915,123 @@ def _is_trivial_noop_body(body_stmt: Any, ctx: _om.WalkerCtx) -> bool:
     return False
 
 
+def _mtp_ssa_name(value: Any) -> Optional[str]:
+    """Printed SSA name (``"%108"``) of a value across binding shapes."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    for attr in ("get_name", "name"):
+        getter = getattr(value, attr, None)
+        if callable(getter):
+            try:
+                out = str(getter())
+                if out:
+                    return out
+            except Exception:
+                pass
+        elif isinstance(getter, str) and getter:
+            return getter
+    try:
+        head = str(value).strip().split()[0]
+        if head.startswith("%"):
+            return head
+    except Exception:
+        pass
+    return None
+
+
+def _mtp_op_name(o: Any) -> str:
+    name = getattr(o, "name", None)
+    if not name:
+        inner = getattr(o, "operation", None)
+        name = getattr(inner, "name", None) if inner is not None else None
+    if not name and isinstance(o, dict):
+        name = o.get("name")
+    return str(name) if name else ""
+
+
+def _materialize_make_tptr_index_operands(func_op: Any, ctx: _om.WalkerCtx) -> None:
+    """Bind every ``tts.make_tptr`` dynamic offset/stride SSA into value_map.
+
+    See the FixPtrState108 note at the call site in :func:`map_tt_func`.
+    Walks the tt.func body to (a) index result-SSA -> defining op and (b)
+    collect ``tts.make_tptr`` ops, then depth-first dispatches each make_tptr
+    dynamic index operand's producer chain through ``OP_TABLE``. Idempotent:
+    a producer already bound (kernel arg / earlier emit) is skipped, and the
+    same producer is bound at most once here; the later body walk re-binding
+    the same scalar SSA is harmless (same value, no statement emitted for a
+    scalar index expr).
+    """
+    from ..mlir_walker import OPS_THAT_HANDLE_OWN_REGIONS  # noqa: WPS433
+
+    regions = _scf_regions(func_op)
+    if not regions:
+        return
+    blocks = getattr(regions[0], "blocks", ()) or []
+    if not blocks:
+        return
+
+    def_of: Dict[str, Any] = {}
+    make_tptr_ops: List[Any] = []
+
+    def _index(o: Any) -> None:
+        nm = _mtp_op_name(o)
+        for r in (_om._results(o) or ()):
+            rn = _mtp_ssa_name(r)
+            if rn:
+                def_of.setdefault(rn, o)
+        if nm == "tts.make_tptr":
+            make_tptr_ops.append(o)
+        for region in getattr(o, "regions", ()) or ():
+            for block in getattr(region, "blocks", ()) or ():
+                for child in getattr(block, "operations", ()) or ():
+                    _index(child)
+
+    for block in blocks:
+        for child in getattr(block, "operations", ()) or ():
+            _index(child)
+
+    if not make_tptr_ops:
+        return
+
+    materialized: set = set()
+
+    def _materialize(ssa: Optional[str], stack: Tuple[str, ...] = ()) -> None:
+        if ssa is None or ssa in materialized:
+            return
+        try:
+            if ssa in ctx.value_map:
+                return
+        except TypeError:
+            return
+        defop = def_of.get(ssa)
+        if defop is None or ssa in stack:
+            # No producer in this module (kernel arg already handled above,
+            # or genuinely unresolvable) -- leave for the precise downstream
+            # raise. Never fabricate an index.
+            return
+        for opnd in getattr(defop, "operands", ()) or ():
+            _materialize(_mtp_ssa_name(opnd), stack + (ssa,))
+        dn = _mtp_op_name(defop)
+        emitter = _om.OP_TABLE.get(dn)
+        if emitter is None:
+            return
+        if getattr(emitter, "owns_regions", False) or dn in OPS_THAT_HANDLE_OWN_REGIONS:
+            # Region-owning producer (scf.*): emitting out of walk order would
+            # mis-scope its body. make_tptr index feeders are flat arith and
+            # never hit this; leave for the precise downstream raise.
+            return
+        materialized.add(ssa)
+        emitter(defop, ctx)
+
+    for mk in make_tptr_ops:
+        operands = list(getattr(mk, "operands", ()) or [])
+        # operand 0 is the base pointer; 1+ are dynamic index offset/stride.
+        for opnd in operands[1:]:
+            _materialize(_mtp_ssa_name(opnd))
+
+
 def map_tt_func(op: Any, ctx: _om.WalkerCtx) -> Any:
     """Build a ``tvm.tir.PrimFunc`` from a ``tt.func`` op.
 
@@ -1002,6 +1119,37 @@ def map_tt_func(op: Any, ctx: _om.WalkerCtx) -> Any:
             except Exception:
                 pass
             ctx.value_map[ssa] = bound
+
+    # ------------------------------------------------------------------
+    # FixPtrState108 -- materialize tts.make_tptr offset/stride operands
+    # ------------------------------------------------------------------
+    #
+    # PtrAnalysis rewrites tt.* pointer arithmetic into ``tts.make_tptr`` ops
+    # whose dynamic offsets/strides are SYNTHETIC index-typed SSA values
+    # (e.g. ``%108 = arith.addi(...)``) inserted by the structured-pointer
+    # rewrite immediately before the make_tptr. Those scalar SSA are recorded
+    # in the recovered ``PtrState`` (``state.offsets`` / ``state.strides``)
+    # and consumed by ``_resolve_ptrstate_value`` when a downstream
+    # ``tt.load`` / ``tts.store`` against the SAME source pointer is emitted.
+    # A loop-carried load (``tt.load(%argNN, ...)`` where ``%argNN`` is an
+    # scf.for iter-arg tracing back to the make_tptr base) is dispatched
+    # BEFORE the walk reaches the later top-level arith ops that DEFINE those
+    # offset/stride SSA -- so they are absent from ``ctx.value_map`` and
+    # resolution raises ``EmitError: PtrState references unresolved SSA value
+    # '%108'``.
+    #
+    # Fix (generic, target-independent): immediately after the tt.func block
+    # args are bound (so kernel-arg SSA like ``%arg23`` resolve) and BEFORE
+    # the body region is walked, eagerly emit the transitive defining-op
+    # chain of every make_tptr's dynamic index operands through the REAL
+    # OP_TABLE emitters, in dependency order (definitions first). This binds
+    # ``%104/%106/%107/%108`` (and their feeders) into ``ctx.value_map``
+    # using the exact arith semantics the walker would apply, so the later
+    # ``_resolve_ptrstate_value`` finds them. RULE #1: we never fabricate an
+    # index -- an operand with no defining op in this module that is also not
+    # already bound is left untouched, so ``_resolve_ptrstate_value`` still
+    # RAISES with the precise op + SSA. Any emitter exception propagates.
+    _materialize_make_tptr_index_operands(op, ctx)
 
     # Walk body region
     regions = _scf_regions(op)
