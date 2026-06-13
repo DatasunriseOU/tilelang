@@ -104,6 +104,96 @@ def _is_cuda_target(ctx: Any = None) -> bool:
     return "cuda" in kind or "nvidia" in tstr or "cuda" in tstr
 
 
+def _is_metal_target(ctx: Any = None) -> bool:
+    """Return True iff the codegen target is explicitly Apple Metal.
+
+    Mirrors ``_is_cuda_target`` (prefers ``ctx.target`` set by ``from_ttir``,
+    falls back to the ambient ``Target.current()``). Used by
+    ``_wants_fragment_c`` to request a ``local.fragment`` C for an
+    Apple-simdgroup-ELIGIBLE dot so the ``metal_fragment_to_simdgroup`` pass can
+    promote it to ``metal.simdgroup`` ops. fp32 dots are screened out by the
+    dtype guard in ``_wants_fragment_c`` (it mirrors the
+    ``metal_fragment_to_simdgroup`` pass's ``_SIMDGROUP_DTYPES``, which does NOT
+    include float32) -- so fp32 dots keep the shared/SIMT path rather than being
+    routed to the (separate, precision-unvalidated) fp32 simdgroup gemm path.
+    """
+    ctx_target = getattr(ctx, "target", None) if ctx is not None else None
+    if ctx_target:
+        t = str(ctx_target).lower()
+        return "metal" in t or "apple" in t
+    try:
+        import tvm  # noqa: WPS433
+
+        target = tvm.target.Target.current(allow_none=True)
+    except Exception:
+        return False
+    if target is None:
+        return False
+    kind = str(getattr(getattr(target, "kind", None), "name", "") or "").lower()
+    tstr = str(target).lower()
+    return "metal" in kind or "metal" in tstr or "apple" in tstr
+
+
+# Simdgroup-promotable INPUT dtypes for the Metal fragment->simdgroup pass.
+# fp32 is DELIBERATELY excluded -- it mirrors
+# ``metal_fragment_to_simdgroup._SIMDGROUP_DTYPES`` (the pass that rewrites a
+# ``local.fragment`` GEMM C to ``metal.simdgroup`` ops), which lists only the
+# half/bf16/fp8/int8 slot dtypes, NOT float32. So an fp32 dot keeps shared/SIMT
+# C; we never force it to fragment to chase a simdgroup C (RULE #1: no silent
+# bf16 downcast of an fp32 dot). NB: TileLang's separate gemm.cc legacy
+# simdgroup path CAN emit ``simdgroup_float8x8`` for an fp32 fragment C, but
+# that path's numerics are NOT parity-validated here (no Apple-GPU dispatch),
+# so the conservative residency choice is to leave fp32 on the shared path.
+_METAL_SIMDGROUP_INPUT_DTYPES = frozenset({
+    "float16", "f16", "half",
+    "bfloat16", "bf16",
+    "float8_e4m3", "float8_e5m2",
+    "fp8", "fp8_e4m3", "fp8_e5m2",
+    "e4m3", "e5m2",
+})
+
+
+def _wants_fragment_c(
+    ctx: Any,
+    a_dtype: str,
+    b_dtype: str,
+    M: int,
+    N: int,
+) -> bool:
+    """Generic residency predicate: should the tt.dot C accumulator be forced
+    into ``local.fragment`` (vs the shared-C default)?
+
+    True iff EITHER:
+      * the target is explicitly CUDA (tensor-core MMA REQUIRES a fragment C --
+        ``make_mma_store_layout`` asserts ``is_fragment(C)``); OR
+      * the target is explicitly Metal AND the dot is Apple-simdgroup ELIGIBLE:
+        both input operands are a simdgroup INPUT dtype (fp16/bf16/fp8 -- NOT
+        fp32) AND M % 8 == 0 AND N % 8 == 0 (simdgroup_matrix is an 8x8 tile).
+        A fragment C then lets ``metal_fragment_to_simdgroup`` promote the dot
+        to ``metal.simdgroup_*`` builtins.
+
+    Otherwise False -> shared C (Metal SIMT default; also fp32 Metal dots such
+    as the Mamba3 dstates recurrence, which cannot be simdgroup on Apple HW).
+
+    RULE #1: this is a target+dtype correctness gate, NOT a silent downgrade --
+    an fp32 Metal dot keeps shared C and a real SIMT codegen path; it is never
+    coerced into an invalid fp32 simdgroup store. M/N/dtype come straight from
+    the dot operands in scope at the call site (a_shape/b_shape, normalized
+    a_dtype/b_dtype); if they were unavailable the caller raises rather than
+    guessing.
+    """
+    if _is_cuda_target(ctx):
+        return True
+    if not _is_metal_target(ctx):
+        return False
+    eligible_dtype = (
+        a_dtype in _METAL_SIMDGROUP_INPUT_DTYPES
+        and b_dtype in _METAL_SIMDGROUP_INPUT_DTYPES
+    )
+    eligible_shape = (int(M) % 8 == 0) and (int(N) % 8 == 0)
+    return eligible_dtype and eligible_shape
+
+
 __all__ = [
     "REDUCTION_EMITTERS",
     "EmitError",
@@ -1579,18 +1669,24 @@ def map_tt_dot(
 
         clear_accum = False
         prefer_shared_c = _result_needs_shared_c()
-        # Target gate: shared-C is the DEFAULT (Metal/unspecified) -- GemmMetal
-        # stores its simdgroup accumulator back to a shared tile, and a
-        # follow-up scalar expr like ``dot * scale`` needs C readable as a
-        # shared tile. But on an EXPLICIT CUDA target the tensor-core MMA path
-        # REQUIRES the accumulator in ``local.fragment``:
-        # ``mma_macro_generator.make_mma_store_layout`` asserts
-        # ``is_fragment(C)`` and aborts on a shared C (``local_buf ... must be
-        # a fragment, but got shared``). So we force fragment-C ONLY when the
-        # target is explicitly CUDA, leaving the Metal/unspecified default
-        # untouched. (RULE #1: a real target-correctness fix, not a silent
-        # downgrade -- a shared-C MMA simply does not codegen on CUDA.)
-        if prefer_shared_c and _is_cuda_target(ctx):
+        # Target gate: shared-C is the DEFAULT (Metal SIMT / unspecified) --
+        # GemmMetal's cooperative path stores its accumulator back to a shared
+        # tile, and a follow-up scalar expr like ``dot * scale`` needs C
+        # readable as a shared tile. We force C into ``local.fragment`` ONLY
+        # when ``_wants_fragment_c`` says so:
+        #   * EXPLICIT CUDA -- tensor-core MMA REQUIRES a fragment C
+        #     (``mma_macro_generator.make_mma_store_layout`` asserts
+        #     ``is_fragment(C)`` and aborts on a shared C); OR
+        #   * EXPLICIT Metal AND an Apple-simdgroup-ELIGIBLE dot
+        #     (fp16/bf16/fp8 inputs, M%8==0, N%8==0) -- a fragment C lets the
+        #     ``metal_fragment_to_simdgroup`` pass promote the dot to
+        #     ``metal.simdgroup_*`` builtins.
+        # fp32 Metal dots (e.g. the Mamba3 dstates recurrence) are NOT eligible
+        # (Apple HW has no fp32 simdgroup_matrix input type), so they fall
+        # through to shared C + the SIMT path -- NOT coerced into an invalid
+        # fp32 simdgroup store (RULE #1: target+dtype correctness, no silent
+        # bf16 downcast). M/N/dtype come straight from the dot operands above.
+        if prefer_shared_c and _wants_fragment_c(ctx, a_dtype, b_dtype, M, N):
             prefer_shared_c = False
         c_scope = "shared" if prefer_shared_c else "local.fragment"
         c_prefix = "dot_c_shared" if prefer_shared_c else "dot_c_frag"
