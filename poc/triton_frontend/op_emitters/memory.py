@@ -1296,6 +1296,252 @@ def _ptrstate_block_base_and_strides(
     return base, strides
 
 
+def _decompose_monotone_mask_extents(
+    ctx: WalkerCtx,
+    mask_lane: Any,
+    loop_vars: Sequence[Any],
+    out_shape: Sequence[int],
+) -> Optional[List[Any]]:
+    """Recover per-axis in-bounds extents from an ``And``-of-``LT`` tile mask.
+
+    BOUNDSHOIST (mask_ssa form). The native ``tl.load``/``tl.store`` row/col
+    mask lowers to ``mask_lane = AND_a ( lhs_a(i_a) < bound_a )`` where each
+    leaf depends on EXACTLY ONE loop var ``i_a`` and ``lhs_a`` is affine in
+    that var with unit coefficient (``offs_a = block_base_a + i_a``, the
+    monotone iota). For such a leaf the in-bounds lane set on axis ``a`` is the
+    contiguous prefix ``i_a < (bound_a - block_base_a)``, i.e. the per-axis
+    extent ``bound_a - lhs_a|_{i_a=0}``.
+
+    We split the ``And`` into leaves, attribute each to its single loop var,
+    and compute the extent by substituting ``i_a := 0`` into ``lhs_a`` (TVM
+    ``Substitute``) and verifying with the arithmetic analyzer that the leaf is
+    exactly ``LT(i_a + c, bound)`` (unit-coeff, single-var) so the prefix is
+    truly contiguous. RULE #1: return ``None`` -- so the caller keeps the
+    correct per-element predicate -- unless EVERY constrained axis yields a
+    verified unit-coeff monotone bound and every axis ends up covered. Never
+    guess a bound: a wrong extent would drop the guard on real OOB lanes.
+    """
+    tir = ctx.tir()
+    rank = len(loop_vars)
+    if rank == 0:
+        return None
+    try:
+        from tvm.tir import stmt_functor as _sf  # noqa: WPS433
+        substitute = _sf.substitute
+    except Exception:
+        return None
+    import tvm as _tvm  # noqa: WPS433
+
+    # Flatten the conjunction into LT leaves. The boolean AND of the row/col
+    # mask lowers either to a ``tir.And`` node OR to a ``tirx.bitwise_and``
+    # Call (the bool tile comparator path); recurse through both. Bail on any
+    # other node (Or, Not, a comparison we don't model) so the caller keeps
+    # the per-element predicate (RULE #1).
+    leaves: List[Any] = []
+    stack = [mask_lane]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, tir.And):
+            stack.append(node.a)
+            stack.append(node.b)
+        elif (
+            isinstance(node, tir.Call)
+            and getattr(node.op, "name", None) == "tirx.bitwise_and"
+            and len(node.args) == 2
+        ):
+            stack.append(node.args[0])
+            stack.append(node.args[1])
+        elif isinstance(node, tir.LT):
+            leaves.append(node)
+        else:
+            return None
+    if not leaves:
+        return None
+
+    var_of = {v: i for i, v in enumerate(loop_vars)}
+    extents: List[Any] = [None] * rank
+    analyzer = _tvm.arith.Analyzer()
+    affine_src = getattr(ctx, "affine_tile_source", None) or {}
+    from tvm.tir import stmt_functor as _sf2  # noqa: WPS433
+
+    def _lhs_as_affine(lhs: Any) -> Optional[Any]:
+        """Return an analyzer-transparent affine form of ``lhs``, or None.
+
+        If ``lhs`` is a bare ``BufferLoad`` of a buffer materialized from a
+        recorded affine iota source, substitute the source's per-lane
+        ``read_lane`` expression (``base + i``). A plain PrimExpr passes
+        through unchanged. RULE #1: when the buffer is NOT a recorded affine
+        source we return ``lhs`` as-is -- the unit-coeff check below then
+        fails and the caller keeps the predicate (never a guessed bound).
+        """
+        if isinstance(lhs, tir.BufferLoad):
+            src_expr = affine_src.get(getattr(lhs.buffer, "data", None))
+            if src_expr is not None:
+                try:
+                    indices = list(lhs.indices)
+                    src_rank = len(getattr(src_expr, "shape", ()) or ())
+                    # An ``expand_dims`` alias indexes the SAME backing buffer
+                    # with extra broadcast (size-1) axes the rank-<src_rank>
+                    # source does not carry. Drop the size-1 axes of the alias
+                    # so the surviving indices map onto the source's lane axes.
+                    if src_rank and len(indices) > src_rank:
+                        buf_shape = list(getattr(lhs.buffer, "shape", []) or [])
+                        if len(buf_shape) == len(indices):
+                            kept = [
+                                idx
+                                for idx, dim in zip(indices, buf_shape)
+                                if not (
+                                    isinstance(dim, tir.IntImm)
+                                    and int(dim.value) == 1
+                                )
+                            ]
+                            if len(kept) == src_rank:
+                                indices = kept
+                    if src_rank and len(indices) != src_rank:
+                        # Could not reconcile rank -> do NOT guess; keep the
+                        # opaque BufferLoad so the unit-coeff check fails and
+                        # the caller retains the predicate (RULE #1).
+                        return lhs
+                    return src_expr.read_lane(ctx, tuple(indices))
+                except Exception:
+                    return None
+            return lhs
+        return lhs
+
+    for leaf in leaves:
+        lhs_raw, rhs = leaf.a, leaf.b
+        lhs = _lhs_as_affine(lhs_raw)
+        if lhs is None:
+            return None
+        # Which loop vars does lhs depend on? Must be exactly one.
+        used_vars = set()
+        _sf2.post_order_visit(
+            lhs, lambda o: used_vars.add(o) if isinstance(o, tir.Var) else None
+        )
+        present = [var_of[v] for v in used_vars if v in var_of]
+        if len(present) != 1:
+            # lhs spans zero or multiple loop vars -> not a clean per-axis
+            # monotone bound. Keep the predicate (RULE #1).
+            return None
+        axis = present[0]
+        var = loop_vars[axis]
+        # Verify lhs is affine unit-coefficient in var: lhs(var) - lhs(var=0)
+        # must simplify to exactly `var` (a strictly-monotone unit-step iota,
+        # so the in-bounds lane set is the contiguous prefix [0, rhs - lhs0)).
+        lhs0 = substitute(lhs, {var: tir.const(0, var.dtype)})
+        delta = analyzer.simplify(lhs - lhs0)
+        if not (isinstance(delta, tir.Var) and delta.same_as(var)):
+            return None
+        # In-bounds extent on this axis: rhs - lhs0 (where lhs = var + lhs0).
+        ext = analyzer.simplify(
+            _cast_index_like(ctx, rhs, var) - _cast_index_like(ctx, lhs0, var)
+        )
+        if extents[axis] is not None:
+            # Two leaves on the same axis -> take the tighter (min) bound.
+            ext = tir.Min(extents[axis], ext)
+        extents[axis] = ext
+    # Any axis with no leaf is fully in-bounds (extent == tile dim).
+    for axis in range(rank):
+        if extents[axis] is None:
+            extents[axis] = tir.const(int(out_shape[axis]), "int32")
+    return extents
+
+
+def _emit_oob_zero_partition(
+    ctx: WalkerCtx,
+    tile_buf: Any,
+    loop_vars: Sequence[Any],
+    out_shape: Sequence[int],
+    extents: Sequence[Any],
+    other_lane: Any,
+) -> bool:
+    """Emit the masked-OOB zero-fill as axis-partitioned UNGUARDED loops.
+
+    BOUNDSHOIST (the corrected, evidence-based dominant move). The previous
+    epilogue wrapped the WHOLE ``BLK_m x BLK_k`` tile in a per-element
+    predicate ``if (i0>=ext0 | i1>=ext1) tile[idx]=0`` -- which native Triton
+    never does. For a fully-aligned tile (``ext_axis == BLK_axis``, the §P1
+    hd=ds=64 case and every tile where the dim divides the block) the
+    predicate is ALWAYS FALSE yet was evaluated ``BLK_m*BLK_k`` times per
+    thread per K-iter -- the dominant contributor to the 9.41B
+    ``op_integer_pred_on`` saturating L1TEX at 87% SOL.
+
+    We instead PARTITION the OOB set ``{ANY axis i_a >= ext_a}`` into disjoint
+    per-axis regions and emit each as a plain clamped ``tir.For`` nest with NO
+    inner predicate -- the loop BOUNDS encode the partition:
+
+      region[a] = { i_a in [clamp(ext_a), BLK_a)  (the OOB suffix of axis a)
+                    AND i_b in [0, clamp(ext_b))  for every earlier axis b<a
+                    AND i_c in [0, BLK_c)         for every later axis c>a }
+
+    Each OOB cell has a UNIQUE smallest-OOB axis, so the regions are disjoint
+    and cover the OOB set EXACTLY (a cell fully in-bounds lands in no region).
+    For a full tile ``clamp(ext_a) == BLK_a`` -> the axis-``a`` suffix
+    ``[BLK_a, BLK_a)`` is EMPTY -> TVM emits no loop body and ptxas drops it:
+    ZERO predicate, ZERO iterations. For a genuine partial trailing tile only
+    the real OOB cells iterate, UNGUARDED. RULE #1: writes ``other`` (0) to
+    EXACTLY the OOB lanes -- bit-identical to the predicated epilogue, never a
+    maskless in-bounds overwrite and never an OOB write past the tile.
+    """
+    tir = ctx.tir()
+    rank = len(loop_vars)
+    if rank == 0 or len(extents) != rank:
+        return False
+    zero = tir.const(0, "int32")
+
+    def _clamp(ext: Any, axis: int) -> Any:
+        # clamp(ext, 0, BLK_axis) -- a serial For with start>stop is a no-op,
+        # but we clamp so the suffix start never exceeds the tile extent (a
+        # dim_axis - block_base that overshoots BLK on a non-trailing tile) and
+        # the prefix stop is a valid [0, BLK] bound.
+        blk = tir.const(int(out_shape[axis]), "int32")
+        ext_i = _cast_index_like(ctx, ext, zero)
+        return tir.Max(zero, tir.Min(ext_i, blk))
+
+    clamped = [_clamp(extents[a], a) for a in range(rank)]
+    blk = [tir.const(int(out_shape[a]), "int32") for a in range(rank)]
+    emitted_any = False
+    for a in range(rank):
+        # Build the per-axis [min, stop) range for partition region[a].
+        # axis a: OOB suffix [clamped_a, BLK_a); earlier axes: in-bounds prefix
+        # [0, clamped_b); later axes: full [0, BLK_c). ``tir.For`` takes
+        # (loop_var, min, EXTENT, kind, body) where extent = stop - min and the
+        # loop var iterates [min, min+extent); a non-positive extent makes the
+        # body unreachable (the full-tile no-op).
+        #
+        # Mint FRESH per-region loop vars: each region constrains a given axis
+        # to a DIFFERENT const-int range ([clamped, BLK) in its own region,
+        # [0, clamped) as an earlier axis elsewhere). Reusing one Var across
+        # regions trips the analyzer's single-const-bound-per-Var invariant.
+        region_vars = [
+            tir.Var(ctx.fresh(f"oobz{a}_{axis}"), "int32")
+            for axis in range(rank)
+        ]
+        # Index the tile with the per-region loop vars (same flat indexing as
+        # the predicated epilogue; any swizzle layout is applied by the later
+        # TVM layout pass, not here).
+        store = tir.BufferStore(tile_buf, other_lane, list(region_vars))
+        body: Any = store
+        for axis in range(rank - 1, -1, -1):
+            if axis == a:
+                lo, stop = clamped[axis], blk[axis]
+            elif axis < a:
+                lo, stop = zero, clamped[axis]
+            else:
+                lo, stop = zero, blk[axis]
+            extent = stop if (lo is zero) else tir.Sub(stop, lo)
+            body = tir.For(
+                region_vars[axis],
+                lo,
+                extent,
+                tir.ForKind.SERIAL,
+                body,
+            )
+        ctx.emit(body)
+        emitted_any = True
+    return emitted_any
+
+
 def _emit_ptrstate_tile_load_copynode(
     op: Any,
     ctx: WalkerCtx,
@@ -1656,6 +1902,7 @@ def _emit_ptrstate_tile_load_copynode(
     # shared tile, overwrite the out-of-bounds lanes with ``other`` (default
     # 0) in a separate predicated For. In-bounds lanes keep the copied value.
     pred = None
+    pred_from_mask_ssa = False
     other_lane: Any = tir.const(0, out_dtype)
     if mask_ssa is not None:
         try:
@@ -1675,6 +1922,9 @@ def _emit_ptrstate_tile_load_copynode(
             # Epilogue writes ``other`` where the lane is OUT of bounds:
             # predicate is the NEGATION of the in-bounds mask.
             pred = tir.Not(mask_lane)
+            pred_from_mask_ssa = True
+    else:
+        mask_lane = None
     dyn = _dynamic_tts_mask_expr(ctx, loop_vars, dynamic_mask_dims)
     if dyn is not None:
         dyn_oob = tir.Not(dyn)
@@ -1682,6 +1932,50 @@ def _emit_ptrstate_tile_load_copynode(
     if pred is not None:
         import os as _os_epi
         _idx = list(loop_vars) or [tir.const(0, "int32")]
+        # BOUNDSHOIST: the masked-OOB epilogue zeroes the lanes OUTSIDE the
+        # native row/col mask. That in-bounds predicate is an ``AND`` of
+        # per-axis monotone bounds ``offs_axis < dim_axis`` (the ``mask_ssa``
+        # ``tl.load`` mask) and/or the clamped ``dynamic_mask_dims`` -- BOTH a
+        # contiguous per-axis prefix. We DECOMPOSE the combined in-bounds
+        # predicate into one extent per axis and emit the zero-fill as
+        # axis-partitioned UNGUARDED loops over the OOB suffix, instead of the
+        # per-element predicate rebuild native Triton never does. For a fully-
+        # aligned tile (the §P1 hd=ds=64 case) every partition loop has an
+        # EMPTY range -> zero predicate, zero iterations (collapses the
+        # dominant 9.41B op_integer_pred_on saturating L1TEX at 87% SOL). The
+        # pipelined path keeps the read-modify-write consumer form (it must
+        # READ tile_buf for the async wait ordering), so partitioning is gated
+        # to the non-pipelined default. RULE #1: writes 0 to EXACTLY the OOB
+        # lanes, bit-identical to the predicate; falls back to the predicated
+        # loop whenever the per-axis extents are not provably recoverable
+        # (never a maskless overwrite, never an OOB write).
+        if (
+            _os_epi.environ.get("TL_PIPELINE_CP_ASYNC") != "1"
+            and _os_epi.environ.get("TL_NO_BOUNDS_HOIST") != "1"
+        ):
+            # Combined in-bounds predicate = mask_lane AND dyn (whichever
+            # present). Decompose it into per-axis contiguous-prefix extents.
+            in_bounds = None
+            if mask_lane is not None:
+                in_bounds = mask_lane
+            if dyn is not None:
+                in_bounds = dyn if in_bounds is None else tir.And(in_bounds, dyn)
+            extents = None
+            if in_bounds is not None:
+                extents = _decompose_monotone_mask_extents(
+                    ctx, in_bounds, loop_vars, out_shape
+                )
+            if _os_epi.environ.get("TL_BOUNDSHOIST_DEBUG") == "1":
+                import sys as _sys
+                print("BOUNDSHOIST epilogue rank=%d mask_ssa=%s dyn=%s "
+                      "partitioned=%s" % (
+                          len(loop_vars), mask_lane is not None,
+                          dyn is not None, extents is not None),
+                      file=_sys.stderr, flush=True)
+            if extents is not None and _emit_oob_zero_partition(
+                ctx, tile_buf, loop_vars, out_shape, extents, other_lane,
+            ):
+                return True
         if _os_epi.environ.get("TL_PIPELINE_CP_ASYNC") == "1":
             # PIPELINENS4 race-free masked fixup: emit the OOB-zeroing as an
             # UNCONDITIONAL read-modify-write -- tile_buf[idx] = select(oob,

@@ -1714,6 +1714,15 @@ def _emit_region(
     if not hasattr(ctx, "swizzle_shared_loads"):
         ctx.swizzle_shared_loads = []
     child.swizzle_shared_loads = ctx.swizzle_shared_loads
+    # BOUNDSHOIST: share the affine-iota tile-source registry into the child
+    # region. The ``offs`` tiles are materialized in the PARENT (prologue);
+    # the masked-OOB epilogue that consumes them as bounds leaves runs in the
+    # K-loop CHILD. Sharing the same dict reference lets the child epilogue
+    # re-derive the affine ``base + i`` form and partition the OOB zero-fill
+    # into UNGUARDED loops instead of a per-element predicate rebuild.
+    if not hasattr(ctx, "affine_tile_source"):
+        ctx.affine_tile_source = {}
+    child.affine_tile_source = ctx.affine_tile_source
     if not hasattr(ctx, "runtime_args"):
         ctx.runtime_args = []
     child.runtime_args = ctx.runtime_args

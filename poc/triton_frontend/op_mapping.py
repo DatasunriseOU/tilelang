@@ -1292,6 +1292,30 @@ def should_fold_addressing(ctx: "WalkerCtx", op: Any) -> bool:
     )
 
 
+def _record_affine_tile_source(ctx: "WalkerCtx", dst: Any, expr: Any) -> None:
+    """Record the lazy source for a materialized tile, keyed by data Var.
+
+    BOUNDSHOIST. When this buffer (or any alias sharing its backing ``data``
+    Var, e.g. an ``expand_dims`` rebind) later appears as the LHS of a
+    masked-store bounds leaf ``offs_buf[i] < dim``, the epilogue partitioner
+    in memory.py re-derives the affine ``read_lane`` form (``base + i``)
+    straight from this source -- proving the per-axis monotone bound a bare
+    BufferLoad hides -- so the OOB zero-fill becomes axis-partitioned UNGUARDED
+    loops. Purely advisory: a missing/non-affine entry just keeps the
+    per-element predicate (RULE #1: never a wrong bound).
+    """
+    try:
+        store_map = getattr(ctx, "affine_tile_source", None)
+        if store_map is None:
+            store_map = {}
+            ctx.affine_tile_source = store_map
+        data_var = getattr(dst, "data", None)
+        if data_var is not None:
+            store_map[data_var] = expr
+    except Exception:
+        pass
+
+
 def materialize_lazy_tile(
     ctx: "WalkerCtx",
     expr: LazyTileExpr,
@@ -1423,6 +1447,7 @@ def materialize_lazy_tile(
                 "barrier after the cooperative shared fill; refusing to emit a "
                 "race-prone distributed tile (RULE #1)."
             ) from exc
+        _record_affine_tile_source(ctx, dst, expr)
         return dst
 
     rank = len(expr.shape)
@@ -1453,6 +1478,7 @@ def materialize_lazy_tile(
             body,
         )
     ctx.emit(body)
+    _record_affine_tile_source(ctx, dst, expr)
     return dst
 
 
