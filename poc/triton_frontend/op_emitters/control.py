@@ -997,33 +997,76 @@ def _materialize_make_tptr_index_operands(func_op: Any, ctx: _om.WalkerCtx) -> N
 
     materialized: set = set()
 
-    def _materialize(ssa: Optional[str], stack: Tuple[str, ...] = ()) -> None:
-        if ssa is None or ssa in materialized:
-            return
+    deferred: set = set()
+
+    def _is_ptrstate_bound(ssa_name: Optional[str]) -> bool:
+        # An SSA already bound as a PtrState dict (a ``tt.addptr`` result) is a
+        # pointer, NOT a scalar index. Reusing it inside an i32-typed arith
+        # (prod-dstates ``%109 = arith.muli %100, %stride`` where %100 is the
+        # addptr) is POINTER arithmetic owned by PtrState resolution.
+        if ssa_name is None:
+            return False
+        try:
+            _b = ctx.value_map.get(ssa_name)
+        except (TypeError, AttributeError):
+            return False
+        return isinstance(_b, dict) and "_ptrstate" in _b
+
+    def _materialize(ssa: Optional[str], stack: Tuple[str, ...] = ()) -> bool:
+        """Eagerly bind ``ssa``'s scalar feeder chain. Returns True if ``ssa``
+        is (now) a usable SCALAR index value, False if it must be DEFERRED to
+        PtrState resolution / the body walk (a pointer-arith op, an op fed by a
+        pointer/PtrState operand, or one of their dependents). A deferred op is
+        never emitted here -- its dependents detect the missing binding and
+        defer too, so the make_tptr loop never dispatches a pointer operand
+        through a scalar arith emitter. RULE #1: this is not a silent
+        index-skip -- genuine integer feeders still materialize; only true
+        pointer-state-fed ops defer to the path that actually owns them."""
+        if ssa is None:
+            return False
+        if ssa in deferred:
+            return False
+        if ssa in materialized:
+            return True
+        if _is_ptrstate_bound(ssa):
+            deferred.add(ssa)
+            return False
         try:
             if ssa in ctx.value_map:
-                return
+                return True
         except TypeError:
-            return
+            return False
         defop = def_of.get(ssa)
         if defop is None or ssa in stack:
-            # No producer in this module (kernel arg already handled above,
-            # or genuinely unresolvable) -- leave for the precise downstream
-            # raise. Never fabricate an index.
-            return
+            # No producer in this module (kernel arg already handled above, or
+            # genuinely unresolvable) -- leave for the precise downstream raise.
+            # Never fabricate an index. Treat as deferred (unbound) so a
+            # dependent does not emit against a missing operand.
+            return False
+        _all_ok = True
         for opnd in getattr(defop, "operands", ()) or ():
-            _materialize(_mtp_ssa_name(opnd), stack + (ssa,))
+            if not _materialize(_mtp_ssa_name(opnd), stack + (ssa,)):
+                _all_ok = False
         dn = _mtp_op_name(defop)
         emitter = _om.OP_TABLE.get(dn)
         if emitter is None:
-            return
+            deferred.add(ssa)
+            return False
         if getattr(emitter, "owns_regions", False) or dn in OPS_THAT_HANDLE_OWN_REGIONS:
             # Region-owning producer (scf.*): emitting out of walk order would
             # mis-scope its body. make_tptr index feeders are flat arith and
             # never hit this; leave for the precise downstream raise.
-            return
+            deferred.add(ssa)
+            return False
+        if not _all_ok:
+            # A feeder was deferred (pointer/PtrState arith or unresolvable) ->
+            # this op is part of the pointer-offset computation PtrState owns;
+            # defer it too rather than dispatch a scalar emitter on a pointer.
+            deferred.add(ssa)
+            return False
         materialized.add(ssa)
         emitter(defop, ctx)
+        return True
 
     for mk in make_tptr_ops:
         operands = list(getattr(mk, "operands", ()) or [])
@@ -1856,12 +1899,6 @@ def _emit_region(
     if not hasattr(ctx, "mma_c_fragments"):
         ctx.mma_c_fragments = []
     child.mma_c_fragments = ctx.mma_c_fragments
-    # BANKSWIZZLE: share the swizzle-load registry into the child region
-    # so an in-loop (K-loop) cp.async dout load surfaces its raw shared
-    # tile to the parent ctx for the post-walk swizzle re-registration.
-    if not hasattr(ctx, "swizzle_shared_loads"):
-        ctx.swizzle_shared_loads = []
-    child.swizzle_shared_loads = ctx.swizzle_shared_loads
     # BOUNDSHOIST: share the affine-iota tile-source registry into the child
     # region. The ``offs`` tiles are materialized in the PARENT (prologue);
     # the masked-OOB epilogue that consumes them as bounds leaves runs in the

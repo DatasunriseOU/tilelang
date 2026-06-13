@@ -132,8 +132,7 @@ def _build_c_fragment_layout(tir_buffer: Any, M: int, N: int, K: int,
 
 
 def register_mma_fragment_layouts(prim_func: Any, fragments: List[Dict[str, Any]],
-                                  pin_c_layout: bool = True,
-                                  swizzle_loads: List[Any] = None) -> Any:
+                                  pin_c_layout: bool = True) -> Any:
     """Wrap ``prim_func``'s body in an SBlock that STRICTLY pins each recorded
     MMA-C fragment to its ``make_mma_store_layout`` (FRAMEFIX, approach b).
 
@@ -152,8 +151,7 @@ def register_mma_fragment_layouts(prim_func: Any, fragments: List[Dict[str, Any]
         ``layout_map`` annotation. RAISES if a recorded fragment is absent from
         the body (a real lowering bug, never silently skipped).
     """
-    swizzle_loads = list(swizzle_loads or [])
-    if not fragments and not swizzle_loads:
+    if not fragments:
         return prim_func
 
     import tvm  # noqa: WPS433
@@ -223,66 +221,6 @@ def register_mma_fragment_layouts(prim_func: Any, fragments: List[Dict[str, Any]
             int(entry.get("num_warps", 4)),
         )
         layout_map[live.data] = lay
-
-    # BANKSWIZZLE: pin each recorded raw cp.async-staged SHARED load tile (the
-    # register-A source, e.g. the dstates ``dout`` tile) to TileLang's
-    # ``make_swizzled_layout`` -- the SAME ldmatrix XOR swizzle T.gemm assigns a
-    # B operand. LayoutInference seeds ``annotated_layout_map_`` from this
-    # SBlock ``layout_map`` (the identical mechanism used for the C fragment),
-    # so BOTH the cp.async store CopyNode and the register-A fragment fill read
-    # the buffer through the swizzle -> per-lane LDS hits distinct banks. RULE
-    # #1: RAISE if a recorded buffer is absent from the body (a real lowering
-    # bug, never silently skipped) -- mirrors the fragment RAISE above.
-    if swizzle_loads:
-        from tilelang.layout import make_swizzled_layout  # noqa: WPS433
-        for rec in swizzle_loads:
-            live = frag_data_to_buf.get(getattr(rec, "data", None))
-            if live is None:
-                live = by_name.get(getattr(rec, "name", None))
-            if live is None:
-                raise RuntimeError(
-                    "frame_register.register_mma_fragment_layouts: recorded "
-                    "BANKSWIZZLE shared load tile %r is not present among the "
-                    "%d AllocBuffer buffers of the PrimFunc body. The walker "
-                    "must allocate it via _alloc_tile_buffer (scope='shared'). "
-                    "RULE #1: refusing to skip the swizzle re-registration."
-                    % (getattr(rec, "name", rec), len(alloc_bufs))
-                )
-            # TL_BANK_SWIZZLE_MODE selects the conflict-removal layout:
-            #   "pad" (default) -> +1-column linear pad (cheap stride i*(K+1)+j)
-            #   "xor"            -> make_swizzled_layout (full ldmatrix XOR)
-            # A pad changes ONLY the physical stride (one mul/add per access),
-            # far cheaper integer math than the multi-term XOR; it removes the
-            # 2-way bank conflicts on a power-of-two inner stride at near-zero
-            # address cost. MEASURED same-session A/B on this fp32 SIMT dstates
-            # kernel (issue/latency bound, NOT shared-bandwidth bound): the pad
-            # is a small reproducible WIN (16.72 -> 16.51 ms CUDA-event,
-            # bank-conflict LD 14.69M -> 7.34M), while the full XOR swizzle
-            # REGRESSES 2x (16.72 -> 26.06 ms) -- its per-access XOR address math
-            # outweighs the (larger 87%) conflict savings because conflicts are
-            # NOT the binding bottleneck here. Pad is therefore the default; XOR
-            # is retained (env-selectable) for bandwidth-bound shapes where the
-            # deeper conflict removal pays off. RULE #1: both modes are proven
-            # bit-EXACT (MAXDIFF 0.0 small + large b2/nh128/s16384/nc256);
-            # neither is a degraded fallback.
-            import os as _os  # noqa: WPS433
-            _mode = _os.environ.get("TL_BANK_SWIZZLE_MODE", "pad")
-            if _mode == "pad":
-                import tvm  # noqa: WPS433
-                from tilelang.layout import Layout  # noqa: WPS433
-                _shape = [int(d) for d in live.shape]
-                if len(_shape) != 2:
-                    raise RuntimeError(
-                        "BANKSWIZZLE pad mode requires a rank-2 tile, got shape "
-                        "%r for %r (RULE#1 RAISE)" % (_shape, getattr(live, "name", live))
-                    )
-                _pad = int(_os.environ.get("TL_BANK_SWIZZLE_PAD", "1"))
-                _stride = _shape[1] + _pad
-                def _forward(i, j, _st=_stride):
-                    return [i * _st + j]
-                layout_map[live.data] = Layout(_shape, _forward)
-            else:
-                layout_map[live.data] = make_swizzled_layout(live)
 
     # Replace AllocBuffer stmts with no-ops (the alloc now lives on the block).
     def _strip(node: Any) -> Any:

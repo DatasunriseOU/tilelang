@@ -432,14 +432,6 @@ class WalkerCtx:
         # + ``T.gemm`` inside ``T.Kernel`` emits. Empty on Metal / non-MMA
         # paths so the gate (CUDA + non-empty) leaves fla_dot_exp2 untouched.
         self.mma_c_fragments: List[Dict[str, Any]] = []
-        # BANKSWIZZLE: raw cp.async-staged SHARED load tiles (the
-        # register-A source, e.g. the dstates ``dout`` tile) that the
-        # post-walk FRAMEFIX SBlock pins to make_swizzled_layout so the
-        # per-lane LDS reads hit distinct banks. Mirrors mma_c_fragments:
-        # shared into scf.for child ctxs so an in-loop load surfaces to
-        # the parent prim_func the re-registration runs on. Empty on
-        # non-CUDA / non-register-A paths (the gate leaves them untouched).
-        self.swizzle_shared_loads: List[Any] = []
         # Printed SSA name -> op names that consume it. Seeded by the MLIR
         # module pre-pass when available. Emitters use this only for layout
         # choices where downstream composability matters (for example

@@ -1573,6 +1573,22 @@ def _build_coalesced_copy_loop_layout(ctx, out_shape, contig_axis, dtype):
     a = int(contig_axis)
     if not (0 <= a < len(shp)):
         return None
+    # PARTITIONABILITY GUARD (RULE #1: skip the hint where it is NOT
+    # structurally invertible -- this is NOT a silent correctness fallback,
+    # the load stays bit-correct, it just is not lane-coalesced here). The
+    # TileLang loop-layout partitioner (LowerTileOp) can only invert a
+    # forward_thread/forward_index Fragment into a clean per-thread loop nest
+    # when the THREAD-fastest axis is the INNERMOST tile axis (proven by
+    # tilelang's own passing loop_layout tests, which all vectorize along the
+    # innermost axis). If we pin consecutive threads to consecutive elements
+    # of an OUTER tile axis (a != last), the partition is non-invertible: the
+    # Fragment's own input iter vars leak as UNDEFINED free symbolics into the
+    # emitted predicate/loop-extent, which MakePackedAPI then rejects
+    # (free index vars used but not passed as API arguments). So only emit the
+    # coalesce loop_layout when the contiguous global axis IS the innermost
+    # tile axis; otherwise return None and keep the inferred layout.
+    if a != len(shp) - 1:
+        return None
     nwarps = int(getattr(ctx, "num_warps", 0) or 0)
     if nwarps <= 0:
         return None
@@ -2233,37 +2249,6 @@ def _emit_ptrstate_tile_load_tir(
         ctx.fresh("tile_load"),
         scope=load_scope,
     )
-    # BANKSWIZZLE (RULE #1 -- generic shared-bank-conflict elimination, CUDA-gated):
-    # a rank>=2 SHARED cp.async-staged load tile that feeds ONLY elementwise ops
-    # (the dout tile scaled by exp(dA) into the register-A MMA fragment) keeps a
-    # PLAIN row-major shared layout: LayoutInference assigns the GEMM ldmatrix
-    # swizzle only to operands handed DIRECTLY to T.gemm (the B/C tile), NOT to a
-    # raw load consumed via a register-A fragment fill. The register-A fill then
-    # reads this flat shared buffer at MMA-A logical positions, so per-lane LDS
-    # reads collide on banks (ncu: ~14.7M shared-LD bank conflicts on tile_load
-    # dout). RECORD the buffer so the post-walk FRAMEFIX SBlock pins it to
-    # make_swizzled_layout (the SAME XOR swizzle T.gemm already gives the B
-    # operand): both the cp.async store AND the register-A read then hit distinct
-    # banks. Gated EXACTLY to the cp.async register-A source tile (shared +
-    # async-eligible + feeds-only-elementwise); a B operand fed straight to
-    # T.gemm already gets the swizzle and is NOT recorded here. Fail-closed: only
-    # when the use-graph proves the elementwise-only feed.
-    if (
-        _ctx_is_cuda_target(ctx)
-        and load_scope == "shared"
-        and len(out_shape or []) == 2
-        and _async_eligible
-        and _rank2_load_feeds_only_elementwise(ctx, result_value)
-    ):
-        sw = getattr(ctx, "swizzle_shared_loads", None)
-        if sw is None:
-            sw = []
-            try:
-                ctx.swizzle_shared_loads = sw
-            except Exception:
-                sw = None
-        if sw is not None:
-            sw.append(tile_buf)
     loop_vars = [
         tir.Var(ctx.fresh(f"i{axis}"), "int32")
         for axis, _extent in enumerate(out_shape or [1])
