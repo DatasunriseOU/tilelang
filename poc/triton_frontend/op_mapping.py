@@ -438,6 +438,11 @@ class WalkerCtx:
         # ``tt.dot`` can keep a direct store result in local.fragment but must
         # use shared scope when a later arith op indexes the dot result).
         self.ssa_users: Dict[str, set] = {}
+        # Printed operand SSA name -> the set of consumer op OBJECTS. A
+        # robust companion to ``ssa_users`` (which holds only op-NAMES):
+        # lets a fold gate call another emitter helper on the actual
+        # consumer op (no op-string parsing). Seeded by the same prepass.
+        self.ssa_user_ops: Dict[str, set] = {}
         # Optional caller-provided ABI shapes for pointer block args.
         # TTIR pointer types do not carry host tensor extents, but runtimes
         # such as MLX validate the DLTensor size against PrimFunc buffer_map.

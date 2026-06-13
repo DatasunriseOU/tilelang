@@ -1608,6 +1608,10 @@ def _emit_region(
     child.transposed_views = dict(ctx.transposed_views)
     child.ptr_states = getattr(ctx, "ptr_states", {})
     child.ssa_users = getattr(ctx, "ssa_users", {})
+    # Propagate the user-op map so in-loop fold gates (e.g. the
+    # register-resident decay-scale expand_dims) can recurse one hop down
+    # the use chain inside the scf.for body, exactly like the prologue.
+    child.ssa_user_ops = getattr(ctx, "ssa_user_ops", {})
     child.arg_buffer_shapes = getattr(ctx, "arg_buffer_shapes", {})
     child.fixed_arg_buffer_keys = getattr(ctx, "fixed_arg_buffer_keys", set())
     child.constant_tile_values = getattr(ctx, "constant_tile_values", {})

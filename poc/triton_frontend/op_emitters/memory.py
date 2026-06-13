@@ -3134,7 +3134,12 @@ def emit_tt_expand_dims(op: Any, ctx: WalkerCtx) -> Any:
         # FULL TRANSFORM 1: fold-eligible expand_dims (consumed only as
         # addressing/mask) stays lazy -- folds into the load/store loop body,
         # so no [N] expand_* array is materialized.
-        if should_fold_addressing(ctx, op):
+        # REGSCALECOLLAPSE/IndexFold-lazy companion: keep the decay-scale
+        # expand_dims (``exp(dA) -> expand_dims -> broadcast -> dout*scale ->
+        # dot``) LAZY so the exp folds JUST-IN-TIME into the MMA-A fragment fill
+        # (register-resident, per-lane) instead of materialising the §P1
+        # ``expand_159[32]`` that pins all K columns of exp(dA) live in regs.
+        if should_fold_addressing(ctx, op) or _expand_dims_feeds_register_a_scale(ctx, op):
             if result_value is not None:
                 ctx.bind(result_value, lazy)
             return lazy
@@ -3237,6 +3242,93 @@ def _broadcast_feeds_register_a_scale(ctx: WalkerCtx, op: Any) -> bool:
     if not users:
         return False
     return set(users).issubset({"arith.mulf", "arith.addf", "arith.subf"})
+
+
+def _op_name_for_gate(op: Any) -> str:
+    """Best-effort MLIR op-name (``dialect.op``) for a consumer op object.
+
+    Mirrors the ``_op_name`` resolution the module prepass uses, so the gate
+    classifies consumer ops the same way ``ssa_users`` keys are built.
+    """
+    for attr in ("name", "OPERATION_NAME"):
+        v = getattr(op, attr, None)
+        if isinstance(v, str) and v:
+            return v
+    operation = getattr(op, "operation", None)
+    if operation is not None:
+        v = getattr(operation, "name", None)
+        if isinstance(v, str) and v:
+            return v
+    return ""
+
+
+def _expand_dims_feeds_register_a_scale(ctx: WalkerCtx, op: Any) -> bool:
+    """True iff this ``tt.expand_dims`` result feeds ONLY the tensor-core
+    decay-scale chain (e.g. Mamba ``exp(dA) -> expand_dims -> broadcast ->
+    dout*scale -> tt.dot``).
+
+    REGSCALECOLLAPSE / IndexFold-lazy companion (RULE #1: scoped + fail-closed).
+    The ``tt.expand_dims`` sits BETWEEN the ``math.exp`` (already lazy) and the
+    ``tt.broadcast`` (kept lazy by ``_broadcast_feeds_register_a_scale``). With
+    no gate here ``emit_tt_expand_dims`` MATERIALISES the lazy exp into a
+    register tile -- the §P1 ``expand_159[32]`` holding all K columns of
+    ``exp(dA)`` LIVE across the whole K-step, the register-pressure ceiling that
+    pins occupancy at 2 blocks/SM. Keeping it lazy lets the ``exp`` fold all the
+    way into the MMA-A fragment fill, recomputed JUST-IN-TIME per lane in
+    registers -- NO ``expand_159`` array, NO wide live range, and (RULE #1) NO
+    local round-trip (a register recompute, not a spill).
+
+    BIT-EXACT regardless: ``expand_dims`` is a pure shape rebind, so the lazy
+    reader reproduces the identical per-lane value. The gate only decides
+    whether keeping it lazy is *beneficial*.
+
+    Gated to (fail-closed, never over-broaden):
+      * CUDA / NVIDIA target (gemm_rs reads A from registers; on Metal/SIMT the
+        scale is applied by the backend emitter, so this is a no-op there --
+        the expand_dims materialises as before, backend-neutral).
+      * Every consumer is EITHER a direct element-wise float arith op
+        (``arith.mulf`` / ``addf`` / ``subf``) OR a ``tt.broadcast`` that ITSELF
+        passes ``_broadcast_feeds_register_a_scale`` (transitive, one hop, on
+        the real consumer op object via ``ctx.ssa_user_ops``). Any other /
+        unknown / unresolved consumer keeps the materialised path.
+    """
+    if not _ctx_is_cuda_target(ctx):
+        return False
+    name = _result_ssa_name(op)
+    if name is None:
+        return False
+    user_names = (
+        ctx.ssa_users.get(name)
+        or ctx.ssa_users.get(name.lstrip("%"))
+        or ctx.ssa_users.get(f"%{name.lstrip('%')}")
+    ) if getattr(ctx, "ssa_users", None) else None
+    if not user_names:
+        return False
+    arith_scale = {"arith.mulf", "arith.addf", "arith.subf"}
+    # Fast accept: every consumer is a direct element-wise arith scale op.
+    if set(user_names).issubset(arith_scale):
+        return True
+    # Otherwise every consumer must be a ``tt.broadcast`` that itself feeds the
+    # scale. Resolve the real consumer op objects (fail-closed if unavailable).
+    if not set(user_names).issubset(arith_scale | {"tt.broadcast"}):
+        return False
+    user_ops = (
+        ctx.ssa_user_ops.get(name)
+        or ctx.ssa_user_ops.get(name.lstrip("%"))
+        or ctx.ssa_user_ops.get(f"%{name.lstrip('%')}")
+    ) if getattr(ctx, "ssa_user_ops", None) else None
+    if not user_ops:
+        return False
+    for user_op in user_ops:
+        op_name = _op_name_for_gate(user_op)
+        if op_name in arith_scale:
+            continue
+        if op_name == "tt.broadcast":
+            if not _broadcast_feeds_register_a_scale(ctx, user_op):
+                return False
+            continue
+        return False
+    return True
 
 
 def emit_tt_broadcast(op: Any, ctx: WalkerCtx) -> Any:

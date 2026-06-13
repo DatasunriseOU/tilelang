@@ -1381,6 +1381,10 @@ def _walk_mlir_module(
                 operand_name = _ssa_name(operand)
                 if operand_name:
                     ctx.ssa_users.setdefault(operand_name, set()).add(name)
+                    # Also record the consumer op OBJECT (op wrappers may be
+                    # unhashable -> use a list) so a fold gate can call another
+                    # emitter helper on the real consumer, not parse its text.
+                    ctx.ssa_user_ops.setdefault(operand_name, []).append(op)
             if name == "tt.func":
                 sym = _func_sym_name(op)
                 if sym:
