@@ -1044,7 +1044,8 @@ def _frame_register_mma_fragments(ctx: Any) -> Any:
     if prim_func is None:
         return None
     fragments = list(getattr(ctx, "mma_c_fragments", None) or [])
-    if not fragments:
+    swizzle_loads = list(getattr(ctx, "swizzle_shared_loads", None) or [])
+    if not fragments and not swizzle_loads:
         return _fold_dead_local_stores(prim_func)
     from .frame_register import register_mma_fragment_layouts
 
@@ -1086,7 +1087,8 @@ def _frame_register_mma_fragments(ctx: Any) -> Any:
     except Exception:  # pragma: no cover - control always importable here
         _direct_epi = True
     registered = register_mma_fragment_layouts(
-        prim_func, fragments, pin_c_layout=bool(_direct_epi)
+        prim_func, fragments, pin_c_layout=bool(_direct_epi),
+        swizzle_loads=swizzle_loads,
     )
     return _fold_dead_local_stores(registered)
 

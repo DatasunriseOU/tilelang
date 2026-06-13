@@ -1708,6 +1708,12 @@ def _emit_region(
     if not hasattr(ctx, "mma_c_fragments"):
         ctx.mma_c_fragments = []
     child.mma_c_fragments = ctx.mma_c_fragments
+    # BANKSWIZZLE: share the swizzle-load registry into the child region
+    # so an in-loop (K-loop) cp.async dout load surfaces its raw shared
+    # tile to the parent ctx for the post-walk swizzle re-registration.
+    if not hasattr(ctx, "swizzle_shared_loads"):
+        ctx.swizzle_shared_loads = []
+    child.swizzle_shared_loads = ctx.swizzle_shared_loads
     if not hasattr(ctx, "runtime_args"):
         ctx.runtime_args = []
     child.runtime_args = ctx.runtime_args
