@@ -184,7 +184,21 @@ bool CheckSIMDGroupCopy(const CopyNode &op, Target target) {
     return false;
   }
   if (op.src->dtype != op.dst->dtype) {
-    return false;
+    // fp16-OUTPUT (and any narrowing-from-accumulator) simdgroup store.  Metal's
+    // ``simdgroup_store`` requires the destination element type to MATCH the
+    // matrix element type (``simdgroup_matrix<float,8,8>`` only stores to
+    // ``device/threadgroup float*``), so we cannot store a float accumulator
+    // directly into a half buffer.  The previous behaviour bailed to
+    // LowerNormalCopy, which emitted an ILLEGAL ``(half4)C_l[...]`` C-style cast
+    // of the simdgroup matrix (rejected by the Metal compiler).  Instead, route
+    // float-accumulator -> {float16,bfloat16,float} destinations through the
+    // simdgroup path: stage into a threadgroup float tile via the legal
+    // dtype-matched ``simdgroup_store`` and then per-element cast+store into the
+    // destination (see LowerSIMDGroupCopy).  Only float-family conversions are
+    // supported here; anything else must still go through LowerNormalCopy.
+    if (!(op.src->dtype.is_float() && op.dst->dtype.is_float())) {
+      return false;
+    }
   }
   if (op.src_range.size() != 2 || op.dst_range.size() != 2 ||
       op.dst->shape.size() != 2) {
@@ -319,25 +333,115 @@ Stmt LowerSIMDGroupCopy(const CopyNode &op, const LowerArgs &T,
   PrimExpr warp_m = FloorMod(warp_id, m_warp);
   PrimExpr warp_n = FloorDiv(warp_id, m_warp);
 
-  Array<Stmt> stmts;
+  const bool needs_cast = op.src->dtype != op.dst->dtype;
+
+  if (!needs_cast) {
+    // --------------------------------------------------------------------
+    // Matched dtype (e.g. float accumulator -> float destination): store the
+    // simdgroup fragments DIRECTLY into the destination buffer.  This is the
+    // original, hardware-verified fast path.
+    // --------------------------------------------------------------------
+    Array<Stmt> stmts;
+    for (int i = 0; i < warp_row_tiles; i++) {
+      for (int j = 0; j < warp_col_tiles; j++) {
+        int tile_idx = i * warp_col_tiles + j;
+        PrimExpr row = dst_row_base + warp_m * (warp_row_tiles * 8) + i * 8;
+        PrimExpr col = dst_col_base + warp_n * (warp_col_tiles * 8) + j * 8;
+        PrimExpr ptr = Call(DataType::Handle(), builtin::address_of(),
+                            {BufferLoad(op.dst, {row, col})});
+        stmts.push_back(Evaluate(Call(
+            DataType::Handle(), builtin::simdgroup_store(),
+            {op.src->data, IntImm(DataType::Int(32), tile_idx), ptr, dst_stride,
+             IntImm(DataType::Int(32), 8), IntImm(DataType::Int(32), 8),
+             Cast(DataType::Bool(), IntImm(DataType::Int(32), 0))})));
+      }
+    }
+    if (stmts.size() == 1) {
+      return stmts[0];
+    }
+    return SeqStmt(stmts);
+  }
+
+  // ----------------------------------------------------------------------
+  // Differing dtype (e.g. float accumulator -> fp16/bf16 destination).  Metal's
+  // ``simdgroup_store`` requires the destination element type to match the
+  // matrix element type, so a float matrix cannot be stored straight into a
+  // half buffer.  Stage every 8x8 fragment into a threadgroup float tile of
+  // shape [M, N] (the legal dtype-matched simdgroup_store), synchronise, then
+  // have ALL threads cooperatively cast each float element down to the
+  // destination dtype and write it into the (possibly strided) destination.
+  // ----------------------------------------------------------------------
+  // Allocate the staging tile through the plumbed workspace callback so the
+  // storage-allocation passes know about it (a raw decl_buffer injected here is
+  // NOT picked up by the shared-memory allocator).  ``AddWorkspace`` returns a
+  // ``shared.dyn`` access pointer; we wrap a flat Buffer view over its data Var
+  // so we can index it with BufferLoad / simdgroup_store.
+  ICHECK(T.AddWorkspace != nullptr)
+      << "Metal fp16-output simdgroup store needs T.AddWorkspace for staging";
+  PrimExpr ws_ptr = T.AddWorkspace(M * N, op.src->dtype);
+  Var stage_var = GetVarFromAccessPtr(ws_ptr);
+  Buffer stage =
+      decl_buffer({IntImm(DataType::Int(32), M * N)}, op.src->dtype,
+                  "C_simd_stage", "shared.dyn");
+  // Rebind the staging buffer's data to the workspace-owned variable so codegen
+  // resolves it to the allocated threadgroup storage.
+  {
+    auto n = make_object<BufferNode>(*stage.get());
+    n->data = stage_var;
+    stage = Buffer(n);
+  }
+  PrimExpr stage_stride = IntImm(DataType::Int(32), N);
+
+  Array<Stmt> body;
+  // Phase 1: simdgroup_store each fragment into the threadgroup staging tile.
   for (int i = 0; i < warp_row_tiles; i++) {
     for (int j = 0; j < warp_col_tiles; j++) {
       int tile_idx = i * warp_col_tiles + j;
-      PrimExpr row = dst_row_base + warp_m * (warp_row_tiles * 8) + i * 8;
-      PrimExpr col = dst_col_base + warp_n * (warp_col_tiles * 8) + j * 8;
+      PrimExpr srow = warp_m * (warp_row_tiles * 8) + i * 8;
+      PrimExpr scol = warp_n * (warp_col_tiles * 8) + j * 8;
+      PrimExpr soff = srow * stage_stride + scol;
       PrimExpr ptr = Call(DataType::Handle(), builtin::address_of(),
-                          {BufferLoad(op.dst, {row, col})});
-      stmts.push_back(Evaluate(Call(
+                          {BufferLoad(stage, {soff})});
+      // First arg is the SIMD-group SOURCE matrix (op.src, the C accumulator);
+      // ``ptr`` addresses the threadgroup staging tile we store the fragment to.
+      body.push_back(Evaluate(Call(
           DataType::Handle(), builtin::simdgroup_store(),
-          {op.src->data, IntImm(DataType::Int(32), tile_idx), ptr, dst_stride,
+          {op.src->data, IntImm(DataType::Int(32), tile_idx), ptr, stage_stride,
            IntImm(DataType::Int(32), 8), IntImm(DataType::Int(32), 8),
            Cast(DataType::Bool(), IntImm(DataType::Int(32), 0))})));
     }
   }
-  if (stmts.size() == 1) {
-    return stmts[0];
-  }
-  return SeqStmt(stmts);
+  // Barrier: the threadgroup tile is now fully populated.
+  body.push_back(Evaluate(
+      Call(DataType::Int(32), builtin::tvm_storage_sync(), {StringImm("shared")})));
+
+  // Phase 2: every thread casts a strided subset of the [M, N] tile down to the
+  // destination dtype and stores it.  Threads of the block stride over all M*N
+  // elements so the work is balanced and independent of the warp layout.
+  PrimExpr tid = relative_thread;
+  Var lv("simd_cast_i", DataType::Int(32));
+  PrimExpr elem = tid + lv * IntImm(DataType::Int(32), block_size);
+  PrimExpr e_row = FloorDiv(elem, IntImm(DataType::Int(32), N));
+  PrimExpr e_col = FloorMod(elem, IntImm(DataType::Int(32), N));
+  PrimExpr src_val = BufferLoad(stage, {e_row * stage_stride + e_col});
+  PrimExpr dst_val = Cast(op.dst->dtype, src_val);
+  Stmt store = BufferStore(
+      op.dst, dst_val, {dst_row_base + e_row, dst_col_base + e_col});
+  // Loop ``elem`` from ``tid`` to M*N stepping by block_size.  ``trip`` is the
+  // exact number of strided iterations this thread performs.
+  int trip = (M * N - 1 - 0) >= 0 ? ((M * N) + block_size - 1) / block_size : 0;
+  Stmt loop_body =
+      IfThenElse(elem < IntImm(DataType::Int(32), M * N), store);
+  body.push_back(For(lv, IntImm(DataType::Int(32), 0),
+                     IntImm(DataType::Int(32), trip), ForKind::kSerial,
+                     loop_body));
+  // Barrier: the staging tile may be reused by a subsequent pipeline stage.
+  body.push_back(Evaluate(
+      Call(DataType::Int(32), builtin::tvm_storage_sync(), {StringImm("shared")})));
+
+  // The staging storage is owned by the workspace allocator (AddWorkspace), so
+  // we must NOT wrap it in our own AllocBuffer here.
+  return SeqStmt(body);
 }
 
 } // namespace
