@@ -108,6 +108,7 @@ private:
   // and a matching per-dtype `EmitFp8XXXHelper()` body. See
   // docs/mlx_port_master_plan.md (Metal codegen FP8 conditional prelude).
   void CollectReferencedLowPrecisionDtypes(const PrimFunc &f);
+  void CollectCooperativeTensorInputDtypes(const PrimFunc &f);
   void EmitFPHelperPrelude();          // public dispatch entry
   void EmitAtomicAddHelperPrelude();
   void EmitAtomicCASHelperPrelude();
@@ -140,6 +141,13 @@ private:
   // inlined cooperative-tensor accumulators in one kernel get unique names
   // instead of all colliding on `__pct_c0`.
   std::unordered_map<const VarNode *, int> ct_c_inlined_base_;
+  // Per-C-accumulator-buffer dtype of the A/B *input* operands feeding its
+  // MMA (e.g. "float" for the fp32 mamba dstates GEMM, "half" for fp16 GEMMs).
+  // Populated by a pre-scan over the kernel body BEFORE allocations are
+  // emitted so the pre-staged `__pct_cN` destination cooperative tensor can be
+  // stamped with operand types that MATCH the `__op.run(...)` site (MPP
+  // matmul2d's "Input types must match cooperative tensor types" assert).
+  std::unordered_map<const VarNode *, std::string> ct_c_input_dtype_;
   int ct_c_inlined_next_{0};
   bool emitted_pct_op_{false};
   bool emitted_frag_lane_vars_{false};

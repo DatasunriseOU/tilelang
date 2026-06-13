@@ -55,6 +55,7 @@ follow-on ``arith.*``) keep composing without per-emitter shape probes.
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Dict, Tuple
 
 # Shared helper for Triton 3.6 ``<{predicate = N : i64}>`` Properties.
@@ -892,6 +893,20 @@ def _normalize_predicate(raw: Any, table: Dict[str, Any], numeric: list) -> str:
         if 0 <= raw < len(numeric):
             return numeric[raw]
         raise EmitError(f"comparison predicate index {raw} out of range")
+    # IREE's mlir.ir prints an IntegerAttr as ``IntegerAttr(3 : i64)``; stock
+    # mlir_core exposes ``.value``. Extract the underlying enum index so the
+    # predicate resolves identically across providers (not a degrade).
+    iree_int = re.match(r"\s*IntegerAttr\((-?\d+)\s*:", str(raw))
+    if iree_int is not None:
+        idx = int(iree_int.group(1))
+        if 0 <= idx < len(numeric):
+            return numeric[idx]
+        raise EmitError(f"comparison predicate index {idx} out of range")
+    val_attr = getattr(raw, "value", None)
+    if isinstance(val_attr, int) and not isinstance(val_attr, bool):
+        if 0 <= val_attr < len(numeric):
+            return numeric[val_attr]
+        raise EmitError(f"comparison predicate index {val_attr} out of range")
     s = str(raw).strip().lower()
     # MLIR sometimes prefixes with the enum name ("CmpFPredicate.olt").
     if "." in s:

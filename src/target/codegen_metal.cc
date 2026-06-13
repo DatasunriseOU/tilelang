@@ -141,6 +141,7 @@ void CodeGenTileLangMetal::InitFuncState(const PrimFunc &f) {
   cooperative_tensor_dtype_.clear();
   ct_c_inlined_.clear();
   ct_c_inlined_base_.clear();
+  ct_c_input_dtype_.clear();
   ct_c_inlined_next_ = 0;
   // analyze the data;
   for (Var arg : f->params) {
@@ -981,6 +982,54 @@ void CodeGenTileLangMetal::CollectReferencedLowPrecisionDtypes(
   if (collector.uses_atomic_cas) uses_atomic_cas_ = true;
 }
 
+namespace {
+// Pre-scan visitor: records (a) each Allocate'd buffer var -> its element dtype
+// and (b) for every `cooperative_tensor_multiply_accumulate` MMA, the C
+// accumulator buffer var -> the A-operand buffer's element dtype. Run BEFORE
+// the codegen visits allocations so the pre-staged `__pct_cN` destination
+// cooperative tensor is stamped with operand types matching the run site.
+class CoopTensorInputDtypeScanner : public StmtExprVisitor {
+public:
+  std::unordered_map<const VarNode *, DataType> alloc_dtype;
+  std::unordered_map<const VarNode *, DataType> c_to_a_dtype;
+
+  void VisitStmt_(const AllocBufferNode *op) final {
+    if (op->buffer.defined()) {
+      alloc_dtype[op->buffer->data.get()] = op->buffer->dtype;
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(tl::cooperative_tensor_multiply_accumulate())) {
+      // args[0] = C accumulator var, args[2] = A operand var (see run site).
+      if (op->args.size() > 2) {
+        const auto *c_v = op->args[0].as<VarNode>();
+        const auto *a_v = op->args[2].as<VarNode>();
+        if (c_v != nullptr && a_v != nullptr) {
+          auto it = alloc_dtype.find(a_v);
+          if (it != alloc_dtype.end()) {
+            c_to_a_dtype[c_v] = it->second;
+          }
+        }
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+};
+}  // namespace
+
+void CodeGenTileLangMetal::CollectCooperativeTensorInputDtypes(
+    const PrimFunc &f) {
+  ct_c_input_dtype_.clear();
+  CoopTensorInputDtypeScanner scanner;
+  scanner(f->body);
+  for (const auto &kv : scanner.c_to_a_dtype) {
+    std::ostringstream os;
+    PrintType(kv.second.element_of(), os);
+    ct_c_input_dtype_[kv.first] = os.str();
+  }
+}
+
 void CodeGenTileLangMetal::EmitAtomicAddHelperPrelude() {
   if (!uses_atomic_add_ || emitted_atomic_add_helper_) return;
   emitted_atomic_add_helper_ = true;
@@ -1228,6 +1277,12 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
   // body generated later in this method. Pure-fp32 kernels emit zero
   // helpers.
   this->CollectReferencedLowPrecisionDtypes(func);
+  // Pre-scan: associate each inlined cooperative-tensor C accumulator with the
+  // dtype of the A/B input operands feeding its MMA, so the pre-staged
+  // `__pct_cN` destination cooperative tensor (emitted at C-alloc time, BEFORE
+  // the GEMM is visited) can be stamped with operand types that MATCH the
+  // `__op.run(...)` site (MPP matmul2d "Input types must match" static_assert).
+  this->CollectCooperativeTensorInputDtypes(func);
   this->EmitAtomicAddHelperPrelude();
   this->EmitAtomicCASHelperPrelude();
   this->EmitFPHelperPrelude();
@@ -1869,14 +1924,36 @@ void CodeGenTileLangMetal::VisitStmt_(const AllocBufferNode *op) {
       int base = ct_c_inlined_next_;
       ct_c_inlined_base_[op->buffer->data.get()] = base;
       ct_c_inlined_next_ += num_c_tiles;
+      // MPP matmul2d REQUIRES the destination cooperative-tensor's left/right
+      // operand template types to MATCH the input cooperative tensors fed at
+      // the `__op.run(...)` site (see MPPTensorOpsMatMul2dImpl.h static_assert
+      // "Input types must match cooperative tensor types"). The run site
+      // (below) stamps the inputs with `a_dtype` -- the recorded dtype of the
+      // A-operand SMEM tile. Hardcoding `half` here is only correct for fp16
+      // GEMMs; an fp32-input GEMM (e.g. the mamba dstates kernel, whose A tile
+      // is the fp32 transpose-scaled `xt_local`) emits fp32 inputs at the run
+      // site and the half-stamped accumulator fails the static_assert. We
+      // stamp the accumulator's operand type from the A-input operand dtype
+      // associated with this C accumulator. RULE #1: if that association is
+      // missing we RAISE rather than silently keep the wrong `half`.
+      auto a_dt_it = ct_c_input_dtype_.find(op->buffer->data.get());
+      ICHECK(a_dt_it != ct_c_input_dtype_.end())
+          << "Metal MMA: no recorded A-input operand dtype for inlined "
+             "cooperative-tensor accumulator "
+          << op->buffer->data.get()->name_hint
+          << "; cannot stamp matching destination operand types (RULE #1: "
+             "refusing to emit a hardcoded `half` that may mismatch the run "
+             "site). The GEMM lowering must record the operand dtype before "
+             "the accumulator is allocated.";
+      const std::string &op_dt = a_dt_it->second;
       for (int t = 0; t < num_c_tiles; t++) {
         this->PrintIndent();
         stream << "auto __pct_c" << (base + t)
                << " = __pct_op.get_destination_cooperative_tensor<"
-               << "decltype(__pct_op.get_left_input_cooperative_tensor<half, "
-                  "half, float>()), "
-               << "decltype(__pct_op.get_right_input_cooperative_tensor<half, "
-                  "half, float>()), float>(); "
+               << "decltype(__pct_op.get_left_input_cooperative_tensor<"
+               << op_dt << ", " << op_dt << ", float>()), "
+               << "decltype(__pct_op.get_right_input_cooperative_tensor<"
+               << op_dt << ", " << op_dt << ", float>()), float>(); "
                << "for (ushort __i = 0; __i < 16; __i++) __pct_c" << (base + t)
                << "[__i] = 0.0f;\n";
       }

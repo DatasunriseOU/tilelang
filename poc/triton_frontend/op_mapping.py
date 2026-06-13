@@ -754,11 +754,33 @@ def _has_consumed_result(op: Any, ctx: Any = None) -> bool:
 
 
 def _attrs(op: Any) -> Dict[str, Any]:
-    """Return ``op`` attribute dict, hiding the MLIR vs dict shape diff."""
+    """Return ``op`` attribute dict, hiding the MLIR vs dict shape diff.
+
+    Two real-MLIR Python binding shapes are supported (not a degrade --
+    both are correct, version-dependent APIs):
+
+    * stock ``mlir_core`` / jaxlib: ``op.attributes`` iterates yielding
+      ``NamedAttribute`` objects exposing ``.name`` / ``.attr``.
+    * IREE's ``OpAttributeMap``: iteration yields attribute *name strings*
+      and the value is fetched via ``attributes[name]`` (dict-like).
+
+    We dispatch on the runtime shape of the first iterated element so the
+    same walker runs against either provider with identical results.
+    """
     if isinstance(op, dict):
         return dict(op.get("attrs", {}))
-    # Real MLIR: attributes attribute. Keep stringified for portability.
-    return {a.name: a.attr for a in op.attributes} if hasattr(op, "attributes") else {}
+    if not hasattr(op, "attributes"):
+        return {}
+    ats = op.attributes
+    out: Dict[str, Any] = {}
+    for a in ats:
+        if isinstance(a, str):
+            # IREE OpAttributeMap: iteration -> name strings; index for value.
+            out[a] = ats[a]
+        else:
+            # stock mlir_core / jaxlib: NamedAttribute with .name / .attr.
+            out[a.name] = a.attr
+    return out
 
 
 # ---------------------------------------------------------------------------
