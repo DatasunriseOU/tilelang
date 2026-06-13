@@ -10,7 +10,13 @@ from tvm.tirx.script.builder.frame import TIRFrame
 from tvm.tirx.script.builder.frame import SBlockFrame
 from tvm.ffi import register_object
 from tilelang import _ffi_api
-from tilelang.jit.exceptions import JITNoBuilderError
+# NOTE: ``JITNoBuilderError`` lives in ``tilelang.jit.exceptions``. Importing it
+# at module top pulls in the whole ``tilelang.jit`` package, whose __init__
+# imports ``tilelang.language.eager`` -> eager.builder -> back to this module,
+# forming an import cycle that deadlocks when ``language`` is imported before
+# ``tilelang.jit`` has finished (e.g. the torch-absent import path). It is only
+# needed at runtime inside the raise sites below, so import it lazily there
+# (the same pattern already used for ``Builder`` further down).
 import threading
 
 # Ensure single-dimension kernel bindings can be unpacked like iterables.
@@ -325,6 +331,7 @@ def Kernel(
     # is being called outside of a JIT/prim_func context.
     # lazy import to avoid circular import
     from tilelang.language.eager.builder import Builder
+    from tilelang.jit.exceptions import JITNoBuilderError
 
     if Builder.current() is None:
         raise JITNoBuilderError("T.Kernel() can only be used inside @tilelang.jit or @T.prim_func context. No Builder is available.")
@@ -409,6 +416,7 @@ def CUDASourceCodeKernel(
         will be injected before the generated kernel code.
     """
     from tilelang.language.eager.builder import Builder
+    from tilelang.jit.exceptions import JITNoBuilderError
 
     if Builder.current() is None:
         raise JITNoBuilderError(
