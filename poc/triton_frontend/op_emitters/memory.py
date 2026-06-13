@@ -2219,6 +2219,8 @@ def _emit_ptrstate_tile_load_tir(
 
     flat_idx = _ptrstate_flat_index(ctx, resolved, loop_vars, out_shape)
     load_expr: Any = tir.BufferLoad(src_buf, [flat_idx])
+    mask_lane = None
+    other_lane = tir.const(0, out_dtype)
     if mask_ssa is not None:
         try:
             mask_expr = ctx.get(mask_ssa)
@@ -2234,8 +2236,89 @@ def _emit_ptrstate_tile_load_tir(
                 other_expr = tir.const(0, out_dtype)
             mask_lane = _resolve_lane_operand(ctx, mask_expr, loop_vars, role="mask")
             other_lane = _resolve_lane_operand(ctx, other_expr, loop_vars, role="other")
-            load_expr = tir.if_then_else(mask_lane, load_expr, other_lane)
     dynamic_mask = _dynamic_tts_mask_expr(ctx, loop_vars, dynamic_mask_dims)
+
+    # DALOADBOUNDSHOIST (the two-birds load-side predicate hoist, same family as
+    # the cp.async tile-load OOB-zero partition). For a rank-1 (vector) masked
+    # load whose native in-bounds predicate is an AND of per-axis MONOTONE
+    # bounds ``offs_a < dim_a`` (the dstates dA decay load: ``offs_k <
+    # chunk_size - i_132*32``), the per-element ``if_then_else(mask, load,
+    # other)`` forces the CUDA codegen to ALSO wrap the symbolic-extent flat
+    # ``BufferLoad`` in its own ``(0 <= flat) && (flat < numel)`` safe-index
+    # guard -- so every lane recomputes the full int64 flat base THREE times
+    # (lower bound, upper bound, and the index) under a predicate. We instead
+    # PARTITION the load into (1) an UNGUARDED ``T.For`` over the in-bounds
+    # contiguous prefix ``[0, clamp(ext_a))`` that reads ``load_expr`` directly
+    # (no per-element mask, so the codegen drops the numel safe-index guard --
+    # the index is now a small affine of bounded loop vars over the dense
+    # prefix) and (2) the OOB-zero suffix via the existing
+    # ``_emit_oob_zero_partition``. For the §P1 full tile (clamp == BLK) the
+    # suffix is EMPTY and the prefix is the whole vector -- bit-identical to the
+    # masked load, fewer integer-pred ops, fewer live predicate/index registers.
+    # Gated to the non-pipelined routed path (the pipelined consumer must keep
+    # the read-modify-write form); falls back to the predicated load whenever
+    # the per-axis extents are not provably recoverable (RULE #1: never a
+    # maskless OOB read, never a dropped guard on a real OOB lane).
+    _hoisted = False
+    import os as _os_da
+    if (
+        _os_da.environ.get("TL_PIPELINE_CP_ASYNC") != "1"
+        and _os_da.environ.get("TL_NO_BOUNDS_HOIST") != "1"
+        and _os_da.environ.get("TL_NO_DA_BOUNDS_HOIST") != "1"
+        and (mask_lane is not None or dynamic_mask is not None)
+    ):
+        in_bounds = None
+        if mask_lane is not None:
+            in_bounds = mask_lane
+        if dynamic_mask is not None:
+            in_bounds = dynamic_mask if in_bounds is None else tir.And(in_bounds, dynamic_mask)
+        extents = None
+        if in_bounds is not None:
+            extents = _decompose_monotone_mask_extents(
+                ctx, in_bounds, loop_vars, out_shape
+            )
+        if _os_da.environ.get("TL_BOUNDSHOIST_DEBUG") == "1":
+            import sys as _sys
+            print("DALOADBOUNDSHOIST rank=%d mask=%s dyn=%s partitioned=%s" % (
+                len(loop_vars), mask_lane is not None,
+                dynamic_mask is not None, extents is not None),
+                file=_sys.stderr, flush=True)
+        if extents is not None and len(extents) == len(loop_vars):
+            zero = tir.const(0, "int32")
+            clamped = [
+                tir.Max(
+                    zero,
+                    tir.Min(
+                        _cast_index_like(ctx, extents[a], zero),
+                        tir.const(int(out_shape[a]), "int32"),
+                    ),
+                )
+                for a in range(len(loop_vars))
+            ]
+            # (1) UNGUARDED in-bounds prefix load (no per-element mask -> codegen
+            # drops the numel safe-index guard for the dense prefix).
+            prefix: Any = tir.BufferStore(
+                tile_buf, load_expr, list(loop_vars) or [tir.const(0, "int32")]
+            )
+            for axis in range(len(loop_vars) - 1, -1, -1):
+                prefix = tir.For(
+                    loop_vars[axis], zero, clamped[axis],
+                    tir.ForKind.SERIAL, prefix,
+                )
+            ctx.emit(prefix)
+            # (2) OOB-zero suffix (partitioned, unguarded) -- bit-identical to
+            # the masked-load ``other`` on the out-of-bounds lanes.
+            _emit_oob_zero_partition(
+                ctx, tile_buf, loop_vars, out_shape, clamped, other_lane,
+            )
+            _hoisted = True
+    if _hoisted:
+        if result_value is not None:
+            ctx.bind(result_value, tile_buf)
+        return tile_buf
+
+    if mask_lane is not None:
+        load_expr = tir.if_then_else(mask_lane, load_expr, other_lane)
     if dynamic_mask is not None:
         load_expr = tir.if_then_else(dynamic_mask, load_expr, tir.const(0, out_dtype))
 
