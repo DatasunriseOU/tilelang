@@ -2374,6 +2374,7 @@ def _is_zero_constant_lazy(init_val: Any) -> bool:
 def _dot_accumulator_iter_arg_slots(
     region: Any,
     iter_arg_block_ssas: List[Any],
+    dot_eligible: Optional[Callable[[str, str, int, int], bool]] = None,
 ) -> Tuple[Dict[int, Tuple[int, int]], List[str], Dict[str, str], Dict[str, str], set]:
     """Return ``{iter_arg_idx: (M, N)}`` for fused-dot accumulator carries.
 
@@ -2501,6 +2502,18 @@ def _dot_accumulator_iter_arg_slots(
             continue
         if len(a_shape) != 2 or len(b_shape) != 2:
             continue
+        # Per-dot residency eligibility (target-aware). On CUDA ``dot_eligible``
+        # is None -> every fused-dot carry is fragment-resident (unchanged). On
+        # Metal it screens out simdgroup-INELIGIBLE dots (fp32 inputs, or M/N
+        # not a multiple of 8): those keep the shared carry + SIMT path rather
+        # than being routed to an invalid fp32 simdgroup carry (RULE #1 -- no
+        # silent bf16 downcast, no corrupting flat fragment copy). The dot's
+        # input dtypes + (M, N) are read straight from its A/B operands here.
+        if dot_eligible is not None:
+            a_dt = _om._normalize_mlir_dtype(_om._dtype_of(dot_operands[0]))
+            b_dt = _om._normalize_mlir_dtype(_om._dtype_of(dot_operands[1]))
+            if not dot_eligible(a_dt, b_dt, a_shape[0], b_shape[1]):
+                continue
 
         # --- FOLDED form: dot C IS the carry block-arg, dot result yielded. ---
         if c_name in blk_index:
@@ -2659,17 +2672,39 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
     # on Metal/unspecified targets, where shared-C GEMM is the correct path.
     _frag_carry_slots: Dict[int, Tuple[int, int]] = {}
     try:
-        from .reduction import _is_cuda_target as _frag_is_cuda  # noqa: WPS433
+        from .reduction import (  # noqa: WPS433
+            _is_cuda_target as _frag_is_cuda,
+            _is_metal_target as _frag_is_metal,
+            _wants_fragment_c as _frag_wants_fragment_c,
+        )
     except Exception:  # pragma: no cover - reduction always importable here
         _frag_is_cuda = None
+        _frag_is_metal = None
+        _frag_wants_fragment_c = None
     _frag_unfold_slots: set = set()
     _frag_unfold_dot: Dict[str, str] = {}
     _frag_unfold_add: Dict[str, str] = {}
-    if _frag_is_cuda is not None and _frag_is_cuda(ctx):
+    # Generic residency gate (mirrors the tt.dot ``_wants_fragment_c`` gate in
+    # reduction.py): a fused-dot loop-carried accumulator becomes a swizzled
+    # ``local.fragment`` carry when the target+dtype wants fragment-C, so
+    # ``map_tt_dot`` accumulates IN PLACE (CUDA tensor-core MMA, or an
+    # Apple-simdgroup-ELIGIBLE fp16/bf16/fp8 dot on Metal). On Metal a per-dot
+    # eligibility filter (``_frag_dot_eligible``) screens out fp32 /
+    # non-8-aligned dots so they keep the shared carry; CUDA passes no filter
+    # (all fused-dot carries stay fragment-resident, exactly as before).
+    _frag_cuda = bool(_frag_is_cuda is not None and _frag_is_cuda(ctx))
+    _frag_metal = bool(_frag_is_metal is not None and _frag_is_metal(ctx))
+    _frag_dot_eligible = None
+    if _frag_metal and _frag_wants_fragment_c is not None:
+        def _frag_dot_eligible(a_dt: str, b_dt: str, m: int, n: int) -> bool:
+            # ctx is Metal here, so ``_wants_fragment_c`` returns True iff the
+            # dot is simdgroup-eligible (fp16/bf16/fp8 inputs, m%8==0, n%8==0).
+            return bool(_frag_wants_fragment_c(ctx, a_dt, b_dt, m, n))
+    if _frag_cuda or _frag_metal:
         (_frag_carry_slots, _frag_dot_results,
          _frag_unfold_dot, _frag_unfold_add,
          _frag_unfold_slots) = _dot_accumulator_iter_arg_slots(
-            region, iter_arg_block_ssas
+            region, iter_arg_block_ssas, dot_eligible=_frag_dot_eligible
         )
         # REGCARRYCOLLAPSE A/B gate: when forced OFF, drop the UNFOLDED-form maps
         # so the recurrence keeps the legacy shared carry_tile/dot_c_logical/
