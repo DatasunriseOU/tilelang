@@ -83,6 +83,7 @@ from ..op_mapping import (
     _shape_of,
     materialize_lazy_tile,
     should_fold_addressing,
+    _result_ssa_name,
 )
 
 
@@ -3167,6 +3168,77 @@ def emit_tt_expand_dims(op: Any, ctx: WalkerCtx) -> Any:
     return out
 
 
+def _ctx_is_cuda_target(ctx: WalkerCtx) -> bool:
+    """True iff the codegen target is explicitly CUDA / NVIDIA.
+
+    Mirrors ``arith._ctx_is_cuda_target`` / ``reduction._is_cuda_target`` --
+    prefers ``ctx.target`` (set by ``from_ttir`` before tilelang lowering passes
+    establish ``Target.current()``), then the ambient target, then False.
+    """
+    ctx_target = getattr(ctx, "target", None) if ctx is not None else None
+    if ctx_target:
+        t = str(ctx_target).lower()
+        return "cuda" in t or "nvidia" in t or t.startswith("sm_") or "nvptx" in t
+    try:
+        import tvm  # noqa: WPS433
+
+        target = tvm.target.Target.current(allow_none=True)
+    except Exception:
+        return False
+    if target is None:
+        return False
+    kind = str(getattr(getattr(target, "kind", None), "name", "") or "").lower()
+    tstr = str(target).lower()
+    return "cuda" in kind or "nvidia" in tstr or "cuda" in tstr
+
+
+def _broadcast_feeds_register_a_scale(ctx: WalkerCtx, op: Any) -> bool:
+    """True iff this ``tt.broadcast`` result feeds ONLY an element-wise float
+    multiply/add (the tensor-core decay-scale, e.g. Mamba ``dout * exp(dA)``).
+
+    REGSCALECOLLAPSE companion (RULE #1: scoped + fail-closed). When True the
+    broadcast is kept LAZY -- its per-lane value folds directly into the
+    consuming binop (which ``arith._feeds_tensorcore_dot_as_register_a`` itself
+    keeps lazy and materialises into the MMA-A ``local.fragment``). That removes
+    the materialised ``bcast_*`` staging tile that ptxas otherwise places in the
+    stack frame (the §P1 dstates ``bcast_156[2048]`` == the entire 8448 B stack
+    frame / 17.6 GB local-memory traffic). The scaled value then lives in the A
+    fragment REGISTERS at MMA time -- exactly native's ``ldmatrix -> *scale in
+    registers -> mma`` -- with no per-K local round-trip.
+
+    Gated to:
+      * CUDA / NVIDIA target (tensor-core MMA; gemm_rs reads A from registers).
+        On Metal / SIMT the analogous scale is applied by the backend's own
+        emitter, so this fold is a no-op there (the broadcast materialises as
+        before) -- backend-neutral by construction.
+      * The broadcast's SSA consumers are EXACTLY a set of element-wise float
+        arithmetic ops (``arith.mulf`` / ``arith.addf`` / ``arith.subf``) -- the
+        decay-scale pattern. Any other / unknown consumer keeps the materialised
+        path (fail-closed: a broadcast read by a non-arith consumer, e.g. a
+        store value or a reduction, is NOT folded). RULE #1: never over-broaden.
+
+    The fold is BIT-EXACT regardless: a broadcast is pure replication, so the
+    lazy reader reproduces the identical per-lane value. The gate only decides
+    whether keeping it lazy is *beneficial* (register-resident scale) vs neutral.
+    """
+    if not _ctx_is_cuda_target(ctx):
+        return False
+    ssa_users = getattr(ctx, "ssa_users", None)
+    if not ssa_users:
+        return False
+    name = _result_ssa_name(op)
+    if name is None:
+        return False
+    users = (
+        ssa_users.get(name)
+        or ssa_users.get(name.lstrip("%"))
+        or ssa_users.get(f"%{name.lstrip('%')}")
+    )
+    if not users:
+        return False
+    return set(users).issubset({"arith.mulf", "arith.addf", "arith.subf"})
+
+
 def emit_tt_broadcast(op: Any, ctx: WalkerCtx) -> Any:
     """Lower ``tt.broadcast`` to ``tir.Broadcast`` or a ``tir.For`` rebuild.
 
@@ -3282,7 +3354,10 @@ def emit_tt_broadcast(op: Any, ctx: WalkerCtx) -> Any:
         # addressing/mask) stay lazy -- the per-lane broadcast read folds into
         # the load/store loop body, so no [2048]/[4096] bcast_* array is
         # materialized (no local spill).
-        if should_fold_addressing(ctx, op):
+        # REGSCALECOLLAPSE companion: keep the decay-scale broadcast LAZY so it
+        # folds into the MMA-A fragment fill (register-resident scale, native
+        # mirror) instead of materialising a ``bcast_*[M*K]`` stack tile.
+        if should_fold_addressing(ctx, op) or _broadcast_feeds_register_a_scale(ctx, op):
             if result_value is not None:
                 ctx.bind(result_value, lazy)
             return lazy

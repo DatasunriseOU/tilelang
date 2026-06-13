@@ -1010,6 +1010,23 @@ def _install_tile_load_store_wrappers() -> None:
 _install_tile_load_store_wrappers()
 
 
+def _fold_dead_local_stores(prim_func: Any) -> Any:
+    """Apply DeadLocalStoreElim (fixpoint DCE of write-only ``scope="local"``
+    index/mask staging tiles) as the final cleanup of the walked PrimFunc.
+
+    See ``poc.triton_frontend.dead_local_store_elim`` for the why/what. This is
+    a generic, backend-neutral, bit-exact TIR cleanup: it only DELETES provably
+    dead staging writes (the per-lane int64 index / mask / broadcast tiles the
+    op_emitters materialise but the inline-folded load/store/copy sites never
+    read). RULE #1: it never drops a buffer that is read by a surviving
+    statement, and on any unexpected structure returns the PrimFunc unchanged.
+    """
+    if prim_func is None:
+        return None
+    from .dead_local_store_elim import eliminate_dead_local_stores
+    return eliminate_dead_local_stores(prim_func)
+
+
 def _frame_register_mma_fragments(ctx: Any) -> Any:
     """FRAMEFIX: re-register CUDA MMA-C fragment layouts on the walked PrimFunc.
 
@@ -1028,7 +1045,7 @@ def _frame_register_mma_fragments(ctx: Any) -> Any:
         return None
     fragments = list(getattr(ctx, "mma_c_fragments", None) or [])
     if not fragments:
-        return prim_func
+        return _fold_dead_local_stores(prim_func)
     from .frame_register import register_mma_fragment_layouts
 
     # BUG 2 FIX (RULE #1 -- determinism, not a silent skip). The SBlock
@@ -1068,9 +1085,10 @@ def _frame_register_mma_fragments(ctx: Any) -> Any:
         )
     except Exception:  # pragma: no cover - control always importable here
         _direct_epi = True
-    return register_mma_fragment_layouts(
+    registered = register_mma_fragment_layouts(
         prim_func, fragments, pin_c_layout=bool(_direct_epi)
     )
+    return _fold_dead_local_stores(registered)
 
 
 # Sentinel type alias. The real return type is ``tvm.tir.PrimFunc``;
