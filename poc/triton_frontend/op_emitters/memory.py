@@ -1617,11 +1617,27 @@ def _build_coalesced_copy_loop_layout(ctx, out_shape, contig_axis, dtype):
     #     not passed as API arguments"). Deferring to natural inference both
     #     coalesces AND compiles cleanly with the OOB mask epilogue intact.
     #   * NON-INNERMOST contiguous axis (a != last, e.g. A's [hd, k] transposed
-    #     dout load): the SOURCE innermost axis is genuinely non-contiguous
-    #     (stride nheads*headdim), so there is NO 16B-vectorizable innermost run
-    #     to coalesce -- scalar 4B is the CORRECT lowering (native also issues
-    #     scalar loads for this operand; ldmatrix/transpose is a proven dead
-    #     end). This is NOT a degrade: it is the geometrically-correct width.
+    #     dout load): with the dout shared tile kept LOGICALLY [hd, k], the
+    #     SOURCE innermost (k) axis has stride nheads*headdim != 1, so the C++
+    #     vectorizer's stride-relaxed probe (loop_vectorize.cc
+    #     ComputeBufferVectorSize, gated on is_one(innermost stride)) correctly
+    #     declines to vectorize -- scalar 4B is the geometrically-correct width
+    #     FOR THIS [hd, k] layout. (Provenance correction: native does NOT issue
+    #     scalar loads for dout -- native VECTORIZES dout to 16B
+    #     cp.async.cg.shared.global 0x10; the scalar cp.async.ca 0x4 loads native
+    #     issues are the dA decay vector, NOT dout. The earlier "native also
+    #     issues scalar loads for this operand" note MISATTRIBUTED dA's loads to
+    #     dout and is removed.) A 16B dout load is achievable ONLY by making the
+    #     shared tile PHYSICALLY [k, hd] (hd innermost, stride 1) so the relaxed
+    #     probe fires -- but that transposed relayout must then re-derive
+    #     BIT-EXACT transposed reads for BOTH the dout*exp elementwise AND the
+    #     register-A MMA fragment (reduction.py: "a transposed A would need the
+    #     [Ka, M] fragment layout -- not yet proven"). MEASURED DISPROOF: the
+    #     loop_layout/Fragment channel CANNOT reach 16B (it thread-coalesces but
+    #     emits T.unroll(16) x 4B, not T.vectorized(4) x 16B like the C operand);
+    #     the transposed-physical-tile path is unproven and high-bit-exact-risk
+    #     on this MAXDIFF=0 kernel. So 4B stays: it is correct for [hd, k], NOT a
+    #     silent degrade (RULE #1).
     #
     # Returning None here keeps the load bit-correct and lets the (now fixed)
     # vectorizer choose the genuine width per operand. RULE #1: no silent
