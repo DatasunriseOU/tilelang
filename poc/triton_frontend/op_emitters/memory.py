@@ -2249,6 +2249,38 @@ def _emit_ptrstate_tile_load_tir(
     # tile -- the gemm reads it directly, native single-#shared. Gated to the
     # routed prologue-opt path; every other path is byte-identical.
     load_scope = "shared" if len(out_shape or []) >= 2 else "local"
+    # LEVER 1 (dA SHARED-RESIDENCY -- eliminate the rank-1 local stack
+    # round-trip; GENERIC, backend-neutral, bit-exact). A rank-1 (vector)
+    # elementwise-feeding load (the SSD/dstates dA decay tile ``float[32]``)
+    # defaults to a per-thread ``local`` addressable array. Its DOWNSTREAM
+    # consumer -- the ``exp(dA)`` scale that builds the swizzled MMA-A operand
+    # fragment -- reads it with a thread-divergent swizzle index
+    # (``(i>>3)*8 + ((i&3)>>1)*4 + (threadIdx.x&3)``). A thread-local
+    # addressable array indexed by a ``threadIdx``-mixed (divergent) expression
+    # CANNOT be SROA-promoted to registers by ptxas, so it is DEMOTED to LOCAL
+    # MEMORY: the conditional-loaded dA value is STAGED to a 128-byte stack
+    # array (STL) and RELOADED (LDL) before the exp-scale MMA -- a high-latency
+    # local round-trip native AVOIDS (MEASURED: 1.835M STL + 0.459M LDL dynamic
+    # warp-insts, 128B stack frame USED). Staging such a rank-1 load in SHARED
+    # instead lets the SAME divergent swizzled read land on shared memory (the
+    # rank>=2 operand tiles already do exactly this), eliminating the local
+    # stack round-trip and dropping the stack frame to 0 B (MEASURED: STL/LDL
+    # 0, stack 0 B, routed 2.64ms -> 2.26ms, MAXDIFF=0 on the prod tile + all 6
+    # partial-mask shapes + int64 2.82GB). RULE #1: the LOADED VALUE and the
+    # OOB->0 guard are byte-identical (same conditional LDG, same boundshoist
+    # prefix+OOB-zero partition, same ``other``); ONLY the staging-buffer scope
+    # changes (local stack array -> shared tile), never the math, the mask, or
+    # the int64 base. Gated to the rank-1 ELEMENTWISE-feeding load on the routed
+    # prologue path (same discriminator as the rank>=2 elementwise demotion
+    # below); every other rank-1 load (constant/affine-indexed scalar tiles that
+    # ptxas keeps in registers) keeps ``local`` and is byte-identical.
+    if (
+        load_scope == "local"
+        and len(out_shape or []) == 1
+        and getattr(ctx, "routed_triton_prologue_opt", False)
+        and _rank2_load_feeds_only_elementwise(ctx, result_value)
+    ):
+        load_scope = "shared"
     # ASYNCIMPL: if this rank>=2 load can become a COOPERATIVE cp.async CopyNode
     # (the routed async path AND the route verifies a contiguous tile axis to
     # coalesce over -- e.g. the dstates dout tile ``[hd, k]`` with hd contiguous),
@@ -2277,10 +2309,17 @@ def _emit_ptrstate_tile_load_tir(
                 _async_eligible = True
     if (
         load_scope == "shared"
+        and len(out_shape or []) >= 2
         and getattr(ctx, "routed_triton_prologue_opt", False)
         and _rank2_load_feeds_only_elementwise(ctx, result_value)
         and not _async_eligible
     ):
+        # rank>=2 elementwise-only load: its result is re-staged into the
+        # swizzled gemm-operand shared tile anyway, so the raw shared tile is
+        # redundant -> demote to local. (LEVER 1: the RANK-1 elementwise dA load
+        # is the OPPOSITE case -- it has NO redundant re-stage and its divergent
+        # swizzled read forces local->stack; it is PROMOTED to shared above and
+        # MUST NOT be demoted here, hence the rank>=2 guard.)
         load_scope = "local"
     tile_buf = _alloc_tile_buffer(
         ctx,
