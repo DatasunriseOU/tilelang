@@ -348,6 +348,23 @@ class WalkerCtx:
         # options or kernel autotune-config when available.
         self.num_warps: int = 4
         self.num_stages: int = 2
+        # minBlocksPerMultiprocessor -- the 2nd arg of
+        # ``__launch_bounds__(maxThreadsPerBlock, minBlocksPerMultiprocessor)``.
+        # 0 = unset (codegen default 1; no extra occupancy hint emitted). When a
+        # positive value is set (by ``from_ttir`` for a kernel whose register
+        # high-water lets ptxas pack into a higher-occupancy budget), the kernel
+        # block scope emits a ``tl.min_blocks_per_sm`` AttrStmt so the CUDA
+        # codegen stamps ``__launch_bounds__(threads, min_blocks_per_sm)``.
+        # MEASURED: this AttrStmt is also a fusion barrier -- its presence keeps
+        # the lowered addressing index-compute in explicit strength-reduced
+        # int32/int64 ``tile_binop`` arrays rather than wide live int64, yielding
+        # a STRUCTURALLY DIFFERENT, lower-register kernel (128->95 regs; NOT a
+        # byte-identical instruction stream). The OUTPUT stays bit-exact vs the
+        # native reference across single-tile + 5 partial-mask + int64 2.82/4.32GB
+        # (MAXDIFF=0.0 every case), so the change is a safe bit-exact perf win
+        # (RULE #1: validated by direct A/B parity, NOT assumed from a byte-equal
+        # claim).
+        self.min_blocks_per_sm: int = 0
         # PROLOGUE-OPT gate (routed-triton path only). When True, the
         # convergence-point tile materializer (``materialize_lazy_tile``)
         # THREAD-DISTRIBUTES the elementwise prologue across the block's
@@ -438,6 +455,11 @@ class WalkerCtx:
         # ``tt.dot`` can keep a direct store result in local.fragment but must
         # use shared scope when a later arith op indexes the dot result).
         self.ssa_users: Dict[str, set] = {}
+        # Printed operand SSA name -> the set of consumer op OBJECTS. A
+        # robust companion to ``ssa_users`` (which holds only op-NAMES):
+        # lets a fold gate call another emitter helper on the actual
+        # consumer op (no op-string parsing). Seeded by the same prepass.
+        self.ssa_user_ops: Dict[str, set] = {}
         # Optional caller-provided ABI shapes for pointer block args.
         # TTIR pointer types do not carry host tensor extents, but runtimes
         # such as MLX validate the DLTensor size against PrimFunc buffer_map.
@@ -1301,6 +1323,30 @@ def should_fold_addressing(ctx: "WalkerCtx", op: Any) -> bool:
     )
 
 
+def _record_affine_tile_source(ctx: "WalkerCtx", dst: Any, expr: Any) -> None:
+    """Record the lazy source for a materialized tile, keyed by data Var.
+
+    BOUNDSHOIST. When this buffer (or any alias sharing its backing ``data``
+    Var, e.g. an ``expand_dims`` rebind) later appears as the LHS of a
+    masked-store bounds leaf ``offs_buf[i] < dim``, the epilogue partitioner
+    in memory.py re-derives the affine ``read_lane`` form (``base + i``)
+    straight from this source -- proving the per-axis monotone bound a bare
+    BufferLoad hides -- so the OOB zero-fill becomes axis-partitioned UNGUARDED
+    loops. Purely advisory: a missing/non-affine entry just keeps the
+    per-element predicate (RULE #1: never a wrong bound).
+    """
+    try:
+        store_map = getattr(ctx, "affine_tile_source", None)
+        if store_map is None:
+            store_map = {}
+            ctx.affine_tile_source = store_map
+        data_var = getattr(dst, "data", None)
+        if data_var is not None:
+            store_map[data_var] = expr
+    except Exception:
+        pass
+
+
 def materialize_lazy_tile(
     ctx: "WalkerCtx",
     expr: LazyTileExpr,
@@ -1432,6 +1478,7 @@ def materialize_lazy_tile(
                 "barrier after the cooperative shared fill; refusing to emit a "
                 "race-prone distributed tile (RULE #1)."
             ) from exc
+        _record_affine_tile_source(ctx, dst, expr)
         return dst
 
     rank = len(expr.shape)
@@ -1462,6 +1509,7 @@ def materialize_lazy_tile(
             body,
         )
     ctx.emit(body)
+    _record_affine_tile_source(ctx, dst, expr)
     return dst
 
 

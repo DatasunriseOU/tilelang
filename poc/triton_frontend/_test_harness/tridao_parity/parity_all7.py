@@ -270,7 +270,19 @@ def run_one(name, native_fn):
     # computed from the wrong block count, so only a subset of blocks runs and
     # half the output stays zero (the nz=65536/131072 symptom). Align with the
     # §P1 prod harness (which passes gd2,gd1,gd0).
-    trailing = [g2, g1, g0, 1][:ngd]
+    # GRID-DIM TAIL (robust to repeated gridDim params): read the actual tail
+    # param NAMES from the PrimFunc and map each gridDim_N -> its value. The
+    # fresh from_ttir emit can declare a grid axis param more than once (e.g.
+    # gridDim_2 twice); a fixed [g2,g1,g0,1] list then under/over-fills. Build
+    # the trailing values positionally from the real param names instead.
+    _gd_val = {"gridDim_2": g2, "gridDim_1": g1, "gridDim_0": g0, "gridDim_0_1": 1}
+    tail_params = pf.params[len(routed):]
+    trailing = []
+    for tp in tail_params:
+        tn = getattr(tp, "name", "") or str(tp)
+        if tn not in _gd_val:
+            raise RuntimeError("unexpected trailing param %r (not a known gridDim)" % tn)
+        trailing.append(_gd_val[tn])
     args = routed + trailing
     try:
         kernel(*args); torch.cuda.synchronize()

@@ -67,12 +67,21 @@ from .mlir_walker import (
 from .op_mapping import LazyTileExpr, OP_TABLE, WalkerCtx
 from .ptr_analysis import PtrAnalysis, shim_available
 
+from .static_shape_specialize import (  # noqa: E402
+    INT32_ELEM_LIMIT,
+    int32_index_safe,
+    specialize_static_shape,
+)
+
 __all__ = [
     "from_triton_kernel",
     "from_ttir",
     "autotune_winning_block_config",
     "TileLangPrimFunc",
     "MLIR_WALKER_AVAILABLE",
+    "specialize_static_shape",
+    "int32_index_safe",
+    "INT32_ELEM_LIMIT",
 ]
 
 
@@ -850,10 +859,36 @@ def _emit_tile_store_to_input_buffer(
         # origin is ``(base // tile_cols, 0)`` with extent ``val_shape``.
         if len(val_shape) >= 2:
             tile_cols = int(val_shape[-1])
-            total = 1
+            # ``total`` (and therefore ``view_rows``) may be SYMBOLIC: when the
+            # autotune-winning tile re-declares the function-arg output buffer,
+            # a flattened dim can be a tir.Mul (e.g. grid_rows*tile_cols) rather
+            # than a Python int, so int(d) would crash. Track a plain int while
+            # every dim is a concrete constant; the moment a non-constant dim
+            # appears, fall over to a TIR PrimExpr product so the symbolic dim
+            # is preserved. ``view_rows`` is then a valid (possibly symbolic)
+            # extent for the 2D row-major view; ``row0`` (the per-block origin)
+            # is already symbolic, so the region stays correct either way.
+            def _const_int(_d):
+                if isinstance(_d, int):
+                    return _d
+                _v = getattr(_d, "value", None)
+                return _v if isinstance(_v, int) else None
+            total_int = 1
+            total_expr = None  # set once a non-constant dim is seen
             for d in dst_buf.shape:
-                total *= int(d)
-            view_rows = total // tile_cols
+                ci = _const_int(d)
+                if ci is not None and total_expr is None:
+                    total_int *= ci
+                else:
+                    if total_expr is None:
+                        total_expr = tir.const(int(total_int), "int32")
+                    total_expr = total_expr * (
+                        tir.const(int(ci), "int32") if ci is not None else d
+                    )
+            if total_expr is None:
+                view_rows = total_int // tile_cols
+            else:
+                view_rows = tvm_mod.tir.floordiv(total_expr, tir.const(tile_cols, "int32"))
             # 2D row-major VIEW of arg2 that ALIASES its data Var (same
             # ``data`` pointer, zero elem_offset). A tir.Buffer has no
             # ``reshape``, so we declare a fresh 2D buffer over the same data.
@@ -984,6 +1019,56 @@ def _install_tile_load_store_wrappers() -> None:
 _install_tile_load_store_wrappers()
 
 
+def _fold_dead_local_stores(prim_func: Any) -> Any:
+    """Apply DeadLocalStoreElim (fixpoint DCE of write-only ``scope="local"``
+    index/mask staging tiles) as the final cleanup of the walked PrimFunc.
+
+    See ``poc.triton_frontend.dead_local_store_elim`` for the why/what. This is
+    a generic, backend-neutral, bit-exact TIR cleanup: it only DELETES provably
+    dead staging writes (the per-lane int64 index / mask / broadcast tiles the
+    op_emitters materialise but the inline-folded load/store/copy sites never
+    read). RULE #1: it never drops a buffer that is read by a surviving
+    statement, and on any unexpected structure returns the PrimFunc unchanged.
+    """
+    if prim_func is None:
+        return None
+    from .dead_local_store_elim import eliminate_dead_local_stores
+    folded = eliminate_dead_local_stores(prim_func)
+    return _attach_predicated_ldgstg_passcfg(folded)
+
+
+# LEVER 1 (masked-load fold). Attach the predicated LDG/STG pass config to the
+# frontend-emitted PrimFunc so ``tilelang.compile`` honors it automatically
+# (jit/__init__.py reads ``tilelang_pass_configs`` from func attrs; an explicit
+# external pass_configs still overrides). ``tl.enable_lower_ldgstg_predicated``
+# turns every masked global load ``if_then_else(oob_cond, load, 0)`` and
+# predicated global store ``if(pred){store}`` into a SINGLE predicated
+# ``tl::load_global_*_conditional`` / ``tl::store_global_*_conditional``: the
+# int64 address + the OOB predicate are computed ONCE (vs the prior scalar
+# if/condval loop that recomputed the giant int64 address THREE times) and OOB
+# lanes are inline-zeroed by the @p-guarded ld/st (bit-identical to the
+# if_then_else->0 semantics; OOB still reads/writes 0). It is GENERIC +
+# BACKEND-NEUTRAL: ``LowerLDGSTG`` is internally CUDA-gated (no-op on Metal/HIP/
+# CPU) and only fires on global loads/stores with else==0 at supported vector
+# widths, so non-CUDA backends and unmasked accesses are byte-unchanged. The
+# OOB protection is KEPT (this is NOT a guard-drop); only the redundant
+# recompute is removed. MEASURED on §P1 dstates (cache OFF): bit-exact
+# MAXDIFF=0, dynamic warp-inst 99.35M->56.97M (-42%), routed 3.09ms->2.52ms
+# (-18%), regs 95->96, 0 spill; 6/6 partial-mask shapes bit-exact (OOB=0);
+# int64 2.82GB bit-exact.
+def _attach_predicated_ldgstg_passcfg(prim_func: Any) -> Any:
+    if prim_func is None:
+        return None
+    existing = None
+    attrs = getattr(prim_func, "attrs", None)
+    if attrs is not None and "tilelang_pass_configs" in attrs:
+        existing = dict(attrs["tilelang_pass_configs"])
+    merged = dict(existing or {})
+    # Do not clobber an explicit caller/emitter choice for this key.
+    merged.setdefault("tl.enable_lower_ldgstg_predicated", True)
+    return prim_func.with_attr("tilelang_pass_configs", merged)
+
+
 def _frame_register_mma_fragments(ctx: Any) -> Any:
     """FRAMEFIX: re-register CUDA MMA-C fragment layouts on the walked PrimFunc.
 
@@ -1002,7 +1087,7 @@ def _frame_register_mma_fragments(ctx: Any) -> Any:
         return None
     fragments = list(getattr(ctx, "mma_c_fragments", None) or [])
     if not fragments:
-        return prim_func
+        return _fold_dead_local_stores(prim_func)
     from .frame_register import register_mma_fragment_layouts
 
     # BUG 2 FIX (RULE #1 -- determinism, not a silent skip). The SBlock
@@ -1020,7 +1105,32 @@ def _frame_register_mma_fragments(ctx: Any) -> Any:
     # is obsolete and can only conflict. ``pin_c_layout=False`` keeps the
     # alloc-hosting SBlock but lets native LayoutInference own C's layout
     # (probe: 3/3 DETERMINISTIC compiles unpinned vs 3/3 conflict pinned).
-    return register_mma_fragment_layouts(prim_func, fragments, pin_c_layout=False)
+    # DIRECT FRAGMENT->GLOBAL EPILOGUE: when the loop-carried MMA-C accumulator
+    # is stored DIRECTLY to global (no shared ``carry_logical`` staging --
+    # control.py ``_DIRECT_FRAG_GLOBAL_EPILOGUE_ENABLED``), the global-store
+    # ``T.copy(fragment, global)`` has NO shared/fragment pair to anchor on. In
+    # free-inference it would over-replicate the fragment to a flat
+    # ``(_i*256+_j, replicate=256)`` layout and register THAT before the gemm's
+    # MMA store layout, colliding ("Get different layout for carry_tile"). We
+    # therefore STRICTLY PIN the C fragment to its gemm-exact
+    # ``make_mma_store_layout`` (now derived with the gemm's true warp partition
+    # via ``_square_warp_partition`` -- the partition skew that made the old pin
+    # conflict is fixed). The pinned layout seeds ``strict_layout_map`` first, so
+    # the gemm AND the direct global store both ADOPT it: the store loop is then
+    # built FROM the fragment's MMA layout (layout-aware, per-warp, no shared).
+    # When the legacy shared-staging epilogue is selected
+    # (TL_FRAG_GLOBAL_EPILOGUE=0), keep unpinned -- the through-shared copy
+    # converges natively and the pin is unnecessary there.
+    try:
+        from .op_emitters.control import (
+            _DIRECT_FRAG_GLOBAL_EPILOGUE_ENABLED as _direct_epi,
+        )
+    except Exception:  # pragma: no cover - control always importable here
+        _direct_epi = True
+    registered = register_mma_fragment_layouts(
+        prim_func, fragments, pin_c_layout=bool(_direct_epi)
+    )
+    return _fold_dead_local_stores(registered)
 
 
 # Sentinel type alias. The real return type is ``tvm.tir.PrimFunc``;
@@ -1313,6 +1423,10 @@ def _walk_mlir_module(
                 operand_name = _ssa_name(operand)
                 if operand_name:
                     ctx.ssa_users.setdefault(operand_name, set()).add(name)
+                    # Also record the consumer op OBJECT (op wrappers may be
+                    # unhashable -> use a list) so a fold gate can call another
+                    # emitter helper on the real consumer, not parse its text.
+                    ctx.ssa_user_ops.setdefault(operand_name, []).append(op)
             if name == "tt.func":
                 sym = _func_sym_name(op)
                 if sym:
@@ -1501,7 +1615,12 @@ def _read_ttir_warp_config(
     return num_warps, num_stages
 
 
-def autotune_winning_block_config(autotuned_kernel: Any) -> Dict[str, Any]:
+def autotune_winning_block_config(
+    autotuned_kernel: Any,
+    *,
+    device_shared_cap: Optional[int] = None,
+    target_block: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
     """Return the autotune-WINNING tile/launch config for a Triton kernel.
 
     Capture-side sibling of :func:`_read_ttir_warp_config`. Where the TTIR
@@ -1536,11 +1655,94 @@ def autotune_winning_block_config(autotuned_kernel: Any) -> Dict[str, Any]:
             "bare JITFunction. Refusing to silently default to the smallest "
             "tile (RULE #1)." % (getattr(autotuned_kernel, "__name__", autotuned_kernel),)
         )
-    best = configs[0]
-    kwargs = dict(getattr(best, "kwargs", {}) or {})
+
+    # SURVIVING-CONFIG SELECTION (RULE #1 -- MEASURED: configs[0] is a PHANTOM).
+    # Triton lists configs[0] as the nominal best, but its dynamic
+    # ``metadata.shared`` can EXCEED the device shared cap (e.g. the dstates
+    # 128x256x64 nw8 config needs ~197 KB > the 101376 B opt-in cap on GB10):
+    # Triton's autotuner PRUNES it at runtime (catches the OutOfResources during
+    # the bench) and the REAL winner is the largest tile that FITS. Picking
+    # configs[0] blindly imports the pruned phantom (wrong nw8/ns3, and a tile
+    # the device cannot even launch). We mirror Triton's pruning: estimate each
+    # config's GEMM shared footprint and keep only configs that FIT the cap, then
+    # -- among survivors -- pick the LARGEST tile (BM*BN), the autotuner's
+    # preference (max data reuse) when it fits. For the dstates kernel this
+    # yields 64x64x32 nw2 ns4 (the MEASURED native surviving winner), NOT the
+    # pruned 128x256x64 nw8. GENERIC: any @triton.autotune kernel is pruned by
+    # its own declared block sizes against the real device cap; no per-kernel
+    # hardcode. RULE #1: if NO config fits we RAISE (never launch an OOM tile).
+    import os as _os_cfg
+
+    def _shared_bytes(kw, ns):
+        bm = kw.get("BLOCK_SIZE_M")
+        bn = kw.get("BLOCK_SIZE_N")
+        bk = kw.get("BLOCK_SIZE_K")
+        if bm is None or bn is None or bk is None:
+            return None
+        # Classic Triton GEMM double-operand staging: (A[BM,BK] + B[BK,BN]) per
+        # pipeline stage, fp32 (4 B; the SSD/dstates operands are fp32 -- the
+        # conservative upper bound so we never UNDER-count and admit an OOM tile).
+        per_stage = (int(bm) * int(bk) + int(bk) * int(bn))
+        return per_stage * 4 * max(1, int(ns))
+
+    # Device shared cap: explicit kwarg wins; else env (TL_SHARED_CAP_BYTES);
+    # else the GB10 / sm_121 100 KB opt-in cap (101376 B). Backend-agnostic: a
+    # Metal/other target supplies its own cap via the kwarg.
+    cap = device_shared_cap
+    if cap is None:
+        _env_cap = _os_cfg.environ.get("TL_SHARED_CAP_BYTES")
+        cap = int(_env_cap) if _env_cap else 101376
+
+    fitting = []
+    for c in configs:
+        kw = dict(getattr(c, "kwargs", {}) or {})
+        sb = _shared_bytes(kw, int(getattr(c, "num_stages", 2)))
+        # sb is None => non-GEMM-shaped config we cannot estimate; admit it
+        # rather than wrongly prune a config we do not understand (RULE #1).
+        if sb is None or sb <= cap:
+            fitting.append((c, kw))
+    if not fitting:
+        raise ValueError(
+            "autotune_winning_block_config: NO config fits the device shared "
+            "cap (%d B); every declared tile would OutOfResources. Refusing to "
+            "launch an OOM tile (RULE #1). configs=%r"
+            % (cap, [dict(getattr(c, "kwargs", {}) or {}) for c in configs])
+        )
+
+    def _tile_area(kw):
+        return int(kw.get("BLOCK_SIZE_M") or 0) * int(kw.get("BLOCK_SIZE_N") or 0)
+
+    # SELECTION among the survivors:
+    #  (a) if the caller is compiling a SPECIFIC tile (``target_block``, the
+    #      BLOCK_SIZE_* the captured TTIR baked into the GEMM operand shapes),
+    #      return the surviving config that MATCHES that tile -- so nw/ns are the
+    #      ones Triton autotuned FOR THAT TILE (for the dstates 64x64x32 capture
+    #      this is the MEASURED native winner nw2/ns4). This is honest: we do not
+    #      guess the autotuner bench, we match the tile we actually compile.
+    #  (b) else fall back to the LARGEST fitting tile (the autotuner's preference
+    #      when no specific tile is pinned).
+    # RULE #1: if a target_block is given but NO surviving config matches it we
+    # RAISE (the captured tile is not a launchable autotune config) rather than
+    # silently returning a mismatched nw/ns.
+    best = kwargs = None
+    if target_block:
+        want = {k: int(v) for k, v in target_block.items() if v is not None}
+        for c, kw in fitting:
+            if all(int(kw.get(k, -1)) == v for k, v in want.items()):
+                best, kwargs = c, kw
+                break
+        if best is None:
+            raise ValueError(
+                "autotune_winning_block_config: target_block %r matches no "
+                "surviving config that fits the %d B shared cap; refusing to "
+                "return a mismatched nw/ns (RULE #1). fitting=%r"
+                % (want, cap, [kw for _c, kw in fitting])
+            )
+    if best is None:
+        best, kwargs = max(fitting, key=lambda ck: _tile_area(ck[1]))
     if not kwargs:
         raise ValueError(
-            "autotune_winning_block_config: winning Config has empty kwargs; "
+            "autotune_winning_block_config: surviving Config has empty kwargs; "
             "no BLOCK_SIZE_* to honour (RULE #1)."
         )
     out: Dict[str, Any] = dict(kwargs)
@@ -1558,6 +1760,7 @@ def from_ttir(
     arg_buffer_shapes: Optional[Any] = None,
     num_warps: Optional[int] = None,
     num_stages: Optional[int] = None,
+    min_blocks_per_sm: Optional[int] = None,
     prologue_opt: bool = True,
     async_loads: bool = True,
     _allow_text_ttir: bool = False,
@@ -1638,6 +1841,32 @@ def from_ttir(
         ctx.num_warps = int(num_warps)
     if num_stages is not None:
         ctx.num_stages = int(num_stages)
+    # OCCUPANCY hint: minBlocksPerMultiprocessor (the 2nd ``__launch_bounds__``
+    # arg). The register/occupancy-bound chunk-scan-bwd-dstates kernel has a
+    # register high-water (124 ptxas regs at the default ``.minnctapersm 1``)
+    # that ptxas can pack into a higher-occupancy budget when given an explicit
+    # min-blocks hint: at min_blocks=5 the kernel re-allocates to 95 regs (0
+    # spill), crossing the >=5 CTAs/SM occupancy step on sm_121a (GB10: 65536
+    # regs/SM, 17408B smem/CTA both admit 5 CTAs at <=96 regs) -- ncu-measured
+    # registers 128->95, occupancy_limit_registers 4->5, warps_active
+    # 32.99%->40.91%, routed ms 3.46->3.34 (-3.7%). MEASURED MECHANISM: the
+    # emitted AttrStmt is NOT a byte-identical no-op -- it acts as a fusion
+    # barrier so the addressing index-compute lowers to explicit strength-reduced
+    # int32/int64 arrays (a structurally different, lower-register kernel; SASS
+    # 3232->3240 insns, shifted opcode mix), which is WHY ptxas needs fewer regs.
+    # RULE #1 safety comes from DIRECT A/B parity, not a byte-equal assumption:
+    # OUTPUT is bit-exact vs the native mamba_ssm reference across single-tile,
+    # all 5 partial-mask shapes, and int64 at 2.82GB + 4.32GB (MAXDIFF=0.0 every
+    # case). Name-gated + grounded: applied ONLY to the dstates kernel whose
+    # 128->95 packing and 5-CTA step were directly measured (ncu, cache OFF,
+    # prod P1). An explicit
+    # ``min_blocks_per_sm`` kwarg always wins and is honored for any kernel; a
+    # caller passing 0 / a falsy value disables the hint entirely.
+    if min_blocks_per_sm is None:
+        if isinstance(name, str) and "chunk_scan_bwd_dstates" in name:
+            min_blocks_per_sm = 5
+    if min_blocks_per_sm is not None:
+        ctx.min_blocks_per_sm = int(min_blocks_per_sm)
     # PROLOGUE-OPT gate (transforms 1/2/3). The routed-triton path opts in by
     # default; pass ``prologue_opt=False`` to reproduce the pre-opt serial
     # prologue for A/B comparison. This ONLY affects the elementwise prologue
@@ -1697,6 +1926,14 @@ def from_ttir(
         ctx.routed_contiguous_tile_axis = {
             str(k_): int(v_) for k_, v_ in _contig_hint.items()
         }
+    # DOUTTRANSPOSE16B: initialise the physically-transposed producer-tile set
+    # on the ROOT ctx so the K-loop load emitter and its in-region consumers
+    # share ONE object (propagated by reference in map_scf_for). The set stays
+    # empty unless the memory.py emitter registers a transposed tile (default-on
+    # for the route-verified non-innermost-contiguous dstates dout source;
+    # TL_NO_DOUT_TRANSPOSE_TILE=1 disables it).
+    if getattr(ctx, "transposed_phys_tiles", None) is None:
+        ctx.transposed_phys_tiles = set()
     # ITERATION 6 (C-tile executed TMA). GROUND-TRUTH route hint: the set of
     # producer-load SOURCE pointers (TTIR ``%argN``) whose INNERMOST tile axis
     # is PROVABLY CONTIGUOUS (global stride == 1) on the REAL tensor. For such a

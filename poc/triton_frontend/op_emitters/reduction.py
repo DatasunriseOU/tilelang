@@ -107,15 +107,20 @@ def _is_cuda_target(ctx: Any = None) -> bool:
 def _is_metal_target(ctx: Any = None) -> bool:
     """Return True iff the codegen target is explicitly Apple Metal.
 
-    Mirrors :func:`_is_cuda_target` (``ctx.target`` first, then the ambient
-    ``tvm.target.Target.current``). Used to let the fused-dot MMA-C accumulator
-    carry leave SHARED on Metal: a ``local.fragment`` C selects the legacy
-    simdgroup GEMM path (``src/backend/metal/op/gemm.cc``) whose accumulator
-    lives in ``simdgroup_*`` registers, freeing the MxN fp32 threadgroup tile.
+    Mirrors ``_is_cuda_target`` (prefers ``ctx.target`` set by ``from_ttir``,
+    falls back to the ambient ``Target.current()``). Used by
+    ``_wants_fragment_c`` to request a ``local.fragment`` C for an
+    Apple-simdgroup-ELIGIBLE dot so the ``metal_fragment_to_simdgroup`` pass can
+    promote it to ``metal.simdgroup`` ops. fp32 dots are screened out by the
+    dtype guard in ``_wants_fragment_c`` (it mirrors the
+    ``metal_fragment_to_simdgroup`` pass's ``_SIMDGROUP_DTYPES``, which does NOT
+    include float32) -- so fp32 dots keep the shared/SIMT path rather than being
+    routed to the (separate, precision-unvalidated) fp32 simdgroup gemm path.
     """
     ctx_target = getattr(ctx, "target", None) if ctx is not None else None
     if ctx_target:
-        return "metal" in str(ctx_target).lower()
+        t = str(ctx_target).lower()
+        return "metal" in t or "apple" in t
     try:
         import tvm  # noqa: WPS433
 
@@ -125,7 +130,68 @@ def _is_metal_target(ctx: Any = None) -> bool:
     if target is None:
         return False
     kind = str(getattr(getattr(target, "kind", None), "name", "") or "").lower()
-    return "metal" in kind or "metal" in str(target).lower()
+    tstr = str(target).lower()
+    return "metal" in kind or "metal" in tstr or "apple" in tstr
+
+
+# Simdgroup-promotable INPUT dtypes for the Metal fragment->simdgroup pass.
+# fp32 is DELIBERATELY excluded -- it mirrors
+# ``metal_fragment_to_simdgroup._SIMDGROUP_DTYPES`` (the pass that rewrites a
+# ``local.fragment`` GEMM C to ``metal.simdgroup`` ops), which lists only the
+# half/bf16/fp8/int8 slot dtypes, NOT float32. So an fp32 dot keeps shared/SIMT
+# C; we never force it to fragment to chase a simdgroup C (RULE #1: no silent
+# bf16 downcast of an fp32 dot). NB: TileLang's separate gemm.cc legacy
+# simdgroup path CAN emit ``simdgroup_float8x8`` for an fp32 fragment C, but
+# that path's numerics are NOT parity-validated here (no Apple-GPU dispatch),
+# so the conservative residency choice is to leave fp32 on the shared path.
+_METAL_SIMDGROUP_INPUT_DTYPES = frozenset({
+    "float16", "f16", "half",
+    "bfloat16", "bf16",
+    "float8_e4m3", "float8_e5m2",
+    "fp8", "fp8_e4m3", "fp8_e5m2",
+    "e4m3", "e5m2",
+})
+
+
+def _wants_fragment_c(
+    ctx: Any,
+    a_dtype: str,
+    b_dtype: str,
+    M: int,
+    N: int,
+) -> bool:
+    """Generic residency predicate: should the tt.dot C accumulator be forced
+    into ``local.fragment`` (vs the shared-C default)?
+
+    True iff EITHER:
+      * the target is explicitly CUDA (tensor-core MMA REQUIRES a fragment C --
+        ``make_mma_store_layout`` asserts ``is_fragment(C)``); OR
+      * the target is explicitly Metal AND the dot is Apple-simdgroup ELIGIBLE:
+        both input operands are a simdgroup INPUT dtype (fp16/bf16/fp8 -- NOT
+        fp32) AND M % 8 == 0 AND N % 8 == 0 (simdgroup_matrix is an 8x8 tile).
+        A fragment C then lets ``metal_fragment_to_simdgroup`` promote the dot
+        to ``metal.simdgroup_*`` builtins.
+
+    Otherwise False -> shared C (Metal SIMT default; also fp32 Metal dots such
+    as the Mamba3 dstates recurrence, which cannot be simdgroup on Apple HW).
+
+    RULE #1: this is a target+dtype correctness gate, NOT a silent downgrade --
+    an fp32 Metal dot keeps shared C and a real SIMT codegen path; it is never
+    coerced into an invalid fp32 simdgroup store. M/N/dtype come straight from
+    the dot operands in scope at the call site (a_shape/b_shape, normalized
+    a_dtype/b_dtype); if they were unavailable the caller raises rather than
+    guessing.
+    """
+    if _is_cuda_target(ctx):
+        return True
+    if not _is_metal_target(ctx):
+        return False
+    eligible_dtype = (
+        a_dtype in _METAL_SIMDGROUP_INPUT_DTYPES
+        and b_dtype in _METAL_SIMDGROUP_INPUT_DTYPES
+    )
+    eligible_shape = (int(M) % 8 == 0) and (int(N) % 8 == 0)
+    return eligible_dtype and eligible_shape
 
 
 __all__ = [
@@ -1165,6 +1231,50 @@ def map_tt_dot(
                 c = None
         else:
             c = None
+        # REGCARRYCOLLAPSE: the UNFOLDED recurrence ``dot(a,b,zero) ->
+        # addf(carry, dot) -> yield`` has its dot-C operand bound to a FRESH
+        # ZERO tile (``%acc_529``), not the loop carry. ``map_scf_for`` proved
+        # (structural use-def) that this dot accumulates into the carry, and
+        # recorded {dot_result -> carry_blockarg_ssa} in ``frag_carry_unfold_dot``.
+        # Override C to the carry FRAGMENT so the MMA accumulates IN PLACE
+        # (clear_accum stays False below since c is non-None), exactly like the
+        # folded fragment-carry form and native's register-resident dstates
+        # recurrence. The carry was allocated ``local.fragment`` + T.fill-zeroed
+        # before the loop, so the first iteration's accumulate starts from zero.
+        # RULE #1: only when the result SSA is in the proven unfold map.
+        _unfold_dot = getattr(ctx, "frag_carry_unfold_dot", None) or {}
+        if result_value is not None and _unfold_dot:
+            # Inline SSA-name extraction (the nested ``_ssa_name`` below is
+            # local-scoped to the gemm branch and not yet defined here; this
+            # mirrors its ``get_name()`` preference so the key MATCHES the name
+            # ``map_scf_for`` recorded in ``frag_carry_unfold_dot``).
+            _rv = None
+            _getter = getattr(result_value, "get_name", None)
+            if callable(_getter):
+                try:
+                    _rv = str(_getter()) or None
+                except Exception:
+                    _rv = None
+            if _rv is None and isinstance(result_value, dict):
+                _rv = str(result_value.get("name") or "") or None
+            _carry_ssa = _unfold_dot.get(_rv) if _rv else None
+            if _carry_ssa is not None:
+                try:
+                    _carry_buf = ctx.get(_carry_ssa)
+                except KeyError:
+                    _carry_buf = (getattr(ctx, "loop_carry_buffers", {}) or {}).get(
+                        _carry_ssa
+                    )
+                if _carry_buf is None:
+                    raise EmitError(
+                        "tt.dot REGCARRYCOLLAPSE: unfolded-recurrence carry "
+                        f"block-arg {_carry_ssa!r} for dot result {_rv!r} is not "
+                        "bound to a buffer. map_scf_for must allocate it as a "
+                        "local.fragment carry and bind the block-arg before the "
+                        "body walks. Refusing to fall back to a fresh shared C "
+                        "(RULE #1)."
+                    )
+                c = _carry_buf
         # Triton accumulates fp16/bf16 inputs into fp32 by convention.
         acc_dtype = (
             "float32" if a_dtype in {"float16", "f16", "bfloat16", "bf16"} else out_dtype
@@ -1267,6 +1377,95 @@ def map_tt_dot(
             except Exception as e:
                 raise EmitError(f"T.copy({label}) failed: {e}") from e
 
+        def _materialize_into(ctx_local: Any, lazy: Any, frag: Any) -> None:
+            """REGSCALECOLLAPSE: fill the MMA A ``frag`` from ``lazy`` with a
+            SPATIAL (``ForKind.PARALLEL``) loop nest.
+
+            The fill reads the lazy expr's per-element value (the raw SHARED
+            operand multiplied by the per-K scale) and stores it into the A
+            fragment. The loop MUST be PARALLEL, not SERIAL: LayoutInference's
+            ParallelLoopTransformer distributes a *spatial* loop's iteration
+            space onto the fragment's MMA thread layout (each thread writes only
+            its register-resident slots, reading the matching SHARED lane -- the
+            ldmatrix). A SERIAL nest would have every thread execute the whole
+            [M,K] space, which LayoutInference rejects for a fragment
+            (``CanProveEqual(abs(scale),1)`` fails) -- so PARALLEL is required
+            for correctness, not a perf nicety. Mirrors a hand-written
+            ``for i,j in T.Parallel(M,K): A_frag[i,j] = A_sh[i,j]*exp(S[j])``
+            (PROVEN bit-identical to the gemm_ss shared-scale path on gb10).
+            """
+            tir_mod = ctx_local.tir()
+            frag_shape = list(getattr(frag, "shape", []) or lazy.shape or [1])
+            loop_vars: List[Any] = [
+                tir_mod.Var(ctx_local.fresh(f"dot_a_frag_i{axis}"), "int32")
+                for axis, _extent in enumerate(frag_shape or [1])
+            ]
+
+            def _src_indices() -> Tuple[Any, ...]:
+                rank = len(lazy.shape)
+                if len(loop_vars) >= rank:
+                    idx = list(loop_vars[-rank:])
+                else:
+                    idx = [tir_mod.const(0, "int32")] * (rank - len(loop_vars)) + list(loop_vars)
+                for axis, extent in enumerate(lazy.shape):
+                    if int(extent) == 1:
+                        idx[axis] = tir_mod.const(0, "int32")
+                return tuple(idx)
+
+            store = tir_mod.BufferStore(
+                frag,
+                lazy.read_lane(ctx_local, _src_indices()),
+                list(loop_vars) or [tir_mod.const(0, "int32")],
+            )
+            body: Any = store
+            for var, extent in zip(reversed(loop_vars), reversed(frag_shape or [1])):
+                body = tir_mod.For(
+                    var,
+                    tir_mod.const(0, "int32"),
+                    tir_mod.const(int(extent), "int32"),
+                    tir_mod.ForKind.PARALLEL,
+                    body,
+                )
+            ctx_local.emit(body)
+
+        def _stage_operand_to_register_a(
+            buf: Any,
+            shape: List[int],
+            dtype: str,
+        ) -> Any:
+            """REGSCALECOLLAPSE: materialise a lazy A operand straight into a
+            ``local.fragment`` (MMA-A load layout) so T.gemm dispatches to
+            ``gemm_rs`` and reads A from REGISTERS -- native's register-resident
+            decay scale.
+
+            ``buf`` is the still-lazy ``dout*exp`` (kept lazy by
+            ``arith._feeds_tensorcore_dot_as_register_a``): its ``read_lane``
+            reads the raw operand from the cp.async-staged SHARED tile and
+            multiplies by the per-K scale. Materialising that lazy expr into a
+            ``local.fragment`` fills the A fragment by reading SHARED + scaling
+            per-element -- exactly ``ldmatrix(dout) -> *exp(dA) in registers``.
+            The follow-on ``T.gemm(A_frag, B_shared, C_frag)`` sees
+            ``is_fragment(A) and is_shared(B)`` -> ``gemm_rs`` (``body_rs``),
+            which consumes ``A_frag`` directly from rmem. NO second shared
+            buffer (``dot_a_logical``) and NO ``__syncthreads`` for its write.
+
+            T.gemm's ``is_gemm_rs`` ``infer_layout`` assigns A the
+            ``make_mma_load_layout(matrix="A")`` Fragment; LayoutInference
+            propagates it back to this fill loop (the SHARED read is the
+            ldmatrix, the fragment write is register-resident). RULE #1: only
+            reached for a still-lazy A operand proven to feed a tensor-core dot;
+            a non-lazy / non-CUDA A keeps the shared-stage path below.
+            """
+            frag = _alloc_tile_buffer(
+                ctx,
+                shape,
+                dtype,
+                name=ctx.fresh("dot_a_frag"),
+                scope="local.fragment",
+            )
+            _materialize_into(ctx, buf, frag)
+            return frag
+
         def _stage_operand_to_shared(
             buf: Any,
             shape: List[int],
@@ -1331,10 +1530,8 @@ def map_tt_dot(
             if not _is_shared_scope(buf):
                 # Plain ``local`` full-per-thread real buffer (e.g. the
                 # ``tile_binop`` = ``dout*exp`` result). Copy it into a shared
-                # logical tile so the gemm-stage copy below is the cooperative
-                # shared->shared path. (This local->shared copy is per-thread but
-                # writes the SAME logical tile; the gemm-stage copy that follows
-                # is the ldmatrix-matching cooperative one.)
+                # logical tile so the gemm reads a SHARED logical operand whose
+                # ldmatrix swizzle T.gemm + LayoutInference own.
                 logical = _alloc_tile_buffer(
                     ctx,
                     shape,
@@ -1344,15 +1541,18 @@ def map_tt_dot(
                 )
                 _emit_copy_stmt(buf, logical, f"{label}, logical shared operand")
                 buf = logical
-            staged = _alloc_tile_buffer(
-                ctx,
-                shape,
-                dtype,
-                name=ctx.fresh(f"dot_{label}_shared"),
-                scope="shared",
-            )
-            _emit_copy_stmt(buf, staged, f"{label}, staged shared operand")
-            return staged
+            # STAGING COLLAPSE (RULE #1 -- correctness + shared-budget): the
+            # operand now lives in ONE plain-logical SHARED buffer. Hand it to
+            # T.gemm DIRECTLY -- exactly the native single-#shared model and the
+            # SAME path the real-shared B operand (``tile_load_69``) already
+            # takes (it hits the early ``_is_shared_scope(buf): return buf``
+            # above). T.gemm + LayoutInference assign the ldmatrix swizzle to
+            # THIS shared buffer and propagate it back to its producer fill, so
+            # there is NO separate ``dot_{label}_shared`` swizzle round-trip.
+            # That kills the 3rd A buffer: A goes from
+            # tile_load(raw shared)+dot_a_logical(shared)+dot_a_shared(swizzled)
+            # = 96KB down to a single ~32KB shared operand, matching native.
+            return buf
 
         def _ssa_name(value: Any) -> str:
             try:
@@ -1469,18 +1669,24 @@ def map_tt_dot(
 
         clear_accum = False
         prefer_shared_c = _result_needs_shared_c()
-        # Target gate: shared-C is the DEFAULT (Metal/unspecified) -- GemmMetal
-        # stores its simdgroup accumulator back to a shared tile, and a
-        # follow-up scalar expr like ``dot * scale`` needs C readable as a
-        # shared tile. But on an EXPLICIT CUDA target the tensor-core MMA path
-        # REQUIRES the accumulator in ``local.fragment``:
-        # ``mma_macro_generator.make_mma_store_layout`` asserts
-        # ``is_fragment(C)`` and aborts on a shared C (``local_buf ... must be
-        # a fragment, but got shared``). So we force fragment-C ONLY when the
-        # target is explicitly CUDA, leaving the Metal/unspecified default
-        # untouched. (RULE #1: a real target-correctness fix, not a silent
-        # downgrade -- a shared-C MMA simply does not codegen on CUDA.)
-        if prefer_shared_c and _is_cuda_target(ctx):
+        # Target gate: shared-C is the DEFAULT (Metal SIMT / unspecified) --
+        # GemmMetal's cooperative path stores its accumulator back to a shared
+        # tile, and a follow-up scalar expr like ``dot * scale`` needs C
+        # readable as a shared tile. We force C into ``local.fragment`` ONLY
+        # when ``_wants_fragment_c`` says so:
+        #   * EXPLICIT CUDA -- tensor-core MMA REQUIRES a fragment C
+        #     (``mma_macro_generator.make_mma_store_layout`` asserts
+        #     ``is_fragment(C)`` and aborts on a shared C); OR
+        #   * EXPLICIT Metal AND an Apple-simdgroup-ELIGIBLE dot
+        #     (fp16/bf16/fp8 inputs, M%8==0, N%8==0) -- a fragment C lets the
+        #     ``metal_fragment_to_simdgroup`` pass promote the dot to
+        #     ``metal.simdgroup_*`` builtins.
+        # fp32 Metal dots (e.g. the Mamba3 dstates recurrence) are NOT eligible
+        # (Apple HW has no fp32 simdgroup_matrix input type), so they fall
+        # through to shared C + the SIMT path -- NOT coerced into an invalid
+        # fp32 simdgroup store (RULE #1: target+dtype correctness, no silent
+        # bf16 downcast). M/N/dtype come straight from the dot operands above.
+        if prefer_shared_c and _wants_fragment_c(ctx, a_dtype, b_dtype, M, N):
             prefer_shared_c = False
         # DEFECT-C (Metal): a fused-dot accumulator whose RESULT is recorded by
         # ``map_scf_for`` as an accumulate-into-carry dot -- either the FOLDED
@@ -1607,7 +1813,31 @@ def map_tt_dot(
 
         a_stage_shape = [Ka, M] if pre_trans_a else [M, Ka]
         b_stage_shape = [N, Kb] if pre_trans_b else [Kb, N]
-        a = _stage_operand_to_shared(a, a_stage_shape, a_dtype, "a")
+        # REGSCALECOLLAPSE: route a still-lazy A operand (the ``dout*exp`` decay
+        # scale kept lazy by ``arith._feeds_tensorcore_dot_as_register_a``)
+        # straight into a ``local.fragment`` (MMA-A load layout) instead of a
+        # cooperative SHARED round-trip. T.gemm then sees ``is_fragment(A)`` ->
+        # ``gemm_rs`` and reads A from REGISTERS, applying the scale on the
+        # fragment after the (T.copy-equivalent) ldmatrix fill. This removes the
+        # ``dot_a_logical`` shared buffer + its ``__syncthreads`` per K-step --
+        # native's register-resident A operand. Gated (RULE #1, fail-closed) to:
+        #   * CUDA target + tensor-core MMA path (``not prefer_scalar_dot``),
+        #   * A still LAZY (so the raw operand + scale are recoverable; a
+        #     materialised local/shared A keeps the shared path),
+        #   * untransposed A (the parallel fill writes the [M,Ka] logical A; a
+        #     transposed A would need the [Ka,M] fragment layout -- not yet
+        #     proven, so it keeps the shared-stage path).
+        _use_register_a = (
+            _is_cuda_target(ctx)
+            and not prefer_scalar_dot
+            and not transpose_A
+            and not pre_trans_a
+            and isinstance(a, LazyTileExpr)
+        )
+        if _use_register_a:
+            a = _stage_operand_to_register_a(a, a_stage_shape, a_dtype)
+        else:
+            a = _stage_operand_to_shared(a, a_stage_shape, a_dtype, "a")
         b = _stage_operand_to_shared(b, b_stage_shape, b_dtype, "b")
 
         if prefer_scalar_dot:
@@ -1654,6 +1884,7 @@ def map_tt_dot(
                     "K": int(Ka),
                     "trans_A": bool(transpose_A),
                     "trans_B": bool(transpose_B),
+                    "num_warps": int(getattr(ctx, "num_warps", 4) or 4),
                 })
         # FRAGMENT EPILOGUE FIX (RULE #1 -- correctness, not a silent downgrade).
         # On CUDA the gemm accumulator ``c`` lives in ``local.fragment`` scope:

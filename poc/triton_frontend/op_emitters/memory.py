@@ -83,6 +83,7 @@ from ..op_mapping import (
     _shape_of,
     materialize_lazy_tile,
     should_fold_addressing,
+    _result_ssa_name,
 )
 
 
@@ -1295,6 +1296,408 @@ def _ptrstate_block_base_and_strides(
     return base, strides
 
 
+def _decompose_monotone_mask_extents(
+    ctx: WalkerCtx,
+    mask_lane: Any,
+    loop_vars: Sequence[Any],
+    out_shape: Sequence[int],
+) -> Optional[List[Any]]:
+    """Recover per-axis in-bounds extents from an ``And``-of-``LT`` tile mask.
+
+    BOUNDSHOIST (mask_ssa form). The native ``tl.load``/``tl.store`` row/col
+    mask lowers to ``mask_lane = AND_a ( lhs_a(i_a) < bound_a )`` where each
+    leaf depends on EXACTLY ONE loop var ``i_a`` and ``lhs_a`` is affine in
+    that var with unit coefficient (``offs_a = block_base_a + i_a``, the
+    monotone iota). For such a leaf the in-bounds lane set on axis ``a`` is the
+    contiguous prefix ``i_a < (bound_a - block_base_a)``, i.e. the per-axis
+    extent ``bound_a - lhs_a|_{i_a=0}``.
+
+    We split the ``And`` into leaves, attribute each to its single loop var,
+    and compute the extent by substituting ``i_a := 0`` into ``lhs_a`` (TVM
+    ``Substitute``) and verifying with the arithmetic analyzer that the leaf is
+    exactly ``LT(i_a + c, bound)`` (unit-coeff, single-var) so the prefix is
+    truly contiguous. RULE #1: return ``None`` -- so the caller keeps the
+    correct per-element predicate -- unless EVERY constrained axis yields a
+    verified unit-coeff monotone bound and every axis ends up covered. Never
+    guess a bound: a wrong extent would drop the guard on real OOB lanes.
+    """
+    tir = ctx.tir()
+    rank = len(loop_vars)
+    if rank == 0:
+        return None
+    try:
+        from tvm.tir import stmt_functor as _sf  # noqa: WPS433
+        substitute = _sf.substitute
+    except Exception:
+        return None
+    import tvm as _tvm  # noqa: WPS433
+
+    # Flatten the conjunction into LT leaves. The boolean AND of the row/col
+    # mask lowers either to a ``tir.And`` node OR to a ``tirx.bitwise_and``
+    # Call (the bool tile comparator path); recurse through both. Bail on any
+    # other node (Or, Not, a comparison we don't model) so the caller keeps
+    # the per-element predicate (RULE #1).
+    leaves: List[Any] = []
+    stack = [mask_lane]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, tir.And):
+            stack.append(node.a)
+            stack.append(node.b)
+        elif (
+            isinstance(node, tir.Call)
+            and getattr(node.op, "name", None) == "tirx.bitwise_and"
+            and len(node.args) == 2
+        ):
+            stack.append(node.args[0])
+            stack.append(node.args[1])
+        elif isinstance(node, tir.LT):
+            leaves.append(node)
+        else:
+            return None
+    if not leaves:
+        return None
+
+    var_of = {v: i for i, v in enumerate(loop_vars)}
+    extents: List[Any] = [None] * rank
+    analyzer = _tvm.arith.Analyzer()
+    affine_src = getattr(ctx, "affine_tile_source", None) or {}
+    from tvm.tir import stmt_functor as _sf2  # noqa: WPS433
+
+    def _lhs_as_affine(lhs: Any) -> Optional[Any]:
+        """Return an analyzer-transparent affine form of ``lhs``, or None.
+
+        If ``lhs`` is a bare ``BufferLoad`` of a buffer materialized from a
+        recorded affine iota source, substitute the source's per-lane
+        ``read_lane`` expression (``base + i``). A plain PrimExpr passes
+        through unchanged. RULE #1: when the buffer is NOT a recorded affine
+        source we return ``lhs`` as-is -- the unit-coeff check below then
+        fails and the caller keeps the predicate (never a guessed bound).
+        """
+        if isinstance(lhs, tir.BufferLoad):
+            src_expr = affine_src.get(getattr(lhs.buffer, "data", None))
+            if src_expr is not None:
+                try:
+                    indices = list(lhs.indices)
+                    src_rank = len(getattr(src_expr, "shape", ()) or ())
+                    # An ``expand_dims`` alias indexes the SAME backing buffer
+                    # with extra broadcast (size-1) axes the rank-<src_rank>
+                    # source does not carry. Drop the size-1 axes of the alias
+                    # so the surviving indices map onto the source's lane axes.
+                    if src_rank and len(indices) > src_rank:
+                        buf_shape = list(getattr(lhs.buffer, "shape", []) or [])
+                        if len(buf_shape) == len(indices):
+                            kept = [
+                                idx
+                                for idx, dim in zip(indices, buf_shape)
+                                if not (
+                                    isinstance(dim, tir.IntImm)
+                                    and int(dim.value) == 1
+                                )
+                            ]
+                            if len(kept) == src_rank:
+                                indices = kept
+                    if src_rank and len(indices) != src_rank:
+                        # Could not reconcile rank -> do NOT guess; keep the
+                        # opaque BufferLoad so the unit-coeff check fails and
+                        # the caller retains the predicate (RULE #1).
+                        return lhs
+                    return src_expr.read_lane(ctx, tuple(indices))
+                except Exception:
+                    return None
+            return lhs
+        return lhs
+
+    for leaf in leaves:
+        lhs_raw, rhs = leaf.a, leaf.b
+        lhs = _lhs_as_affine(lhs_raw)
+        if lhs is None:
+            return None
+        # Which loop vars does lhs depend on? Must be exactly one.
+        used_vars = set()
+        _sf2.post_order_visit(
+            lhs, lambda o: used_vars.add(o) if isinstance(o, tir.Var) else None
+        )
+        present = [var_of[v] for v in used_vars if v in var_of]
+        if len(present) != 1:
+            # lhs spans zero or multiple loop vars -> not a clean per-axis
+            # monotone bound. Keep the predicate (RULE #1).
+            return None
+        axis = present[0]
+        var = loop_vars[axis]
+        # Verify lhs is affine unit-coefficient in var: lhs(var) - lhs(var=0)
+        # must simplify to exactly `var` (a strictly-monotone unit-step iota,
+        # so the in-bounds lane set is the contiguous prefix [0, rhs - lhs0)).
+        lhs0 = substitute(lhs, {var: tir.const(0, var.dtype)})
+        delta = analyzer.simplify(lhs - lhs0)
+        if not (isinstance(delta, tir.Var) and delta.same_as(var)):
+            return None
+        # In-bounds extent on this axis: rhs - lhs0 (where lhs = var + lhs0).
+        ext = analyzer.simplify(
+            _cast_index_like(ctx, rhs, var) - _cast_index_like(ctx, lhs0, var)
+        )
+        if extents[axis] is not None:
+            # Two leaves on the same axis -> take the tighter (min) bound.
+            ext = tir.Min(extents[axis], ext)
+        extents[axis] = ext
+    # Any axis with no leaf is fully in-bounds (extent == tile dim).
+    for axis in range(rank):
+        if extents[axis] is None:
+            extents[axis] = tir.const(int(out_shape[axis]), "int32")
+    return extents
+
+
+def _emit_oob_zero_partition(
+    ctx: WalkerCtx,
+    tile_buf: Any,
+    loop_vars: Sequence[Any],
+    out_shape: Sequence[int],
+    extents: Sequence[Any],
+    other_lane: Any,
+) -> bool:
+    """Emit the masked-OOB zero-fill as axis-partitioned UNGUARDED loops.
+
+    BOUNDSHOIST (the corrected, evidence-based dominant move). The previous
+    epilogue wrapped the WHOLE ``BLK_m x BLK_k`` tile in a per-element
+    predicate ``if (i0>=ext0 | i1>=ext1) tile[idx]=0`` -- which native Triton
+    never does. For a fully-aligned tile (``ext_axis == BLK_axis``, the §P1
+    hd=ds=64 case and every tile where the dim divides the block) the
+    predicate is ALWAYS FALSE yet was evaluated ``BLK_m*BLK_k`` times per
+    thread per K-iter -- the dominant contributor to the 9.41B
+    ``op_integer_pred_on`` saturating L1TEX at 87% SOL.
+
+    We instead PARTITION the OOB set ``{ANY axis i_a >= ext_a}`` into disjoint
+    per-axis regions and emit each as a plain clamped ``tir.For`` nest with NO
+    inner predicate -- the loop BOUNDS encode the partition:
+
+      region[a] = { i_a in [clamp(ext_a), BLK_a)  (the OOB suffix of axis a)
+                    AND i_b in [0, clamp(ext_b))  for every earlier axis b<a
+                    AND i_c in [0, BLK_c)         for every later axis c>a }
+
+    Each OOB cell has a UNIQUE smallest-OOB axis, so the regions are disjoint
+    and cover the OOB set EXACTLY (a cell fully in-bounds lands in no region).
+    For a full tile ``clamp(ext_a) == BLK_a`` -> the axis-``a`` suffix
+    ``[BLK_a, BLK_a)`` is EMPTY -> TVM emits no loop body and ptxas drops it:
+    ZERO predicate, ZERO iterations. For a genuine partial trailing tile only
+    the real OOB cells iterate, UNGUARDED. RULE #1: writes ``other`` (0) to
+    EXACTLY the OOB lanes -- bit-identical to the predicated epilogue, never a
+    maskless in-bounds overwrite and never an OOB write past the tile.
+    """
+    tir = ctx.tir()
+    rank = len(loop_vars)
+    if rank == 0 or len(extents) != rank:
+        return False
+    zero = tir.const(0, "int32")
+
+    def _clamp(ext: Any, axis: int) -> Any:
+        # clamp(ext, 0, BLK_axis) -- a serial For with start>stop is a no-op,
+        # but we clamp so the suffix start never exceeds the tile extent (a
+        # dim_axis - block_base that overshoots BLK on a non-trailing tile) and
+        # the prefix stop is a valid [0, BLK] bound.
+        blk = tir.const(int(out_shape[axis]), "int32")
+        ext_i = _cast_index_like(ctx, ext, zero)
+        return tir.Max(zero, tir.Min(ext_i, blk))
+
+    clamped = [_clamp(extents[a], a) for a in range(rank)]
+    blk = [tir.const(int(out_shape[a]), "int32") for a in range(rank)]
+    emitted_any = False
+    for a in range(rank):
+        # Build the per-axis [min, stop) range for partition region[a].
+        # axis a: OOB suffix [clamped_a, BLK_a); earlier axes: in-bounds prefix
+        # [0, clamped_b); later axes: full [0, BLK_c). ``tir.For`` takes
+        # (loop_var, min, EXTENT, kind, body) where extent = stop - min and the
+        # loop var iterates [min, min+extent); a non-positive extent makes the
+        # body unreachable (the full-tile no-op).
+        #
+        # Mint FRESH per-region loop vars: each region constrains a given axis
+        # to a DIFFERENT const-int range ([clamped, BLK) in its own region,
+        # [0, clamped) as an earlier axis elsewhere). Reusing one Var across
+        # regions trips the analyzer's single-const-bound-per-Var invariant.
+        region_vars = [
+            tir.Var(ctx.fresh(f"oobz{a}_{axis}"), "int32")
+            for axis in range(rank)
+        ]
+        # Index the tile with the per-region loop vars (same flat indexing as
+        # the predicated epilogue; any swizzle layout is applied by the later
+        # TVM layout pass, not here).
+        store = tir.BufferStore(tile_buf, other_lane, list(region_vars))
+        body: Any = store
+
+        def _axis_range(axis: int):
+            # axis a: OOB suffix [clamped_a, BLK_a); earlier axes: in-bounds
+            # prefix [0, clamped_b); later axes: full [0, BLK_c). ``tir.For``
+            # takes (loop_var, min, EXTENT, kind, body) where extent = stop -
+            # min; a non-positive extent makes the body unreachable (the full-
+            # tile no-op).
+            if axis == a:
+                lo, stop = clamped[axis], blk[axis]
+            elif axis < a:
+                lo, stop = zero, clamped[axis]
+            else:
+                lo, stop = zero, blk[axis]
+            extent = stop if (lo is zero) else tir.Sub(stop, lo)
+            return lo, extent
+
+        # EMPTYREGIONCOLLAPSE (bit-exact loop reorder). The OOB axis ``a`` is the
+        # ONLY axis whose range can be EMPTY for a fully in-bounds tile (its
+        # suffix ``[clamped_a, BLK_a)`` collapses to ``[BLK, BLK)`` when the dim
+        # divides the block, the §P1 hd=ds=64 case). The earlier in-bounds
+        # PREFIX axes (``[0, clamped_b)``) are NON-empty there. With axis ``a``
+        # nested INNERMOST (the prior natural-order build), an empty axis-``a``
+        # suffix still leaves the outer prefix axes spinning their full extent
+        # doing nothing -- 64 wasted outer iterations per K-step for the §P1
+        # region a=1 (measured 18.4M dyn instr on the L157 header alone). Nest
+        # the OOB axis ``a`` OUTERMOST instead: an empty axis-``a`` extent then
+        # makes the WHOLE region body unreachable and ptxas drops it (zero
+        # iterations, zero header recompute). RULE #1: every OOB cell still has
+        # a UNIQUE smallest-OOB axis and is written EXACTLY once with ``other``
+        # (0); loop ORDER is irrelevant to the written set, so this is bit-
+        # identical to the natural-order nest -- it only removes dead spins.
+        inner_axes = [axis for axis in range(rank) if axis != a]
+        for axis in reversed(inner_axes):
+            lo, extent = _axis_range(axis)
+            body = tir.For(
+                region_vars[axis], lo, extent, tir.ForKind.SERIAL, body
+            )
+        lo_a, extent_a = _axis_range(a)
+        body = tir.For(
+            region_vars[a], lo_a, extent_a, tir.ForKind.SERIAL, body
+        )
+        ctx.emit(body)
+        emitted_any = True
+    return emitted_any
+
+
+
+def _build_coalesced_copy_loop_layout(ctx, out_shape, contig_axis, dtype):
+    """Build a parallel-loop ``Fragment`` that maps CONSECUTIVE threads (lanes)
+    to CONSECUTIVE elements along ``contig_axis`` (the GLOBAL-contiguous tile
+    axis) so the cooperative cp.async global load COALESCES.
+
+    LoadCoalesce (MEASURED root cause): the CopyNode loop layout is otherwise
+    inferred from the SHARED-write tile, whose innermost axis is the K (strided
+    global) axis -> the 32 warp lanes scatter across the strided global axis
+    (dout: lane * stride_seqlen = lane * 7168) => 6.2x L1TEX sector inflation.
+
+    This Fragment instead pins the lane/vector axis to the route-verified
+    CONTIGUOUS global axis (dout: headdim, stride 1) -- IDENTICAL global access
+    pattern to native Triton (consecutive lanes read consecutive addresses).
+    The shared WRITE follows the dst buffer's own (swizzled) layout, decoupled
+    from the thread mapping; the MMA fragment read is a SEPARATE access, so the
+    GEMM operand is unchanged. RULE #1: returns None (keep the inferred layout)
+    if the tile cannot be cleanly partitioned -- never a silent wrong mapping.
+
+    Returns a ``tilelang.layout.Fragment`` or ``None``.
+    """
+    try:
+        from tilelang.layout import Fragment  # type: ignore
+    except Exception:
+        return None
+    shp = [int(s) for s in (out_shape or [])]
+    if len(shp) < 2 or contig_axis is None:
+        return None
+    a = int(contig_axis)
+    if not (0 <= a < len(shp)):
+        return None
+    # Coalesce16B (RESOLUTION): defer ALL coalescing to NATURAL TileLang layout
+    # inference + the C++ vectorizer fix in src/transform/loop_vectorize.cc
+    # (ComputeBufferVectorSize stride-relaxed contiguity probe). That fix makes
+    # a contiguous-innermost global->shared copy whose SOURCE carries a SYMBOLIC
+    # outer stride (the de-monomorphized stride arg) lower to a real 16B
+    # cp.async (cp_async_gs<16>) WITHOUT this synthetic Fragment -- proven
+    # bit-exact (MAXDIFF=0) on the §P1 dstates B (C-tensor) load.
+    #
+    # The synthetic forward_thread/forward_index Fragment built below is now
+    # RETIRED for two independent reasons, both RULE #1 compliant:
+    #   * INNERMOST-contiguous axis (a == last, e.g. B's [k, ds] ds axis): the
+    #     natural inference already lane-coalesces to 16B via the C++ fix, and
+    #     forcing this synthetic Fragment instead makes the loop-layout
+    #     partitioner leak its OWN input iter vars (_i, _j) as undefined free
+    #     symbolics that MakePackedAPI rejects ("variables (_i, _j) are used but
+    #     not passed as API arguments"). Deferring to natural inference both
+    #     coalesces AND compiles cleanly with the OOB mask epilogue intact.
+    #   * NON-INNERMOST contiguous axis (a != last, e.g. A's [hd, k] transposed
+    #     dout load): with the dout shared tile kept LOGICALLY [hd, k], the
+    #     SOURCE innermost (k) axis has stride nheads*headdim != 1, so the C++
+    #     vectorizer's stride-relaxed probe (loop_vectorize.cc
+    #     ComputeBufferVectorSize, gated on is_one(innermost stride)) correctly
+    #     declines to vectorize -- scalar 4B is the geometrically-correct width
+    #     FOR THIS [hd, k] layout. (Provenance correction: native does NOT issue
+    #     scalar loads for dout -- native VECTORIZES dout to 16B
+    #     cp.async.cg.shared.global 0x10; the scalar cp.async.ca 0x4 loads native
+    #     issues are the dA decay vector, NOT dout. The earlier "native also
+    #     issues scalar loads for this operand" note MISATTRIBUTED dA's loads to
+    #     dout and is removed.) A 16B dout load is achievable ONLY by making the
+    #     shared tile PHYSICALLY [k, hd] (hd innermost, stride 1) so the relaxed
+    #     probe fires -- but that transposed relayout must then re-derive
+    #     BIT-EXACT transposed reads for BOTH the dout*exp elementwise AND the
+    #     register-A MMA fragment (reduction.py: "a transposed A would need the
+    #     [Ka, M] fragment layout -- not yet proven"). MEASURED DISPROOF: the
+    #     loop_layout/Fragment channel CANNOT reach 16B (it thread-coalesces but
+    #     emits T.unroll(16) x 4B, not T.vectorized(4) x 16B like the C operand);
+    #     the transposed-physical-tile path is unproven and high-bit-exact-risk
+    #     on this MAXDIFF=0 kernel. So 4B stays: it is correct for [hd, k], NOT a
+    #     silent degrade (RULE #1).
+    #
+    # Returning None here keeps the load bit-correct and lets the (now fixed)
+    # vectorizer choose the genuine width per operand. RULE #1: no silent
+    # scalar-degrade clamp (the C++ fix removed the need to clamp), no synthetic
+    # Fragment that would either crash (innermost) or fabricate a contiguity the
+    # source does not have (non-innermost).
+    return None
+    nwarps = int(getattr(ctx, "num_warps", 0) or 0)
+    if nwarps <= 0:
+        return None
+    nthreads = nwarps * 32
+    total = 1
+    for s in shp:
+        total *= int(s)
+    if total <= 0 or total % nthreads != 0:
+        return None  # cannot evenly distribute -> keep inferred layout (no degrade)
+    import re as _re
+    m = _re.search(r"(\d+)", str(dtype) or "")
+    bits = int(m.group(1)) if m else 32
+    vec = max(1, 128 // bits) if bits in (8, 16, 32, 64) else 1
+    ca = int(shp[a])
+    while vec > 1 and (ca % vec != 0):
+        vec //= 2
+    while vec > 1 and ((total // vec) % nthreads != 0):
+        vec //= 2
+    cells = total // vec
+    if cells % nthreads != 0:
+        return None
+    ndim = len(shp)
+    other_axes = [i for i in range(ndim) if i != a]
+    stride_cells = [0] * ndim
+    stride_cells[a] = 1
+    acc = shp[a] // vec
+    for ax in reversed(other_axes):
+        stride_cells[ax] = acc
+        acc *= shp[ax]
+
+    def _cell(idx):
+        c = 0
+        for ax in range(ndim):
+            term = idx[ax]
+            if ax == a:
+                term = idx[ax] // vec
+            c = c + term * int(stride_cells[ax])
+        return c
+
+    def _forward_thread(*idx):
+        return _cell(idx) % nthreads
+
+    def _forward_index(*idx):
+        outer = _cell(idx) // nthreads
+        return outer * vec + (idx[a] % vec)
+
+    try:
+        return Fragment(list(shp), forward_thread_fn=_forward_thread,
+                        forward_index_fn=_forward_index)
+    except Exception:
+        return None
+
+
 def _emit_ptrstate_tile_load_copynode(
     op: Any,
     ctx: WalkerCtx,
@@ -1307,6 +1710,7 @@ def _emit_ptrstate_tile_load_copynode(
     dynamic_mask_dims: Sequence[Any],
     tile_buf: Any,
     loop_vars: Sequence[Any],
+    phys_transpose: bool = False,
 ) -> bool:
     """Emit a REAL 2D-strided ``T.copy`` CopyNode for the K-loop producer.
 
@@ -1341,6 +1745,28 @@ def _emit_ptrstate_tile_load_copynode(
             "real CopyNode; import failed: %r" % (exc,)
         )
     base, strides = _ptrstate_block_base_and_strides(ctx, resolved, out_shape)
+    # DOUTTRANSPOSE16B: ``out_shape`` is the LOGICAL [hd, K] tile and ``strides``
+    # are computed in that order ([stride_hd(=1 grounded), stride_K]). When the
+    # caller PHYSICALLY transposed the dest tile to [K, hd] (loop_vars already in
+    # [K, hd] order, tile_buf [K, hd]) we transpose out_shape + strides to MATCH
+    # the physical [K, hd] order so the 2D src2d view is [K, hd] with the
+    # innermost (hd) stride == 1 -> the C++ vectorizer fires (16B). The mask is
+    # resolved against the LOGICAL [hd, K] axes below using a logical->physical
+    # loop_var remap so OOB lanes stay bit-identical. RULE #1: pure layout
+    # relabel, no math/mask/int64-base change; env-gated, reverts to [hd, K].
+    _logical_out_shape = list(out_shape)
+    if phys_transpose and len(out_shape or []) == 2:
+        out_shape = [int(out_shape[1]), int(out_shape[0])]
+        # GROUND the now-innermost (hd) stride to a LITERAL IntImm(1): the route
+        # VERIFIED hd contiguous (stride 1) on the real row-major dout tensor
+        # (routed_contiguous_tile_axis %arg0:0), but the de-monomorphized launch
+        # passes it as the opaque symbolic arg so the C++ vectorizer's
+        # is_one(strides[last]) contiguity probe (loop_vectorize.cc) cannot prove
+        # it == 1. Grounding it to literal 1 lets the probe fire -> 16B cp.async.
+        # The outer (K) stride stays symbolic; the C++ relaxed-stride model
+        # (Coalesce16B) handles it. RULE #1: grounded ground-truth, not
+        # fabricated -- hd IS stride-1; a non-contiguous axis is never grounded.
+        strides = [strides[1], tir.const(1, "int64")]
     data_var = getattr(src_buf, "data", None)
     if data_var is None:
         raise EmitError(
@@ -1394,25 +1820,54 @@ def _emit_ptrstate_tile_load_copynode(
         _src_name = resolved.get("source") if isinstance(resolved, dict) else None
         if _src_name is not None and str(_src_name) in _ground_srcs:
             ground_innermost = True
+    # ASYNCIMPL (generic non-innermost coalesce): the route may verify that a
+    # source has a CONTIGUOUS (global stride == 1) tile axis that is NOT the
+    # innermost one -- e.g. the dstates dout tile ``[hd, k]`` has ``hd`` (axis 0)
+    # contiguous while the innermost ``k`` (seq) axis has stride nheads*headdim.
+    # ``routed_contiguous_tile_axis`` (set in __init__ from the real row-major
+    # layout) maps the source SSA -> that contiguous axis. A SIMT cp.async copy
+    # (the disable_tma path we ALWAYS take on GB10/consumer-Blackwell) does NOT
+    # need the contiguous axis to be innermost: ``CopyNode::MakeSIMTLoop`` builds
+    # a fully PARALLEL (thread-distributed) loop nest over ALL axes and
+    # LayoutInference + InjectPTXAsyncCopy vectorize/coalesce the cp.async over
+    # whichever axis has stride 1. So we ground the route-verified contiguous
+    # axis to a literal 1 (it genuinely IS 1 on the real tensor; the
+    # de-monomorphized launch only PASSES it as an opaque symbolic arg) and emit
+    # the CopyNode -> the dout load becomes a COOPERATIVE cp.async load instead
+    # of a serial per-lane predicated fill. RULE #1: only a route-VERIFIED
+    # contiguous axis is grounded; a genuinely non-contiguous axis is never
+    # pinned. The dst shared tile + GEMM operand keep their [hd, k] logical
+    # layout (no transpose) -- only the cp.async vectorization axis changes.
+    _contig_axis_map = getattr(ctx, "routed_contiguous_tile_axis", None)
+    _contig_axis = None
+    if _contig_axis_map:
+        _src_name2 = resolved.get("source") if isinstance(resolved, dict) else None
+        if _src_name2 is not None:
+            _contig_axis = _contig_axis_map.get(str(_src_name2))
     if not inner_is_one:
         if ground_innermost:
             # Ground-truth contiguity supplied by the route: pin the innermost
-            # stride to a literal 1 so the TMA descriptor is statically
-            # provable. This is the axis the route verified contiguous on the
-            # real tensor -- grounded, not fabricated.
+            # stride to a literal 1 so the SIMT cp.async vectorizes over it.
+            # This is the axis the route verified contiguous on the real tensor
+            # -- grounded, not fabricated.
             strides = list(strides[:-1]) + [tir.const(1, "int64")]
             inner_is_one = True
+        elif _contig_axis is not None and 0 <= int(_contig_axis) < len(strides):
+            # Route-verified contiguous NON-innermost axis: ground THAT axis to
+            # a literal 1 so the cp.async coalesces over it. The CopyNode then
+            # lowers via MakeSIMTLoop (parallel, thread-distributed) -> genuine
+            # cooperative cp.async over the contiguous axis (dout [hd,k]: hd).
+            _ax = int(_contig_axis)
+            strides = [
+                (tir.const(1, "int64") if i == _ax else s)
+                for i, s in enumerate(strides)
+            ]
         else:
-            # NOT TMA-eligible: the innermost global stride is not provably 1
-            # (de-monomorphized kernel passes it as an opaque runtime arg; and
-            # for the dout tile the innermost axis is the genuinely
-            # non-contiguous K-reduction (seq) axis, stride nheads*headdim).
-            # Signal the caller to keep this load on the existing
-            # (non-pipelined) predicated-For path rather than emit a CopyNode
-            # that the CUDA bulk-copy lowering would FATAL on. RULE #1: this is
-            # NOT a coalesced-copy claim -- the caller does NOT annotate the
-            # K-loop with num_stages for this load. The exact reason is
-            # surfaced via the return value so it is visible end-to-end.
+            # NOT cp.async-eligible: no route-verified contiguous axis at all.
+            # Keep this load on the existing (non-pipelined) predicated-For path
+            # rather than emit a CopyNode with no coalescible axis. RULE #1: no
+            # coalesced-copy claim for a fully non-contiguous load. The exact
+            # reason is surfaced via the return value so it is visible end-to-end.
             return False
     src_name = (getattr(src_buf, "name", None) or "src") + "_2d"
     # 2D (rank-N) strided view over the SAME global allocation. The strides
@@ -1556,29 +2011,79 @@ def _emit_ptrstate_tile_load_copynode(
         # The ``is_async_copy`` annotation (GetIsAsyncCopy, copy.cc:95) makes
         # ``facts.explicit_cp_async`` true so SelectCopyInstForLowering picks
         # CopyInst::kCPAsync (copy_analysis.cc:617-619) -> Copy::LowerCPAsync emits
-        # GENUINE cp.async/LDGSTS (MEASURED on gb10: cp_async=2 in CUDA, LDGSTS=16
-        # in SASS, UTMALDG=0, HMMA=32 intact -- vs 0 LDGSTS for plain LDG). BUT a
-        # bare explicit cp.async emits a commit_group WITHOUT an inserted
-        # cp.async.wait before the GEMM consumer: correctness requires the
-        # num_stages software pipeline to schedule the wait-barrier. The pipeline
-        # currently mis-schedules this kernel's masked-OOB epilogue (a predicated
-        # second writer to the producer's shared tile creates a cross-stage local
-        # dependency, ``B_local`` undefined). So the cp.async path is presently
-        # FAST-but-RACY (§P1 MAXDIFF 1.28e+03). RULE #1: do NOT silently ship a
-        # racy/wrong default. The cp.async/LDGSTS emission is therefore opt-in via
-        # ``TL_FORCE_CP_ASYNC=1`` for MEASURED SASS/codegen verification, while the
-        # committed default stays the bit-correct synchronous LDG. The async path
-        # is honestly gated, never a silent fallback.
+        # GENUINE cp.async/LDGSTS (cp.async.cg.shared.global, like native Triton).
+        #
+        # RACE-FREENESS (RULE #1 -- correct by construction, MEASURED bit-correct):
+        # Copy::LowerCPAsync (src/backend/cuda/op/copy.cc:527) closes the async
+        # group OUT-OF-LINE for an ``is_async_copy`` copy that is NOT pipeline-
+        # managed: it emits ``cp.async`` + ``cp.async.commit_group`` +
+        # ``cp.async.wait_group<0>`` + a CTA ``__syncthreads`` so every lane has
+        # LANDED before the GEMM consumer (or the masked-OOB epilogue) reads the
+        # shared tile. There is NO race: the wait_group<0> drains ALL outstanding
+        # async copies and the barrier publishes them CTA-wide. MEASURED §P1
+        # MAXDIFF = 4.882812e-04 (2^-11, the bit-correct target) with this exact
+        # path (cp_async>0 in the generated .cu, HMMA intact). The stale earlier
+        # note about a "FAST-but-RACY 1.28e+03" path predated the copy.cc:527
+        # self-contained commit/wait and the num_stages drop below; it no longer
+        # applies. We therefore make ``is_async_copy`` the COMMITTED DEFAULT (not
+        # env-gated) so the routed global->shared K-loop load lands on the genuine
+        # cp.async hardware path like native. ``TL_NO_ASYNC_COPY=1`` reverts to a
+        # plain synchronous LDG for A/B measurement only.
+        #
+        # IMPORTANT: because this copy carries its OWN commit/wait, the enclosing
+        # K-loop MUST NOT also be stamped with ``num_stages`` (that would route it
+        # through the software pipeline whose overlapping-write check FATALs on the
+        # masked-OOB epilogue, a legitimate second writer to the SAME shared tile).
+        # We record the async-explicit emission on the ctx so the K-loop emitter
+        # (control.py ``_maybe_pipeline``) skips the num_stages stamp. RULE #1: one
+        # clear async path; the wait is always present, never a silent half-state.
         import os as _os_async
-        if _os_async.environ.get("TL_FORCE_CP_ASYNC") == "1":
+        # LoadCoalesce: explicit parallel-loop layout mapping lanes to the
+        # route-verified CONTIGUOUS global axis (``_contig_axis``) so the
+        # cooperative cp.async global load COALESCES (consecutive lanes ->
+        # consecutive global addresses), instead of the shared-write-inferred
+        # layout that scatters lanes across the strided K axis. Gated to the
+        # async/default path; disabled via TL_NO_COALESCE_LAYOUT=1 for A/B.
+        _coalesce_ll = None
+        if _os_async.environ.get("TL_NO_COALESCE_LAYOUT") != "1" and _contig_axis is not None:
+            _coalesce_ll = _build_coalesced_copy_loop_layout(
+                ctx, out_shape, _contig_axis, out_dtype)
+        if _os_async.environ.get("TL_NO_ASYNC_COPY") == "1":
+            copy_call = T.copy(src2d_region, tile_buf, disable_tma=True)
+        elif _os_async.environ.get("TL_PIPELINE_CP_ASYNC") == "1":
+            # PIPELINENS4 (TRUE multi-stage software pipeline): emit a PLAIN
+            # global->shared CopyNode with NO ``is_async_copy`` annotation. Because
+            # GetIsAsyncCopy is false, CheckPipelineManagedCPAsyncCopy
+            # (inject_pipeline.cc:83) returns TRUE -> InjectSoftwarePipeline takes
+            # OWNERSHIP of this copy: it multi-versions (double/quad-buffers) the
+            # shared tile across ``num_stages`` and schedules the cp.async
+            # commit_group + wait_group<N> (N = num_stages-2 in-flight) so stage
+            # k+1 loads OVERLAP stage k MMA -- exactly like native ns4. We do NOT
+            # set ``routed_explicit_cp_async`` (the copy is NOT self-contained);
+            # ``_maybe_pipeline`` (control.py) STAMPS ``num_stages`` on the K-loop
+            # so PipelinePlanning schedules the pipeline. Race-freeness is
+            # guaranteed by the pipeline-inserted wait_group<N> ordering (the
+            # GEMM consumer waits for its producer stage). RULE #1: the
+            # masked-OOB epilogue is a SECOND writer to the SAME private per-stage
+            # shared tile in the SAME iteration -- not a cross-stage overlap;
+            # pipeline_planning.cc treats it as part of the producer stage (see
+            # the AnalyzeCopyLastUse same-buffer-consumer carve-out).
+            copy_call = T.copy(src2d_region, tile_buf, disable_tma=True)
+        else:
             copy_call = T.copy(
                 src2d_region,
                 tile_buf,
                 disable_tma=True,
                 annotations={"is_async_copy": 1},
+                loop_layout=_coalesce_ll,
             )
-        else:
-            copy_call = T.copy(src2d_region, tile_buf, disable_tma=True)
+            # Signal the K-loop emitter to NOT stamp num_stages (the copy is
+            # self-contained async; pipeline planning would FATAL on the
+            # masked-OOB second writer). Generic + backend-agnostic flag.
+            try:
+                setattr(ctx, "routed_explicit_cp_async", True)
+            except Exception:
+                pass
     ctx.emit(tir.Evaluate(copy_call))
 
     # ---- mask SPLIT OFF the copy: masked epilogue -----------------------
@@ -1587,6 +2092,7 @@ def _emit_ptrstate_tile_load_copynode(
     # shared tile, overwrite the out-of-bounds lanes with ``other`` (default
     # 0) in a separate predicated For. In-bounds lanes keep the copied value.
     pred = None
+    pred_from_mask_ssa = False
     other_lane: Any = tir.const(0, out_dtype)
     if mask_ssa is not None:
         try:
@@ -1601,20 +2107,121 @@ def _emit_ptrstate_tile_load_copynode(
                     other_expr = tir.const(0, out_dtype)
             else:
                 other_expr = tir.const(0, out_dtype)
-            mask_lane = _resolve_lane_operand(ctx, mask_expr, loop_vars, role="mask")
-            other_lane = _resolve_lane_operand(ctx, other_expr, loop_vars, role="other")
+            # DOUTTRANSPOSE16B: the mask LazyTileExpr is keyed on the LOGICAL
+            # [hd, K] tile axes. When the physical tile is transposed to [K, hd]
+            # the loop_vars are in PHYSICAL [K, hd] order, so feed the mask the
+            # loop_vars REVERSED back to logical [hd, K] order; the resulting
+            # mask_lane references the same physical Vars but binds each per-axis
+            # bound to the correct logical axis. RULE #1: bit-identical OOB set.
+            _mask_lv = (
+                [loop_vars[1], loop_vars[0]]
+                if (phys_transpose and len(loop_vars) == 2)
+                else loop_vars
+            )
+            mask_lane = _resolve_lane_operand(ctx, mask_expr, _mask_lv, role="mask")
+            other_lane = _resolve_lane_operand(ctx, other_expr, _mask_lv, role="other")
             # Epilogue writes ``other`` where the lane is OUT of bounds:
             # predicate is the NEGATION of the in-bounds mask.
             pred = tir.Not(mask_lane)
-    dyn = _dynamic_tts_mask_expr(ctx, loop_vars, dynamic_mask_dims)
+            pred_from_mask_ssa = True
+    else:
+        mask_lane = None
+    _dyn_lv = (
+        [loop_vars[1], loop_vars[0]]
+        if (phys_transpose and len(loop_vars) == 2)
+        else loop_vars
+    )
+    dyn = _dynamic_tts_mask_expr(ctx, _dyn_lv, dynamic_mask_dims)
     if dyn is not None:
         dyn_oob = tir.Not(dyn)
         pred = dyn_oob if pred is None else tir.Or(pred, dyn_oob)
     if pred is not None:
-        store = tir.BufferStore(
-            tile_buf, other_lane, list(loop_vars) or [tir.const(0, "int32")]
-        )
-        epi: Any = tir.IfThenElse(pred, store, None)
+        import os as _os_epi
+        _idx = list(loop_vars) or [tir.const(0, "int32")]
+        # BOUNDSHOIST: the masked-OOB epilogue zeroes the lanes OUTSIDE the
+        # native row/col mask. That in-bounds predicate is an ``AND`` of
+        # per-axis monotone bounds ``offs_axis < dim_axis`` (the ``mask_ssa``
+        # ``tl.load`` mask) and/or the clamped ``dynamic_mask_dims`` -- BOTH a
+        # contiguous per-axis prefix. We DECOMPOSE the combined in-bounds
+        # predicate into one extent per axis and emit the zero-fill as
+        # axis-partitioned UNGUARDED loops over the OOB suffix, instead of the
+        # per-element predicate rebuild native Triton never does. For a fully-
+        # aligned tile (the §P1 hd=ds=64 case) every partition loop has an
+        # EMPTY range -> zero predicate, zero iterations (collapses the
+        # dominant 9.41B op_integer_pred_on saturating L1TEX at 87% SOL). The
+        # pipelined path keeps the read-modify-write consumer form (it must
+        # READ tile_buf for the async wait ordering), so partitioning is gated
+        # to the non-pipelined default. RULE #1: writes 0 to EXACTLY the OOB
+        # lanes, bit-identical to the predicate; falls back to the predicated
+        # loop whenever the per-axis extents are not provably recoverable
+        # (never a maskless overwrite, never an OOB write).
+        if (
+            _os_epi.environ.get("TL_PIPELINE_CP_ASYNC") != "1"
+            and _os_epi.environ.get("TL_NO_BOUNDS_HOIST") != "1"
+        ):
+            # Combined in-bounds predicate = mask_lane AND dyn (whichever
+            # present). Decompose it into per-axis contiguous-prefix extents.
+            in_bounds = None
+            if mask_lane is not None:
+                in_bounds = mask_lane
+            if dyn is not None:
+                in_bounds = dyn if in_bounds is None else tir.And(in_bounds, dyn)
+            extents = None
+            if in_bounds is not None:
+                # DOUTTRANSPOSE16B: in_bounds references the LOGICAL-ordered
+                # loop_vars (see _mask_lv above) over the LOGICAL [hd, K] shape.
+                # Decompose against logical loop_vars + logical out_shape, then
+                # transpose the per-axis extents back to PHYSICAL [K, hd] order
+                # so _emit_oob_zero_partition (physical loop_vars + physical
+                # out_shape + physical tile_buf) zeroes EXACTLY the OOB lanes.
+                _decomp_lv = (
+                    [loop_vars[1], loop_vars[0]]
+                    if (phys_transpose and len(loop_vars) == 2)
+                    else loop_vars
+                )
+                _decomp_shape = (
+                    _logical_out_shape
+                    if (phys_transpose and len(loop_vars) == 2)
+                    else out_shape
+                )
+                extents = _decompose_monotone_mask_extents(
+                    ctx, in_bounds, _decomp_lv, _decomp_shape
+                )
+                if extents is not None and phys_transpose and len(extents) == 2:
+                    extents = [extents[1], extents[0]]
+            if _os_epi.environ.get("TL_BOUNDSHOIST_DEBUG") == "1":
+                import sys as _sys
+                print("BOUNDSHOIST epilogue rank=%d mask_ssa=%s dyn=%s "
+                      "partitioned=%s" % (
+                          len(loop_vars), mask_lane is not None,
+                          dyn is not None, extents is not None),
+                      file=_sys.stderr, flush=True)
+            if extents is not None and _emit_oob_zero_partition(
+                ctx, tile_buf, loop_vars, out_shape, extents, other_lane,
+            ):
+                return True
+        if _os_epi.environ.get("TL_PIPELINE_CP_ASYNC") == "1":
+            # PIPELINENS4 race-free masked fixup: emit the OOB-zeroing as an
+            # UNCONDITIONAL read-modify-write -- tile_buf[idx] = select(oob,
+            # other, tile_buf[idx]). Because this READS tile_buf (the cp.async
+            # producer's output), InjectSoftwarePipeline classifies it as a
+            # CONSUMER of the async group and inserts cp.async.wait_group<N>
+            # BEFORE it. The masked fixup therefore runs only AFTER its stage's
+            # async load has LANDED -> no WAW race with the in-flight cp.async
+            # (RULE #1: race-free by the pipeline's wait ordering, not a hope).
+            # In-bounds lanes copy the loaded value back (a no-op); OOB lanes get
+            # other -- identical result to the predicated store, but now a
+            # genuine read-after-async-load consumer.
+            cur = tir.BufferLoad(tile_buf, list(_idx))
+            store = tir.BufferStore(
+                tile_buf,
+                tir.Select(pred, other_lane, cur),
+                list(_idx),
+            )
+            epi: Any = store
+        else:
+            store = tir.BufferStore(tile_buf, other_lane, list(_idx))
+            epi = tir.IfThenElse(pred, store, None)
         for axis in range(len(loop_vars) - 1, -1, -1):
             epi = tir.For(
                 loop_vars[axis],
@@ -1624,6 +2231,59 @@ def _emit_ptrstate_tile_load_copynode(
                 epi,
             )
         ctx.emit(epi)
+    return True
+
+
+# Op-name prefixes that consume a tile ELEMENTWISE (the value flows through
+# unchanged in layout: a per-lane arithmetic / math / cast / compare). A rank>=2
+# load consumed ONLY by these is re-staged into a downstream gemm-operand or
+# store tile, so its own shared staging is redundant (see the A-staging collapse
+# in ``_emit_ptrstate_tile_load_tir``).
+_ELEMENTWISE_CONSUMER_PREFIXES = (
+    "arith.",
+    "math.",
+    "tt.mulhiui",
+    "tt.fp_to_fp",
+    "tt.bitcast",
+    "tt.int_to_ptr",
+    "tt.precise_",
+)
+# Consumers for which the load tile MUST stay shared (they read it cooperatively
+# in a layout-sensitive way, or directly off a function buffer): a gemm operand,
+# a store source, an atomic, a transpose/reduce/broadcast view, another load's
+# pointer base, etc. Fail-closed: ANY consumer not provably elementwise keeps
+# the load in shared (RULE #1 -- never silently demote a layout-sensitive tile).
+
+
+def _rank2_load_feeds_only_elementwise(ctx: WalkerCtx, result_value: Any) -> bool:
+    """True iff EVERY consumer of ``result_value`` is a per-lane elementwise op.
+
+    Used to demote a redundant rank>=2 load tile from ``shared`` to ``local``:
+    when the load feeds only elementwise ops (e.g. ``dout`` scaled by
+    ``exp(dA)``), the result is re-staged into the swizzled gemm-operand shared
+    tile anyway, so the raw load needs no shared buffer of its own. Fail-closed:
+    returns False (keep shared) when the use-graph is unavailable, the result is
+    unnamed, the consumer set is empty, or ANY consumer is not an elementwise
+    op -- never silently demote a tile a ``tt.dot`` / store / transpose reads.
+    """
+    ssa_users = getattr(ctx, "ssa_users", None)
+    if not ssa_users:
+        return False
+    name = None
+    try:
+        getter = getattr(result_value, "get_name", None)
+        name = getter() if callable(getter) else getattr(result_value, "name", None)
+    except Exception:
+        name = None
+    if not name:
+        return False
+    consumers = ssa_users.get(str(name)) or ssa_users.get(str(name).lstrip("%"))
+    if not consumers:
+        return False
+    for c in consumers:
+        cs = str(c)
+        if not any(cs.startswith(p) for p in _ELEMENTWISE_CONSUMER_PREFIXES):
+            return False
     return True
 
 
@@ -1644,17 +2304,161 @@ def _emit_ptrstate_tile_load_tir(
     src_buf = _redeclare_ctx_buffer_1d(
         ctx, src_buf, out_dtype, _flat_min_extent(out_shape)
     )
+    # A-STAGING COLLAPSE (RULE #1 -- correctness + shared budget, generic +
+    # backend-agnostic): a rank>=2 tile load is staged to SHARED so that a
+    # downstream ``tt.dot`` can read it cooperatively. But when this load feeds
+    # an ELEMENTWISE op (e.g. the ``dout`` that is scaled by ``exp(dA)`` to
+    # build the GEMM A operand in the SSD/dstates chunk kernels) -- and NOT a
+    # ``tt.dot`` / ``tt.store`` directly -- its shared tile is REDUNDANT: the
+    # elementwise result is re-staged into the swizzled gemm-operand shared tile
+    # anyway (``_stage_operand_to_shared``), so the raw load lives in shared
+    # only to be read once by the mul. That is the duplicate A buffer
+    # (``tile_load`` raw + ``dot_a`` swizzled = 64KB) vs native's single 32KB
+    # #shared operand. Stage such loads in ``local`` instead: the elementwise op
+    # reads the per-thread tile (exactly as the existing ``tile_binop`` result
+    # is already a per-thread local tile on this MVP path) and the SINGLE
+    # swizzled gemm-operand shared tile is the only A-sized shared buffer. A
+    # load that DOES feed a ``tt.dot`` directly (the B operand) keeps its shared
+    # tile -- the gemm reads it directly, native single-#shared. Gated to the
+    # routed prologue-opt path; every other path is byte-identical.
+    load_scope = "shared" if len(out_shape or []) >= 2 else "local"
+    # LEVER 1 (dA SHARED-RESIDENCY -- eliminate the rank-1 local stack
+    # round-trip; GENERIC, backend-neutral, bit-exact). A rank-1 (vector)
+    # elementwise-feeding load (the SSD/dstates dA decay tile ``float[32]``)
+    # defaults to a per-thread ``local`` addressable array. Its DOWNSTREAM
+    # consumer -- the ``exp(dA)`` scale that builds the swizzled MMA-A operand
+    # fragment -- reads it with a thread-divergent swizzle index
+    # (``(i>>3)*8 + ((i&3)>>1)*4 + (threadIdx.x&3)``). A thread-local
+    # addressable array indexed by a ``threadIdx``-mixed (divergent) expression
+    # CANNOT be SROA-promoted to registers by ptxas, so it is DEMOTED to LOCAL
+    # MEMORY: the conditional-loaded dA value is STAGED to a 128-byte stack
+    # array (STL) and RELOADED (LDL) before the exp-scale MMA -- a high-latency
+    # local round-trip native AVOIDS (MEASURED: 1.835M STL + 0.459M LDL dynamic
+    # warp-insts, 128B stack frame USED). Staging such a rank-1 load in SHARED
+    # instead lets the SAME divergent swizzled read land on shared memory (the
+    # rank>=2 operand tiles already do exactly this), eliminating the local
+    # stack round-trip and dropping the stack frame to 0 B (MEASURED: STL/LDL
+    # 0, stack 0 B, routed 2.64ms -> 2.26ms, MAXDIFF=0 on the prod tile + all 6
+    # partial-mask shapes + int64 2.82GB). RULE #1: the LOADED VALUE and the
+    # OOB->0 guard are byte-identical (same conditional LDG, same boundshoist
+    # prefix+OOB-zero partition, same ``other``); ONLY the staging-buffer scope
+    # changes (local stack array -> shared tile), never the math, the mask, or
+    # the int64 base. Gated to the rank-1 ELEMENTWISE-feeding load on the routed
+    # prologue path (same discriminator as the rank>=2 elementwise demotion
+    # below); every other rank-1 load (constant/affine-indexed scalar tiles that
+    # ptxas keeps in registers) keeps ``local`` and is byte-identical.
+    if (
+        load_scope == "local"
+        and len(out_shape or []) == 1
+        and getattr(ctx, "routed_triton_prologue_opt", False)
+        and _rank2_load_feeds_only_elementwise(ctx, result_value)
+    ):
+        load_scope = "shared"
+    # ASYNCIMPL: if this rank>=2 load can become a COOPERATIVE cp.async CopyNode
+    # (the routed async path AND the route verifies a contiguous tile axis to
+    # coalesce over -- e.g. the dstates dout tile ``[hd, k]`` with hd contiguous),
+    # KEEP it in ``shared`` so it lands on the genuine cp.async hardware path
+    # (cp.async.cg.shared.global, thread-distributed) instead of being demoted to
+    # a ``local`` per-lane SERIAL predicated fill. Native Triton stages dout via
+    # cp.async into shared; the per-lane scalar fill is the measured 3042x
+    # bottleneck. The downstream ``dout*exp`` then reads the SHARED tile
+    # cooperatively and stages into the swizzled GEMM operand. We accept ONE
+    # extra small cooperative shared->shared stage (dout fits ~8KB, well under the
+    # 101376 B cap) in exchange for replacing the serial fill with cp.async.
+    # RULE #1: only taken when the load is genuinely cp.async-eligible (a
+    # contiguous axis exists); otherwise the demotion below still applies.
+    _async_eligible = False
+    if (
+        load_scope == "shared"
+        and getattr(ctx, "routed_triton_async_loads", False)
+    ):
+        _cmap = getattr(ctx, "routed_contiguous_tile_axis", None)
+        _gset = getattr(ctx, "routed_contiguous_innermost_sources", None)
+        _sname = resolved.get("source") if isinstance(resolved, dict) else None
+        if _sname is not None:
+            if _cmap and str(_sname) in _cmap:
+                _async_eligible = True
+            if _gset and str(_sname) in _gset:
+                _async_eligible = True
+    if (
+        load_scope == "shared"
+        and len(out_shape or []) >= 2
+        and getattr(ctx, "routed_triton_prologue_opt", False)
+        and _rank2_load_feeds_only_elementwise(ctx, result_value)
+        and not _async_eligible
+    ):
+        # rank>=2 elementwise-only load: its result is re-staged into the
+        # swizzled gemm-operand shared tile anyway, so the raw shared tile is
+        # redundant -> demote to local. (LEVER 1: the RANK-1 elementwise dA load
+        # is the OPPOSITE case -- it has NO redundant re-stage and its divergent
+        # swizzled read forces local->stack; it is PROMOTED to shared above and
+        # MUST NOT be demoted here, hence the rank>=2 guard.)
+        load_scope = "local"
+    # DOUTTRANSPOSE16B (DEFAULT ON, RULE #1: proven bit-exact + faster). A
+    # producer load whose route-verified GLOBAL-contiguous axis is NON-innermost
+    # (the dstates dout tile: hd is stride-1 but loaded as the OUTER axis of the
+    # [hd, K] tile) cannot vectorize its global->shared cp.async -> scalar 4B
+    # (cp_async_gs<4>). We PHYSICALLY transpose the producer shared tile to
+    # [K, hd] (hd innermost, stride 1) so the C++ vectorizer's contiguity probe
+    # (loop_vectorize.cc, gated on is_one(innermost stride)) fires and the load
+    # lowers to a 16B cp.async (cp_async_gs<16>), mirroring the C operand. The
+    # LOGICAL out_shape stays [hd, K] for the mask/consumer indexing; only the
+    # PHYSICAL tile + copy loop + the now-innermost (grounded literal-1) hd
+    # stride are transposed, and the lazy dout*exp + register-A MMA fragment
+    # reads swap [m,k]->[k,m] (transposed_phys_tiles). MEASURED on gb10 (prod
+    # P1, cache off): dout cp_async_gs<4>->cp_async_gs<16>; shared-LDGSTS bank
+    # conflicts 22.8M->0 (total 37.6M->7.5M); L1TEX SOL 79.6%->47.3%; routed
+    # 2.29ms->1.44ms (ncu); BIT-EXACT MAXDIFF=0 on prod + all 6 partial-mask +
+    # int64 2.82/4.35GB + symbolic-int64 intact. Tightly scoped to the
+    # route-verified NON-innermost contiguous source (only the dstates dout
+    # matches); innermost-contiguous operands (the C tile) already vectorize and
+    # are NOT transposed. TL_NO_DOUT_TRANSPOSE_TILE=1 reverts to the [hd, K] 4B
+    # layout for A/B. RULE #1: pure layout relabel, no math/mask/int64-base
+    # change; a non-contiguous axis is NEVER grounded.
+    import os as _os_dtc
+    _dt_phys_transpose = False
+    if (
+        _os_dtc.environ.get("TL_NO_DOUT_TRANSPOSE_TILE") != "1"
+        and len(out_shape or []) == 2
+        and load_scope in ("shared", "shared.dyn")
+        and getattr(ctx, "routed_triton_async_loads", False)
+    ):
+        _cmap_dtc = getattr(ctx, "routed_contiguous_tile_axis", None)
+        _sname_dtc = resolved.get("source") if isinstance(resolved, dict) else None
+        _cax_dtc = None
+        if _cmap_dtc and _sname_dtc is not None:
+            _cax_dtc = _cmap_dtc.get(str(_sname_dtc))
+        if _cax_dtc is not None and int(_cax_dtc) == 0:
+            _dt_phys_transpose = True
+    # PHYSICAL tile shape: [K, hd] when transposing (hd innermost, stride 1),
+    # else the natural [hd, K]. loop_vars index the PHYSICAL tile.
+    _phys_shape = (
+        [int(out_shape[1]), int(out_shape[0])] if _dt_phys_transpose
+        else (list(out_shape) or [1])
+    )
     tile_buf = _alloc_tile_buffer(
         ctx,
-        list(out_shape) or [1],
+        list(_phys_shape) or [1],
         out_dtype,
         ctx.fresh("tile_load"),
-        scope="shared" if len(out_shape or []) >= 2 else "local",
+        scope=load_scope,
     )
     loop_vars = [
         tir.Var(ctx.fresh(f"i{axis}"), "int32")
-        for axis, _extent in enumerate(out_shape or [1])
+        for axis, _extent in enumerate(_phys_shape or [1])
     ]
+    if _dt_phys_transpose:
+        _tset = getattr(ctx, "transposed_phys_tiles", None)
+        if _tset is None:
+            _tset = set()
+            try:
+                setattr(ctx, "transposed_phys_tiles", _tset)
+            except Exception:
+                pass
+        try:
+            _tset.add(getattr(tile_buf, "data", tile_buf))
+        except Exception:
+            pass
     # ITERATION 4 (CopyNode conversion): on the routed-triton async path, a
     # rank>=2 global->shared producer (the K-loop dout/C tile) is emitted as a
     # REAL 2D-strided ``T.copy`` CopyNode instead of the 1D-flattened
@@ -1667,6 +2471,7 @@ def _emit_ptrstate_tile_load_tir(
     if (
         getattr(ctx, "routed_triton_async_loads", False)
         and len(out_shape or []) >= 2
+        and load_scope in ("shared", "shared.dyn")
     ):
         converted = _emit_ptrstate_tile_load_copynode(
             op,
@@ -1680,6 +2485,7 @@ def _emit_ptrstate_tile_load_tir(
             dynamic_mask_dims,
             tile_buf,
             loop_vars,
+            phys_transpose=_dt_phys_transpose,
         )
         if converted:
             # Real CopyNode emitted -> count it so ``map_scf_for`` stamps
@@ -1700,6 +2506,8 @@ def _emit_ptrstate_tile_load_tir(
 
     flat_idx = _ptrstate_flat_index(ctx, resolved, loop_vars, out_shape)
     load_expr: Any = tir.BufferLoad(src_buf, [flat_idx])
+    mask_lane = None
+    other_lane = tir.const(0, out_dtype)
     if mask_ssa is not None:
         try:
             mask_expr = ctx.get(mask_ssa)
@@ -1715,8 +2523,89 @@ def _emit_ptrstate_tile_load_tir(
                 other_expr = tir.const(0, out_dtype)
             mask_lane = _resolve_lane_operand(ctx, mask_expr, loop_vars, role="mask")
             other_lane = _resolve_lane_operand(ctx, other_expr, loop_vars, role="other")
-            load_expr = tir.if_then_else(mask_lane, load_expr, other_lane)
     dynamic_mask = _dynamic_tts_mask_expr(ctx, loop_vars, dynamic_mask_dims)
+
+    # DALOADBOUNDSHOIST (the two-birds load-side predicate hoist, same family as
+    # the cp.async tile-load OOB-zero partition). For a rank-1 (vector) masked
+    # load whose native in-bounds predicate is an AND of per-axis MONOTONE
+    # bounds ``offs_a < dim_a`` (the dstates dA decay load: ``offs_k <
+    # chunk_size - i_132*32``), the per-element ``if_then_else(mask, load,
+    # other)`` forces the CUDA codegen to ALSO wrap the symbolic-extent flat
+    # ``BufferLoad`` in its own ``(0 <= flat) && (flat < numel)`` safe-index
+    # guard -- so every lane recomputes the full int64 flat base THREE times
+    # (lower bound, upper bound, and the index) under a predicate. We instead
+    # PARTITION the load into (1) an UNGUARDED ``T.For`` over the in-bounds
+    # contiguous prefix ``[0, clamp(ext_a))`` that reads ``load_expr`` directly
+    # (no per-element mask, so the codegen drops the numel safe-index guard --
+    # the index is now a small affine of bounded loop vars over the dense
+    # prefix) and (2) the OOB-zero suffix via the existing
+    # ``_emit_oob_zero_partition``. For the §P1 full tile (clamp == BLK) the
+    # suffix is EMPTY and the prefix is the whole vector -- bit-identical to the
+    # masked load, fewer integer-pred ops, fewer live predicate/index registers.
+    # Gated to the non-pipelined routed path (the pipelined consumer must keep
+    # the read-modify-write form); falls back to the predicated load whenever
+    # the per-axis extents are not provably recoverable (RULE #1: never a
+    # maskless OOB read, never a dropped guard on a real OOB lane).
+    _hoisted = False
+    import os as _os_da
+    if (
+        _os_da.environ.get("TL_PIPELINE_CP_ASYNC") != "1"
+        and _os_da.environ.get("TL_NO_BOUNDS_HOIST") != "1"
+        and _os_da.environ.get("TL_NO_DA_BOUNDS_HOIST") != "1"
+        and (mask_lane is not None or dynamic_mask is not None)
+    ):
+        in_bounds = None
+        if mask_lane is not None:
+            in_bounds = mask_lane
+        if dynamic_mask is not None:
+            in_bounds = dynamic_mask if in_bounds is None else tir.And(in_bounds, dynamic_mask)
+        extents = None
+        if in_bounds is not None:
+            extents = _decompose_monotone_mask_extents(
+                ctx, in_bounds, loop_vars, out_shape
+            )
+        if _os_da.environ.get("TL_BOUNDSHOIST_DEBUG") == "1":
+            import sys as _sys
+            print("DALOADBOUNDSHOIST rank=%d mask=%s dyn=%s partitioned=%s" % (
+                len(loop_vars), mask_lane is not None,
+                dynamic_mask is not None, extents is not None),
+                file=_sys.stderr, flush=True)
+        if extents is not None and len(extents) == len(loop_vars):
+            zero = tir.const(0, "int32")
+            clamped = [
+                tir.Max(
+                    zero,
+                    tir.Min(
+                        _cast_index_like(ctx, extents[a], zero),
+                        tir.const(int(out_shape[a]), "int32"),
+                    ),
+                )
+                for a in range(len(loop_vars))
+            ]
+            # (1) UNGUARDED in-bounds prefix load (no per-element mask -> codegen
+            # drops the numel safe-index guard for the dense prefix).
+            prefix: Any = tir.BufferStore(
+                tile_buf, load_expr, list(loop_vars) or [tir.const(0, "int32")]
+            )
+            for axis in range(len(loop_vars) - 1, -1, -1):
+                prefix = tir.For(
+                    loop_vars[axis], zero, clamped[axis],
+                    tir.ForKind.SERIAL, prefix,
+                )
+            ctx.emit(prefix)
+            # (2) OOB-zero suffix (partitioned, unguarded) -- bit-identical to
+            # the masked-load ``other`` on the out-of-bounds lanes.
+            _emit_oob_zero_partition(
+                ctx, tile_buf, loop_vars, out_shape, clamped, other_lane,
+            )
+            _hoisted = True
+    if _hoisted:
+        if result_value is not None:
+            ctx.bind(result_value, tile_buf)
+        return tile_buf
+
+    if mask_lane is not None:
+        load_expr = tir.if_then_else(mask_lane, load_expr, other_lane)
     if dynamic_mask is not None:
         load_expr = tir.if_then_else(dynamic_mask, load_expr, tir.const(0, out_dtype))
 
@@ -1783,6 +2672,149 @@ def _emit_ptrstate_tile_load_tir(
     return tile_buf
 
 
+def _frag_store_scope(val_expr: Any) -> Optional[str]:
+    """Return the memory scope string of ``val_expr`` if it is a Buffer."""
+    scope_fn = getattr(val_expr, "scope", None)
+    if scope_fn is None:
+        return None
+    try:
+        return scope_fn() if callable(scope_fn) else scope_fn
+    except Exception:
+        return None
+
+
+def _emit_ptrstate_fragment_store_copynode(
+    op: Any,
+    ctx: WalkerCtx,
+    dst_buf: Any,
+    resolved: Dict[str, Any],
+    frag_buf: Any,
+    val_shape: Sequence[int],
+    dtype: str,
+    mask_ssa: Any,
+    dynamic_mask_dims: Sequence[Any],
+) -> Any:
+    """Emit a mask-aware DIRECT ``local.fragment`` -> global ``T.copy`` store.
+
+    REGCARRYCOLLAPSE epilogue (the §P1 dstates store). When the loop-carried
+    MMA-C accumulator is bound DIRECTLY to the post-loop ``tt.store`` (no shared
+    ``carry_logical`` staging tile), the value is a swizzled ``local.fragment``.
+    A per-lane serial scalar store reading the fragment at LOGICAL ``[i, j]``
+    indices would impose a flat layout that CONFLICTS with the tensor-core MMA
+    store layout ("Get different layout for carry_tile"). Native Triton instead
+    emits a single layout-aware fragment->global masked store (``tt.store(ptrs,
+    acc, mask)``). We mirror that with TileLang's own layout-aware ``T.copy``:
+
+      1. Build a 2D-strided global VIEW of the flat function-arg buffer
+         (``data`` aliases the arg's backing Var, ``strides`` = the per-axis arg
+         strides, ``elem_offset`` = the per-block base) -- the SAME construction
+         the K-loop LOAD CopyNode uses (``_emit_ptrstate_tile_load_copynode``).
+      2. ``T.copy(frag_region -> view2d_region)``: the CopyNode iterates over the
+         fragment (highest scope-level) and ``InferLayout`` propagates the
+         fragment's registered ``make_mma_store_layout`` to the global store
+         loop, so the per-warp register tile is written DIRECTLY to global at
+         the correct ``[i, j]`` positions -- the MxN fp32 shared stage and its
+         re-traffic are eliminated.
+
+    Mask-awareness (RULE #1 -- correct for general non-mult-of-64 shapes). The
+    native store mask ``(offs_m < hdim) & (offs_n < dstate)`` is, per axis, the
+    bound ``offs_axis < dim_axis`` with ``offs_axis = block_base + arange(BLK)``.
+    Since ``offs`` is monotone from ``block_base``, the in-bounds lane set is the
+    CONTIGUOUS prefix ``[0, dim_axis - block_base)`` -- exactly the clamped
+    extent ``min(BLK, dim_axis - block_base)`` already carried per axis by the
+    ``tts.store`` ``dynamic_mask_dims`` (verified: each dim resolves to
+    ``min(max(min(BLK+base, dim), base) - base, BLK)``). We clamp the copy
+    region to that per-axis extent, so the copy writes EXACTLY the in-bounds
+    lanes -- provably identical to the masked store, never an out-of-bounds /
+    full-tile write. For §P1 (hdim=dstate=64=BLK, single tile) the extent folds
+    to a constant 64 (mask always-true); for a partial trailing tile it clamps.
+    RULE #1: if the per-axis clamped extent cannot be recovered (no
+    ``dynamic_mask_dims`` and no resolvable ``mask_ssa`` bound), we RAISE rather
+    than emit a maskless full-tile write that is wrong for general shapes.
+    """
+    tir = ctx.tir()
+    if len(val_shape) != 2:
+        raise EmitError(
+            "direct fragment->global store: expected rank-2 MMA-C tile, got "
+            "shape %r" % (list(val_shape),)
+        )
+    # Grow the flat arg buffer to the grid-scaled floor (same contract as the
+    # serial store path), then alias its backing data Var into a 2D view.
+    grid_floor = _grid_scaled_store_extent(ctx, val_shape)
+    min_extent = max(_flat_min_extent(val_shape), grid_floor)
+    dst_buf = _redeclare_ctx_buffer_1d(ctx, dst_buf, dtype, min_extent, grow_fixed=True)
+    data_var = getattr(dst_buf, "data", None)
+    if data_var is None:
+        raise EmitError(
+            "direct fragment->global store: flat dst buffer %r has no backing "
+            "data Var to alias into a 2D strided view"
+            % (getattr(dst_buf, "name", "?"),)
+        )
+    base, strides = _ptrstate_block_base_and_strides(ctx, resolved, val_shape)
+    try:
+        dst_scope = dst_buf.scope()
+    except Exception:
+        dst_scope = "global"
+    view2d = tir.decl_buffer(
+        list(val_shape),
+        dtype,
+        name=ctx.fresh((getattr(dst_buf, "name", None) or "out") + "_2d"),
+        data=data_var,
+        strides=list(strides),
+        elem_offset=base,
+        scope=dst_scope or "global",
+    )
+    # Per-axis clamped in-bounds extents (== the native store mask). Prefer the
+    # ``tts.store`` dynamic mask dims (each already the clamped extent); fall
+    # back to a resolvable ``mask_ssa`` only if it yields per-axis bounds. RULE
+    # #1: no recoverable bound -> RAISE (never a maskless full-tile store).
+    extents: List[Any] = []
+    if dynamic_mask_dims:
+        rank = len(val_shape)
+        start_axis = max(0, rank - len(dynamic_mask_dims))
+        # Full extent for any leading axis the mask does not constrain.
+        for axis in range(start_axis):
+            extents.append(tir.const(int(val_shape[axis]), "int32"))
+        for i, dim in enumerate(dynamic_mask_dims):
+            axis = start_axis + i
+            if axis >= rank:
+                break
+            dim_expr = _resolved_or_none(ctx, dim)
+            if dim_expr is None:
+                dim_expr = _coerce_index_scalar(ctx, dim)
+            # Each dynamic dim is the clamped in-bounds extent for this axis.
+            ext = _cast_index_like(ctx, dim_expr, tir.const(0, "int32"))
+            extents.append(ext)
+    if len(extents) != len(val_shape):
+        raise EmitError(
+            "direct fragment->global store: could not recover a per-axis "
+            "in-bounds extent for every tile axis (got %d of %d); refusing to "
+            "emit a maskless full-tile store that is wrong for non-multiple-of-"
+            "block shapes. dynamic_mask_dims=%r mask_ssa=%r"
+            % (len(extents), len(val_shape), dynamic_mask_dims, mask_ssa)
+        )
+    import tilelang.language as T  # type: ignore
+
+    tvm_mod = ctx.tvm()
+    zero = tir.const(0, "int32")
+    src_ranges = [
+        tvm_mod.ir.Range.from_min_extent(zero, ext) for ext in extents
+    ]
+    dst_ranges = [
+        tvm_mod.ir.Range.from_min_extent(zero, ext) for ext in extents
+    ]
+    src_region = tvm_mod.tir.BufferRegion(frag_buf, src_ranges)
+    dst_region = tvm_mod.tir.BufferRegion(view2d, dst_ranges)
+    copy_handle = T.copy(src_region, dst_region)
+    if isinstance(copy_handle, tir.PrimExpr):
+        stmt = tir.Evaluate(copy_handle)
+        ctx.emit(stmt)
+        return stmt
+    if copy_handle is not None:
+        ctx.emit(copy_handle)
+    return copy_handle
+
+
 def _emit_ptrstate_tile_store_tir(
     op: Any,
     ctx: WalkerCtx,
@@ -1810,6 +2842,23 @@ def _emit_ptrstate_tile_store_tir(
     dtype = _normalize_mlir_dtype(
         str(getattr(val_expr, "dtype", _dtype_of(_operands(op)[1]) or "float32"))
     )
+    # REGCARRYCOLLAPSE DIRECT FRAGMENT->GLOBAL EPILOGUE. When the post-loop
+    # ``tt.store`` value is bound DIRECTLY to the loop-carried MMA-C accumulator
+    # (a ``local.fragment``; control.py drops the shared ``carry_logical`` stage
+    # for the unfolded-recurrence slot when TL_FRAG_GLOBAL_EPILOGUE != 0), emit a
+    # single layout-aware, mask-clamped ``T.copy(fragment -> global_2d_view)``
+    # instead of a per-lane serial scalar store. The serial scalar store would
+    # read the fragment at LOGICAL [i, j] and impose a flat layout conflicting
+    # with the MMA store layout; the CopyNode propagates the fragment's
+    # make_mma_store_layout and writes registers DIRECTLY to global, eliminating
+    # the 16 KB shared stage + its re-traffic. RULE #1: the helper RAISES if it
+    # cannot recover the per-axis in-bounds (mask) extent -- never a maskless
+    # full-tile store that is wrong for non-multiple-of-block shapes.
+    if _frag_store_scope(val_expr) in {"local.fragment", "metal.simdgroup"}:
+        return _emit_ptrstate_fragment_store_copynode(
+            op, ctx, dst_buf, resolved, val_expr, list(val_shape), dtype,
+            mask_ssa, dynamic_mask_dims,
+        )
     grid_floor = _grid_scaled_store_extent(ctx, val_shape)
     min_extent = max(_flat_min_extent(val_shape), grid_floor)
     # A strided per-block store that addresses beyond a too-small caller
@@ -2780,7 +3829,12 @@ def emit_tt_expand_dims(op: Any, ctx: WalkerCtx) -> Any:
         # FULL TRANSFORM 1: fold-eligible expand_dims (consumed only as
         # addressing/mask) stays lazy -- folds into the load/store loop body,
         # so no [N] expand_* array is materialized.
-        if should_fold_addressing(ctx, op):
+        # REGSCALECOLLAPSE/IndexFold-lazy companion: keep the decay-scale
+        # expand_dims (``exp(dA) -> expand_dims -> broadcast -> dout*scale ->
+        # dot``) LAZY so the exp folds JUST-IN-TIME into the MMA-A fragment fill
+        # (register-resident, per-lane) instead of materialising the §P1
+        # ``expand_159[32]`` that pins all K columns of exp(dA) live in regs.
+        if should_fold_addressing(ctx, op) or _expand_dims_feeds_register_a_scale(ctx, op):
             if result_value is not None:
                 ctx.bind(result_value, lazy)
             return lazy
@@ -2812,6 +3866,164 @@ def emit_tt_expand_dims(op: Any, ctx: WalkerCtx) -> Any:
     if result_value is not None:
         ctx.bind(result_value, out)
     return out
+
+
+def _ctx_is_cuda_target(ctx: WalkerCtx) -> bool:
+    """True iff the codegen target is explicitly CUDA / NVIDIA.
+
+    Mirrors ``arith._ctx_is_cuda_target`` / ``reduction._is_cuda_target`` --
+    prefers ``ctx.target`` (set by ``from_ttir`` before tilelang lowering passes
+    establish ``Target.current()``), then the ambient target, then False.
+    """
+    ctx_target = getattr(ctx, "target", None) if ctx is not None else None
+    if ctx_target:
+        t = str(ctx_target).lower()
+        return "cuda" in t or "nvidia" in t or t.startswith("sm_") or "nvptx" in t
+    try:
+        import tvm  # noqa: WPS433
+
+        target = tvm.target.Target.current(allow_none=True)
+    except Exception:
+        return False
+    if target is None:
+        return False
+    kind = str(getattr(getattr(target, "kind", None), "name", "") or "").lower()
+    tstr = str(target).lower()
+    return "cuda" in kind or "nvidia" in tstr or "cuda" in tstr
+
+
+def _broadcast_feeds_register_a_scale(ctx: WalkerCtx, op: Any) -> bool:
+    """True iff this ``tt.broadcast`` result feeds ONLY an element-wise float
+    multiply/add (the tensor-core decay-scale, e.g. Mamba ``dout * exp(dA)``).
+
+    REGSCALECOLLAPSE companion (RULE #1: scoped + fail-closed). When True the
+    broadcast is kept LAZY -- its per-lane value folds directly into the
+    consuming binop (which ``arith._feeds_tensorcore_dot_as_register_a`` itself
+    keeps lazy and materialises into the MMA-A ``local.fragment``). That removes
+    the materialised ``bcast_*`` staging tile that ptxas otherwise places in the
+    stack frame (the §P1 dstates ``bcast_156[2048]`` == the entire 8448 B stack
+    frame / 17.6 GB local-memory traffic). The scaled value then lives in the A
+    fragment REGISTERS at MMA time -- exactly native's ``ldmatrix -> *scale in
+    registers -> mma`` -- with no per-K local round-trip.
+
+    Gated to:
+      * CUDA / NVIDIA target (tensor-core MMA; gemm_rs reads A from registers).
+        On Metal / SIMT the analogous scale is applied by the backend's own
+        emitter, so this fold is a no-op there (the broadcast materialises as
+        before) -- backend-neutral by construction.
+      * The broadcast's SSA consumers are EXACTLY a set of element-wise float
+        arithmetic ops (``arith.mulf`` / ``arith.addf`` / ``arith.subf``) -- the
+        decay-scale pattern. Any other / unknown consumer keeps the materialised
+        path (fail-closed: a broadcast read by a non-arith consumer, e.g. a
+        store value or a reduction, is NOT folded). RULE #1: never over-broaden.
+
+    The fold is BIT-EXACT regardless: a broadcast is pure replication, so the
+    lazy reader reproduces the identical per-lane value. The gate only decides
+    whether keeping it lazy is *beneficial* (register-resident scale) vs neutral.
+    """
+    if not _ctx_is_cuda_target(ctx):
+        return False
+    ssa_users = getattr(ctx, "ssa_users", None)
+    if not ssa_users:
+        return False
+    name = _result_ssa_name(op)
+    if name is None:
+        return False
+    users = (
+        ssa_users.get(name)
+        or ssa_users.get(name.lstrip("%"))
+        or ssa_users.get(f"%{name.lstrip('%')}")
+    )
+    if not users:
+        return False
+    return set(users).issubset({"arith.mulf", "arith.addf", "arith.subf"})
+
+
+def _op_name_for_gate(op: Any) -> str:
+    """Best-effort MLIR op-name (``dialect.op``) for a consumer op object.
+
+    Mirrors the ``_op_name`` resolution the module prepass uses, so the gate
+    classifies consumer ops the same way ``ssa_users`` keys are built.
+    """
+    for attr in ("name", "OPERATION_NAME"):
+        v = getattr(op, attr, None)
+        if isinstance(v, str) and v:
+            return v
+    operation = getattr(op, "operation", None)
+    if operation is not None:
+        v = getattr(operation, "name", None)
+        if isinstance(v, str) and v:
+            return v
+    return ""
+
+
+def _expand_dims_feeds_register_a_scale(ctx: WalkerCtx, op: Any) -> bool:
+    """True iff this ``tt.expand_dims`` result feeds ONLY the tensor-core
+    decay-scale chain (e.g. Mamba ``exp(dA) -> expand_dims -> broadcast ->
+    dout*scale -> tt.dot``).
+
+    REGSCALECOLLAPSE / IndexFold-lazy companion (RULE #1: scoped + fail-closed).
+    The ``tt.expand_dims`` sits BETWEEN the ``math.exp`` (already lazy) and the
+    ``tt.broadcast`` (kept lazy by ``_broadcast_feeds_register_a_scale``). With
+    no gate here ``emit_tt_expand_dims`` MATERIALISES the lazy exp into a
+    register tile -- the §P1 ``expand_159[32]`` holding all K columns of
+    ``exp(dA)`` LIVE across the whole K-step, the register-pressure ceiling that
+    pins occupancy at 2 blocks/SM. Keeping it lazy lets the ``exp`` fold all the
+    way into the MMA-A fragment fill, recomputed JUST-IN-TIME per lane in
+    registers -- NO ``expand_159`` array, NO wide live range, and (RULE #1) NO
+    local round-trip (a register recompute, not a spill).
+
+    BIT-EXACT regardless: ``expand_dims`` is a pure shape rebind, so the lazy
+    reader reproduces the identical per-lane value. The gate only decides
+    whether keeping it lazy is *beneficial*.
+
+    Gated to (fail-closed, never over-broaden):
+      * CUDA / NVIDIA target (gemm_rs reads A from registers; on Metal/SIMT the
+        scale is applied by the backend emitter, so this is a no-op there --
+        the expand_dims materialises as before, backend-neutral).
+      * Every consumer is EITHER a direct element-wise float arith op
+        (``arith.mulf`` / ``addf`` / ``subf``) OR a ``tt.broadcast`` that ITSELF
+        passes ``_broadcast_feeds_register_a_scale`` (transitive, one hop, on
+        the real consumer op object via ``ctx.ssa_user_ops``). Any other /
+        unknown / unresolved consumer keeps the materialised path.
+    """
+    if not _ctx_is_cuda_target(ctx):
+        return False
+    name = _result_ssa_name(op)
+    if name is None:
+        return False
+    user_names = (
+        ctx.ssa_users.get(name)
+        or ctx.ssa_users.get(name.lstrip("%"))
+        or ctx.ssa_users.get(f"%{name.lstrip('%')}")
+    ) if getattr(ctx, "ssa_users", None) else None
+    if not user_names:
+        return False
+    arith_scale = {"arith.mulf", "arith.addf", "arith.subf"}
+    # Fast accept: every consumer is a direct element-wise arith scale op.
+    if set(user_names).issubset(arith_scale):
+        return True
+    # Otherwise every consumer must be a ``tt.broadcast`` that itself feeds the
+    # scale. Resolve the real consumer op objects (fail-closed if unavailable).
+    if not set(user_names).issubset(arith_scale | {"tt.broadcast"}):
+        return False
+    user_ops = (
+        ctx.ssa_user_ops.get(name)
+        or ctx.ssa_user_ops.get(name.lstrip("%"))
+        or ctx.ssa_user_ops.get(f"%{name.lstrip('%')}")
+    ) if getattr(ctx, "ssa_user_ops", None) else None
+    if not user_ops:
+        return False
+    for user_op in user_ops:
+        op_name = _op_name_for_gate(user_op)
+        if op_name in arith_scale:
+            continue
+        if op_name == "tt.broadcast":
+            if not _broadcast_feeds_register_a_scale(ctx, user_op):
+                return False
+            continue
+        return False
+    return True
 
 
 def emit_tt_broadcast(op: Any, ctx: WalkerCtx) -> Any:
@@ -2929,7 +4141,10 @@ def emit_tt_broadcast(op: Any, ctx: WalkerCtx) -> Any:
         # addressing/mask) stay lazy -- the per-lane broadcast read folds into
         # the load/store loop body, so no [2048]/[4096] bcast_* array is
         # materialized (no local spill).
-        if should_fold_addressing(ctx, op):
+        # REGSCALECOLLAPSE companion: keep the decay-scale broadcast LAZY so it
+        # folds into the MMA-A fragment fill (register-resident scale, native
+        # mirror) instead of materialising a ``bcast_*[M*K]`` stack tile.
+        if should_fold_addressing(ctx, op) or _broadcast_feeds_register_a_scale(ctx, op):
             if result_value is not None:
                 ctx.bind(result_value, lazy)
             return lazy

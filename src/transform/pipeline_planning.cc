@@ -816,12 +816,64 @@ private:
           continue;
         }
 
+        // PIPELINENS4 carve-out (RULE #1 -- race-free, not a paper-over):
+        // The frontend lowers a masked global->shared load as a recognizable
+        // pure-copy CopyNode (the cp.async producer) PLUS a separate masked
+        // out-of-bounds fixup that overwrites the OOB lanes of the SAME shared
+        // tile. In the multi-stage pipeline that shared tile is double/quad-
+        // buffered, so the fixup writes to the producer's OWN private per-stage
+        // buffer in the SAME iteration -- it is NOT a cross-iteration overlap of
+        // two independent producers. It is emitted as a read-modify-write
+        // (tile[idx] = select(oob, other, tile[idx])), so it READS the copy's
+        // output and is therefore scheduled as a CONSUMER of the cp.async group
+        // (the pipeline inserts cp.async.wait_group<N> before it -> the fixup
+        // runs only after its stage's async load has landed, no WAW race).
+        // Detect exactly this pattern and skip the false-positive FATAL: stage i
+        // is NOT a copy/producer stage, it READS the conflicting buffer it
+        // writes (RMW), and every buffer it writes is also written by this copy
+        // stage (it only touches the copy's outputs). Anything else still FATALs.
+        const auto &second = (*pipeline_stage_infos)[i];
+        // Structural test for an in-stage masked read-modify-write fixup of the
+        // copy producer's output: stage i is NOT itself a global->shared copy
+        // producer (it must not source the conflicting buffer from global), AND
+        // every buffer it writes it also READS (RMW of the same region) AND is
+        // also written by this copy stage. A genuine cross-iteration second
+        // producer copies from GLOBAL and does NOT read the shared tile it
+        // writes, so it fails reads_same and still FATALs. ``is_first_stage`` is
+        // NOT used as a gate: the producer_for_copy propagation can flag the
+        // fixup, but the RMW structure is the exact, race-safe discriminator.
+        bool is_in_stage_masked_fixup =
+            !second.is_copy_stage() && !second.writes.empty();
+        if (is_in_stage_masked_fixup) {
+          for (const BufferRegion &w : second.writes) {
+            bool reads_same = std::any_of(
+                second.reads.begin(), second.reads.end(),
+                [&](const BufferRegion &rd) {
+                  return rd->buffer == w->buffer &&
+                         MayConflict(rd->region, w->region);
+                });
+            bool copy_also_writes = std::any_of(
+                pinfo.writes.begin(), pinfo.writes.end(),
+                [&](const BufferRegion &cw) { return cw->buffer == w->buffer; });
+            if (!(reads_same && copy_also_writes)) {
+              is_in_stage_masked_fixup = false;
+              break;
+            }
+          }
+        }
         for (const BufferRegion &write : (*pipeline_stage_infos)[i].writes) {
           if (std::find_if(pinfo.writes.begin(), pinfo.writes.end(),
                            [&](const BufferRegion &r) {
                              return r->buffer == write->buffer &&
                                     MayConflict(r->region, write->region);
                            }) != pinfo.writes.end()) {
+            if (is_in_stage_masked_fixup) {
+              // Same-stage masked RMW fixup of the copy's output. Keep it in the
+              // copy producer's stage (it is the last in-stage use of the copied
+              // data on the producer side) and continue -- no real hazard.
+              pinfo.last_use_stmt_index = std::max(pinfo.last_use_stmt_index, i);
+              continue;
+            }
             LOG(FATAL) << "Pipeline planning error: Multiple writes to "
                           "overlapping buffer regions detected. "
                        << "Stage " << pinfo.original_stmt_index << " and stage "

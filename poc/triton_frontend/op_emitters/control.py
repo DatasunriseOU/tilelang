@@ -101,6 +101,18 @@ _DIRECT_FRAG_GLOBAL_EPILOGUE_ENABLED = (
     _os.environ.get("TL_FRAG_GLOBAL_EPILOGUE", "1") != "0"
 )
 
+# REGCARRYCOLLAPSE gate (named capability). When ON (default), the UNFOLDED
+# GEMM-accumulate recurrence ``dot(a,b,zero) -> addf(carry, dot) -> yield`` is
+# collapsed to an in-place MMA-fragment accumulation: the chunk-loop carry lives
+# REGISTER/FRAGMENT-resident across the loop, eliminating the redundant
+# ``carry_tile`` + ``dot_c_logical`` + ``carry_next`` shared buffers (native's
+# register-resident dstates recurrence). Set ``TL_REGCARRY_COLLAPSE=0`` to force
+# the legacy shared-carry path for a controlled same-session A/B measurement.
+# RULE #1: both paths are bit-correct; the gate isolates the lever's
+# contribution, it is NOT a degraded fallback. The env var is read DYNAMICALLY
+# at the ``map_scf_for`` call site (NOT cached here) so a single process can
+# build both A and B by toggling the var between compiles.
+
 __all__ = [
     "CONTROL_EMITTERS",
     "EmitError",
@@ -903,6 +915,166 @@ def _is_trivial_noop_body(body_stmt: Any, ctx: _om.WalkerCtx) -> bool:
     return False
 
 
+def _mtp_ssa_name(value: Any) -> Optional[str]:
+    """Printed SSA name (``"%108"``) of a value across binding shapes."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    for attr in ("get_name", "name"):
+        getter = getattr(value, attr, None)
+        if callable(getter):
+            try:
+                out = str(getter())
+                if out:
+                    return out
+            except Exception:
+                pass
+        elif isinstance(getter, str) and getter:
+            return getter
+    try:
+        head = str(value).strip().split()[0]
+        if head.startswith("%"):
+            return head
+    except Exception:
+        pass
+    return None
+
+
+def _mtp_op_name(o: Any) -> str:
+    name = getattr(o, "name", None)
+    if not name:
+        inner = getattr(o, "operation", None)
+        name = getattr(inner, "name", None) if inner is not None else None
+    if not name and isinstance(o, dict):
+        name = o.get("name")
+    return str(name) if name else ""
+
+
+def _materialize_make_tptr_index_operands(func_op: Any, ctx: _om.WalkerCtx) -> None:
+    """Bind every ``tts.make_tptr`` dynamic offset/stride SSA into value_map.
+
+    See the FixPtrState108 note at the call site in :func:`map_tt_func`.
+    Walks the tt.func body to (a) index result-SSA -> defining op and (b)
+    collect ``tts.make_tptr`` ops, then depth-first dispatches each make_tptr
+    dynamic index operand's producer chain through ``OP_TABLE``. Idempotent:
+    a producer already bound (kernel arg / earlier emit) is skipped, and the
+    same producer is bound at most once here; the later body walk re-binding
+    the same scalar SSA is harmless (same value, no statement emitted for a
+    scalar index expr).
+    """
+    from ..mlir_walker import OPS_THAT_HANDLE_OWN_REGIONS  # noqa: WPS433
+
+    regions = _scf_regions(func_op)
+    if not regions:
+        return
+    blocks = getattr(regions[0], "blocks", ()) or []
+    if not blocks:
+        return
+
+    def_of: Dict[str, Any] = {}
+    make_tptr_ops: List[Any] = []
+
+    def _index(o: Any) -> None:
+        nm = _mtp_op_name(o)
+        for r in (_om._results(o) or ()):
+            rn = _mtp_ssa_name(r)
+            if rn:
+                def_of.setdefault(rn, o)
+        if nm == "tts.make_tptr":
+            make_tptr_ops.append(o)
+        for region in getattr(o, "regions", ()) or ():
+            for block in getattr(region, "blocks", ()) or ():
+                for child in getattr(block, "operations", ()) or ():
+                    _index(child)
+
+    for block in blocks:
+        for child in getattr(block, "operations", ()) or ():
+            _index(child)
+
+    if not make_tptr_ops:
+        return
+
+    materialized: set = set()
+
+    deferred: set = set()
+
+    def _is_ptrstate_bound(ssa_name: Optional[str]) -> bool:
+        # An SSA already bound as a PtrState dict (a ``tt.addptr`` result) is a
+        # pointer, NOT a scalar index. Reusing it inside an i32-typed arith
+        # (prod-dstates ``%109 = arith.muli %100, %stride`` where %100 is the
+        # addptr) is POINTER arithmetic owned by PtrState resolution.
+        if ssa_name is None:
+            return False
+        try:
+            _b = ctx.value_map.get(ssa_name)
+        except (TypeError, AttributeError):
+            return False
+        return isinstance(_b, dict) and "_ptrstate" in _b
+
+    def _materialize(ssa: Optional[str], stack: Tuple[str, ...] = ()) -> bool:
+        """Eagerly bind ``ssa``'s scalar feeder chain. Returns True if ``ssa``
+        is (now) a usable SCALAR index value, False if it must be DEFERRED to
+        PtrState resolution / the body walk (a pointer-arith op, an op fed by a
+        pointer/PtrState operand, or one of their dependents). A deferred op is
+        never emitted here -- its dependents detect the missing binding and
+        defer too, so the make_tptr loop never dispatches a pointer operand
+        through a scalar arith emitter. RULE #1: this is not a silent
+        index-skip -- genuine integer feeders still materialize; only true
+        pointer-state-fed ops defer to the path that actually owns them."""
+        if ssa is None:
+            return False
+        if ssa in deferred:
+            return False
+        if ssa in materialized:
+            return True
+        if _is_ptrstate_bound(ssa):
+            deferred.add(ssa)
+            return False
+        try:
+            if ssa in ctx.value_map:
+                return True
+        except TypeError:
+            return False
+        defop = def_of.get(ssa)
+        if defop is None or ssa in stack:
+            # No producer in this module (kernel arg already handled above, or
+            # genuinely unresolvable) -- leave for the precise downstream raise.
+            # Never fabricate an index. Treat as deferred (unbound) so a
+            # dependent does not emit against a missing operand.
+            return False
+        _all_ok = True
+        for opnd in getattr(defop, "operands", ()) or ():
+            if not _materialize(_mtp_ssa_name(opnd), stack + (ssa,)):
+                _all_ok = False
+        dn = _mtp_op_name(defop)
+        emitter = _om.OP_TABLE.get(dn)
+        if emitter is None:
+            deferred.add(ssa)
+            return False
+        if getattr(emitter, "owns_regions", False) or dn in OPS_THAT_HANDLE_OWN_REGIONS:
+            # Region-owning producer (scf.*): emitting out of walk order would
+            # mis-scope its body. make_tptr index feeders are flat arith and
+            # never hit this; leave for the precise downstream raise.
+            deferred.add(ssa)
+            return False
+        if not _all_ok:
+            # A feeder was deferred (pointer/PtrState arith or unresolvable) ->
+            # this op is part of the pointer-offset computation PtrState owns;
+            # defer it too rather than dispatch a scalar emitter on a pointer.
+            deferred.add(ssa)
+            return False
+        materialized.add(ssa)
+        emitter(defop, ctx)
+        return True
+
+    for mk in make_tptr_ops:
+        operands = list(getattr(mk, "operands", ()) or [])
+        # operand 0 is the base pointer; 1+ are dynamic index offset/stride.
+        for opnd in operands[1:]:
+            _materialize(_mtp_ssa_name(opnd))
+
+
 def map_tt_func(op: Any, ctx: _om.WalkerCtx) -> Any:
     """Build a ``tvm.tir.PrimFunc`` from a ``tt.func`` op.
 
@@ -990,6 +1162,37 @@ def map_tt_func(op: Any, ctx: _om.WalkerCtx) -> Any:
             except Exception:
                 pass
             ctx.value_map[ssa] = bound
+
+    # ------------------------------------------------------------------
+    # FixPtrState108 -- materialize tts.make_tptr offset/stride operands
+    # ------------------------------------------------------------------
+    #
+    # PtrAnalysis rewrites tt.* pointer arithmetic into ``tts.make_tptr`` ops
+    # whose dynamic offsets/strides are SYNTHETIC index-typed SSA values
+    # (e.g. ``%108 = arith.addi(...)``) inserted by the structured-pointer
+    # rewrite immediately before the make_tptr. Those scalar SSA are recorded
+    # in the recovered ``PtrState`` (``state.offsets`` / ``state.strides``)
+    # and consumed by ``_resolve_ptrstate_value`` when a downstream
+    # ``tt.load`` / ``tts.store`` against the SAME source pointer is emitted.
+    # A loop-carried load (``tt.load(%argNN, ...)`` where ``%argNN`` is an
+    # scf.for iter-arg tracing back to the make_tptr base) is dispatched
+    # BEFORE the walk reaches the later top-level arith ops that DEFINE those
+    # offset/stride SSA -- so they are absent from ``ctx.value_map`` and
+    # resolution raises ``EmitError: PtrState references unresolved SSA value
+    # '%108'``.
+    #
+    # Fix (generic, target-independent): immediately after the tt.func block
+    # args are bound (so kernel-arg SSA like ``%arg23`` resolve) and BEFORE
+    # the body region is walked, eagerly emit the transitive defining-op
+    # chain of every make_tptr's dynamic index operands through the REAL
+    # OP_TABLE emitters, in dependency order (definitions first). This binds
+    # ``%104/%106/%107/%108`` (and their feeders) into ``ctx.value_map``
+    # using the exact arith semantics the walker would apply, so the later
+    # ``_resolve_ptrstate_value`` finds them. RULE #1: we never fabricate an
+    # index -- an operand with no defining op in this module that is also not
+    # already bound is left untouched, so ``_resolve_ptrstate_value`` still
+    # RAISES with the precise op + SSA. Any emitter exception propagates.
+    _materialize_make_tptr_index_operands(op, ctx)
 
     # Walk body region
     regions = _scf_regions(op)
@@ -1085,6 +1288,55 @@ def map_tt_func(op: Any, ctx: _om.WalkerCtx) -> Any:
             tir_mod.EQ(tid_var, tir_mod.const(0, "int32")),
             body_stmt,
             None,
+        )
+    # Occupancy/register-budget hint: emit ``tl.min_blocks_per_sm`` as an
+    # AttrStmt INSIDE the kernel block scope (nested within the threadIdx.x
+    # ``thread_extent`` wrap below) when ``ctx.min_blocks_per_sm`` is set to a
+    # positive value. The CUDA codegen ``LaunchConfigExtractor`` walks the
+    # PrimFunc body and stamps it as the 2nd arg of
+    # ``__launch_bounds__(threads, min_blocks_per_sm)``. Placing it at the
+    # function-body top (e.g. a PrimFunc attr) is stripped by the lowering
+    # pipeline -- it must live in the thread-extent scope like the public
+    # ``T.annotate_min_blocks_per_sm`` API (which emits ``attr(None,
+    # "tl.min_blocks_per_sm", n)`` inside ``with T.Kernel(...)``).
+    #
+    # MEASURED MECHANISM (gb10 sm_121a, cache OFF, prod P1; do NOT claim more
+    # than this): this AttrStmt is NOT a pure no-op annotation. Besides stamping
+    # ``__launch_bounds__``, its presence in the thread-extent scope acts as a
+    # statement boundary that the downstream TIR fusion/fold passes do not cross,
+    # so the lowered kernel keeps the addressing index-compute in EXPLICIT
+    # strength-reduced int32/int64 ``tile_binop`` arrays instead of folding them
+    # into wide live int64 expressions. The result is a STRUCTURALLY DIFFERENT,
+    # more register-friendly kernel: ptxas 128->95 regs (0 spill), SASS 3232->
+    # 3240 insns with a shifted opcode mix (fewer wide IADD.64, more int32 IADD/
+    # IMAD). It is NOT a byte-identical instruction stream -- the earlier
+    # "byte-identical PTX" framing was wrong. What IS measured and load-bearing
+    # for RULE #1: the OUTPUT is bit-exact vs the native mamba_ssm triton
+    # reference across single-tile, all 5 partial-mask shapes, and int64 at
+    # 2.82GB + 4.32GB (MAXDIFF=0.0 every case), and routed ms drops 3.46->3.34
+    # (-3.7%, occupancy step 4->5 CTAs/SM, warps_active 33.0%->40.9%). So the
+    # change is a SAFE bit-exact perf win whose true cause is a fusion-barrier-
+    # driven addressing strength-reduction, not a ptxas-only re-budget.
+    #
+    # Gated on a positive value: 0 (unset) emits nothing, preserving byte-
+    # identical output for every other routed kernel and the dict-shaped unit
+    # tests.
+    min_blocks_per_sm = int(getattr(ctx, "min_blocks_per_sm", 0) or 0)
+    if min_blocks_per_sm > 0:
+        # NOTE: the AttrStmt node must be a NON-NULL, walkable PrimExpr. A
+        # ``None`` node (as the public ``T.annotate_min_blocks_per_sm`` emits via
+        # ``attr(None, ...)``) segfaults the tirx ``IsPureFunction`` purity
+        # visitor in this build (VisitStmt_(AttrStmtNode) -> VisitExpr on a null
+        # node). The CUDA codegen ``LaunchConfigExtractor`` reads ONLY
+        # ``op->value`` for ``tl.min_blocks_per_sm`` (never ``op->node``), so a
+        # placeholder IntImm node carries no semantics and is purely to satisfy
+        # the visitor -- the emitted ``__launch_bounds__`` value comes solely
+        # from the ``op->value`` IntImm below.
+        body_stmt = tir_mod.AttrStmt(
+            tir_mod.const(0, "int32"),
+            "tl.min_blocks_per_sm",
+            tir_mod.const(min_blocks_per_sm, "int32"),
+            body_stmt,
         )
     tid_iter = tir_mod.IterVar(
         (0, tid_extent), tid_var, tir_mod.IterVar.ThreadIndex, "threadIdx.x",
@@ -1596,6 +1848,10 @@ def _emit_region(
     child.transposed_views = dict(ctx.transposed_views)
     child.ptr_states = getattr(ctx, "ptr_states", {})
     child.ssa_users = getattr(ctx, "ssa_users", {})
+    # Propagate the user-op map so in-loop fold gates (e.g. the
+    # register-resident decay-scale expand_dims) can recurse one hop down
+    # the use chain inside the scf.for body, exactly like the prologue.
+    child.ssa_user_ops = getattr(ctx, "ssa_user_ops", {})
     child.arg_buffer_shapes = getattr(ctx, "arg_buffer_shapes", {})
     child.fixed_arg_buffer_keys = getattr(ctx, "fixed_arg_buffer_keys", set())
     child.constant_tile_values = getattr(ctx, "constant_tile_values", {})
@@ -1607,6 +1863,13 @@ def _emit_region(
         child.frag_carry_dot_results = ctx.frag_carry_dot_results
     if getattr(ctx, "frag_c_metal_unfolded", None):
         child.frag_c_metal_unfolded = ctx.frag_c_metal_unfolded
+    # REGCARRYCOLLAPSE: share the unfolded-recurrence maps so the dot (C ->
+    # carry fragment, in-place accumulate) and the following addf (no-op rebind
+    # to the carry) emit the register/fragment-resident carry inside the region.
+    if getattr(ctx, "frag_carry_unfold_dot", None):
+        child.frag_carry_unfold_dot = ctx.frag_carry_unfold_dot
+    if getattr(ctx, "frag_carry_unfold_add", None):
+        child.frag_carry_unfold_add = ctx.frag_carry_unfold_add
     child.requires_single_thread_body = bool(
         getattr(ctx, "requires_single_thread_body", False)
     )
@@ -1636,6 +1899,19 @@ def _emit_region(
     # reorders the load TRAVERSAL order for axes the route VERIFIED contiguous.
     if getattr(ctx, "routed_contiguous_tile_axis", None) is not None:
         child.routed_contiguous_tile_axis = ctx.routed_contiguous_tile_axis
+    # DOUTTRANSPOSE16B: share the physically-transposed producer-tile set so the
+    # consumer reads (lazy dout*exp + register-A fragment fill) inside this
+    # region see the SAME set the load emitter registered and swap their
+    # [m,k]->[k,m] indices. Share the object (not a copy) so a load emitted in a
+    # deeper region surfaces to siblings. RULE #1: pure layout relabel set.
+    if getattr(ctx, "transposed_phys_tiles", None) is not None:
+        child.transposed_phys_tiles = ctx.transposed_phys_tiles
+    else:
+        try:
+            ctx.transposed_phys_tiles = set()
+            child.transposed_phys_tiles = ctx.transposed_phys_tiles
+        except Exception:
+            pass
     # ITERATION 6 (C-tile executed TMA): propagate the per-source innermost
     # ground-truth-contiguity set so the CopyNode emitter inside the scf.for
     # K-loop body grounds the C (%arg1) innermost stride to literal 1 and lowers
@@ -1687,6 +1963,15 @@ def _emit_region(
     if not hasattr(ctx, "mma_c_fragments"):
         ctx.mma_c_fragments = []
     child.mma_c_fragments = ctx.mma_c_fragments
+    # BOUNDSHOIST: share the affine-iota tile-source registry into the child
+    # region. The ``offs`` tiles are materialized in the PARENT (prologue);
+    # the masked-OOB epilogue that consumes them as bounds leaves runs in the
+    # K-loop CHILD. Sharing the same dict reference lets the child epilogue
+    # re-derive the affine ``base + i`` form and partition the OOB zero-fill
+    # into UNGUARDED loops instead of a per-element predicate rebuild.
+    if not hasattr(ctx, "affine_tile_source"):
+        ctx.affine_tile_source = {}
+    child.affine_tile_source = ctx.affine_tile_source
     if not hasattr(ctx, "runtime_args"):
         ctx.runtime_args = []
     child.runtime_args = ctx.runtime_args
@@ -1755,6 +2040,17 @@ def _emit_region(
     ctx._tmp_counter = child._tmp_counter
     if getattr(child, "requires_single_thread_body", False):
         ctx.requires_single_thread_body = True
+    # ASYNCIMPL: the routed global->shared K-loop CopyNode emitter (memory.py)
+    # sets ``routed_explicit_cp_async`` on the WALKING ctx when it stamps an
+    # explicit self-contained cp.async (``is_async_copy``). Inside a region that
+    # ctx is THIS ``child``, which is discarded on return, so the flag would be
+    # lost before ``map_scf_for._maybe_pipeline`` (which runs on the PARENT ctx)
+    # reads it -> the K-loop would be (wrongly) stamped with num_stages and
+    # PipelinePlanning would FATAL on the masked-OOB second writer. Bubble the
+    # flag up so the parent skips the num_stages stamp. RULE #1: the wait lives
+    # in the copy itself; this only prevents a double-managed (crashing) stage.
+    if getattr(child, "routed_explicit_cp_async", False):
+        ctx.routed_explicit_cp_async = True
     # Propagate tile-scoped buffers allocated inside the region back to the
     # parent context. ``_alloc_tile_buffer`` registers each buffer in
     # ``ctx.local_buffers``; when ``ctx`` is the child, those buffers are
@@ -2370,13 +2666,37 @@ def _is_zero_constant_lazy(init_val: Any) -> bool:
 def _dot_accumulator_iter_arg_slots(
     region: Any,
     iter_arg_block_ssas: List[Any],
-) -> Tuple[Dict[int, Tuple[int, int]], List[str]]:
+    dot_eligible: Optional[Callable[[str, str, int, int], bool]] = None,
+) -> Tuple[Dict[int, Tuple[int, int]], List[str], Dict[str, str], Dict[str, str], set]:
     """Return ``{iter_arg_idx: (M, N)}`` for fused-dot accumulator carries.
 
     Triton's folded/canonicalized TTIR fuses ``acc = acc + dot(a, b)`` into a
     single ``tt.dot %a, %b, %acc_blockarg`` whose RESULT is yielded back into
     the SAME iter_arg slot -- the accumulator threads through the K-loop as a
     loop-carried tile. This is the fused-GEMM-accumulate-into-carry form.
+
+    REGCARRYCOLLAPSE also detects the **UNFOLDED** recurrence that Triton's
+    *un-canonicalized* TTIR emits (the §P1 Mamba dstates form)::
+
+        %z   = arith.constant dense<0.0>          # fresh zero dot-C
+        %d   = tt.dot %a, %b, %z                   # dot into fresh zero
+        %acc = arith.addf %acc_blockarg, %d        # SEPARATE add into the carry
+        scf.yield %acc                             # yield the add result
+
+    Mathematically ``acc = acc + dot(a, b)`` -- identical to the folded form,
+    just split across a ``tt.dot`` (whose C is a fresh zero) and a following
+    ``arith.addf`` (carry + dot result). Native carries this recurrence in the
+    MMA fragment / registers (no shared ``carry_tile`` / ``dot_c_logical`` /
+    ``carry_next``). We collapse it to the SAME in-place fragment accumulation
+    as the folded form: the carry is allocated ``local.fragment``, the dot
+    accumulates DIRECTLY into that carry fragment (``clear_accum=False``, C =
+    the carry, not the fresh zero), and the ``arith.addf`` becomes a no-op
+    rebind to the carry (the MMA already added the dot into it). The yielded
+    add-result then IS the carry fragment, so ``_append_loop_carry_copies``
+    short-circuits (no ``carry_next``) and the final store reads the fragment
+    directly. RULE #1: only fires when the structural use-def below proves the
+    exact ``dot(zero)->addf(carry,dot)->yield(addf)`` chain; any deviation
+    keeps the shared-carry path.
 
     On CUDA that carry MUST be a swizzled ``local.fragment`` (the tensor-core
     MMA store layout asserts a fragment C). If it is materialised as a plain
@@ -2401,11 +2721,23 @@ def _dot_accumulator_iter_arg_slots(
     keep the result == the fragment carry (no in-loop fragment->shared
     epilogue), so the accumulation stays in place across iterations.
     """
+    # ``unfold_dot``: {dot_result_ssa -> carry_blockarg_ssa} so ``map_tt_dot``
+    # routes the unfolded dot's C to the carry fragment (accumulate in place).
+    # ``unfold_add``: {addf_result_ssa -> carry_blockarg_ssa} so ``_emit_addf``
+    # rebinds the add result to the carry (the MMA already added the dot).
+    unfold_dot: Dict[str, str] = {}
+    unfold_add: Dict[str, str] = {}
+    # Slots whose carry came from the UNFOLDED recurrence: their result feeds a
+    # masked strided ``tt.store`` (not a CopyNode), so the post-loop epilogue
+    # must stage the fragment through ONE shared logical tile rather than bind
+    # the fragment to a serial store that would impose a flat layout conflicting
+    # with the MMA store layout.
+    unfold_slots: set = set()
     if not iter_arg_block_ssas:
-        return {}, []
+        return {}, [], unfold_dot, unfold_add, unfold_slots
     ops = _region_body_ops(region)
     if not ops:
-        return {}, []
+        return {}, [], unfold_dot, unfold_add, unfold_slots
     # scf.yield operand order maps 1:1 onto iter_arg slots.
     yield_operands: List[Any] = []
     for inner in ops:
@@ -2413,46 +2745,34 @@ def _dot_accumulator_iter_arg_slots(
             yield_operands = list(_om._operands(inner))
             break
     if not yield_operands:
-        return {}, []
+        return {}, [], unfold_dot, unfold_add, unfold_slots
     blk_names = [_ssa_name(b) for b in iter_arg_block_ssas]
     blk_index = {nm: i for i, nm in enumerate(blk_names) if nm}
     slots: Dict[int, Tuple[int, int]] = {}
     dot_result_ssas: List[str] = []
-    _unfolded_frag_results: List[str] = []
-    # Build a lookup of ``arith.addf`` ops keyed by their first operand SSA name
-    # (the in-flight accumulator), to recognise the UNFOLDED accumulate form
-    # below. Triton's *un*canonicalised TTIR emits ``acc = acc + dot(a,b,0)`` as
-    # two ops -- ``%d = tt.dot(a,b, %zeroC)`` then ``%s = arith.addf(%accBlkArg,
-    # %d)`` with ``%s`` yielded back into the accumulator slot. The dot's own C
-    # is a FRESH zero (not the block-arg), so the folded detector above misses
-    # it; this map lets the second pass below stitch dot->addf->yield together.
-    addf_by_lhs: Dict[str, Any] = {}
-    addf_by_rhs: Dict[str, Any] = {}
+    # Index every op's result SSA so the unfolded-form scan can resolve the
+    # producing op of an addf's operands (purely structural use-def).
+    op_by_result: Dict[str, Any] = {}
     for inner in ops:
-        if _wk is None or _wk._op_name(inner) != "arith.addf":
-            continue
-        add_ops = _om._operands(inner)
-        if len(add_ops) < 2:
-            continue
-        lhs, rhs = _ssa_name(add_ops[0]), _ssa_name(add_ops[1])
-        if lhs:
-            addf_by_lhs[lhs] = inner
-        if rhs:
-            addf_by_rhs[rhs] = inner
+        for res in _om._results(inner):
+            rn = _ssa_name(res)
+            if rn:
+                op_by_result[rn] = inner
 
-    def _zero_const_ssa(name: str) -> bool:
-        """True iff ``name`` names an ``arith.constant`` dense-0 tile op."""
-        for cand in ops:
-            if _wk is None or _wk._op_name(cand) != "arith.constant":
-                continue
-            res = _om._results(cand)
-            if not res or _ssa_name(res[0]) != name:
-                continue
-            attrs = _om._attrs(cand)
-            val = attrs.get("value")
-            sval = str(val)
-            return "0.0" in sval or "dense<0" in sval or sval.strip() in ("0", "0.0")
-        return False
+    def _is_zero_dense_const(producer: Any) -> bool:
+        """True iff ``producer`` is an ``arith.constant dense<0.0>`` tile."""
+        if producer is None or _wk is None:
+            return False
+        if _wk._op_name(producer) != "arith.constant":
+            return False
+        try:
+            for v in _om._attrs(producer).values():
+                txt = str(v)
+                if "dense" in txt and ("0.0" in txt or "0.000" in txt):
+                    return True
+            return "0.0" in str(producer) or "dense<0" in str(producer)
+        except Exception:
+            return False
 
     for inner in ops:
         if _wk is None or _wk._op_name(inner) != "tt.dot":
@@ -2465,50 +2785,8 @@ def _dot_accumulator_iter_arg_slots(
             continue
         res_name = _ssa_name(results[0])
         c_name = _ssa_name(dot_operands[2])
-        slot = blk_index.get(c_name)
-        _unfolded = False
-        if slot is not None:
-            # FOLDED form: dot's C IS the carry block-arg and the dot RESULT is
-            # yielded back into the SAME slot (accumulate-in-place).
-            if slot >= len(yield_operands):
-                continue
-            if _ssa_name(yield_operands[slot]) != res_name:
-                continue
-        else:
-            _unfolded = True
-            # UNFOLDED form: dot's C is a fresh zero; its result feeds an
-            # ``arith.addf(carryBlkArg, dotResult)`` whose result is yielded
-            # back into the carry slot. This is the SAME accumulate-into-carry
-            # semantics, just not yet fused by Triton's canonicaliser. We mark
-            # the dot result so ``map_tt_dot`` keeps the dot's C fragment-
-            # resident (off SHARED): the dot computes its 64x64 partial in
-            # ``simdgroup`` registers and the addf reads that fragment, so the
-            # separate ``dot_c_shared`` MxN fp32 threadgroup tile is never
-            # allocated. The carry tile itself stays as-is (its own slot).
-            if not _zero_const_ssa(c_name):
-                continue
-            add_op = addf_by_rhs.get(res_name) or addf_by_lhs.get(res_name)
-            if add_op is None:
-                continue
-            add_ops = _om._operands(add_op)
-            # The OTHER addf operand must be a carry block-arg.
-            other = [_ssa_name(o) for o in add_ops if _ssa_name(o) != res_name]
-            carry_slot = next(
-                (blk_index[n] for n in other if n in blk_index), None
-            )
-            if carry_slot is None:
-                continue
-            add_res = _om._results(add_op)
-            if not add_res:
-                continue
-            add_res_name = _ssa_name(add_res[0])
-            if carry_slot >= len(yield_operands):
-                continue
-            if _ssa_name(yield_operands[carry_slot]) != add_res_name:
-                continue
-            slot = carry_slot
         # Recover the accumulator (M, N) from the dot's A (M x Ka) and
-        # B (Kb x N) operand tile shapes.
+        # B (Kb x N) operand tile shapes (shared by both folded + unfolded).
         try:
             a_shape = [int(s) for s in _om._shape_of(dot_operands[0])]
             b_shape = [int(s) for s in _om._shape_of(dot_operands[1])]
@@ -2516,19 +2794,71 @@ def _dot_accumulator_iter_arg_slots(
             continue
         if len(a_shape) != 2 or len(b_shape) != 2:
             continue
-        slots[slot] = (a_shape[0], b_shape[1])
-        if res_name and not _unfolded:
-            # Only the FOLDED in-place carry result is recorded as an in-place
-            # fused-dot result (``map_tt_dot`` then keeps it == the fragment
-            # carry and SKIPS the fragment->shared epilogue). The UNFOLDED form
-            # has a SEPARATE carry tile and its dot result feeds an ``addf``, so
-            # it must KEEP the layout-aware fragment->shared epilogue (a logical
-            # read of a raw ``simdgroup`` register tile does not compile/is
-            # wrong); ``map_tt_dot`` learns the C scope from ``_unfolded_frag_c``.
-            dot_result_ssas.append(res_name)
-        if res_name and _unfolded:
-            _unfolded_frag_results.append(res_name)
-    return slots, dot_result_ssas, _unfolded_frag_results
+        # Per-dot residency eligibility (target-aware). On CUDA ``dot_eligible``
+        # is None -> every fused-dot carry is fragment-resident (unchanged). On
+        # Metal it screens out simdgroup-INELIGIBLE dots (fp32 inputs, or M/N
+        # not a multiple of 8): those keep the shared carry + SIMT path rather
+        # than being routed to an invalid fp32 simdgroup carry (RULE #1 -- no
+        # silent bf16 downcast, no corrupting flat fragment copy). The dot's
+        # input dtypes + (M, N) are read straight from its A/B operands here.
+        if dot_eligible is not None:
+            a_dt = _om._normalize_mlir_dtype(_om._dtype_of(dot_operands[0]))
+            b_dt = _om._normalize_mlir_dtype(_om._dtype_of(dot_operands[1]))
+            if not dot_eligible(a_dt, b_dt, a_shape[0], b_shape[1]):
+                continue
+
+        # --- FOLDED form: dot C IS the carry block-arg, dot result yielded. ---
+        if c_name in blk_index:
+            slot = blk_index[c_name]
+            if slot >= len(yield_operands):
+                continue
+            if _ssa_name(yield_operands[slot]) != res_name:
+                continue
+            slots[slot] = (a_shape[0], b_shape[1])
+            if res_name:
+                dot_result_ssas.append(res_name)
+            continue
+
+        # --- UNFOLDED form: dot C is a fresh zero; a following
+        #     ``arith.addf %carry_blockarg, %dot_result`` is yielded. ---
+        if not _is_zero_dense_const(op_by_result.get(c_name)):
+            continue
+        # Find the addf that consumes this dot result + a carry block-arg and
+        # is yielded back into that block-arg's slot.
+        for cand in ops:
+            if _wk._op_name(cand) not in ("arith.addf", "tt.fadd"):
+                continue
+            add_ops = _om._operands(cand)
+            if len(add_ops) != 2:
+                continue
+            n0 = _ssa_name(add_ops[0])
+            n1 = _ssa_name(add_ops[1])
+            # one operand is the dot result, the other is a carry block-arg
+            if res_name == n0 and n1 in blk_index:
+                carry_blk = n1
+            elif res_name == n1 and n0 in blk_index:
+                carry_blk = n0
+            else:
+                continue
+            slot = blk_index[carry_blk]
+            add_results = _om._results(cand)
+            if not add_results:
+                continue
+            add_res = _ssa_name(add_results[0])
+            if slot >= len(yield_operands):
+                continue
+            if _ssa_name(yield_operands[slot]) != add_res:
+                continue
+            # PROVEN unfolded accumulate-in-place recurrence on slot ``slot``.
+            slots[slot] = (a_shape[0], b_shape[1])
+            if res_name:
+                dot_result_ssas.append(res_name)
+                unfold_dot[res_name] = carry_blk
+            if add_res:
+                unfold_add[add_res] = carry_blk
+            unfold_slots.add(slot)
+            break
+    return slots, dot_result_ssas, unfold_dot, unfold_add, unfold_slots
 
 
 def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
@@ -2634,46 +2964,78 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
     # on Metal/unspecified targets, where shared-C GEMM is the correct path.
     _frag_carry_slots: Dict[int, Tuple[int, int]] = {}
     try:
-        from .reduction import _is_cuda_target as _frag_is_cuda  # noqa: WPS433
+        from .reduction import (  # noqa: WPS433
+            _is_cuda_target as _frag_is_cuda,
+            _is_metal_target as _frag_is_metal,
+            _wants_fragment_c as _frag_wants_fragment_c,
+        )
     except Exception:  # pragma: no cover - reduction always importable here
         _frag_is_cuda = None
-    try:
-        from .reduction import _is_metal_target as _frag_is_metal  # noqa: WPS433
-    except Exception:  # pragma: no cover - reduction always importable here
         _frag_is_metal = None
-    # DEFECT-C (frontend): the fused-dot MMA-C accumulator carry must leave
-    # SHARED. On CUDA the tensor-core MMA store layout REQUIRES a swizzled
-    # ``local.fragment`` C (above). On Metal the same fragment-resident carry
-    # binds C to a ``simdgroup_*`` register tile (the legacy simdgroup GEMM
-    # path, ``src/backend/metal/op/gemm.cc``: a ``local.fragment``/``metal.
-    # simdgroup`` C selects ``kMetalSIMDGroup`` whose accumulator lives in
-    # ``simdgroup_float8x8`` registers, NOT a ``threadgroup`` tile) -- so the
-    # MxN fp32 C accumulator no longer consumes threadgroup memory. This is the
-    # SAME fragment-resident accumulator a hand-written TileLang Metal kernel
-    # carries via ``T.alloc_fragment`` across a K-loop; the only change is that
-    # the Triton-frontend folded ``acc = acc + dot`` carry now qualifies for it
-    # on Metal too instead of being pinned to ``shared``. Empty only on truly
-    # unspecified targets, where shared-C GEMM remains the correct default.
-    _frag_target_ok = (_frag_is_cuda is not None and _frag_is_cuda(ctx)) or (
-        _frag_is_metal is not None and _frag_is_metal(ctx)
-    )
-    if _frag_target_ok:
-        (
-            _frag_carry_slots,
-            _frag_dot_results,
-            _frag_unfolded_results,
-        ) = _dot_accumulator_iter_arg_slots(region, iter_arg_block_ssas)
-        # UNFOLDED accumulate (``addf(carry, dot(a,b,0))``): the dot's C must be
-        # fragment-resident (off SHARED) but its result is NOT an in-place carry
-        # -- ``map_tt_dot`` keeps the layout-aware fragment->shared epilogue so
-        # the ``addf`` reads correct logical data. Record those results on a
-        # SEPARATE ctx set the C-scope decision consults to force fragment C.
-        if _frag_unfolded_results:
+        _frag_wants_fragment_c = None
+    _frag_unfold_slots: set = set()
+    _frag_unfold_dot: Dict[str, str] = {}
+    _frag_unfold_add: Dict[str, str] = {}
+    # Generic residency gate (mirrors the tt.dot ``_wants_fragment_c`` gate in
+    # reduction.py): a fused-dot loop-carried accumulator becomes a swizzled
+    # ``local.fragment`` carry when the target+dtype wants fragment-C, so
+    # ``map_tt_dot`` accumulates IN PLACE (CUDA tensor-core MMA, or an
+    # Apple-simdgroup-ELIGIBLE fp16/bf16/fp8 dot on Metal). On Metal a per-dot
+    # eligibility filter (``_frag_dot_eligible``) screens out fp32 /
+    # non-8-aligned dots so they keep the shared carry; CUDA passes no filter
+    # (all fused-dot carries stay fragment-resident, exactly as before).
+    _frag_cuda = bool(_frag_is_cuda is not None and _frag_is_cuda(ctx))
+    _frag_metal = bool(_frag_is_metal is not None and _frag_is_metal(ctx))
+    _frag_dot_eligible = None
+    if _frag_metal and _frag_wants_fragment_c is not None:
+        def _frag_dot_eligible(a_dt: str, b_dt: str, m: int, n: int) -> bool:
+            # ctx is Metal here, so ``_wants_fragment_c`` returns True iff the
+            # dot is simdgroup-eligible (fp16/bf16/fp8 inputs, m%8==0, n%8==0).
+            return bool(_frag_wants_fragment_c(ctx, a_dt, b_dt, m, n))
+    if _frag_cuda or _frag_metal:
+        (_frag_carry_slots, _frag_dot_results,
+         _frag_unfold_dot, _frag_unfold_add,
+         _frag_unfold_slots) = _dot_accumulator_iter_arg_slots(
+            region, iter_arg_block_ssas, dot_eligible=_frag_dot_eligible
+        )
+        # REGCARRYCOLLAPSE A/B gate: when forced OFF, drop the UNFOLDED-form maps
+        # so the recurrence keeps the legacy shared carry_tile/dot_c_logical/
+        # carry_next path (the FOLDED-form detection above is unaffected -- it
+        # remains a real fragment carry). This isolates the lever for same-session
+        # measurement; both paths are bit-correct (RULE #1).
+        if _os.environ.get("TL_REGCARRY_COLLAPSE", "1") == "0":
+            # Remove ONLY the unfolded slots from the fragment-carry set + clear
+            # the unfold maps, so map_tt_dot / _emit_addf take the shared path.
+            for _s in _frag_unfold_slots:
+                _frag_carry_slots.pop(_s, None)
+            _frag_dot_results = [
+                r for r in _frag_dot_results if r not in _frag_unfold_dot
+            ]
+            _frag_unfold_dot = {}
+            _frag_unfold_add = {}
+            _frag_unfold_slots = set()
+        # METAL UNFOLDED form: on Metal the unfolded ``addf(carry, dot(a,b,0))``
+        # recurrence does NOT collapse to an in-place fragment carry (the legacy
+        # simdgroup GEMM C is read back through a layout-aware fragment->shared
+        # epilogue so the separate ``addf`` sees correct logical data). Instead
+        # the dot's C is merely forced fragment-resident (off SHARED): record the
+        # unfolded dot result SSAs in ``ctx.frag_c_metal_unfolded`` (the C-scope
+        # decision consults it to pick ``local.fragment``) and DROP the CUDA
+        # in-place collapse maps so ``map_tt_dot`` keeps the fragment->shared
+        # epilogue and ``_emit_addf`` stays a real add. CUDA keeps the collapse.
+        if _frag_metal and not _frag_cuda and _frag_unfold_dot:
             existing_u = set(
                 getattr(ctx, "frag_c_metal_unfolded", set()) or set()
             )
-            existing_u.update(_frag_unfolded_results)
+            existing_u.update(_frag_unfold_dot.keys())
             ctx.frag_c_metal_unfolded = existing_u
+            # Metal keeps the epilogue: do not let the CUDA in-place collapse
+            # rebind the dot result / addf to the carry fragment.
+            _frag_dot_results = [
+                r for r in _frag_dot_results if r not in _frag_unfold_dot
+            ]
+            _frag_unfold_dot = {}
+            _frag_unfold_add = {}
         # Record the in-place fused-dot result SSAs so ``map_tt_dot`` keeps the
         # result == the fragment carry (skips its fragment->shared epilogue),
         # leaving the accumulation in place across the K-loop. The set is shared
@@ -2683,6 +3045,21 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
             existing = set(getattr(ctx, "frag_carry_dot_results", set()) or set())
             existing.update(_frag_dot_results)
             ctx.frag_carry_dot_results = existing
+        # REGCARRYCOLLAPSE (CUDA): record the UNFOLDED-recurrence maps so
+        # ``map_tt_dot`` routes the dot's C to the carry fragment (in-place
+        # accumulate) and ``_emit_addf`` rebinds the separate add to the carry
+        # (the MMA already added the dot). These collapse carry_tile /
+        # dot_c_logical / carry_next to a single register/fragment-resident carry
+        # (native's recurrence). On Metal these maps were cleared above (Metal
+        # keeps the fragment->shared epilogue), so this is a CUDA-only collapse.
+        if _frag_unfold_dot:
+            ed = dict(getattr(ctx, "frag_carry_unfold_dot", {}) or {})
+            ed.update(_frag_unfold_dot)
+            ctx.frag_carry_unfold_dot = ed
+        if _frag_unfold_add:
+            ea = dict(getattr(ctx, "frag_carry_unfold_add", {}) or {})
+            ea.update(_frag_unfold_add)
+            ctx.frag_carry_unfold_add = ea
 
     # Materialise iter_args. Scalar carries get a fresh tir.Var bound via
     # ``tir.LetStmt(var, init, body)``; buffer / tuple carries (e.g. a
@@ -2840,18 +3217,33 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
         if not _async_enabled:
             return for_node
         import os as _os_pipe
-        if (_os_pipe.environ.get("TL_NO_NUM_STAGES") == "1"
-                or _os_pipe.environ.get("TL_FORCE_CP_ASYNC") == "1"):
-            # ASYNCIMPL: when the routed copy is emitted as an explicit cp.async
-            # producer (``TL_FORCE_CP_ASYNC=1`` sets is_async_copy in memory.py),
-            # Copy::LowerCPAsync emits genuine cp.async/LDGSTS at LowerTileOp time,
-            # INDEPENDENT of the software pipeline. We DROP the num_stages pipeline
-            # annotation so PipelinePlanning skips this loop entirely and its
-            # overlapping-write check (producer copy + masked OOB-zero epilogue both
-            # write the shared tile) is never triggered. NOTE: without the pipeline
-            # there is no auto-inserted cp.async.wait before the GEMM consumer, so
-            # this path is FAST-but-RACY -- it exists for MEASURED SASS/codegen
-            # verification of LDGSTS, not as a correct default (see memory.py).
+        # PIPELINENS4: when TRUE multi-stage software pipelining is requested,
+        # the routed copy was emitted PLAIN (no is_async_copy, so
+        # routed_explicit_cp_async is NOT set) and InjectSoftwarePipeline manages
+        # the cp.async commit/wait across stages. We MUST keep the num_stages
+        # stamp (do NOT drop it) so the pipeline actually overlaps stage k+1 loads
+        # with stage k MMA. TL_NO_NUM_STAGES still forces a serial loop for A/B.
+        _pipeline_cp_async = (_os_pipe.environ.get("TL_PIPELINE_CP_ASYNC") == "1")
+        if _pipeline_cp_async:
+            pass  # fall through to the num_stages stamp below
+        elif (_os_pipe.environ.get("TL_NO_NUM_STAGES") == "1"
+                or _os_pipe.environ.get("TL_FORCE_CP_ASYNC") == "1"
+                or getattr(ctx, "routed_explicit_cp_async", False)):
+            # ASYNCIMPL (COMMITTED DEFAULT): the routed global->shared K-loop copy
+            # is emitted as an EXPLICIT, SELF-CONTAINED cp.async producer
+            # (``is_async_copy`` in memory.py -> Copy::LowerCPAsync at copy.cc:527
+            # appends cp.async.commit_group + cp.async.wait_group<0> + a CTA
+            # __syncthreads). The cp.async/LDGSTS is emitted at LowerTileOp time,
+            # INDEPENDENT of the software pipeline, AND the out-of-line wait makes
+            # it race-free (MEASURED §P1 MAXDIFF 4.882812e-04 = 2^-11, bit-correct).
+            # We therefore DROP the num_stages pipeline annotation so
+            # PipelinePlanning skips this loop entirely and its overlapping-write
+            # check (producer copy + masked OOB-zero epilogue both write the SAME
+            # shared tile -- a legitimate sequenced pair, not a pipeline hazard) is
+            # never triggered. ``ctx.routed_explicit_cp_async`` is set by the
+            # CopyNode emitter whenever it stamps ``is_async_copy``; the env flags
+            # remain as explicit overrides. RULE #1: the wait is ALWAYS present (in
+            # the copy itself), never a silent racy half-state.
             return for_node
         if len(ctx._gmem_shared_copies) <= _gmem_copies_before:
             return for_node
@@ -2972,22 +3364,42 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
                     # data. Only the genuine fragment carry takes this path.
                     carry_scope = _frag_scope_of(carry)
                     if idx in _frag_carry_slots and carry_scope == "local.fragment":
+                        # REGCARRYCOLLAPSE: an UNFOLDED-recurrence carry feeds a
+                        # MASKED strided ``tt.store``. The post-loop store emitter
+                        # (``_emit_ptrstate_fragment_store_copynode``) now lowers a
+                        # ``local.fragment`` value to a single MASK-CLAMPED
+                        # ``T.copy(fragment -> global_2d_view)`` -- a layout-aware
+                        # fragment->global store (the CopyNode propagates the MMA
+                        # store layout, no flat-[i,j] conflict) whose copy region
+                        # is clamped per-axis to the in-bounds extent carried by
+                        # the ``tts.store`` dynamic_mask_dims (== the native
+                        # ``(offs_m<hdim)&(offs_n<dstate)`` mask). So we can bind
+                        # the UNFOLDED-recurrence carry DIRECTLY to the store too,
+                        # dropping the post-loop ``carry_logical`` shared stage
+                        # (16 KB) and its store re-traffic -- not just the
+                        # per-iteration round-trips. RULE #1: the store helper
+                        # RAISES if the mask extent cannot be recovered (never a
+                        # maskless full-tile store wrong for non-mult-of-block
+                        # shapes); the parity gate proves bit-correctness. Set
+                        # TL_FRAG_GLOBAL_EPILOGUE=0 to force the legacy shared
+                        # stage for same-session A/B measurement.
                         if _DIRECT_FRAG_GLOBAL_EPILOGUE_ENABLED:
                             # DIRECT FRAGMENT->GLOBAL EPILOGUE (named capability,
                             # see module docstring). Bind the loop result to the
                             # MMA-C fragment ITSELF -- no shared ``carry_logical``
                             # staging tile. The downstream ``tt.store`` lowers to
-                            # ``T.copy(fragment, global)``: the CopyNode iterates
-                            # over the fragment (highest scope-level) and
-                            # ``InferLayout`` propagates the fragment's registered
-                            # ``make_mma_store_layout`` to the store loop, so the
-                            # per-warp register tile is written DIRECTLY to global
-                            # at the correct [i,j] positions -- the same
-                            # layout-aware fragment->global store native Triton
-                            # emits, with the MxN fp32 shared buffer eliminated.
-                            # RULE #1: this is the correctness path; the parity
-                            # gate proves it bit-correct. A wrong result must RAISE
-                            # (parity harness FAIL), never silently re-stage.
+                            # the mask-clamped ``T.copy(fragment, global_2d_view)``
+                            # (memory.py ``_emit_ptrstate_fragment_store_copynode``):
+                            # the CopyNode iterates over the fragment (highest
+                            # scope-level) and ``InferLayout`` propagates the
+                            # fragment's registered ``make_mma_store_layout`` to the
+                            # store loop, so the per-warp register tile is written
+                            # DIRECTLY to global at the correct [i,j] positions --
+                            # the same layout-aware masked fragment->global store
+                            # native Triton emits, with the MxN fp32 shared buffer
+                            # eliminated. RULE #1: this is the correctness path; the
+                            # parity gate proves it bit-correct. A wrong result must
+                            # RAISE (parity harness FAIL), never silently re-stage.
                             ctx.bind(result_ssa, carry)
                         else:
                             # Legacy shared-staging epilogue, kept ONLY for

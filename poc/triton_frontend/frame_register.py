@@ -43,8 +43,55 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 
+def _square_warp_partition(M: int, N: int, num_warps: int,
+                           k_n_per_warp: int = 8) -> tuple:
+    """Reproduce ``ComputeDefaultWarpPartition`` (Square policy) from
+    ``src/backend/cuda/op/gemm.cc``.
+
+    The gemm op's default ``GemmWarpPolicy.Square`` selects ``(m_warp,
+    n_warp)`` with ``m_warp*n_warp == num_warps`` whose per-warp tile aspect
+    ratio best matches ``M/N``. The C-fragment ``make_mma_store_layout``
+    depends on this partition; the FRAMEFIX re-registration MUST use the
+    identical partition or the pinned layout conflicts with the gemm's own.
+
+    ``k_n_per_warp`` is the N granularity per warp (the mma n-tile, 8 for the
+    standard m16n8k* tensor-core path). RULE #1: RAISE on an impossible
+    partition rather than silently returning a skewed one.
+    """
+    k_m_per_warp = 16  # kMPerWarp in gemm.cc
+    if M % k_m_per_warp != 0:
+        raise RuntimeError(
+            "frame_register._square_warp_partition: M=%d not divisible by %d"
+            % (M, k_m_per_warp)
+        )
+    max_m_warps = M // k_m_per_warp
+    ideal_ratio = (float(M) / float(N)) if N > 0 else 1.0
+    best_m, best_n = 1, 1
+    best_balance = None
+    for m in range(1, min(max_m_warps, num_warps) + 1):
+        if num_warps % m:
+            continue
+        n = num_warps // m
+        m_per_warp = float(M) / (m * k_m_per_warp)
+        n_per_warp = float(N) / (n * k_n_per_warp)
+        if m_per_warp < 1 or n_per_warp < 1:
+            continue
+        balance = abs(m_per_warp / n_per_warp - ideal_ratio)
+        if best_balance is None or balance < best_balance:
+            best_balance = balance
+            best_m, best_n = m, n
+    if best_m * best_n != num_warps:
+        raise RuntimeError(
+            "frame_register._square_warp_partition: no valid (m_warp,n_warp) "
+            "for M=%d N=%d num_warps=%d (best=%d*%d)"
+            % (M, N, num_warps, best_m, best_n)
+        )
+    return best_m, best_n
+
+
 def _build_c_fragment_layout(tir_buffer: Any, M: int, N: int, K: int,
-                             trans_A: bool, trans_B: bool) -> Any:
+                             trans_A: bool, trans_B: bool,
+                             num_warps: int = 4) -> Any:
     """Return the ``make_mma_store_layout`` Fragment for a C accumulator.
 
     Mirrors ``tilelang.cuda.op.gemm.gemm_mma.GemmMMA._make_mma_emitter``: the
@@ -57,32 +104,14 @@ def _build_c_fragment_layout(tir_buffer: Any, M: int, N: int, K: int,
         TensorCoreIntrinEmitter,
     )
 
-    # 128-thread block (num_warps*32 = 4*32). The warp partition that
-    # GemmWarpPolicy.compute_warp_partition selects for a square M==N tile is
-    # the balanced 2x2 (4 warps); derive it from M/N so non-square tiles get a
-    # row/col-major partition consistent with the gemm op.
-    num_warps = 4  # ctx.num_warps default; threads_per_block = 128
-    # Balanced partition: prefer square, fall back to full-row/full-col.
-    import math
-
-    def _partition(m: int, n: int, warps: int):
-        best = (1, warps)
-        best_score = None
-        for mw in range(1, warps + 1):
-            if warps % mw:
-                continue
-            nw = warps // mw
-            if m % mw or n % nw:
-                continue
-            # Prefer the partition whose per-warp tile is closest to square.
-            wr, wc = m // mw, n // nw
-            score = abs(wr - wc)
-            if best_score is None or score < best_score:
-                best_score = score
-                best = (mw, nw)
-        return best
-
-    m_warp, n_warp = _partition(M, N, num_warps)
+    # Reproduce the gemm op's EXACT warp partition so the re-derived C-store
+    # layout equals the one ``T.gemm``'s InferLayout produces (otherwise the
+    # pinned layout skews and conflicts -- the bug the prior hardcoded
+    # ``num_warps=4`` / nearest-square heuristic caused). This mirrors
+    # ``ComputeDefaultWarpPartition`` (isSquare branch) in
+    # ``src/backend/cuda/op/gemm.cc``: for the default Square policy it picks
+    # the (m_warp, n_warp) whose per-warp aspect ratio best matches M/N.
+    m_warp, n_warp = _square_warp_partition(int(M), int(N), int(num_warps))
     warp_row_tiles = M // m_warp
     warp_col_tiles = N // n_warp
 
@@ -171,6 +200,17 @@ def register_mma_fragment_layouts(prim_func: Any, fragments: List[Dict[str, Any]
             # VALIDATE every recorded fragment is live (the RAISE above), so a
             # missing fragment is never silently skipped.
             continue
+        # DIRECT-STORE PIN GATE: only the full-block (>=8 warp / 256-thread)
+        # MMA-C accumulator needs the strict layout pin. Its direct
+        # fragment->global store otherwise free-infers a flat replicated layout
+        # that collides with the gemm MMA layout. Sub-block tiles (gemm clamps
+        # the warp count, e.g. 64x64 -> 128 threads) adopt the gemm C layout
+        # naturally via the direct-store copy and are PROVEN bit-correct
+        # unpinned; pinning them with a full-block layout would conflict on
+        # thread_range. RULE #1: this gate selects the correct path per tile, it
+        # is NOT a degraded fallback (both paths produce bit-correct stores).
+        if int(entry.get("num_warps", 4)) < 8:
+            continue
         lay = _build_c_fragment_layout(
             live,
             int(entry["M"]),
@@ -178,6 +218,7 @@ def register_mma_fragment_layouts(prim_func: Any, fragments: List[Dict[str, Any]
             int(entry["K"]),
             bool(entry.get("trans_A", False)),
             bool(entry.get("trans_B", False)),
+            int(entry.get("num_warps", 4)),
         )
         layout_map[live.data] = lay
 

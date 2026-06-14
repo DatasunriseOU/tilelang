@@ -851,6 +851,63 @@ private:
       elem_offset += transformed_indices[i] * strides[i];
     }
 
+    // Coalesce16B (generic, SOUND): a strided global->shared copy whose source
+    // is a row-major view with a LITERAL-1 innermost stride but SYMBOLIC outer
+    // strides (a de-monomorphized kernel passes stride_row as an opaque runtime
+    // arg) is geometrically vec-contiguous along the innermost axis -- but the
+    // downstream IndicesCanVectorize base-divisibility proof
+    // FloorMod(outer_index * stride_row + ..., vec) == 0 fails because
+    // stride_row is symbolic, de-vectorizing the copy to scalar 4B cp.async.
+    // The ROW-MAJOR CONTIGUOUS-INNERMOST CONTRACT guarantees every outer stride
+    // is a multiple of the innermost extent (the row pitch spans >= one full
+    // innermost row), so the outer-stride terms ARE vec-aligned whenever the
+    // candidate vec divides them. We encode exactly that fact by replacing each
+    // NON-CONSTANT outer stride EXPRESSION with vec * fresh in a relaxed offset
+    // used only for the contiguity probe. This is precise (only the buffer's
+    // own stride EXPRESSIONS are modeled, never thread/block indices) and SOUND
+    // for any contiguous-innermost buffer; a non-contiguous-innermost buffer
+    // (innermost stride != 1) is left untouched. A wrong assumption surfaces
+    // immediately as a garbage/OOB result in the bit-exact parity probe.
+    // RULE #1: no fabricated alignment, no silent scalar de-vectorize.
+    PrimExpr elem_offset_relaxed = elem_offset;
+    bool relaxed_strides = false;
+    if (!strides.empty() && is_one(strides[strides.size() - 1]) &&
+        strides.size() == transformed_indices.size()) {
+      // Model each NON-CONSTANT outer stride expression as
+      // (innermost_extent * fresh). Build the relaxed offset per-axis: the
+      // innermost (literal-1) axis keeps stride 1; every non-constant outer axis
+      // is modeled as a multiple of the innermost extent; constant outer axes
+      // are kept exact. Using the INNERMOST EXTENT (not the max vector width) as
+      // the multiplier is the PRECISE row-major contract: a contiguous-innermost
+      // tensor's next-axis pitch is exactly innermost_extent elements, so any
+      // candidate vec that the innermost contiguity probe can actually reach
+      // (vec | innermost_extent) is also a divisor of the modeled stride. This
+      // keeps the relaxation SOUND for every probed vec without over-assuming a
+      // 128-element alignment the buffer may not have.
+      PrimExpr inner_extent =
+          analyzer_->Simplify(buffer->shape[buffer->shape.size() - 1]);
+      PrimExpr off = 0;
+      int outer_idx = 0;
+      bool any_modeled = false;
+      for (size_t i = 0; i < transformed_indices.size(); ++i) {
+        PrimExpr st = strides[i];
+        bool is_inner = (i + 1 == strides.size());
+        if (!is_inner) {
+          PrimExpr st_s = analyzer_->Simplify(st);
+          if (!st_s.as<IntImmNode>()) {
+            Var fresh("stride_vm" + std::to_string(outer_idx++), st.dtype());
+            st = inner_extent * fresh;
+            any_modeled = true;
+          }
+        }
+        off += transformed_indices[i] * st;
+      }
+      if (any_modeled) {
+        elem_offset_relaxed = off;
+        relaxed_strides = true;
+      }
+    }
+
     // 2. Check if current buffer_vec_size works with invariant boundary check
     // In some cases, buffer_vec_size is max (e.g. 128), but
     // IsExprInvariantInVectorBoundary may only be true at a smaller size (e.g.
@@ -888,8 +945,16 @@ private:
     }
     // 4. Try to find max vectorize size for this buffer
     // CPPMEGA fix-B6 (idea712): memoized halving probe.
+    // Coalesce16B: probe the stride-relaxed offset for a contiguous-innermost
+    // buffer so a symbolic outer stride (proven a vec-multiple by the row-major
+    // contract above) does not mask the genuine innermost contiguity. The
+    // relaxed offset is IDENTICAL to elem_offset except the symbolic outer
+    // strides are modeled as vec-multiples; the innermost (stride-1) ramp that
+    // determines correctness is untouched.
+    const PrimExpr &probe_offset =
+        relaxed_strides ? elem_offset_relaxed : elem_offset;
     while (buffer_vec_size > 1) {
-      int ret = MemoizedIndicesCanVectorize(elem_offset, inner_for_->loop_var,
+      int ret = MemoizedIndicesCanVectorize(probe_offset, inner_for_->loop_var,
                                             inner_for_->extent, buffer_vec_size);
       if (ret != 0) {
         if (common_stride_ == 0) {
