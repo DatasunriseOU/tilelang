@@ -104,6 +104,30 @@ def _is_cuda_target(ctx: Any = None) -> bool:
     return "cuda" in kind or "nvidia" in tstr or "cuda" in tstr
 
 
+def _is_metal_target(ctx: Any = None) -> bool:
+    """Return True iff the codegen target is explicitly Apple Metal.
+
+    Mirrors :func:`_is_cuda_target` (``ctx.target`` first, then the ambient
+    ``tvm.target.Target.current``). Used to let the fused-dot MMA-C accumulator
+    carry leave SHARED on Metal: a ``local.fragment`` C selects the legacy
+    simdgroup GEMM path (``src/backend/metal/op/gemm.cc``) whose accumulator
+    lives in ``simdgroup_*`` registers, freeing the MxN fp32 threadgroup tile.
+    """
+    ctx_target = getattr(ctx, "target", None) if ctx is not None else None
+    if ctx_target:
+        return "metal" in str(ctx_target).lower()
+    try:
+        import tvm  # noqa: WPS433
+
+        target = tvm.target.Target.current(allow_none=True)
+    except Exception:
+        return False
+    if target is None:
+        return False
+    kind = str(getattr(getattr(target, "kind", None), "name", "") or "").lower()
+    return "metal" in kind or "metal" in str(target).lower()
+
+
 __all__ = [
     "REDUCTION_EMITTERS",
     "EmitError",
@@ -1458,6 +1482,42 @@ def map_tt_dot(
         # downgrade -- a shared-C MMA simply does not codegen on CUDA.)
         if prefer_shared_c and _is_cuda_target(ctx):
             prefer_shared_c = False
+        # DEFECT-C (Metal): a fused-dot accumulator whose RESULT is recorded by
+        # ``map_scf_for`` as an accumulate-into-carry dot -- either the FOLDED
+        # ``acc + dot`` (``ctx.frag_carry_dot_results``) or the UNFOLDED
+        # ``addf(carry, dot(a,b,0))`` (``ctx.frag_c_metal_unfolded``) -- must
+        # compute its MxN partial in ``simdgroup_*`` REGISTERS, not a ``shared``
+        # tile. A ``local.fragment`` C selects the register-resident
+        # ``kMetalSIMDGroup`` GEMM path (``src/backend/metal/op/gemm.cc``),
+        # eliminating the ``dot_c_shared`` MxN fp32 threadgroup tile that the
+        # cooperative-tensor path would store into via ``__pct_cN.store``.
+        # Without this override ``prefer_shared_c`` (True on Metal whenever the
+        # dot result feeds a non-gemm consumer -- the ``arith.addf`` into the
+        # loop carry, then the post-loop ``tt.store``) pins C to ``shared``.
+        #
+        # For the UNFOLDED form the dot result is NOT an in-place carry (it feeds
+        # a separate ``addf``), so it is NOT in ``frag_carry_dot_results`` and the
+        # ``_is_inplace_frag_carry`` gate below stays False -- the LAYOUT-AWARE
+        # fragment->shared epilogue (``simdgroup_store`` of each 8x8 register tile
+        # to its correct [i,j] in a fresh shared ``dot_c_logical``) FIRES, so the
+        # ``addf`` reads correct logical ``float`` data (a raw flat index of a
+        # ``simdgroup_float8x8`` register tile does NOT compile -- verified). The
+        # MxN C is register-resident only during the GEMM; one shared tile is
+        # restored at the epilogue, which the merge/aliasing pass then packs.
+        # RULE #1: real scope-correctness, not a silent downgrade -- a wrong
+        # result must surface in the parity gate, never be papered over.
+        _metal_frag_c = (
+            prefer_shared_c
+            and _is_metal_target(ctx)
+            and result_value is not None
+            and _ssa_name(result_value)
+            in (
+                (getattr(ctx, "frag_carry_dot_results", set()) or set())
+                | (getattr(ctx, "frag_c_metal_unfolded", set()) or set())
+            )
+        )
+        if _metal_frag_c:
+            prefer_shared_c = False
         c_scope = "shared" if prefer_shared_c else "local.fragment"
         c_prefix = "dot_c_shared" if prefer_shared_c else "dot_c_frag"
         if c is None:
@@ -1648,7 +1708,7 @@ def map_tt_dot(
         if (
             result_value is not None
             and not _is_inplace_frag_carry
-            and _is_cuda_target(ctx)
+            and (_is_cuda_target(ctx) or _is_metal_target(ctx))
             and _scope_of(c) == "local.fragment"
             and _result_needs_shared_c()
         ):

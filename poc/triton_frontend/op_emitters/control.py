@@ -65,6 +65,42 @@ try:  # pragma: no cover - import wiring
 except Exception:  # pragma: no cover
     _wk = None  # type: ignore
 
+import os as _os  # noqa: WPS433
+
+
+# DIRECT-FRAGMENT->GLOBAL EPILOGUE (named generic capability).
+# ----------------------------------------------------------------------------
+# A loop-carried MMA-C accumulator lives in a swizzled ``local.fragment`` (the
+# tensor-core store layout). The post-loop ``tt.store`` of that accumulator must
+# reach global memory. The PRIOR epilogue staged the whole MxN fp32 accumulator
+# through a freshly-allocated ``shared`` tile (``carry_logical``) and then did a
+# second shared->global store -- 128KB of shared for a 128x256 fp32 tile, which
+# pushed the autotune-winning tile over the GB10 opt-in shared cap (101376 B).
+#
+# Native Triton stores the MMA-C fragment DIRECTLY to global, per-warp-tile,
+# layout-aware -- it never materialises the accumulator in shared at the
+# epilogue. TileLang's ``T.copy(fragment, global)`` lowers to exactly that: the
+# CopyNode picks the fragment (highest scope-level) as the iteration base and
+# ``InferLayout`` propagates the fragment's registered ``make_mma_store_layout``
+# to the parallel store loop, emitting a direct layout-aware fragment->global
+# store with no shared staging.
+#
+# This is a GENERIC, BACKEND-AGNOSTIC frontend capability: it binds the loop
+# result to the fragment itself so EVERY fragment-carry epilogue (all tiles, any
+# backend whose copy lowering supports fragment->global -- CUDA tensor-core and
+# Metal simdgroup alike) skips the shared staging buffer. RULE #1: it is a
+# correctness route, NOT a degraded fallback -- the parity gate below proves the
+# direct store is bit-correct; if it ever regressed it must RAISE, never
+# silently revert to staging.
+#
+# The env override exists ONLY for same-session A/B measurement of the shared
+# budget and parity; it defaults to the direct store. Set
+# ``TL_FRAG_GLOBAL_EPILOGUE=0`` to force the legacy shared-staging path for a
+# controlled comparison.
+_DIRECT_FRAG_GLOBAL_EPILOGUE_ENABLED = (
+    _os.environ.get("TL_FRAG_GLOBAL_EPILOGUE", "1") != "0"
+)
+
 __all__ = [
     "CONTROL_EMITTERS",
     "EmitError",
@@ -1569,6 +1605,8 @@ def _emit_region(
     # fragment->shared epilogue), accumulating in place across the K-loop.
     if getattr(ctx, "frag_carry_dot_results", None):
         child.frag_carry_dot_results = ctx.frag_carry_dot_results
+    if getattr(ctx, "frag_c_metal_unfolded", None):
+        child.frag_c_metal_unfolded = ctx.frag_c_metal_unfolded
     child.requires_single_thread_body = bool(
         getattr(ctx, "requires_single_thread_body", False)
     )
@@ -1816,8 +1854,11 @@ def _append_loop_carry_copies(
         return body
     tvm_mod = ctx.tvm()
     Buffer = tvm_mod.tir.Buffer
-    snapshot_copies: List[Any] = []
-    commit_copies: List[Any] = []
+
+    # Collect the (carry, yielded_value) pairs that actually require a commit
+    # copy (carry is a real Buffer, yielded is a Buffer/LazyTileExpr, and the
+    # two are not already the same buffer).
+    committable: List[Tuple[Any, Any]] = []
     for (_blk_ssa, carry), yielded_value in zip(iter_arg_pairs, yielded):
         if not isinstance(carry, Buffer):
             continue
@@ -1825,6 +1866,29 @@ def _append_loop_carry_copies(
             continue
         if isinstance(yielded_value, Buffer) and _same_tir_buffer(carry, yielded_value):
             continue
+        committable.append((carry, yielded_value))
+
+    if not committable:
+        return body
+
+    # SINGLE-CARRY FAST PATH (generic SMEM-footprint fix): the snapshot
+    # temporary only exists to break a cross-carry read-before-write hazard —
+    # i.e. when one carry's yielded expression must observe the *previous*
+    # iteration value of *another* carry that is also being committed (online
+    # softmax: ``acc`` reads old ``m_i``). With exactly one committed carry,
+    # the yielded value is fully computed into its own buffer before any
+    # commit, so there is no such hazard and the intermediate ``carry_next``
+    # buffer is dead weight. For a shared-resident carry that temporary is a
+    # full tile in threadgroup memory (e.g. 64x64 fp32 = 16 KiB), which on
+    # Metal alone can blow past the 32 KiB threadgroup cap. Commit the yielded
+    # value straight into the carry buffer instead.
+    if len(committable) == 1:
+        carry, yielded_value = committable[0]
+        return ctx.tir().SeqStmt([body, _copy_buffer_stmt(ctx, yielded_value, carry)])
+
+    snapshot_copies: List[Any] = []
+    commit_copies: List[Any] = []
+    for carry, yielded_value in committable:
         scope_fn = getattr(carry, "scope", None)
         try:
             scope = str(scope_fn() if callable(scope_fn) else scope_fn)
@@ -1843,8 +1907,6 @@ def _append_loop_carry_copies(
         )
         snapshot_copies.append(_copy_buffer_stmt(ctx, yielded_value, tmp))
         commit_copies.append(_copy_buffer_stmt(ctx, tmp, carry))
-    if not snapshot_copies:
-        return body
     return ctx.tir().SeqStmt([body] + snapshot_copies + commit_copies)
 
 
@@ -2356,27 +2418,95 @@ def _dot_accumulator_iter_arg_slots(
     blk_index = {nm: i for i, nm in enumerate(blk_names) if nm}
     slots: Dict[int, Tuple[int, int]] = {}
     dot_result_ssas: List[str] = []
+    _unfolded_frag_results: List[str] = []
+    # Build a lookup of ``arith.addf`` ops keyed by their first operand SSA name
+    # (the in-flight accumulator), to recognise the UNFOLDED accumulate form
+    # below. Triton's *un*canonicalised TTIR emits ``acc = acc + dot(a,b,0)`` as
+    # two ops -- ``%d = tt.dot(a,b, %zeroC)`` then ``%s = arith.addf(%accBlkArg,
+    # %d)`` with ``%s`` yielded back into the accumulator slot. The dot's own C
+    # is a FRESH zero (not the block-arg), so the folded detector above misses
+    # it; this map lets the second pass below stitch dot->addf->yield together.
+    addf_by_lhs: Dict[str, Any] = {}
+    addf_by_rhs: Dict[str, Any] = {}
+    for inner in ops:
+        if _wk is None or _wk._op_name(inner) != "arith.addf":
+            continue
+        add_ops = _om._operands(inner)
+        if len(add_ops) < 2:
+            continue
+        lhs, rhs = _ssa_name(add_ops[0]), _ssa_name(add_ops[1])
+        if lhs:
+            addf_by_lhs[lhs] = inner
+        if rhs:
+            addf_by_rhs[rhs] = inner
+
+    def _zero_const_ssa(name: str) -> bool:
+        """True iff ``name`` names an ``arith.constant`` dense-0 tile op."""
+        for cand in ops:
+            if _wk is None or _wk._op_name(cand) != "arith.constant":
+                continue
+            res = _om._results(cand)
+            if not res or _ssa_name(res[0]) != name:
+                continue
+            attrs = _om._attrs(cand)
+            val = attrs.get("value")
+            sval = str(val)
+            return "0.0" in sval or "dense<0" in sval or sval.strip() in ("0", "0.0")
+        return False
+
     for inner in ops:
         if _wk is None or _wk._op_name(inner) != "tt.dot":
             continue
         dot_operands = _om._operands(inner)
         if len(dot_operands) < 3:
             continue
-        c_name = _ssa_name(dot_operands[2])
-        if c_name not in blk_index:
-            continue
-        slot = blk_index[c_name]
-        # The dot's result must be yielded back into the SAME slot -- this is
-        # the accumulate-in-place carry. A dot whose C is a block-arg but whose
-        # result flows elsewhere is NOT a fused carry and keeps its own path.
         results = _om._results(inner)
         if not results:
             continue
         res_name = _ssa_name(results[0])
-        if slot >= len(yield_operands):
-            continue
-        if _ssa_name(yield_operands[slot]) != res_name:
-            continue
+        c_name = _ssa_name(dot_operands[2])
+        slot = blk_index.get(c_name)
+        _unfolded = False
+        if slot is not None:
+            # FOLDED form: dot's C IS the carry block-arg and the dot RESULT is
+            # yielded back into the SAME slot (accumulate-in-place).
+            if slot >= len(yield_operands):
+                continue
+            if _ssa_name(yield_operands[slot]) != res_name:
+                continue
+        else:
+            _unfolded = True
+            # UNFOLDED form: dot's C is a fresh zero; its result feeds an
+            # ``arith.addf(carryBlkArg, dotResult)`` whose result is yielded
+            # back into the carry slot. This is the SAME accumulate-into-carry
+            # semantics, just not yet fused by Triton's canonicaliser. We mark
+            # the dot result so ``map_tt_dot`` keeps the dot's C fragment-
+            # resident (off SHARED): the dot computes its 64x64 partial in
+            # ``simdgroup`` registers and the addf reads that fragment, so the
+            # separate ``dot_c_shared`` MxN fp32 threadgroup tile is never
+            # allocated. The carry tile itself stays as-is (its own slot).
+            if not _zero_const_ssa(c_name):
+                continue
+            add_op = addf_by_rhs.get(res_name) or addf_by_lhs.get(res_name)
+            if add_op is None:
+                continue
+            add_ops = _om._operands(add_op)
+            # The OTHER addf operand must be a carry block-arg.
+            other = [_ssa_name(o) for o in add_ops if _ssa_name(o) != res_name]
+            carry_slot = next(
+                (blk_index[n] for n in other if n in blk_index), None
+            )
+            if carry_slot is None:
+                continue
+            add_res = _om._results(add_op)
+            if not add_res:
+                continue
+            add_res_name = _ssa_name(add_res[0])
+            if carry_slot >= len(yield_operands):
+                continue
+            if _ssa_name(yield_operands[carry_slot]) != add_res_name:
+                continue
+            slot = carry_slot
         # Recover the accumulator (M, N) from the dot's A (M x Ka) and
         # B (Kb x N) operand tile shapes.
         try:
@@ -2387,9 +2517,18 @@ def _dot_accumulator_iter_arg_slots(
         if len(a_shape) != 2 or len(b_shape) != 2:
             continue
         slots[slot] = (a_shape[0], b_shape[1])
-        if res_name:
+        if res_name and not _unfolded:
+            # Only the FOLDED in-place carry result is recorded as an in-place
+            # fused-dot result (``map_tt_dot`` then keeps it == the fragment
+            # carry and SKIPS the fragment->shared epilogue). The UNFOLDED form
+            # has a SEPARATE carry tile and its dot result feeds an ``addf``, so
+            # it must KEEP the layout-aware fragment->shared epilogue (a logical
+            # read of a raw ``simdgroup`` register tile does not compile/is
+            # wrong); ``map_tt_dot`` learns the C scope from ``_unfolded_frag_c``.
             dot_result_ssas.append(res_name)
-    return slots, dot_result_ssas
+        if res_name and _unfolded:
+            _unfolded_frag_results.append(res_name)
+    return slots, dot_result_ssas, _unfolded_frag_results
 
 
 def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
@@ -2498,10 +2637,43 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
         from .reduction import _is_cuda_target as _frag_is_cuda  # noqa: WPS433
     except Exception:  # pragma: no cover - reduction always importable here
         _frag_is_cuda = None
-    if _frag_is_cuda is not None and _frag_is_cuda(ctx):
-        _frag_carry_slots, _frag_dot_results = _dot_accumulator_iter_arg_slots(
-            region, iter_arg_block_ssas
-        )
+    try:
+        from .reduction import _is_metal_target as _frag_is_metal  # noqa: WPS433
+    except Exception:  # pragma: no cover - reduction always importable here
+        _frag_is_metal = None
+    # DEFECT-C (frontend): the fused-dot MMA-C accumulator carry must leave
+    # SHARED. On CUDA the tensor-core MMA store layout REQUIRES a swizzled
+    # ``local.fragment`` C (above). On Metal the same fragment-resident carry
+    # binds C to a ``simdgroup_*`` register tile (the legacy simdgroup GEMM
+    # path, ``src/backend/metal/op/gemm.cc``: a ``local.fragment``/``metal.
+    # simdgroup`` C selects ``kMetalSIMDGroup`` whose accumulator lives in
+    # ``simdgroup_float8x8`` registers, NOT a ``threadgroup`` tile) -- so the
+    # MxN fp32 C accumulator no longer consumes threadgroup memory. This is the
+    # SAME fragment-resident accumulator a hand-written TileLang Metal kernel
+    # carries via ``T.alloc_fragment`` across a K-loop; the only change is that
+    # the Triton-frontend folded ``acc = acc + dot`` carry now qualifies for it
+    # on Metal too instead of being pinned to ``shared``. Empty only on truly
+    # unspecified targets, where shared-C GEMM remains the correct default.
+    _frag_target_ok = (_frag_is_cuda is not None and _frag_is_cuda(ctx)) or (
+        _frag_is_metal is not None and _frag_is_metal(ctx)
+    )
+    if _frag_target_ok:
+        (
+            _frag_carry_slots,
+            _frag_dot_results,
+            _frag_unfolded_results,
+        ) = _dot_accumulator_iter_arg_slots(region, iter_arg_block_ssas)
+        # UNFOLDED accumulate (``addf(carry, dot(a,b,0))``): the dot's C must be
+        # fragment-resident (off SHARED) but its result is NOT an in-place carry
+        # -- ``map_tt_dot`` keeps the layout-aware fragment->shared epilogue so
+        # the ``addf`` reads correct logical data. Record those results on a
+        # SEPARATE ctx set the C-scope decision consults to force fragment C.
+        if _frag_unfolded_results:
+            existing_u = set(
+                getattr(ctx, "frag_c_metal_unfolded", set()) or set()
+            )
+            existing_u.update(_frag_unfolded_results)
+            ctx.frag_c_metal_unfolded = existing_u
         # Record the in-place fused-dot result SSAs so ``map_tt_dot`` keeps the
         # result == the fragment carry (skips its fragment->shared epilogue),
         # leaving the accumulation in place across the K-loop. The set is shared
@@ -2800,20 +2972,40 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
                     # data. Only the genuine fragment carry takes this path.
                     carry_scope = _frag_scope_of(carry)
                     if idx in _frag_carry_slots and carry_scope == "local.fragment":
-                        c_logical = _om._alloc_tile_buffer(
-                            ctx,
-                            list(getattr(carry, "shape", []) or [1]),
-                            str(getattr(carry, "dtype", "float32")),
-                            ctx.fresh("carry_logical"),
-                            scope="shared",
-                        )
-                        import tilelang.language as _Tepi  # noqa: WPS433
-                        copy_handle = _Tepi.copy(carry, c_logical)
-                        if isinstance(copy_handle, tir.PrimExpr):
-                            ctx.emit(tir.Evaluate(copy_handle))
+                        if _DIRECT_FRAG_GLOBAL_EPILOGUE_ENABLED:
+                            # DIRECT FRAGMENT->GLOBAL EPILOGUE (named capability,
+                            # see module docstring). Bind the loop result to the
+                            # MMA-C fragment ITSELF -- no shared ``carry_logical``
+                            # staging tile. The downstream ``tt.store`` lowers to
+                            # ``T.copy(fragment, global)``: the CopyNode iterates
+                            # over the fragment (highest scope-level) and
+                            # ``InferLayout`` propagates the fragment's registered
+                            # ``make_mma_store_layout`` to the store loop, so the
+                            # per-warp register tile is written DIRECTLY to global
+                            # at the correct [i,j] positions -- the same
+                            # layout-aware fragment->global store native Triton
+                            # emits, with the MxN fp32 shared buffer eliminated.
+                            # RULE #1: this is the correctness path; the parity
+                            # gate proves it bit-correct. A wrong result must RAISE
+                            # (parity harness FAIL), never silently re-stage.
+                            ctx.bind(result_ssa, carry)
                         else:
-                            ctx.emit(copy_handle)
-                        ctx.bind(result_ssa, c_logical)
+                            # Legacy shared-staging epilogue, kept ONLY for
+                            # same-session A/B measurement (TL_FRAG_GLOBAL_EPILOGUE=0).
+                            c_logical = _om._alloc_tile_buffer(
+                                ctx,
+                                list(getattr(carry, "shape", []) or [1]),
+                                str(getattr(carry, "dtype", "float32")),
+                                ctx.fresh("carry_logical"),
+                                scope="shared",
+                            )
+                            import tilelang.language as _Tepi  # noqa: WPS433
+                            copy_handle = _Tepi.copy(carry, c_logical)
+                            if isinstance(copy_handle, tir.PrimExpr):
+                                ctx.emit(tir.Evaluate(copy_handle))
+                            else:
+                                ctx.emit(copy_handle)
+                            ctx.bind(result_ssa, c_logical)
                     else:
                         ctx.bind(result_ssa, carry)
                 elif yielded and idx < len(yielded):

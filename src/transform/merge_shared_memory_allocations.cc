@@ -173,6 +173,181 @@ public:
   SharedAllocMap static_shmem_allocs_;
 };
 
+// Classify which appropriate-shared buffers are loop-carried.
+//
+// A shared buffer is "loop-carried" when, in forward program order, its FIRST
+// touch is a READ rather than a WRITE.  In that case the value consumed at the
+// top of the body was produced by the PREVIOUS loop iteration (via the loop
+// back-edge), so its storage must stay live across the whole allocation scope.
+// Such a buffer is unsafe to give a tight per-statement sub-interval and must
+// keep the conservative allocation-level liveness window.
+//
+// Conversely, a buffer whose first touch is a WRITE is fully produced and then
+// consumed inside the same iteration; its storage is dead before the next
+// iteration overwrites it, so a tight per-statement interval is exact and lets
+// the arena packer alias it with other disjoint transients.  This is the key
+// signal that lets load-A -> use-A -> load-B -> mma -> store-C reuse storage.
+//
+// This classification is generic and backend-neutral (the same read-before-
+// write rule defines loop-carried liveness on CUDA, ROCm, and Metal alike).
+class LoopCarryClassifier final : public StmtExprVisitor {
+public:
+  explicit LoopCarryClassifier(bool is_dynamic) : is_dynamic_(is_dynamic) {}
+
+  // Returns the set of buffer vars that are loop-carried (read-before-write).
+  std::unordered_set<const VarNode *> loop_carried_;
+
+private:
+  bool IsAppropriateSharedMemory(const Var &var) {
+    return is_dynamic_ ? IsDynamicSharedMemory(var) : IsStaticSharedMemory(var);
+  }
+
+  // Record the first-touch kind for `buf`.  `is_read` is true for loads /
+  // direct var references, false for stores.  Only the first observation per
+  // buffer matters; later touches do not change the classification.
+  void Observe(const VarNode *buf, bool is_read) {
+    if (!buf)
+      return;
+    // Buffer-definition metadata (shape/stride/elem_offset vars) and other
+    // non-pointer vars reach this visitor; GetPtrStorageScope ICHECKs pointer
+    // type, so guard here exactly like the alignment planner does before
+    // querying the storage scope.
+    if (!buf->type_annotation.as<PointerTypeNode>())
+      return;
+    Var var = tvm::ffi::GetRef<Var>(buf);
+    if (!IsAppropriateSharedMemory(var))
+      return;
+    if (seen_.count(buf))
+      return;
+    seen_.insert(buf);
+    if (is_read) {
+      // First touch is a read => value comes from a previous iteration / before
+      // the allocation scope; the buffer is loop-carried and must stay live.
+      loop_carried_.insert(buf);
+    }
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    // Visit the RHS value and indices first so that a read of `buf` on the RHS
+    // that precedes its own store is observed as read-before-write.
+    this->VisitExpr(op->value);
+    for (const PrimExpr &index : op->indices) {
+      this->VisitExpr(index);
+    }
+    Observe(op->buffer->data.get(), /*is_read=*/false);
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    StmtExprVisitor::VisitExpr_(op);
+    Observe(op->buffer->data.get(), /*is_read=*/true);
+  }
+
+  // Extract the underlying buffer Var from a pointer expression of the form
+  // address_of(BufferLoad(buf, ...)).  Returns nullptr if it is not that shape.
+  static const VarNode *BufferVarOfAddressOf(const PrimExpr &ptr) {
+    const auto *call = ptr.as<CallNode>();
+    if (call == nullptr || !call->op.same_as(builtin::address_of()) ||
+        call->args.size() != 1U)
+      return nullptr;
+    if (const auto *load = call->args[0].as<BufferLoadNode>())
+      return load->buffer->data.get();
+    return nullptr;
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    // tvm_access_ptr(type, data, offset, extent, rw_mask) carries an explicit
+    // direction in rw_mask (1=read, 2=write, 3=read|write).  Use it so a buffer
+    // first WRITTEN through an access pointer is correctly classified
+    // write-first (not loop-carried), while a buffer first READ (rw_mask=1) is
+    // classified read-first (loop-carried).  Without this, the bare `data`
+    // VarNode below would treat every access_ptr touch as a read, needlessly
+    // pinning written-first staging buffers live.
+    if (op->op.same_as(builtin::tvm_access_ptr()) && op->args.size() == 5U) {
+      if (const auto *data = op->args[1].as<VarNode>()) {
+        // Visit the offset/extent expressions (they may touch other buffers),
+        // but classify `data` by the mask instead of as a bare var read.
+        this->VisitExpr(op->args[2]);
+        this->VisitExpr(op->args[3]);
+        int64_t rw_mask = 0;
+        if (const auto *imm = op->args[4].as<IntImmNode>()) {
+          rw_mask = imm->value;
+        }
+        // mask&1 (read) present, or unknown mask => treat as read (the
+        // conservative, loop-carried direction).  Pure write (mask==2) only is
+        // the sole case classified as a write.
+        bool is_read = (rw_mask & 1) != 0 || rw_mask == 0;
+        Observe(data, is_read);
+        return;
+      }
+    }
+
+    // simdgroup_store(frag, idx, address_of(buf[..]), ...) WRITES the buffer
+    // pointed to by args[2]; simdgroup_load(...) READS it.  The pointer arrives
+    // as address_of(BufferLoad(buf)), so the bare BufferLoad would otherwise be
+    // misread as a load.  Classify by the intrinsic's direction instead.  This
+    // is the path the Metal fragment->shared C epilogue uses to write its
+    // staging tile, which must be seen as write-first so it is NOT pinned
+    // loop-carried (and can therefore alias the freed A/B transients).
+    bool is_sg_store = op->op.same_as(builtin::simdgroup_store());
+    bool is_sg_load = op->op.same_as(builtin::simdgroup_load());
+    if ((is_sg_store || is_sg_load) && op->args.size() >= 3U) {
+      // Register the directional touch for the pointer arg FIRST so it wins the
+      // first-observation race over the bare BufferLoad inside the address_of
+      // (which the generic descent below would otherwise see as a read).
+      if (const VarNode *buf = BufferVarOfAddressOf(op->args[2])) {
+        Observe(buf, /*is_read=*/is_sg_load);
+      }
+      // Then visit all args generically so any other nested buffer touches are
+      // still observed (the already-seen pointer buffer is a no-op).
+      StmtExprVisitor::VisitExpr_(op);
+      return;
+    }
+
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const VarNode *op) final { Observe(op, /*is_read=*/true); }
+
+  void VisitStmt_(const SBlockNode *op) final {
+    if (op->init.defined()) {
+      this->VisitStmt(op->init.value());
+    }
+    this->VisitStmt(op->body);
+  }
+
+  void VisitStmt_(const SBlockRealizeNode *op) final {
+    if (!is_one(op->predicate)) {
+      this->VisitExpr(op->predicate);
+    }
+    this->VisitStmt(op->block);
+  }
+
+  void VisitStmt_(const AllocBufferNode *op) final {
+    // Bodyless; do not descend into buffer-definition metadata (mirrors the
+    // finder's handling for migration-era TileLang buffers).
+  }
+
+  void VisitStmt(const Stmt &stmt) override {
+    if (const auto *op = stmt.as<AllocateNode>()) {
+      this->VisitStmt(op->body);
+      return;
+    }
+    if (const auto *op = stmt.as<LetStmtNode>()) {
+      this->VisitExpr(op->value);
+      this->VisitStmt(op->body);
+      return;
+    }
+    if (const auto *op = stmt.as<EvaluateNode>()) {
+      this->VisitExpr(op->value);
+      return;
+    }
+    StmtExprVisitor::VisitStmt(stmt);
+  }
+
+  bool is_dynamic_{true};
+  std::unordered_set<const VarNode *> seen_;
+};
+
 // Find a linear pattern of storage access
 // Used for liveness analysis.
 // "linear" means fitting a complex access pattern into an array of StmtEntry
@@ -190,9 +365,11 @@ class SharedMemLinearAccessPatternFinder final : public StmtExprVisitor {
 public:
   explicit SharedMemLinearAccessPatternFinder(
       bool is_dynamic = true, bool enable_aggressive_merge = false,
-      bool verbose = false)
+      bool verbose = false,
+      std::unordered_set<const VarNode *> loop_carried = {})
       : is_dynamic_(is_dynamic),
-        enable_aggressive_merge_(enable_aggressive_merge), verbose_(verbose) {}
+        enable_aggressive_merge_(enable_aggressive_merge), verbose_(verbose),
+        loop_carried_(std::move(loop_carried)) {}
   /*! \brief record the touch list of statement. */
   struct StmtEntry {
     // The statement
@@ -297,13 +474,9 @@ public:
     if (it != alloc_info_.end() && it->second.defined) {
       ICHECK_LT(it->second.level, scope_.size());
       if (IsAppropriateSharedMemory(tvm::ffi::GetRef<Var>(buf))) {
-        // set into scope_.size() - 1 for aggressive memory reuse
-        auto enable_aggressive_merge = enable_aggressive_merge_;
-        if (enable_aggressive_merge) {
-          scope_[scope_.size() - 1].touched.push_back(buf);
-        } else {
-          scope_[it->second.level].touched.push_back(buf);
-        }
+        // Non-loop-carried buffers get a tight per-statement interval at the
+        // innermost frame; loop-carried buffers keep allocation-level liveness.
+        scope_[TouchFrameLevel(buf, it->second.level)].touched.push_back(buf);
       }
     }
 
@@ -348,17 +521,10 @@ public:
       ICHECK_LE(it->second.level, scope_.size())
           << "Load memory in places other than store.";
       if (IsAppropriateSharedMemory(tvm::ffi::GetRef<Var>(buf))) {
-        auto enable_aggressive_merge = enable_aggressive_merge_;
-        if (enable_aggressive_merge) {
-          scope_[scope_.size() - 1].touched.push_back(buf);
-        } else {
-          // When the access happens in the same scope frame as the allocation
-          // we attribute it to that frame instead of the outer parent.  This
-          // keeps the liveness window tight while still accounting for nested
-          // scopes that legitimately touch the buffer deeper in the tree.
-          size_t access_level = std::min(it->second.level, scope_.size() - 1);
-          scope_[access_level].touched.push_back(buf);
-        }
+        // Tight per-statement interval for non-loop-carried buffers (innermost
+        // frame); allocation-level liveness for loop-carried ones.  The old
+        // `min(alloc_level, scope-1)` clamp is subsumed by TouchFrameLevel.
+        scope_[TouchFrameLevel(buf, it->second.level)].touched.push_back(buf);
       }
     }
   }
@@ -390,15 +556,9 @@ public:
       // record the touch for liveness planning.
       ICHECK_LE(it->second.level, scope_.size());
       if (IsAppropriateSharedMemory(tvm::ffi::GetRef<Var>(buf))) {
-        auto enable_aggressive_merge = enable_aggressive_merge_;
-        if (enable_aggressive_merge) {
-          scope_[scope_.size() - 1].touched.push_back(buf);
-        } else {
-          // Attribute same-level uses to the allocation frame, mirroring the
-          // BufferLoad handling to keep reuse decisions consistent.
-          size_t access_level = std::min(it->second.level, scope_.size() - 1);
-          scope_[access_level].touched.push_back(buf);
-        }
+        // Mirror the BufferLoad handling: tight innermost-frame interval for
+        // non-loop-carried buffers, allocation-level for loop-carried ones.
+        scope_[TouchFrameLevel(buf, it->second.level)].touched.push_back(buf);
       }
     }
   }
@@ -556,12 +716,54 @@ private:
   bool IsAppropriateSharedMemory(const Var &var) {
     return is_dynamic_ ? IsDynamicSharedMemory(var) : IsStaticSharedMemory(var);
   }
+
+  // Pick the scope-stack frame that should own this touch.
+  //
+  // The historical conservative behaviour attributed every touch to the
+  // buffer's ALLOCATION frame (`alloc_level`).  When a buffer is allocated
+  // outside a loop but accessed by several distinct statements inside the loop
+  // body, that collapses ALL of those accesses onto the single coarse loop
+  // statement, so every transient gets the identical loop-wide liveness window
+  // and the arena packer cannot reuse storage between disjoint transients.
+  //
+  // For buffers that are NOT loop-carried (their first touch in the body is a
+  // write -- see LoopCarryClassifier) the value is produced and consumed within
+  // one iteration, so attributing each touch to the INNERMOST live scope frame
+  // yields a tight, exact per-statement sub-interval.  load-A, use-A, load-B,
+  // mma, store-C then become sequential intervals that LinearScanPack aliases
+  // down to their true peak.
+  //
+  // Loop-carried buffers keep the conservative allocation-level attribution so
+  // their storage stays reserved across the back-edge.  This is the only case
+  // where the inner sub-interval would be unsafe (it would free storage that a
+  // later iteration still reads), so it is exactly the case we exclude.
+  size_t TouchFrameLevel(const VarNode *buf, size_t alloc_level) const {
+    ICHECK(!scope_.empty());
+    size_t innermost = scope_.size() - 1;
+    if (enable_aggressive_merge_) {
+      // Aggressive mode already attributes everything to the innermost frame.
+      return innermost;
+    }
+    if (loop_carried_.count(buf)) {
+      // Loop-carried: keep the value live across the whole allocation scope by
+      // attributing the touch to the allocation frame (clamped to the current
+      // stack depth, matching the historical conservative behaviour).
+      return std::min(alloc_level, innermost);
+    }
+    // Not loop-carried: tight per-statement interval attributed to the
+    // innermost live scope frame at the access site.
+    return innermost;
+  }
+
   // Whether do dynamic analysis.
   bool is_dynamic_{true};
   // Whether do aggressive merge.
   bool enable_aggressive_merge_{false};
   // Whether do verbose logging.
   bool verbose_{false};
+  // Buffers that are read-before-written within their allocation scope and so
+  // must retain conservative (allocation-level) liveness.
+  std::unordered_set<const VarNode *> loop_carried_;
   // Whether already in thread env.
   bool in_thread_env_{false};
   // The scope stack.
@@ -693,8 +895,14 @@ public:
    */
   void PlanReuse(const Stmt &stmt, bool is_dynamic = true,
                  bool enable_aggressive_merge = false, bool verbose = false) {
-    SharedMemLinearAccessPatternFinder finder(is_dynamic,
-                                              enable_aggressive_merge, verbose);
+    // Classify which shared buffers are loop-carried (read-before-write) so the
+    // finder can give the remaining transients tight per-statement liveness
+    // sub-intervals while keeping loop-carried buffers conservatively live.
+    LoopCarryClassifier classifier(is_dynamic);
+    classifier(stmt);
+    SharedMemLinearAccessPatternFinder finder(
+        is_dynamic, enable_aggressive_merge, verbose,
+        std::move(classifier.loop_carried_));
     finder(stmt);
     shmem_alignment_map_ = SharedMemoryAlignmentPlanner::Plan(stmt);
     // First compute liveness over the flattened schedule, then feed it into the
@@ -1734,8 +1942,6 @@ private:
                              ? make_const(offset_dtype, 0)
                              : AlignPrimExpr(total_size, align_bytes_);
 
-    bool overlap_detected = false;
-
     if (verbose_) {
       LOG(DEBUG) << "Memory Allocation Plan for "
                  << (is_dynamic_ ? "Dynamic" : "Static") << " Shared Memory:";
@@ -1746,54 +1952,50 @@ private:
                    << " end=" << info.end << " alignment=" << info.alignment
                    << " offset=" << offset << " size=" << info.size_expr;
       }
-      // Sanity check for overlapping constant buffers.
-      for (size_t i = 0; i < buf_infos.size(); ++i) {
-        const BufInfo &a = buf_infos[i];
-        auto a_off_imm = buffer_byte_offsets_.at(a.var).as<IntImmNode>();
-        if (!a.const_size_bytes.has_value() || a_off_imm == nullptr)
-          continue;
-        int64_t a_off = a_off_imm->value;
-        int64_t a_end = a_off + a.const_size_bytes.value();
-        for (size_t j = i + 1; j < buf_infos.size(); ++j) {
-          const BufInfo &b = buf_infos[j];
-          auto b_off_imm = buffer_byte_offsets_.at(b.var).as<IntImmNode>();
-          if (!b.const_size_bytes.has_value() || b_off_imm == nullptr)
-            continue;
-          bool live_overlap = !(a.end <= b.start || b.end <= a.start);
-          if (!live_overlap)
-            continue;
-          int64_t b_off = b_off_imm->value;
-          int64_t b_end = b_off + b.const_size_bytes.value();
-          bool mem_overlap = !(a_end <= b_off || b_end <= a_off);
-          if (mem_overlap) {
-            overlap_detected = true;
-            LOG(WARNING) << "Buffer overlap detected between " << a.name
-                         << " and " << b.name << " (lifetime overlap with "
-                         << "offset ranges [" << a_off << ", " << a_end
-                         << ") and [" << b_off << ", " << b_end << ")).";
-          }
-        }
-      }
     }
 
-    if (overlap_detected) {
-      LOG(WARNING) << "Detected overlapping constant buffers; falling back to "
-                   << "sequential allocation without reuse.";
-      buffer_byte_offsets_.clear();
-      // In the fallback path we simply lay buffers out sequentially.
-      PrimExpr new_cursor = make_const(offset_dtype, 0);
-      PrimExpr new_total = make_const(offset_dtype, 0);
-      for (const BufInfo &info : buf_infos) {
-        new_cursor = AlignPrimExpr(new_cursor, info.alignment);
-        PrimExpr size_expr = CastToOffset(info.size_expr);
-        buffer_byte_offsets_[info.var] = new_cursor;
-        PrimExpr buf_end = new_cursor + size_expr;
-        new_total = max(new_total, buf_end);
-        new_cursor = buf_end;
+    // Correctness guard: verify no two SIMULTANEOUSLY-LIVE constant buffers were
+    // placed at overlapping byte ranges.  A liveness-window overlap combined
+    // with a byte-range overlap means the arena packer aliased two buffers that
+    // are both live at the same program point -- one would silently clobber the
+    // other, producing wrong results.  This must NEVER happen with a correct
+    // liveness computation, so it is a hard error rather than a silent
+    // sequential-layout fallback (RULE#1: fail loud, do not paper over a bug).
+    //
+    // This runs unconditionally (not only under verbose logging) precisely
+    // because it is the safety net for the per-statement sub-interval liveness:
+    // any mistake there surfaces here as a crash instead of corrupt output.
+    for (size_t i = 0; i < buf_infos.size(); ++i) {
+      const BufInfo &a = buf_infos[i];
+      auto a_off_imm = buffer_byte_offsets_.at(a.var).as<IntImmNode>();
+      if (!a.const_size_bytes.has_value() || a_off_imm == nullptr)
+        continue;
+      int64_t a_off = a_off_imm->value;
+      int64_t a_end = a_off + a.const_size_bytes.value();
+      for (size_t j = i + 1; j < buf_infos.size(); ++j) {
+        const BufInfo &b = buf_infos[j];
+        auto b_off_imm = buffer_byte_offsets_.at(b.var).as<IntImmNode>();
+        if (!b.const_size_bytes.has_value() || b_off_imm == nullptr)
+          continue;
+        bool live_overlap = !(a.end <= b.start || b.end <= a.start);
+        if (!live_overlap)
+          continue;
+        int64_t b_off = b_off_imm->value;
+        int64_t b_end = b_off + b.const_size_bytes.value();
+        bool mem_overlap = !(a_end <= b_off || b_end <= a_off);
+        if (mem_overlap) {
+          LOG(FATAL)
+              << "MergeSharedMemoryAllocations produced an INVALID plan: shared "
+              << "buffers '" << a.name << "' and '" << b.name << "' have "
+              << "overlapping lifetimes (liveness windows [" << a.start << ", "
+              << a.end << ") and [" << b.start << ", " << b.end << ")) yet were "
+              << "placed at overlapping byte ranges ([" << a_off << ", " << a_end
+              << ") and [" << b_off << ", " << b_end << ")). This would alias "
+              << "two simultaneously-live buffers and corrupt results. This is "
+              << "a liveness/packing bug -- failing loud instead of emitting a "
+              << "silently-wrong kernel.";
+        }
       }
-      merged_alloc_size_ = buf_infos.empty()
-                               ? make_const(offset_dtype, 0)
-                               : AlignPrimExpr(new_total, align_bytes_);
     }
   }
 

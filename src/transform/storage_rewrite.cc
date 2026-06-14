@@ -2205,8 +2205,21 @@ public:
 
       Array<PrimExpr> shape = buf->shape;
       PrimExpr last_dim = shape[shape.size() - 1];
+      // The shape is expressed in elements of THIS buffer's *current* dtype,
+      // which is not necessarily ``info.old_element_dtype``: the same
+      // ``buffer_var`` can back both the byte-typed arena allocation (e.g.
+      // ``uint8[byte_count]`` from MergeSharedMemoryAllocations) AND already
+      // re-typed float aliases over the same ``.data``. A single lane-based
+      // ``info.factor()`` cannot rescale both, so derive the extent divisor
+      // from the byte-size ratio between the new element and *this* buffer's
+      // own element type. For a float alias (4B -> 4B) the ratio is 1 and the
+      // float-element shape is preserved; for the uint8 arena (1B -> 4B) the
+      // ratio is 4 and the byte-count extent collapses to the correct float
+      // count (fixes the 4x threadgroup over-allocation).
       shape.Set(shape.size() - 1,
-                last_dim / make_const(last_dim.dtype(), info.factor()));
+                last_dim / make_const(last_dim.dtype(),
+                                      ByteSizeRatio(buf->dtype,
+                                                    info.new_element_dtype)));
 
       auto writer = buf.CopyOnWrite();
       writer->data = info.new_buffer_var;
@@ -2297,8 +2310,15 @@ public:
 
     Array<PrimExpr> extents = op->extents;
     PrimExpr last_extent = extents[extents.size() - 1];
+    // Rescale by the byte-size ratio between the new element type and THIS
+    // allocation's own element type (``op->dtype``), not the lane-based
+    // ``info.factor()``. See the rationale in ``RemapBuffer``: a byte-typed
+    // arena allocation (uint8) re-typed to float must shrink its extent 4x,
+    // while a same-byte re-type keeps its element count.
     extents.Set(extents.size() - 1,
-                last_extent / make_const(last_extent.dtype(), info.factor()));
+                last_extent / make_const(last_extent.dtype(),
+                                         ByteSizeRatio(op->dtype,
+                                                       info.new_element_dtype)));
     DLOG(INFO) << "Allocate with " << new_buffer_var << " and "
                << info.new_element_dtype << " extents: " << extents;
     return build_alloc_seq(new_buffer_var, info.new_element_dtype, extents,
@@ -2364,6 +2384,22 @@ private:
       return new_lanes / old_lanes;
     }
   };
+
+  // How many ``from``-dtype elements pack into one ``to``-dtype element, by
+  // total byte size. Used to rescale buffer extents when an allocation/alias
+  // is re-typed (e.g. uint8 arena -> float32: 4). Distinct from
+  // RewriteInfo::factor(), which is lane-based and governs index rewriting for
+  // genuine scalar->vector widening.
+  static int ByteSizeRatio(const DataType &from, const DataType &to) {
+    int from_bytes = from.bytes() * from.lanes();
+    int to_bytes = to.bytes() * to.lanes();
+    ICHECK_GT(from_bytes, 0);
+    ICHECK_EQ(to_bytes % from_bytes, 0)
+        << "PointerValueTypeRewrite: cannot rescale extent from " << from
+        << " (" << from_bytes << "B) to " << to << " (" << to_bytes
+        << "B): target element size is not a whole multiple of the source.";
+    return to_bytes / from_bytes;
+  }
 
   bool rewrite_indices_{true};
   std::unordered_map<const VarNode *, RewriteInfo> rewrite_map_;
