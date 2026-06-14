@@ -1573,22 +1573,36 @@ def _build_coalesced_copy_loop_layout(ctx, out_shape, contig_axis, dtype):
     a = int(contig_axis)
     if not (0 <= a < len(shp)):
         return None
-    # PARTITIONABILITY GUARD (RULE #1: skip the hint where it is NOT
-    # structurally invertible -- this is NOT a silent correctness fallback,
-    # the load stays bit-correct, it just is not lane-coalesced here). The
-    # TileLang loop-layout partitioner (LowerTileOp) can only invert a
-    # forward_thread/forward_index Fragment into a clean per-thread loop nest
-    # when the THREAD-fastest axis is the INNERMOST tile axis (proven by
-    # tilelang's own passing loop_layout tests, which all vectorize along the
-    # innermost axis). If we pin consecutive threads to consecutive elements
-    # of an OUTER tile axis (a != last), the partition is non-invertible: the
-    # Fragment's own input iter vars leak as UNDEFINED free symbolics into the
-    # emitted predicate/loop-extent, which MakePackedAPI then rejects
-    # (free index vars used but not passed as API arguments). So only emit the
-    # coalesce loop_layout when the contiguous global axis IS the innermost
-    # tile axis; otherwise return None and keep the inferred layout.
-    if a != len(shp) - 1:
-        return None
+    # Coalesce16B (RESOLUTION): defer ALL coalescing to NATURAL TileLang layout
+    # inference + the C++ vectorizer fix in src/transform/loop_vectorize.cc
+    # (ComputeBufferVectorSize stride-relaxed contiguity probe). That fix makes
+    # a contiguous-innermost global->shared copy whose SOURCE carries a SYMBOLIC
+    # outer stride (the de-monomorphized stride arg) lower to a real 16B
+    # cp.async (cp_async_gs<16>) WITHOUT this synthetic Fragment -- proven
+    # bit-exact (MAXDIFF=0) on the §P1 dstates B (C-tensor) load.
+    #
+    # The synthetic forward_thread/forward_index Fragment built below is now
+    # RETIRED for two independent reasons, both RULE #1 compliant:
+    #   * INNERMOST-contiguous axis (a == last, e.g. B's [k, ds] ds axis): the
+    #     natural inference already lane-coalesces to 16B via the C++ fix, and
+    #     forcing this synthetic Fragment instead makes the loop-layout
+    #     partitioner leak its OWN input iter vars (_i, _j) as undefined free
+    #     symbolics that MakePackedAPI rejects ("variables (_i, _j) are used but
+    #     not passed as API arguments"). Deferring to natural inference both
+    #     coalesces AND compiles cleanly with the OOB mask epilogue intact.
+    #   * NON-INNERMOST contiguous axis (a != last, e.g. A's [hd, k] transposed
+    #     dout load): the SOURCE innermost axis is genuinely non-contiguous
+    #     (stride nheads*headdim), so there is NO 16B-vectorizable innermost run
+    #     to coalesce -- scalar 4B is the CORRECT lowering (native also issues
+    #     scalar loads for this operand; ldmatrix/transpose is a proven dead
+    #     end). This is NOT a degrade: it is the geometrically-correct width.
+    #
+    # Returning None here keeps the load bit-correct and lets the (now fixed)
+    # vectorizer choose the genuine width per operand. RULE #1: no silent
+    # scalar-degrade clamp (the C++ fix removed the need to clamp), no synthetic
+    # Fragment that would either crash (innermost) or fabricate a contiguity the
+    # source does not have (non-innermost).
+    return None
     nwarps = int(getattr(ctx, "num_warps", 0) or 0)
     if nwarps <= 0:
         return None
