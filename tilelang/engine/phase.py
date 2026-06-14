@@ -262,6 +262,97 @@ def PreLowerSemanticCheck(mod: IRModule) -> None:
     tilelang.analysis.FragmentLoopChecker()(mod)
 
 
+def _reconstruct_dout_swizzle_layouts(mod: IRModule) -> IRModule:
+    """Rebuild make_swizzled_layout for buffers flagged by the round-trip-safe
+    ``tl.dout_swizzle_buffers`` block marker (DOUTSWIZZLE16B).
+
+    The Triton frontend (frame_register) records the dout phys [K, hd] producer
+    tile by NAME (a string survives JSON round-trip; a Layout does not). For each
+    named buffer this pass finds the live Buffer in the block's alloc_buffers,
+    builds make_swizzled_layout(buf, k_major=False) FRESH, and merges it into the
+    block's ``layout_map`` annotation so LayoutInference applies the SAME XOR
+    address permutation to the cp.async write, the OOB-zero writes, AND the
+    register-A MMA fragment-fill read (bit-exact by construction, conflict-free).
+
+    RULE #1: RAISES if a named buffer is not found among the block's
+    alloc_buffers -- a missing buffer means the swizzle would silently not apply
+    and the write/read would carry inconsistent layouts (miscompile).
+    """
+    import tvm as _tvm
+    from tvm import tir as _tir, tirx as _tirx
+    from tilelang.layout import make_swizzled_layout as _mk_swz
+
+    def _rewrite_func(func):
+        if not isinstance(func, _tir.PrimFunc):
+            return func
+        found = {"hit": False}
+
+        def _mut(node):
+            if type(node).__name__ not in ("SBlock", "Block"):
+                return None
+            ann = dict(getattr(node, "annotations", {}) or {})
+            names = ann.get("tl.dout_swizzle_buffers")
+            if not names:
+                return None
+            wanted = {str(n) for n in names}
+            by_name = {b.name: b for b in (node.alloc_buffers or [])}
+            lm = dict(ann.get("layout_map", {}) or {})
+            for nm in sorted(wanted):
+                buf = by_name.get(nm)
+                if buf is None:
+                    raise RuntimeError(
+                        "DoutSwizzleReconstruct: buffer %r flagged by "
+                        "tl.dout_swizzle_buffers is not among the block's "
+                        "%d alloc_buffers %r. RULE #1: refusing to skip the "
+                        "swizzle reconstruction -- the cp.async write and the "
+                        "MMA read would carry inconsistent shared layouts."
+                        % (nm, len(node.alloc_buffers or []),
+                           sorted(by_name)))
+                if len(list(buf.shape)) != 2:
+                    raise RuntimeError(
+                        "DoutSwizzleReconstruct: buffer %r is not rank-2 "
+                        "(shape=%r); the dout swizzle is only defined for a 2D "
+                        "[K, hd] producer tile." % (nm, list(buf.shape)))
+                if buf.data in lm:
+                    raise RuntimeError(
+                        "DoutSwizzleReconstruct: buffer %r already has a pinned "
+                        "layout (collision). RULE #1: the dout producer tile "
+                        "must be distinct from any other pinned buffer." % nm)
+                lm[buf.data] = _mk_swz(buf, k_major=False)
+            ann["layout_map"] = lm
+            # Drop the marker now that it is consumed.
+            ann.pop("tl.dout_swizzle_buffers", None)
+            found["hit"] = True
+            new_block = _tirx.SBlock(
+                iter_vars=list(node.iter_vars),
+                reads=list(node.reads),
+                writes=list(node.writes),
+                name_hint=node.name_hint,
+                body=node.body,
+                init=node.init,
+                alloc_buffers=list(node.alloc_buffers),
+                match_buffers=list(node.match_buffers),
+                annotations=ann,
+            )
+            return new_block
+
+        new_body = _tir.stmt_functor.ir_transform(func.body, None, _mut, None)
+        if not found["hit"]:
+            return func
+        return func.with_body(new_body)
+
+    updates = {}
+    for gv, func in mod.functions.items():
+        nf = _rewrite_func(func)
+        if nf is not func:
+            updates[gv] = nf
+    if updates:
+        mod = mod.clone() if hasattr(mod, "clone") else mod
+        for gv, nf in updates.items():
+            mod.update_func(gv, nf)
+    return mod
+
+
 def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     # Bind the target device information to the module
     """
@@ -375,6 +466,16 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = AutoGemmifyReductions(mod)
     if target.kind.name == "metal":
         mod = tilelang.transform.MetalSimdgroupSemanticGuard(mod)
+    # DOUTSWIZZLE16B: reconstruct make_swizzled_layout for any buffer named by a
+    # ``tl.dout_swizzle_buffers`` block marker (set by the Triton frontend's
+    # frame_register). The Layout itself is NOT serializable across
+    # save_json/load_json (forward-index IterVar binding is lost), so the
+    # frontend records only the buffer NAME and we rebuild the swizzle FRESH here
+    # -- AFTER any load_json, BEFORE LayoutInference -- exactly like the GEMM
+    # operand swizzles are derived fresh. RULE #1: this RAISES if a named buffer
+    # is absent (never silently skips) so a marker can never produce a
+    # row-major/swizzled mismatch (silent miscompile).
+    mod = _reconstruct_dout_swizzle_layouts(mod)
     # Infer memory layouts for fragments and shared memory
     mod = tilelang.transform.LayoutInference()(mod)
     # Visualize the layout

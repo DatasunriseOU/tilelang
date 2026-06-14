@@ -132,7 +132,8 @@ def _build_c_fragment_layout(tir_buffer: Any, M: int, N: int, K: int,
 
 
 def register_mma_fragment_layouts(prim_func: Any, fragments: List[Dict[str, Any]],
-                                  pin_c_layout: bool = True) -> Any:
+                                  pin_c_layout: bool = True,
+                                  dout_swizzle_tiles: Any = None) -> Any:
     """Wrap ``prim_func``'s body in an SBlock that STRICTLY pins each recorded
     MMA-C fragment to its ``make_mma_store_layout`` (FRAMEFIX, approach b).
 
@@ -151,7 +152,7 @@ def register_mma_fragment_layouts(prim_func: Any, fragments: List[Dict[str, Any]
         ``layout_map`` annotation. RAISES if a recorded fragment is absent from
         the body (a real lowering bug, never silently skipped).
     """
-    if not fragments:
+    if not fragments and not (dout_swizzle_tiles or None):
         return prim_func
 
     import tvm  # noqa: WPS433
@@ -222,6 +223,65 @@ def register_mma_fragment_layouts(prim_func: Any, fragments: List[Dict[str, Any]
         )
         layout_map[live.data] = lay
 
+    # DOUTSWIZZLE16B (OPTION-1 SWIZZLE-BOTH): pin a make_swizzled_layout on each
+    # recorded dout phys [K, hd] producer tile so the cp.async WRITE, the
+    # OOB-zero writes, AND the register-A MMA fragment-fill READ all carry the
+    # SAME XOR address permutation (exactly the C operand-B tile pattern, which
+    # has zero bank conflicts). A swizzle is a PURE address permutation applied
+    # uniformly to every access -> bit-exact BY CONSTRUCTION; conflict-free
+    # because the MMA-natural per-lane read now lands on distinct banks. The
+    # full-bank swizzle permutes 16B chunks (vector_size=4 for TF32), so the
+    # innermost 16B cp.async contiguity is preserved. RULE #1: a recorded tile
+    # MUST be live among the AllocBuffers (RAISE otherwise) -- never silently
+    # skipped, or the read/write would carry inconsistent layouts.
+    dout_swizzle_names: List[str] = []
+    if dout_swizzle_tiles:
+        for data_var, rec in dict(dout_swizzle_tiles).items():
+            live = frag_data_to_buf.get(data_var)
+            if live is None:
+                live = frag_data_to_buf.get(getattr(rec, "data", None))
+            if live is None:
+                live = by_name.get(getattr(rec, "name", None))
+            if live is None:
+                raise RuntimeError(
+                    "frame_register.register_mma_fragment_layouts: recorded dout "
+                    f"swizzle tile {getattr(rec, 'name', rec)!r} is not present "
+                    f"among the {len(alloc_bufs)} AllocBuffer buffers. The load "
+                    "emitter must allocate the dout phys [K, hd] tile via "
+                    "_alloc_tile_buffer (AllocBuffer at body head). RULE #1: "
+                    "refusing to skip the swizzle pin -- a missing tile means "
+                    "the cp.async write and the MMA read would carry "
+                    "inconsistent shared layouts (silent miscompile)."
+                )
+            if len(list(getattr(live, "shape", []) or [])) != 2:
+                raise RuntimeError(
+                    "frame_register: dout swizzle tile "
+                    f"{getattr(live, 'name', live)!r} is not rank-2 (shape="
+                    f"{list(getattr(live, 'shape', []))}); the swizzle is only "
+                    "defined for a 2D [K, hd] producer tile."
+                )
+            if live.data in layout_map:
+                raise RuntimeError(
+                    "frame_register: dout swizzle tile "
+                    f"{getattr(live, 'name', live)!r} already has a pinned "
+                    "layout (collision with the C-fragment pin). RULE #1: the "
+                    "dout producer tile and the MMA-C accumulator must be "
+                    "distinct buffers."
+                )
+            # ROUND-TRIP SAFE: a make_swizzled_layout Layout does NOT survive
+            # tvm.ir.save_json/load_json (its forward-index IterVar binding is
+            # lost -> the swizzle becomes a symbolic, non-constant-shape, WRONG
+            # mapping that aborts LowerTileOp). The dstates harness saves the
+            # PrimFunc to JSON and reloads it before compiling, so we MUST NOT
+            # bake the Layout. Instead we record a SERIALIZABLE marker (the
+            # buffer NAME string); a compile-time pass (DoutSwizzleReconstruct in
+            # tilelang/engine/phase.py, run right before LayoutInference AFTER
+            # any load_json) reconstructs make_swizzled_layout(buf, k_major=False)
+            # FRESH against the live buffer and pins it into the layout_map. This
+            # mirrors how the GEMM operand swizzles are derived fresh at compile
+            # time (never serialized), which is why the C tile round-trips fine.
+            dout_swizzle_names.append(str(live.name))
+
     # Replace AllocBuffer stmts with no-ops (the alloc now lives on the block).
     def _strip(node: Any) -> Any:
         if type(node).__name__ == "AllocBuffer":
@@ -266,7 +326,11 @@ def register_mma_fragment_layouts(prim_func: Any, fragments: List[Dict[str, Any]
         name_hint="root",
         body=inner,
         alloc_buffers=alloc_bufs,
-        annotations={"layout_map": layout_map},
+        annotations=(
+            {"layout_map": layout_map, "tl.dout_swizzle_buffers": dout_swizzle_names}
+            if dout_swizzle_names
+            else {"layout_map": layout_map}
+        ),
     )
     realize = tirx.SBlockRealize([], tvm.tir.const(True, "bool"), block)
 

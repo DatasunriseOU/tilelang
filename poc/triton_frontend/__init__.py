@@ -1127,8 +1127,12 @@ def _frame_register_mma_fragments(ctx: Any) -> Any:
         )
     except Exception:  # pragma: no cover - control always importable here
         _direct_epi = True
+    # DOUTSWIZZLE16B: thread the recorded dout phys [K, hd] producer tiles so the
+    # re-registration also pins a make_swizzled_layout on each (write+read carry
+    # the SAME permutation -> bit-exact + conflict-free, mirroring the C tile).
     registered = register_mma_fragment_layouts(
-        prim_func, fragments, pin_c_layout=bool(_direct_epi)
+        prim_func, fragments, pin_c_layout=bool(_direct_epi),
+        dout_swizzle_tiles=getattr(ctx, "dout_swizzle_tiles", None),
     )
     return _fold_dead_local_stores(registered)
 

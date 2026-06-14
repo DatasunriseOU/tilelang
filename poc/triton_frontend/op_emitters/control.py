@@ -1912,6 +1912,19 @@ def _emit_region(
             child.transposed_phys_tiles = ctx.transposed_phys_tiles
         except Exception:
             pass
+    # DOUTSWIZZLE16B: share the dout-swizzle producer-tile registry (data Var ->
+    # buffer) so a dout phys [K, hd] tile recorded by a load emitter inside this
+    # region surfaces to the root ctx, whose prim_func frame_register pins with a
+    # make_swizzled_layout. Share the SAME object (not a copy). RULE #1: pure
+    # address-permutation registry, applied uniformly to write+read (bit-exact).
+    if getattr(ctx, "dout_swizzle_tiles", None) is not None:
+        child.dout_swizzle_tiles = ctx.dout_swizzle_tiles
+    else:
+        try:
+            ctx.dout_swizzle_tiles = {}
+            child.dout_swizzle_tiles = ctx.dout_swizzle_tiles
+        except Exception:
+            pass
     # ITERATION 6 (C-tile executed TMA): propagate the per-source innermost
     # ground-truth-contiguity set so the CopyNode emitter inside the scf.for
     # K-loop body grounds the C (%arg1) innermost stride to literal 1 and lowers

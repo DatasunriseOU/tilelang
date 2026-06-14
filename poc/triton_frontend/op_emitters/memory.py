@@ -2459,6 +2459,32 @@ def _emit_ptrstate_tile_load_tir(
             _tset.add(getattr(tile_buf, "data", tile_buf))
         except Exception:
             pass
+        # DOUTSWIZZLE16B (OPTION-1 SWIZZLE-BOTH): the dout phys [K, hd] producer
+        # tile is written ROW-MAJOR by the cp.async (16B) + OOB-zero, but the
+        # register-A MMA fragment fill READS it with the MMA-natural per-lane
+        # pattern -> a row-major TF32 read whose lanes collide modulo 32 banks
+        # (MEASURED op_ld bank conflicts 7.47M). The C (operand-B) tile has ZERO
+        # conflicts because BOTH its write and read carry the SAME make_swizzled
+        # XOR layout. We mirror that: record this tile so frame_register pins a
+        # make_swizzled_layout on it. LayoutInference then applies the SAME
+        # address permutation to the cp.async WRITE, the OOB-zero writes, AND the
+        # fragment-fill READ -> bit-exact BY CONSTRUCTION (a pure address
+        # permutation applied uniformly to every access) and conflict-free. The
+        # full-bank swizzle permutes 16B-aligned chunks (vector_size=4 for TF32),
+        # so the innermost 16B contiguity (the cp.async vector) is preserved.
+        # Gated by TL_DOUT_SWIZZLE (default ON); =0 reverts to the row-major tile.
+        if _os_dtc.environ.get("TL_DOUT_SWIZZLE", "1") != "0":
+            _dsw = getattr(ctx, "dout_swizzle_tiles", None)
+            if _dsw is None:
+                _dsw = {}
+                try:
+                    setattr(ctx, "dout_swizzle_tiles", _dsw)
+                except Exception:
+                    pass
+            try:
+                _dsw[getattr(tile_buf, "data", tile_buf)] = tile_buf
+            except Exception:
+                pass
     # ITERATION 4 (CopyNode conversion): on the routed-triton async path, a
     # rank>=2 global->shared producer (the K-loop dout/C tile) is emitted as a
     # REAL 2D-strided ``T.copy`` CopyNode instead of the 1D-flattened

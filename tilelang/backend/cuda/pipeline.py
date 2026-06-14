@@ -89,6 +89,14 @@ def CUDAPassPipelineBodyPrologue(mod: IRModule, target: Target) -> IRModule:
     # explicit thread-level layout, so layout inference must not see them.
     # mod = tilelang.transform.metal.MetalFragmentToSimdgroup(mod)
 
+    # DOUTSWIZZLE16B: reconstruct make_swizzled_layout for any buffer named by a
+    # round-trip-safe ``tl.dout_swizzle_buffers`` block marker (set by the Triton
+    # frontend frame_register). The Layout is NOT serializable across
+    # save_json/load_json, so the frontend records only the buffer NAME and we
+    # rebuild the swizzle FRESH here -- AFTER any load_json, BEFORE
+    # LayoutInference -- exactly as the GEMM operand swizzles are derived fresh.
+    from tilelang.engine.phase import _reconstruct_dout_swizzle_layouts
+    mod = _reconstruct_dout_swizzle_layouts(mod)
     # Infer memory layouts for fragments and shared memory
     mod = tilelang.transform.LayoutInference()(mod)
     # Visualize the layout
