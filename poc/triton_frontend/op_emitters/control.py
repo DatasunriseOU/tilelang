@@ -1289,6 +1289,55 @@ def map_tt_func(op: Any, ctx: _om.WalkerCtx) -> Any:
             body_stmt,
             None,
         )
+    # Occupancy/register-budget hint: emit ``tl.min_blocks_per_sm`` as an
+    # AttrStmt INSIDE the kernel block scope (nested within the threadIdx.x
+    # ``thread_extent`` wrap below) when ``ctx.min_blocks_per_sm`` is set to a
+    # positive value. The CUDA codegen ``LaunchConfigExtractor`` walks the
+    # PrimFunc body and stamps it as the 2nd arg of
+    # ``__launch_bounds__(threads, min_blocks_per_sm)``. Placing it at the
+    # function-body top (e.g. a PrimFunc attr) is stripped by the lowering
+    # pipeline -- it must live in the thread-extent scope like the public
+    # ``T.annotate_min_blocks_per_sm`` API (which emits ``attr(None,
+    # "tl.min_blocks_per_sm", n)`` inside ``with T.Kernel(...)``).
+    #
+    # MEASURED MECHANISM (gb10 sm_121a, cache OFF, prod P1; do NOT claim more
+    # than this): this AttrStmt is NOT a pure no-op annotation. Besides stamping
+    # ``__launch_bounds__``, its presence in the thread-extent scope acts as a
+    # statement boundary that the downstream TIR fusion/fold passes do not cross,
+    # so the lowered kernel keeps the addressing index-compute in EXPLICIT
+    # strength-reduced int32/int64 ``tile_binop`` arrays instead of folding them
+    # into wide live int64 expressions. The result is a STRUCTURALLY DIFFERENT,
+    # more register-friendly kernel: ptxas 128->95 regs (0 spill), SASS 3232->
+    # 3240 insns with a shifted opcode mix (fewer wide IADD.64, more int32 IADD/
+    # IMAD). It is NOT a byte-identical instruction stream -- the earlier
+    # "byte-identical PTX" framing was wrong. What IS measured and load-bearing
+    # for RULE #1: the OUTPUT is bit-exact vs the native mamba_ssm triton
+    # reference across single-tile, all 5 partial-mask shapes, and int64 at
+    # 2.82GB + 4.32GB (MAXDIFF=0.0 every case), and routed ms drops 3.46->3.34
+    # (-3.7%, occupancy step 4->5 CTAs/SM, warps_active 33.0%->40.9%). So the
+    # change is a SAFE bit-exact perf win whose true cause is a fusion-barrier-
+    # driven addressing strength-reduction, not a ptxas-only re-budget.
+    #
+    # Gated on a positive value: 0 (unset) emits nothing, preserving byte-
+    # identical output for every other routed kernel and the dict-shaped unit
+    # tests.
+    min_blocks_per_sm = int(getattr(ctx, "min_blocks_per_sm", 0) or 0)
+    if min_blocks_per_sm > 0:
+        # NOTE: the AttrStmt node must be a NON-NULL, walkable PrimExpr. A
+        # ``None`` node (as the public ``T.annotate_min_blocks_per_sm`` emits via
+        # ``attr(None, ...)``) segfaults the tirx ``IsPureFunction`` purity
+        # visitor in this build (VisitStmt_(AttrStmtNode) -> VisitExpr on a null
+        # node). The CUDA codegen ``LaunchConfigExtractor`` reads ONLY
+        # ``op->value`` for ``tl.min_blocks_per_sm`` (never ``op->node``), so a
+        # placeholder IntImm node carries no semantics and is purely to satisfy
+        # the visitor -- the emitted ``__launch_bounds__`` value comes solely
+        # from the ``op->value`` IntImm below.
+        body_stmt = tir_mod.AttrStmt(
+            tir_mod.const(0, "int32"),
+            "tl.min_blocks_per_sm",
+            tir_mod.const(min_blocks_per_sm, "int32"),
+            body_stmt,
+        )
     tid_iter = tir_mod.IterVar(
         (0, tid_extent), tid_var, tir_mod.IterVar.ThreadIndex, "threadIdx.x",
     )

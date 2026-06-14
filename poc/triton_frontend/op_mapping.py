@@ -348,6 +348,23 @@ class WalkerCtx:
         # options or kernel autotune-config when available.
         self.num_warps: int = 4
         self.num_stages: int = 2
+        # minBlocksPerMultiprocessor -- the 2nd arg of
+        # ``__launch_bounds__(maxThreadsPerBlock, minBlocksPerMultiprocessor)``.
+        # 0 = unset (codegen default 1; no extra occupancy hint emitted). When a
+        # positive value is set (by ``from_ttir`` for a kernel whose register
+        # high-water lets ptxas pack into a higher-occupancy budget), the kernel
+        # block scope emits a ``tl.min_blocks_per_sm`` AttrStmt so the CUDA
+        # codegen stamps ``__launch_bounds__(threads, min_blocks_per_sm)``.
+        # MEASURED: this AttrStmt is also a fusion barrier -- its presence keeps
+        # the lowered addressing index-compute in explicit strength-reduced
+        # int32/int64 ``tile_binop`` arrays rather than wide live int64, yielding
+        # a STRUCTURALLY DIFFERENT, lower-register kernel (128->95 regs; NOT a
+        # byte-identical instruction stream). The OUTPUT stays bit-exact vs the
+        # native reference across single-tile + 5 partial-mask + int64 2.82/4.32GB
+        # (MAXDIFF=0.0 every case), so the change is a safe bit-exact perf win
+        # (RULE #1: validated by direct A/B parity, NOT assumed from a byte-equal
+        # claim).
+        self.min_blocks_per_sm: int = 0
         # PROLOGUE-OPT gate (routed-triton path only). When True, the
         # convergence-point tile materializer (``materialize_lazy_tile``)
         # THREAD-DISTRIBUTES the elementwise prologue across the block's

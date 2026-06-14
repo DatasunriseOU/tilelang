@@ -1718,6 +1718,7 @@ def from_ttir(
     arg_buffer_shapes: Optional[Any] = None,
     num_warps: Optional[int] = None,
     num_stages: Optional[int] = None,
+    min_blocks_per_sm: Optional[int] = None,
     prologue_opt: bool = True,
     async_loads: bool = True,
     _allow_text_ttir: bool = False,
@@ -1798,6 +1799,32 @@ def from_ttir(
         ctx.num_warps = int(num_warps)
     if num_stages is not None:
         ctx.num_stages = int(num_stages)
+    # OCCUPANCY hint: minBlocksPerMultiprocessor (the 2nd ``__launch_bounds__``
+    # arg). The register/occupancy-bound chunk-scan-bwd-dstates kernel has a
+    # register high-water (124 ptxas regs at the default ``.minnctapersm 1``)
+    # that ptxas can pack into a higher-occupancy budget when given an explicit
+    # min-blocks hint: at min_blocks=5 the kernel re-allocates to 95 regs (0
+    # spill), crossing the >=5 CTAs/SM occupancy step on sm_121a (GB10: 65536
+    # regs/SM, 17408B smem/CTA both admit 5 CTAs at <=96 regs) -- ncu-measured
+    # registers 128->95, occupancy_limit_registers 4->5, warps_active
+    # 32.99%->40.91%, routed ms 3.46->3.34 (-3.7%). MEASURED MECHANISM: the
+    # emitted AttrStmt is NOT a byte-identical no-op -- it acts as a fusion
+    # barrier so the addressing index-compute lowers to explicit strength-reduced
+    # int32/int64 arrays (a structurally different, lower-register kernel; SASS
+    # 3232->3240 insns, shifted opcode mix), which is WHY ptxas needs fewer regs.
+    # RULE #1 safety comes from DIRECT A/B parity, not a byte-equal assumption:
+    # OUTPUT is bit-exact vs the native mamba_ssm reference across single-tile,
+    # all 5 partial-mask shapes, and int64 at 2.82GB + 4.32GB (MAXDIFF=0.0 every
+    # case). Name-gated + grounded: applied ONLY to the dstates kernel whose
+    # 128->95 packing and 5-CTA step were directly measured (ncu, cache OFF,
+    # prod P1). An explicit
+    # ``min_blocks_per_sm`` kwarg always wins and is honored for any kernel; a
+    # caller passing 0 / a falsy value disables the hint entirely.
+    if min_blocks_per_sm is None:
+        if isinstance(name, str) and "chunk_scan_bwd_dstates" in name:
+            min_blocks_per_sm = 5
+    if min_blocks_per_sm is not None:
+        ctx.min_blocks_per_sm = int(min_blocks_per_sm)
     # PROLOGUE-OPT gate (transforms 1/2/3). The routed-triton path opts in by
     # default; pass ``prologue_opt=False`` to reproduce the pre-opt serial
     # prologue for A/B comparison. This ONLY affects the elementwise prologue
