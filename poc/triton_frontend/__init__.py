@@ -67,12 +67,21 @@ from .mlir_walker import (
 from .op_mapping import LazyTileExpr, OP_TABLE, WalkerCtx
 from .ptr_analysis import PtrAnalysis, shim_available
 
+from .static_shape_specialize import (  # noqa: E402
+    INT32_ELEM_LIMIT,
+    int32_index_safe,
+    specialize_static_shape,
+)
+
 __all__ = [
     "from_triton_kernel",
     "from_ttir",
     "autotune_winning_block_config",
     "TileLangPrimFunc",
     "MLIR_WALKER_AVAILABLE",
+    "specialize_static_shape",
+    "int32_index_safe",
+    "INT32_ELEM_LIMIT",
 ]
 
 
