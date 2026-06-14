@@ -1897,6 +1897,19 @@ def _emit_region(
     # reorders the load TRAVERSAL order for axes the route VERIFIED contiguous.
     if getattr(ctx, "routed_contiguous_tile_axis", None) is not None:
         child.routed_contiguous_tile_axis = ctx.routed_contiguous_tile_axis
+    # DOUTTRANSPOSE16B: share the physically-transposed producer-tile set so the
+    # consumer reads (lazy dout*exp + register-A fragment fill) inside this
+    # region see the SAME set the load emitter registered and swap their
+    # [m,k]->[k,m] indices. Share the object (not a copy) so a load emitted in a
+    # deeper region surfaces to siblings. RULE #1: pure layout relabel set.
+    if getattr(ctx, "transposed_phys_tiles", None) is not None:
+        child.transposed_phys_tiles = ctx.transposed_phys_tiles
+    else:
+        try:
+            ctx.transposed_phys_tiles = set()
+            child.transposed_phys_tiles = ctx.transposed_phys_tiles
+        except Exception:
+            pass
     # ITERATION 6 (C-tile executed TMA): propagate the per-source innermost
     # ground-truth-contiguity set so the CopyNode emitter inside the scf.for
     # K-loop body grounds the C (%arg1) innermost stride to literal 1 and lowers

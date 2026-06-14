@@ -281,6 +281,21 @@ def _read_lane(ctx: EmitContext, value: Any, indices: Tuple[Any, ...]) -> Any:
         idx = list(indices[-rank:]) if rank else [tir.const(0, "int32")]
         if not idx:
             idx = [tir.const(0, "int32")]
+        # DOUTTRANSPOSE16B: a producer tile registered as PHYSICALLY transposed
+        # ([K, hd] in memory while the LOGICAL operand is [hd, K]) is read by
+        # consumers (the lazy ``dout*exp`` AND the register-A MMA fragment fill)
+        # with LOGICAL [m=hd, k] indices -> swap to physical [k, m] so the VALUE
+        # read is bit-identical to the [hd, K] layout. RULE #1: pure index
+        # relabel keyed on a route-registered transposed tile; never reorders an
+        # untransposed buffer.
+        _tset = getattr(ctx, "transposed_phys_tiles", None)
+        if _tset and rank == 2:
+            try:
+                _datakey = getattr(value, "data", value)
+            except Exception:
+                _datakey = value
+            if _datakey in _tset:
+                idx = [idx[1], idx[0]]
         return tir.BufferLoad(value, idx)
     bcast_cls = getattr(tir, "Broadcast", None)
     if bcast_cls is not None and isinstance(value, bcast_cls):

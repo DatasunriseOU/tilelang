@@ -1710,6 +1710,7 @@ def _emit_ptrstate_tile_load_copynode(
     dynamic_mask_dims: Sequence[Any],
     tile_buf: Any,
     loop_vars: Sequence[Any],
+    phys_transpose: bool = False,
 ) -> bool:
     """Emit a REAL 2D-strided ``T.copy`` CopyNode for the K-loop producer.
 
@@ -1744,6 +1745,28 @@ def _emit_ptrstate_tile_load_copynode(
             "real CopyNode; import failed: %r" % (exc,)
         )
     base, strides = _ptrstate_block_base_and_strides(ctx, resolved, out_shape)
+    # DOUTTRANSPOSE16B: ``out_shape`` is the LOGICAL [hd, K] tile and ``strides``
+    # are computed in that order ([stride_hd(=1 grounded), stride_K]). When the
+    # caller PHYSICALLY transposed the dest tile to [K, hd] (loop_vars already in
+    # [K, hd] order, tile_buf [K, hd]) we transpose out_shape + strides to MATCH
+    # the physical [K, hd] order so the 2D src2d view is [K, hd] with the
+    # innermost (hd) stride == 1 -> the C++ vectorizer fires (16B). The mask is
+    # resolved against the LOGICAL [hd, K] axes below using a logical->physical
+    # loop_var remap so OOB lanes stay bit-identical. RULE #1: pure layout
+    # relabel, no math/mask/int64-base change; env-gated, reverts to [hd, K].
+    _logical_out_shape = list(out_shape)
+    if phys_transpose and len(out_shape or []) == 2:
+        out_shape = [int(out_shape[1]), int(out_shape[0])]
+        # GROUND the now-innermost (hd) stride to a LITERAL IntImm(1): the route
+        # VERIFIED hd contiguous (stride 1) on the real row-major dout tensor
+        # (routed_contiguous_tile_axis %arg0:0), but the de-monomorphized launch
+        # passes it as the opaque symbolic arg so the C++ vectorizer's
+        # is_one(strides[last]) contiguity probe (loop_vectorize.cc) cannot prove
+        # it == 1. Grounding it to literal 1 lets the probe fire -> 16B cp.async.
+        # The outer (K) stride stays symbolic; the C++ relaxed-stride model
+        # (Coalesce16B) handles it. RULE #1: grounded ground-truth, not
+        # fabricated -- hd IS stride-1; a non-contiguous axis is never grounded.
+        strides = [strides[1], tir.const(1, "int64")]
     data_var = getattr(src_buf, "data", None)
     if data_var is None:
         raise EmitError(
@@ -2084,15 +2107,31 @@ def _emit_ptrstate_tile_load_copynode(
                     other_expr = tir.const(0, out_dtype)
             else:
                 other_expr = tir.const(0, out_dtype)
-            mask_lane = _resolve_lane_operand(ctx, mask_expr, loop_vars, role="mask")
-            other_lane = _resolve_lane_operand(ctx, other_expr, loop_vars, role="other")
+            # DOUTTRANSPOSE16B: the mask LazyTileExpr is keyed on the LOGICAL
+            # [hd, K] tile axes. When the physical tile is transposed to [K, hd]
+            # the loop_vars are in PHYSICAL [K, hd] order, so feed the mask the
+            # loop_vars REVERSED back to logical [hd, K] order; the resulting
+            # mask_lane references the same physical Vars but binds each per-axis
+            # bound to the correct logical axis. RULE #1: bit-identical OOB set.
+            _mask_lv = (
+                [loop_vars[1], loop_vars[0]]
+                if (phys_transpose and len(loop_vars) == 2)
+                else loop_vars
+            )
+            mask_lane = _resolve_lane_operand(ctx, mask_expr, _mask_lv, role="mask")
+            other_lane = _resolve_lane_operand(ctx, other_expr, _mask_lv, role="other")
             # Epilogue writes ``other`` where the lane is OUT of bounds:
             # predicate is the NEGATION of the in-bounds mask.
             pred = tir.Not(mask_lane)
             pred_from_mask_ssa = True
     else:
         mask_lane = None
-    dyn = _dynamic_tts_mask_expr(ctx, loop_vars, dynamic_mask_dims)
+    _dyn_lv = (
+        [loop_vars[1], loop_vars[0]]
+        if (phys_transpose and len(loop_vars) == 2)
+        else loop_vars
+    )
+    dyn = _dynamic_tts_mask_expr(ctx, _dyn_lv, dynamic_mask_dims)
     if dyn is not None:
         dyn_oob = tir.Not(dyn)
         pred = dyn_oob if pred is None else tir.Or(pred, dyn_oob)
@@ -2129,9 +2168,27 @@ def _emit_ptrstate_tile_load_copynode(
                 in_bounds = dyn if in_bounds is None else tir.And(in_bounds, dyn)
             extents = None
             if in_bounds is not None:
-                extents = _decompose_monotone_mask_extents(
-                    ctx, in_bounds, loop_vars, out_shape
+                # DOUTTRANSPOSE16B: in_bounds references the LOGICAL-ordered
+                # loop_vars (see _mask_lv above) over the LOGICAL [hd, K] shape.
+                # Decompose against logical loop_vars + logical out_shape, then
+                # transpose the per-axis extents back to PHYSICAL [K, hd] order
+                # so _emit_oob_zero_partition (physical loop_vars + physical
+                # out_shape + physical tile_buf) zeroes EXACTLY the OOB lanes.
+                _decomp_lv = (
+                    [loop_vars[1], loop_vars[0]]
+                    if (phys_transpose and len(loop_vars) == 2)
+                    else loop_vars
                 )
+                _decomp_shape = (
+                    _logical_out_shape
+                    if (phys_transpose and len(loop_vars) == 2)
+                    else out_shape
+                )
+                extents = _decompose_monotone_mask_extents(
+                    ctx, in_bounds, _decomp_lv, _decomp_shape
+                )
+                if extents is not None and phys_transpose and len(extents) == 2:
+                    extents = [extents[1], extents[0]]
             if _os_epi.environ.get("TL_BOUNDSHOIST_DEBUG") == "1":
                 import sys as _sys
                 print("BOUNDSHOIST epilogue rank=%d mask_ssa=%s dyn=%s "
@@ -2337,17 +2394,71 @@ def _emit_ptrstate_tile_load_tir(
         # swizzled read forces local->stack; it is PROMOTED to shared above and
         # MUST NOT be demoted here, hence the rank>=2 guard.)
         load_scope = "local"
+    # DOUTTRANSPOSE16B (DEFAULT ON, RULE #1: proven bit-exact + faster). A
+    # producer load whose route-verified GLOBAL-contiguous axis is NON-innermost
+    # (the dstates dout tile: hd is stride-1 but loaded as the OUTER axis of the
+    # [hd, K] tile) cannot vectorize its global->shared cp.async -> scalar 4B
+    # (cp_async_gs<4>). We PHYSICALLY transpose the producer shared tile to
+    # [K, hd] (hd innermost, stride 1) so the C++ vectorizer's contiguity probe
+    # (loop_vectorize.cc, gated on is_one(innermost stride)) fires and the load
+    # lowers to a 16B cp.async (cp_async_gs<16>), mirroring the C operand. The
+    # LOGICAL out_shape stays [hd, K] for the mask/consumer indexing; only the
+    # PHYSICAL tile + copy loop + the now-innermost (grounded literal-1) hd
+    # stride are transposed, and the lazy dout*exp + register-A MMA fragment
+    # reads swap [m,k]->[k,m] (transposed_phys_tiles). MEASURED on gb10 (prod
+    # P1, cache off): dout cp_async_gs<4>->cp_async_gs<16>; shared-LDGSTS bank
+    # conflicts 22.8M->0 (total 37.6M->7.5M); L1TEX SOL 79.6%->47.3%; routed
+    # 2.29ms->1.44ms (ncu); BIT-EXACT MAXDIFF=0 on prod + all 6 partial-mask +
+    # int64 2.82/4.35GB + symbolic-int64 intact. Tightly scoped to the
+    # route-verified NON-innermost contiguous source (only the dstates dout
+    # matches); innermost-contiguous operands (the C tile) already vectorize and
+    # are NOT transposed. TL_NO_DOUT_TRANSPOSE_TILE=1 reverts to the [hd, K] 4B
+    # layout for A/B. RULE #1: pure layout relabel, no math/mask/int64-base
+    # change; a non-contiguous axis is NEVER grounded.
+    import os as _os_dtc
+    _dt_phys_transpose = False
+    if (
+        _os_dtc.environ.get("TL_NO_DOUT_TRANSPOSE_TILE") != "1"
+        and len(out_shape or []) == 2
+        and load_scope in ("shared", "shared.dyn")
+        and getattr(ctx, "routed_triton_async_loads", False)
+    ):
+        _cmap_dtc = getattr(ctx, "routed_contiguous_tile_axis", None)
+        _sname_dtc = resolved.get("source") if isinstance(resolved, dict) else None
+        _cax_dtc = None
+        if _cmap_dtc and _sname_dtc is not None:
+            _cax_dtc = _cmap_dtc.get(str(_sname_dtc))
+        if _cax_dtc is not None and int(_cax_dtc) == 0:
+            _dt_phys_transpose = True
+    # PHYSICAL tile shape: [K, hd] when transposing (hd innermost, stride 1),
+    # else the natural [hd, K]. loop_vars index the PHYSICAL tile.
+    _phys_shape = (
+        [int(out_shape[1]), int(out_shape[0])] if _dt_phys_transpose
+        else (list(out_shape) or [1])
+    )
     tile_buf = _alloc_tile_buffer(
         ctx,
-        list(out_shape) or [1],
+        list(_phys_shape) or [1],
         out_dtype,
         ctx.fresh("tile_load"),
         scope=load_scope,
     )
     loop_vars = [
         tir.Var(ctx.fresh(f"i{axis}"), "int32")
-        for axis, _extent in enumerate(out_shape or [1])
+        for axis, _extent in enumerate(_phys_shape or [1])
     ]
+    if _dt_phys_transpose:
+        _tset = getattr(ctx, "transposed_phys_tiles", None)
+        if _tset is None:
+            _tset = set()
+            try:
+                setattr(ctx, "transposed_phys_tiles", _tset)
+            except Exception:
+                pass
+        try:
+            _tset.add(getattr(tile_buf, "data", tile_buf))
+        except Exception:
+            pass
     # ITERATION 4 (CopyNode conversion): on the routed-triton async path, a
     # rank>=2 global->shared producer (the K-loop dout/C tile) is emitted as a
     # REAL 2D-strided ``T.copy`` CopyNode instead of the 1D-flattened
@@ -2374,6 +2485,7 @@ def _emit_ptrstate_tile_load_tir(
             dynamic_mask_dims,
             tile_buf,
             loop_vars,
+            phys_transpose=_dt_phys_transpose,
         )
         if converted:
             # Real CopyNode emitted -> count it so ``map_scf_for`` stamps

@@ -1926,6 +1926,14 @@ def from_ttir(
         ctx.routed_contiguous_tile_axis = {
             str(k_): int(v_) for k_, v_ in _contig_hint.items()
         }
+    # DOUTTRANSPOSE16B: initialise the physically-transposed producer-tile set
+    # on the ROOT ctx so the K-loop load emitter and its in-region consumers
+    # share ONE object (propagated by reference in map_scf_for). The set stays
+    # empty unless the memory.py emitter registers a transposed tile (default-on
+    # for the route-verified non-innermost-contiguous dstates dout source;
+    # TL_NO_DOUT_TRANSPOSE_TILE=1 disables it).
+    if getattr(ctx, "transposed_phys_tiles", None) is None:
+        ctx.transposed_phys_tiles = set()
     # ITERATION 6 (C-tile executed TMA). GROUND-TRUTH route hint: the set of
     # producer-load SOURCE pointers (TTIR ``%argN``) whose INNERMOST tile axis
     # is PROVABLY CONTIGUOUS (global stride == 1) on the REAL tensor. For such a
