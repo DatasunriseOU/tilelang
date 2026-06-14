@@ -3237,7 +3237,15 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
         # stamp (do NOT drop it) so the pipeline actually overlaps stage k+1 loads
         # with stage k MMA. TL_NO_NUM_STAGES still forces a serial loop for A/B.
         _pipeline_cp_async = (_os_pipe.environ.get("TL_PIPELINE_CP_ASYNC") == "1")
-        if _pipeline_cp_async:
+        # LEVER B-prime (DBUF): the routed copy was emitted PLAIN (producer-only,
+        # no is_async_copy, routed_explicit_cp_async NOT set) and the OOB epilogue
+        # is WRITE-ONLY, so the shared tile is producer-only and
+        # InjectSoftwarePipeline double-buffers it. We MUST keep the num_stages
+        # stamp (do NOT early-return on routed_explicit_cp_async -- which DBUF
+        # never sets anyway) so PipelinePlanning schedules the staggered
+        # cp.async.wait_group<num_stages-1>. TL_NO_NUM_STAGES still forces serial.
+        _pipeline_dbuf = (_os_pipe.environ.get("TL_PIPELINE_DBUF") == "1")
+        if _pipeline_cp_async or _pipeline_dbuf:
             pass  # fall through to the num_stages stamp below
         elif (_os_pipe.environ.get("TL_NO_NUM_STAGES") == "1"
                 or _os_pipe.environ.get("TL_FORCE_CP_ASYNC") == "1"
@@ -3270,6 +3278,16 @@ def map_scf_for(op: Any, ctx: _om.WalkerCtx) -> Any:
         if not isinstance(for_node.body, tir.SeqStmt):
             return for_node
         num_stages = int(getattr(ctx, "num_stages", 2) or 2)
+        if _pipeline_dbuf:
+            # LEVER B-prime (DBUF): depth-2 double-buffer ONLY. The shared tile is
+            # multi-versioned by num_versions = num_stages, so num_stages=N would
+            # cost Nx shared and blow the occupancy budget (the autotune config
+            # stamps ns=4 -> 4x shared). Cap at 2 so ComputeBufferVersions yields
+            # exactly DOUBLE-buffering (the MEASURED depth-2 overlap that keeps 5
+            # blocks/SM at BK=16). TL_DBUF_NUM_STAGES overrides for A/B.
+            import os as _os_db
+            _ns_env = _os_db.environ.get("TL_DBUF_NUM_STAGES")
+            num_stages = int(_ns_env) if _ns_env else 2
         if num_stages < 1:
             return for_node
         anns = dict(for_node.annotations or {})

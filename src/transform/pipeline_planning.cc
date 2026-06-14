@@ -833,29 +833,62 @@ private:
         // writes (RMW), and every buffer it writes is also written by this copy
         // stage (it only touches the copy's outputs). Anything else still FATALs.
         const auto &second = (*pipeline_stage_infos)[i];
-        // Structural test for an in-stage masked read-modify-write fixup of the
-        // copy producer's output: stage i is NOT itself a global->shared copy
-        // producer (it must not source the conflicting buffer from global), AND
-        // every buffer it writes it also READS (RMW of the same region) AND is
-        // also written by this copy stage. A genuine cross-iteration second
-        // producer copies from GLOBAL and does NOT read the shared tile it
-        // writes, so it fails reads_same and still FATALs. ``is_first_stage`` is
-        // NOT used as a gate: the producer_for_copy propagation can flag the
-        // fixup, but the RMW structure is the exact, race-safe discriminator.
+        // Structural test for an in-stage masked fixup of the copy producer's
+        // output: stage i is NOT itself a global->shared copy producer (it must
+        // not source the conflicting buffer from global -- a genuine
+        // cross-iteration second producer is a ``copy_stage`` and is excluded
+        // here), AND every buffer it writes is ALSO written by this copy stage
+        // (it only touches the copy's outputs, never an independent tile).
+        //
+        // Two race-safe shapes are accepted (RULE #1 -- not a paper-over):
+        //   (a) READ-MODIFY-WRITE fixup (TL_PIPELINE_CP_ASYNC):
+        //       tile[idx] = select(oob, other, tile[idx]). It READS the copy's
+        //       output, so it is scheduled as a CONSUMER of the cp.async group
+        //       (wait_group<N> inserted before it -> runs after the async load
+        //       landed, no WAW race).
+        //   (b) WRITE-ONLY constant-fill fixup (LEVER B-prime / TL_PIPELINE_DBUF,
+        //       the BOUNDSHOIST partitioned zero-fill): tile[oob_idx] = other.
+        //       It writes ONLY the OOB suffix lanes of the SAME per-stage private
+        //       buffer in the SAME iteration -- disjoint from the in-bounds lanes
+        //       the cp.async producer wrote, sequenced after the copy. Keeping it
+        //       write-only is REQUIRED so the tile stays producer-only ->
+        //       ComputeBufferVersions double-buffers it. There is NO cross-stage
+        //       hazard: it is part of the producer stage's own buffer fill, and
+        //       the GEMM consumer reads it only after the stage's wait_group<N>.
+        //       The discriminator vs a genuine second producer is exactly
+        //       ``!is_copy_stage`` (no global source) + ``copy_also_writes`` for
+        //       every write + the fixup reads NOTHING from outside the copy's
+        //       own outputs (it sources a constant ``other``, not global memory).
+        // ``is_first_stage`` is NOT used as a gate: the producer_for_copy
+        // propagation can flag the fixup, but the structure above is the exact,
+        // race-safe discriminator.
         bool is_in_stage_masked_fixup =
             !second.is_copy_stage() && !second.writes.empty();
         if (is_in_stage_masked_fixup) {
+          // Every buffer the fixup writes must also be written by this copy
+          // stage (it only fixes up the copy's outputs).
           for (const BufferRegion &w : second.writes) {
-            bool reads_same = std::any_of(
-                second.reads.begin(), second.reads.end(),
-                [&](const BufferRegion &rd) {
-                  return rd->buffer == w->buffer &&
-                         MayConflict(rd->region, w->region);
-                });
             bool copy_also_writes = std::any_of(
                 pinfo.writes.begin(), pinfo.writes.end(),
                 [&](const BufferRegion &cw) { return cw->buffer == w->buffer; });
-            if (!(reads_same && copy_also_writes)) {
+            if (!copy_also_writes) {
+              is_in_stage_masked_fixup = false;
+              break;
+            }
+          }
+        }
+        if (is_in_stage_masked_fixup) {
+          // The fixup must not READ any buffer that the copy stage does NOT also
+          // write -- i.e. it sources nothing from global / an independent tile.
+          // A constant-fill reads nothing (write-only, shape (b)); an RMW reads
+          // ONLY the copy's own output tile (shape (a)). Either is race-safe; a
+          // genuine second producer would read from GLOBAL (a buffer the copy
+          // stage does not write) and is rejected here.
+          for (const BufferRegion &rd : second.reads) {
+            bool from_copy_output = std::any_of(
+                pinfo.writes.begin(), pinfo.writes.end(),
+                [&](const BufferRegion &cw) { return cw->buffer == rd->buffer; });
+            if (!from_copy_output) {
               is_in_stage_masked_fixup = false;
               break;
             }

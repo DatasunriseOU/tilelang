@@ -308,17 +308,35 @@ def _reconstruct_dout_swizzle_layouts(mod: IRModule) -> IRModule:
                         "MMA read would carry inconsistent shared layouts."
                         % (nm, len(node.alloc_buffers or []),
                            sorted(by_name)))
-                if len(list(buf.shape)) != 2:
+                _shape = list(buf.shape)
+                if len(_shape) not in (2, 3):
                     raise RuntimeError(
-                        "DoutSwizzleReconstruct: buffer %r is not rank-2 "
-                        "(shape=%r); the dout swizzle is only defined for a 2D "
-                        "[K, hd] producer tile." % (nm, list(buf.shape)))
+                        "DoutSwizzleReconstruct: buffer %r is not rank-2 (or "
+                        "version-prefixed rank-3) (shape=%r); the dout swizzle "
+                        "is only defined for a 2D [K, hd] producer tile (or a "
+                        "[V, K, hd] double-buffered tile)." % (nm, _shape))
                 if buf.data in lm:
                     raise RuntimeError(
                         "DoutSwizzleReconstruct: buffer %r already has a pinned "
                         "layout (collision). RULE #1: the dout producer tile "
                         "must be distinct from any other pinned buffer." % nm)
-                lm[buf.data] = _mk_swz(buf, k_major=False)
+                if len(_shape) == 2:
+                    lm[buf.data] = _mk_swz(buf, k_major=False)
+                else:
+                    # LEVER B-prime (DBUF): InjectSoftwarePipeline prepended a
+                    # version axis -> the tile is [V, K, hd]. Build the swizzle on
+                    # the INNER 2D [K, hd] and ``expand`` the leading version dim
+                    # (identity passthrough of the version index), mirroring
+                    # ExpandAnnotatedLayoutForMultiVersionedBuffer in
+                    # inject_pipeline.cc. RULE #1: the swizzle still pins EXACTLY
+                    # the [K, hd] producer tile per version; no row-major leak.
+                    _inner = _tir.decl_buffer(
+                        _shape[1:], dtype=buf.dtype, name=buf.name + "_inner2d",
+                        scope=buf.scope() if callable(getattr(buf, "scope", None))
+                        else "shared",
+                    )
+                    _swz2d = _mk_swz(_inner, k_major=False)
+                    lm[buf.data] = _swz2d.expand([_shape[0]])
             ann["layout_map"] = lm
             # Drop the marker now that it is consumed.
             ann.pop("tl.dout_swizzle_buffers", None)

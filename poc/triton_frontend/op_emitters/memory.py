@@ -2050,6 +2050,30 @@ def _emit_ptrstate_tile_load_copynode(
                 ctx, out_shape, _contig_axis, out_dtype)
         if _os_async.environ.get("TL_NO_ASYNC_COPY") == "1":
             copy_call = T.copy(src2d_region, tile_buf, disable_tma=True)
+        elif _os_async.environ.get("TL_PIPELINE_DBUF") == "1":
+            # LEVER B-prime (DBUF): emit a PLAIN producer-only global->shared copy
+            # (NO ``is_async_copy``) so CheckPipelineManagedCPAsyncCopy returns
+            # TRUE and InjectSoftwarePipeline takes OWNERSHIP -- double-buffering
+            # the shared tile across num_stages=2 and emitting the STAGGERED
+            # cp.async.commit_group + cp.async.wait_group<num_stages-1> so stage
+            # k+1 loads OVERLAP stage k MMA (drops long_scoreboard global-load
+            # latency). UNLIKE the broken global TL_PIPELINE_CP_ASYNC path (28-54x
+            # slower because its RMW-Select epilogue READS the tile making it a
+            # CONSUMER -> num_versions stays 1), DBUF keeps the WRITE-ONLY
+            # partitioned OOB-zero epilogue (the TL_PIPELINE_CP_ASYNC!=1 gate at
+            # ~2159 below) so the tile is PRODUCER-ONLY -> ComputeBufferVersions
+            # returns num_versions=2. We KEEP the coalesced loop_layout so the
+            # dout copy stays a 16B cp.async (cp_async_gs<16>). We do NOT set
+            # ``routed_explicit_cp_async`` so ``_maybe_pipeline`` STAMPS
+            # num_stages on the K-loop. Race-freeness is the pipeline-inserted
+            # wait_group<N> ordering. RULE #1: one clear pipelined path; the wait
+            # is always present (pipeline-scheduled), never a silent half-state.
+            copy_call = T.copy(
+                src2d_region,
+                tile_buf,
+                disable_tma=True,
+                loop_layout=_coalesce_ll,
+            )
         elif _os_async.environ.get("TL_PIPELINE_CP_ASYNC") == "1":
             # PIPELINENS4 (TRUE multi-stage software pipeline): emit a PLAIN
             # global->shared CopyNode with NO ``is_async_copy`` annotation. Because
