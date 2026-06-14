@@ -1522,7 +1522,13 @@ def _emit_oob_zero_partition(
         # TVM layout pass, not here).
         store = tir.BufferStore(tile_buf, other_lane, list(region_vars))
         body: Any = store
-        for axis in range(rank - 1, -1, -1):
+
+        def _axis_range(axis: int):
+            # axis a: OOB suffix [clamped_a, BLK_a); earlier axes: in-bounds
+            # prefix [0, clamped_b); later axes: full [0, BLK_c). ``tir.For``
+            # takes (loop_var, min, EXTENT, kind, body) where extent = stop -
+            # min; a non-positive extent makes the body unreachable (the full-
+            # tile no-op).
             if axis == a:
                 lo, stop = clamped[axis], blk[axis]
             elif axis < a:
@@ -1530,13 +1536,33 @@ def _emit_oob_zero_partition(
             else:
                 lo, stop = zero, blk[axis]
             extent = stop if (lo is zero) else tir.Sub(stop, lo)
+            return lo, extent
+
+        # EMPTYREGIONCOLLAPSE (bit-exact loop reorder). The OOB axis ``a`` is the
+        # ONLY axis whose range can be EMPTY for a fully in-bounds tile (its
+        # suffix ``[clamped_a, BLK_a)`` collapses to ``[BLK, BLK)`` when the dim
+        # divides the block, the §P1 hd=ds=64 case). The earlier in-bounds
+        # PREFIX axes (``[0, clamped_b)``) are NON-empty there. With axis ``a``
+        # nested INNERMOST (the prior natural-order build), an empty axis-``a``
+        # suffix still leaves the outer prefix axes spinning their full extent
+        # doing nothing -- 64 wasted outer iterations per K-step for the §P1
+        # region a=1 (measured 18.4M dyn instr on the L157 header alone). Nest
+        # the OOB axis ``a`` OUTERMOST instead: an empty axis-``a`` extent then
+        # makes the WHOLE region body unreachable and ptxas drops it (zero
+        # iterations, zero header recompute). RULE #1: every OOB cell still has
+        # a UNIQUE smallest-OOB axis and is written EXACTLY once with ``other``
+        # (0); loop ORDER is irrelevant to the written set, so this is bit-
+        # identical to the natural-order nest -- it only removes dead spins.
+        inner_axes = [axis for axis in range(rank) if axis != a]
+        for axis in reversed(inner_axes):
+            lo, extent = _axis_range(axis)
             body = tir.For(
-                region_vars[axis],
-                lo,
-                extent,
-                tir.ForKind.SERIAL,
-                body,
+                region_vars[axis], lo, extent, tir.ForKind.SERIAL, body
             )
+        lo_a, extent_a = _axis_range(a)
+        body = tir.For(
+            region_vars[a], lo_a, extent_a, tir.ForKind.SERIAL, body
+        )
         ctx.emit(body)
         emitted_any = True
     return emitted_any
