@@ -75,6 +75,7 @@
   _(cuModuleUnload)                                                            \
   _(cuModuleGetFunction)                                                       \
   _(cuModuleGetGlobal)                                                         \
+  _(cuFuncGetAttribute)                                                        \
   _(cuFuncSetAttribute)                                                        \
   _(cuLaunchKernel)                                                            \
   _(cuLaunchKernelEx)                                                          \
@@ -183,6 +184,9 @@ TILELANG_CUDA_STUB_API CUresult cuModuleGetGlobal_v2(CUdeviceptr *dptr,
                                                      size_t *bytes,
                                                      CUmodule hmod,
                                                      const char *name);
+TILELANG_CUDA_STUB_API CUresult cuFuncGetAttribute(int *pi,
+                                                   CUfunction_attribute attrib,
+                                                   CUfunction hfunc);
 TILELANG_CUDA_STUB_API CUresult cuFuncSetAttribute(CUfunction hfunc,
                                                    CUfunction_attribute attrib,
                                                    int value);
