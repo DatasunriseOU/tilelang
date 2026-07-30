@@ -196,6 +196,11 @@ CUresult cuModuleGetGlobal_v2(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod,
   return CUDADriverAPI::get()->cuModuleGetGlobal_(dptr, bytes, hmod, name);
 }
 
+CUresult cuFuncGetAttribute(int *pi, CUfunction_attribute attrib,
+                            CUfunction hfunc) {
+  return CUDADriverAPI::get()->cuFuncGetAttribute_(pi, attrib, hfunc);
+}
+
 CUresult cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib,
                             int value) {
   return CUDADriverAPI::get()->cuFuncSetAttribute_(hfunc, attrib, value);
