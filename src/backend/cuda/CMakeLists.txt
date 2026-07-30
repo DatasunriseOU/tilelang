@@ -45,6 +45,11 @@ if(TILELANG_USE_CUDA_STUBS)
     OUTPUT_NAME "cuda_stub"
   )
 
+  # Make TVM link its CUDA driver calls to the lazy-loading stub. Otherwise
+  # find_cuda() selects the toolkit's libcuda.so and wheel repair removes that
+  # dependency, leaving libtvm_runtime.so with unresolved cu* symbols.
+  set(CUDA_CUDA_LIBRARY cuda_stub CACHE STRING "CUDA driver library to link against" FORCE)
+
   # ============================================================================
   # CUDA Runtime Stub Library (libcudart_stub.so)
   # ============================================================================
