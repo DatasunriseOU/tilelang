@@ -117,7 +117,7 @@ bool UpdateExpandedLayoutMapForRemappedAllocs(
 
 } // namespace
 
-enum class Role : uint8_t { kConsumer, kProducer, kBoth };
+enum class Role : uint8_t { kNeutral, kConsumer, kProducer, kBoth };
 
 class WarpSpecializedRoleMarker_ : public StmtVisitor {
 public:
@@ -151,9 +151,11 @@ public:
     }
 
     // Check reads from global
-    SBlock block(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{}, /*name_hint=*/"",
-                /*body*/ tvm::ffi::GetRef<Stmt>(op));
-    auto access = s_tir::GetSBlockReadWriteRegion(block, buffer_data_to_buffer_);
+    SBlock block(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{},
+                 /*name_hint=*/"",
+                 /*body*/ tvm::ffi::GetRef<Stmt>(op));
+    auto access =
+        s_tir::GetSBlockReadWriteRegion(block, buffer_data_to_buffer_);
     auto reads = access[0];
     Role role = Role::kProducer;
     for (auto read : reads) {
@@ -169,12 +171,9 @@ public:
 
   void VisitStmt_(const SeqStmtNode *op) final {
     StmtVisitor::VisitStmt_(op);
-    auto role = GetRole(op->seq[0]);
+    Role role = Role::kNeutral;
     for (auto stmt : op->seq) {
-      if (role != GetRole(stmt)) {
-        role = Role::kBoth;
-        break;
-      }
+      role = MergeRoles(role, GetRole(stmt));
     }
     SetRole(op, role);
   }
@@ -183,9 +182,7 @@ public:
     StmtVisitor::VisitStmt_(op);
     auto role = GetRole(op->then_case);
     if (op->else_case.defined()) {
-      auto role_else = GetRole(op->else_case.value());
-      if (role != role_else)
-        role = Role::kBoth;
+      role = MergeRoles(role, GetRole(op->else_case.value()));
     }
     SetRole(op, role);
   }
@@ -200,14 +197,19 @@ public:
     SetRole(op, GetRole(op->body));
   }
 
+  template <class NodeType> void HandleBodylessStmt(const NodeType *op) {
+    StmtVisitor::VisitStmt_(op);
+    SetRole(op, Role::kNeutral);
+  }
+
+  void VisitStmt_(const BindNode *op) final { HandleBodylessStmt(op); }
   void VisitStmt_(const ForNode *op) final { HandleBodyStmt(op); }
+  void VisitStmt_(const WhileNode *op) final { HandleBodyStmt(op); }
   void VisitStmt_(const AttrStmtNode *op) final { HandleBodyStmt(op); }
-  // CPPMEGA: AssertStmtNode and DeclBufferNode lost their `body` field; with
-  // the body now living in the surrounding SeqStmt the role is inherited
-  // implicitly from the next stmt — nothing to record here.
-  void VisitStmt_(const AssertStmtNode *op) final { StmtVisitor::VisitStmt_(op); }
+  void VisitStmt_(const AllocBufferNode *op) final { HandleBodylessStmt(op); }
+  void VisitStmt_(const AssertStmtNode *op) final { HandleBodylessStmt(op); }
   void VisitStmt_(const SBlockNode *op) final { HandleBodyStmt(op); }
-  void VisitStmt_(const DeclBufferNode *op) final { StmtVisitor::VisitStmt_(op); }
+  void VisitStmt_(const DeclBufferNode *op) final { HandleBodylessStmt(op); }
   // CPPMEGA: vendored TileLang LetStmt and Allocate are not in apache's
   // StmtFunctor dispatch — manual intercept via VisitStmt(const Stmt&).
   void HandleLetStmt(const LetStmtNode *op) {
@@ -235,6 +237,14 @@ public:
   bool HasSimtCopy() { return has_simt_copy_; }
 
 private:
+  static Role MergeRoles(Role lhs, Role rhs) {
+    if (lhs == Role::kNeutral)
+      return rhs;
+    if (rhs == Role::kNeutral)
+      return lhs;
+    return lhs == rhs ? lhs : Role::kBoth;
+  }
+
   void SetRole(const StmtNode *stmt, Role role) { map_[stmt] = role; }
   Map<Var, Buffer> buffer_data_to_buffer_;
   std::unordered_map<const StmtNode *, Role> map_;
@@ -303,7 +313,7 @@ private:
     for (const Stmt &stmt : pipeline_stmts) {
       marker(stmt);
       SBlock block(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{},
-                  /*name_hint=*/"", /*body*/ stmt);
+                   /*name_hint=*/"", /*body*/ stmt);
       auto access = s_tir::GetSBlockAccessRegion(block, buffer_data_to_buffer_);
       Array<BufferRegion> stmt_reads = access[0];
       Array<BufferRegion> stmt_writes = access[1];
