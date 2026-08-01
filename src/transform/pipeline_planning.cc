@@ -1,7 +1,7 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tirx/analysis.h>
 #include <tvm/s_tir/analysis.h>
+#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
@@ -17,9 +17,9 @@
 #include <algorithm>
 #include <functional>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <queue>
-#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -54,6 +54,27 @@ bool MayConflict(const Region &region1, const Region &region2) {
   return true;
 }
 
+/*!
+ * \brief Check whether two regions are provably identical.
+ *
+ * Unlike MayConflict, this is fail-closed when symbolic bounds cannot be
+ * proven equal. It is used for the dependent-RMW exception below so a partial
+ * read cannot justify a larger overlapping write.
+ */
+bool RegionsProvablyEqual(const Region &region1, const Region &region2) {
+  if (region1.size() != region2.size()) {
+    return false;
+  }
+  arith::Analyzer analyzer;
+  for (size_t i = 0; i < region1.size(); i++) {
+    if (!analyzer.CanProveEqual(region1[i]->min, region2[i]->min) ||
+        !analyzer.CanProveEqual(region1[i]->extent, region2[i]->extent)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 class TmemLoadCollector : public StmtExprVisitor {
 public:
   TmemLoadCollector() {}
@@ -63,8 +84,7 @@ public:
 private:
   void VisitExpr_(const BufferLoadNode *op) {
     Buffer buf = op->buffer;
-    const auto *ptr_type =
-        buf->data->type_annotation.as<PointerTypeNode>();
+    const auto *ptr_type = buf->data->type_annotation.as<PointerTypeNode>();
     if (ptr_type && ptr_type->storage_scope == "shared") {
       // We only care about shared.tmem buffers
       ICHECK(!result.defined())
@@ -816,12 +836,47 @@ private:
           continue;
         }
 
+        // A dependent read-modify-write is a consumer of this copy, not an
+        // independent second producer. Its read keeps the copy live through
+        // this statement, so async scheduling waits for the copy before the
+        // in-place update. Keep the carve-out exact: the later statement must
+        // be a non-copy RMW, and every region it writes must both overlap a
+        // provably identical region it reads and overlap an output of this
+        // copy. Pure or only-partially-dependent second writes still fail.
+        const auto &later = (*pipeline_stage_infos)[i];
+        bool is_dependent_rmw = !later.is_copy_stage() && !later.writes.empty();
+        if (is_dependent_rmw) {
+          for (const BufferRegion &write : later.writes) {
+            bool reads_same_region = std::any_of(
+                later.reads.begin(), later.reads.end(),
+                [&](const BufferRegion &read) {
+                  return read->buffer == write->buffer &&
+                         RegionsProvablyEqual(read->region, write->region);
+                });
+            bool copy_writes_same_region = std::any_of(
+                pinfo.writes.begin(), pinfo.writes.end(),
+                [&](const BufferRegion &copy_write) {
+                  return copy_write->buffer == write->buffer &&
+                         MayConflict(copy_write->region, write->region);
+                });
+            if (!reads_same_region || !copy_writes_same_region) {
+              is_dependent_rmw = false;
+              break;
+            }
+          }
+        }
+
         for (const BufferRegion &write : (*pipeline_stage_infos)[i].writes) {
           if (std::find_if(pinfo.writes.begin(), pinfo.writes.end(),
                            [&](const BufferRegion &r) {
                              return r->buffer == write->buffer &&
                                     MayConflict(r->region, write->region);
                            }) != pinfo.writes.end()) {
+            if (is_dependent_rmw) {
+              pinfo.last_use_stmt_index =
+                  std::max(pinfo.last_use_stmt_index, i);
+              continue;
+            }
             LOG(FATAL) << "Pipeline planning error: Multiple writes to "
                           "overlapping buffer regions detected. "
                        << "Stage " << pinfo.original_stmt_index << " and stage "
@@ -957,8 +1012,9 @@ private:
   PipelineStageInfo
   MakePipelineStageInfo(Stmt stmt, int idx,
                         AsyncDependencyChainBuilder &chain_builder) {
-    SBlock block(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{}, /*name_hint=*/"",
-                /*body*/ std::move(stmt));
+    SBlock block(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{},
+                 /*name_hint=*/"",
+                 /*body*/ std::move(stmt));
     Array<Array<BufferRegion>> access =
         s_tir::GetSBlockReadWriteRegion(block, buffer_data_to_buffer_);
     auto collector =
@@ -1975,8 +2031,10 @@ private:
       stages.push_back(pinfo.stage);
     }
 
-    annotations.Set(tirx::attr::software_pipeline_stage, Array<Integer>(stages));
-    annotations.Set(tirx::attr::software_pipeline_order, Array<Integer>(orders));
+    annotations.Set(tirx::attr::software_pipeline_stage,
+                    Array<Integer>(stages));
+    annotations.Set(tirx::attr::software_pipeline_order,
+                    Array<Integer>(orders));
 
     // Propagate per-statement TMA eligibility so InjectSoftwarePipeline can
     // rewrite TMA copies to use pipeline-level barrier management.
@@ -2078,9 +2136,9 @@ private:
       Stmt rebuilt_inner =
           RebuildBodyWrapper(block->body, pipeline_body_seq, new_body_seq);
       SBlock new_block(block->iter_vars, block->reads, block->writes,
-                      block->name_hint, rebuilt_inner, block->init,
-                      block->alloc_buffers, block->match_buffers,
-                      block->annotations);
+                       block->name_hint, rebuilt_inner, block->init,
+                       block->alloc_buffers, block->match_buffers,
+                       block->annotations);
       new_loop_body =
           SBlockRealize(realize->iter_values, realize->predicate, new_block);
     } else {
