@@ -4397,32 +4397,105 @@ void CodeGenTileLangCUDA::VisitStmt_(const AllocateNode *op) {
 }
 
 void CodeGenTileLangCUDA::VisitStmt_(const AllocBufferNode *op) {
-  // Only barrier scopes need the special reinterpret_cast declaration so that
-  // the `.init()/.wait()/.arrive()` method-call intrinsics compile. Everything
-  // else falls through to the base CodeGenC implementation unchanged.
-  auto scope = GetPtrStorageScope(op->buffer->data);
-  if (scope != "shared.barrier" && scope != "shared.cluster_barrier") {
-    CodeGenC::VisitStmt_(op);
-    return;
-  }
+  ICHECK(op->buffer.defined());
   std::string vid = AllocVarID(op->buffer->data.get());
   this->PrintIndent();
-  size_t constant_size = 1;
-  for (const auto &dim : op->buffer->shape) {
-    const auto *dim_imm = dim.as<IntImmNode>();
-    ICHECK(dim_imm) << "Can only handle constant size barrier allocation";
-    constant_size *= dim_imm->value;
-  }
-  ICHECK_GT(constant_size, 0);
-  // Record the scope so downstream lookups (RegisterHandleType etc.) agree.
+  std::string scope = GetPtrStorageScope(op->buffer->data);
   alloc_storage_scope_[op->buffer->data.get()] = scope;
-  auto v_id_mem = vid + "_mem";
-  stream << "__shared__ __align__(" << barrier_alignment_bytes_ << ") uint64_t "
-         << v_id_mem << "[" << constant_size << "];\n";
-  PrintIndent();
-  stream << "auto " << vid << " = reinterpret_cast<" << mbarrier_dtype_
-         << "*>(" << v_id_mem << ");\n";
-  RegisterHandleType(op->buffer->data.get(), op->buffer->dtype);
+  const VarNode *buffer = op->buffer->data.as<VarNode>();
+  DataType alloc_dtype = op->buffer->dtype;
+  if (scope.find("wmma.") == 0) {
+    if (scope == "wmma.matrix_a" || scope == "wmma.matrix_b") {
+      ICHECK(
+          alloc_dtype == DataType::Float(16) ||
+          alloc_dtype == DataType::Int(8) || alloc_dtype == DataType::UInt(8) ||
+          alloc_dtype == DataType::Int(4) || alloc_dtype == DataType::UInt(4) ||
+          alloc_dtype == DataType::Int(1) ||
+          alloc_dtype == DataType::BFloat(16))
+          << "Matrix_a and matrix_b only support half or char or unsigned char "
+          << "or uint4 or int4 or int1 type for now";
+    } else {
+      ICHECK(alloc_dtype == DataType::Float(16) ||
+             alloc_dtype == DataType::Float(32) ||
+             alloc_dtype == DataType::Int(32))
+          << "Accumulator only support half, float and int type for now";
+    }
+    PrintWmmaScope(scope, alloc_dtype, buffer, stream);
+  } else if (scope == "local.descriptor.wgmma") {
+    stream << "tl::GmmaDescriptor " << vid << ";\n";
+  } else if (scope == "local.descriptor.tcgen05_smem") {
+    stream << "tl::Tcgen05SMemDescriptor " << vid << ";\n";
+  } else if (scope == "local.descriptor.tcgen05_instr") {
+    stream << "tl::Tcgen05InstrDescriptor " << vid << ";\n";
+  } else {
+    bool is_fp4_scalar_local =
+        alloc_dtype.is_float4() && alloc_dtype.is_scalar() && scope == "local";
+    bool is_int4_scalar_local =
+        (alloc_dtype == DataType::Int(4) || alloc_dtype == DataType::UInt(4)) &&
+        alloc_dtype.is_scalar() && scope == "local";
+    if (!is_fp4_scalar_local && !is_int4_scalar_local) {
+      PrintStorageScope(scope, stream);
+      PrintType(alloc_dtype, stream);
+    }
+  }
+
+  if (scope == "shared.dyn") {
+    stream << ' ' << vid << "[];\n";
+  } else {
+    auto opt_size = GetRef<AllocBuffer>(op).ConstantAllocationSize();
+    ICHECK(opt_size.has_value())
+        << "Can only handle constant size stack allocation for now, but get "
+        << "non-constant for " << op->buffer->data->name_hint;
+    size_t constant_size = static_cast<size_t>(opt_size.value());
+    ICHECK_GT(constant_size, 0);
+    if (scope.find("wmma.") == 0) {
+      constant_size = GetWmmaFragmentSize(scope, buffer, constant_size);
+    }
+    if ((alloc_dtype == DataType::Int(4) || alloc_dtype == DataType::UInt(4)) &&
+        scope == "shared") {
+      constant_size = (constant_size + 1) / 2;
+    } else if (alloc_dtype == DataType::Int(1) && scope == "shared") {
+      constant_size = constant_size / 32;
+    }
+    if (scope == "shared") {
+      stream << ' ' << vid << '[' << constant_size << "];\n";
+    } else if (scope == "shared.barrier" || scope == "shared.cluster_barrier") {
+      auto v_id_mem = vid + "_mem";
+      stream << ' ' << v_id_mem << "[" << constant_size << "];\n";
+      PrintIndent();
+      stream << "auto " << vid << " = reinterpret_cast<" << mbarrier_dtype_
+             << "*>(" << v_id_mem << ");\n";
+    } else if (scope == "local") {
+      if (alloc_dtype == DataType::Int(4) || alloc_dtype == DataType::UInt(4)) {
+        stream << "alignas(16) ";
+        PrintType(alloc_dtype, stream);
+        stream << ' ' << vid << '[' << (constant_size + 1) / 2 << "];\n";
+      } else if (alloc_dtype.is_float4() && alloc_dtype.is_scalar()) {
+        auto vid_packed = vid + "_packed";
+        stream << "fp4_e2_2_t " << vid_packed << '[' << (constant_size + 1) / 2
+               << "];\n";
+        fp4_packed_buffers_[op->buffer->data.get()] = vid_packed;
+      } else {
+        stream << ' ' << vid << '[' << constant_size << "];\n";
+      }
+    } else if (scope == "local.var") {
+      PrimExpr init = tirx::make_const(alloc_dtype, 0);
+      auto init_it = op->annotations.find(tl::attr::kLocalVarInit);
+      if (init_it != op->annotations.end()) {
+        PrimExpr user_init = Downcast<PrimExpr>((*init_it).second);
+        if (!user_init.dtype().is_void() && user_init.dtype() != alloc_dtype) {
+          user_init = tirx::Cast(alloc_dtype, user_init);
+        }
+        init = user_init;
+      }
+      stream << ' ' << vid << " = " << PrintExpr(init) << ";\n";
+    } else if (scope.find("local.descriptor") != 0) {
+      ICHECK(false) << "Unsupported scope: " << scope << " for buffer "
+                    << op->buffer->data->name_hint;
+    }
+  }
+
+  RegisterHandleType(op->buffer->data.get(), alloc_dtype);
 }
 
 void CodeGenTileLangCUDA::VisitStmt_(const EvaluateNode *op) {
