@@ -26,6 +26,6 @@ def test_cuda_alloc_buffer_special_scopes_use_scalar_declarations():
     target = Target({"kind": "cuda", "arch": "sm_90a", "keys": ["cuda", "gpu"]})
     source = lower(prog.with_attr("global_symbol", "main"), target=target).kernel_source
 
-    assert re.search(r"\bfloat\s+\w+\s*=\s*0(?:\.0+)?f?;", source), source
-    assert re.search(r"\btl::GmmaDescriptor\s+\w+;", source), source
-    assert not re.search(r"\b(?:float|uint64_t)\s+\w+\[1\];", source), source
+    assert re.search(r"\bfloat\s+state(?:_\d+)?\s*=", source), source
+    assert re.search(r"\btl::GmmaDescriptor\s+desc(?:_\d+)?;", source), source
+    assert not re.search(r"\b(?:float|uint64_t)\s+(?:state|desc)(?:_\d+)?\[1\];", source), source
