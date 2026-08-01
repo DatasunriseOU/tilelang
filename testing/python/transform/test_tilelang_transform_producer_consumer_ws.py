@@ -173,6 +173,28 @@ def explicit_cp_async_wait_position(iters=4, block=16, cp_elems=8, dtype="float1
     return main
 
 
+def producer_bound_tma_index(iters=2, block=32, dtype="float16", threads=256):
+    """A TMA source offset bound from producer-owned shared state."""
+
+    @T.prim_func
+    def main(
+        A: T.Buffer((iters * block,), dtype),
+        B: T.Buffer((iters * block,), dtype),
+    ):
+        with T.Kernel(1, threads=threads):
+            index_shared = T.alloc_shared((1,), "int32")
+            A_shared = T.alloc_shared((block,), dtype)
+
+            for ko in T.Pipelined(iters, num_stages=2):
+                index_shared[0] = ko * block
+                offset = index_shared[0]
+                T.copy(A[offset], A_shared)
+                for i in T.Parallel(block):
+                    B[ko * block + i] = A_shared[i]
+
+    return main
+
+
 def grouped_gemm_padded_pipelined(
     batch_sizes,
     K,
@@ -645,6 +667,30 @@ def test_tiled_ws_bodyless_statements_preserve_roles():
     consumer_store = _find_after(script, "B_out[ko] = B_shared[0]", consumer_branch)
     assert producer_branch < probe_store < consumer_branch
     assert consumer_branch < neutral_bind < consumer_store
+
+
+def test_tiled_ws_propagates_producer_role_through_bind():
+    """A scalar Bind feeding TMA must be defined in the producer branch."""
+
+    func = producer_bound_tma_index().with_attr("global_symbol", "main")
+    mod = tvm.IRModule.from_expr(func)
+    target = determine_target("cuda -arch=sm_90", return_object=True)
+    mod = tvm.tirx.transform.BindTarget(target)(mod)
+    mod = tilelang.transform.ProducerConsumerWarpSpecialized()(mod)
+    script = mod["main"].script()
+
+    assert "tl_tiled_ws_applied" in script
+    producer_branch = _find_after(script, "if tx >= 256:")
+    offset_bind = _find_after(
+        script,
+        "offset: T.int32 = index_shared",
+        producer_branch,
+    )
+    tma_copy = _find_after(script, "T.tma_copy", producer_branch)
+    consumer_branch = _find_after(script, "else:", producer_branch)
+
+    assert producer_branch < offset_bind < tma_copy < consumer_branch
+    assert "offset: T.int32 = index_shared" not in script[consumer_branch:]
 
 
 @tilelang.testing.requires_cuda

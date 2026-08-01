@@ -1012,7 +1012,8 @@ public:
     PrimExpr value = this->VisitExpr(op->value);
     ICHECK(!let_var_map_.count(op->var))
         << "SSA violation, a single var is binded twice";
-    if (!value.same_as(op->value)) {
+    if (value.dtype().get_lanes_or_vscale_factor() !=
+        op->value.dtype().get_lanes_or_vscale_factor()) {
       Var new_var(op->var->name_hint, value.dtype());
       let_var_map_[op->var] = new_var;
       let_value_binding_[op->var] = op->value;
@@ -1020,7 +1021,16 @@ public:
       return Bind(new_var, value, op->span);
     } else {
       let_var_map_[op->var] = op->var;
-      return tvm::ffi::GetRef<Stmt>(op);
+      // Keep the scalar source expression for a later scalarized
+      // sub-statement.  The vectorized value may contain the loop ramp, while
+      // scalar restoration must substitute the per-lane scalar index.
+      let_value_binding_[op->var] = op->value;
+      if (value.same_as(op->value)) {
+        scalarization_invariant_bindings_.insert(op->var);
+        return tvm::ffi::GetRef<Stmt>(op);
+      } else {
+        return Bind(op->var, value, op->span);
+      }
     }
   }
 
@@ -1110,6 +1120,7 @@ public:
       if (const auto *v = node.as<VarNode>()) {
         Var var = GetRef<Var>(v);
         if (let_value_binding_.count(var) &&
+            !scalarization_invariant_bindings_.count(var) &&
             !defined_in_stmt.count(var.get()) &&
             seen_roots.insert(var.get()).second) {
           root_vars.push_back(var);
@@ -1140,6 +1151,7 @@ public:
             if (const auto *v = node.as<VarNode>()) {
               Var dependency = GetRef<Var>(v);
               if (let_value_binding_.count(dependency) &&
+                  !scalarization_invariant_bindings_.count(dependency) &&
                   !defined_in_stmt.count(dependency.get()) &&
                   seen_dependencies.insert(dependency.get()).second) {
                 dependencies.push_back(dependency);
@@ -1157,12 +1169,35 @@ public:
       add_binding(root);
     }
 
-    stmt = Substitute(stmt, {{var_, idx}});
+    // A same-lane Bind keeps its original Var in the vectorized outer body.
+    // Restoring that binding inside the scalar loop therefore needs a fresh
+    // Var to preserve SSA.  Bindings whose lane count changed already use a
+    // distinct vector Var outside the scalar loop and can restore the original
+    // scalar Var directly.
+    std::unordered_map<Var, Var, ObjectPtrHash, ObjectPtrEqual>
+        restored_var_map;
+    ffi::Map<Var, PrimExpr> scalar_substitute;
+    scalar_substitute.Set(var_, idx);
+    for (const Var &binding : binding_order) {
+      auto mapped_it = let_var_map_.find(binding);
+      if (mapped_it != let_var_map_.end() &&
+          mapped_it->second.same_as(binding)) {
+        Var restored_var(binding->name_hint, binding->dtype);
+        restored_var_map.emplace(binding, restored_var);
+        scalar_substitute.Set(binding, restored_var);
+      }
+    }
 
-    // Wrap in reverse topological order so dependencies dominate their uses.
+    // Emit native bodyless Bind statements in reverse topological order so
+    // dependencies dominate their uses.
+    stmt = Substitute(stmt, scalar_substitute);
     for (auto it = binding_order.rbegin(); it != binding_order.rend(); ++it) {
-      auto new_value = Substitute(let_value_binding_.at(*it), {{var_, idx}});
-      stmt = LetStmt(*it, new_value, stmt);
+      auto restored_it = restored_var_map.find(*it);
+      Var restored_var =
+          restored_it == restored_var_map.end() ? *it : restored_it->second;
+      auto new_value =
+          Substitute(let_value_binding_.at(*it), scalar_substitute);
+      stmt = SeqStmt({Bind(restored_var, new_value), stmt});
     }
 
     return For(idx, IntImm(var_->dtype, 0), var_lanes_, ForKind::kSerial, stmt);
@@ -1186,6 +1221,10 @@ private:
   // Let value binding: map new_var -> value
   std::unordered_map<Var, PrimExpr, ObjectPtrHash, ObjectPtrEqual>
       let_value_binding_;
+  // Native Bind values that remain unchanged are loop-invariant and already
+  // dominate any scalarized sub-statement; do not emit a duplicate definition.
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>
+      scalarization_invariant_bindings_;
   // vectorizable property
   OpAttrMap<TVectorizable> op_vectorizable_ =
       Op::GetAttrMap<TVectorizable>("TVectorizable");
