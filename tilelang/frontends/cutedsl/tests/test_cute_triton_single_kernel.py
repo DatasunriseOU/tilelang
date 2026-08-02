@@ -32,6 +32,7 @@ from __future__ import annotations
 import importlib
 
 import pytest
+import contextlib
 
 
 _HAS_TVM = importlib.util.find_spec("tvm") is not None
@@ -126,10 +127,8 @@ def cute_gemm_then_triton_softmax(
         return prim
     finally:
         sys.modules.pop(module_id, None)
-        try:
+        with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
-        except FileNotFoundError:
-            pass
 
 
 def test_cute_gemm_then_triton_softmax_lowers_to_one_primfunc() -> None:

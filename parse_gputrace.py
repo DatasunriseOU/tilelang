@@ -128,9 +128,8 @@ def extract_shader_info(gputrace_path: str) -> dict:
                 and re.match(r"^[a-z_][a-z0-9_]*$", s)
                 and len(s) > 3
                 and s not in ("function", "functions", "buffer", "buffers")
-            ):
-                if s not in info["functions"]:
-                    info["functions"].append(s)
+            ) and s not in info["functions"]:
+                info["functions"].append(s)
 
     return info
 
@@ -319,7 +318,7 @@ def main():
                 idx = row["index"]
                 fields = {k: v for k, v in row.items() if k != "index"}
                 parts = []
-                for k, v in fields.items():
+                for _k, v in fields.items():
                     if isinstance(v, list):
                         parts.append(f"({', '.join(f'{x:.4f}' for x in v)})")
                     elif isinstance(v, float):

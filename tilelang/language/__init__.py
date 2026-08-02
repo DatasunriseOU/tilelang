@@ -104,22 +104,24 @@ from .reduce_op import (
     warp_reduce_bitor,  # noqa: F401
 )
 from .print_op import print, device_assert  # noqa: F401
-from .customize import (
+from .atomic import (
     atomic_max,  # noqa: F401
     atomic_min,  # noqa: F401
     atomic_add,  # noqa: F401
     atomic_addx2,  # noqa: F401
     atomic_addx4,  # noqa: F401
-    dp4a,  # noqa: F401
-    clamp,  # noqa: F401
-    reshape,  # noqa: F401
-    view,  # noqa: F401
     atomic_load,  # noqa: F401
     atomic_store,  # noqa: F401
     atomic_xchg,  # noqa: F401
     atomic_and,  # noqa: F401
     atomic_or,  # noqa: F401
     atomic_xor,  # noqa: F401
+)
+from .customize import (
+    dp4a,  # noqa: F401
+    clamp,  # noqa: F401
+    reshape,  # noqa: F401
+    view,  # noqa: F401
     loop_break,  # noqa: F401
 )
 from .logical import any_of, all_of  # noqa: F401

@@ -100,7 +100,6 @@ Public attribution
 from __future__ import annotations
 
 import os
-from typing import Optional
 from collections.abc import Iterable
 
 from tilelang import tvm as _tvm  # noqa: F401
@@ -157,7 +156,7 @@ METAL_FP8_INTRINSIC_OPS: tuple[str, ...] = (
 
 
 def assert_metal_fp8_intrinsics_registered(
-    required_ops: Optional[Iterable[str]] = None,
+    required_ops: Iterable[str] | None = None,
 ) -> None:
     """Raise if the C++ Metal FP8 intrinsic registry is not loaded.
 
@@ -229,7 +228,7 @@ def _shape_extent(buffer, axis: int) -> int:
     return -1
 
 
-def _resolve_target(target: Optional[Target]) -> Optional[Target]:
+def _resolve_target(target: Target | None) -> Target | None:
     """Return an explicit target, or the target active during reparsing."""
     if target is None:
         return Target.current(allow_none=True)
@@ -238,7 +237,7 @@ def _resolve_target(target: Optional[Target]) -> Optional[Target]:
     return target
 
 
-def _is_metal_target(target: Optional[Target]) -> bool:
+def _is_metal_target(target: Target | None) -> bool:
     """Return True when the caller requests Metal lowering."""
     target = _resolve_target(target)
     if target is None:
@@ -250,7 +249,7 @@ def _is_metal_target(target: Optional[Target]) -> bool:
     return "metal" in str(target).lower()
 
 
-def _allows_metal_fast_path(target: Optional[Target]) -> bool:
+def _allows_metal_fast_path(target: Target | None) -> bool:
     """Return True only when macro expansion can see a Metal target.
 
     ``T.fp8_scaled_matmul`` expands while ``@T.prim_func`` is built, before
@@ -262,7 +261,7 @@ def _allows_metal_fast_path(target: Optional[Target]) -> bool:
     return _is_metal_target(target)
 
 
-def _target_thread_warp_size(target: Optional[Target]) -> int:
+def _target_thread_warp_size(target: Target | None) -> int:
     """Return the target SIMD-group width used by Metal warp intrinsics."""
     target = _resolve_target(target)
     if target is None:
@@ -307,7 +306,7 @@ _DOT4_INTRINSICS = (
     "tir.metal.fp8_load_u32",
     "tir.metal.fp8_e4m3_dot4_words",
 )
-_dot4_intrinsics_registered_cache: Optional[bool] = None
+_dot4_intrinsics_registered_cache: bool | None = None
 
 
 def _dot4_intrinsics_registered() -> bool:
@@ -338,7 +337,7 @@ def _dot4_intrinsics_registered() -> bool:
     return True
 
 
-def _buffer_innermost_stride(buffer) -> Optional[int]:
+def _buffer_innermost_stride(buffer) -> int | None:
     """Return the innermost stride of a buffer if statically known, else None.
 
     A row-major buffer with no explicit strides has innermost stride 1 by
@@ -361,7 +360,7 @@ def _buffer_innermost_stride(buffer) -> Optional[int]:
     return None
 
 
-def _buffer_element_offset(buffer) -> Optional[int]:
+def _buffer_element_offset(buffer) -> int | None:
     """Return ``elem_offset`` if statically known, else None (assume 0)."""
     eo = getattr(buffer, "elem_offset", None)
     if eo is None:
@@ -432,12 +431,10 @@ def _is_int_imm_or_int(value) -> bool:
         return False
     if isinstance(value, int):
         return True
-    if isinstance(value, tir.IntImm):
-        return True
-    return False
+    return bool(isinstance(value, tir.IntImm))
 
 
-def _const_int_value(value) -> Optional[int]:
+def _const_int_value(value) -> int | None:
     """Coerce ``value`` to a Python int when it's a constant; else ``None``."""
     if isinstance(value, bool):
         return None
@@ -1081,7 +1078,9 @@ def _fp8_scaled_matmul_m1_vecmat_metal_macro(
     dot = T.alloc_var(T.float32)
     reduced = T.alloc_local((1,), T.float32)
 
-    if j < outputs_per_block:
+    # Keep symbolic predicates nested: Python ``and`` would force PrimExpr
+    # truth-value conversion before the TileLang macro parser sees them.
+    if j < outputs_per_block:  # noqa: SIM102
         if col < N_dim:
             base = C_local[0, j]
             for kk in T.serial(
@@ -1144,8 +1143,9 @@ def _fp8_scaled_matmul_trans_b_direct_metal_macro(
     k_words = K_dim // 4
     dot = T.alloc_var(T.float32)
 
-    if row < M_dim:
-        if col_lane < outputs_per_block:
+    # Keep symbolic predicates nested for the TileLang macro parser.
+    if row < M_dim:  # noqa: SIM102
+        if col_lane < outputs_per_block:  # noqa: SIM102
             if col < N_dim:
                 for word_i in T.unroll(0, k_words, explicit=False, unroll_factor=4):
                     dot += T.metal_fp8_e4m3_dot4(
@@ -1174,7 +1174,6 @@ def _fp8_scaled_matmul_m1_vecmat_metal_macro_legacy(A_fp8, A_scale, B_fp8, B_sca
     """
     M_dim, K_dim = A_fp8.shape
     N_dim, K_dim_b = B_fp8.shape
-    sa_size = A_scale.shape[0]
     sb_size = B_scale.shape[0]
     tx = T.get_thread_binding(0)
 
@@ -1208,7 +1207,7 @@ def fp8_scaled_matmul(
     *,
     transpose_B: bool = False,
     accum_dtype: str = "float32",
-    target: Optional[Target] = None,
+    target: Target | None = None,
     scale_format: str | None = None,
     scale_block_size: int | None = None,
     block_scale_layout: BlockScaledLayout | None = None,
@@ -1216,8 +1215,8 @@ def fp8_scaled_matmul(
     b_scale_offset=None,
     c_row_offset=None,
     c_col_offset=None,
-    simd_group_width: Optional[int] = None,
-    outputs_per_block: Optional[int] = None,
+    simd_group_width: int | None = None,
+    outputs_per_block: int | None = None,
     accumulate: bool = True,
 ):
     """Scaled FP8 matmul intrinsic — accumulate scaled FP8 product into ``C``.

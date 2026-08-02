@@ -48,6 +48,7 @@ from tilelang.analysis.cost_model import attach_reduction_cost_metadata
 from tilelang.analysis.reduction_legality import attach_reduction_legality_metadata
 from tilelang.analysis.reduction_plan import attach_reduction_plan_metadata
 from tilelang.analysis.sync_event_plan import attach_sync_event_plan_metadata
+import contextlib
 
 logger = logging.getLogger("tilelang.metal_simd_lift")
 
@@ -623,11 +624,10 @@ class _ButterflyRewriter:
         # skipped. We reconstruct the node if the body changed.
         if hasattr(node, "body") and node.body is not None:
             new_body = self._mutate(node.body)
-            if not new_body.same_as(node.body):
-                # Best-effort reconstruction via with_body if available,
-                # otherwise fall through to return the original node.
-                if hasattr(node, "with_body"):
-                    return node.with_body(new_body)
+            # Best-effort reconstruction via with_body if available,
+            # otherwise fall through to return the original node.
+            if not new_body.same_as(node.body) and hasattr(node, "with_body"):
+                return node.with_body(new_body)
         return node
 
     def _visit_for(self, node: tir.For) -> tir.Stmt:
@@ -801,10 +801,8 @@ def _metal_simd_lift(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.PrimFunc:
 
     candidates = _walk_reductions(func.body)
     func_name = ""
-    try:
+    with contextlib.suppress(Exception):
         func_name = str(func.attrs.get("global_symbol", ""))
-    except Exception:
-        pass
     _log_candidates(func_name, candidates)
 
     # Stash candidate metadata.
@@ -816,10 +814,8 @@ def _metal_simd_lift(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.PrimFunc:
         )
         if diagnostics:
             new_attrs["tl.reduction_rewrite_diagnostics"] = tir.StringImm(_serialize_rewrite_diagnostics(diagnostics))
-        try:
+        with contextlib.suppress(Exception):
             func = func.with_attrs(new_attrs)
-        except Exception:
-            pass
 
     # Conservative semantic rewrite: only fires on annotated, proved add
     # reductions where the accumulator contribution can be extracted.

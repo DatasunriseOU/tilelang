@@ -653,7 +653,7 @@ def _atomic_intrin_in_ir(builder_fn, expected_substr: str) -> None:
 
     @T.prim_func
     def f(A: T.Tensor((1,), "int32")):
-        with T.Kernel(1, threads=1) as bx:
+        with T.Kernel(1, threads=1) as bx:  # noqa: F841
             builder_fn(A)
 
     text = str(f)

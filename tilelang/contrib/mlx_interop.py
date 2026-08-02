@@ -23,7 +23,7 @@ import functools
 import hashlib
 import re
 from collections.abc import Iterable, Mapping
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from typing import Any
 
 from tilelang import tvm
@@ -819,7 +819,5 @@ def sync_tvm_metal_internal_command_buffer(args: Iterable[Any]) -> None:
     if not device_ids:
         device_ids.add(0)
     for device_id in device_ids:
-        try:
+        with suppress(Exception):
             tvm.metal(device_id).sync()
-        except Exception:
-            pass

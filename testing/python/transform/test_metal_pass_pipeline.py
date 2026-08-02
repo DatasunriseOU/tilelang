@@ -159,7 +159,7 @@ def test_metal_scalar_bind_canonicalizer_reuses_cse_address_binds():
         def main(A: TX.Buffer(1024, "float32"), B: TX.Buffer(1024, "float32"), i: TX.int32):
             TX.func_attr({"target": TX.target("metal")})
             base: TX.int32 = i * 17 + 3
-            idx0: TX.int32 = base % 1024
+            idx0: TX.int32 = base % 1024  # noqa: F841
             idx1: TX.int32 = base % 1024
             A[i % 1024] = B[base % 1024] + B[idx1]
 

@@ -507,8 +507,8 @@ def test_metal_tma_copy_runtime():
     """Verify that a TMA copy kernel compiles and runs successfully on Metal
     via the pointer-arithmetic fallback."""
 
-    M, N = 128, 256
-    block_M, block_N = 64, 128
+    _M, _N = 128, 256
+    _block_M, _block_N = 64, 128
     pytest.xfail("Runtime test for TMA fallback on Metal requires full pipeline setup")
 
 

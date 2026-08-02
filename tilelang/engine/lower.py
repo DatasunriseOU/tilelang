@@ -18,7 +18,6 @@ from tilelang.engine.param import KernelParam, CompiledArtifact
 from tilelang.engine.semantic_check import PreLowerSemanticCheck
 from tilelang.utils.target import determine_target, target_get_mcpu
 from tilelang.engine.phase import (
-    PreLowerSemanticCheck,
     _maybe_tir_simplify,
     _module_disables_tir_simplify,
     apply_metal_scalar_pipeline,

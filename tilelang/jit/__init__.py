@@ -104,7 +104,10 @@ def compile(
         )
     except Exception:
         _compile_ttir = None  # type: ignore
-        _is_ttir_input = lambda _obj: False  # type: ignore[assignment]
+
+        def _is_ttir_input(_obj):
+            return False  # type: ignore[assignment]
+
     if _compile_ttir is not None and _is_ttir_input(func):
         return _compile_ttir(
             func,

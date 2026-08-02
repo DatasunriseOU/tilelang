@@ -128,7 +128,7 @@ def test_pass_is_registered():
     """Sanity: the pass is callable and yields a tvm.transform.Pass."""
     p = tl.transform.AutoDoubleBuffer()
     assert p is not None
-    assert hasattr(p, "__call__")
+    assert callable(p)
 
 
 if __name__ == "__main__":

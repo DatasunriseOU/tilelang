@@ -9,11 +9,19 @@ multiply-accumulate loop.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
 import tilelang
 from tvm.target import Target
 import tilelang.language as T
+
+if TYPE_CHECKING:
+    # Runtime values are injected by each factory immediately before the
+    # decorated TileLang function is constructed.
+    _M = _N = _K = _BM = _BN = _BK = _SA = _SB = 0
+    _A_DTYPE = _B_DTYPE = ""
 
 
 def _make_kernel(

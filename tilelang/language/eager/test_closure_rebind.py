@@ -3,7 +3,8 @@ import tilelang.language as T
 
 
 def my_macro(x: T.int32) -> T.int32:
-    return x * N
+    # ``rebind_macro`` supplies this global before the function is called.
+    return x * N  # noqa: F821
 
 
 # Rebind closure

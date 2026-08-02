@@ -15,6 +15,8 @@ algorithm at the TileLang frontend layer. Every test:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import os
 import re
 import shutil
@@ -27,6 +29,18 @@ import tilelang
 from tvm.target import Target
 import tilelang.language as T
 import tilelang.testing
+
+if TYPE_CHECKING:
+    # Runtime values are injected by the factories immediately before each
+    # decorated TileLang function is constructed.
+    _M = _N = _K = _BM = _BN = _BK = _SA = _SB = 0
+    _A_DTYPE = _B_DTYPE = ""
+    _VM_N = _VM_K = _VM_BN = _VM_BK = _VM_SA = _VM_SB = 0
+    _VM_A_DTYPE = _VM_B_DTYPE = ""
+    _VM_MACRO_TARGET: object | None = None
+    _DM_N = _DM_K = _DM_BN = 0
+    _DM_MACRO_TARGET: object | None = None
+    _DTB_M = _DTB_N = _DTB_K = _DTB_BM = _DTB_BN = 0
 
 
 _HAS_METAL_SDK = (
@@ -787,8 +801,6 @@ def test_e2e_per_tensor_scale_parity():
     a_dequant_cpu = a_fp8.cpu().to(torch.float32)
     b_dequant_cpu = b_fp8.cpu().to(torch.float32)
     c_ref_cpu = (a_dequant_cpu @ b_dequant_cpu) * a_scale[0].cpu().item() * b_scale[0].cpu().item()
-    c_ref = c_ref_cpu.to("mps")
-
     c_out = torch.zeros(M, N, dtype=torch.float32, device="mps")
     jit_kernel(a_fp8, a_scale, b_fp8, b_scale, c_out)
     torch.mps.synchronize()

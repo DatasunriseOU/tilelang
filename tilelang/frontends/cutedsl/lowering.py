@@ -22,6 +22,7 @@ from typing import Any
 from collections.abc import Sequence
 
 from tvm import tir
+import contextlib
 
 
 class CuTeDSLLoweringError(RuntimeError):
@@ -353,10 +354,8 @@ def from_cute_source(
         return prim_func
     finally:
         sys.modules.pop(module_id, None)
-        try:
+        with contextlib.suppress(FileNotFoundError):
             os.unlink(emitted_path)
-        except FileNotFoundError:
-            pass
 
 
 def compile_cute_source(

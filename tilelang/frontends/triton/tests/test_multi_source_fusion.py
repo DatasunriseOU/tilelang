@@ -182,7 +182,6 @@ def test_multi_source_fusion_lowers_to_single_primfunc() -> None:
 
     # Synthesise a small wrapper PrimFunc using TVM's TIR builder so we
     # can stitch the three source surfaces into one entry.
-    handle_dtype = "handle"
     a_buf = tir.decl_buffer((16,), "float32", name="a", scope="shared")
     b_buf = tir.decl_buffer((16,), "float32", name="b", scope="shared")
     c_buf = tir.decl_buffer((16,), "float32", name="c", scope="shared")

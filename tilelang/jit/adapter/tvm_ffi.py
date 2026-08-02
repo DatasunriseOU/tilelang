@@ -49,6 +49,7 @@ from tilelang.jit.adapter._mlx_tvm_ffi import (
     prepared_metal_call as mlx_tvm_ffi_prepared_metal_call,
 )
 from tilelang.analysis.metal_graph_sync import make_tvm_ffi_metal_dependency_metadata
+import contextlib
 
 
 COMPILE_ARGS = {}
@@ -808,24 +809,23 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             # never from ``device_mod``, whose param order does not describe the
             # host wrapper's calling convention.
             compiled_param_names = None
-            if target_kind == "metal":
-                if hasattr(self, "device_kernel_source") and self.device_kernel_source:
-                    try:
-                        match = re.search(
-                            r"__global__\s+void\s+(?:__launch_bounds__\([^)]*\)\s+)?([a-zA-Z_0-9]+)\s*\(([^)]+)\)",
-                            self.device_kernel_source,
-                        )
-                        if match:
-                            params_str = match.group(2)
-                            names = []
-                            for param in params_str.split(","):
-                                param = param.strip()
-                                param_match = re.search(r"([a-zA-Z_0-9]+)\s*$", param)
-                                if param_match:
-                                    names.append(param_match.group(1))
-                            compiled_param_names = names
-                    except Exception:
-                        pass
+            if target_kind == "metal" and hasattr(self, "device_kernel_source") and self.device_kernel_source:
+                try:
+                    match = re.search(
+                        r"__global__\s+void\s+(?:__launch_bounds__\([^)]*\)\s+)?([a-zA-Z_0-9]+)\s*\(([^)]+)\)",
+                        self.device_kernel_source,
+                    )
+                    if match:
+                        params_str = match.group(2)
+                        names = []
+                        for param in params_str.split(","):
+                            param = param.strip()
+                            param_match = re.search(r"([a-zA-Z_0-9]+)\s*$", param)
+                            if param_match:
+                                names.append(param_match.group(1))
+                        compiled_param_names = names
+                except Exception:
+                    pass
 
             if (
                 target_kind == "metal"
@@ -888,10 +888,14 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                         r"extern\s+__shared__\s+.*buf_dyn_shmem\s*\[\s*\]",
                         self.device_kernel_source,
                     )
-                    if is_dynamic:
-                        if hasattr(self, "prim_func") and self.prim_func:
-                            if self.prim_func.attrs and "dyn_shared_memory_buf" in self.prim_func.attrs:
-                                dyn_shmem_size = int(self.prim_func.attrs["dyn_shared_memory_buf"])
+                    if (
+                        is_dynamic
+                        and hasattr(self, "prim_func")
+                        and self.prim_func
+                        and self.prim_func.attrs
+                        and "dyn_shared_memory_buf" in self.prim_func.attrs
+                    ):
+                        dyn_shmem_size = int(self.prim_func.attrs["dyn_shared_memory_buf"])
 
             if target_kind == "metal" and dyn_shmem_size > 0:
                 exec_tensor_list = list(exec_tensor_list) + [dyn_shmem_size]
@@ -1055,10 +1059,8 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             return [int(idx) for idx in attrs["tilelang_metal_zero_init_output_positions"]]
 
         source_parts = [source for source in (self.device_kernel_source, self.host_kernel_source) if isinstance(source, str)]
-        try:
+        with contextlib.suppress(Exception):
             source_parts.append(str(self.prim_func))
-        except Exception:
-            pass
         source = "\n".join(source_parts)
         if "atomic_add" not in source and "atomic_fetch_add" not in source:
             return []

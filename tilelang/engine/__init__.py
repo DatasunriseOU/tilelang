@@ -1,9 +1,10 @@
 try:
     from .lower import lower, is_device_call  # noqa: F401
-except Exception as _lower_import_error:
+except Exception as exc:
+    _LOWER_IMPORT_ERROR = exc
 
     def lower(*_args, **_kwargs):
-        raise RuntimeError("tilelang.engine.lower is unavailable in this checkout") from _lower_import_error
+        raise RuntimeError("tilelang.engine.lower is unavailable in this checkout") from _LOWER_IMPORT_ERROR
 
     def is_device_call(*_args, **_kwargs):
         return False

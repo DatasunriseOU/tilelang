@@ -95,9 +95,7 @@ def allow_tir_simplify(
     mod: IRModule | None = None,
     pass_ctx: PassContext | None = None,
 ) -> bool:
-    if mod is not None and _module_disables_tir_simplify(mod):
-        return False
-    return True
+    return not (mod is not None and _module_disables_tir_simplify(mod))
 
 
 def _maybe_simplify(

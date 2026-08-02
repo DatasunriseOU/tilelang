@@ -65,7 +65,7 @@ def test_static_bound_check_dropped():
 def test_symbolic_bound_check_dropped_via_z3():
     """Symbolic `for i in range(N): if i < N: ...` — default analyzer with
     kSymbolicBound (or Z3 fallback) proves; check dropped."""
-    N = T.symbolic("N", "int32")
+    N = T.symbolic("N", "int32")  # noqa: F841
 
     @T.prim_func
     def before(A: T.handle, B: T.handle, N_: T.int32):

@@ -56,7 +56,7 @@ def _make_fragment_var(name: str, dtype: str) -> tir.Var:
 def _make_fp8_gemm_func() -> tir.PrimFunc:
     """Build a minimal PrimFunc containing one ``tl.tileop.gemm`` with fp8
     inputs (``e4m3``) and an fp32 ``local.fragment`` accumulator."""
-    region_op = ir.Op.get("tir.tvm_access_ptr")  # placeholder for shape
+    _region_op = ir.Op.get("tir.tvm_access_ptr")  # placeholder for shape
     gemm_op = ir.Op.get("tl.tileop.gemm")
 
     M, N, K = 16, 16, 16

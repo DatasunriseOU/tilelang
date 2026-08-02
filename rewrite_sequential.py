@@ -14,8 +14,6 @@ def rewrite():
         print("Could not find start or end")
         return
 
-    old_method = content[start_idx:end_idx]
-
     new_method = """    def _emit_sequential_region(
         self, T: Any,
         region: List[Tuple[str, Tuple[Any, ...]]],
