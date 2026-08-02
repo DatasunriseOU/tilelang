@@ -187,10 +187,7 @@ def test_dependency_metadata_preserves_tir_param_names_and_result_positions():
         (0, "A", "read"),
         (2, "B", "read"),
     ]
-    assert [
-        (access.param_index, access.name, access.mode, access.result_position)
-        for access in metadata.output_accesses
-    ] == [
+    assert [(access.param_index, access.name, access.mode, access.result_position) for access in metadata.output_accesses] == [
         (1, "C", "write", 0),
         (3, "D", "write", 1),
     ]

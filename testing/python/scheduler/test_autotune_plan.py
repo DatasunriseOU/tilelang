@@ -94,12 +94,8 @@ def test_warm_schedule_profiles_only_legal_candidates_and_caches_hit():
 
 def test_warm_schedule_cache_invalidates_on_proof_or_codegen_hash_change():
     base = (_candidate("fast", config={"threads": 256}),)
-    changed_proof = (
-        _candidate("fast", config={"threads": 256}, proof_hash="proof-b"),
-    )
-    changed_codegen = (
-        _candidate("fast", config={"threads": 256}, codegen_hash="codegen-b"),
-    )
+    changed_proof = (_candidate("fast", config={"threads": 256}, proof_hash="proof-b"),)
+    changed_codegen = (_candidate("fast", config={"threads": 256}, codegen_hash="codegen-b"),)
     cache = {}
     profiled: list[str] = []
 

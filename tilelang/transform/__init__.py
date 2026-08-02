@@ -564,9 +564,7 @@ def FlattenBuffer():
     return _ffi_api.FlattenBuffer()  # type: ignore
 
 
-def MergeSharedMemoryAllocations(enable_aggressive_merge: bool = False,
-                                 align_bytes: int = 16,
-                                 disable_reuse: bool = False):
+def MergeSharedMemoryAllocations(enable_aggressive_merge: bool = False, align_bytes: int = 16, disable_reuse: bool = False):
     """MergeSharedMemoryAllocations
 
     Parameters
@@ -591,6 +589,7 @@ def MergeSharedMemoryAllocations(enable_aggressive_merge: bool = False,
     """
     if disable_reuse:
         import warnings
+
         warnings.warn(
             "MergeSharedMemoryAllocations(disable_reuse=True) is not yet "
             "honored: the vendored C++ pass predates the upstream "

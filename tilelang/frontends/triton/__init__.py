@@ -21,6 +21,7 @@ state (``OP_TABLE``, ``MLIR_WALKER_AVAILABLE``, MLIR alias bootstrap)
 lives in submodules of :mod:`poc.triton_frontend`, so re-exporting names
 does not duplicate it.
 """
+
 from __future__ import annotations
 
 from typing import Any, Optional, Tuple

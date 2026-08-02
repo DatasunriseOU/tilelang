@@ -61,10 +61,7 @@ def _tma_legality_z3_registered() -> bool:
 _Z3_LEGALITY_REGISTERED = _tma_legality_z3_registered()
 _z3_skip = pytest.mark.skipif(
     not _Z3_LEGALITY_REGISTERED,
-    reason=(
-        "PassConfig 'tl.tma_legality_z3' is not registered — "
-        "rebuild the tilelang C++ extension with Z3 idea #6"
-    ),
+    reason=("PassConfig 'tl.tma_legality_z3' is not registered — rebuild the tilelang C++ extension with Z3 idea #6"),
 )
 
 
@@ -79,11 +76,10 @@ def _build_program(M, N, block_M, block_N):
 
     @T.prim_func
     def main(
-            A: T.Tensor((M, N), "float16"),
-            B: T.Tensor((M, N), "float16"),
+        A: T.Tensor((M, N), "float16"),
+        B: T.Tensor((M, N), "float16"),
     ):
-        with T.Kernel(
-                T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_N), "float16")
             T.copy(A[by * block_M, bx * block_N], A_shared)
             T.copy(A_shared, B[by * block_M, bx * block_N])
@@ -97,11 +93,10 @@ def _build_program_with_offset(M, N, block_M, block_N, elem_offset_expr):
 
     @T.prim_func
     def main(
-            A: T.Tensor((M, N), "float16"),
-            B: T.Tensor((M, N), "float16"),
+        A: T.Tensor((M, N), "float16"),
+        B: T.Tensor((M, N), "float16"),
     ):
-        with T.Kernel(
-                T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_N), "float16")
             # Force a fixed elem_offset on the source view so the addr
             # alignment becomes a constant the Z3 helper must reason about.
@@ -118,8 +113,7 @@ def test_tma_legality_static_aligned_emits_tma():
     # M=1024, block_N=128 fp16 -> stride_bytes = 1024*2 = 2048, %16==0.
     program = _build_program(M=1024, N=1024, block_M=128, block_N=128)
     src = _device_source(program, **{"tl.tma_legality_z3": True})
-    assert ("tl::tma_load" in src or "tl::tma_store" in src), (
-        "Static aligned stride must admit TMA path even with Z3 legality on")
+    assert "tl::tma_load" in src or "tl::tma_store" in src, "Static aligned stride must admit TMA path even with Z3 legality on"
 
 
 @_z3_skip
@@ -130,8 +124,7 @@ def test_tma_legality_static_misaligned_falls_back():
     # eligibility check rejects this before Z3 is consulted.
     program = _build_program(M=128, N=15, block_M=16, block_N=15)
     src = _device_source(program, **{"tl.tma_legality_z3": True})
-    assert "tl::tma_load" not in src and "tl::tma_store" not in src, (
-        "Statically misaligned stride must NOT emit TMA bulk copy")
+    assert "tl::tma_load" not in src and "tl::tma_store" not in src, "Statically misaligned stride must NOT emit TMA bulk copy"
 
 
 @_z3_skip
@@ -144,8 +137,7 @@ def test_tma_legality_default_off_preserves_behavior():
     """
     program = _build_program(M=1024, N=1024, block_M=128, block_N=128)
     src = _device_source(program)  # default: tl.tma_legality_z3 = False
-    assert ("tl::tma_load" in src or "tl::tma_store" in src), (
-        "Default-off mode must preserve the historical TMA admission path")
+    assert "tl::tma_load" in src or "tl::tma_store" in src, "Default-off mode must preserve the historical TMA admission path"
 
 
 @_z3_skip
@@ -160,14 +152,9 @@ def test_tma_legality_addr_misaligned_falls_back():
     """
     # block_N=128 fp16 -> stride_bytes = 1024*2 = 2048 (aligned).
     # elem_offset = 17 elems = 34 bytes -> 34 % 16 == 2 (NOT aligned).
-    program = _build_program_with_offset(
-        M=1024, N=1024, block_M=128, block_N=128, elem_offset_expr=17
-    )
+    program = _build_program_with_offset(M=1024, N=1024, block_M=128, block_N=128, elem_offset_expr=17)
     src = _device_source(program, **{"tl.tma_legality_z3": True})
-    assert "tl::tma_load" not in src, (
-        "Misaligned addr (elem_offset=17 fp16 = 34B) must reject TMA "
-        "even when stride alone is aligned"
-    )
+    assert "tl::tma_load" not in src, "Misaligned addr (elem_offset=17 fp16 = 34B) must reject TMA even when stride alone is aligned"
 
 
 @_z3_skip
@@ -182,16 +169,12 @@ def test_tma_legality_symbolic_addr_with_alignment_proof():
     """
     # block_N=128 fp16 -> stride_bytes = 1024*2 = 2048 (aligned).
     # 8*bx fp16 elements = 16*bx bytes -> addr_bytes % 16 == 0 symbolically.
-    program = _build_program_with_offset(
-        M=1024, N=1024, block_M=128, block_N=128, elem_offset_expr=0
-    )
+    program = _build_program_with_offset(M=1024, N=1024, block_M=128, block_N=128, elem_offset_expr=0)
     src = _device_source(program, **{"tl.tma_legality_z3": True})
     # When elem_offset is statically zero the analyzer trivially decides
     # alignment without consulting Z3 — but the result must still be
     # "TMA emitted", because addr=0 is 16-aligned and stride is too.
-    assert ("tl::tma_load" in src or "tl::tma_store" in src), (
-        "Symbolic addr that is 16-byte aligned (zero offset) must admit TMA"
-    )
+    assert "tl::tma_load" in src or "tl::tma_store" in src, "Symbolic addr that is 16-byte aligned (zero offset) must admit TMA"
 
 
 def test_tma_legality_z3_query_shape():
@@ -220,9 +203,7 @@ def test_tma_legality_z3_query_shape():
     # 2^48, NOT 2^40 — H100 supports 49-bit VAs and the prior 2^40 bound
     # was too conservative for kernels touching the upper VA range.
     assert expected_va_envelope == (1 << 48)
-    assert expected_va_envelope > (1 << 40), (
-        "VA envelope must be widened from the original 2^40 bound"
-    )
+    assert expected_va_envelope > (1 << 40), "VA envelope must be widened from the original 2^40 bound"
 
 
 def test_tma_legality_z3_passconfig_registered():
@@ -233,11 +214,9 @@ def test_tma_legality_z3_passconfig_registered():
     clear, single-line failure rather than a swarm of skips.
     """
     if not _Z3_LEGALITY_REGISTERED:
-        pytest.fail(
-            "PassConfig 'tl.tma_legality_z3' is not registered — "
-            "rebuild the tilelang C++ extension."
-        )
+        pytest.fail("PassConfig 'tl.tma_legality_z3' is not registered — rebuild the tilelang C++ extension.")
     from tvm.ir.transform import PassContext
+
     assert "tl.tma_legality_z3" in PassContext.list_configs()
 
 

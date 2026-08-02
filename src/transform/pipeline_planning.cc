@@ -1,7 +1,7 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tirx/analysis.h>
 #include <tvm/s_tir/analysis.h>
+#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
@@ -17,9 +17,9 @@
 #include <algorithm>
 #include <functional>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <queue>
-#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -63,8 +63,7 @@ public:
 private:
   void VisitExpr_(const BufferLoadNode *op) {
     Buffer buf = op->buffer;
-    const auto *ptr_type =
-        buf->data->type_annotation.as<PointerTypeNode>();
+    const auto *ptr_type = buf->data->type_annotation.as<PointerTypeNode>();
     if (ptr_type && ptr_type->storage_scope == "shared") {
       // We only care about shared.tmem buffers
       ICHECK(!result.defined())
@@ -957,8 +956,9 @@ private:
   PipelineStageInfo
   MakePipelineStageInfo(Stmt stmt, int idx,
                         AsyncDependencyChainBuilder &chain_builder) {
-    SBlock block(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{}, /*name_hint=*/"",
-                /*body*/ std::move(stmt));
+    SBlock block(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{},
+                 /*name_hint=*/"",
+                 /*body*/ std::move(stmt));
     Array<Array<BufferRegion>> access =
         s_tir::GetSBlockReadWriteRegion(block, buffer_data_to_buffer_);
     auto collector =
@@ -1975,8 +1975,10 @@ private:
       stages.push_back(pinfo.stage);
     }
 
-    annotations.Set(tirx::attr::software_pipeline_stage, Array<Integer>(stages));
-    annotations.Set(tirx::attr::software_pipeline_order, Array<Integer>(orders));
+    annotations.Set(tirx::attr::software_pipeline_stage,
+                    Array<Integer>(stages));
+    annotations.Set(tirx::attr::software_pipeline_order,
+                    Array<Integer>(orders));
 
     // Propagate per-statement TMA eligibility so InjectSoftwarePipeline can
     // rewrite TMA copies to use pipeline-level barrier management.
@@ -2078,9 +2080,9 @@ private:
       Stmt rebuilt_inner =
           RebuildBodyWrapper(block->body, pipeline_body_seq, new_body_seq);
       SBlock new_block(block->iter_vars, block->reads, block->writes,
-                      block->name_hint, rebuilt_inner, block->init,
-                      block->alloc_buffers, block->match_buffers,
-                      block->annotations);
+                       block->name_hint, rebuilt_inner, block->init,
+                       block->alloc_buffers, block->match_buffers,
+                       block->annotations);
       new_loop_body =
           SBlockRealize(realize->iter_values, realize->predicate, new_block);
     } else {

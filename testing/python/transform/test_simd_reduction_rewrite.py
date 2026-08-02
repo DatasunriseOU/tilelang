@@ -29,13 +29,8 @@ from tvm.target import Target
 
 def _load_worktree_module():
     here = os.path.dirname(os.path.abspath(__file__))
-    candidate = os.path.normpath(
-        os.path.join(here, "..", "..", "..", "tilelang", "transform",
-                     "metal_simd_lift.py")
-    )
-    spec = importlib.util.spec_from_file_location(
-        "_worktree_metal_simd_lift_rw", candidate
-    )
+    candidate = os.path.normpath(os.path.join(here, "..", "..", "..", "tilelang", "transform", "metal_simd_lift.py"))
+    spec = importlib.util.spec_from_file_location("_worktree_metal_simd_lift_rw", candidate)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
@@ -44,9 +39,7 @@ def _load_worktree_module():
 
 metal_simd_lift = _load_worktree_module()
 rewrite_reductions = metal_simd_lift.rewrite_reductions
-rewrite_reductions_to_thread_allreduce = (
-    metal_simd_lift.rewrite_reductions_to_thread_allreduce
-)
+rewrite_reductions_to_thread_allreduce = metal_simd_lift.rewrite_reductions_to_thread_allreduce
 count_shfl_xor_calls = metal_simd_lift.count_shfl_xor_calls
 count_thread_allreduce_calls = metal_simd_lift.count_thread_allreduce_calls
 detect_candidates = metal_simd_lift.detect_candidates
@@ -58,6 +51,7 @@ LOOP_ANNOTATION_KEY = metal_simd_lift.LOOP_ANNOTATION_KEY
 # ---------------------------------------------------------------------------
 # Pure helpers (no TIR construction)
 # ---------------------------------------------------------------------------
+
 
 def test_butterfly_stages_32():
     assert _butterfly_stages(32) == [16, 8, 4, 2, 1]
@@ -79,6 +73,7 @@ def test_butterfly_stages_1_or_0():
 # ---------------------------------------------------------------------------
 # IR rewrite tests
 # ---------------------------------------------------------------------------
+
 
 def _build_annotated_reduction(extent: int, op: str = "add"):
     """Build a PrimFunc with a reduction loop carrying the butterfly anno."""
@@ -219,29 +214,20 @@ def test_default_off_preserves_behavior():
 def test_pass_on_non_metal_target_preserves_behavior():
     """Even with PassConfig ON, a non-metal target must not be rewritten."""
     from tvm.target import Target
-    func = _build_annotated_reduction(16, op="add").with_attr(
-        "global_symbol", "main"
-    )
+
+    func = _build_annotated_reduction(16, op="add").with_attr("global_symbol", "main")
     mod = tvm.IRModule.from_expr(func)
-    with tvm.transform.PassContext(
-        config={metal_simd_lift.PASS_CONFIG_KEY: True}
-    ):
-        with Target("cuda"):
-            out = metal_simd_lift.MetalSimdLiftReductions(mod)
+    with tvm.transform.PassContext(config={metal_simd_lift.PASS_CONFIG_KEY: True}), Target("cuda"):
+        out = metal_simd_lift.MetalSimdLiftReductions(mod)
     # On non-metal: pass returns func unchanged.
     tvm.ir.assert_structural_equal(out["main"], mod["main"], True)
 
 
 def test_pass_on_metal_target_prefers_semantic_thread_allreduce():
-    func = _build_annotated_reduction(16, op="add").with_attr(
-        "global_symbol", "main"
-    )
+    func = _build_annotated_reduction(16, op="add").with_attr("global_symbol", "main")
     mod = tvm.IRModule.from_expr(func)
-    with tvm.transform.PassContext(
-        config={metal_simd_lift.PASS_CONFIG_KEY: True}
-    ):
-        with Target("metal"):
-            out = metal_simd_lift.MetalSimdLiftReductions(mod)
+    with tvm.transform.PassContext(config={metal_simd_lift.PASS_CONFIG_KEY: True}), Target("metal"):
+        out = metal_simd_lift.MetalSimdLiftReductions(mod)
     assert count_thread_allreduce_calls(out["main"]) == 1
     assert count_shfl_xor_calls(out["main"]) == 0
     payload = json.loads(out["main"].attrs["tl.reduction_plans"].value)
@@ -256,15 +242,10 @@ def test_pass_on_metal_target_prefers_semantic_thread_allreduce():
 
 
 def test_pass_records_machine_readable_reduction_rewrite_diagnostics():
-    func = _build_annotated_reduction(64, op="add").with_attr(
-        "global_symbol", "main"
-    )
+    func = _build_annotated_reduction(64, op="add").with_attr("global_symbol", "main")
     mod = tvm.IRModule.from_expr(func)
-    with tvm.transform.PassContext(
-        config={metal_simd_lift.PASS_CONFIG_KEY: True}
-    ):
-        with Target("metal"):
-            out = metal_simd_lift.MetalSimdLiftReductions(mod)
+    with tvm.transform.PassContext(config={metal_simd_lift.PASS_CONFIG_KEY: True}), Target("metal"):
+        out = metal_simd_lift.MetalSimdLiftReductions(mod)
     payload = json.loads(out["main"].attrs["tl.reduction_rewrite_diagnostics"].value)
     assert payload == [
         {
@@ -280,15 +261,10 @@ def test_pass_records_machine_readable_reduction_rewrite_diagnostics():
 
 
 def test_pass_preserves_semantic_diagnostic_when_backend_fallback_rewrites():
-    func = _build_annotated_reduction(16, op="max").with_attr(
-        "global_symbol", "main"
-    )
+    func = _build_annotated_reduction(16, op="max").with_attr("global_symbol", "main")
     mod = tvm.IRModule.from_expr(func)
-    with tvm.transform.PassContext(
-        config={metal_simd_lift.PASS_CONFIG_KEY: True}
-    ):
-        with Target("metal"):
-            out = metal_simd_lift.MetalSimdLiftReductions(mod)
+    with tvm.transform.PassContext(config={metal_simd_lift.PASS_CONFIG_KEY: True}), Target("metal"):
+        out = metal_simd_lift.MetalSimdLiftReductions(mod)
     assert count_thread_allreduce_calls(out["main"]) == 0
     assert count_shfl_xor_calls(out["main"]) == 4
     payload = json.loads(out["main"].attrs["tl.reduction_rewrite_diagnostics"].value)
@@ -298,6 +274,7 @@ def test_pass_preserves_semantic_diagnostic_when_backend_fallback_rewrites():
 # ---------------------------------------------------------------------------
 # Direct shfl_xor_sync emission shape
 # ---------------------------------------------------------------------------
+
 
 def test_butterfly_uses_decreasing_shifts():
     """Verify the butterfly emits shifts in [16, 8, 4, 2, 1] order."""

@@ -14,7 +14,8 @@
 
 #include "arith/pattern_match.h"
 // CPPMEGA: tvm/node/{functor,repr_printer}.h removed in apache/tvm latest.
-// ReprPrinter dispatchers below have been removed; debug printing will fall back to default.
+// ReprPrinter dispatchers below have been removed; debug printing will fall
+// back to default.
 #include "utils.h"
 
 namespace tvm {
@@ -1061,8 +1062,9 @@ void FragmentNode::RegisterReflection() {
       .def("_DebugOutput", &FragmentNode::DebugOutput);
 }
 
-// CPPMEGA: ReprPrinter removed in apache/tvm latest. Layout/Fragment debug printing
-// is no longer hooked to operator<<; call DebugOutput() directly when needed.
+// CPPMEGA: ReprPrinter removed in apache/tvm latest. Layout/Fragment debug
+// printing is no longer hooked to operator<<; call DebugOutput() directly when
+// needed.
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;

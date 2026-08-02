@@ -64,17 +64,17 @@ private:
     Array<Buffer> alloc_buffers = op->alloc_buffers;
 
     // Record the mapping from buffer data var to buffer for later lookup
-    for (const auto& buffer : alloc_buffers) {
+    for (const auto &buffer : alloc_buffers) {
       buffer_map_.insert({buffer->data, buffer});
     }
-    for (const auto& match_buffer : op->match_buffers) {
+    for (const auto &match_buffer : op->match_buffers) {
       buffer_map_.insert({match_buffer->buffer->data, match_buffer->buffer});
     }
 
     // Only check buffers allocated in THIS block, not accumulated from parent
     // blocks
     Array<Buffer> barrier_buffers;
-    for (const auto& buffer : alloc_buffers) {
+    for (const auto &buffer : alloc_buffers) {
       const auto *ptr_type =
           buffer->data->type_annotation.as<PointerTypeNode>();
       if (!ptr_type)
@@ -96,7 +96,7 @@ private:
 
     ICHECK(thread_var_.defined()) << "thread_var_ is not defined";
 
-    for (const auto& buffer : barrier_buffers) {
+    for (const auto &buffer : barrier_buffers) {
       buffer_data_to_buffer_.Set(buffer->data, buffer);
     }
 
@@ -128,7 +128,7 @@ private:
     // Create init calls for each barrier buffer
     // Initialize each barrier element with its respective arrive count
     Array<Stmt> init_mbarrier_calls_;
-    for (const auto& buffer : barrier_buffers) {
+    for (const auto &buffer : barrier_buffers) {
       auto data = buffer->data;
       ICHECK(barrier_init_map.count(data))
           << "Barrier buffer " << buffer->name
@@ -138,8 +138,7 @@ private:
       ICHECK(shape_imm)
           << "Barrier buffer shape[0] must be a constant integer for buffer "
           << buffer->name;
-      ICHECK(arrive_counts.size() ==
-             static_cast<size_t>(shape_imm->value))
+      ICHECK(arrive_counts.size() == static_cast<size_t>(shape_imm->value))
           << "The number of arrive counts (" << arrive_counts.size()
           << ") must match the barrier buffer size (" << buffer->shape[0]
           << ") for buffer " << buffer->name;

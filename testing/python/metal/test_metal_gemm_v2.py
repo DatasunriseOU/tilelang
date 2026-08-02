@@ -153,8 +153,7 @@ def matmul_gemm_rs(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dt
 def test_gemm_rs_staged_shared_16x16x16():
     M = N = K = 64
     block_M = block_N = block_K = 16
-    jit_kernel = tilelang.compile(
-        matmul_gemm_rs(M, N, K, block_M, block_N, block_K), target="metal", out_idx=None)
+    jit_kernel = tilelang.compile(matmul_gemm_rs(M, N, K, block_M, block_N, block_K), target="metal", out_idx=None)
     a = torch.randn(M, K, dtype=torch.float16, device="mps")
     b = torch.randn(K, N, dtype=torch.float16, device="mps")
     c = torch.zeros(M, N, dtype=torch.float32, device="mps")
@@ -185,15 +184,16 @@ def _is_apple_m5_or_newer():
     xcrun metal compile time.  See PR tile-ai/tilelang#2252."""
     import platform
     import subprocess
+
     if platform.system() != "Darwin":
         return False
     try:
-        cpu = subprocess.check_output(
-            ["sysctl", "-n", "machdep.cpu.brand_string"]).decode().strip()
+        cpu = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"]).decode().strip()
     except Exception:
         return False
     # "Apple M5", "Apple M5 Max", "Apple M6", ... but NOT "Apple M4", M3, M2, M1.
     import re
+
     m = re.search(r"Apple M(\d+)", cpu)
     if not m:
         return False
@@ -206,10 +206,12 @@ def test_gemm_v2_cooperative_tensor_non_square():
     (PR tile-ai/tilelang#2252).  Skips on M1-M4 because the kernel uses
     ``mpp::tensor_ops::matmul2d`` from Metal 4."""
     import pytest
+
     if not _is_apple_m5_or_newer():
         pytest.skip("metal.cooperative_tensor T.gemm requires Apple M5+ silicon")
     # Also requires the MSL4 compile callback to be wired.
     from tilelang.engine.callback import register_default_metal_compile_callback
+
     register_default_metal_compile_callback(override=True)
     assert_gemm_v2(128, 128, 128, 32, 64, 32)
 

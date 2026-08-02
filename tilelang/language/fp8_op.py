@@ -100,7 +100,8 @@ Public attribution
 from __future__ import annotations
 
 import os
-from typing import Iterable, Optional
+from typing import Optional
+from collections.abc import Iterable
 
 from tilelang import tvm as _tvm  # noqa: F401
 import tilelang.language as T
@@ -115,6 +116,7 @@ from tvm.target import Target
 # static fast path discharges the predicate in plain Python).
 try:
     import z3 as _z3  # type: ignore
+
     _Z3_AVAILABLE = True
 except ImportError:  # pragma: no cover - exercised when z3-solver isn't installed
     _z3 = None  # type: ignore
@@ -170,9 +172,7 @@ def assert_metal_fp8_intrinsics_registered(
         try:
             from tilelang.tvm.ir import Op  # type: ignore
         except Exception as exc:
-            raise RuntimeError(
-                "Metal FP8 intrinsic check requires TVM, but TVM is not importable"
-            ) from exc
+            raise RuntimeError("Metal FP8 intrinsic check requires TVM, but TVM is not importable") from exc
 
     missing: list[str] = []
     for name in tuple(required_ops or METAL_FP8_INTRINSIC_OPS):
@@ -181,10 +181,7 @@ def assert_metal_fp8_intrinsics_registered(
         except Exception:
             missing.append(name)
     if missing:
-        raise RuntimeError(
-            "TileLang Metal FP8 intrinsics are not registered by the backend: "
-            + ", ".join(missing)
-        )
+        raise RuntimeError("TileLang Metal FP8 intrinsics are not registered by the backend: " + ", ".join(missing))
 
 
 def metal_fp8_e4m3_dot4(a_ptr, b_ptr, a_word_idx, b_word_idx):
@@ -538,15 +535,11 @@ def _z3_prove_dot4_legal(
             # path lowers to LUT-decoded fp32 arithmetic, so late Metal lowering
             # passes require_int24_safe=False and uses only layout legality.
             from tilelang.analysis.int24_overflow_proof import prove_dot4_int24_safe
+
             if not prove_dot4_int24_safe(ka):
                 return False, f"static: int24 overflow at K={ka} (K*127*127 >= 2^23)"
-        accumulation_reason = (
-            "int24 safe" if require_int24_safe else "fp32 helper accumulation"
-        )
-        return True, (
-            f"static fast path: K={ka}, strides=(1,1), "
-            f"addrs=({aa}%4=0,{ab}%4=0), {accumulation_reason}"
-        )
+        accumulation_reason = "int24 safe" if require_int24_safe else "fp32 helper accumulation"
+        return True, (f"static fast path: K={ka}, strides=(1,1), addrs=({aa}%4=0,{ab}%4=0), {accumulation_reason}")
 
     # ----- Symbolic / Z3 fallback -------------------------------------------
     # If z3 isn't installed in this interpreter we MUST fall back to the
@@ -564,8 +557,7 @@ def _z3_prove_dot4_legal(
         if _v and _v != "0":
             return (
                 False,
-                f"z3 dot4-legality gated off by {_gate_var}; "
-                "keeping legacy macro path",
+                f"z3 dot4-legality gated off by {_gate_var}; keeping legacy macro path",
             )
 
     # Note: the Python-side ``tvm.arith.Z3Prover`` bridge described in the
@@ -592,8 +584,12 @@ def _z3_prove_dot4_legal(
         # is responsible for any tighter range invariants -- we add only the
         # bare-minimum non-negativity / BV32 emulation below.
         for slot, py_val in (
-            (ka_v, K_a), (kb_v, K_b), (sa_v, stride_a), (sb_v, stride_b),
-            (aa_v, addr_a), (ab_v, addr_b),
+            (ka_v, K_a),
+            (kb_v, K_b),
+            (sa_v, stride_a),
+            (sb_v, stride_b),
+            (aa_v, addr_a),
+            (ab_v, addr_b),
         ):
             cv = _const_int_value(py_val)
             if cv is not None:
@@ -620,8 +616,10 @@ def _z3_prove_dot4_legal(
         s.add(
             ka_v > 0,
             kb_v > 0,
-            sa_v > 0, sa_v < _DOT4_MAX_STRIDE,
-            sb_v > 0, sb_v < _DOT4_MAX_STRIDE,
+            sa_v > 0,
+            sa_v < _DOT4_MAX_STRIDE,
+            sb_v > 0,
+            sb_v < _DOT4_MAX_STRIDE,
         )
 
         legality = _z3.And(
@@ -647,15 +645,11 @@ def _z3_prove_dot4_legal(
                 # legacy scalar path. If K is constant or pinned the int24
                 # prover discharges the overflow obligation in plain Python.
                 from tilelang.analysis.int24_overflow_proof import prove_dot4_int24_safe
+
                 int24_ok = prove_dot4_int24_safe(K_a)
                 if not int24_ok:
-                    return False, (
-                        "z3 proved dot4 alignment but int24 overflow proof failed; "
-                        "falling back to scalar accumulator"
-                    )
-            accumulation_reason = (
-                "int24 safe" if require_int24_safe else "fp32 helper accumulation"
-            )
+                    return False, ("z3 proved dot4 alignment but int24 overflow proof failed; falling back to scalar accumulator")
+            accumulation_reason = "int24 safe" if require_int24_safe else "fp32 helper accumulation"
             return True, (
                 "z3 proved dot4 legal under symbolic constraints "
                 f"(timeout={_Z3_DOT4_TIMEOUT_MS}ms, "
@@ -706,7 +700,14 @@ def _z3_prove_dot4_legal_for_buffers(
         return False, "buffer elem_offset is symbolic"
 
     return _z3_prove_dot4_legal(
-        K_a, K_b, a_stride, b_stride, a_off, b_off, A_fp8, B_fp8,
+        K_a,
+        K_b,
+        a_stride,
+        b_stride,
+        a_off,
+        b_off,
+        A_fp8,
+        B_fp8,
     )
 
 
@@ -718,30 +719,18 @@ def _normalize_block_scale_layout(
 ) -> BlockScaledLayout | None:
     if block_scale_layout is not None:
         if not isinstance(block_scale_layout, BlockScaledLayout):
-            raise TypeError(
-                "T.fp8_scaled_matmul block_scale_layout must be a "
-                "T.BlockScaledLayout instance"
-            )
+            raise TypeError("T.fp8_scaled_matmul block_scale_layout must be a T.BlockScaledLayout instance")
         if scale_format is not None and scale_format != block_scale_layout.scale_format:
-            raise ValueError(
-                "T.fp8_scaled_matmul scale_format conflicts with block_scale_layout"
-            )
+            raise ValueError("T.fp8_scaled_matmul scale_format conflicts with block_scale_layout")
         if scale_block_size is not None and int(scale_block_size) != block_scale_layout.block_size:
-            raise ValueError(
-                "T.fp8_scaled_matmul scale_block_size conflicts with block_scale_layout"
-            )
+            raise ValueError("T.fp8_scaled_matmul scale_block_size conflicts with block_scale_layout")
         return block_scale_layout
     if scale_format is None and scale_block_size is None:
         return None
     if scale_format != E8M0_BLOCK_K32:
-        raise ValueError(
-            "T.fp8_scaled_matmul e8m0 block-scale metadata requires "
-            "scale_format='e8m0_block_k32'"
-        )
+        raise ValueError("T.fp8_scaled_matmul e8m0 block-scale metadata requires scale_format='e8m0_block_k32'")
     if scale_block_size is None or int(scale_block_size) != E8M0_BLOCK_SIZE:
-        raise ValueError(
-            "T.fp8_scaled_matmul e8m0_block_k32 metadata requires scale_block_size=32"
-        )
+        raise ValueError("T.fp8_scaled_matmul e8m0_block_k32 metadata requires scale_block_size=32")
     return BlockScaledLayout.e8m0_k32()
 
 
@@ -780,13 +769,9 @@ def _validate_buffers(
     sb_dtype = str(getattr(B_scale, "dtype", "")) if hasattr(B_scale, "dtype") else ""
 
     if not _is_fp8_dtype(A_dtype):
-        raise TypeError(
-            f"T.fp8_scaled_matmul: A_fp8 must be FP8 (e4m3 or e5m2), got dtype={A_dtype!r}"
-        )
+        raise TypeError(f"T.fp8_scaled_matmul: A_fp8 must be FP8 (e4m3 or e5m2), got dtype={A_dtype!r}")
     if not _is_fp8_dtype(B_dtype):
-        raise TypeError(
-            f"T.fp8_scaled_matmul: B_fp8 must be FP8 (e4m3 or e5m2), got dtype={B_dtype!r}"
-        )
+        raise TypeError(f"T.fp8_scaled_matmul: B_fp8 must be FP8 (e4m3 or e5m2), got dtype={B_dtype!r}")
     scale_prefixes = ("float32", "float16", "bfloat")
     if block_scale_layout is not None:
         scale_prefixes = ("uint8",)
@@ -799,9 +784,7 @@ def _validate_buffers(
             f"T.fp8_scaled_matmul: B_scale must be a {'uint8 E8M0 block-scale' if block_scale_layout is not None else 'floating-point scalar'} buffer, got dtype={sb_dtype!r}"
         )
     if C_dtype and not (C_dtype.startswith("float32") or C_dtype.startswith("float16") or C_dtype == "bfloat16"):
-        raise TypeError(
-            f"T.fp8_scaled_matmul: C output must be float32 / float16 / bfloat16 (got {C_dtype!r})"
-        )
+        raise TypeError(f"T.fp8_scaled_matmul: C output must be float32 / float16 / bfloat16 (got {C_dtype!r})")
 
     A_shape = getattr(A_fp8, "shape", None)
     B_shape = getattr(B_fp8, "shape", None)
@@ -809,9 +792,7 @@ def _validate_buffers(
     if A_shape is None or B_shape is None or C_shape is None:
         return  # opaque buffer types — defer to runtime
     if len(A_shape) < 2 or len(B_shape) < 2 or len(C_shape) < 2:
-        raise ValueError(
-            "T.fp8_scaled_matmul: operands must be at least 2D"
-        )
+        raise ValueError("T.fp8_scaled_matmul: operands must be at least 2D")
 
     M = _shape_extent(A_fp8, 0)
     K = _shape_extent(A_fp8, 1)
@@ -824,20 +805,16 @@ def _validate_buffers(
     M_c = _shape_extent(C_out, 0)
     N_c = _shape_extent(C_out, 1)
 
-    if K > 0 and K_b > 0 and K != K_b:
+    if K > 0 and K_b > 0 and K_b != K:
         raise ValueError(
             f"T.fp8_scaled_matmul: K mismatch — A is {M}x{K}, "
             f"B is {'NxK' if transpose_B else 'KxN'} = {K_b}x{N}; "
             "the contracted dimension must agree"
         )
-    if M > 0 and M_c > 0 and M != M_c:
-        raise ValueError(
-            f"T.fp8_scaled_matmul: M mismatch — A has {M} rows but C has {M_c} rows"
-        )
-    if N > 0 and N_c > 0 and N != N_c:
-        raise ValueError(
-            f"T.fp8_scaled_matmul: N mismatch — B has {N} columns but C has {N_c} columns"
-        )
+    if M > 0 and M_c > 0 and M_c != M:
+        raise ValueError(f"T.fp8_scaled_matmul: M mismatch — A has {M} rows but C has {M_c} rows")
+    if N > 0 and N_c > 0 and N_c != N:
+        raise ValueError(f"T.fp8_scaled_matmul: N mismatch — B has {N} columns but C has {N_c} columns")
 
     sa_size = _shape_extent(A_scale, 0)
     sb_size = _shape_extent(B_scale, 0)
@@ -859,48 +836,28 @@ def _validate_buffers(
             n_extent=N,
         )
         return
-    if (
-        M > 0
-        and sa_size > 0
-        and sa_size != 1
-        and sa_size != M
-        and sa_size < M
-    ):
+    if M > 0 and sa_size > 0 and sa_size != 1 and sa_size != M and sa_size < M:
         raise ValueError(
             f"T.fp8_scaled_matmul: A_scale must be per-tensor (size 1) or "
             f"per-row for the local tile (size M={M}); got size {sa_size}. "
             "Pass a_scale_offset when using a larger global scale buffer."
         )
     if M > 0 and sa_size > M and a_scale_offset is None:
-        raise ValueError(
-            f"T.fp8_scaled_matmul: A_scale has global size {sa_size} for local tile M={M}; "
-            "pass a_scale_offset explicitly."
-        )
-    if (
-        N > 0
-        and sb_size > 0
-        and sb_size != 1
-        and sb_size != N
-        and sb_size < N
-    ):
+        raise ValueError(f"T.fp8_scaled_matmul: A_scale has global size {sa_size} for local tile M={M}; pass a_scale_offset explicitly.")
+    if N > 0 and sb_size > 0 and sb_size != 1 and sb_size != N and sb_size < N:
         raise ValueError(
             f"T.fp8_scaled_matmul: B_scale must be per-tensor (size 1) or "
             f"per-col for the local tile (size N={N}); got size {sb_size}. "
             "Pass b_scale_offset when using a larger global scale buffer."
         )
     if N > 0 and sb_size > N and b_scale_offset is None:
-        raise ValueError(
-            f"T.fp8_scaled_matmul: B_scale has global size {sb_size} for local tile N={N}; "
-            "pass b_scale_offset explicitly."
-        )
+        raise ValueError(f"T.fp8_scaled_matmul: B_scale has global size {sb_size} for local tile N={N}; pass b_scale_offset explicitly.")
 
     # accum_dtype currently must be wider than FP8; we don't accept FP16
     # accumulators because the scaled-FMA reference always accumulates in
     # FP32 (the scales themselves are typically out-of-range for FP16).
     if accum_dtype not in ("float32", "float", "float64"):
-        raise ValueError(
-            f"T.fp8_scaled_matmul: accum_dtype must be float32 (or wider); got {accum_dtype!r}"
-        )
+        raise ValueError(f"T.fp8_scaled_matmul: accum_dtype must be float32 (or wider); got {accum_dtype!r}")
 
 
 def _as_tile_region_arg(buffer, access_type: str):
@@ -1208,9 +1165,7 @@ def _fp8_scaled_matmul_trans_b_direct_metal_macro(
 # The legacy macro now emits semantic `thread_allreduce_sum`; the Metal backend
 # lowers that reduction to `simd_sum` during final codegen.
 @T.macro
-def _fp8_scaled_matmul_m1_vecmat_metal_macro_legacy(
-    A_fp8, A_scale, B_fp8, B_scale, C_local
-):
+def _fp8_scaled_matmul_m1_vecmat_metal_macro_legacy(A_fp8, A_scale, B_fp8, B_scale, C_local):
     """Metal M=1 vecmat path: 32 lanes reduce K with ``simd_sum``.
 
     Only dispatched for ``transpose_B=True`` and ``A.shape[0] == 1`` when no
@@ -1356,7 +1311,11 @@ def fp8_scaled_matmul(
     if inferred_b_scale_offset is None and c_col_offset is not None:
         inferred_b_scale_offset = c_col_offset
     _validate_buffers(
-        A_fp8, A_scale, B_fp8, B_scale, C_out,
+        A_fp8,
+        A_scale,
+        B_fp8,
+        B_scale,
+        C_out,
         transpose_B=transpose_B,
         accum_dtype=accum_dtype,
         block_scale_layout=layout,
@@ -1414,23 +1373,21 @@ def fp8_scaled_matmul(
         and _dot4_intrinsics_registered()
     ):
         proved, _reason = _z3_prove_dot4_legal_for_buffers(
-            A_fp8, B_fp8, transpose_B=transpose_B,
+            A_fp8,
+            B_fp8,
+            transpose_B=transpose_B,
         )
         if proved:
             sgw = simd_group_width
             if sgw is None:
                 sgw = _target_thread_warp_size(target)
             if int(sgw) <= 0:
-                raise ValueError(
-                    f"T.fp8_scaled_matmul: simd_group_width must be positive, got {sgw!r}"
-                )
+                raise ValueError(f"T.fp8_scaled_matmul: simd_group_width must be positive, got {sgw!r}")
             opb = outputs_per_block
             if opb is None:
                 opb = _shape_extent(B_fp8, 0)
             if int(opb) <= 0:
-                raise ValueError(
-                    f"T.fp8_scaled_matmul: outputs_per_block must be positive, got {opb!r}"
-                )
+                raise ValueError(f"T.fp8_scaled_matmul: outputs_per_block must be positive, got {opb!r}")
             return _fp8_scaled_matmul_m1_vecmat_metal_macro(
                 A_fp8,
                 A_scale,
@@ -1451,16 +1408,8 @@ def fp8_scaled_matmul(
     # which are not registered in apache TVM, so it only fires when the
     # direct-global-store offsets opt the caller into that fast path, OR
     # when the Z3 idea #10 prover above proved legality.
-    if (
-        layout is None
-        and transpose_B
-        and not direct_global_store
-        and _allows_metal_fast_path(target)
-        and _shape_extent(A_fp8, 0) == 1
-    ):
-        return _fp8_scaled_matmul_m1_vecmat_metal_macro_legacy(
-            A_fp8, A_scale, B_fp8, B_scale, C_out
-        )
+    if layout is None and transpose_B and not direct_global_store and _allows_metal_fast_path(target) and _shape_extent(A_fp8, 0) == 1:
+        return _fp8_scaled_matmul_m1_vecmat_metal_macro_legacy(A_fp8, A_scale, B_fp8, B_scale, C_out)
 
     if (
         layout is None
@@ -1476,15 +1425,11 @@ def fp8_scaled_matmul(
         if simd_group_width is None:
             simd_group_width = _target_thread_warp_size(target)
         if int(simd_group_width) <= 0:
-            raise ValueError(
-                f"T.fp8_scaled_matmul: simd_group_width must be positive, got {simd_group_width!r}"
-            )
+            raise ValueError(f"T.fp8_scaled_matmul: simd_group_width must be positive, got {simd_group_width!r}")
         if outputs_per_block is None:
             outputs_per_block = _shape_extent(B_fp8, 0)
         if int(outputs_per_block) <= 0:
-            raise ValueError(
-                f"T.fp8_scaled_matmul: outputs_per_block must be positive, got {outputs_per_block!r}"
-            )
+            raise ValueError(f"T.fp8_scaled_matmul: outputs_per_block must be positive, got {outputs_per_block!r}")
         if direct_global_store:
             return _fp8_scaled_matmul_m1_vecmat_metal_direct_macro(
                 A_fp8,
@@ -1525,9 +1470,7 @@ def fp8_scaled_matmul(
         if outputs_per_block is None:
             outputs_per_block = _shape_extent(B_fp8, 0)
         if int(outputs_per_block) <= 0:
-            raise ValueError(
-                f"T.fp8_scaled_matmul: outputs_per_block must be positive, got {outputs_per_block!r}"
-            )
+            raise ValueError(f"T.fp8_scaled_matmul: outputs_per_block must be positive, got {outputs_per_block!r}")
         return _fp8_scaled_matmul_trans_b_direct_metal_macro(
             A_fp8,
             A_scale,

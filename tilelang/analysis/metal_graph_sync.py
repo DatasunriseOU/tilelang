@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import itertools
 import weakref
-from typing import Any, Literal, Sequence
+from typing import Any, Literal
+from collections.abc import Sequence
 
 from tilelang.analysis.metal_sync_proof import plan_metal_buffer_sync
 
@@ -27,7 +28,7 @@ _DEFAULT_COMMAND_BUFFER_DOMAIN = ("mlx_tvm_ffi", "default_metal_stream")
 # leaving its consumer with no device-event edge -> the consumer kernel reads the
 # buffer before the producer kernel has finished -> NaN / wrong output.
 _PRODUCER_GENERATION = itertools.count(1)
-_PRODUCERS: dict[int, "_ProducerEntry"] = {}
+_PRODUCERS: dict[int, _ProducerEntry] = {}
 
 
 MetalBufferAccessMode = Literal["read", "write"]
@@ -76,7 +77,7 @@ class _ProducerEntry:
     id-reusing lookup can ever act on a slot that a newer call has replaced.
     """
 
-    ref: "weakref.ref[Any]"
+    ref: weakref.ref[Any]
     record: MetalProducerRecord
     generation: int
 
@@ -275,14 +276,9 @@ def _sync_decision_from_plan(
 ) -> MetalLaunchSyncDecision:
     plan = plan_metal_buffer_sync(
         may_alias=True,
-        same_command_buffer=(
-            producer.command_buffer_domain == consumer_metadata.command_buffer_domain
-        ),
+        same_command_buffer=(producer.command_buffer_domain == consumer_metadata.command_buffer_domain),
         producer_before_consumer=consumer_metadata.producer_before_consumer,
-        resource_tracked=(
-            producer.output_access.resource_tracked
-            and consumer_access.resource_tracked
-        ),
+        resource_tracked=(producer.output_access.resource_tracked and consumer_access.resource_tracked),
     )
     return MetalLaunchSyncDecision(
         consumer_kernel_symbol=consumer_metadata.kernel_symbol,
@@ -345,10 +341,7 @@ def inspect_mlx_tvm_ffi_launch_sync(
         dependency_metadata=dependency_metadata,
         command_buffer_domain=command_buffer_domain,
     )
-    return tuple(
-        decision
-        for _producer, decision in _planned_launch_dependencies(inputs, metadata)
-    )
+    return tuple(decision for _producer, decision in _planned_launch_dependencies(inputs, metadata))
 
 
 def plan_mlx_tvm_ffi_launch(

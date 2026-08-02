@@ -53,7 +53,7 @@ namespace {
 // Collect all `Var` referenced anywhere inside an expression. Used for
 // "free-var" emulation when seeding Z3 with BV32-style constraints.
 class VarCollector : public ExprVisitor {
- public:
+public:
   std::unordered_set<const VarNode *> vars;
   void VisitExpr_(const VarNode *op) final { vars.insert(op); }
 };
@@ -69,7 +69,7 @@ class VarCollector : public ExprVisitor {
 // This avoids accidentally treating arbitrary boolean predicates (e.g.
 // `cond[0] > 0` in the LoopUnswitching tests) as bound checks.
 class IsBufferBoundCheck : public ExprVisitor {
- public:
+public:
   bool ok = true;
 
   static bool Check(const PrimExpr &expr) {
@@ -78,9 +78,10 @@ class IsBufferBoundCheck : public ExprVisitor {
     return v.ok;
   }
 
- private:
+private:
   void Walk(const PrimExpr &expr) {
-    if (!ok) return;
+    if (!ok)
+      return;
     if (const auto *op = expr.as<AndNode>()) {
       Walk(op->a);
       Walk(op->b);
@@ -125,7 +126,7 @@ class IsBufferBoundCheck : public ExprVisitor {
 };
 
 class HasOverflowSensitiveArithmetic : public ExprVisitor {
- public:
+public:
   bool found = false;
 
   static bool Check(const PrimExpr &expr) {
@@ -156,10 +157,10 @@ class HasOverflowSensitiveArithmetic : public ExprVisitor {
   }
 };
 
-}  // namespace
+} // namespace
 
 class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
- public:
+public:
   static PrimFunc Apply(PrimFunc func) {
     arith::Analyzer analyzer;
     DropProvableBoundChecks rewriter(&analyzer);
@@ -170,7 +171,7 @@ class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
 
   int dropped_count() const { return dropped_count_; }
 
- private:
+private:
   explicit DropProvableBoundChecks(arith::Analyzer *analyzer)
       : IRMutatorWithAnalyzer(analyzer) {}
 
@@ -198,9 +199,8 @@ class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
       return IRMutatorWithAnalyzer::VisitStmt_(op);
     }
 
-    bool overflow_sensitive =
-        inside_overflow_sensitive_loop_ ||
-        HasOverflowSensitiveArithmetic::Check(cond);
+    bool overflow_sensitive = inside_overflow_sensitive_loop_ ||
+                              HasOverflowSensitiveArithmetic::Check(cond);
 
     // 1) Default analyzer first (with kSymbolicBound), except for
     // expressions whose truth depends on machine-width overflow semantics.
@@ -249,7 +249,7 @@ class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
         PrimExpr hi = make_const(v.dtype(), hi64);
         scopes.emplace_back(z3, (v >= lo) && (v <= hi));
         if (scopes.size() > 8) {
-          bail = true;  // don't blow up the solver
+          bail = true; // don't blow up the solver
           break;
         }
       }
@@ -259,7 +259,7 @@ class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
       }
       // scopes destruct in reverse order here — solver state rebalanced.
     } catch (...) {
-      proved = false;  // conservative: keep guard
+      proved = false; // conservative: keep guard
     }
 
     if (proved) {
@@ -275,7 +275,8 @@ class DropProvableBoundChecks : public IRMutatorWithAnalyzer {
 };
 
 PrimFunc DropProvableBoundChecksFn(PrimFunc func) {
-  if (!func->body.defined()) return func;
+  if (!func->body.defined())
+    return func;
   return DropProvableBoundChecks::Apply(std::move(func));
 }
 
@@ -285,7 +286,8 @@ tvm::transform::Pass DropProvableBoundChecksPass() {
     bool enable = ctx->GetConfig<Bool>(kDropProvableBoundChecks, Bool(false))
                       .value()
                       ->value;
-    if (!enable) return f;
+    if (!enable)
+      return f;
     return DropProvableBoundChecksFn(std::move(f));
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.DropProvableBoundChecks", {});
@@ -297,5 +299,5 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                         DropProvableBoundChecksPass);
 }
 
-}  // namespace tl
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm

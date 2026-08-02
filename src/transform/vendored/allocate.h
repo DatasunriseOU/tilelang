@@ -44,14 +44,14 @@ namespace tilelang {
 namespace tl_tir {
 
 using tvm::DataType;
-using tvm::Span;
 using tvm::PrimExpr;
+using tvm::Span;
 using tvm::tirx::Stmt;
 using tvm::tirx::StmtNode;
 using tvm::tirx::Var;
 
 class AllocateNode : public StmtNode {
- public:
+public:
   /*! \brief Variable that holds the pointer to the allocation. */
   Var buffer_var;
   /*! \brief Element data type. */
@@ -91,11 +91,12 @@ class AllocateNode : public StmtNode {
         .def_ro("annotations", &AllocateNode::annotations);
   }
 
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tilelang.Allocate", AllocateNode, StmtNode);
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tilelang.Allocate", AllocateNode,
+                                    StmtNode);
 };
 
 class Allocate : public Stmt {
- public:
+public:
   TVM_DLL Allocate(Var buffer_var, DataType dtype,
                    tvm::ffi::Array<PrimExpr> extents, PrimExpr condition,
                    Stmt body,
@@ -114,7 +115,7 @@ class Allocate : public Stmt {
   TVM_DEFINE_OBJECT_REF_COW_METHOD(AllocateNode);
 };
 
-}  // namespace tl_tir
-}  // namespace tilelang
+} // namespace tl_tir
+} // namespace tilelang
 
-#endif  // TILELANG_TRANSFORM_VENDORED_ALLOCATE_H_
+#endif // TILELANG_TRANSFORM_VENDORED_ALLOCATE_H_

@@ -33,10 +33,10 @@ chains.
 
 Inputs were random `torch.randn` tensors on default (CPU) device:
 
-* (a) `x = (8, 8)`
-* (b) `x, y = (8, 8)`
-* (c) `b = (16,)`, `x = (8, 32)`, `w = (32, 16)`
-* (d) `q = k = v = (1, 4, 16, 32)`
+- (a) `x = (8, 8)`
+- (b) `x, y = (8, 8)`
+- (c) `b = (16,)`, `x = (8, 32)`, `w = (32, 16)`
+- (d) `q = k = v = (1, 4, 16, 32)`
 
 `out` and `ref` are bit-identical for cases (a)-(c) — the custom_op artifact
 is calling the eager kernel under the hood (FXToTileLang's MVP path), not

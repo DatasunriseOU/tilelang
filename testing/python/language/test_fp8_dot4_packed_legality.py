@@ -66,7 +66,12 @@ class StaticFastPathTests(unittest.TestCase):
     def test_static_k_mismatch_rejected(self):
         # K_a != K_b -- even if everything else is legal we cannot dot4.
         proved, _ = _z3_prove_dot4_legal(
-            K_a=128, K_b=64, stride_a=1, stride_b=1, addr_a=0, addr_b=0,
+            K_a=128,
+            K_b=64,
+            stride_a=1,
+            stride_b=1,
+            addr_a=0,
+            addr_b=0,
         )
         self.assertFalse(proved)
 
@@ -171,8 +176,7 @@ class SymbolicZ3PathTests(unittest.TestCase):
         )
         self.assertFalse(
             proved,
-            f"BV32 invariant broken: opaque negative-allowed addr was proved legal "
-            f"(reason={reason!r})",
+            f"BV32 invariant broken: opaque negative-allowed addr was proved legal (reason={reason!r})",
         )
         self.assertIn("z3", reason.lower())
 

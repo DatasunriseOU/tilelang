@@ -65,9 +65,7 @@ def _first_plan(func: tir.PrimFunc):
 
 
 def test_same_simdgroup_reduction_proves_no_sync():
-    proof = prove_reduction_plan_legality(
-        _first_plan(_make_thread_allreduce_func(32))
-    )
+    proof = prove_reduction_plan_legality(_first_plan(_make_thread_allreduce_func(32)))
     assert proof.proved_exact_coverage is True
     assert proof.proved_no_oob is True
     assert proof.proved_no_sync is True
@@ -79,9 +77,7 @@ def test_same_simdgroup_reduction_proves_no_sync():
 
 
 def test_split_simdgroup_reduction_requires_threadgroup_barrier_only():
-    proof = prove_reduction_plan_legality(
-        _first_plan(_make_thread_allreduce_func(128))
-    )
+    proof = prove_reduction_plan_legality(_first_plan(_make_thread_allreduce_func(128)))
     assert proof.proved_exact_coverage is True
     assert proof.proved_tail_broadcast_legal is True
     assert proof.proved_no_sync is False
@@ -91,9 +87,7 @@ def test_split_simdgroup_reduction_requires_threadgroup_barrier_only():
 
 
 def test_tail_extent_between_simdgroups_proves_bounds_with_barrier():
-    proof = prove_reduction_plan_legality(
-        _first_plan(_make_thread_allreduce_func(33))
-    )
+    proof = prove_reduction_plan_legality(_first_plan(_make_thread_allreduce_func(33)))
     assert proof.proved_exact_coverage is True
     assert proof.proved_no_oob is True
     assert proof.proved_tail_broadcast_legal is True
@@ -104,9 +98,7 @@ def test_tail_extent_between_simdgroups_proves_bounds_with_barrier():
 
 
 def test_large_reduction_requires_two_pass_device_edge():
-    proof = prove_reduction_plan_legality(
-        _first_plan(_make_thread_allreduce_func(512))
-    )
+    proof = prove_reduction_plan_legality(_first_plan(_make_thread_allreduce_func(512)))
     assert proof.proved_exact_coverage is True
     assert proof.proved_tail_broadcast_legal is True
     assert proof.requires_threadgroup_barrier is False
@@ -115,9 +107,7 @@ def test_large_reduction_requires_two_pass_device_edge():
 
 
 def test_extent_over_int32_blocks_index_width_proof():
-    proof = prove_reduction_plan_legality(
-        _first_plan(_make_thread_allreduce_func(1 << 31, extent_dtype="int64"))
-    )
+    proof = prove_reduction_plan_legality(_first_plan(_make_thread_allreduce_func(1 << 31, extent_dtype="int64")))
     assert proof.proved_exact_coverage is False
     assert proof.proved_no_oob is False
     assert proof.proved_index_width_safe is False
@@ -127,18 +117,14 @@ def test_extent_over_int32_blocks_index_width_proof():
 
 
 def test_missing_static_extent_blocks_parallel_proof():
-    proof = prove_reduction_plan_legality(
-        _first_plan(_make_thread_allreduce_func(64, static_extent=False))
-    )
+    proof = prove_reduction_plan_legality(_first_plan(_make_thread_allreduce_func(64, static_extent=False)))
     assert proof.proved_exact_coverage is False
     assert proof.proved_no_sync is False
     assert proof.cannot_parallelize_reason == "missing_static_axis_extent"
 
 
 def test_input_output_alias_requires_explicit_in_place_plan():
-    proof = prove_reduction_plan_legality(
-        _first_plan(_make_thread_allreduce_func(32, alias_output=True))
-    )
+    proof = prove_reduction_plan_legality(_first_plan(_make_thread_allreduce_func(32, alias_output=True)))
     assert proof.proved_exact_coverage is False
     assert proof.proved_no_read_after_write_hazard is False
     assert proof.proved_in_place_legal is False

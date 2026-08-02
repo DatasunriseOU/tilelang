@@ -162,13 +162,13 @@ public:
  * returns false (either disproved or unknown), the pass MUST NOT
  * transform.
  */
-PrimExpr BuildSoundnessObligation(const CandidateInfo &info,
-                                  const Var &k_var) {
+PrimExpr BuildSoundnessObligation(const CandidateInfo &info, const Var &k_var) {
   Var k_next("k_next", k_var.dtype());
-  
-  bool load_addr_independent = !UsesVar(info.load_address_expr, [&](const VarNode* v) {
-    return v == info.candidate_buffer->data.get();
-  });
+
+  bool load_addr_independent =
+      !UsesVar(info.load_address_expr, [&](const VarNode *v) {
+        return v == info.candidate_buffer->data.get();
+      });
 
   if (!load_addr_independent) {
     return Bool(false);
@@ -207,7 +207,8 @@ public:
         arith::Analyzer analyzer;
         analyzer.Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
         PrimExpr obligation = BuildSoundnessObligation(det.info, op->loop_var);
-        bool proved = arith::Z3Prover(analyzer).CanProve(analyzer.Simplify(obligation));
+        bool proved =
+            arith::Z3Prover(analyzer).CanProve(analyzer.Simplify(obligation));
 
         std::ostringstream candidate_name;
         if (det.info.candidate_buffer.defined()) {
@@ -248,8 +249,7 @@ using namespace tirx::transform;
 
 tvm::transform::Pass AutoDoubleBuffer() {
   auto pass_func = [](PrimFunc f, const IRModule &m, const PassContext &ctx) {
-    bool enabled =
-        ctx->GetConfig<Bool>(kAutoDoubleBuffer, Bool(false)).value();
+    bool enabled = ctx->GetConfig<Bool>(kAutoDoubleBuffer, Bool(false)).value();
     if (!enabled) {
       // Default OFF: skip the IR traversal entirely.
       return f;

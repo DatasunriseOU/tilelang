@@ -5,6 +5,7 @@ yet implement multiplicative all-reduce; this test only verifies that the
 primitive is importable and that the high-level call constructs valid TIR.
 A full numerical check requires a backend that supports the ``mul`` kind.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -27,7 +28,6 @@ def test_reduce_prod_is_exported():
 # mul now a valid kind this test should construct without raising.
 def test_reduce_prod_constructs_call():
     try:
-        import tilelang
         import tilelang.language as T
     except Exception as exc:
         pytest.skip(f"tilelang unavailable: {exc!r}")
@@ -61,9 +61,11 @@ def test_reduce_prod_emits_runtime_warning():
 
     # Reset module-level latch so the warning fires inside catch_warnings.
     import tilelang.language.reduce_op as _rop
+
     _rop._REDUCE_PROD_WARNED = False
 
     import warnings
+
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         # Call signature only — no prim_func body, no lowering.
@@ -79,9 +81,7 @@ def test_reduce_prod_emits_runtime_warning():
             pass  # Outside a prim_func the call may fail; we only want the warning.
 
     msgs = [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)]
-    assert any("reduce_prod" in m and "mul" in m for m in msgs), (
-        f"expected wave-7 #5 RuntimeWarning, got: {msgs}"
-    )
+    assert any("reduce_prod" in m and "mul" in m for m in msgs), f"expected wave-7 #5 RuntimeWarning, got: {msgs}"
 
 
 # Wave-10 #3 / Wave-11 #1 (closes meta rev_c2fc451321 + grok rev_d1fb5da1bb

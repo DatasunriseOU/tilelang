@@ -3660,24 +3660,24 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
       if (tgt_dtype.is_float4_e2m1fn()) {
         // We view the source as an uint16, and then extract bits of two fp4
         // numbers, and finally reinterpret the result as fp4x2.
-        value =
-            tirx::Call(DataType::UInt(16), tirx::builtin::reinterpret(), {value});
+        value = tirx::Call(DataType::UInt(16), tirx::builtin::reinterpret(),
+                           {value});
         tirx::Var temp_var("temp_var", DataType::UInt(16));
         value =
             tirx::Let(temp_var, value,
-                     tirx::Cast(DataType::UInt(8),
-                               (temp_var & IntImm(DataType::UInt(16), 0xF)) |
-                                   ((temp_var >> 4) &
-                                    IntImm(DataType::UInt(16), 0xF0))));
+                      tirx::Cast(DataType::UInt(8),
+                                 (temp_var & IntImm(DataType::UInt(16), 0xF)) |
+                                     ((temp_var >> 4) &
+                                      IntImm(DataType::UInt(16), 0xF0))));
       } else {
-        value = tirx::Cast(
-            DataType::UInt(16),
-            tirx::Call(DataType::UInt(8), tirx::builtin::reinterpret(), {value}));
+        value = tirx::Cast(DataType::UInt(16),
+                           tirx::Call(DataType::UInt(8),
+                                      tirx::builtin::reinterpret(), {value}));
         tirx::Var temp_var("temp_var", DataType::UInt(16));
         value =
             tirx::Let(temp_var, value,
-                     (temp_var & IntImm(DataType::UInt(16), 0xF)) |
-                         ((temp_var & IntImm(DataType::UInt(16), 0xF0)) << 4));
+                      (temp_var & IntImm(DataType::UInt(16), 0xF)) |
+                          ((temp_var & IntImm(DataType::UInt(16), 0xF0)) << 4));
       }
       os << PrintExpr(
           tirx::Call(tgt_dtype, tirx::builtin::reinterpret(), {value}));
@@ -3685,8 +3685,8 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
       if (tgt_dtype.is_float4_e2m1fn()) {
         // We view the source as an uint32, and then extract bits of four fp4
         // numbers, and finally reinterpret the result as fp4x4.
-        value =
-            tirx::Call(DataType::UInt(32), tirx::builtin::reinterpret(), {value});
+        value = tirx::Call(DataType::UInt(32), tirx::builtin::reinterpret(),
+                           {value});
         tirx::Var temp_var("temp_var", DataType::UInt(32));
         value = tirx::Let(
             temp_var, value,
@@ -3698,8 +3698,8 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
                     ((temp_var >> 12) & IntImm(DataType::UInt(32), 0xF000))));
       } else {
         value = tirx::Cast(DataType::UInt(32),
-                          tirx::Call(DataType::UInt(16),
-                                    tirx::builtin::reinterpret(), {value}));
+                           tirx::Call(DataType::UInt(16),
+                                      tirx::builtin::reinterpret(), {value}));
         tirx::Var temp_var("temp_var", DataType::UInt(32));
         value = tirx::Let(
             temp_var, value,

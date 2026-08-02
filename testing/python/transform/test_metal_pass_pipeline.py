@@ -195,9 +195,7 @@ def test_metal_index_normalizer_keeps_non_immediate_int_operands_same_dtype():
         )
         for n, expr in enumerate(exprs)
     ]
-    func = tvm.tir.PrimFunc([A, B, i, stride64], tvm.tir.SeqStmt(stores)).with_attr(
-        "target", tvm.target.Target("metal")
-    )
+    func = tvm.tir.PrimFunc([A, B, i, stride64], tvm.tir.SeqStmt(stores)).with_attr("target", tvm.target.Target("metal"))
     before = tvm.IRModule({"main": func})
 
     after = tilelang.transform.BindMetalScalarIntrinsics()(before)
@@ -215,9 +213,7 @@ def test_metal_index_normalizer_keeps_non_immediate_int_operands_same_dtype():
 
     def is_scalar_int_dtype(dtype):
         dtype_name = str(dtype)
-        return dtype.lanes == 1 and (
-            dtype_name.startswith("int") or dtype_name.startswith("uint")
-        )
+        return dtype.lanes == 1 and (dtype_name.startswith("int") or dtype_name.startswith("uint"))
 
     def visit(node):
         if isinstance(node, binary_nodes):

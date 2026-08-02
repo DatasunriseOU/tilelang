@@ -267,11 +267,15 @@ def tl_matmul_with_ladder_weight_only_transform_block_reduce_int4(
                     vk = rk * (block_K // reduce_k) + k
                     A_shared[i, vk] = A[by * block_M + i, ko * block_K + vk]
 
-                T.copy(B[bx * (block_N // micro_size_y) : bx * (block_N // micro_size_y) + block_N // micro_size_y,
-                         ko * (block_K // micro_size_k) : ko * (block_K // micro_size_k) + block_K // micro_size_k,
-                         0 : micro_size_y,
-                         0 : micro_size_k // num_elems_per_byte],
-                       B_shared)
+                T.copy(
+                    B[
+                        bx * (block_N // micro_size_y) : bx * (block_N // micro_size_y) + block_N // micro_size_y,
+                        ko * (block_K // micro_size_k) : ko * (block_K // micro_size_k) + block_K // micro_size_k,
+                        0:micro_size_y,
+                        0 : micro_size_k // num_elems_per_byte,
+                    ],
+                    B_shared,
+                )
 
                 for ki in T.serial(0, (block_K // (micro_size_k * reduce_k))):
                     # Load A into fragment

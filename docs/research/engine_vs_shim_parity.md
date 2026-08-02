@@ -80,7 +80,7 @@ cell path is silently dead.
 
 All four fp8_amax cells share one root cause (above). No second-tier
 divergence to report — the other 24 cells are uniformly green at the import
-+ attribute level.
+- attribute level.
 
 ## Recommended wave-7-followup fix path
 

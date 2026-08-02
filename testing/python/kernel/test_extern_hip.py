@@ -16,6 +16,7 @@ __device__ void vector_scale_2_hip(const float* in_vec, float* out_vec) {
 }
 """
 
+
 @pytest.fixture(autouse=True)
 def _isolate_registry():
     """Drop our test entry between tests to avoid cross-test pollution."""
@@ -52,12 +53,7 @@ def run_hip_extern_intrinsic():
 
             # Call the intrinsic
             T.evaluate(
-                T.call_extern(
-                    "handle",
-                    "tl.extern_intrinsic.vector_scale_2_hip",
-                    a_shared.access_ptr("r"),
-                    b_shared.access_ptr("rw")
-                )
+                T.call_extern("handle", "tl.extern_intrinsic.vector_scale_2_hip", a_shared.access_ptr("r"), b_shared.access_ptr("rw"))
             )
 
             # Copy back to global

@@ -36,7 +36,7 @@ namespace tvm {
  *  Use MemoryInfo as its container type
  */
 class MemoryInfoNode : public ffi::Object {
- public:
+public:
   /*! \brief The addressable unit */
   int64_t unit_bits;
   /*! \brief Maximum number of bits supported in the memory */
@@ -57,13 +57,15 @@ class MemoryInfoNode : public ffi::Object {
         .def_ro("max_simd_bits", &MemoryInfoNode::max_simd_bits)
         .def_ro("head_address", &MemoryInfoNode::head_address);
   }
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("target.MemoryInfo", MemoryInfoNode, ffi::Object);
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("target.MemoryInfo", MemoryInfoNode,
+                                    ffi::Object);
 };
 
 /*! \brief Defines memory info */
 class MemoryInfo : public ffi::ObjectRef {
- public:
-  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(MemoryInfo, ffi::ObjectRef, MemoryInfoNode);
+public:
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(MemoryInfo, ffi::ObjectRef,
+                                             MemoryInfoNode);
 };
 
 /*!
@@ -71,7 +73,7 @@ class MemoryInfo : public ffi::ObjectRef {
  * \param scope The scope name.
  * \return info The memory info.
  */
-TVM_DLL MemoryInfo GetMemoryInfo(const std::string& scope);
+TVM_DLL MemoryInfo GetMemoryInfo(const std::string &scope);
 
-}  // namespace tvm
-#endif  // TVM_TARGET_TARGET_INFO_H_
+} // namespace tvm
+#endif // TVM_TARGET_TARGET_INFO_H_

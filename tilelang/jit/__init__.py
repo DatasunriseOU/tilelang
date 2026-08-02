@@ -118,9 +118,7 @@ def compile(
             **frontend_kwargs,
         )
 
-    is_prim_func = isinstance(func, PrimFunc) or (
-        hasattr(func, "params") and hasattr(func, "body") and hasattr(func, "attrs")
-    )
+    is_prim_func = isinstance(func, PrimFunc) or (hasattr(func, "params") and hasattr(func, "body") and hasattr(func, "attrs"))
     assert is_prim_func, f"target function must be a PrimFunc but got {type(func)}"
     if frontend_kwargs:
         raise TypeError(

@@ -73,10 +73,10 @@
  * a runtime context handle of its own that benefits from CSE in host code),
  * port the merge branch back here against that new symbol.
  */
-#include <tvm/ffi/function.h>
-#include <tvm/ffi/reflection/registry.h>
 #include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/ffi/extra/structural_hash.h>
+#include <tvm/ffi/function.h>
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/stmt.h>
@@ -102,12 +102,12 @@ using ::tilelang::tl_tir::LetStmtNode;
 // absent: apache-latest deleted both `tvm_thread_context` and all its
 // emitters, and TileLang never emitted the builtin itself.
 class ContextCallCombiner final : public StmtExprMutator {
- public:
-  PrimExpr VisitExpr_(const CallNode* op) final {
+public:
+  PrimExpr VisitExpr_(const CallNode *op) final {
     return StmtExprMutator::VisitExpr_(op);
   }
 
-  Stmt VisitStmt_(const AttrStmtNode* op) final {
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key == attr::thread_extent ||
         op->attr_key == ::tilelang::tl_attr::coproc_uop_scope) {
       // Map of comparison expression to variable
@@ -121,7 +121,7 @@ class ContextCallCombiner final : public StmtExprMutator {
     }
   }
 
-  Stmt VisitStmt_(const ForNode* op) final {
+  Stmt VisitStmt_(const ForNode *op) final {
     if (op->kind == ForKind::kParallel) {
       // Map of comparison expression to variable
       std::unordered_map<PrimExpr, Var, StructuralHash, StructuralEqual> temp;
@@ -134,15 +134,19 @@ class ContextCallCombiner final : public StmtExprMutator {
     }
   }
 
-  Stmt Combine(Stmt stmt) { return BuildContext(ctx_map_, this->VisitStmt(stmt)); }
+  Stmt Combine(Stmt stmt) {
+    return BuildContext(ctx_map_, this->VisitStmt(stmt));
+  }
 
- private:
+private:
   // Uses vendored `tilelang::tl_tir::LetStmt` (3-arg form).
   // `tl.transform.LowerTileLangLetStmt` desugars to
   // `SeqStmt({tirx::Bind(var, value), body})` before apache/tvm pipeline.
   static Stmt BuildContext(
-      const std::unordered_map<PrimExpr, Var, StructuralHash, StructuralEqual>& cmap, Stmt body) {
-    for (const auto& kv : cmap) {
+      const std::unordered_map<PrimExpr, Var, StructuralHash, StructuralEqual>
+          &cmap,
+      Stmt body) {
+    for (const auto &kv : cmap) {
       body = LetStmt(kv.second, kv.first, body);
     }
     return body;
@@ -168,6 +172,6 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::GlobalDef().def("tl.transform.CombineContextCall", CombineContextCall);
 }
 
-}  // namespace transform
-}  // namespace tirx
-}  // namespace tvm
+} // namespace transform
+} // namespace tirx
+} // namespace tvm

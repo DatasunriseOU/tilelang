@@ -64,8 +64,6 @@ namespace transform {
 
 using tvm::IRModule;
 using tvm::PrimExpr;
-using tvm::transform::Pass;
-using tvm::transform::PassContext;
 using tvm::tirx::AllocBuffer;
 using tvm::tirx::Bind;
 using tvm::tirx::Buffer;
@@ -76,6 +74,8 @@ using tvm::tirx::PrimFuncNode;
 using tvm::tirx::SeqStmt;
 using tvm::tirx::Stmt;
 using tvm::tirx::StmtMutator;
+using tvm::transform::Pass;
+using tvm::transform::PassContext;
 
 namespace {
 
@@ -90,12 +90,12 @@ namespace {
  * `body` then re-enters the normal mutator path.
  */
 class LowerTileLangAllocateMutator : public StmtMutator {
- public:
+public:
   bool found_any() const { return found_any_; }
 
- protected:
-  Stmt VisitStmt(const Stmt& stmt) override {
-    if (const auto* alloc = stmt.as<tl_tir::AllocateNode>()) {
+protected:
+  Stmt VisitStmt(const Stmt &stmt) override {
+    if (const auto *alloc = stmt.as<tl_tir::AllocateNode>()) {
       found_any_ = true;
       // Recurse into body first (bottom-up rewriting); use our own VisitStmt
       // so nested vendored Allocate nodes are also rewritten.
@@ -125,9 +125,9 @@ class LowerTileLangAllocateMutator : public StmtMutator {
 
       // Only wrap in IfThenElse when the predicate is non-trivial. The
       // legacy Allocate's default condition is `const_true(1)`.
-      const PrimExpr& cond = alloc->condition;
+      const PrimExpr &cond = alloc->condition;
       bool trivial = false;
-      if (const auto* imm = cond.as<tvm::tirx::IntImmNode>()) {
+      if (const auto *imm = cond.as<tvm::tirx::IntImmNode>()) {
         trivial = (imm->value != 0);
       }
       if (!trivial) {
@@ -144,7 +144,7 @@ class LowerTileLangAllocateMutator : public StmtMutator {
     // here as a defensive measure (mirrors LowerTileLangLetStmtMutator).
     // Recurse into body via our own VisitStmt so nested vendored Allocates
     // / LetStmts in the body are still handled.
-    if (const auto* let = stmt.as<tl_tir::LetStmtNode>()) {
+    if (const auto *let = stmt.as<tl_tir::LetStmtNode>()) {
       auto value = this->VisitExpr(let->value);
       auto body = this->VisitStmt(let->body);
       return SeqStmt({Bind(let->var, value, let->span), body}, let->span);
@@ -152,11 +152,11 @@ class LowerTileLangAllocateMutator : public StmtMutator {
     return StmtMutator::VisitStmt(stmt);
   }
 
- private:
+private:
   bool found_any_{false};
 };
 
-}  // namespace
+} // namespace
 
 Pass LowerTileLangAllocate() {
   auto pass_func = [](PrimFunc f, IRModule, PassContext) -> PrimFunc {
@@ -166,7 +166,7 @@ Pass LowerTileLangAllocate() {
       // No-op fast path — leave the function untouched.
       return f;
     }
-    auto* node = f.CopyOnWrite();
+    auto *node = f.CopyOnWrite();
     node->body = std::move(new_body);
     return f;
   };
@@ -180,5 +180,5 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                         LowerTileLangAllocate);
 }
 
-}  // namespace transform
-}  // namespace tilelang
+} // namespace transform
+} // namespace tilelang

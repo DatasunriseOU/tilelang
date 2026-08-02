@@ -63,12 +63,7 @@ def _is_zero(expr) -> bool:
 def _is_mul_by_two(expr) -> bool:
     if not isinstance(expr, tir.Mul):
         return False
-    return (
-        isinstance(expr.a, tir.IntImm)
-        and int(expr.a.value) == 2
-        or isinstance(expr.b, tir.IntImm)
-        and int(expr.b.value) == 2
-    )
+    return isinstance(expr.a, tir.IntImm) and int(expr.a.value) == 2 or isinstance(expr.b, tir.IntImm) and int(expr.b.value) == 2
 
 
 def _is_active_lane_mod_condition(expr) -> bool:
@@ -79,9 +74,7 @@ def _is_active_lane_mod_condition(expr) -> bool:
         lhs, rhs = rhs, lhs
     if not _is_zero(rhs):
         return False
-    mod_types = tuple(
-        t for t in (getattr(tir, "FloorMod", None), getattr(tir, "Mod", None)) if t is not None
-    )
+    mod_types = tuple(t for t in (getattr(tir, "FloorMod", None), getattr(tir, "Mod", None)) if t is not None)
     if not mod_types or not isinstance(lhs, mod_types):
         return False
     return _is_mul_by_two(lhs.b)
@@ -168,13 +161,7 @@ def _collect_access_stats(stmt: tir.Stmt) -> _AccessStats:
 
 def _is_merge_local_phase(stmt: tir.Stmt) -> bool:
     stats = _collect_access_stats(stmt)
-    return (
-        stats.syncs == 0
-        and stats.shared_loads > 0
-        and stats.shared_stores == 0
-        and stats.local_stores > 0
-        and stats.other_stores == 0
-    )
+    return stats.syncs == 0 and stats.shared_loads > 0 and stats.shared_stores == 0 and stats.local_stores > 0 and stats.other_stores == 0
 
 
 def _is_shared_writeback_phase(stmt: tir.Stmt, merge_stats: _AccessStats) -> bool:
@@ -247,9 +234,7 @@ class MetalMergeRoundBarrierCleanup:
     barrier, it leaves the function unchanged.
     """
 
-    def transform_function(
-        self, func: tir.PrimFunc, mod: IRModule, ctx
-    ) -> tir.PrimFunc:
+    def transform_function(self, func: tir.PrimFunc, mod: IRModule, ctx) -> tir.PrimFunc:
         if not _pass_enabled(ctx) or not _is_metal_func(func):
             return func
 

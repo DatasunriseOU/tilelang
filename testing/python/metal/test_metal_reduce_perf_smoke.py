@@ -145,7 +145,7 @@ def _time_synced_ms(fn, sync, *, warmup: int, iterations: int) -> _Timing:
     kept = samples[: max(1, int(len(samples) * 0.9))]
     mean = sum(kept) / len(kept)
     variance = sum((x - mean) ** 2 for x in kept) / max(1, len(kept) - 1)
-    return _Timing(mean, variance ** 0.5)
+    return _Timing(mean, variance**0.5)
 
 
 def _time_tilelang_profiler_ms(jit_kernel, input_tensors, *, warmup: int, iterations: int) -> _Timing:
@@ -170,10 +170,7 @@ def _maybe_skip_optional(case: _ReducePerfCase, stage: str, fn):
     except Exception as exc:
         if case.optional:
             case_desc = getattr(case, "label", repr(case))
-            pytest.skip(
-                f"optional Metal reduce perf case {case_desc} "
-                f"skipped during {stage}: {type(exc).__name__}: {exc}"
-            )
+            pytest.skip(f"optional Metal reduce perf case {case_desc} skipped during {stage}: {type(exc).__name__}: {exc}")
         raise
 
 
@@ -188,9 +185,7 @@ def _detect_row_reduce_load_pattern(src: str) -> str:
     if arg_match:
         arg_type = f"A_{arg_match.group(1)}_ptr"
 
-    load_types = sorted(
-        set(re.findall(r"\*\(\s*thread\s+([A-Za-z0-9_]+)\s*\*\)\s*\(\s*src\s*\+", src))
-    )
+    load_types = sorted(set(re.findall(r"\*\(\s*thread\s+([A-Za-z0-9_]+)\s*\*\)\s*\(\s*src\s*\+", src)))
     if load_types:
         return f"{arg_type}__thread_{'_'.join(load_types)}_load"
 

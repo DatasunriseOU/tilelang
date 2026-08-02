@@ -26,7 +26,8 @@ public:
   Buffer src, dst;    ///< Source and destination buffers
   Array<Range> src_range,
       dst_range; ///< Access ranges for source and destination
-  Map<String, ffi::ObjectRef> annotations; ///< Annotations for the atomic operation
+  Map<String, ffi::ObjectRef>
+      annotations; ///< Annotations for the atomic operation
   // Supported annotation keys:
   //   - "coalesced_width": IntImm, width for memory coalescing optimization
   //   - "memory_order": IntImm, memory order for atomic operations
@@ -96,8 +97,8 @@ public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(AtomicMax, TileOperator,
                                              AtomicMaxNode);
   TVM_DLL
-  AtomicMax(Array<PrimExpr> args,
-            Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
+  AtomicMax(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations =
+                                      Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 
@@ -129,8 +130,8 @@ public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(AtomicMin, TileOperator,
                                              AtomicMinNode);
   TVM_DLL
-  AtomicMin(Array<PrimExpr> args,
-            Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
+  AtomicMin(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations =
+                                      Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 

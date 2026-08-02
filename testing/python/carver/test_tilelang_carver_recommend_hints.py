@@ -40,17 +40,19 @@ def _arch_without_runtime(cls, target, platform, bandwidth):
 
 
 def _first_sr_1024_hint(arch):
-    return carver.GeneralReductionTemplate(
-        structure="SR",
-        shape=[1024, 1024],
-        dtype="float32",
-    ).with_arch(arch).recommend_hints(topk=1)[0]
+    return (
+        carver.GeneralReductionTemplate(
+            structure="SR",
+            shape=[1024, 1024],
+            dtype="float32",
+        )
+        .with_arch(arch)
+        .recommend_hints(topk=1)[0]
+    )
 
 
 def test_metal_row_reduce_1024_prefers_128_reduce_threads():
-    hint = _first_sr_1024_hint(
-        _arch_without_runtime(METAL, "metal", "METAL", [750, 1200])
-    )
+    hint = _first_sr_1024_hint(_arch_without_runtime(METAL, "metal", "METAL", [750, 1200]))
 
     assert hint.block == [1]
     assert hint.thread == [1]
@@ -59,11 +61,7 @@ def test_metal_row_reduce_1024_prefers_128_reduce_threads():
 
 
 def test_cuda_row_reduce_1024_hint_order_is_unchanged():
-    hint = _first_sr_1024_hint(
-        _arch_without_runtime(
-            CUDA, {"kind": "cuda", "arch": "sm_80"}, "CUDA", [750, 12080]
-        )
-    )
+    hint = _first_sr_1024_hint(_arch_without_runtime(CUDA, {"kind": "cuda", "arch": "sm_80"}, "CUDA", [750, 12080]))
 
     assert hint.block == [128]
     assert hint.thread == [128]

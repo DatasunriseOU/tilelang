@@ -34,13 +34,13 @@ public:
     }
     fptr->body = substituter.VisitStmt(f->body);
     Map<String, Array<PrimExpr>> init_l2_persistent_map;
-    for (const auto& [buffer, hit_ratio] : substituter.hit_ratio_map_) {
+    for (const auto &[buffer, hit_ratio] : substituter.hit_ratio_map_) {
       Array<PrimExpr> l2_persistent_arguments;
       // Argument 0: hit ratio
       // Argument 1: size in bytes
       l2_persistent_arguments.push_back(hit_ratio);
       PrimExpr size_in_bytes = IntImm(DataType::Int(64), buffer->dtype.bytes());
-      for (const auto& dim : buffer->shape) {
+      for (const auto &dim : buffer->shape) {
         size_in_bytes = size_in_bytes * dim;
       }
       l2_persistent_arguments.push_back(size_in_bytes);
@@ -55,13 +55,13 @@ public:
 
   Stmt VisitStmt_(const SBlockNode *op) final {
     // Record the mapping from buffer data var to buffer for later lookup
-    for (const auto& buffer : op->alloc_buffers) {
+    for (const auto &buffer : op->alloc_buffers) {
       buffer_map_.insert({buffer->data, buffer});
     }
-    for (const auto& match_buffer : op->match_buffers) {
+    for (const auto &match_buffer : op->match_buffers) {
       buffer_map_.insert({match_buffer->buffer->data, match_buffer->buffer});
     }
-    for (const auto& buffer : op->alloc_buffers) {
+    for (const auto &buffer : op->alloc_buffers) {
       buffer_data_to_buffer_.Set(buffer->data, buffer);
     }
 
@@ -69,7 +69,7 @@ public:
       auto hit_ratio_map = op->annotations.at(attr::kL2RatioMap)
                                .as<Map<Var, FloatImm>>()
                                .value();
-      for (const auto& [buffer_var, hit_ratio] : hit_ratio_map) {
+      for (const auto &[buffer_var, hit_ratio] : hit_ratio_map) {
         Buffer buffer = buffer_data_to_buffer_.at(buffer_var);
         hit_ratio_map_.Set(buffer, hit_ratio);
       }

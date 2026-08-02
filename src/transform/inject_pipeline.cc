@@ -12,8 +12,8 @@
  * :file:`extern_intrinsic_meta.h` for the shared helper.
  */
 #include <tvm/arith/analyzer.h>
-#include <tvm/target/target.h>
 #include <tvm/s_tir/analysis.h>
+#include <tvm/target/target.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/transform.h>
 
@@ -35,8 +35,8 @@
 #include "common/mbarrier.h"
 #include "common/pipeline_utils.h"
 #include "extern_intrinsic_meta.h"
-#include "support/utils.h"
 #include "s_tir/schedule/utils.h"
+#include "support/utils.h"
 #include "tirx/transform/ir_utils.h"
 #include "vendored/let_stmt.h"
 
@@ -313,7 +313,7 @@ private:
  * \return The result block.
  */
 SBlock MakeBlock(const Stmt &body,
-                const Map<Var, Buffer> &buffer_data_to_buffer) {
+                 const Map<Var, Buffer> &buffer_data_to_buffer) {
   SBlock block;
   if (const SBlockRealizeNode *block_realize = body.as<SBlockRealizeNode>()) {
     if (is_one(block_realize->predicate)) {
@@ -322,7 +322,7 @@ SBlock MakeBlock(const Stmt &body,
   }
   if (!block.defined()) {
     block = SBlock(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{},
-                  /*name_hint=*/"", /*body*/ body);
+                   /*name_hint=*/"", /*body*/ body);
   }
   Array<Array<BufferRegion>> access =
       s_tir::GetSBlockReadWriteRegion(block, buffer_data_to_buffer);
@@ -1484,7 +1484,7 @@ private:
           SBlock new_block = realize->block;
           new_block.CopyOnWrite()->body = inner;
           return SBlockRealize(realize->iter_values, realize->predicate,
-                              new_block, realize->span);
+                               new_block, realize->span);
         }
       }
       return stmt;
@@ -1593,7 +1593,7 @@ private:
           SBlock new_block = realize->block;
           new_block.CopyOnWrite()->body = new_body;
           return SBlockRealize(realize->iter_values, realize->predicate,
-                              new_block, realize->span);
+                               new_block, realize->span);
         }
       }
       return stmt;
@@ -1660,7 +1660,7 @@ private:
           SBlock new_block = realize->block;
           new_block.CopyOnWrite()->body = new_body;
           return SBlockRealize(realize->iter_values, realize->predicate,
-                              new_block, realize->span);
+                               new_block, realize->span);
         }
       }
       return stmt;
@@ -1805,7 +1805,7 @@ private:
           SBlock new_block = realize->block;
           new_block.CopyOnWrite()->body = new_body;
           return SBlockRealize(realize->iter_values, realize->predicate,
-                              new_block, realize->span);
+                               new_block, realize->span);
         }
       }
       return stmt;
@@ -2342,7 +2342,7 @@ private:
                      std::move(new_loop), std::nullopt, preserved_annotations);
     }
     Stmt result = SBlockRealize({}, Bool(true),
-                               MakeBlock(new_loop, buffer_data_to_buffer_));
+                                MakeBlock(new_loop, buffer_data_to_buffer_));
     if (pipeline_num_stages) {
       if (pipeline_num_stages.value()->value > 1) {
         result =
@@ -2378,11 +2378,12 @@ private:
  * source to the destination. \param[out] dep_dst2src Optional, a map to store
  * dependency edges from the destination to the source.
  */
-void BuildDependencyGraph(const Array<SBlock> &blocks,
-                          std::unordered_map<SBlock, Array<SBlock>, ObjectPtrHash,
-                                             ObjectPtrEqual> *dep_src2dst,
-                          std::unordered_map<SBlock, Array<SBlock>, ObjectPtrHash,
-                                             ObjectPtrEqual> *dep_dst2src) {
+void BuildDependencyGraph(
+    const Array<SBlock> &blocks,
+    std::unordered_map<SBlock, Array<SBlock>, ObjectPtrHash, ObjectPtrEqual>
+        *dep_src2dst,
+    std::unordered_map<SBlock, Array<SBlock>, ObjectPtrHash, ObjectPtrEqual>
+        *dep_dst2src) {
   std::unordered_map<Var, Array<SBlock>, ObjectPtrHash, ObjectPtrEqual>
       buffer_writers;
 
@@ -2731,10 +2732,10 @@ Map<Buffer, Buffer> ExpandPipelineBarriers(
         auto it = old_to_new.find(ab.get());
         new_allocs.push_back(it != old_to_new.end() ? it->second : ab);
       }
-      SBlock new_block(old_block->iter_vars, old_block->reads, old_block->writes,
-                      old_block->name_hint, new_body, old_block->init,
-                      new_allocs, old_block->match_buffers,
-                      old_block->annotations);
+      SBlock new_block(old_block->iter_vars, old_block->reads,
+                       old_block->writes, old_block->name_hint, new_body,
+                       old_block->init, new_allocs, old_block->match_buffers,
+                       old_block->annotations);
       PipelineAnnotation anno = pipeline_info.at(old_block);
       pipeline_info.erase(old_block);
       pipeline_info.emplace(new_block, anno);
@@ -2821,9 +2822,9 @@ Buffer RewritePipelineTmaBarriers(
     Stmt new_body = rewriter(old_block->body);
 
     SBlock new_block(old_block->iter_vars, old_block->reads, old_block->writes,
-                    old_block->name_hint, new_body, old_block->init,
-                    old_block->alloc_buffers, old_block->match_buffers,
-                    old_block->annotations);
+                     old_block->name_hint, new_body, old_block->init,
+                     old_block->alloc_buffers, old_block->match_buffers,
+                     old_block->annotations);
 
     PipelineAnnotation anno = pipeline_info.at(old_block);
     pipeline_info.erase(old_block);
@@ -2858,9 +2859,9 @@ Buffer RewritePipelineTmaBarriers(
     Stmt new_body = SeqStmt(wait_stmts);
 
     SBlock new_block(old_block->iter_vars, old_block->reads, old_block->writes,
-                    old_block->name_hint, new_body, old_block->init,
-                    old_block->alloc_buffers, old_block->match_buffers,
-                    old_block->annotations);
+                     old_block->name_hint, new_body, old_block->init,
+                     old_block->alloc_buffers, old_block->match_buffers,
+                     old_block->annotations);
 
     PipelineAnnotation anno = pipeline_info.at(old_block);
     pipeline_info.erase(old_block);
@@ -2903,8 +2904,9 @@ private:
     }
   }
 
-  Stmt RewriteFlatAllocBuffers(
-      Stmt stmt, std::vector<std::pair<Buffer, Buffer>> *remapped) {
+  Stmt
+  RewriteFlatAllocBuffers(Stmt stmt,
+                          std::vector<std::pair<Buffer, Buffer>> *remapped) {
     class Rewriter : public StmtExprMutator {
     public:
       Rewriter(PipelineInjector *injector,
@@ -3479,8 +3481,8 @@ private:
         }
         pipeline = rewrap_outer_attrs(
             SBlockRealize(pipeline_realize->iter_values,
-                         pipeline_realize->predicate, pipeline_block,
-                         pipeline_realize->span),
+                          pipeline_realize->predicate, pipeline_block,
+                          pipeline_realize->span),
             outer_attrs);
       } else {
         pipeline = apply_wrappers(pipeline);
@@ -3539,8 +3541,7 @@ private:
         new_alloc_buffers.push_back(buffer);
       }
     }
-    Stmt remapped_body =
-        RewriteFlatAllocBuffers(block->body, &remapped_allocs);
+    Stmt remapped_body = RewriteFlatAllocBuffers(block->body, &remapped_allocs);
     bool flat_allocs_changed = !remapped_body.same_as(block->body);
     if (flat_allocs_changed) {
       block.CopyOnWrite()->body = remapped_body;
@@ -3711,12 +3712,13 @@ private:
   // ``pipeline_stage == -1`` (default) is a passthrough; ``0`` means "no
   // pipelining hint"; ``stage >= 1`` becomes ``num_stages = stage + 1``,
   // matching the convention in :func:`GetPipelineNumStages`.
-  bool MaybeWrapExternPipelineStage(const SBlockNode *op,
-                                    SBlock *block) const {
+  bool MaybeWrapExternPipelineStage(const SBlockNode *op, SBlock *block) const {
     auto meta_opt = GetExternBlockMeta(op);
-    if (!meta_opt.has_value()) return false;
+    if (!meta_opt.has_value())
+      return false;
     auto stage_any = meta_opt.value().Get("pipeline_stage");
-    if (!stage_any.has_value()) return false;
+    if (!stage_any.has_value())
+      return false;
     int64_t raw_stage = -1;
     if (auto integer = stage_any.value().try_cast<Integer>()) {
       raw_stage = (*integer)->value;
@@ -3726,11 +3728,11 @@ private:
       return false;
     }
     int stage = static_cast<int>(raw_stage);
-    if (stage < 1) return false;
+    if (stage < 1)
+      return false;
     PrimExpr ns = IntImm(DataType::Int(32), stage + 1);
     SBlockNode *bn = block->CopyOnWrite();
-    bn->body =
-        AttrStmt(Integer(0), kPipelineContextNumStages, ns, bn->body);
+    bn->body = AttrStmt(Integer(0), kPipelineContextNumStages, ns, bn->body);
     return true;
   }
 

@@ -10,6 +10,7 @@ entry point used by :func:`tilelang.compile` when it receives a Triton
 TTIR string, an ``mlir.ir.Module`` carrying ``tt.func`` ops, or an
 already-built :class:`tvm.tir.PrimFunc` produced by ``from_triton_kernel``.
 """
+
 from __future__ import annotations
 
 __all__ = ["triton"]

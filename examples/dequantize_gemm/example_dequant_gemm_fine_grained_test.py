@@ -268,12 +268,16 @@ def tl_matmul_with_ladder_weight_only_transform_block_reduce_int4(
                     A_shared[i, vk] = A[by * block_M + i, ko * block_K + vk]
                 # TODO(lei): Layout Inference Pass is not efficient to handle the four dims int8 load
                 # Replacing with T.copy and coalesced_width
-                T.copy(B[bx * (block_N // micro_size_y) : bx * (block_N // micro_size_y) + block_N // micro_size_y,
-                         ko * (block_K // micro_size_k) : ko * (block_K // micro_size_k) + block_K // micro_size_k,
-                         0 : micro_size_y,
-                         0 : micro_size_k // num_elems_per_byte],
-                       B_shared, coalesced_width=vec_load_qb)
-
+                T.copy(
+                    B[
+                        bx * (block_N // micro_size_y) : bx * (block_N // micro_size_y) + block_N // micro_size_y,
+                        ko * (block_K // micro_size_k) : ko * (block_K // micro_size_k) + block_K // micro_size_k,
+                        0:micro_size_y,
+                        0 : micro_size_k // num_elems_per_byte,
+                    ],
+                    B_shared,
+                    coalesced_width=vec_load_qb,
+                )
 
                 for ki in T.serial(0, (block_K // (micro_size_k * reduce_k))):
                     # Load A into fragment

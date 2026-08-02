@@ -37,17 +37,13 @@ def _load_worktree_module():
     file directly via ``importlib``.
     """
     here = os.path.dirname(os.path.abspath(__file__))
-    candidate = os.path.normpath(
-        os.path.join(here, "..", "..", "..", "tilelang", "transform",
-                     "metal_fragment_to_simdgroup.py")
-    )
+    candidate = os.path.normpath(os.path.join(here, "..", "..", "..", "tilelang", "transform", "metal_fragment_to_simdgroup.py"))
     if not os.path.exists(candidate):
         # Fallback: standard import.
         from tilelang.transform import metal_fragment_to_simdgroup as m
+
         return m
-    spec = importlib.util.spec_from_file_location(
-        "_worktree_metal_fragment_to_simdgroup", candidate
-    )
+    spec = importlib.util.spec_from_file_location("_worktree_metal_fragment_to_simdgroup", candidate)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
@@ -62,8 +58,7 @@ _z3_simdgroup_eligible = _M._z3_simdgroup_eligible
 
 class _FakeBuf:
     def __init__(self, shape, dtype, name="buf"):
-        self.shape = [tir.IntImm("int32", s) if isinstance(s, int) else s
-                      for s in shape]
+        self.shape = [tir.IntImm("int32", s) if isinstance(s, int) else s for s in shape]
         self.dtype = dtype
         self.name = name
 
@@ -71,6 +66,7 @@ class _FakeBuf:
 # ---------------------------------------------------------------------------
 # Static cases
 # ---------------------------------------------------------------------------
+
 
 def test_static_fp16_8x8_detected():
     buf = _FakeBuf([8, 8], "float16")
@@ -106,6 +102,7 @@ def test_static_fp16_8x9_not_detected():
 # fp8 packed
 # ---------------------------------------------------------------------------
 
+
 def test_static_fp8_8x8_detected():
     # uint8/int8 stand in for "packed fp8" pre-quantization buffers.
     buf = _FakeBuf([8, 8], "uint8")
@@ -116,6 +113,7 @@ def test_static_fp8_8x8_detected():
 # ---------------------------------------------------------------------------
 # Symbolic cases — Z3 fallback
 # ---------------------------------------------------------------------------
+
 
 def test_symbolic_unconstrained_not_detected():
     # Symbolic shape with no upstream constraint → Z3 cannot prove
@@ -152,6 +150,7 @@ def test_dtype_rejected_before_z3():
 # ---------------------------------------------------------------------------
 # Helper smoke tests
 # ---------------------------------------------------------------------------
+
 
 def test_static_helper_direct():
     assert _static_simdgroup_eligible([8, 8], "float16")

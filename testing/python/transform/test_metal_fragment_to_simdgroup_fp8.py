@@ -32,16 +32,12 @@ from tvm import transform as tvm_transform
 def _load_worktree_module():
     """Load the worktree copy of metal_fragment_to_simdgroup.py."""
     here = os.path.dirname(os.path.abspath(__file__))
-    candidate = os.path.normpath(
-        os.path.join(here, "..", "..", "..", "tilelang", "transform",
-                     "metal_fragment_to_simdgroup.py")
-    )
+    candidate = os.path.normpath(os.path.join(here, "..", "..", "..", "tilelang", "transform", "metal_fragment_to_simdgroup.py"))
     if not os.path.exists(candidate):
         from tilelang.transform import metal_fragment_to_simdgroup as m
+
         return m
-    spec = importlib.util.spec_from_file_location(
-        "_worktree_metal_fragment_to_simdgroup_fp8", candidate
-    )
+    spec = importlib.util.spec_from_file_location("_worktree_metal_fragment_to_simdgroup_fp8", candidate)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
@@ -144,8 +140,8 @@ def test_fp8_gemm_accum_not_promoted_to_simdgroup():
 
     out_func = out_mod["main"]
     assert not _module_has_simdgroup_scope(out_func), (
-        "fp8 GEMM with fp32 accumulator was incorrectly promoted to "
-        "metal.simdgroup scope; gated rewrite should reject it.")
+        "fp8 GEMM with fp32 accumulator was incorrectly promoted to metal.simdgroup scope; gated rewrite should reject it."
+    )
 
 
 if __name__ == "__main__":

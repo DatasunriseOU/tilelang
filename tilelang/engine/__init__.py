@@ -3,12 +3,11 @@ try:
 except Exception as _lower_import_error:
 
     def lower(*_args, **_kwargs):
-        raise RuntimeError(
-            "tilelang.engine.lower is unavailable in this checkout"
-        ) from _lower_import_error
+        raise RuntimeError("tilelang.engine.lower is unavailable in this checkout") from _lower_import_error
 
     def is_device_call(*_args, **_kwargs):
         return False
+
 
 try:
     from .param import KernelParam  # noqa: F401

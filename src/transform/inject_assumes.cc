@@ -7,10 +7,10 @@
 #include "common/assume.h"
 #include "common/attr.h"
 #include "tvm/arith/analyzer.h"
+#include "tvm/ffi/extra/structural_hash.h"
 #include "tvm/ffi/optional.h"
 #include "tvm/ir/expr.h"
 #include "tvm/ir/transform.h"
-#include "tvm/ffi/extra/structural_hash.h"
 #include "tvm/tirx/builtin.h"
 #include "tvm/tirx/expr.h"
 #include "tvm/tirx/op.h"
@@ -87,9 +87,8 @@ private:
       size_t h = sh(stride);
       auto &bucket = stride_div_buckets[h];
       auto it = std::find_if(bucket.begin(), bucket.end(), [&](size_t y) {
-        return tvm::ffi::StructuralEqual::Equal(stride,
-                                                stride_div_items[y].stride,
-                                                true, true);
+        return tvm::ffi::StructuralEqual::Equal(
+            stride, stride_div_items[y].stride, true, true);
       });
       if (it == bucket.end()) {
         auto index = stride_div_items.size();
@@ -238,8 +237,8 @@ private:
     }
 
     return SBlock(op->iter_vars, op->reads, op->writes, op->name_hint,
-                 c.build(body), op->init, op->alloc_buffers, op->match_buffers,
-                 op->annotations, op->span);
+                  c.build(body), op->init, op->alloc_buffers, op->match_buffers,
+                  op->annotations, op->span);
   }
 
   PrimFunc f;

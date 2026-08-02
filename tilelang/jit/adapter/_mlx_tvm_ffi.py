@@ -7,7 +7,8 @@ import or call this bridge directly.
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 from tilelang.analysis.metal_graph_sync import (
     MetalLaunchDependencyMetadata,
@@ -34,9 +35,7 @@ def _load_native_module():
     try:
         import _tilelang_mlx_tvm_ffi  # type: ignore
     except Exception as exc:  # pragma: no cover - depends on optional native build
-        raise MLXTVMFFIBridgeUnavailable(
-            "native MLX TVM-FFI bridge is not built or cannot be loaded"
-        ) from exc
+        raise MLXTVMFFIBridgeUnavailable("native MLX TVM-FFI bridge is not built or cannot be loaded") from exc
     _NATIVE_MODULE = _tilelang_mlx_tvm_ffi
     return _tilelang_mlx_tvm_ffi
 

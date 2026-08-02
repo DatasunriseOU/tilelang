@@ -66,17 +66,14 @@ struct FinalizeReducerImpl {
   std::string (*make_batch_allreduce)(const FinalizeReducerOpNode &op,
                                       const LowerArgs &T,
                                       const ReductionPlan &plan,
-                                      const std::string &op_str,
-                                      int64_t batch);
+                                      const std::string &op_str, int64_t batch);
 
-  bool (*needs_scalar_workspace)(const LowerArgs &T,
-                                 const ReductionPlan &plan);
-  int (*scalar_workspace_size)(const LowerArgs &T,
-                               const ReductionPlan &plan);
-  bool (*needs_batch_workspace)(const LowerArgs &T,
-                                const ReductionPlan &plan, int64_t batch);
-  int (*batch_workspace_size)(const LowerArgs &T,
-                              const ReductionPlan &plan, int64_t batch);
+  bool (*needs_scalar_workspace)(const LowerArgs &T, const ReductionPlan &plan);
+  int (*scalar_workspace_size)(const LowerArgs &T, const ReductionPlan &plan);
+  bool (*needs_batch_workspace)(const LowerArgs &T, const ReductionPlan &plan,
+                                int64_t batch);
+  int (*batch_workspace_size)(const LowerArgs &T, const ReductionPlan &plan,
+                              int64_t batch);
 
   void (*append_scalar_args)(Array<PrimExpr> *args, const LowerArgs &T,
                              bool need_workspace, const PrimExpr &workspace);

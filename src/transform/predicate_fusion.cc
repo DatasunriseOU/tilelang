@@ -142,7 +142,7 @@ public:
 // the fusion to `if(a && b)` — though C++/MSL short-circuit at runtime,
 // the lowered TIR may evaluate both sides depending on the codegen.
 class ExprBufferLoadCollector : public ExprVisitor {
- public:
+public:
   std::vector<const BufferLoadNode *> loads;
   void VisitExpr_(const BufferLoadNode *op) final {
     loads.push_back(op);
@@ -195,7 +195,8 @@ static bool Z3ProvesIndexInRange(const Buffer &buf, size_t dim,
       break;
     }
   }
-  if (too_many_vars) return false;
+  if (too_many_vars)
+    return false;
   PrimExpr goal = (idx >= make_const(idx.dtype(), 0)) && (idx < extent);
   try {
     return z3.CanProve(goal);
@@ -263,7 +264,8 @@ bool Z3ProvesConditionLoadsWellDefined(const PrimExpr &cond,
 // `outer_guard` is purely informational here — we explicitly do NOT
 // constrain it, because the whole point of the proof is that `b` must
 // be safe even when `!a`.
-bool Z3ProvesInnerWellDefined(const Stmt &inner_body, arith::Analyzer *analyzer) {
+bool Z3ProvesInnerWellDefined(const Stmt &inner_body,
+                              arith::Analyzer *analyzer) {
   BufferLoadCollector collector;
   collector(inner_body);
   if (collector.bailout) {
@@ -408,8 +410,7 @@ using namespace tirx::transform;
 
 tvm::transform::Pass PredicateFusion() {
   auto pass_func = [](PrimFunc f, const IRModule &m, const PassContext &ctx) {
-    bool enabled =
-        ctx->GetConfig<Bool>(kPredicateFusion, Bool(false)).value();
+    bool enabled = ctx->GetConfig<Bool>(kPredicateFusion, Bool(false)).value();
     if (!enabled) {
       return f;
     }

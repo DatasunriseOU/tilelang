@@ -23,11 +23,11 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/s_tir/utils.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
-#include <tvm/s_tir/utils.h>
 
 #include <queue>
 

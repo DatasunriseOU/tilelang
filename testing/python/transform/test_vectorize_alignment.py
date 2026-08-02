@@ -42,6 +42,7 @@ def _has_vec_aligned_annotation(mod) -> bool:
 # 2048 % (vec_width=4 * dtype_bytes=2) == 0
 # ---------------------------------------------------------------------------
 
+
 def test_static_aligned_addr():
     """`A` and `B` are fp16 and the loop access pattern is `A[i]/B[i]`
     starting at offset 0. The base address aligns to 8 bytes, and the
@@ -71,6 +72,7 @@ def test_static_aligned_addr():
 # ---------------------------------------------------------------------------
 # Case 2: static misaligned (logical) — annotation must NOT appear.
 # ---------------------------------------------------------------------------
+
 
 def test_static_misaligned_addr():
     """A loop with `B[i + 1] = A[i + 1]` shifts the base address by one
@@ -140,6 +142,7 @@ def test_symbolic_aligned_via_z3():
 # Case 4: with config OFF, no `tl.vec_aligned` annotation appears.
 # ---------------------------------------------------------------------------
 
+
 def test_default_off_preserves():
     """When `tl.vectorize_alignment_proof` is unset/False, the pass must
     NOT add the annotation. This is the "additive optimization" contract:
@@ -168,6 +171,7 @@ def test_default_off_preserves():
 # so an explicit reverse-iteration access pattern must be left scalar
 # (no `vectorized` annotation should appear on the rewritten loop).
 # ---------------------------------------------------------------------------
+
 
 def test_indices_can_vectorize_memoized_halving():
     """fix-B6 regression: a body that triggers the planner's halving
@@ -280,6 +284,7 @@ def test_negative_stride_not_vectorized():
 # colliding memo entry could have flipped a "cannot vectorize" answer
 # to "can vectorize" (or vice versa) on the second loop.
 # ---------------------------------------------------------------------------
+
 
 def test_memo_collision_resistance():
     """Two distinct vectorize-eligible loops in the same module each

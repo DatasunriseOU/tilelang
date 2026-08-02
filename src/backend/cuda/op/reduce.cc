@@ -66,12 +66,13 @@ bool MatchCudaReduceTarget(Target target) {
 // MatchDefaultReduceTarget (= !TargetIsMetal) already covers CUDA/CuTeDSL and
 // whose MakeDefault{Scalar,Batch}AllReduce reproduce exactly this backend's
 // SM90 NamedBarrier / pre-SM90 SyncThreadsBarrier logic against the NEW
-// ReduceImpl contract ({name, match_target, int priority, make_scalar_allreduce,
-// make_batch_allreduce, needs/size workspace fns, append_args}). The legacy
-// cuda::Reduce here still uses the OLD 3-field {name, match_target, Lower(CRTP)}
-// shape, which no longer compiles. Disable the redundant registration; the
-// CUDA reduce path is fully served by default.Reduce. (The cuda::Reduce struct
-// is retained above for reference / future CUDA-specific specialization.)
+// ReduceImpl contract ({name, match_target, int priority,
+// make_scalar_allreduce, make_batch_allreduce, needs/size workspace fns,
+// append_args}). The legacy cuda::Reduce here still uses the OLD 3-field {name,
+// match_target, Lower(CRTP)} shape, which no longer compiles. Disable the
+// redundant registration; the CUDA reduce path is fully served by
+// default.Reduce. (The cuda::Reduce struct is retained above for reference /
+// future CUDA-specific specialization.)
 #if 0
 bool RegisterCudaReduce() {
   RegisterReduceImpl(ReduceImpl{

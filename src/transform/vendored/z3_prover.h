@@ -40,35 +40,35 @@ namespace tlz3 {
 class Z3ProverImpl;
 
 class Z3Prover {
- public:
-  explicit Z3Prover(::tvm::arith::Analyzer* parent);
+public:
+  explicit Z3Prover(::tvm::arith::Analyzer *parent);
   ~Z3Prover();
 
-  Z3Prover(const Z3Prover&) = delete;
-  Z3Prover& operator=(const Z3Prover&) = delete;
+  Z3Prover(const Z3Prover &) = delete;
+  Z3Prover &operator=(const Z3Prover &) = delete;
 
   // Public surface mirrors the TileLang-fork class. Return types use
   // ffi::String upstream; we surface std::string for caller convenience —
   // every call site streams the result into a stringstream, so this is
   // lossless.
-  void Bind(const ::tvm::tirx::Var& var, const ::tvm::Range& new_range,
+  void Bind(const ::tvm::tirx::Var &var, const ::tvm::Range &new_range,
             bool allow_override = false);
-  void Bind(const ::tvm::tirx::Var& var, const ::tvm::PrimExpr& expr,
+  void Bind(const ::tvm::tirx::Var &var, const ::tvm::PrimExpr &expr,
             bool allow_override = false);
   // Queries the solver to see if `expr` (interpreted as a boolean
   // condition) is universally true under the current constraint stack.
   // Returns true if proven, false otherwise (timeout, unsupported
   // operator, or counter-example found).
-  bool CanProve(const ::tvm::PrimExpr& expr);
-  std::function<void()> EnterConstraint(const ::tvm::PrimExpr& constraint,
+  bool CanProve(const ::tvm::PrimExpr &expr);
+  std::function<void()> EnterConstraint(const ::tvm::PrimExpr &constraint,
                                         bool is_assume = false);
   std::string GetSMTLIB2(::tvm::ffi::Optional<::tvm::PrimExpr> expr);
   // Convenience overload — accepts std::nullopt directly without forcing the
   // caller to construct an `ffi::Optional<PrimExpr>`.
   std::string GetSMTLIB2(std::nullopt_t);
   std::string GetStats();
-  std::string GetModel(const ::tvm::PrimExpr& expr);
-  int64_t CountSatisfyingValues(const ::tvm::tirx::Var& var, int64_t max_count,
+  std::string GetModel(const ::tvm::PrimExpr &expr);
+  int64_t CountSatisfyingValues(const ::tvm::tirx::Var &var, int64_t max_count,
                                 int64_t min_consecutive = 1);
 
   void SetTimeoutMs(unsigned timeout_ms);
@@ -125,7 +125,7 @@ class Z3Prover {
   // recoverers); fails-fast otherwise to surface the lifecycle violation.
   void Reset();
 
- private:
+private:
   std::unique_ptr<Z3ProverImpl> impl_;
 };
 
@@ -147,8 +147,8 @@ class Z3Prover {
 // `SetBitVectorMode` docs); on enter and on exit the solver state is
 // reset, so do not nest scopes that share variable bindings.
 class ScopedBVMode {
- public:
-  ScopedBVMode(Z3Prover& prover, int width)
+public:
+  ScopedBVMode(Z3Prover &prover, int width)
       : prover_(prover), prev_width_(prover.GetBitVectorWidth()) {
     prover_.SetBitVectorMode(width);
   }
@@ -160,13 +160,13 @@ class ScopedBVMode {
   // marker makes the contract explicit at the type-system level.
   ~ScopedBVMode() noexcept { prover_.SetBitVectorMode(prev_width_); }
 
-  ScopedBVMode(const ScopedBVMode&) = delete;
-  ScopedBVMode& operator=(const ScopedBVMode&) = delete;
-  ScopedBVMode(ScopedBVMode&&) = delete;
-  ScopedBVMode& operator=(ScopedBVMode&&) = delete;
+  ScopedBVMode(const ScopedBVMode &) = delete;
+  ScopedBVMode &operator=(const ScopedBVMode &) = delete;
+  ScopedBVMode(ScopedBVMode &&) = delete;
+  ScopedBVMode &operator=(ScopedBVMode &&) = delete;
 
- private:
-  Z3Prover& prover_;
+private:
+  Z3Prover &prover_;
   int prev_width_;
 };
 
@@ -174,7 +174,7 @@ class ScopedBVMode {
 // `Analyzer*` so successive `Z3Prover(analyzer)` calls in the same logical
 // scope share solver state. `thread_local` guards Z3 context affinity (Z3's
 // own context is not thread-safe).
-Z3Prover& GetOrCreate(::tvm::arith::Analyzer* analyzer);
+Z3Prover &GetOrCreate(::tvm::arith::Analyzer *analyzer);
 
 // CPPMEGA z3-final per-pass gate (2026-05-07). Granular complement to the
 // blanket `TILELANG_DISABLE_Z3=1` global gate at `Z3Prover::CanProve`.
@@ -203,8 +203,8 @@ Z3Prover& GetOrCreate(::tvm::arith::Analyzer* analyzer);
 // hits hit a small unordered_map. This keeps the gate cheap on the hot
 // path (vectorize/drop-bound-checks call `IsEnabled` per probe).
 class Z3PassGate {
- public:
-  static bool IsEnabled(const char* pass_name);
+public:
+  static bool IsEnabled(const char *pass_name);
 };
 
 // CPPMEGA z3-stack fix-A8 (NEW-2): per-pass cache hygiene. Pass drivers
@@ -214,10 +214,10 @@ class Z3PassGate {
 // reuse for a freed Analyzer would otherwise hand a stale prover (with
 // stale memo/scope/bv-mode) to the new owner. Cheap; idempotent.
 void ClearProverCache();
-void ResetProverFor(::tvm::arith::Analyzer* analyzer);
+void ResetProverFor(::tvm::arith::Analyzer *analyzer);
 
-}  // namespace tlz3
-}  // namespace tilelang
+} // namespace tlz3
+} // namespace tilelang
 
 // Free-function shim — replaces the `Z3ProverStub` shim. Call sites continue
 // to write `arith::Z3Prover(analyzer).Foo(...)`; this resolves to the free
@@ -225,13 +225,13 @@ void ResetProverFor(::tvm::arith::Analyzer* analyzer);
 // `tilelang::z3::` namespace, not `tvm::arith::`.
 namespace tvm {
 namespace arith {
-inline ::tilelang::tlz3::Z3Prover& Z3Prover(Analyzer& a) {
+inline ::tilelang::tlz3::Z3Prover &Z3Prover(Analyzer &a) {
   return ::tilelang::tlz3::GetOrCreate(&a);
 }
-inline ::tilelang::tlz3::Z3Prover& Z3Prover(Analyzer* a) {
+inline ::tilelang::tlz3::Z3Prover &Z3Prover(Analyzer *a) {
   return ::tilelang::tlz3::GetOrCreate(a);
 }
-}  // namespace arith
-}  // namespace tvm
+} // namespace arith
+} // namespace tvm
 
-#endif  // TILELANG_VENDORED_Z3_PROVER_H_
+#endif // TILELANG_VENDORED_Z3_PROVER_H_

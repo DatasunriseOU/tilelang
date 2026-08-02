@@ -14,11 +14,7 @@ from tvm.tirx.expr import CallEffectKind
 
 
 def is_prim_func_like(func) -> bool:
-    return isinstance(func, PrimFunc) or (
-        hasattr(func, "params")
-        and hasattr(func, "body")
-        and hasattr(func, "attrs")
-    )
+    return isinstance(func, PrimFunc) or (hasattr(func, "params") and hasattr(func, "body") and hasattr(func, "attrs"))
 
 
 def prim_func_global_symbol(func) -> str:
@@ -213,10 +209,7 @@ def retrieve_func_from_module(ir_module: IRModule) -> PrimFunc:
     """
     if is_prim_func_like(ir_module):
         return ir_module
-    if not isinstance(ir_module, IRModule) and not (
-        hasattr(ir_module, "get_global_vars")
-        and hasattr(ir_module, "functions")
-    ):
+    if not isinstance(ir_module, IRModule) and not (hasattr(ir_module, "get_global_vars") and hasattr(ir_module, "functions")):
         raise ValueError("Not supported type: ", type(ir_module))
     assert len(ir_module.get_global_vars()) == 1, "The optimized module should only have one global variable for default schedule."
     func = list(ir_module.functions.values())[0]

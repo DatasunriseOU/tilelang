@@ -66,6 +66,7 @@ def _z3_pass_disabled(name: str) -> bool:
             return True
     return False
 
+
 # ---------------------------------------------------------------------------
 # Z3 import is optional. When z3-solver isn't installed, the symbolic branch
 # returns conservative-False (matching the dot4-legality prover policy).

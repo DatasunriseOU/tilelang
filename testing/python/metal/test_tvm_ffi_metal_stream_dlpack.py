@@ -240,18 +240,10 @@ def test_tvm_ffi_metal_env_stream_context_path():
 
 @tilelang.testing.requires_metal
 def test_tvm_ffi_metal_explicit_tvm_stream_path():
-    set_external = tilelang.tvm.ffi.get_global_func(
-        "metal.SetExternalCommandBuffer", allow_missing=True
-    )
-    get_external = tilelang.tvm.ffi.get_global_func(
-        "metal.GetExternalCommandBuffer", allow_missing=True
-    )
-    clear_external = tilelang.tvm.ffi.get_global_func(
-        "metal.ClearExternalCommandBuffer", allow_missing=True
-    )
-    get_tvm_stream = tilelang.tvm.ffi.get_global_func(
-        "metal.GetCurrentTVMStream", allow_missing=True
-    )
+    set_external = tilelang.tvm.ffi.get_global_func("metal.SetExternalCommandBuffer", allow_missing=True)
+    get_external = tilelang.tvm.ffi.get_global_func("metal.GetExternalCommandBuffer", allow_missing=True)
+    clear_external = tilelang.tvm.ffi.get_global_func("metal.ClearExternalCommandBuffer", allow_missing=True)
+    get_tvm_stream = tilelang.tvm.ffi.get_global_func("metal.GetCurrentTVMStream", allow_missing=True)
 
     assert set_external is not None
     assert get_external is not None
@@ -984,9 +976,7 @@ def test_tvm_ffi_metal_cached_host_wrapper_path_is_graph_ordered():
         state = debug_state()
     finally:
         if previous_boundary is not None:
-            os.environ["TILELANG_MLX_TVM_FFI_FORCE_COMMAND_BUFFER_BOUNDARY"] = (
-                previous_boundary
-            )
+            os.environ["TILELANG_MLX_TVM_FFI_FORCE_COMMAND_BUFFER_BOUNDARY"] = previous_boundary
 
     assert state["force_command_buffer_boundary_enabled"] is False
     assert state["direct_device_launches"] == 0

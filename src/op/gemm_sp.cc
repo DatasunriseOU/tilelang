@@ -182,7 +182,7 @@ Stmt GemmSPNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
                            IntImm(DataType::Int(32), 1));
       }
       return SBlockRealize(block_realize->iter_values, block_realize->predicate,
-                          block);
+                           block);
     }
     // wrap with block realize node
     Map<String, ffi::ObjectRef> block_annotations;
@@ -193,9 +193,9 @@ Stmt GemmSPNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         /*predicate=*/const_true(),
         /*block=*/
         SBlock(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{},
-              /*name_hint=*/global_symbol.value(), prim_func->body,
-              /*init=*/Optional<Stmt>(), /*alloc_buffers=*/{},
-              /*match_buffers=*/{}, /*annotations=*/block_annotations));
+               /*name_hint=*/global_symbol.value(), prim_func->body,
+               /*init=*/Optional<Stmt>(), /*alloc_buffers=*/{},
+               /*match_buffers=*/{}, /*annotations=*/block_annotations));
   } else {
     LOG(FATAL) << "No lower function found for gemm_sp";
   }

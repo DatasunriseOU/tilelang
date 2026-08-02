@@ -69,7 +69,7 @@ public:
   void VisitStmt_(const BufferStoreNode *op) final; // NOLINT(*)
   void VisitExpr_(const BufferLoadNode *op,
                   std::ostream &os) final;                          // NOLINT(*)
-  void VisitExpr_(const VarNode *op, std::ostream &os) final;        // NOLINT(*)
+  void VisitExpr_(const VarNode *op, std::ostream &os) final;       // NOLINT(*)
   void VisitExpr_(const SelectNode *op, std::ostream &os) final;    // NOLINT(*)
   void VisitExpr_(const BroadcastNode *op, std::ostream &os) final; // NOLINT(*)
   void VisitExpr_(const CallNode *op, std::ostream &os) final;      // NOLINT(*)
@@ -108,18 +108,18 @@ private:
   // and a matching per-dtype `EmitFp8XXXHelper()` body. See
   // docs/mlx_port_master_plan.md (Metal codegen FP8 conditional prelude).
   void CollectReferencedLowPrecisionDtypes(const PrimFunc &f);
-  void EmitFPHelperPrelude();          // public dispatch entry
+  void EmitFPHelperPrelude(); // public dispatch entry
   void EmitAtomicAddHelperPrelude();
   void EmitAtomicCASHelperPrelude();
   void EmitFp8E3M4Helper();
   void EmitFp8E4M3Helper();
-  void EmitFp8E4M3FnAliasHelper();     // delegates to E4M3
+  void EmitFp8E4M3FnAliasHelper(); // delegates to E4M3
   void EmitFp8E4M3FnuzHelper();
   void EmitFp8E4M3B11FnuzHelper();
   void EmitFp8E5M2Helper();
   void EmitFp8E5M2FnuzHelper();
   void EmitFp8E8M0FnuHelper();
-  void EmitFp8Dot4Helpers();           // LUT + dot4_words + dot4_packed overloads
+  void EmitFp8Dot4Helpers(); // LUT + dot4_words + dot4_packed overloads
 
   std::set<int> referenced_fp8_codes_;
   bool uses_fp8_dot4_{false};

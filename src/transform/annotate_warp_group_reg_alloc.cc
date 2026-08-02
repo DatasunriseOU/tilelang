@@ -80,9 +80,9 @@ Stmt RewriteWarpSpecializationBody(const Stmt &stmt, F &&rewrite_if,
       return stmt;
     }
     SBlock new_block(block->iter_vars, block->reads, block->writes,
-                    block->name_hint, new_body, block->init,
-                    block->alloc_buffers, block->match_buffers,
-                    block->annotations);
+                     block->name_hint, new_body, block->init,
+                     block->alloc_buffers, block->match_buffers,
+                     block->annotations);
     return SBlockRealize(realize->iter_values, realize->predicate, new_block);
   }
 
@@ -93,8 +93,8 @@ Stmt RewriteWarpSpecializationBody(const Stmt &stmt, F &&rewrite_if,
       return stmt;
     }
     return SBlock(block->iter_vars, block->reads, block->writes,
-                 block->name_hint, new_body, block->init, block->alloc_buffers,
-                 block->match_buffers, block->annotations);
+                  block->name_hint, new_body, block->init, block->alloc_buffers,
+                  block->match_buffers, block->annotations);
   }
 
   return stmt;

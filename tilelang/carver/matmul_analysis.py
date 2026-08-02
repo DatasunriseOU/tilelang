@@ -733,7 +733,9 @@ def get_propagate_map(trans: bool = True, dtype="float16", matrix_name="A", inde
 # Instructions.
 def get_ladder_stage3_map(dtype="float16", index_dtype="int32"):
     from tvm import DataType
+
     dtype_bits = DataType(dtype).bits
+
     def shared_32x8_to_mma_32x8_layout(i, j):
         thread_id = (i % 8) * 4 + (j // 2)
         local_id = (i // 8) * 2 + (j % 2)

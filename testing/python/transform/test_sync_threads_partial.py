@@ -15,6 +15,7 @@ Codegen lowering matrix (verified by reading source, not invoked here):
     HIP   → ``// no-op (wave-level convergence)``
     Metal → ``simdgroup_barrier(mem_flags::mem_threadgroup);``
 """
+
 from __future__ import annotations
 
 import pytest

@@ -1,9 +1,9 @@
 #include "../op/builtin.h"
 #include "arith/ir_mutator_with_analyzer.h"
+#include "tirx/ir/data_type_rewriter.h"
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/builtin.h>
-#include "tirx/ir/data_type_rewriter.h"
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/transform.h>
 

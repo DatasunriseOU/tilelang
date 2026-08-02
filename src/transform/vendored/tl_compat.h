@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// TileLang compat shim: alias old ICHECK family → apache/tvm-latest TVM_FFI_ICHECK family.
-// Force-included from CMake via -include flag so every .cc gets ICHECK transparently.
+// TileLang compat shim: alias old ICHECK family → apache/tvm-latest
+// TVM_FFI_ICHECK family. Force-included from CMake via -include flag so every
+// .cc gets ICHECK transparently.
 #ifndef TILELANG_VENDORED_TL_COMPAT_H_
 #define TILELANG_VENDORED_TL_COMPAT_H_
 
@@ -17,14 +18,13 @@
 namespace tvm {
 using Object = ::tvm::ffi::Object;
 using ObjectRef = ::tvm::ffi::ObjectRef;
-template <typename T>
-using ObjectPtr = ::tvm::ffi::ObjectPtr<T>;
+template <typename T> using ObjectPtr = ::tvm::ffi::ObjectPtr<T>;
 using ObjectPtrHash = ::tvm::ffi::ObjectPtrHash;
 using ObjectPtrEqual = ::tvm::ffi::ObjectPtrEqual;
 using StructuralEqual = ::tvm::ffi::StructuralEqual;
 using StructuralHash = ::tvm::ffi::StructuralHash;
 using PackedArgs = ::tvm::ffi::PackedArgs;
-}  // namespace tvm
+} // namespace tvm
 
 #ifndef CHECK
 #define CHECK(x) TVM_FFI_CHECK(x, InternalError)
@@ -95,9 +95,9 @@ constexpr TVMStructFieldKind kArrByteOffset = kDLTensorByteOffset;
 constexpr TVMStructFieldKind kArrDeviceId = kDLTensorDeviceId;
 constexpr TVMStructFieldKind kArrDeviceType = kDLTensorDeviceType;
 constexpr TVMStructFieldKind kArrKindBound_ = kDLTensorKindBound_;
-}  // namespace builtin
-}  // namespace tirx
-}  // namespace tvm
+} // namespace builtin
+} // namespace tirx
+} // namespace tvm
 
 // CPPMEGA: TileLang-private launch-param tags for SM90+ thread-block clusters.
 // These never existed upstream. Add them under the `tvm::runtime::launch_param`
@@ -106,12 +106,12 @@ constexpr TVMStructFieldKind kArrKindBound_ = kDLTensorKindBound_;
 namespace tvm {
 namespace runtime {
 namespace launch_param {
-constexpr const char* kClusterDimX = "tilelang.cluster_dim_x";
-constexpr const char* kClusterDimY = "tilelang.cluster_dim_y";
-constexpr const char* kClusterDimZ = "tilelang.cluster_dim_z";
-}  // namespace launch_param
-}  // namespace runtime
-}  // namespace tvm
+constexpr const char *kClusterDimX = "tilelang.cluster_dim_x";
+constexpr const char *kClusterDimY = "tilelang.cluster_dim_y";
+constexpr const char *kClusterDimZ = "tilelang.cluster_dim_z";
+} // namespace launch_param
+} // namespace runtime
+} // namespace tvm
 
 // CPPMEGA: alias attribute keys that moved from `tirx::attr` to `s_tir::attr`
 // (software pipelining + async copy markers) and add TileLang-only keys
@@ -121,24 +121,30 @@ constexpr const char* kClusterDimZ = "tilelang.cluster_dim_z";
 namespace tvm {
 namespace tirx {
 namespace attr {
-constexpr const char* software_pipeline_stage = ::tvm::s_tir::attr::software_pipeline_stage;
-constexpr const char* software_pipeline_order = ::tvm::s_tir::attr::software_pipeline_order;
-constexpr const char* software_pipeline_async_stages = ::tvm::s_tir::attr::software_pipeline_async_stages;
-constexpr const char* async_scope = ::tvm::s_tir::attr::async_scope;
-constexpr const char* async_commit_queue_scope = ::tvm::s_tir::attr::async_commit_queue_scope;
-constexpr const char* async_wait_queue_scope = ::tvm::s_tir::attr::async_wait_queue_scope;
-constexpr const char* async_wait_inflight_count = ::tvm::s_tir::attr::async_wait_inflight_count;
-constexpr const char* virtual_thread = ::tvm::s_tir::attr::virtual_thread;
-constexpr const char* buffer_dim_align = ::tvm::s_tir::attr::buffer_dim_align;
-constexpr const char* reduce_scope = ::tvm::s_tir::attr::reduce_scope;
+constexpr const char *software_pipeline_stage =
+    ::tvm::s_tir::attr::software_pipeline_stage;
+constexpr const char *software_pipeline_order =
+    ::tvm::s_tir::attr::software_pipeline_order;
+constexpr const char *software_pipeline_async_stages =
+    ::tvm::s_tir::attr::software_pipeline_async_stages;
+constexpr const char *async_scope = ::tvm::s_tir::attr::async_scope;
+constexpr const char *async_commit_queue_scope =
+    ::tvm::s_tir::attr::async_commit_queue_scope;
+constexpr const char *async_wait_queue_scope =
+    ::tvm::s_tir::attr::async_wait_queue_scope;
+constexpr const char *async_wait_inflight_count =
+    ::tvm::s_tir::attr::async_wait_inflight_count;
+constexpr const char *virtual_thread = ::tvm::s_tir::attr::virtual_thread;
+constexpr const char *buffer_dim_align = ::tvm::s_tir::attr::buffer_dim_align;
+constexpr const char *reduce_scope = ::tvm::s_tir::attr::reduce_scope;
 // `volatile_scope` was dropped from apache/tvm; mirror the TileLang vendored
 // constant so `tirx::attr::volatile_scope` keeps resolving.
-constexpr const char* volatile_scope = "volatile_scope";
+constexpr const char *volatile_scope = "volatile_scope";
 // TileLang-private attribute key — never existed upstream.
-constexpr const char* tilelang_assume = "tilelang.assume";
-}  // namespace attr
-}  // namespace tirx
-}  // namespace tvm
+constexpr const char *tilelang_assume = "tilelang.assume";
+} // namespace attr
+} // namespace tirx
+} // namespace tvm
 
 // CPPMEGA: alias the vendored TileLang-private Allocate node into the
 // `tvm::tirx` namespace so the legacy form `Allocate(buffer_var, dtype,
@@ -151,7 +157,7 @@ namespace tvm {
 namespace tirx {
 using Allocate = ::tilelang::tl_tir::Allocate;
 using AllocateNode = ::tilelang::tl_tir::AllocateNode;
-}  // namespace tirx
-}  // namespace tvm
+} // namespace tirx
+} // namespace tvm
 
-#endif  // TILELANG_VENDORED_TL_COMPAT_H_
+#endif // TILELANG_VENDORED_TL_COMPAT_H_

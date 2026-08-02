@@ -11,12 +11,12 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/s_tir/utils.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/index_map.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
-#include <tvm/s_tir/utils.h>
 
 #include <algorithm>
 #include <deque>
@@ -96,7 +96,7 @@ bool IsSimdgroupEligible(const Buffer &buffer) {
   for (size_t i = shape.size() - 2; i < shape.size(); ++i) {
     const auto *imm = shape[i].as<IntImmNode>();
     if (imm == nullptr) {
-      return false;  // conservative: Python rejects symbolic shapes
+      return false; // conservative: Python rejects symbolic shapes
     }
     int64_t v = imm->value;
     if (v <= 0 || (v % 8) != 0) {
@@ -572,7 +572,6 @@ public:
   }
 
 private:
-
   // Return true if any buffer that this op (idx) touches already has
   // an inferred layout in layout_map. Used to prioritize enqueue order.
   bool HasKnownLayoutAnchor(int idx, const LayoutMap &layout_map) const {
@@ -849,7 +848,8 @@ private:
       // back to ``Layout()`` (the original behaviour).
       auto tile_size_arr = [&]() -> Array<Integer> {
         auto v = meta.Get("tile_size");
-        if (!v.has_value()) return {};
+        if (!v.has_value())
+          return {};
         return v.value().as<Array<Integer>>().value_or(Array<Integer>());
       }();
       auto tile_at = [&](size_t i, int fallback) -> int {
@@ -863,12 +863,10 @@ private:
       const int default_element_bits = 16;
 
       // Layout strings we recognise. Anything else is opaque / passthrough.
-      auto layout_for_string =
-          [&](const ffi::String &s) -> Layout {
+      auto layout_for_string = [&](const ffi::String &s) -> Layout {
         const std::string str(s);
         // Linear / opaque kinds: nothing to register; fall through.
-        if (str == "row_major" || str == "col_major" ||
-            str == "swizzled_xor") {
+        if (str == "row_major" || str == "col_major" || str == "swizzled_xor") {
           return Layout();
         }
         // mma_* fragments: tile_size = (M, N, K). Use M as warp_m, N as
@@ -876,7 +874,8 @@ private:
         // known here — the GEMM op's full block/warp partition lives in
         // gemm.cc and is unavailable in this scope.
         if (str == "mma_A" || str == "mma_B" || str == "mma_C") {
-          if (tile_size_arr.size() < 2) return Layout();
+          if (tile_size_arr.size() < 2)
+            return Layout();
           int M = tile_at(0, 16);
           int N = tile_at(1, 16);
           int K = tile_at(2, 16);
@@ -914,17 +913,21 @@ private:
       // ``IfThenElse``) we fall back to a one-pass ``PostOrderVisit`` so
       // existing kernels keep working.
       auto handle_call = [&](const CallNode *call) {
-        if (!IsExternIntrinsicCall(call)) return;
+        if (!IsExternIntrinsicCall(call))
+          return;
         // Per-frag layout list lives under "layouts" (Array<String>) when
         // the decorator chose to serialise it; otherwise meta is a flat
         // map keyed by frag name. We accept both shapes here.
         auto layouts_any = meta.Get("layouts");
-        if (!layouts_any) return;
-        auto layouts = layouts_any.value().as<Array<ffi::String>>().value_or(Array<ffi::String>());
-        for (size_t i = 0;
-             i < layouts.size() && i + 1 < call->args.size(); ++i) {
+        if (!layouts_any)
+          return;
+        auto layouts = layouts_any.value().as<Array<ffi::String>>().value_or(
+            Array<ffi::String>());
+        for (size_t i = 0; i < layouts.size() && i + 1 < call->args.size();
+             ++i) {
           auto buf_opt = getBufferFromAccessPtr(call->args[i + 1]);
-          if (!buf_opt.defined()) continue;
+          if (!buf_opt.defined())
+            continue;
           Layout l = layout_for_string(layouts[i]);
           if (l.defined() && IsRegisterBuffer(buf_opt.value())) {
             annotated_layout_map_.Set(buf_opt.value(), l);
@@ -1327,13 +1330,16 @@ private:
           }
         } catch (const LayoutConflictException &e) {
           do_update = false;
-          std::cout << "attempt failed due to LayoutConflictException " << e.what() << std::endl;
+          std::cout << "attempt failed due to LayoutConflictException "
+                    << e.what() << std::endl;
         } catch (const NormalizeIterException &e) {
           do_update = false;
-          std::cout << "attempt failed due to NormalizeIterException " << e.what() << std::endl;
+          std::cout << "attempt failed due to NormalizeIterException "
+                    << e.what() << std::endl;
         } catch (const LoopLayoutInjectiveException &e) {
           do_update = false;
-          std::cout << "attempt failed due to LoopLayoutInjectiveException " << e.what() << std::endl;
+          std::cout << "attempt failed due to LoopLayoutInjectiveException "
+                    << e.what() << std::endl;
         }
 
         if (do_update) {
@@ -1348,8 +1354,11 @@ private:
                   frag_reg_num *= *pci;
                 } else {
                   auto cib = analyzer_.const_int_bound(i);
-                  ICHECK(cib->max_value < arith::ConstIntBound::kPosInf && cib->max_value >= 0)
-                      << "Can not deduce constant bound for fragment shape expr: " << i;
+                  ICHECK(cib->max_value < arith::ConstIntBound::kPosInf &&
+                         cib->max_value >= 0)
+                      << "Can not deduce constant bound for fragment shape "
+                         "expr: "
+                      << i;
                   frag_reg_num *= cib->max_value;
                 }
               }

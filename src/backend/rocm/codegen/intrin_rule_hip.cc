@@ -131,9 +131,10 @@ template <typename T> static PrimExpr DispatchHIPShuffle(const PrimExpr &e) {
   // NOLINTEND(clang-analyzer-cplusplus.InnerPointer)
 }
 
-TVM_REGISTER_OP("tirx.clz").set_attr<FLowerIntrinsic>(
-    "hip.FLowerIntrinsic",
-    DispatchPureExtern<HIPMath, /*dtype_from_arg=*/true>);
+TVM_REGISTER_OP("tirx.clz")
+    .set_attr<FLowerIntrinsic>(
+        "hip.FLowerIntrinsic",
+        DispatchPureExtern<HIPMath, /*dtype_from_arg=*/true>);
 
 TVM_REGISTER_OP("tirx.floor")
     .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic",
@@ -159,8 +160,9 @@ TVM_REGISTER_OP("tirx.nearbyint")
     .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic",
                                DispatchPureExtern<HIPMath>);
 
-TVM_REGISTER_OP("tirx.exp").set_attr<FLowerIntrinsic>(
-    "hip.FLowerIntrinsic", DispatchPureExtern<HIPFastMath>);
+TVM_REGISTER_OP("tirx.exp")
+    .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic",
+                               DispatchPureExtern<HIPFastMath>);
 
 TVM_REGISTER_OP("tirx.exp2")
     .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic",
@@ -170,11 +172,13 @@ TVM_REGISTER_OP("tirx.exp10")
     .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic",
                                DispatchPureExtern<HIPFastMath>);
 
-TVM_REGISTER_OP("tirx.erf").set_attr<FLowerIntrinsic>(
-    "hip.FLowerIntrinsic", DispatchPureExtern<HIPMath>);
+TVM_REGISTER_OP("tirx.erf")
+    .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic",
+                               DispatchPureExtern<HIPMath>);
 
-TVM_REGISTER_OP("tirx.log").set_attr<FLowerIntrinsic>(
-    "hip.FLowerIntrinsic", DispatchPureExtern<HIPFastMath>);
+TVM_REGISTER_OP("tirx.log")
+    .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic",
+                               DispatchPureExtern<HIPFastMath>);
 
 TVM_REGISTER_OP("tirx.log2")
     .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic",
@@ -184,18 +188,21 @@ TVM_REGISTER_OP("tirx.log10")
     .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic",
                                DispatchPureExtern<HIPFastMath>);
 
-TVM_REGISTER_OP("tirx.tan").set_attr<FLowerIntrinsic>(
-    "hip.FLowerIntrinsic", DispatchPureExtern<HIPFastMathTan>);
+TVM_REGISTER_OP("tirx.tan")
+    .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic",
+                               DispatchPureExtern<HIPFastMathTan>);
 
-TVM_REGISTER_OP("tirx.cos").set_attr<FLowerIntrinsic>(
-    "hip.FLowerIntrinsic", DispatchPureExtern<HIPFastMath>);
+TVM_REGISTER_OP("tirx.cos")
+    .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic",
+                               DispatchPureExtern<HIPFastMath>);
 
 TVM_REGISTER_OP("tirx.cosh")
     .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic",
                                DispatchPureExtern<HIPMath>);
 
-TVM_REGISTER_OP("tirx.sin").set_attr<FLowerIntrinsic>(
-    "hip.FLowerIntrinsic", DispatchPureExtern<HIPFastMath>);
+TVM_REGISTER_OP("tirx.sin")
+    .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic",
+                               DispatchPureExtern<HIPFastMath>);
 
 TVM_REGISTER_OP("tirx.sinh")
     .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic",
@@ -213,8 +220,9 @@ TVM_REGISTER_OP("tirx.sqrt")
     .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic",
                                DispatchPureExtern<HIPMath>);
 
-TVM_REGISTER_OP("tirx.pow").set_attr<FLowerIntrinsic>(
-    "hip.FLowerIntrinsic", DispatchPureExtern<HIPMath>);
+TVM_REGISTER_OP("tirx.pow")
+    .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic",
+                               DispatchPureExtern<HIPMath>);
 
 TVM_REGISTER_OP("tirx.popcount")
     .set_attr<FLowerIntrinsic>("hip.FLowerIntrinsic",

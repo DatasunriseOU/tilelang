@@ -84,10 +84,7 @@ def _prove_static_extent(extent: int, timeout_ms: int) -> tuple[bool, str]:
     n = _z3.IntVal(int(extent))
     solver.add(lane >= 0, lane < n)
     solver.add(_z3.Or(lane < 0, lane >= n, n <= 0, n >= _INT32_INDEX_LIMIT))
-    return solver.check() == _z3.unsat, (
-        f"z3: forall lane. 0 <= lane < {extent}; "
-        f"0 < {extent} < {_INT32_INDEX_LIMIT}"
-    )
+    return solver.check() == _z3.unsat, (f"z3: forall lane. 0 <= lane < {extent}; 0 < {extent} < {_INT32_INDEX_LIMIT}")
 
 
 def _buffers_may_alias(plan: ReductionPlan) -> bool:
@@ -178,10 +175,7 @@ def prove_reduction_plans(
     *,
     timeout_ms: int = 50,
 ) -> tuple[ReductionLegalityProof, ...]:
-    return tuple(
-        prove_reduction_plan_legality(plan, timeout_ms=timeout_ms)
-        for plan in plans
-    )
+    return tuple(prove_reduction_plan_legality(plan, timeout_ms=timeout_ms) for plan in plans)
 
 
 def serialize_reduction_legality(
@@ -196,9 +190,7 @@ def attach_reduction_legality_metadata(func: tir.PrimFunc) -> tir.PrimFunc:
         return func
     proofs = prove_reduction_plans(plans)
     attrs = dict(func.attrs) if func.attrs is not None else {}
-    attrs["tl.reduction_legality"] = tir.StringImm(
-        serialize_reduction_legality(proofs)
-    )
+    attrs["tl.reduction_legality"] = tir.StringImm(serialize_reduction_legality(proofs))
     return func.with_attrs(attrs)
 
 

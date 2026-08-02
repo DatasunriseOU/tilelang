@@ -50,7 +50,7 @@ def _retarget_editable_finder(target_root: str) -> None:
                     if old.endswith("/tilelang"):
                         v[key] = os.path.join(target_root, "tilelang")
                     continue
-                rel = old[idx + 1:]
+                rel = old[idx + 1 :]
                 v[key] = os.path.join(target_root, rel)
 
 

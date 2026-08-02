@@ -24,7 +24,6 @@ import tempfile
 import pytest
 
 import tilelang
-from tilelang import tvm
 from tvm.target import Target
 import tilelang.language as T
 import tilelang.testing
@@ -32,27 +31,16 @@ import tilelang.testing
 
 _HAS_METAL_SDK = (
     shutil.which("xcrun") is not None
-    and subprocess.run(
-        ["xcrun", "--sdk", "macosx", "--find", "metal"], capture_output=True
-    ).returncode
-    == 0
+    and subprocess.run(["xcrun", "--sdk", "macosx", "--find", "metal"], capture_output=True).returncode == 0
 )
 
 
 def _has_e4m3_dot4_helper(body: str) -> bool:
-    return (
-        "__tvm_fp8_e4m3_dot4_packed" in body
-        or "__tvm_fp8_e4m3_dot4_words" in body
-        or "__tvm_fp8_e4m3fn_lut[" in body
-    )
+    return "__tvm_fp8_e4m3_dot4_packed" in body or "__tvm_fp8_e4m3_dot4_words" in body or "__tvm_fp8_e4m3fn_lut[" in body
 
 
 def _has_metal_simd_reduction(body: str) -> bool:
-    return (
-        "simd_sum(" in body
-        or "simd_shuffle_down(" in body
-        or "simd_shuffle(" in body
-    )
+    return "simd_sum(" in body or "simd_shuffle_down(" in body or "simd_shuffle(" in body
 
 
 def _first_metal_simd_reduction_pos(body: str) -> int:
@@ -70,10 +58,7 @@ def _first_metal_simd_reduction_pos(body: str) -> int:
 
 
 def _scale_applied_after_simd_reduction(body: str, simd_pos: int) -> bool:
-    scale_after_simd = [
-        pos for pos in (body.find("A_scale", simd_pos), body.find("B_scale", simd_pos))
-        if pos >= 0
-    ]
+    scale_after_simd = [pos for pos in (body.find("A_scale", simd_pos), body.find("B_scale", simd_pos)) if pos >= 0]
     if scale_after_simd and min(scale_after_simd) > simd_pos:
         return True
     return re.search(r"simd_sum\([^)]*\).*?\*\s*sa.*?\*\s*sb", body, re.S) is not None
@@ -100,9 +85,16 @@ def _make_kernel(
     """
     g = globals()
     g.update(
-        _M=M, _N=N, _K=K, _BM=BM, _BN=BN, _BK=BK,
-        _SA=a_scale_size, _SB=b_scale_size,
-        _A_DTYPE=a_dtype, _B_DTYPE=b_dtype,
+        _M=M,
+        _N=N,
+        _K=K,
+        _BM=BM,
+        _BN=BN,
+        _BK=BK,
+        _SA=a_scale_size,
+        _SB=b_scale_size,
+        _A_DTYPE=a_dtype,
+        _B_DTYPE=b_dtype,
     )
 
     @T.prim_func
@@ -142,9 +134,14 @@ def _make_vecmat_m1_kernel(
     """Build an M=1, transpose_B=True vecmat kernel using the Metal path."""
     g = globals()
     g.update(
-        _VM_N=N, _VM_K=K, _VM_BN=BN, _VM_BK=BK,
-        _VM_SA=a_scale_size, _VM_SB=b_scale_size,
-        _VM_A_DTYPE=a_dtype, _VM_B_DTYPE=b_dtype,
+        _VM_N=N,
+        _VM_K=K,
+        _VM_BN=BN,
+        _VM_BK=BK,
+        _VM_SA=a_scale_size,
+        _VM_SB=b_scale_size,
+        _VM_A_DTYPE=a_dtype,
+        _VM_B_DTYPE=b_dtype,
         _VM_MACRO_TARGET=macro_target,
     )
 
@@ -198,7 +195,9 @@ def _make_direct_m1_kernel(
     """Build a direct-global-store M=1 transposed-B kernel."""
     g = globals()
     g.update(
-        _DM_N=N, _DM_K=K, _DM_BN=BN,
+        _DM_N=N,
+        _DM_K=K,
+        _DM_BN=BN,
         _DM_MACRO_TARGET=macro_target,
     )
 
@@ -248,7 +247,11 @@ def _make_direct_transposed_b_matmul_kernel(
     """Build a direct global-store full matmul for row-major B[N, K]."""
     g = globals()
     g.update(
-        _DTB_M=M, _DTB_N=N, _DTB_K=K, _DTB_BM=BM, _DTB_BN=BN,
+        _DTB_M=M,
+        _DTB_N=N,
+        _DTB_K=K,
+        _DTB_BM=BM,
+        _DTB_BN=BN,
     )
 
     @T.prim_func
@@ -291,7 +294,8 @@ def _xcrun_compile(msl_source: str) -> tuple[int, str]:
         air_path = msl_path + ".air"
         res = subprocess.run(
             ["xcrun", "--sdk", "macosx", "metal", "-c", msl_path, "-o", air_path],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         return res.returncode, (res.stderr or "")
     finally:
@@ -304,6 +308,7 @@ def _xcrun_compile(msl_source: str) -> tuple[int, str]:
 # IR-level lowering tests (no GPU required)
 # --------------------------------------------------------------------------
 
+
 def test_per_tensor_scale_lowers_on_metal():
     """Per-tensor scaling: ``A_scale.shape == (1,)``, ``B_scale.shape == (1,)``."""
     fn = _make_kernel(M=32, N=32, K=64, BM=32, BN=32, BK=64)
@@ -313,11 +318,9 @@ def test_per_tensor_scale_lowers_on_metal():
 
     # Audiohacking-pattern markers — the MSL inner loop is the
     # ``a_val * b_val * sa * sb`` accumulation.
-    assert "__tvm_fp8_e4m3_to_half" in src, (
-        "expected MSL to contain Agent C's FP8 dequant helper"
-    )
+    assert "__tvm_fp8_e4m3_to_half" in src, "expected MSL to contain Agent C's FP8 dequant helper"
     # Matmul-body shape: should accumulate into C_local.
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
     assert "C_local" in body
     assert "__tvm_fp8_e4m3_to_half(A_shared" in body
     assert "__tvm_fp8_e4m3_to_half(B_shared" in body
@@ -332,22 +335,26 @@ def test_per_tensor_scale_lowers_on_metal():
     assert "threadIdx.x) <= (((i_" not in body
 
     # No simdgroup MMA for FP8 — Apple has no native FP8 ALU through M5.
-    assert "simdgroup_multiply_accumulate" not in body, (
-        "FP8 input must take the scalar fallback path on Metal"
-    )
+    assert "simdgroup_multiply_accumulate" not in body, "FP8 input must take the scalar fallback path on Metal"
 
 
 def test_per_row_scale_lowers_on_metal():
     """Per-row A_scale, per-tensor B_scale."""
     fn = _make_kernel(
-        M=32, N=32, K=64, BM=32, BN=32, BK=64,
-        a_scale_size=32, b_scale_size=1,
+        M=32,
+        N=32,
+        K=64,
+        BM=32,
+        BN=32,
+        BK=64,
+        a_scale_size=32,
+        b_scale_size=1,
     )
     target = Target("metal")
     artifact = tilelang.lower(fn, target=target)
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
 
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
     # Per-row indexing should use the row variable as scale index.
     assert "A_scale[" in body
     # Per-tensor B uses index 0.
@@ -357,13 +364,19 @@ def test_per_row_scale_lowers_on_metal():
 def test_per_col_scale_lowers_on_metal():
     """Per-tensor A_scale, per-col B_scale."""
     fn = _make_kernel(
-        M=32, N=32, K=64, BM=32, BN=32, BK=64,
-        a_scale_size=1, b_scale_size=32,
+        M=32,
+        N=32,
+        K=64,
+        BM=32,
+        BN=32,
+        BK=64,
+        a_scale_size=1,
+        b_scale_size=32,
     )
     target = Target("metal")
     artifact = tilelang.lower(fn, target=target)
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
 
     assert "A_scale[0]" in body
     assert "B_scale[" in body  # per-col indexing
@@ -378,13 +391,19 @@ def test_e5m2_lowers_on_metal():
     helper definitions in the prelude.
     """
     fn = _make_kernel(
-        M=32, N=32, K=64, BM=32, BN=32, BK=64,
-        a_dtype="float8_e5m2", b_dtype="float8_e5m2",
+        M=32,
+        N=32,
+        K=64,
+        BM=32,
+        BN=32,
+        BK=64,
+        a_dtype="float8_e5m2",
+        b_dtype="float8_e5m2",
     )
     target = Target("metal")
     artifact = tilelang.lower(fn, target=target)
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
 
     # Calls in the kernel body — A_shared / B_shared loads should both
     # decode through the e5m2 helper.
@@ -401,13 +420,19 @@ def test_e5m2_lowers_on_metal():
 def test_mixed_e4m3_e5m2_lowers_on_metal():
     """A in e4m3, B in e5m2 — both helpers must be called from the kernel body."""
     fn = _make_kernel(
-        M=32, N=32, K=64, BM=32, BN=32, BK=64,
-        a_dtype="float8_e4m3", b_dtype="float8_e5m2",
+        M=32,
+        N=32,
+        K=64,
+        BM=32,
+        BN=32,
+        BK=64,
+        a_dtype="float8_e4m3",
+        b_dtype="float8_e5m2",
     )
     target = Target("metal")
     artifact = tilelang.lower(fn, target=target)
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
 
     # Mixed-dtype: A path uses e4m3, B path uses e5m2.
     assert "__tvm_fp8_e4m3_to_half(A_shared" in body
@@ -426,16 +451,14 @@ def test_m1_transposed_b_vecmat_explicit_metal_target_lowers_to_dot4_simd_sum():
     target = Target("metal")
     artifact = tilelang.lower(fn, target=target)
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
 
     assert _has_e4m3_dot4_helper(body)
     assert _has_metal_simd_reduction(body)
     assert "__tvm_fp8_e4m3_to_half(A_shared" not in body
     assert "__tvm_fp8_e4m3_to_half(B_shared" not in body
     simd_pos = _first_metal_simd_reduction_pos(body)
-    assert _scale_applied_after_simd_reduction(body, simd_pos), (
-        "scale must be applied after the SIMD dot reduction"
-    )
+    assert _scale_applied_after_simd_reduction(body, simd_pos), "scale must be applied after the SIMD dot reduction"
 
 
 def test_m1_transposed_b_vecmat_keeps_semantic_reduce_until_codegen():
@@ -457,7 +480,7 @@ def test_m1_transposed_b_vecmat_keeps_semantic_reduce_until_codegen():
 
     artifact = tilelang.lower(fn, target=Target("metal"))
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
 
     assert "T.metal_fp8_e4m3_dot4" not in body
     assert "T.tirx.metal.simd_sum" not in body
@@ -471,7 +494,7 @@ def test_m1_transposed_b_vecmat_without_macro_target_uses_late_scalar_lowering()
     assert "tl.fp8_scaled_matmul.marker" in str(fn)
     artifact = tilelang.lower(fn, target=Target("metal"))
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
 
     assert not _has_e4m3_dot4_helper(body)
     assert "tl.fp8_scaled_matmul.marker" not in body
@@ -484,7 +507,7 @@ def test_m1_non_transposed_b_vecmat_late_lowers_to_simd_sum():
     fn = _make_kernel(M=1, N=64, K=96, BM=1, BN=64, BK=96)
     artifact = tilelang.lower(fn, target=Target("metal"))
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
 
     assert "tl.fp8_scaled_matmul.marker" not in body
     assert not _has_e4m3_dot4_helper(body)
@@ -512,7 +535,7 @@ def test_m1_transposed_b_vecmat_unsafe_dot4_marker_uses_scalar_fallback():
     assert "tl.fp8_scaled_matmul.marker" in str(fn)
     artifact = tilelang.lower(fn, target=Target("metal"))
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
 
     assert "tl.fp8_scaled_matmul.marker" not in body
     assert not _has_e4m3_dot4_helper(body)
@@ -531,7 +554,7 @@ def test_m1_transposed_b_vecmat_jit_metal_target_uses_marker_late_lowering():
     assert "tl.fp8_scaled_matmul.marker" in str(fn)
     artifact = tilelang.lower(fn, target=Target("metal"))
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
 
     assert "tl.fp8_scaled_matmul.marker" not in body
     assert _has_metal_simd_reduction(body)
@@ -549,7 +572,7 @@ def test_m1_transposed_b_vecmat_explicit_non_metal_target_uses_scalar_fallback()
     )
     artifact = tilelang.lower(fn, target=Target("metal"))
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
 
     assert not _has_e4m3_dot4_helper(body)
     assert not _has_metal_simd_reduction(body)
@@ -561,7 +584,7 @@ def test_m1_transposed_b_direct_explicit_metal_target_lowers_to_dot4():
     fn = _make_direct_m1_kernel(N=64, K=96, BN=64, macro_target=Target("metal"))
     artifact = tilelang.lower(fn, target=Target("metal"))
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
 
     assert _has_e4m3_dot4_helper(body)
     assert _has_metal_simd_reduction(body)
@@ -574,7 +597,7 @@ def test_m1_transposed_b_direct_without_macro_target_late_lowers_to_dot4():
     assert "tl.fp8_scaled_matmul.marker" in str(fn)
     artifact = tilelang.lower(fn, target=Target("metal"))
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
 
     assert "tl.fp8_scaled_matmul.marker" not in body
     assert _has_e4m3_dot4_helper(body)
@@ -586,29 +609,31 @@ def test_m1_transposed_b_direct_marker_stores_global_column_index():
     fn = _make_direct_m1_kernel(N=128, K=96, BN=64)
     artifact = tilelang.lower(fn, target=Target("metal"))
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
     c_access_lines = [line.strip() for line in body.splitlines() if "C[" in line]
 
     assert _has_e4m3_dot4_helper(body)
     assert _has_metal_simd_reduction(body)
-    assert any(
-        "C[(gridThreadIdx >> 5)]" in line or "C[(grid_tid >> 5)]" in line
-        for line in c_access_lines
-    ) or re.search(
-        r"int (?P<idx>cse_v\d+(?:_\d+)?) = \(grid_tid >> 5\);\n.*C\[(?P=idx)\]",
-        body,
-        re.S,
-    ) or re.search(
-        r"int (?P<idx>cse_v\d+(?:_\d+)?) = \(gridThreadIdx\.x >> 5\);\n.*C\[(?P=idx)\]",
-        body,
-        re.S,
-    ) or re.search(
-        r"int (?P<idx>cse_v\d+(?:_\d+)?) = "
-        r"\(\(\(\(int\)blockIdx\.x\) \* 64\) \+ "
-        r"\((?:\(\(int\)threadIdx\.x\)|threadgroup_tid(?:_\d+)?) >> "
-        r"(?:\((?:long|int)\))?5\)\);\n.*C\[(?P=idx)\]",
-        body,
-        re.S,
+    assert (
+        any("C[(gridThreadIdx >> 5)]" in line or "C[(grid_tid >> 5)]" in line for line in c_access_lines)
+        or re.search(
+            r"int (?P<idx>cse_v\d+(?:_\d+)?) = \(grid_tid >> 5\);\n.*C\[(?P=idx)\]",
+            body,
+            re.S,
+        )
+        or re.search(
+            r"int (?P<idx>cse_v\d+(?:_\d+)?) = \(gridThreadIdx\.x >> 5\);\n.*C\[(?P=idx)\]",
+            body,
+            re.S,
+        )
+        or re.search(
+            r"int (?P<idx>cse_v\d+(?:_\d+)?) = "
+            r"\(\(\(\(int\)blockIdx\.x\) \* 64\) \+ "
+            r"\((?:\(\(int\)threadIdx\.x\)|threadgroup_tid(?:_\d+)?) >> "
+            r"(?:\((?:long|int)\))?5\)\);\n.*C\[(?P=idx)\]",
+            body,
+            re.S,
+        )
     )
     assert not any("C[((gridThreadIdx >> 5) -" in line for line in c_access_lines)
 
@@ -619,7 +644,7 @@ def test_full_transposed_b_direct_marker_late_lowers_to_dot4():
     assert "tl.fp8_scaled_matmul.marker" in str(fn)
     artifact = tilelang.lower(fn, target=Target("metal"))
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
 
     assert "tl.fp8_scaled_matmul.marker" not in body
     assert _has_e4m3_dot4_helper(body)
@@ -633,9 +658,8 @@ def test_full_transposed_b_direct_marker_late_lowers_to_dot4():
 # Offline ``xcrun metal -c`` acceptance tests (require macOS metal SDK)
 # --------------------------------------------------------------------------
 
-@pytest.mark.skipif(
-    not _HAS_METAL_SDK, reason="macOS metal SDK (xcrun) not available"
-)
+
+@pytest.mark.skipif(not _HAS_METAL_SDK, reason="macOS metal SDK (xcrun) not available")
 def test_xcrun_compile_per_tensor_scale():
     """The lowered MSL is accepted by the Metal AIR compiler."""
     fn = _make_kernel(M=32, N=32, K=64, BM=32, BN=32, BK=64)
@@ -646,13 +670,17 @@ def test_xcrun_compile_per_tensor_scale():
     assert rc == 0, f"xcrun metal -c failed:\n{stderr}"
 
 
-@pytest.mark.skipif(
-    not _HAS_METAL_SDK, reason="macOS metal SDK (xcrun) not available"
-)
+@pytest.mark.skipif(not _HAS_METAL_SDK, reason="macOS metal SDK (xcrun) not available")
 def test_xcrun_compile_per_row_scale():
     fn = _make_kernel(
-        M=32, N=32, K=64, BM=32, BN=32, BK=64,
-        a_scale_size=32, b_scale_size=32,
+        M=32,
+        N=32,
+        K=64,
+        BM=32,
+        BN=32,
+        BK=64,
+        a_scale_size=32,
+        b_scale_size=32,
     )
     target = Target("metal")
     artifact = tilelang.lower(fn, target=target)
@@ -661,13 +689,17 @@ def test_xcrun_compile_per_row_scale():
     assert rc == 0, f"xcrun metal -c failed:\n{stderr}"
 
 
-@pytest.mark.skipif(
-    not _HAS_METAL_SDK, reason="macOS metal SDK (xcrun) not available"
-)
+@pytest.mark.skipif(not _HAS_METAL_SDK, reason="macOS metal SDK (xcrun) not available")
 def test_xcrun_compile_mixed_dtype():
     fn = _make_kernel(
-        M=32, N=32, K=64, BM=32, BN=32, BK=64,
-        a_dtype="float8_e4m3", b_dtype="float8_e5m2",
+        M=32,
+        N=32,
+        K=64,
+        BM=32,
+        BN=32,
+        BK=64,
+        a_dtype="float8_e4m3",
+        b_dtype="float8_e5m2",
     )
     target = Target("metal")
     artifact = tilelang.lower(fn, target=target)
@@ -676,9 +708,7 @@ def test_xcrun_compile_mixed_dtype():
     assert rc == 0, f"xcrun metal -c failed:\n{stderr}"
 
 
-@pytest.mark.skipif(
-    not _HAS_METAL_SDK, reason="macOS metal SDK (xcrun) not available"
-)
+@pytest.mark.skipif(not _HAS_METAL_SDK, reason="macOS metal SDK (xcrun) not available")
 def test_xcrun_compile_full_transposed_b_direct_dot4():
     fn = _make_direct_transposed_b_matmul_kernel(M=32, N=64, K=128, BM=8, BN=16)
     artifact = tilelang.lower(fn, target=Target("metal"))
@@ -693,6 +723,7 @@ def test_xcrun_compile_full_transposed_b_direct_dot4():
 
 try:
     import torch
+
     _HAS_TORCH_MPS = torch.backends.mps.is_available()
 except Exception:
     torch = None
@@ -722,9 +753,7 @@ def _torch_fp8_dequantize(x_fp8: "torch.Tensor") -> "torch.Tensor":
     return x_fp8.cpu().to(torch.float32).to(x_fp8.device)
 
 
-@pytest.mark.skipif(
-    not _HAS_TORCH_MPS, reason="torch.mps not available"
-)
+@pytest.mark.skipif(not _HAS_TORCH_MPS, reason="torch.mps not available")
 @tilelang.testing.requires_metal
 def test_e2e_per_tensor_scale_parity():
     """Run the kernel on Metal and compare with hand-written reference.
@@ -778,9 +807,7 @@ def test_e2e_per_tensor_scale_parity():
     )
 
 
-@pytest.mark.skipif(
-    not _HAS_TORCH_MPS, reason="torch.mps not available"
-)
+@pytest.mark.skipif(not _HAS_TORCH_MPS, reason="torch.mps not available")
 @tilelang.testing.requires_metal
 def test_e2e_per_row_scale_parity():
     """Per-row A scale, per-tensor B scale parity check."""
@@ -814,14 +841,13 @@ def test_e2e_per_row_scale_parity():
     torch.mps.synchronize()
     rel = torch.abs(c_out - c_ref) / (torch.abs(c_ref) + 1e-6)
     rmax = rel.max().item()
-    assert rmax < 5e-3, (
-        f"per-row FP8 scaled matmul parity failed: max relative error {rmax:.3g}"
-    )
+    assert rmax < 5e-3, f"per-row FP8 scaled matmul parity failed: max relative error {rmax:.3g}"
 
 
 # --------------------------------------------------------------------------
 # Negative tests: dtype / shape validation surfaces clean errors
 # --------------------------------------------------------------------------
+
 
 def test_rejects_non_fp8_a():
     """Non-FP8 ``A_fp8`` must raise TypeError at parse time."""
@@ -892,6 +918,7 @@ def test_rejects_bad_scale_shape():
 
 try:
     import mlx.core as mx  # noqa: F401
+
     _HAS_MLX = True
 except Exception:
     _HAS_MLX = False
@@ -902,14 +929,14 @@ try:
         fp8_scaled_matmul_raw as _audio_fp8_scaled_matmul,
         fp8_scaled_vecmat as _audio_fp8_scaled_vecmat,
     )
-    _AUDIO_AVAILABLE = (
-        fp8_msl_status().available if _HAS_MLX else False
-    )
+
+    _AUDIO_AVAILABLE = fp8_msl_status().available if _HAS_MLX else False
 except Exception:
     _AUDIO_AVAILABLE = False
 
 try:
     import torch as _torch
+
     _HAS_TORCH_MPS_E2E = _torch.backends.mps.is_available()
 except Exception:
     _torch = None
@@ -978,12 +1005,8 @@ def _audio_ground_truth_vecmat(
     w_t = np.ascontiguousarray(w_bytes.T)
     w_t_mx = mx.array(w_t)
 
-    sx_mx = float(sx) if not isinstance(sx, _torch.Tensor) else mx.array(
-        sx.detach().cpu().numpy().astype(np.float32)
-    )
-    sw_mx = float(sw) if not isinstance(sw, _torch.Tensor) else mx.array(
-        sw.detach().cpu().numpy().astype(np.float32)
-    )
+    sx_mx = float(sx) if not isinstance(sx, _torch.Tensor) else mx.array(sx.detach().cpu().numpy().astype(np.float32))
+    sw_mx = float(sw) if not isinstance(sw, _torch.Tensor) else mx.array(sw.detach().cpu().numpy().astype(np.float32))
     out = _audio_fp8_scaled_vecmat(x_mx, w_t_mx, scale_x=sx_mx, scale_w=sw_mx)
     mx.eval(out)
     return _torch.from_numpy(np.array(out))
@@ -1003,7 +1026,6 @@ def test_e2e_audiohacking_parity_per_tensor_128():
     output and 1e-4 relative when the reference is non-zero.
     """
     import torch
-    import numpy as np
 
     M, N, K = 128, 128, 128
     BM, BN, BK = 32, 32, 32
@@ -1075,22 +1097,15 @@ def test_e2e_audiohacking_parity_per_row_singleblock():
     b_fp8 = b_orig.to(torch.float8_e4m3fn).to("mps")
 
     c_out = torch.zeros(M, N, dtype=torch.float32, device="mps")
-    jit_kernel(
-        a_fp8, a_scale.to("mps"), b_fp8, b_scale.to("mps"), c_out
-    )
+    jit_kernel(a_fp8, a_scale.to("mps"), b_fp8, b_scale.to("mps"), c_out)
     torch.mps.synchronize()
 
-    c_ref = _audio_ground_truth_matmul(
-        a_fp8.cpu(), b_fp8.cpu(), a_scale, b_scale[0].item()
-    )
+    c_ref = _audio_ground_truth_matmul(a_fp8.cpu(), b_fp8.cpu(), a_scale, b_scale[0].item())
     diff = (c_out.cpu() - c_ref).abs()
     rel = diff / (c_ref.abs() + 1e-6)
     abs_max = diff.max().item()
     rel_max = rel.max().item()
-    assert abs_max < 1e-3, (
-        f"audiohacking per-row parity failed: max abs err {abs_max:.3g}, "
-        f"max rel err {rel_max:.3g}"
-    )
+    assert abs_max < 1e-3, f"audiohacking per-row parity failed: max abs err {abs_max:.3g}, max rel err {rel_max:.3g}"
 
 
 @pytest.mark.skipif(
@@ -1188,19 +1203,18 @@ def test_e2e_audiohacking_parity_full_transposed_b_direct_128():
     rel = diff / (c_ref.abs() + 1e-6)
     abs_max = diff.max().item()
     rel_max = rel.max().item()
-    assert abs_max < 1e-3, (
-        f"direct dot4 audiohacking parity failed: max abs err {abs_max:.3g}, "
-        f"max rel err {rel_max:.3g}"
-    )
+    assert abs_max < 1e-3, f"direct dot4 audiohacking parity failed: max abs err {abs_max:.3g}, max rel err {rel_max:.3g}"
 
 
 # --------------------------------------------------------------------------
 # Bench: TFLOPS for matmul + vecmat, alongside the audiohacking baseline
 # --------------------------------------------------------------------------
 
+
 def _bench_callable(fn, sync, n_warm=3, n_iter=10):
     """Time a callable and return (mean_seconds, std_seconds)."""
     import time
+
     for _ in range(n_warm):
         fn()
         sync()
@@ -1217,7 +1231,7 @@ def _bench_callable(fn, sync, n_warm=3, n_iter=10):
     s = samples[:keep]
     mean = sum(s) / len(s)
     var = sum((x - mean) ** 2 for x in s) / max(1, len(s) - 1)
-    return mean, var ** 0.5
+    return mean, var**0.5
 
 
 @pytest.mark.skipif(
@@ -1276,11 +1290,11 @@ def test_bench_matmul_vs_audiohacking(capsys):
     with capsys.disabled():
         print(
             f"\n[bench] {M}x{N}x{K} per-tensor e4m3 FP8 scaled matmul:\n"
-            f"  TileLang  : {tl_mean*1e3:7.3f} +/- {tl_std*1e3:5.3f} ms  "
+            f"  TileLang  : {tl_mean * 1e3:7.3f} +/- {tl_std * 1e3:5.3f} ms  "
             f"({tl_tflops:5.3f} TFLOPS)\n"
-            f"  audiohack : {au_mean*1e3:7.3f} +/- {au_std*1e3:5.3f} ms  "
+            f"  audiohack : {au_mean * 1e3:7.3f} +/- {au_std * 1e3:5.3f} ms  "
             f"({au_tflops:5.3f} TFLOPS)\n"
-            f"  ratio TileLang / audio = {tl_mean/au_mean:.2f}x"
+            f"  ratio TileLang / audio = {tl_mean / au_mean:.2f}x"
         )
 
 
@@ -1331,11 +1345,11 @@ def test_bench_transposed_b_direct_dot4_vs_audiohacking(capsys):
     with capsys.disabled():
         print(
             f"\n[bench] {M}x{N}x{K} direct e4m3 FP8 scaled matmul, B[N,K]:\n"
-            f"  TileLang dot4 : {tl_mean*1e3:7.3f} +/- {tl_std*1e3:5.3f} ms  "
+            f"  TileLang dot4 : {tl_mean * 1e3:7.3f} +/- {tl_std * 1e3:5.3f} ms  "
             f"({tl_tflops:5.3f} TFLOPS)\n"
-            f"  audiohack dot4: {au_mean*1e3:7.3f} +/- {au_std*1e3:5.3f} ms  "
+            f"  audiohack dot4: {au_mean * 1e3:7.3f} +/- {au_std * 1e3:5.3f} ms  "
             f"({au_tflops:5.3f} TFLOPS)\n"
-            f"  ratio TileLang / audio = {tl_mean/au_mean:.2f}x"
+            f"  ratio TileLang / audio = {tl_mean / au_mean:.2f}x"
         )
 
 
@@ -1379,6 +1393,7 @@ def test_bench_vecmat_vs_audiohacking(capsys):
 
     # audiohacking vecmat kernel uses (K,) x (N, K) signature.
     import numpy as np
+
     x_bytes = a_fp8.reshape(K).cpu().view(torch.uint8).numpy()
     w_bytes = b_fp8.cpu().view(torch.uint8).numpy()
     x_mx = mx.array(x_bytes)
@@ -1396,9 +1411,9 @@ def test_bench_vecmat_vs_audiohacking(capsys):
     with capsys.disabled():
         print(
             f"\n[bench] M=1 N={N} K={K} e4m3 FP8 vecmat:\n"
-            f"  TileLang simdg   : {tl_mean*1e3:7.3f} +/- {tl_std*1e3:5.3f} ms  "
+            f"  TileLang simdg   : {tl_mean * 1e3:7.3f} +/- {tl_std * 1e3:5.3f} ms  "
             f"({tl_tflops:6.3f} TFLOPS)\n"
-            f"  audiohack simdg  : {av_mean*1e3:7.3f} +/- {av_std*1e3:5.3f} ms  "
+            f"  audiohack simdg  : {av_mean * 1e3:7.3f} +/- {av_std * 1e3:5.3f} ms  "
             f"({av_tflops:6.3f} TFLOPS)\n"
-            f"  ratio TileLang / audio = {tl_mean/av_mean:.2f}x"
+            f"  ratio TileLang / audio = {tl_mean / av_mean:.2f}x"
         )

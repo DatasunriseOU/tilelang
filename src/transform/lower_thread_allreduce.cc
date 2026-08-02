@@ -168,8 +168,8 @@ public:
 
       if (buf.scope() == shared_scope) {
         // Use volatile access to shared buffer.
-        write_ptr->body = AttrStmt(buf->data, tirx::attr::volatile_scope, 1,
-                                   write_ptr->body);
+        write_ptr->body =
+            AttrStmt(buf->data, tirx::attr::volatile_scope, 1, write_ptr->body);
       }
     }
     return std::move(node);
@@ -338,9 +338,8 @@ private:
               << "Metal split allreduce extent " << split_extent
               << " exceeds thread extent " << e.extent;
           ICHECK_EQ(e.extent % split_extent, 0)
-              << "Metal split allreduce requires the thread extent "
-              << e.extent << " to be divisible by the reduce extent "
-              << split_extent;
+              << "Metal split allreduce requires the thread extent " << e.extent
+              << " to be divisible by the reduce extent " << split_extent;
           split_vred.push_back(SplitThreadReduceEntry{e, split_extent});
           ++nmatch;
           reduce_dim_index = e.scope.dim_index;
@@ -488,15 +487,15 @@ private:
       PrimExpr mask = Call(mask_dtype, builtin::tvm_warp_activemask(), {});
 
       if (reduce_extent <= warp_size_) {
-        bool native_metal_simd_sum =
-            target_->kind->name == "metal" && reduce_extent == warp_size_ &&
-            IsSumCombiner(combiner);
+        bool native_metal_simd_sum = target_->kind->name == "metal" &&
+                                     reduce_extent == warp_size_ &&
+                                     IsSumCombiner(combiner);
         if (native_metal_simd_sum) {
           Op simd_sum_op = Op::Get("tirx.metal.simd_sum");
           for (size_t i = 0; i < size; ++i) {
-            seq.push_back(BufferStore(
-                buffers[i], Call(types[i], simd_sum_op, {values[i]}),
-                {zero_index}));
+            seq.push_back(BufferStore(buffers[i],
+                                      Call(types[i], simd_sum_op, {values[i]}),
+                                      {zero_index}));
           }
           return SeqStmt::Flatten(seq);
         } else {
@@ -939,8 +938,7 @@ private:
   }
 
   bool TryMatchMetalSplitReduceIndex(const PrimExpr &expr,
-                                     const VarNode **out_var,
-                                     int *out_extent) {
+                                     const VarNode **out_var, int *out_extent) {
     PrimExpr simplified = analyzer_.Simplify(expr);
     const FloorModNode *mod = simplified.as<FloorModNode>();
     if (mod == nullptr) {
@@ -986,8 +984,8 @@ private:
     if (groups_per_warp <= 1) {
       return make_zero(group_index.dtype());
     }
-    PrimExpr group_in_warp = floormod(
-        group_index, make_const(group_index.dtype(), groups_per_warp));
+    PrimExpr group_in_warp =
+        floormod(group_index, make_const(group_index.dtype(), groups_per_warp));
     return group_in_warp * make_const(group_index.dtype(), reduce_extent);
   }
 
@@ -1001,8 +999,8 @@ private:
       return false;
     }
     auto same_expr = [](const PrimExpr &lhs, const PrimExpr &rhs) {
-      return tvm::ffi::StructuralEqual::Equal(
-          lhs, rhs, /*map_free_vars=*/true, /*skip_tensor_content=*/true);
+      return tvm::ffi::StructuralEqual::Equal(lhs, rhs, /*map_free_vars=*/true,
+                                              /*skip_tensor_content=*/true);
     };
     bool lhs_rhs = same_expr(add->a, combiner->lhs[0]) &&
                    same_expr(add->b, combiner->rhs[0]);
@@ -1037,14 +1035,15 @@ private:
     Array<PrimExpr> shape = {1};
     Op simd_sum_op = Op::Get("tirx.metal.simd_sum");
     for (int idx = 0; idx < n_buffers; ++idx) {
-      Buffer buf = decl_buffer(shape, dtypes[idx], "red_buf" + std::to_string(idx),
-                               "local");
+      Buffer buf = decl_buffer(shape, dtypes[idx],
+                               "red_buf" + std::to_string(idx), "local");
       PrimExpr value = src_values[idx];
       if (predicate.defined()) {
-        value = Select(predicate.value(), value, combiner->identity_element[idx]);
+        value =
+            Select(predicate.value(), value, combiner->identity_element[idx]);
       }
-      seq->push_back(BufferStore(
-          buf, Call(dtypes[idx], simd_sum_op, {value}), zero_indices));
+      seq->push_back(BufferStore(buf, Call(dtypes[idx], simd_sum_op, {value}),
+                                 zero_indices));
       results.push_back(BufferLoad(buf, zero_indices));
     }
     return {results, local_bufs};

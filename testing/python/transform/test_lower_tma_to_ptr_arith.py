@@ -56,23 +56,32 @@ def _build_tma_kernel(data_type_code: int = _CU_TENSOR_MAP_DATA_TYPE_FLOAT16):
             create_tma,
             T.int32(data_type_code),  # CUtensorMapDataType code
             T.int32(2),  # rank
-            A_handle,    # global_addr
-            T.int32(64), T.int32(64),       # shape
-            T.int32(2), T.int32(128),       # stride (bytes)
-            T.int32(16), T.int32(16),       # smem_box
-            T.int32(1), T.int32(1),         # smem_stride
-            T.int32(0),                     # interleave
-            T.int32(0),                     # swizzle
-            T.int32(0),                     # l2_promotion
-            T.int32(0),                     # oob_fill
+            A_handle,  # global_addr
+            T.int32(64),
+            T.int32(64),  # shape
+            T.int32(2),
+            T.int32(128),  # stride (bytes)
+            T.int32(16),
+            T.int32(16),  # smem_box
+            T.int32(1),
+            T.int32(1),  # smem_stride
+            T.int32(0),  # interleave
+            T.int32(0),  # swizzle
+            T.int32(0),  # l2_promotion
+            T.int32(0),  # oob_fill
         )
         T.evaluate(
             T.call_intrin(
-                "handle", tma_load,
-                desc, T.int32(0), smem_handle,
-                T.int32(0), T.int32(0),  # coord_0, coord_1
-                T.int32(0),              # eviction policy
-            ))
+                "handle",
+                tma_load,
+                desc,
+                T.int32(0),
+                smem_handle,
+                T.int32(0),
+                T.int32(0),  # coord_0, coord_1
+                T.int32(0),  # eviction policy
+            )
+        )
 
     return kernel
 
@@ -93,26 +102,20 @@ def _lower(func, target_str: str):
     func = func.with_attr("global_symbol", "main")
     func = func.with_attr("target", target)
     mod = tvm.IRModule.from_expr(func)
-    with tvm.transform.PassContext():
-        with target:
-            return tl.transform.LowerTMAToPtrArith()(mod)
+    with tvm.transform.PassContext(), target:
+        return tl.transform.LowerTMAToPtrArith()(mod)
 
 
 def _has_tma_call(mod) -> bool:
     s = str(mod.script() if hasattr(mod, "script") else mod)
-    return (
-        ("tma_load(" in s)
-        or ("tma_store(" in s)
-        or ("tma_load_im2col(" in s)
-    )
+    return ("tma_load(" in s) or ("tma_store(" in s) or ("tma_load_im2col(" in s)
 
 
 def test_cuda_hopper_passes_through():
     """On sm_90 (Hopper) the pass is a no-op: TMA call must survive."""
     func = _build_tma_kernel()
     mod = _lower(func, "cuda -arch=sm_90")
-    assert _has_tma_call(mod), \
-        "LowerTMAToPtrArith on Hopper should leave TMA calls intact"
+    assert _has_tma_call(mod), "LowerTMAToPtrArith on Hopper should leave TMA calls intact"
 
 
 def test_metal_decomposes():
@@ -120,8 +123,7 @@ def test_metal_decomposes():
     func = _build_tma_kernel()
     mod = _lower(func, "metal")
     print("[metal lowered IR]\n", mod)
-    assert not _has_tma_call(mod), \
-        "LowerTMAToPtrArith on Metal must rewrite TMA calls"
+    assert not _has_tma_call(mod), "LowerTMAToPtrArith on Metal must rewrite TMA calls"
 
 
 def test_hip_decomposes():
@@ -129,8 +131,7 @@ def test_hip_decomposes():
     func = _build_tma_kernel()
     mod = _lower(func, "hip")
     print("[hip lowered IR]\n", mod)
-    assert not _has_tma_call(mod), \
-        "LowerTMAToPtrArith on HIP must rewrite TMA calls"
+    assert not _has_tma_call(mod), "LowerTMAToPtrArith on HIP must rewrite TMA calls"
 
 
 def test_metal_fp32_uses_4_byte_stride():
@@ -145,17 +146,14 @@ def test_metal_fp32_uses_4_byte_stride():
     mod = _lower(func, "metal")
     s = str(mod.script() if hasattr(mod, "script") else mod)
     if "__tl_ptr_copy_elem" in s:
-        assert ", 4)" in s or ", 4i64)" in s or ", T.int64(4)" in s, \
-            f"expected 4-byte element stride in fp32 opaque fallback:\n{s}"
+        assert ", 4)" in s or ", 4i64)" in s or ", T.int64(4)" in s, f"expected 4-byte element stride in fp32 opaque fallback:\n{s}"
     else:
         # Non-opaque path (default): typed BufferLoad/BufferStore must
         # appear, and the synthetic view must carry the fp32 dtype so
         # downstream cp.async / vectorize re-detection sees correct
         # element bytes.
-        assert "BufferLoad" in s or "tl_tma_global_view" in s, \
-            f"expected BufferLoad-shaped fallback in lowered IR:\n{s}"
-        assert "float32" in s, \
-            f"expected fp32 element dtype in synthetic view:\n{s}"
+        assert "BufferLoad" in s or "tl_tma_global_view" in s, f"expected BufferLoad-shaped fallback in lowered IR:\n{s}"
+        assert "float32" in s, f"expected fp32 element dtype in synthetic view:\n{s}"
 
 
 def test_metal_fp16_uses_2_byte_stride():
@@ -165,13 +163,10 @@ def test_metal_fp16_uses_2_byte_stride():
     mod = _lower(func, "metal")
     s = str(mod.script() if hasattr(mod, "script") else mod)
     if "__tl_ptr_copy_elem" in s:
-        assert ", 2)" in s or ", 2i64)" in s or ", T.int64(2)" in s, \
-            f"expected 2-byte element stride in fp16 opaque fallback:\n{s}"
+        assert ", 2)" in s or ", 2i64)" in s or ", T.int64(2)" in s, f"expected 2-byte element stride in fp16 opaque fallback:\n{s}"
     else:
-        assert "BufferLoad" in s or "tl_tma_global_view" in s, \
-            f"expected BufferLoad-shaped fallback in lowered IR:\n{s}"
-        assert "float16" in s, \
-            f"expected fp16 element dtype in synthetic view:\n{s}"
+        assert "BufferLoad" in s or "tl_tma_global_view" in s, f"expected BufferLoad-shaped fallback in lowered IR:\n{s}"
+        assert "float16" in s, f"expected fp16 element dtype in synthetic view:\n{s}"
 
 
 def test_swizzle_pragma_is_preserved():
@@ -192,10 +187,14 @@ def test_swizzle_pragma_is_preserved():
             T.int32(_CU_TENSOR_MAP_DATA_TYPE_FLOAT16),
             T.int32(2),
             A_handle,
-            T.int32(64), T.int32(64),
-            T.int32(2), T.int32(128),
-            T.int32(16), T.int32(16),
-            T.int32(1), T.int32(1),
+            T.int32(64),
+            T.int32(64),
+            T.int32(2),
+            T.int32(128),
+            T.int32(16),
+            T.int32(16),
+            T.int32(1),
+            T.int32(1),
             T.int32(0),
             T.int32(2),  # swizzle = CU_TENSOR_MAP_SWIZZLE_64B
             T.int32(0),
@@ -203,16 +202,20 @@ def test_swizzle_pragma_is_preserved():
         )
         T.evaluate(
             T.call_intrin(
-                "handle", tma_load,
-                desc, T.int32(0), smem_handle,
-                T.int32(0), T.int32(0),
+                "handle",
+                tma_load,
+                desc,
                 T.int32(0),
-            ))
+                smem_handle,
+                T.int32(0),
+                T.int32(0),
+                T.int32(0),
+            )
+        )
 
     mod = _lower(kernel, "metal")
     s = str(mod.script() if hasattr(mod, "script") else mod)
-    assert ("pragma_tma_swizzle" in s) or ("tl_tma_swizzle" in s), \
-        f"expected swizzle hint to be preserved post-lowering:\n{s}"
+    assert ("pragma_tma_swizzle" in s) or ("tl_tma_swizzle" in s), f"expected swizzle hint to be preserved post-lowering:\n{s}"
 
 
 def test_im2col_call_is_left_in_place_with_warning():
@@ -232,31 +235,54 @@ def test_im2col_call_is_left_in_place_with_warning():
         #   lower×2, upper×2, smem_box_pixel, smem_box_channel,
         #   interleave, swizzle, l2_promotion, oob_fill
         desc = T.call_intrin(
-            "handle", create_im2col,
+            "handle",
+            create_im2col,
             T.int32(_CU_TENSOR_MAP_DATA_TYPE_FLOAT16),
             T.int32(4),
             A_handle,
-            T.int32(8), T.int32(64), T.int32(64), T.int32(1),  # shape
-            T.int32(2), T.int32(16), T.int32(1024), T.int32(65536),  # stride
-            T.int32(1), T.int32(1), T.int32(1), T.int32(1),  # elem_stride
-            T.int32(0), T.int32(0),                          # lower_corner
-            T.int32(0), T.int32(0),                          # upper_corner
-            T.int32(16), T.int32(8),                         # smem_box pix/ch
-            T.int32(0), T.int32(0), T.int32(0), T.int32(0),  # interleave/swiz
+            T.int32(8),
+            T.int32(64),
+            T.int32(64),
+            T.int32(1),  # shape
+            T.int32(2),
+            T.int32(16),
+            T.int32(1024),
+            T.int32(65536),  # stride
+            T.int32(1),
+            T.int32(1),
+            T.int32(1),
+            T.int32(1),  # elem_stride
+            T.int32(0),
+            T.int32(0),  # lower_corner
+            T.int32(0),
+            T.int32(0),  # upper_corner
+            T.int32(16),
+            T.int32(8),  # smem_box pix/ch
+            T.int32(0),
+            T.int32(0),
+            T.int32(0),
+            T.int32(0),  # interleave/swiz
         )
         T.evaluate(
             T.call_intrin(
-                "handle", tma_load_im2col_op,
-                desc, T.int32(0), smem_handle,
-                T.int32(0), T.int32(0), T.int32(0), T.int32(0),  # coords c,w,h,n
-                T.int32(0), T.int32(0),                          # img_off w,h
-                T.int32(0),                                      # eviction
-            ))
+                "handle",
+                tma_load_im2col_op,
+                desc,
+                T.int32(0),
+                smem_handle,
+                T.int32(0),
+                T.int32(0),
+                T.int32(0),
+                T.int32(0),  # coords c,w,h,n
+                T.int32(0),
+                T.int32(0),  # img_off w,h
+                T.int32(0),  # eviction
+            )
+        )
 
     mod = _lower(kernel, "metal")
     s = str(mod.script() if hasattr(mod, "script") else mod)
-    assert "tma_load_im2col(" in s, \
-        "im2col call must NOT be silently rewritten (TODO: gather loop)."
+    assert "tma_load_im2col(" in s, "im2col call must NOT be silently rewritten (TODO: gather loop)."
 
 
 def _build_tma_kernel_full(
@@ -285,10 +311,14 @@ def _build_tma_kernel_full(
             T.int32(data_type_code),
             T.int32(2),
             A_handle,
-            T.int32(64), T.int32(64),
-            stride_t(inner_stride), stride_t(outer_stride),
-            T.int32(16), T.int32(16),
-            T.int32(1), T.int32(1),
+            T.int32(64),
+            T.int32(64),
+            stride_t(inner_stride),
+            stride_t(outer_stride),
+            T.int32(16),
+            T.int32(16),
+            T.int32(1),
+            T.int32(1),
             T.int32(0),
             T.int32(swizzle),
             T.int32(0),
@@ -296,11 +326,16 @@ def _build_tma_kernel_full(
         )
         T.evaluate(
             T.call_intrin(
-                "handle", tma_load,
-                desc, T.int32(0), smem_handle,
-                T.int32(0), T.int32(0),
+                "handle",
+                tma_load,
+                desc,
                 T.int32(0),
-            ))
+                smem_handle,
+                T.int32(0),
+                T.int32(0),
+                T.int32(0),
+            )
+        )
 
     return kernel
 
@@ -323,19 +358,17 @@ def test_dtype_recovery_matrix(code, expected):
 
     type_name, byte_size = expected
     func = _build_tma_kernel_full(
-        data_type_code=code, elem_bytes=byte_size,
+        data_type_code=code,
+        elem_bytes=byte_size,
     )
     mod = _lower(func, "metal")
     s = str(mod.script() if hasattr(mod, "script") else mod)
     if "__tl_ptr_copy_elem" in s:
         # Legacy opaque path: byte count must be exact.
-        marker = (f", {byte_size})", f", {byte_size}i64)",
-                  f", T.int64({byte_size})")
-        assert any(m in s for m in marker), \
-            f"expected {byte_size}-byte stride for {type_name}:\n{s}"
+        marker = (f", {byte_size})", f", {byte_size}i64)", f", T.int64({byte_size})")
+        assert any(m in s for m in marker), f"expected {byte_size}-byte stride for {type_name}:\n{s}"
     else:
-        assert type_name in s, \
-            f"expected {type_name} dtype in synthetic view:\n{s}"
+        assert type_name in s, f"expected {type_name} dtype in synthetic view:\n{s}"
 
 
 @pytest.mark.parametrize(
@@ -366,12 +399,10 @@ def test_swizzle_distinguishability(swizzle_code):
         return
     # Non-zero codes MUST be visible somewhere in the lowered IR — either
     # as the AttrStmt key or the For-loop annotation key.
-    assert ("pragma_tma_swizzle" in s) or ("tl_tma_swizzle" in s), \
-        f"swizzle code {swizzle_code} dropped during lowering:\n{s}"
+    assert ("pragma_tma_swizzle" in s) or ("tl_tma_swizzle" in s), f"swizzle code {swizzle_code} dropped during lowering:\n{s}"
     # And the integer value must be the one we set, not collapsed to a
     # constant 0/1.
-    assert str(swizzle_code) in s, \
-        f"swizzle integer code {swizzle_code} not present in IR:\n{s}"
+    assert str(swizzle_code) in s, f"swizzle integer code {swizzle_code} not present in IR:\n{s}"
 
 
 def test_int64_stride_no_overflow():
@@ -389,8 +420,7 @@ def test_int64_stride_no_overflow():
     # Either the cast(int64, ...) form, the i64 literal suffix, or the
     # T.int64() printer form must appear — all three are valid TVM
     # serializations of an Int(64) op chain.
-    assert ("int64" in s) or ("i64" in s) or ("T.int64(" in s), \
-        f"expected Int(64) accumulator in lowered IR for >2^31 stride:\n{s}"
+    assert ("int64" in s) or ("i64" in s) or ("T.int64(" in s), f"expected Int(64) accumulator in lowered IR for >2^31 stride:\n{s}"
 
 
 def test_unknown_dtype_code_is_refused():
@@ -400,8 +430,7 @@ def test_unknown_dtype_code_is_refused():
     memory."""
     func = _build_tma_kernel(data_type_code=999)  # outside enum range
     mod = _lower(func, "metal")
-    assert _has_tma_call(mod), \
-        "Unknown dtype must NOT be silently lowered (would corrupt mem)."
+    assert _has_tma_call(mod), "Unknown dtype must NOT be silently lowered (would corrupt mem)."
 
 
 def test_vendored_allocate_is_passed_through():
@@ -429,23 +458,36 @@ def test_vendored_allocate_is_passed_through():
         # path. The exact buffer shape is irrelevant for this regression.
         smem = T.alloc_buffer((16, 16), "float16", scope="shared")
         desc = T.call_intrin(
-            "handle", create_tma,
+            "handle",
+            create_tma,
             T.int32(_CU_TENSOR_MAP_DATA_TYPE_FLOAT16),
-            T.int32(2), A_handle,
-            T.int32(64), T.int32(64),
-            T.int32(2), T.int32(128),
-            T.int32(16), T.int32(16),
-            T.int32(1), T.int32(1),
-            T.int32(0), T.int32(0),
-            T.int32(0), T.int32(0),
+            T.int32(2),
+            A_handle,
+            T.int32(64),
+            T.int32(64),
+            T.int32(2),
+            T.int32(128),
+            T.int32(16),
+            T.int32(16),
+            T.int32(1),
+            T.int32(1),
+            T.int32(0),
+            T.int32(0),
+            T.int32(0),
+            T.int32(0),
         )
         T.evaluate(
             T.call_intrin(
-                "handle", tma_load,
-                desc, T.int32(0), smem.access_ptr("w"),
-                T.int32(0), T.int32(0),
+                "handle",
+                tma_load,
+                desc,
                 T.int32(0),
-            ))
+                smem.access_ptr("w"),
+                T.int32(0),
+                T.int32(0),
+                T.int32(0),
+            )
+        )
 
     # The bug manifests at IR construction inside the pass — any
     # successful return (Hopper no-op or Metal rewrite) confirms the
@@ -459,6 +501,7 @@ def test_vendored_allocate_is_passed_through():
 import tilelang.testing
 import torch
 
+
 @tilelang.testing.requires_metal
 def test_metal_tma_copy_runtime():
     """Verify that a TMA copy kernel compiles and runs successfully on Metal
@@ -467,6 +510,8 @@ def test_metal_tma_copy_runtime():
     M, N = 128, 256
     block_M, block_N = 64, 128
     pytest.xfail("Runtime test for TMA fallback on Metal requires full pipeline setup")
+
+
 @tilelang.testing.requires_rocm
 def test_hip_tma_copy_runtime():
     """Verify that a TMA copy kernel compiles and runs successfully on HIP
@@ -499,6 +544,7 @@ def test_hip_tma_copy_runtime():
     b = torch.zeros_like(a)
     kernel(a, b)
     torch.testing.assert_close(a, b)
+
 
 if __name__ == "__main__":
     tilelang.testing.main()

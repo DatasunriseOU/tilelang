@@ -284,7 +284,8 @@ public:
 
   // Convenience entry to vectorize a loop body without exposing
   // the mutator invocation pattern at call sites.
-  static Stmt Vectorize(const Var &var, const PrimExpr &var_lanes, Stmt body, bool negative_ramp = false) {
+  static Stmt Vectorize(const Var &var, const PrimExpr &var_lanes, Stmt body,
+                        bool negative_ramp = false) {
     TLVectorizer vec{var, var_lanes, negative_ramp};
     Stmt original_body = body;
     auto vec_stmt = vec(std::move(body));
@@ -295,9 +296,11 @@ public:
     return vec_stmt;
   }
 
-  TLVectorizer(const Var &var, const PrimExpr &var_lanes, bool negative_ramp = false)
+  TLVectorizer(const Var &var, const PrimExpr &var_lanes,
+               bool negative_ramp = false)
       : var_(var), var_lanes_(var_lanes) {
-    ramp_ = Ramp(IntImm(var->dtype, 0), IntImm(var->dtype, negative_ramp ? -1 : 1), var_lanes);
+    ramp_ = Ramp(IntImm(var->dtype, 0),
+                 IntImm(var->dtype, negative_ramp ? -1 : 1), var_lanes);
   }
 
   Stmt VisitStmt(const Stmt &stmt) final {
@@ -735,7 +738,8 @@ public:
         need_scalarize_ = true;
         std::cout << "SCALARIZE 2" << std::endl;
         return tvm::ffi::GetRef<PrimExpr>(op);
-      }      predicate = pred;
+      }
+      predicate = pred;
     }
 
     auto lanes_ptr = as_const_int(var_lanes_);
@@ -1054,9 +1058,9 @@ public:
                          /*buffer_type=*/BufferType::kDefault,
                          /*axis_separators=*/{},
                          /*span=*/op->span);
-    Stmt seq = SeqStmt({AllocBuffer(alloc_buf_obj, op->annotations, op->span),
-                        body},
-                       op->span);
+    Stmt seq =
+        SeqStmt({AllocBuffer(alloc_buf_obj, op->annotations, op->span), body},
+                op->span);
     bool trivial = false;
     if (const auto *imm = condition.as<IntImmNode>()) {
       trivial = (imm->value != 0);
@@ -1228,11 +1232,12 @@ public:
       ICHECK(is_zero(op->min));
       bool negative_ramp = false;
       if (auto annot = op->annotations.Get("negative_ramp")) {
-        if (const auto* val = annot.value().as<IntImmNode>()) {
+        if (const auto *val = annot.value().as<IntImmNode>()) {
           negative_ramp = val->value != 0;
         }
       }
-      return TLVectorizer::Vectorize(op->loop_var, op->extent, op->body, negative_ramp);
+      return TLVectorizer::Vectorize(op->loop_var, op->extent, op->body,
+                                     negative_ramp);
     } else {
       return StmtMutator::VisitStmt_(op);
     }

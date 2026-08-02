@@ -1248,7 +1248,8 @@ def cooperative_tensor_fill(data, idx, value, rows: int, cols: int):
             value,
             rows,
             cols,
-        ))
+        )
+    )
 
 
 def cooperative_tensor_load(
@@ -1280,7 +1281,8 @@ def cooperative_tensor_load(
             tile_n,
             tile_k,
             operand_role,
-        ))
+        )
+    )
 
 
 def cooperative_tensor_store(
@@ -1312,7 +1314,8 @@ def cooperative_tensor_store(
             tile_n,
             tile_k,
             operand_role,
-        ))
+        )
+    )
 
 
 def cooperative_tensor_multiply_accumulate(
@@ -1366,7 +1369,8 @@ def cooperative_tensor_multiply_accumulate(
             "handle",
             tirx.op.Op.get("tl.cooperative_tensor_multiply_accumulate"),
             *args,
-        ))
+        )
+    )
 
 
 def loop_break():

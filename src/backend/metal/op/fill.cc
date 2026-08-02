@@ -30,7 +30,8 @@ struct Fill {
       int region_elements = 1;
       for (auto r : op.region) {
         auto imm = r->extent.as<IntImmNode>();
-        ICHECK(imm) << "cooperative_tensor fill region must have constant extents";
+        ICHECK(imm)
+            << "cooperative_tensor fill region must have constant extents";
         region_elements *= imm->value;
       }
       constexpr int kTileM = 16;
@@ -94,8 +95,7 @@ struct Fill {
       // matrices; in that case fall back to a dense per-lane emission instead
       // of emitting consecutive simdgroup writes that could be unsound.
       PrimExpr last_element_offset =
-          element_offset +
-          IntImm(element_offset.dtype(), total_elements - 1);
+          element_offset + IntImm(element_offset.dtype(), total_elements - 1);
       PrimExpr last_matrix_index =
           FloorDiv(last_element_offset, matrix_elements);
       PrimExpr expected_last =
@@ -113,11 +113,11 @@ struct Fill {
       }
       Array<Stmt> stmts;
       for (int i = 0; i < num_matrices; i++) {
-        stmts.push_back(Evaluate(
-            Call(DataType::Handle(), builtin::make_filled_simdgroup_matrix(),
-                 {op.dst->data, matrix_index_base + IntImm(DataType::Int(32), i),
-                  fill_value, IntImm(DataType::Int(32), 8),
-                  IntImm(DataType::Int(32), 8)})));
+        stmts.push_back(Evaluate(Call(
+            DataType::Handle(), builtin::make_filled_simdgroup_matrix(),
+            {op.dst->data, matrix_index_base + IntImm(DataType::Int(32), i),
+             fill_value, IntImm(DataType::Int(32), 8),
+             IntImm(DataType::Int(32), 8)})));
       }
       if (stmts.size() == 1)
         return stmts[0];

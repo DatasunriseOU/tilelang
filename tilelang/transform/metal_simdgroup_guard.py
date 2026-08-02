@@ -73,8 +73,7 @@ def _const_int(value: Any) -> int | None:
 def _validate_shfl_xor(call: tir.Call, func_name: str) -> None:
     if len(call.args) != 4:
         raise ValueError(
-            "Metal SIMDgroup guard rejected malformed tl.shfl_xor_sync in "
-            f"{func_name}: expected <mask, value, lane_mask, width>."
+            f"Metal SIMDgroup guard rejected malformed tl.shfl_xor_sync in {func_name}: expected <mask, value, lane_mask, width>."
         )
     mask = _const_int(call.args[0])
     width = _const_int(call.args[3])
@@ -111,11 +110,7 @@ def validate_metal_simdgroup_intrinsics(
     if isinstance(func_or_mod, tir.PrimFunc):
         funcs = [("main", func_or_mod)]
     else:
-        funcs = [
-            (global_var.name_hint, func)
-            for global_var, func in func_or_mod.functions.items()
-            if isinstance(func, tir.PrimFunc)
-        ]
+        funcs = [(global_var.name_hint, func) for global_var, func in func_or_mod.functions.items() if isinstance(func, tir.PrimFunc)]
 
     for func_name, func in funcs:
         effective_target = target if target is not None else _func_target(func)

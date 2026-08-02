@@ -650,15 +650,14 @@ def _atomic_intrin_in_ir(builder_fn, expected_substr: str) -> None:
     ``builder_fn`` is a one-arg lambda taking a 1-element ``int32`` buffer
     and emitting an atomic intrinsic call against it.
     """
+
     @T.prim_func
     def f(A: T.Tensor((1,), "int32")):
         with T.Kernel(1, threads=1) as bx:
             builder_fn(A)
 
     text = str(f)
-    assert expected_substr in text, (
-        f"expected {expected_substr!r} in lowered IR for atomic intrinsic; got:\n{text}"
-    )
+    assert expected_substr in text, f"expected {expected_substr!r} in lowered IR for atomic intrinsic; got:\n{text}"
 
 
 def test_atomic_xchg_emits_tl_atomic_xchg_intrin():

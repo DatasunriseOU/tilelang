@@ -26,16 +26,16 @@ namespace tilelang {
 namespace tl_attr {
 
 /*! \brief Mark the scope as volatile access for certain handle. */
-constexpr const char* volatile_scope = "volatile_scope";
+constexpr const char *volatile_scope = "volatile_scope";
 
 /*! \brief Mark a scope as a pipeline execution stage. */
-constexpr const char* pipeline_exec_scope = "pipeline_exec_scope";
+constexpr const char *pipeline_exec_scope = "pipeline_exec_scope";
 
 /*! \brief Mark a scope as coprocessor micro-op scope (used by
  * legacy CombineContextCall pass). */
-constexpr const char* coproc_uop_scope = "coproc_uop_scope";
+constexpr const char *coproc_uop_scope = "coproc_uop_scope";
 
-}  // namespace tl_attr
-}  // namespace tilelang
+} // namespace tl_attr
+} // namespace tilelang
 
-#endif  // TILELANG_TRANSFORM_VENDORED_TL_ATTR_H_
+#endif // TILELANG_TRANSFORM_VENDORED_TL_ATTR_H_

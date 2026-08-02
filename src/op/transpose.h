@@ -71,8 +71,8 @@ public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(Transpose, TileOperator,
                                              TransposeNode);
   TVM_DLL
-  Transpose(Array<PrimExpr> args,
-            Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
+  Transpose(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations =
+                                      Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 

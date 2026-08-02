@@ -32,21 +32,22 @@
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/op.h>
 #include <tvm/tirx/op.h>            // TVM_TIR_REGISTER_OP
-#include <tvm/tirx/op_attr_types.h>  // CallEffectKind, TCallEffectKind
+#include <tvm/tirx/op_attr_types.h> // CallEffectKind, TCallEffectKind
 
 namespace tvm {
 namespace tirx {
 namespace builtin {
 
-const Op& tvm_global_barrier_kinit() {
-  static const Op& op = Op::Get("tirx.tvm_global_barrier_kinit");
+const Op &tvm_global_barrier_kinit() {
+  static const Op &op = Op::Get("tirx.tvm_global_barrier_kinit");
   return op;
 }
 
 // Mirrors the registration form used in
 // 3rdparty/tvm/src/tirx/op/builtin.cc (e.g. tvm_warp_activemask, line ~250):
 //   TIR_DEFINE_BUILTIN_FUNC(tvm_global_barrier_kinit)
-//       .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
+//       .set_attr<TCallEffectKind>("TCallEffectKind",
+//       Integer(CallEffectKind::kOpaque));
 // We expand it manually here (we don't have access to the upstream macro
 // from this translation unit, and re-declaring it would shadow the upstream
 // version). The macro body is two statements: a `Op::Get` accessor (already
@@ -56,9 +57,9 @@ TVM_REGISTER_OP("tirx.tvm_global_barrier_kinit")
     .set_attr<TScriptPrinterName>("TScriptPrinterName",
                                   "tvm_global_barrier_kinit")
     .set_num_inputs(0)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(static_cast<int>(CallEffectKind::kOpaque)));
+    .set_attr<TCallEffectKind>(
+        "TCallEffectKind", Integer(static_cast<int>(CallEffectKind::kOpaque)));
 
-}  // namespace builtin
-}  // namespace tirx
-}  // namespace tvm
+} // namespace builtin
+} // namespace tirx
+} // namespace tvm

@@ -1,6 +1,6 @@
-import tvm
 from tvm import tir
 from tvm.arith import Analyzer
+
 analyzer = Analyzer()
 k = tir.Var("k", "int32")
 k_next = k + 1

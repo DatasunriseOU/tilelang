@@ -20,9 +20,7 @@ class _RecordingExecutable:
 def _make_fake_tvm_ffi_adapter(func, out_idx, target="llvm"):
     adapter = TVMFFIKernelAdapter.__new__(TVMFFIKernelAdapter)
     adapter.params = [
-        KernelParam.from_buffer(func.buffer_map[param])
-        if param in func.buffer_map
-        else KernelParam.from_var(param)
+        KernelParam.from_buffer(func.buffer_map[param]) if param in func.buffer_map else KernelParam.from_var(param)
         for param in func.params
     ]
     adapter.result_idx = adapter._legalize_result_idx(out_idx)
@@ -94,10 +92,7 @@ def test_tvm_ffi_adapter_builds_explicit_metal_dependency_metadata():
     assert [(access.param_index, access.name, access.mode) for access in metadata.input_accesses] == [
         (0, "A", "read"),
     ]
-    assert [
-        (access.param_index, access.name, access.mode, access.result_position)
-        for access in metadata.output_accesses
-    ] == [
+    assert [(access.param_index, access.name, access.mode, access.result_position) for access in metadata.output_accesses] == [
         (1, "C", "write", 0),
     ]
 

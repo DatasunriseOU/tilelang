@@ -40,10 +40,12 @@ For PartitionLoop(For op, Var thread_var, arith::Analyzer *analyzer,
                   const Fragment &loop_layout);
 
 Fragment PlanLoopPartition(const tirx::For &op, size_t num_thread,
-                           int vectorize_size, arith::Analyzer* analyzer = nullptr);
+                           int vectorize_size,
+                           arith::Analyzer *analyzer = nullptr);
 
 Fragment PlanLoopPartition(const tirx::For &op, int vectorize_size,
-                           const Range &thread_range, arith::Analyzer* analyzer = nullptr);
+                           const Range &thread_range,
+                           arith::Analyzer *analyzer = nullptr);
 
 For PragmaUnrollLoop(For stmt);
 

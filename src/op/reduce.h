@@ -33,7 +33,8 @@ enum class ReduceTypeEnum : uint8_t {
 class ReduceTypeNode : public ffi::Object {
 public:
   int type{-1}; ///< Internal type identifier
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.ReduceType", ReduceTypeNode, ffi::Object);
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.ReduceType", ReduceTypeNode,
+                                    ffi::Object);
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
@@ -94,9 +95,10 @@ public:
  * is emitted as an MSL template parameter, so symbolic Z3 proofs cannot make a
  * non-constant offset codegen-legal.
  */
-TVM_DLL bool IsSameSimdgroupMetalReductionSafe(
-    const Target &target, int reducing_threads, int scale,
-    const PrimExpr &thread_offset_expr, arith::Analyzer *analyzer);
+TVM_DLL bool
+IsSameSimdgroupMetalReductionSafe(const Target &target, int reducing_threads,
+                                  int scale, const PrimExpr &thread_offset_expr,
+                                  arith::Analyzer *analyzer);
 
 struct ReductionPlan {
   int reducing_threads{0};
@@ -175,14 +177,12 @@ struct ReduceImpl {
                                       const LowerArgs &T,
                                       const ReductionPlan &plan, int batch);
 
-  bool (*needs_scalar_workspace)(const LowerArgs &T,
-                                 const ReductionPlan &plan);
-  int (*scalar_workspace_size)(const LowerArgs &T,
-                               const ReductionPlan &plan);
-  bool (*needs_batch_workspace)(const LowerArgs &T,
-                                const ReductionPlan &plan, int batch);
-  int (*batch_workspace_size)(const LowerArgs &T,
-                              const ReductionPlan &plan, int batch);
+  bool (*needs_scalar_workspace)(const LowerArgs &T, const ReductionPlan &plan);
+  int (*scalar_workspace_size)(const LowerArgs &T, const ReductionPlan &plan);
+  bool (*needs_batch_workspace)(const LowerArgs &T, const ReductionPlan &plan,
+                                int batch);
+  int (*batch_workspace_size)(const LowerArgs &T, const ReductionPlan &plan,
+                              int batch);
 
   void (*append_scalar_args)(Array<PrimExpr> *args, const LowerArgs &T,
                              bool need_workspace, const PrimExpr &workspace);
@@ -198,8 +198,8 @@ public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(ReduceOp, TileOperator,
                                              ReduceOpNode);
   TVM_DLL
-  ReduceOp(Array<PrimExpr> args,
-           Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
+  ReduceOp(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations =
+                                     Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 
@@ -250,8 +250,8 @@ public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(CumSumOp, TileOperator,
                                              CumSumOpNode);
   TVM_DLL
-  CumSumOp(Array<PrimExpr> args,
-           Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
+  CumSumOp(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations =
+                                     Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 

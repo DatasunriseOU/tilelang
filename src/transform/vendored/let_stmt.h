@@ -48,8 +48,8 @@
 namespace tilelang {
 namespace tl_tir {
 
+using tvm::PrimExpr; // PrimExpr lives at tvm:: top-level (not tirx::)
 using tvm::Span;
-using tvm::PrimExpr;  // PrimExpr lives at tvm:: top-level (not tirx::)
 using tvm::tirx::Stmt;
 using tvm::tirx::StmtNode;
 using tvm::tirx::Var;
@@ -61,7 +61,7 @@ using tvm::tirx::Var;
  * values, and Span semantics match the upstream definition exactly.
  */
 class LetStmtNode : public StmtNode {
- public:
+public:
   /*! \brief The variable. */
   Var var;
   /*! \brief The value to be bound. */
@@ -85,14 +85,14 @@ class LetStmtNode : public StmtNode {
  * \sa LetStmtNode
  */
 class LetStmt : public Stmt {
- public:
+public:
   TVM_DLL LetStmt(Var var, PrimExpr value, Stmt body, Span span = Span());
 
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(LetStmt, Stmt, LetStmtNode);
   TVM_DEFINE_OBJECT_REF_COW_METHOD(LetStmtNode);
 };
 
-}  // namespace tl_tir
-}  // namespace tilelang
+} // namespace tl_tir
+} // namespace tilelang
 
-#endif  // TILELANG_TRANSFORM_VENDORED_LET_STMT_H_
+#endif // TILELANG_TRANSFORM_VENDORED_LET_STMT_H_

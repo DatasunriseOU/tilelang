@@ -123,7 +123,8 @@ public:
   TVM_DLL Layout(Array<IterVar> forward_var, Array<PrimExpr> forward_index);
   TVM_DLL Layout(Array<PrimExpr> input_size, Array<PrimExpr> forward_index);
 
-  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(Layout, ffi::ObjectRef, LayoutNode);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(Layout, ffi::ObjectRef,
+                                             LayoutNode);
 };
 
 class FragmentNode : public LayoutNode {

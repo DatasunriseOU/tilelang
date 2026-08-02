@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 import json
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
+from collections.abc import Iterable
 
 
 def _stable_json(value: Any) -> str:
@@ -108,7 +109,7 @@ class WarmScheduleSelection:
     profiled_candidate_count: int
     skipped_illegal_candidate_count: int
 
-    def with_cache_hit(self) -> "WarmScheduleSelection":
+    def with_cache_hit(self) -> WarmScheduleSelection:
         return replace(self, cache_hit=True, profiled_candidate_count=0)
 
     def to_json(self) -> dict[str, Any]:
@@ -153,11 +154,7 @@ def schedule_selection_key(
 ) -> str:
     """Stable cache key for an ordered legal schedule search space."""
 
-    legal_keys = [
-        schedule_candidate_key(candidate, abi)
-        for candidate in candidates
-        if candidate.legal
-    ]
+    legal_keys = [schedule_candidate_key(candidate, abi) for candidate in candidates if candidate.legal]
     return _stable_hash({"legal_candidate_keys": legal_keys})
 
 

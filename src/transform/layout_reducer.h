@@ -66,7 +66,8 @@ struct ReducerInfoNode : ffi::Object {
 
   ReducerInfoNode() = default;
   ReducerInfoNode(const String &op_str, const String &rep_str);
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.ReducerInfo", ReducerInfoNode, ffi::Object);
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.ReducerInfo", ReducerInfoNode,
+                                    ffi::Object);
 };
 
 struct ReducerInfo : ffi::ObjectRef {

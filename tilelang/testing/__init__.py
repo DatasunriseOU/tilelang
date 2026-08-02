@@ -136,7 +136,7 @@ def requires_cuda_or_rocm(func):
     """Skip unless the selected default target is CUDA or ROCm and corresponding runtime is available."""
     target_kind = _default_target_kind()
     target_desc = target_kind if target_kind is not None else "unavailable"
-    
+
     # We can only reliably use the marks if one of the backends is available.
     # We use a custom skipif for the target kind
     marks = [

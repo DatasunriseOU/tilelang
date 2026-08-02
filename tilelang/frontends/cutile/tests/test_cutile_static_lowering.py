@@ -1,5 +1,4 @@
-"""Phase 5 acceptance: static CUTile -> TileLang TIR lowering and conformance tests.
-"""
+"""Phase 5 acceptance: static CUTile -> TileLang TIR lowering and conformance tests."""
 
 from __future__ import annotations
 
@@ -74,8 +73,8 @@ def test_from_cutile_source_emits_tilelang_dsl() -> None:
     )
     assert "import tilelang" in emitted
     assert "@T.prim_func" in emitted
-    assert "T.alloc_shared((16,), \"float32\")" in emitted
-    assert "T.alloc_fragment((16,), \"float32\")" in emitted
+    assert 'T.alloc_shared((16,), "float32")' in emitted
+    assert 'T.alloc_fragment((16,), "float32")' in emitted
     assert "T.copy(A, A_smem)" in emitted
     assert "T.copy(B, B_smem)" in emitted
     assert "C_frag[i] = (A_smem[i] + B_smem[i])" in emitted

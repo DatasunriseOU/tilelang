@@ -403,12 +403,12 @@ private:
   Stmt InjectOpaqueBlock(Stmt body, const ffi::Array<Buffer> &alloc_buffers) {
     ICHECK(!alloc_buffers.empty());
     SBlock opaque_block(/*iter_vars=*/{},
-                       /*reads=*/{},
-                       /*writes=*/{},
-                       /*name_hint=*/"",
-                       /*body=*/std::move(body),
-                       /*init=*/std::nullopt,
-                       /*alloc_buffers=*/alloc_buffers);
+                        /*reads=*/{},
+                        /*writes=*/{},
+                        /*name_hint=*/"",
+                        /*body=*/std::move(body),
+                        /*init=*/std::nullopt,
+                        /*alloc_buffers=*/alloc_buffers);
     ObjectPtr<SBlockNode> n = CopyOnWrite(opaque_block.get());
     // Snapshot to a Var->Buffer map using the innermost binding for each Var.
     ffi::Map<Var, Buffer> var_map = SnapshotVarMap();

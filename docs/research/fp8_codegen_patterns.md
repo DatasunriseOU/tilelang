@@ -12,10 +12,10 @@ Every claim below is pinned to a commit-locked github URL.
 CUTLASS defines exactly four FP8 MMA atoms for SM_89 (Ada) and SM_90
 (Hopper) classic FP8, all sharing one register-tiling pattern:
 
-* `SM89_16x8x32_F32E4M3E4M3F32_TN` — shape **16x8x32** (M,N,K).
-* `SM89_16x8x32_F32E4M3E5M2F32_TN`, `..._F32E5M2E4M3F32_TN`,
+- `SM89_16x8x32_F32E4M3E4M3F32_TN` — shape **16x8x32** (M,N,K).
+- `SM89_16x8x32_F32E4M3E5M2F32_TN`, `..._F32E5M2E4M3F32_TN`,
   `..._F32E5M2E5M2F32_TN` — same MNK, mixed E4M3/E5M2 inputs.
-* Per-thread fragment: D output = 4× `float`, A input = 4× `uint32_t`,
+- Per-thread fragment: D output = 4× `float`, A input = 4× `uint32_t`,
   B input = 2× `uint32_t` per lane (32-lane warp).
 
 Source:
@@ -70,8 +70,8 @@ wires gfx942 (`fnuz`) and gfx950 (`fn`) FP8 dtype routing through
 `tilelang/intrinsics/mfma_macro_generator.py` and `src/target/codegen_hip.cc`.
 The hardware shapes are:
 
-* gfx942: `v_mfma_f32_16x16x32_fp8_fp8` — 16x16x32 (M,N,K).
-* gfx950 scaled: `v_mfma_scale_f32_16x16x128_f8f6f4` — 16x16x128.
+- gfx942: `v_mfma_f32_16x16x32_fp8_fp8` — 16x16x32 (M,N,K).
+- gfx950 scaled: `v_mfma_scale_f32_16x16x128_f8f6f4` — 16x16x128.
 
 The CDNA factory for fp16/bf16 already uses 16x16 base tiles
 ([tile-ai/tilelang src/layout/gemm_layouts.cc#L63-L97](https://github.com/tile-ai/tilelang/blob/main/src/layout/gemm_layouts.cc#L63)):
@@ -256,17 +256,17 @@ dot4 would be incorrect unless a producer changes the layout. The direct
 path avoids wrapper-side transposes and tensor copies by requiring the
 producer to materialize B in K-contiguous row-major `B[N,K]`.
 
-* **Apple has no FP8 MMA**: confirmed via WWDC25 cooperative-tensor
+- **Apple has no FP8 MMA**: confirmed via WWDC25 cooperative-tensor
   session ([Metal 4 talk](https://developers.apple.com/videos/play/wwdc2025/205))
   and MLX's lack of fp8 simdgroup paths
   ([ml-explore/mlx#2962](https://github.com/ml-explore/mlx/issues/2962)).
   The Layout above is scaffolding; the *executor* on Apple silicon
   remains the byte-packed `metal_fp8_e4m3_dot4` LUT path
   ([tilelang/language/fp8_op.py#L144](https://github.com/tile-ai/tilelang/blob/main/tilelang/language/fp8_op.py#L144)).
-* **k_pack drift**: if Apple ships fp8 cooperative tensors with a
+- **k_pack drift**: if Apple ships fp8 cooperative tensors with a
   different K (e.g. 16 instead of 32), bump `k_pack` to 2 — only the
   factory constant changes, not the call sites.
-* **No FP8 in MLX quantized.h** today; if MLX adopts a different lane
+- **No FP8 in MLX quantized.h** today; if MLX adopts a different lane
   layout (e.g. 16 fp8 per lane like a hypothetical
   `simdgroup_matrix<16,16>`), we add a parallel
   `makeSimdgroupFragmentAFp8_16x16` factory rather than re-shaping the
