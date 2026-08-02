@@ -338,14 +338,14 @@ void CodeGenCHost::PrintCallPacked(const tvm::tirx::CallNode *op) {
   this->stream << result << ".v_int64 = 0;\n";
 
   if (!is_in_metal_context) {
-    PrintPackedCallIntoResult(op, packed_func_name, args_stack, num_args, result,
-                              "return -1;");
+    PrintPackedCallIntoResult(op, packed_func_name, args_stack, num_args,
+                              result, "return -1;");
     return;
   }
 
   if (RuntimeAssertsDisabled()) {
-    PrintPackedCallIntoResult(op, packed_func_name, args_stack, num_args, result,
-                              "return -1;");
+    PrintPackedCallIntoResult(op, packed_func_name, args_stack, num_args,
+                              result, "return -1;");
     return;
   }
 
@@ -360,10 +360,9 @@ void CodeGenCHost::PrintCallPacked(const tvm::tirx::CallNode *op) {
   this->PrintLine(
       "const auto get_current_tvm_stream = "
       "tvm::ffi::Function::GetGlobal(\"metal.GetCurrentTVMStream\");");
-  this->PrintLine(
-      "if (!set_external_command_buffer.has_value() || "
-      "!get_external_command_buffer.has_value() || "
-      "!get_current_tvm_stream.has_value()) {");
+  this->PrintLine("if (!set_external_command_buffer.has_value() || "
+                  "!get_external_command_buffer.has_value() || "
+                  "!get_current_tvm_stream.has_value()) {");
   int missing_stream_hook_scope = this->BeginScope();
   this->PrintLine(
       "TVMFFIErrorSetRaisedFromCStr(\"RuntimeError\", "
@@ -375,8 +374,8 @@ void CodeGenCHost::PrintCallPacked(const tvm::tirx::CallNode *op) {
                   "(*get_external_command_buffer)().cast<void*>();");
   this->PrintLine(
       "void* current_tvm_stream = (*get_current_tvm_stream)().cast<void*>();");
-  this->PrintLine(
-      "if (owner_command_buffer != nullptr || current_tvm_stream != nullptr) {");
+  this->PrintLine("if (owner_command_buffer != nullptr || current_tvm_stream "
+                  "!= nullptr) {");
   int owner_scope = this->BeginScope();
   PrintPackedCallIntoResult(op, packed_func_name, args_stack, num_args, result,
                             metal_result + " = -1;");
@@ -453,18 +452,20 @@ void CodeGenCHost::VisitExpr_(const tvm::tirx::CallNode *op,
   }
 }
 
-void CodeGenCHost::VisitStmt_(const tvm::tirx::AssertStmtNode *op) { // NOLINT(*)
+void CodeGenCHost::VisitStmt_(
+    const tvm::tirx::AssertStmtNode *op) { // NOLINT(*)
   if (emit_asserts_) {
     std::string cond = PrintExpr(op->condition);
     PrintIndent();
     stream << "if (!(" << cond << ")) {\n";
     int assert_if_scope = this->BeginScope();
     {
-      // CPPMEGA: apache/tvm latest replaced AssertStmtNode { condition; message; body }
-      // with { condition; error_kind; message_parts (Array<StringImm>) }. We concatenate
-      // message_parts into a single literal string for the C runtime error.
+      // CPPMEGA: apache/tvm latest replaced AssertStmtNode { condition;
+      // message; body } with { condition; error_kind; message_parts
+      // (Array<StringImm>) }. We concatenate message_parts into a single
+      // literal string for the C runtime error.
       std::string esc_msg;
-      std::string msg_expr;  // unused with the new schema (always literal)
+      std::string msg_expr; // unused with the new schema (always literal)
       bool msg_is_literal = true;
       {
         std::string raw_msg;
@@ -509,7 +510,8 @@ void CodeGenCHost::VisitStmt_(const tvm::tirx::AssertStmtNode *op) { // NOLINT(*
     stream << "}\n";
   }
   // CPPMEGA: apache/tvm latest dropped AssertStmtNode::body — body is now the
-  // following stmt in the surrounding SeqStmt context (visited by the SeqStmt walker).
+  // following stmt in the surrounding SeqStmt context (visited by the SeqStmt
+  // walker).
 }
 
 void CodeGenCHost::VisitStmt_(const tvm::tirx::AttrStmtNode *op) {

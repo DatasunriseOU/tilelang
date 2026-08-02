@@ -202,7 +202,7 @@ public:
         PrimExpr let_rdiv = tirx::Let(
             rdiv, truncdiv(op->a, op->b),
             tirx::Select((op->b >= 0 && rmod >= 0) || (op->b < 0 && rmod <= 0),
-                        rdiv, rdiv - make_const(dtype, 1)));
+                         rdiv, rdiv - make_const(dtype, 1)));
         return Let(rmod, truncmod(op->a, op->b), let_rdiv);
       }
     }

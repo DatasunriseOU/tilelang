@@ -258,8 +258,8 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
     return {};
 
   // Bind LetStmt variables to their expressions in our local analyzer
-  for (const auto& kv : T.let_var_to_expr) {
-    const_cast<arith::Analyzer*>(&analyzer_)->Bind(kv.first, kv.second);
+  for (const auto &kv : T.let_var_to_expr) {
+    const_cast<arith::Analyzer *>(&analyzer_)->Bind(kv.first, kv.second);
   }
 
   // Expand let bindings to find fragment buffer accesses
@@ -487,20 +487,21 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
     single_point_loop =
         single_point_loop &&
         analyzer_.CanProveEqual(iv->dom->min, make_zero(iv->var.dtype())) &&
-        analyzer_.CanProveEqual(iv->dom->extent, make_const(iv->var.dtype(), 1));
+        analyzer_.CanProveEqual(iv->dom->extent,
+                                make_const(iv->var.dtype(), 1));
     owner_indices.push_back(make_zero(iv->var.dtype()));
   }
-  bool single_output_point = loop_layout_->OutputDim() == 1 &&
-                             analyzer_.CanProveEqual(loop_layout_->OutputShape()[0],
-                                                     make_const(DataType::Int(32), 1));
-  bool single_replica =
-      analyzer_.CanProveEqual(loop_layout_->ReplicateExtent(),
+  bool single_output_point =
+      loop_layout_->OutputDim() == 1 &&
+      analyzer_.CanProveEqual(loop_layout_->OutputShape()[0],
                               make_const(DataType::Int(32), 1));
+  bool single_replica = analyzer_.CanProveEqual(
+      loop_layout_->ReplicateExtent(), make_const(DataType::Int(32), 1));
   if (single_point_loop && single_output_point && single_replica &&
       !store_fragment_buffers_.empty()) {
-    PrimExpr owner =
-        analyzer_.Simplify(loop_layout_->ForwardThread(owner_indices, std::nullopt) +
-                           T.thread_bounds->min);
+    PrimExpr owner = analyzer_.Simplify(
+        loop_layout_->ForwardThread(owner_indices, std::nullopt) +
+        T.thread_bounds->min);
     AddPredicate(EQ(InputPlaceholder(0), owner));
   } else if (!analyzer_.CanProveEqual(loop_thread_extent, block_size)) {
     AddPredicate(
@@ -716,7 +717,9 @@ Fragment ParallelOpNode::ComputePlanCandidate(const LayoutInferArgs &T) const {
       LOG(FATAL) << "coalesced_width should be an IntImmNode.";
     }
   } else {
-    vector_size = GetVectorizeSize(maybe_remapped_root_, const_cast<arith::Analyzer*>(&analyzer_), T.layout_map);
+    vector_size = GetVectorizeSize(maybe_remapped_root_,
+                                   const_cast<arith::Analyzer *>(&analyzer_),
+                                   T.layout_map);
 
     PrimExpr loop_total_size = 1;
     for (Stmt l = root_; l.as<For>().has_value(); l = l.as<For>().value()->body)
@@ -730,8 +733,9 @@ Fragment ParallelOpNode::ComputePlanCandidate(const LayoutInferArgs &T) const {
       }
     }
 
-    while (!analyzer_.CanProve(floormod(max_loop_total_size, T.thread_bounds->extent *
-                                                             vector_size) == 0) &&
+    while (!analyzer_.CanProve(
+               floormod(max_loop_total_size,
+                        T.thread_bounds->extent * vector_size) == 0) &&
            vector_size > 1)
       vector_size /= 2;
   }
@@ -739,7 +743,8 @@ Fragment ParallelOpNode::ComputePlanCandidate(const LayoutInferArgs &T) const {
   DLOG(INFO) << "[PlanLoopPartition] root_ = " << root_
              << " ############# vector_size = " << vector_size
              << ", thread_bounds = " << T.thread_bounds << '\n';
-  auto plan = PlanLoopPartition(root_, vector_size, T.thread_bounds, const_cast<arith::Analyzer*>(&analyzer_));
+  auto plan = PlanLoopPartition(root_, vector_size, T.thread_bounds,
+                                const_cast<arith::Analyzer *>(&analyzer_));
   DLOG(INFO) << "[PlanLoopPartition] candidate = " << plan->DebugOutput()
              << '\n';
   return plan;

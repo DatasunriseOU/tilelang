@@ -183,11 +183,7 @@ if not env.is_light_import():
                 def _wrapper(*args, **kwargs):
                     warnings.warn(
                         f"{method_name} is deprecated, use {new_method_name} instead"
-                        + (
-                            f" and will be removed in {phaseout_version}"
-                            if phaseout_version
-                            else ""
-                        ),
+                        + (f" and will be removed in {phaseout_version}" if phaseout_version else ""),
                         DeprecationWarning,
                         stacklevel=2,
                     )
@@ -238,10 +234,7 @@ if not env.is_light_import():
     else:
 
         def _requires_torch(*_args, **_kwargs):
-            raise ModuleNotFoundError(
-                "torch is required for TileLang JIT, profiler, autotuner, "
-                "and engine lowering APIs"
-            )
+            raise ModuleNotFoundError("torch is required for TileLang JIT, profiler, autotuner, and engine lowering APIs")
 
         jit = compile = par_compile = autotune = lower = _requires_torch
         JITKernel = Profiler = None  # type: ignore
@@ -257,6 +250,7 @@ if not env.is_light_import():
     from .math import *  # noqa: F403
     from . import ir  # noqa: F401
     from . import tileop  # noqa: F401
+
     # Promote production language frontends (Triton TTIR, ...). The
     # subpackage registers ``tilelang.frontends.triton`` for both
     # direct callers and the ``compile()`` TTIR-dispatch helper.
@@ -272,29 +266,22 @@ if not env.is_light_import():
         # the (large) implementation tree.
         pass
     for _backend_name in ("cpu", "cuda", "rocm"):
-        try:
+        # Backend packages are optional in partially merged local checkouts;
+        # importing TileLang must keep working for non-backend lowering.
+        with contextlib.suppress(Exception):
             globals()[_backend_name] = __import__(
                 f"{__name__}.{_backend_name}",
                 fromlist=[_backend_name],
             )
-        except Exception:
-            # Backend packages are optional in partially merged local
-            # checkouts; importing tilelang.engine must keep working for
-            # non-backend-specific lowering.
-            pass
     # Fork-specific: ``tilelang.backend`` hosts the reduction-lowerer dispatch
     # and the standalone Metal backend (gemm + reduction). Importing it here
     # registers those implementations (upstream #2165 moved only the
     # CUDA/CPU/ROCm GEMM packages out to ``tilelang.{cpu,cuda,rocm}``).
-    try:
+    with contextlib.suppress(Exception):
         from . import backend as _backend  # noqa: F401
-    except Exception:
-        pass
 
 
 del _lazy_extension_imports
 del _import_optional_torch
-try:
+with contextlib.suppress(NameError):
     del _backend_name
-except NameError:
-    pass

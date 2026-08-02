@@ -62,7 +62,8 @@ void RegisterAtomicReduceImpl(AtomicReduceImpl impl) {
 // AtomicMax Implementation
 // ============================================================================
 
-AtomicMax::AtomicMax(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {
+AtomicMax::AtomicMax(Array<PrimExpr> args,
+                     Map<String, ffi::ObjectRef> annotations) {
   ICHECK(args.size() >= 2)
       << "AtomicMax expects at least 2 arguments (src, dst), got "
       << args.size();
@@ -103,7 +104,8 @@ const Op &AtomicMaxNode::GetElemOp() const { return atomic_max_elem_op(); }
 // AtomicMin Implementation
 // ============================================================================
 
-AtomicMin::AtomicMin(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {
+AtomicMin::AtomicMin(Array<PrimExpr> args,
+                     Map<String, ffi::ObjectRef> annotations) {
   ICHECK(args.size() >= 2)
       << "AtomicMin expects at least 2 arguments (src, dst), got "
       << args.size();

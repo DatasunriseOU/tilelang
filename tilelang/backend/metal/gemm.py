@@ -20,5 +20,4 @@ register_gemm_impl(GEMM_INST_METAL_SIMDGROUP, GEMM_INST_METAL, _match_metal, Gem
 # Metal M5+ mpp::tensor_ops::matmul2d cooperative-tensor path
 # (PR tile-ai/tilelang#2252).  Selected automatically by
 # src/backend/metal/op/gemm.cc when shape/scope preconditions hold.
-register_gemm_impl(GEMM_INST_METAL_COOPERATIVE_TENSOR, GEMM_INST_METAL_COOPERATIVE_TENSOR,
-                   _match_metal, GemmMetal)
+register_gemm_impl(GEMM_INST_METAL_COOPERATIVE_TENSOR, GEMM_INST_METAL_COOPERATIVE_TENSOR, _match_metal, GemmMetal)

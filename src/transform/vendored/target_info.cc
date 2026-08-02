@@ -28,7 +28,7 @@ namespace tvm {
 
 TVM_FFI_STATIC_INIT_BLOCK() { MemoryInfoNode::RegisterReflection(); }
 
-MemoryInfo GetMemoryInfo(const std::string& scope) {
+MemoryInfo GetMemoryInfo(const std::string &scope) {
   std::string fname = "tvm.info.mem." + scope;
   const auto f = tvm::ffi::Function::GetGlobal(fname);
   if (!f.has_value()) {
@@ -39,4 +39,4 @@ MemoryInfo GetMemoryInfo(const std::string& scope) {
   }
 }
 
-}  // namespace tvm
+} // namespace tvm

@@ -107,6 +107,7 @@ def check_supported_precision(supported_list: list, in_dtype_a: str, in_dtype_b:
                 return True
     return False
 
+
 def is_tensorcore_supported_precision(in_dtype_a: str, in_dtype_b: str, accum_dtype: str, arch: TileDevice) -> bool:
     if is_volta_arch(arch):
         return check_supported_precision(volta_tensorcore_supported, in_dtype_a, in_dtype_b, accum_dtype)
@@ -160,9 +161,9 @@ class CUDA(TileDevice):
         # bandwidth in MB/s, will be used for recommend basic tile size
         # Heuristic bandwidth mapping for common architectures
         bandwidth_map = {
-            70: [750, 900000],   # Volta V100: ~900 GB/s
+            70: [750, 900000],  # Volta V100: ~900 GB/s
             80: [750, 1555000],  # Ampere A100: ~1555 GB/s
-            86: [750, 760000],   # Ampere RTX 3090: ~760 GB/s
+            86: [750, 760000],  # Ampere RTX 3090: ~760 GB/s
             89: [750, 1008000],  # Ada RTX 4090: ~1008 GB/s
             90: [750, 3350000],  # Hopper H100: ~3350 GB/s
         }

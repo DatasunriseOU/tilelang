@@ -1,6 +1,6 @@
 #include "codegen_cutedsl.h"
-#include "target/cuda/cuda_fallback_module.h"
 #include "runtime/pack_args.h"
+#include "target/cuda/cuda_fallback_module.h"
 #include <tvm/ffi/reflection/registry.h>
 
 namespace tvm {
@@ -19,12 +19,14 @@ ExtractFuncInfo(const IRModule &mod) {
     ffi::Array<runtime::ArgExtraTags> arg_extra_tags;
     auto is_tensormap = [](const tirx::Var &var) -> bool {
       const auto *type = var->type_annotation.as<PointerTypeNode>();
-      if (type == nullptr) return false;
+      if (type == nullptr)
+        return false;
       return type->element_type.as<TensorMapTypeNode>() != nullptr;
     };
     for (size_t i = 0; i < f->params.size(); ++i) {
       DataType dtype = f->params[i].dtype();
-      if (dtype.is_bool()) dtype = DataType::Int(32);
+      if (dtype.is_bool())
+        dtype = DataType::Int(32);
       arg_types.push_back(dtype);
       arg_extra_tags.push_back(is_tensormap(f->params[i])
                                    ? runtime::ArgExtraTags::kTensorMap
@@ -39,10 +41,9 @@ ExtractFuncInfo(const IRModule &mod) {
     }
     auto global_symbol = f->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol);
     ffi::String name = global_symbol.value();
-    fmap.Set(name,
-             runtime::FunctionInfo(name, std::move(arg_types),
-                                   std::move(launch_param_tags),
-                                   std::move(arg_extra_tags)));
+    fmap.Set(name, runtime::FunctionInfo(name, std::move(arg_types),
+                                         std::move(launch_param_tags),
+                                         std::move(arg_extra_tags)));
   }
   return fmap;
 }
@@ -68,7 +69,8 @@ ffi::Module BuildTileLangCuTeDSLWithoutCompile(IRModule mod, Target target) {
   ffi::Map<ffi::String, ffi::String> source_map;
   source_map.Set("cuda", code);
   source_map.Set("cuda_source", code);
-  return target::CUDAModuleCreateWithFallback(ffi::Bytes("ptx", 3), ffi::String("ptx"),
+  return target::CUDAModuleCreateWithFallback(ffi::Bytes("ptx", 3),
+                                              ffi::String("ptx"),
                                               ExtractFuncInfo(mod), source_map);
 }
 

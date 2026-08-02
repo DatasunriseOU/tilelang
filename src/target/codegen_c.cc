@@ -389,7 +389,8 @@ void CodeGenTileLangC::VisitExpr_(const CallNode *op,
     size_t unit = sizeof(TVMFFIAny);
     size_t size = 0;
     if (type == "shape") {
-      // CPPMEGA: tvm::runtime::tvm_index_t was removed; DLTensor shape is int64_t.
+      // CPPMEGA: tvm::runtime::tvm_index_t was removed; DLTensor shape is
+      // int64_t.
       size = (num->value * sizeof(int64_t) + unit - 1) / unit;
     } else if (type == "arg_value") {
       size = (num->value * sizeof(TVMFFIAny) + unit - 1) / unit;
@@ -428,7 +429,8 @@ void CodeGenTileLangC::VisitExpr_(const CallNode *op,
 void CodeGenTileLangC::VisitStmt_(const AssertStmtNode *op) { // NOLINT(*)
   // CPPMEGA: apache/tvm replaced AssertStmt(cond, message, body) with
   // AssertStmt(cond, error_kind, message_parts) — body is gone (it now follows
-  // in the surrounding SeqStmt). Concatenate message_parts for the error string.
+  // in the surrounding SeqStmt). Concatenate message_parts for the error
+  // string.
   if (emit_asserts_) {
     std::string cond = PrintExpr(op->condition);
     PrintIndent();
@@ -449,10 +451,11 @@ void CodeGenTileLangC::VisitStmt_(const AssertStmtNode *op) { // NOLINT(*)
 }
 
 void CodeGenTileLangC::VisitStmt_(const AllocBufferNode *op) {
-  // CPPMEGA: apache/tvm latest replaced AllocateNode (raw fields buffer_var/dtype/
-  // extents/condition/body) with AllocBufferNode { Buffer buffer; annotations }.
-  // The buffer object carries the Var/dtype/shape directly, and the body is now the
-  // following stmt in the surrounding SeqStmt context (no body field on AllocBuffer).
+  // CPPMEGA: apache/tvm latest replaced AllocateNode (raw fields
+  // buffer_var/dtype/ extents/condition/body) with AllocBufferNode { Buffer
+  // buffer; annotations }. The buffer object carries the Var/dtype/shape
+  // directly, and the body is now the following stmt in the surrounding SeqStmt
+  // context (no body field on AllocBuffer).
   const Buffer &buf = op->buffer;
   std::string vid = AllocVarID(buf->data.get());
 
@@ -472,7 +475,8 @@ void CodeGenTileLangC::VisitStmt_(const AllocBufferNode *op) {
     }
   }
   ffi::Optional<int64_t> opt_size;
-  if (size_is_const && alloc_size > 0) opt_size = alloc_size;
+  if (size_is_const && alloc_size > 0)
+    opt_size = alloc_size;
   ICHECK(opt_size.has_value() && opt_size.value() > 0)
       << "Can only handle constant size stack allocation for now";
 

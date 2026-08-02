@@ -48,6 +48,7 @@ from tilelang.analysis.cost_model import attach_reduction_cost_metadata
 from tilelang.analysis.reduction_legality import attach_reduction_legality_metadata
 from tilelang.analysis.reduction_plan import attach_reduction_plan_metadata
 from tilelang.analysis.sync_event_plan import attach_sync_event_plan_metadata
+import contextlib
 
 logger = logging.getLogger("tilelang.metal_simd_lift")
 
@@ -244,16 +245,21 @@ def _log_candidates(func_name: str, candidates: list[_ReductionCandidate]):
     if os.environ.get("TL_LOG_SIMD_LIFT") or any(c.proved for c in candidates):
         for c in candidates:
             logger.warning(
-                "simd-lift-detect: func=%s loop=%s extent=%s op=%s proved=%s "
-                "annotated=%s query=%s",
-                func_name, c.loop_var, c.extent_repr, c.op, c.proved,
-                c.annotated, c.query,
+                "simd-lift-detect: func=%s loop=%s extent=%s op=%s proved=%s annotated=%s query=%s",
+                func_name,
+                c.loop_var,
+                c.extent_repr,
+                c.op,
+                c.proved,
+                c.annotated,
+                c.query,
             )
 
 
 # ---------------------------------------------------------------------------
 # Butterfly construction
 # ---------------------------------------------------------------------------
+
 
 def _butterfly_stages(extent: int) -> list[int]:
     """Return the lane-shift sequence for a butterfly over ``extent`` lanes.
@@ -278,10 +284,7 @@ def _butterfly_stages(extent: int) -> list[int]:
     # but assert here so any future caller misuse fails loudly instead of
     # producing out-of-range shuffle indices.
     for shift in out:
-        assert 1 <= shift < 32, (
-            f"butterfly stage {shift} out of [1,32) for Apple simdgroup "
-            f"(extent={extent})"
-        )
+        assert 1 <= shift < 32, f"butterfly stage {shift} out of [1,32) for Apple simdgroup (extent={extent})"
     return out
 
 
@@ -425,7 +428,11 @@ class _ThreadAllreduceRewriter:
 
     def _for_with_body(self, node: tir.For, body: tir.Stmt) -> tir.For:
         return tir.For(
-            node.loop_var, node.min, node.extent, node.kind, body,
+            node.loop_var,
+            node.min,
+            node.extent,
+            node.kind,
+            body,
             getattr(node, "thread_binding", None),
             getattr(node, "annotations", {}),
             self._span(node),
@@ -444,25 +451,36 @@ class _ThreadAllreduceRewriter:
         if isinstance(node, tir.LetStmt):
             return tir.LetStmt(node.var, node.value, self._mutate(node.body), self._span(node))
         if isinstance(node, tir.AttrStmt):
-            return tir.AttrStmt(
-                node.node, node.attr_key, node.value, self._mutate(node.body), self._span(node)
-            )
+            return tir.AttrStmt(node.node, node.attr_key, node.value, self._mutate(node.body), self._span(node))
         allocate_const = getattr(tir, "AllocateConst", None)
         if allocate_const is not None and isinstance(node, allocate_const):
             return allocate_const(
-                node.buffer_var, node.dtype, node.extents, node.data,
-                self._mutate(node.body), node.annotations, self._span(node),
+                node.buffer_var,
+                node.dtype,
+                node.extents,
+                node.data,
+                self._mutate(node.body),
+                node.annotations,
+                self._span(node),
             )
         if isinstance(node, tir.Allocate):
             return tir.Allocate(
-                node.buffer_var, node.dtype, node.extents, node.condition,
-                self._mutate(node.body), node.annotations, self._span(node),
+                node.buffer_var,
+                node.dtype,
+                node.extents,
+                node.condition,
+                self._mutate(node.body),
+                node.annotations,
+                self._span(node),
             )
         if isinstance(node, tir.DeclBuffer):
             return tir.DeclBuffer(node.buffer, self._mutate(node.body), self._span(node))
         if isinstance(node, tir.Block):
             return tir.Block(
-                node.iter_vars, node.reads, node.writes, node.name_hint,
+                node.iter_vars,
+                node.reads,
+                node.writes,
+                node.name_hint,
                 self._mutate(node.body),
                 getattr(node, "init", None),
                 getattr(node, "alloc_buffers", []),
@@ -472,8 +490,10 @@ class _ThreadAllreduceRewriter:
             )
         if isinstance(node, tir.BlockRealize):
             return tir.BlockRealize(
-                node.iter_values, node.predicate,
-                self._mutate(node.block), self._span(node),
+                node.iter_values,
+                node.predicate,
+                self._mutate(node.block),
+                self._span(node),
             )
         if hasattr(node, "body") and node.body is not None:
             new_body = self._mutate(node.body)
@@ -495,17 +515,18 @@ class _ThreadAllreduceRewriter:
         proved, query = _z3_extent_le_32(node.extent)
         if not proved:
             logger.warning(
-                "semantic-reduction-rewrite: declining annotated loop var=%s extent=%s "
-                "reason=z3_extent_unproved query=%s",
-                str(node.loop_var.name), str(node.extent), query,
+                "semantic-reduction-rewrite: declining annotated loop var=%s extent=%s reason=z3_extent_unproved query=%s",
+                str(node.loop_var.name),
+                str(node.extent),
+                query,
             )
             return self._for_with_body(node, recursed_body)
         contribution = _extract_add_contribution(body_stmt)
         if contribution is None:
             logger.warning(
-                "semantic-reduction-rewrite: declining annotated loop var=%s extent=%s "
-                "reason=accumulator_contribution_not_extracted",
-                str(node.loop_var.name), str(node.extent),
+                "semantic-reduction-rewrite: declining annotated loop var=%s extent=%s reason=accumulator_contribution_not_extracted",
+                str(node.loop_var.name),
+                str(node.extent),
             )
             return self._for_with_body(node, recursed_body)
         out = tir.BufferLoad(body_stmt.buffer, list(body_stmt.indices))
@@ -530,7 +551,11 @@ class _ButterflyRewriter:
 
     def _for_with_body(self, node: tir.For, body: tir.Stmt) -> tir.For:
         return tir.For(
-            node.loop_var, node.min, node.extent, node.kind, body,
+            node.loop_var,
+            node.min,
+            node.extent,
+            node.kind,
+            body,
             getattr(node, "thread_binding", None),
             getattr(node, "annotations", {}),
             self._span(node),
@@ -549,25 +574,36 @@ class _ButterflyRewriter:
         if isinstance(node, tir.LetStmt):
             return tir.LetStmt(node.var, node.value, self._mutate(node.body), self._span(node))
         if isinstance(node, tir.AttrStmt):
-            return tir.AttrStmt(
-                node.node, node.attr_key, node.value, self._mutate(node.body), self._span(node)
-            )
+            return tir.AttrStmt(node.node, node.attr_key, node.value, self._mutate(node.body), self._span(node))
         allocate_const = getattr(tir, "AllocateConst", None)
         if allocate_const is not None and isinstance(node, allocate_const):
             return allocate_const(
-                node.buffer_var, node.dtype, node.extents, node.data,
-                self._mutate(node.body), node.annotations, self._span(node),
+                node.buffer_var,
+                node.dtype,
+                node.extents,
+                node.data,
+                self._mutate(node.body),
+                node.annotations,
+                self._span(node),
             )
         if isinstance(node, tir.Allocate):
             return tir.Allocate(
-                node.buffer_var, node.dtype, node.extents, node.condition,
-                self._mutate(node.body), node.annotations, self._span(node),
+                node.buffer_var,
+                node.dtype,
+                node.extents,
+                node.condition,
+                self._mutate(node.body),
+                node.annotations,
+                self._span(node),
             )
         if isinstance(node, tir.DeclBuffer):
             return tir.DeclBuffer(node.buffer, self._mutate(node.body), self._span(node))
         if isinstance(node, tir.Block):
             return tir.Block(
-                node.iter_vars, node.reads, node.writes, node.name_hint,
+                node.iter_vars,
+                node.reads,
+                node.writes,
+                node.name_hint,
                 self._mutate(node.body),
                 getattr(node, "init", None),
                 getattr(node, "alloc_buffers", []),
@@ -577,8 +613,10 @@ class _ButterflyRewriter:
             )
         if isinstance(node, tir.BlockRealize):
             return tir.BlockRealize(
-                node.iter_values, node.predicate,
-                self._mutate(node.block), self._span(node),
+                node.iter_values,
+                node.predicate,
+                self._mutate(node.block),
+                self._span(node),
             )
         # Catch-all: recurse into any body-bearing node we don't explicitly
         # handle (e.g. AssertStmt, ProducerRealize). Without this, annotated
@@ -586,11 +624,10 @@ class _ButterflyRewriter:
         # skipped. We reconstruct the node if the body changed.
         if hasattr(node, "body") and node.body is not None:
             new_body = self._mutate(node.body)
-            if not new_body.same_as(node.body):
-                # Best-effort reconstruction via with_body if available,
-                # otherwise fall through to return the original node.
-                if hasattr(node, "with_body"):
-                    return node.with_body(new_body)
+            # Best-effort reconstruction via with_body if available,
+            # otherwise fall through to return the original node.
+            if not new_body.same_as(node.body) and hasattr(node, "with_body"):
+                return node.with_body(new_body)
         return node
 
     def _visit_for(self, node: tir.For) -> tir.Stmt:
@@ -612,9 +649,10 @@ class _ButterflyRewriter:
             # Annotated loop but Z3 cannot prove extent <= 32 — log so CI can
             # surface the missed rewrite instead of dropping silently.
             logger.warning(
-                "simd-lift-rewrite: declining annotated loop var=%s extent=%s "
-                "reason=z3_extent_unproved query=%s",
-                str(node.loop_var.name), str(node.extent), query,
+                "simd-lift-rewrite: declining annotated loop var=%s extent=%s reason=z3_extent_unproved query=%s",
+                str(node.loop_var.name),
+                str(node.extent),
+                query,
             )
             return self._for_with_body(node, recursed_body)
 
@@ -628,9 +666,9 @@ class _ButterflyRewriter:
             # emit the static stage list. Conservative: skip — log so CI can
             # diagnose why an annotated/proved loop wasn't rewritten.
             logger.warning(
-                "simd-lift-rewrite: declining annotated loop var=%s extent=%s "
-                "reason=symbolic_extent_no_static_value",
-                str(node.loop_var.name), str(node.extent),
+                "simd-lift-rewrite: declining annotated loop var=%s extent=%s reason=symbolic_extent_no_static_value",
+                str(node.loop_var.name),
+                str(node.extent),
             )
             return self._for_with_body(node, recursed_body)
 
@@ -638,21 +676,18 @@ class _ButterflyRewriter:
         # [2, 32]. Non-power-of-2 extents would yield bad shuffle indices,
         # and SIMD-group width on Metal/Apple GPUs is 32, so larger extents
         # cannot be served by a single shfl_xor_sync chain.
-        if (extent_val < 2 or extent_val > 32 or
-                (extent_val & (extent_val - 1)) != 0):
+        if extent_val < 2 or extent_val > 32 or (extent_val & (extent_val - 1)) != 0:
             logger.warning(
-                "simd-lift-rewrite: declining annotated loop var=%s extent=%d "
-                "reason=extent_not_pow2_in_[2,32]",
-                str(node.loop_var.name), extent_val,
+                "simd-lift-rewrite: declining annotated loop var=%s extent=%d reason=extent_not_pow2_in_[2,32]",
+                str(node.loop_var.name),
+                extent_val,
             )
             return self._for_with_body(node, recursed_body)
 
         # Build acc_load (BufferLoad mirroring the BufferStore).
         store: tir.BufferStore = body_stmt
         acc_load = tir.BufferLoad(store.buffer, list(store.indices))
-        dtype = str(store.value.dtype) if hasattr(store.value, "dtype") else str(
-            store.buffer.dtype
-        )
+        dtype = str(store.value.dtype) if hasattr(store.value, "dtype") else str(store.buffer.dtype)
         reduced = _build_butterfly(acc_load, op_name, extent_val, dtype)
         new_store = tir.BufferStore(store.buffer, reduced, list(store.indices), self._span(store))
         self.replaced += 1
@@ -670,7 +705,11 @@ def rewrite_reductions(func: tir.PrimFunc) -> tuple[tir.PrimFunc, int, int]:
     if rw.replaced == 0:
         return func, 0, 0
     new_func = tir.PrimFunc(
-        func.params, new_body, func.ret_type, func.buffer_map, func.attrs,
+        func.params,
+        new_body,
+        func.ret_type,
+        func.buffer_map,
+        func.attrs,
         getattr(func, "span", None),
     )
     return new_func, rw.replaced, rw.stages_emitted
@@ -691,7 +730,11 @@ def rewrite_reductions_to_thread_allreduce(
     if rw.replaced == 0:
         return func, 0
     new_func = tir.PrimFunc(
-        func.params, new_body, func.ret_type, func.buffer_map, func.attrs,
+        func.params,
+        new_body,
+        func.ret_type,
+        func.buffer_map,
+        func.attrs,
         getattr(func, "span", None),
     )
     return new_func, rw.replaced
@@ -731,10 +774,12 @@ def count_thread_allreduce_calls(func: tir.PrimFunc) -> int:
 # Pass entry
 # ---------------------------------------------------------------------------
 
+
 def _metal_simd_lift(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.PrimFunc:
     enabled = False
     try:
         from tvm import transform as tvm_transform
+
         cfg = tvm_transform.PassContext.current().config
         val = cfg.get(PASS_CONFIG_KEY, None) if cfg is not None else None
         if val is not None:
@@ -756,34 +801,21 @@ def _metal_simd_lift(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.PrimFunc:
 
     candidates = _walk_reductions(func.body)
     func_name = ""
-    try:
+    with contextlib.suppress(Exception):
         func_name = str(func.attrs.get("global_symbol", ""))
-    except Exception:
-        pass
     _log_candidates(func_name, candidates)
 
     # Stash candidate metadata.
     if candidates:
-        diagnostics = [
-            diagnostic for c in candidates
-            if (diagnostic := _candidate_rewrite_diagnostic(c)) is not None
-        ]
+        diagnostics = [diagnostic for c in candidates if (diagnostic := _candidate_rewrite_diagnostic(c)) is not None]
         new_attrs = dict(func.attrs) if func.attrs is not None else {}
         new_attrs["tl.simd_lift_candidates"] = tir.StringImm(
-            ";".join(
-                f"{c.loop_var}:{c.extent_repr}:{c.op}:proved={c.proved}:"
-                f"annotated={c.annotated}"
-                for c in candidates
-            )
+            ";".join(f"{c.loop_var}:{c.extent_repr}:{c.op}:proved={c.proved}:annotated={c.annotated}" for c in candidates)
         )
         if diagnostics:
-            new_attrs["tl.reduction_rewrite_diagnostics"] = tir.StringImm(
-                _serialize_rewrite_diagnostics(diagnostics)
-            )
-        try:
+            new_attrs["tl.reduction_rewrite_diagnostics"] = tir.StringImm(_serialize_rewrite_diagnostics(diagnostics))
+        with contextlib.suppress(Exception):
             func = func.with_attrs(new_attrs)
-        except Exception:
-            pass
 
     # Conservative semantic rewrite: only fires on annotated, proved add
     # reductions where the accumulator contribution can be extracted.
@@ -792,7 +824,8 @@ def _metal_simd_lift(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.PrimFunc:
         if n_semantic:
             logger.warning(
                 "semantic-reduction-rewrite: func=%s replaced=%d",
-                func_name, n_semantic,
+                func_name,
+                n_semantic,
             )
             try:
                 if func.attrs is not None:
@@ -815,7 +848,9 @@ def _metal_simd_lift(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.PrimFunc:
         if n_replaced:
             logger.warning(
                 "simd-lift-rewrite: func=%s replaced=%d butterfly_stages=%d",
-                func_name, n_replaced, n_stages,
+                func_name,
+                n_replaced,
+                n_stages,
             )
             # Preserve previously stashed attrs through the rewrite.
             try:
@@ -828,9 +863,7 @@ def _metal_simd_lift(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.PrimFunc:
     return func
 
 
-MetalSimdLiftReductions = prim_func_pass(
-    _metal_simd_lift, opt_level=0, name="tl.MetalSimdLiftReductions"
-)
+MetalSimdLiftReductions = prim_func_pass(_metal_simd_lift, opt_level=0, name="tl.MetalSimdLiftReductions")
 
 
 def detect_candidates(func: tir.PrimFunc) -> list[_ReductionCandidate]:

@@ -102,11 +102,7 @@ class DefaultPolicy:
         if not is_metal_arch(self.arch) or len(self.ordered_nodes) != 1:
             return False
         node = self.ordered_nodes[0]
-        if (
-            node.reduction_block is None
-            or len(node.get_space_dim()) != 1
-            or len(node.raxis) != 1
-        ):
+        if node.reduction_block is None or len(node.get_space_dim()) != 1 or len(node.raxis) != 1:
             return False
 
         axis = node.raxis[0]

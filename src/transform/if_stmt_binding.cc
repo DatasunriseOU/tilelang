@@ -44,7 +44,7 @@ private:
         auto stmt = body.value();
         if (auto seq_stmt = stmt.as<SeqStmtNode>()) {
           Array<Stmt> seq_;
-          for (const auto& s : seq_stmt->seq) {
+          for (const auto &s : seq_stmt->seq) {
             seq_.push_back(IfThenElse(condition, s, Stmt()));
           }
           return SeqStmt(std::move(seq_));
@@ -66,7 +66,7 @@ private:
 
   Stmt VisitStmt_(const SeqStmtNode *op) final {
     Array<Stmt> seq;
-    for (const auto& stmt : op->seq) {
+    for (const auto &stmt : op->seq) {
       seq.push_back(VisitStmt(stmt));
     }
     return SeqStmt(std::move(seq));

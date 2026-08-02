@@ -250,7 +250,7 @@ they are non-blocking. Each entry is a separate follow-up.
    Root cause turned out to be two-fold and was diagnosed by inspecting
    the lowered TIR + the emitted descriptor source:
 
-   * **Launcher bug**: `path_c_fusion_launcher.py::Mamba3Fp8TrainBlockLauncher.real_abi_inputs`
+   - **Launcher bug**: `path_c_fusion_launcher.py::Mamba3Fp8TrainBlockLauncher.real_abi_inputs`
      only exposed `contract.declared_required_real_abi_inputs`
      (trainable weights). The fused PrimFunc also needs the forward
      activation seed `hidden` and the three recurrent state carriers
@@ -258,7 +258,7 @@ they are non-blocking. Each entry is a separate follow-up.
      kernel reads zeros from the bank and every downstream activation
      resolves to zero too. The fix expands `real_abi_inputs` to
      include the forward-state seeds, ordered after the weights.
-   * **Dead-store elimination on the residual output**:
+   - **Dead-store elimination on the residual output**:
      `_append_row_phased_residual_rmsnorm_body` emitted the first
      output (bare residual sum, e.g. `hidden_after_m2rnn`) BEFORE the
      normalized output. TileLang's downstream lowering then dropped

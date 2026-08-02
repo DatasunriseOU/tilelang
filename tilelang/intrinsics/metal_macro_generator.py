@@ -107,10 +107,7 @@ class MPSIntrinEmitter:
             return buffer[prefix_offsets[0], row_idx, col_idx]
         if prefix_rank == 2:
             return buffer[prefix_offsets[0], prefix_offsets[1], row_idx, col_idx]
-        raise ValueError(
-            "Metal GEMM supports at most two leading staged/shared buffer "
-            f"dimensions, got {prefix_rank}"
-        )
+        raise ValueError(f"Metal GEMM supports at most two leading staged/shared buffer dimensions, got {prefix_rank}")
 
     def ldmatrix_a(self, A_local_buf, A_shared_buf: Buffer | BufferRegion, ki, k_inner: int = 0):
         warp_rows = self.warp_rows
@@ -218,14 +215,16 @@ class MPSIntrinEmitter:
 
         return _warp_ldmatrix_b(B_local_buf, buffer, offset_k, offset_n, stride, warp_n, ki)
 
-    def mma(self,
-            A_local_buf,
-            B_local_buf,
-            C_local_buf,
-            k_inner: int = 0,
-            A_shared_buf: Buffer | BufferRegion | None = None,
-            B_shared_buf: Buffer | BufferRegion | None = None,
-            ki: int = 0):
+    def mma(
+        self,
+        A_local_buf,
+        B_local_buf,
+        C_local_buf,
+        k_inner: int = 0,
+        A_shared_buf: Buffer | BufferRegion | None = None,
+        B_shared_buf: Buffer | BufferRegion | None = None,
+        ki: int = 0,
+    ):
         warp_rows = self.warp_rows
         warp_cols = self.warp_cols
         micro_size_x = self.micro_size_x
@@ -242,8 +241,8 @@ class MPSIntrinEmitter:
             # used.  This makes the matmul fully self-contained (no fragile
             # cross-call recording across renamed loop variables).
             assert A_shared_buf is not None and B_shared_buf is not None, (
-                "cooperative_tensor mma requires A/B shared regions to derive "
-                "the native source views")
+                "cooperative_tensor mma requires A/B shared regions to derive the native source views"
+            )
             warp_m, warp_n = self._get_warp_indices()
             a_buffer, a_prefix, a_off_m, a_off_k, a_stride = self._parse_buffer_2d(A_shared_buf)
             if self.a_stride_override is not None:
@@ -342,8 +341,7 @@ class MPSIntrinEmitter:
                     ct_op(
                         C_simd_buf.data,
                         i * warp_cols + j,
-                        T.access_ptr(self._access_2d(buffer, prefix_offsets, row, col),
-                                     access_mode),
+                        T.access_ptr(self._access_2d(buffer, prefix_offsets, row, col), access_mode),
                         stride,
                         micro_size_x,
                         micro_size_y,
@@ -366,8 +364,7 @@ class MPSIntrinEmitter:
                 simd_op(
                     C_simd_buf.data,
                     index_c,
-                    T.access_ptr(self._access_2d(buffer, prefix_offsets, row, col),
-                                 access_mode),
+                    T.access_ptr(self._access_2d(buffer, prefix_offsets, row, col), access_mode),
                     stride,
                     micro_size_x,
                     micro_size_y,
@@ -395,8 +392,7 @@ class MPSIntrinEmitter:
             mma_i = i % self.micro_size_x
             mma_j = j % self.micro_size_y
             lane_id, _ = inverse_index_map.map_indices([mma_i, mma_j])
-            return (warp_m * (self.block_col_warps * self.WARP_SIZE) +
-                    warp_n * self.WARP_SIZE + lane_id)
+            return warp_m * (self.block_col_warps * self.WARP_SIZE) + warp_n * self.WARP_SIZE + lane_id
 
         def forward_index(i: int, j: int) -> int:
             warp_i = (i // self.micro_size_x) % self.warp_rows
@@ -406,8 +402,7 @@ class MPSIntrinEmitter:
             _, local_id = inverse_index_map.map_indices([mma_i, mma_j])
             return warp_i * (self.warp_cols * 16) + warp_j * 16 + local_id
 
-        return T.Fragment(
-            shape, forward_thread_fn=forward_thread, forward_index_fn=forward_index)
+        return T.Fragment(shape, forward_thread_fn=forward_thread, forward_index_fn=forward_index)
 
     def simd_store(self, C_simd_buf, C_dst):
         return self.simdgroup_copy(C_simd_buf, C_dst, is_store=True)

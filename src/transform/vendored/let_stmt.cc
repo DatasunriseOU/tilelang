@@ -63,13 +63,12 @@ LetStmt::LetStmt(Var var, PrimExpr value, Stmt body, Span span) {
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def(
-      "tilelang.LetStmt",
-      [](Var var, PrimExpr value, Stmt body, Span span) {
-        return LetStmt(std::move(var), std::move(value), std::move(body),
-                       std::move(span));
-      });
+  refl::GlobalDef().def("tilelang.LetStmt",
+                        [](Var var, PrimExpr value, Stmt body, Span span) {
+                          return LetStmt(std::move(var), std::move(value),
+                                         std::move(body), std::move(span));
+                        });
 }
 
-}  // namespace tl_tir
-}  // namespace tilelang
+} // namespace tl_tir
+} // namespace tilelang

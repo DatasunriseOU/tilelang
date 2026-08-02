@@ -9,12 +9,19 @@ multiply-accumulate loop.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
 import tilelang
-from tilelang import tvm
 from tvm.target import Target
 import tilelang.language as T
+
+if TYPE_CHECKING:
+    # Runtime values are injected by each factory immediately before the
+    # decorated TileLang function is constructed.
+    _M = _N = _K = _BM = _BN = _BK = _SA = _SB = 0
+    _A_DTYPE = _B_DTYPE = ""
 
 
 def _make_kernel(
@@ -31,9 +38,16 @@ def _make_kernel(
 ):
     g = globals()
     g.update(
-        _M=M, _N=N, _K=K, _BM=BM, _BN=BN, _BK=BK,
-        _SA=a_scale_size, _SB=b_scale_size,
-        _A_DTYPE=a_dtype, _B_DTYPE=b_dtype,
+        _M=M,
+        _N=N,
+        _K=K,
+        _BM=BM,
+        _BN=BN,
+        _BK=BK,
+        _SA=a_scale_size,
+        _SB=b_scale_size,
+        _A_DTYPE=a_dtype,
+        _B_DTYPE=b_dtype,
     )
 
     @T.prim_func
@@ -72,10 +86,8 @@ def test_macro_expands_to_scalar_kloop_metal():
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
 
     # Audiohacking markers: per-element FP8 dequant + scale * scale.
-    assert "__tvm_fp8_e4m3_to_half" in src, (
-        "expected per-element FP8 dequantization in lowered IR"
-    )
-    body = src[src.find("kernel void"):]
+    assert "__tvm_fp8_e4m3_to_half" in src, "expected per-element FP8 dequantization in lowered IR"
+    body = src[src.find("kernel void") :]
     assert "C_local" in body
     # The scale multiplications survive lowering — even in the per-tensor
     # case where the compiler could hoist them out, the generated MSL
@@ -88,7 +100,7 @@ def test_per_tensor_scale_lowering_shape():
     fn = _make_kernel(a_scale_size=1, b_scale_size=1)
     artifact = tilelang.lower(fn, target=Target("metal"))
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
     assert "A_scale[0]" in body
     assert "B_scale[0]" in body
 
@@ -98,7 +110,7 @@ def test_per_row_scale_lowering_shape():
     fn = _make_kernel(a_scale_size=32, b_scale_size=1)
     artifact = tilelang.lower(fn, target=Target("metal"))
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
     # Row-indexed: per-row sa scale uses an iteration variable as index.
     # We can't predict the variable name (depends on optimizer choices)
     # but it's not the constant-0 form.
@@ -111,7 +123,7 @@ def test_e5m2_lowering_uses_e5m2_helper():
     fn = _make_kernel(a_dtype="float8_e5m2", b_dtype="float8_e5m2")
     artifact = tilelang.lower(fn, target=Target("metal"))
     src = artifact.kernel_source if hasattr(artifact, "kernel_source") else str(artifact)
-    body = src[src.find("kernel void"):]
+    body = src[src.find("kernel void") :]
     assert "__tvm_fp8_e5m2_to_half(A_shared" in body
     assert "__tvm_fp8_e5m2_to_half(B_shared" in body
 

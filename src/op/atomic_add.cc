@@ -73,7 +73,8 @@ void RegisterAtomicAddImpl(AtomicAddImpl impl) {
  * - The constructor checks that args[0] and args[1] are region-compatible.
  * - The constructed node is stored in this->data_.
  */
-AtomicAdd::AtomicAdd(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {
+AtomicAdd::AtomicAdd(Array<PrimExpr> args,
+                     Map<String, ffi::ObjectRef> annotations) {
   ICHECK(args.size() >= 2)
       << "AtomicAdd expects at least 2 arguments (src, dst), got "
       << args.size();

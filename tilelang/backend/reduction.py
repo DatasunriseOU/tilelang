@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 from tvm.target import Target
 
@@ -26,12 +27,8 @@ class ReductionLowererEntry:
     external_materialization_required: bool
     notes: str = ""
 
-    def matches(self, key: "ReductionLowererKey") -> bool:
-        return (
-            key.target_kind in self.target_kinds
-            and key.strategy in self.strategies
-            and (_ANY_OP in self.ops or key.op in self.ops)
-        )
+    def matches(self, key: ReductionLowererKey) -> bool:
+        return key.target_kind in self.target_kinds and key.strategy in self.strategies and (_ANY_OP in self.ops or key.op in self.ops)
 
 
 @dataclass(frozen=True)
@@ -162,16 +159,11 @@ def _select_reduction_lowerer_cached(
 ) -> ReductionLowererSelection:
     matches = [entry for entry in _REDUCTION_LOWERERS if entry.matches(key)]
     if not matches:
-        raise ValueError(
-            "No reduction lowerer registered for "
-            f"target={key.target_kind!r}, op={key.op!r}, strategy={key.strategy!r}"
-        )
+        raise ValueError(f"No reduction lowerer registered for target={key.target_kind!r}, op={key.op!r}, strategy={key.strategy!r}")
     if len(matches) > 1:
         names = ", ".join(entry.name for entry in matches)
         raise ValueError(
-            "Multiple reduction lowerers matched "
-            f"target={key.target_kind!r}, op={key.op!r}, "
-            f"strategy={key.strategy!r}: {names}"
+            f"Multiple reduction lowerers matched target={key.target_kind!r}, op={key.op!r}, strategy={key.strategy!r}: {names}"
         )
     entry = matches[0]
     return ReductionLowererSelection(
@@ -234,10 +226,7 @@ def resolve_reduction_lowerer(
         except ValueError as exc:
             errors.append(str(exc))
     detail = "; ".join(errors)
-    raise ValueError(
-        f"No reduction lowerer resolved for target={_target_kind(target)!r}, "
-        f"op={op!r}, candidates={strategies!r}. {detail}"
-    )
+    raise ValueError(f"No reduction lowerer resolved for target={_target_kind(target)!r}, op={op!r}, candidates={strategies!r}. {detail}")
 
 
 def reduction_lowerer_cache_info():

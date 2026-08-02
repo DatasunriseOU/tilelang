@@ -118,15 +118,18 @@ def test_existing_fa_v3_tma_fallback_triggers_metal_simdgroup_guard():
 
     assert func.attrs["global_symbol"] == "fa_v3_tma_fallback"
     assert "tl.tileop.gemm" in op_names
-    assert not {
-        "tl.shfl_sync",
-        "tl.shfl_down_sync",
-        "tl.shfl_up_sync",
-        "tl.shfl_xor_sync",
-        "tir.tvm_warp_shuffle",
-        "tir.tvm_warp_shuffle_up",
-        "tir.tvm_warp_shuffle_down",
-    } & op_names
+    assert (
+        not {
+            "tl.shfl_sync",
+            "tl.shfl_down_sync",
+            "tl.shfl_up_sync",
+            "tl.shfl_xor_sync",
+            "tir.tvm_warp_shuffle",
+            "tir.tvm_warp_shuffle_up",
+            "tir.tvm_warp_shuffle_down",
+        }
+        & op_names
+    )
 
     mod = tvm.IRModule({"main": func})
     with pytest.raises(

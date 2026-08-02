@@ -251,8 +251,7 @@ def build_reduction_cost_estimates(
     """Build static cost estimates for all semantic reductions in a PrimFunc."""
 
     return tuple(
-        estimate_reduction_cost(plan, source=f"reduction:{idx}:{plan.op}")
-        for idx, plan in enumerate(extract_reduction_plans(func))
+        estimate_reduction_cost(plan, source=f"reduction:{idx}:{plan.op}") for idx, plan in enumerate(extract_reduction_plans(func))
     )
 
 
@@ -275,9 +274,7 @@ def attach_reduction_cost_metadata(func: tir.PrimFunc) -> tir.PrimFunc:
     if not estimates:
         return func
     attrs = dict(func.attrs) if func.attrs is not None else {}
-    attrs["tl.reduction_costs"] = tir.StringImm(
-        serialize_reduction_cost_estimates(estimates)
-    )
+    attrs["tl.reduction_costs"] = tir.StringImm(serialize_reduction_cost_estimates(estimates))
     return func.with_attrs(attrs)
 
 

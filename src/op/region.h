@@ -82,8 +82,8 @@ public:
    * - args[2 + i]: Extent of axis i (supports dynamic PrimExpr).
    */
   TVM_DLL
-  RegionOp(Array<PrimExpr> args,
-           Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
+  RegionOp(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations =
+                                     Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 

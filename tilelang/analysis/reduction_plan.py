@@ -388,9 +388,7 @@ def _region_load(call: tir.Call) -> tir.BufferLoad | None:
 def _region_extent(call: tir.Call, dim: int) -> int | None:
     rank = len(call.args) - 2
     if dim < 0 or dim >= rank:
-        raise ReductionPlanError(
-            f"malformed tl.tileop.reduce axis dim={dim} for tl.tileop.region rank={rank}"
-        )
+        raise ReductionPlanError(f"malformed tl.tileop.reduce axis dim={dim} for tl.tileop.region rank={rank}")
     extent_index = 2 + dim
     if extent_index >= len(call.args):
         return None

@@ -56,10 +56,13 @@ void LogMessageImpl(const std::string &file, int lineno, int level,
 [[noreturn]] void LogFatalImpl(const std::string &file, int lineno,
                                const std::string &message) {
   LogMessageImpl(file, lineno, TVM_LOG_LEVEL_FATAL, message);
-  // CPPMEGA: apache/tvm latest replaces InternalError class with TVM_FFI_THROW macro
-  ::tvm::ffi::details::ErrorBuilder("InternalError",
+  // CPPMEGA: apache/tvm latest replaces InternalError class with TVM_FFI_THROW
+  // macro
+  ::tvm::ffi::details::ErrorBuilder(
+      "InternalError",
       ::tvm::ffi::Backtrace(file.c_str(), lineno, "LogFatalImpl", 0), false)
-      .GetMessage() << message;
+          .GetMessage()
+      << message;
   std::abort();
 }
 

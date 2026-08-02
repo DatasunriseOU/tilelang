@@ -71,7 +71,8 @@ public:
   void VisitExpr_(const MaxNode *op, std::ostream &os) final; // NOLINT(*)
 
   void VisitStmt_(const AssertStmtNode *op) final; // NOLINT(*)
-  void VisitStmt_(const AllocBufferNode *op) final;   // NOLINT(*)  // CPPMEGA: was AllocateNode
+  void VisitStmt_(const AllocBufferNode *op)
+      final; // NOLINT(*)  // CPPMEGA: was AllocateNode
 
   void GenerateForwardFunctionDeclarations(ffi::String global_symbol,
                                            const ffi::Array<Type> &arg_types,

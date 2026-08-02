@@ -5,11 +5,11 @@
  */
 #include "../op/builtin.h"
 #include "../target/utils.h"
-#include "vendored/let_stmt.h"
 #include "tvm/ir/type.h"
 #include "tvm/tirx/builtin.h"
 #include "tvm/tirx/expr.h"
 #include "tvm/tirx/stmt.h"
+#include "vendored/let_stmt.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/analysis.h>
@@ -135,10 +135,10 @@ private:
     }
 
     // Record the mapping from buffer data var to buffer for later lookup
-    for (const auto& buffer : alloc_buffers) {
+    for (const auto &buffer : alloc_buffers) {
       buffer_map_.insert({buffer->data, buffer});
     }
-    for (const auto& match_buffer : op->match_buffers) {
+    for (const auto &match_buffer : op->match_buffers) {
       buffer_map_.insert({match_buffer->buffer->data, match_buffer->buffer});
     }
 
@@ -162,7 +162,7 @@ private:
 
     auto [fallthrough_deallocs, _] = CollectFallthroughDeallocs(op->body);
 
-    for (const auto& buffer : tmem_buffers) {
+    for (const auto &buffer : tmem_buffers) {
       buffer_data_to_buffer_.Set(buffer->data, buffer);
     }
 
@@ -184,7 +184,7 @@ private:
     */
     // 1. create new data vars
     Array<Var> new_data_vars;
-    for (const auto& buffer : tmem_buffers) {
+    for (const auto &buffer : tmem_buffers) {
       auto data = buffer->data;
       if (var_remap_.count(data))
         continue;
@@ -196,7 +196,7 @@ private:
 
     // 2. create new buffers
     Array<Buffer> new_buffers;
-    for (const auto& buffer : tmem_buffers) {
+    for (const auto &buffer : tmem_buffers) {
       auto data = buffer->data;
       ICHECK(var_remap_.find(data) != var_remap_.end())
           << "data not found in var_remap_";
@@ -239,7 +239,7 @@ private:
     // 3. create init & dealloc calls for new buffers
     std::vector<Stmt> init_mtmem_calls_;
     std::vector<Stmt> dealloc_tmem_calls_;
-    for (const auto& buffer : tmem_buffers) {
+    for (const auto &buffer : tmem_buffers) {
       auto data = buffer->data;
       auto old_buffer = buffer_data_to_buffer_.at(data);
       auto new_buffer = buffer_remap_.at(old_buffer);
@@ -445,7 +445,8 @@ private:
   std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> buffer_map_;
   std::unordered_map<Var, int, ObjectPtrHash, ObjectPtrEqual>
       tmem_num_cols_allocated_;
-  std::unordered_map<Var, Map<String, ffi::ObjectRef>, ObjectPtrHash, ObjectPtrEqual>
+  std::unordered_map<Var, Map<String, ffi::ObjectRef>, ObjectPtrHash,
+                     ObjectPtrEqual>
       tmem_call_annotations_;
   Map<Buffer, Layout> layout_map_;
 };

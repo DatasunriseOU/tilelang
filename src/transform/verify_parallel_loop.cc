@@ -1,7 +1,6 @@
 #include "../op/utils.h"
 #include "common/constr_visitor.h"
 #include "layout_reducer.h"
-#include "vendored/z3_prover_stub.h"
 #include "tvm/arith/analyzer.h"
 #include "tvm/ffi/base_details.h"
 #include "tvm/ffi/object.h"
@@ -9,6 +8,7 @@
 #include "tvm/tirx/op.h"
 #include "tvm/tirx/stmt.h"
 #include "tvm/tirx/var.h"
+#include "vendored/z3_prover_stub.h"
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>

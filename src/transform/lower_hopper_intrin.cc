@@ -120,7 +120,8 @@ public:
 
   Stmt VisitStmt_(const AllocateNode *op) {
     Stmt mutated_body = this->VisitStmt(op->body);
-    Allocate stmt(op->buffer_var, op->dtype, op->extents, op->condition, mutated_body, op->annotations);
+    Allocate stmt(op->buffer_var, op->dtype, op->extents, op->condition,
+                  mutated_body, op->annotations);
     Array<Stmt> init_stmts;
     for (auto &desc_init : desc_inits_) {
       if (!desc_init.emitted && desc_init.base_var == op->buffer_var.get()) {

@@ -23,6 +23,7 @@ The test goal:
 This is the structural floor for the RFC §7 Phase 4.2 contract, not the
 final single-kernel fusion acceptance test.
 """
+
 from __future__ import annotations
 
 import importlib

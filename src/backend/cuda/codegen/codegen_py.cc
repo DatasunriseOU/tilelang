@@ -476,8 +476,10 @@ void CodeGenTileLangPY::VisitStmt_(const DeclBufferNode *op) {
   // apache/tvm-latest stripped `body` from DeclBufferNode (it is now a leaf
   // stmt; the surrounding SeqStmt carries what was previously the body).
   // Nothing to emit here — Python source for the body follows in the SeqStmt.
-  if (op == nullptr) return;
-  if (!op->buffer.defined()) return;  // apache stripped semantics — skip
+  if (op == nullptr)
+    return;
+  if (!op->buffer.defined())
+    return; // apache stripped semantics — skip
 }
 
 void CodeGenTileLangPY::VisitStmt_(const LetStmtNode *op) {

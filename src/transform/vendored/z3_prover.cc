@@ -26,10 +26,10 @@
 #include "z3_prover.h"
 
 #include <tvm/arith/analyzer.h>
-#include <tvm/ir/transform.h>
-#include <tvm/ir/expr.h>
 #include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/ffi/extra/structural_hash.h>
+#include <tvm/ir/expr.h>
+#include <tvm/ir/transform.h>
 #include <tvm/runtime/data_type.h>
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>
@@ -74,8 +74,8 @@ using ::tvm::runtime::DataType;
 using ::tvm::tirx::AddNode;
 using ::tvm::tirx::AndNode;
 using ::tvm::tirx::BufferLoadNode;
-using ::tvm::tirx::CallNode;
 using ::tvm::tirx::CallEffectKind;
+using ::tvm::tirx::CallNode;
 using ::tvm::tirx::CastNode;
 using ::tvm::tirx::DivNode;
 using ::tvm::tirx::EQNode;
@@ -107,7 +107,7 @@ namespace tirx_op = ::tvm::tirx;
 
 struct Namespace {
   std::unordered_set<std::string> used_names;
-  std::string GetNewName(const PrimExpr& expr) {
+  std::string GetNewName(const PrimExpr &expr) {
     std::stringstream ss;
     ss << expr;
     auto name = ss.str();
@@ -126,21 +126,22 @@ struct Namespace {
   }
 };
 
-}  // namespace
+} // namespace
 
-class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
- public:
-  using Base = ExprFunctor<z3::expr(const PrimExpr&)>;
+class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr &)> {
+public:
+  using Base = ExprFunctor<z3::expr(const PrimExpr &)>;
 
-  ::tvm::arith::Analyzer* analyzer;
+  ::tvm::arith::Analyzer *analyzer;
 
   // Z3 context shared per-thread (Z3 init is slow on some CPUs).
   inline static thread_local std::shared_ptr<::z3::context> ctx{
       new ::z3::context()};
 
   ::z3::solver solver{*ctx};
-  std::unordered_map<PrimExpr, ::z3::expr,
-                     ::tvm::ffi::StructuralHash, ExprDeepEqual> memo_;
+  std::unordered_map<PrimExpr, ::z3::expr, ::tvm::ffi::StructuralHash,
+                     ExprDeepEqual>
+      memo_;
   bool is_assume = false;
   Namespace ns;
   unsigned timeout_ms{UINT_MAX};
@@ -158,10 +159,11 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
   // ctx->int_*; in BV mode they produce sized bv_const / bv_val with the
   // current width, and bv_sort for the sort.
   ::z3::sort MakeIntSort() {
-    if (bv_width_ > 0) return ctx->bv_sort(static_cast<unsigned>(bv_width_));
+    if (bv_width_ > 0)
+      return ctx->bv_sort(static_cast<unsigned>(bv_width_));
     return ctx->int_sort();
   }
-  ::z3::expr MakeIntConst(const std::string& name) {
+  ::z3::expr MakeIntConst(const std::string &name) {
     if (bv_width_ > 0) {
       return ctx->bv_const(name.c_str(), static_cast<unsigned>(bv_width_));
     }
@@ -207,20 +209,20 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     return ctx->int_val(value);
   }
 
-  static ::z3::solver CreateSolver(::z3::context& ctx) {
+  static ::z3::solver CreateSolver(::z3::context &ctx) {
     ::z3::solver solver(ctx);
     solver.set("model", false);
     solver.set("random_seed", (unsigned)42);
     return solver;
   }
 
-  explicit Z3ProverImpl(::tvm::arith::Analyzer* parent) : analyzer(parent) {
+  explicit Z3ProverImpl(::tvm::arith::Analyzer *parent) : analyzer(parent) {
     scope_stack_.push_back({});
     solver = CreateSolver(*ctx);
     SetRLimit(static_cast<unsigned>(1e4));
   }
 
-  ::z3::expr Create(const PrimExprNode* op) {
+  ::z3::expr Create(const PrimExprNode *op) {
     auto ref = GetRef<PrimExpr>(op);
     auto dtype = op->dtype;
     std::string name = ns.GetNewName(ref);
@@ -238,8 +240,7 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
       } else {
         auto min_val = Downcast<IntImm>(::tvm::min_value(dtype))->value;
         auto max_val = Downcast<IntImm>(::tvm::max_value(dtype))->value;
-        solver.add(ctx->int_val(min_val) <= e &&
-                   e <= ctx->int_val(max_val));
+        solver.add(ctx->int_val(min_val) <= e && e <= ctx->int_val(max_val));
       }
       return e;
     }
@@ -260,7 +261,7 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
 
   std::vector<std::vector<Scope>> scope_stack_;
 
-  std::function<void()> EnterConstraint(const PrimExpr& constraint,
+  std::function<void()> EnterConstraint(const PrimExpr &constraint,
                                         bool is_assume_in = false) {
     scope_stack_.push_back({});
     scope_stack_.back().push_back(Scope{Scope::Constraint, Var(), PrimExpr(),
@@ -285,8 +286,8 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     // We move out of the member to avoid an extra copy, then explicitly
     // copy into the lambda capture (the `=` form spells it out).
     std::vector<PrimExpr> side_effect_exprs = std::move(side_effect_exprs_);
-    side_effect_exprs_.clear();  // moved-from is valid-but-unspecified;
-                                 // make the member explicitly empty.
+    side_effect_exprs_.clear(); // moved-from is valid-but-unspecified;
+                                // make the member explicitly empty.
     if (is_assume_in) {
       // Capture-by-value (explicit): `side_effect_exprs` is copied into
       // the lambda. The original local will go out of scope at the end
@@ -294,7 +295,7 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
       // recovery fires.
       return [this, side_effect_exprs = std::move(side_effect_exprs)]() {
         solver.pop();
-        for (const auto& expr : side_effect_exprs) {
+        for (const auto &expr : side_effect_exprs) {
           memo_.erase(expr);
         }
         scope_stack_.pop_back();
@@ -306,7 +307,7 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
       // pre-fix behavior and keeps the constraint scope's solver state
       // tight (we don't carry the side_effect set forward into the
       // recovery closure).
-      for (const auto& expr : side_effect_exprs) {
+      for (const auto &expr : side_effect_exprs) {
         memo_.erase(expr);
       }
       return [this]() {
@@ -316,14 +317,17 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     }
   }
 
-  bool CheckTrivilBadCases(const PrimExpr& expr) {
+  bool CheckTrivilBadCases(const PrimExpr &expr) {
     if (IsFreeNode(expr)) {
       return true;
     }
-    auto checkTrivilCmp = [this](const PrimExpr& lhs, const PrimExpr& rhs) {
-      if (IsFreeNode(lhs) && rhs->IsInstance<IntImmNode>()) return true;
-      if (IsFreeNode(rhs) && lhs->IsInstance<IntImmNode>()) return true;
-      if (IsFreeNode(lhs) && IsFreeNode(rhs)) return true;
+    auto checkTrivilCmp = [this](const PrimExpr &lhs, const PrimExpr &rhs) {
+      if (IsFreeNode(lhs) && rhs->IsInstance<IntImmNode>())
+        return true;
+      if (IsFreeNode(rhs) && lhs->IsInstance<IntImmNode>())
+        return true;
+      if (IsFreeNode(lhs) && IsFreeNode(rhs))
+        return true;
       if (auto cast = lhs.as<CastNode>()) {
         if (IsFreeNode(cast->value) && rhs->IsInstance<IntImmNode>())
           return true;
@@ -342,16 +346,18 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     return false;
   }
 
-  bool CanProve(const PrimExpr& expr) {
-    if (CheckTrivilBadCases(expr)) return false;
-    if (!IsValidDType(expr->dtype)) return false;
+  bool CanProve(const PrimExpr &expr) {
+    if (CheckTrivilBadCases(expr))
+      return false;
+    if (!IsValidDType(expr->dtype))
+      return false;
     try {
       ::z3::expr_vector constr(*ctx);
       constr.push_back(!ConvertBool(expr));
       auto result = solver.check(constr);
       constr.pop_back();
       return result == ::z3::unsat;
-    } catch (const std::exception& e) {
+    } catch (const std::exception &e) {
       LOG(WARNING) << "Z3 query exception: " << e.what();
       return false;
     } catch (...) {
@@ -360,14 +366,16 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     }
   }
 
-  void Bind(const Var& var, const PrimExpr& value, bool /*allow_override*/) {
-    if (!IsValidDType(var->dtype)) return;
+  void Bind(const Var &var, const PrimExpr &value, bool /*allow_override*/) {
+    if (!IsValidDType(var->dtype))
+      return;
     scope_stack_.back().push_back(Scope{Scope::BindValue, var, value});
     memo_.emplace(var, ConvertInt(value));
   }
 
-  void Bind(const Var& var, const Range& range, bool /*allow_override*/) {
-    if (!IsValidDType(var->dtype)) return;
+  void Bind(const Var &var, const Range &range, bool /*allow_override*/) {
+    if (!IsValidDType(var->dtype))
+      return;
     scope_stack_.back().push_back(
         Scope{Scope::BindRange, var, PrimExpr(), range->min, range->extent});
     // CPPMEGA fix-A3: defer memoization until after the BV-range check.
@@ -396,13 +404,14 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
         if (bv_width_ > 0 && bv_width_ < 64) {
           int64_t lo = (bv_width_ == 32) ? static_cast<int64_t>(INT32_MIN)
                                          : -(int64_t{1} << (bv_width_ - 1));
-          int64_t hi = (bv_width_ == 32) ? static_cast<int64_t>(INT32_MAX)
-                                         : ((int64_t{1} << (bv_width_ - 1)) - 1);
+          int64_t hi = (bv_width_ == 32)
+                           ? static_cast<int64_t>(INT32_MAX)
+                           : ((int64_t{1} << (bv_width_ - 1)) - 1);
           if (min_value < lo || max_value > hi) {
             if (!bv_range_warned_) {
               LOG(WARNING) << "Z3Prover BV" << bv_width_
-                           << ": dropping out-of-range bind " << var
-                           << " in [" << min_value << ", " << max_value
+                           << ": dropping out-of-range bind " << var << " in ["
+                           << min_value << ", " << max_value
                            << ") (signed BV range [" << lo << ", " << hi
                            << "]). Subsequent CanProve over this var will"
                            << " fail closed. (further occurrences suppressed)";
@@ -425,7 +434,7 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
         memo_.emplace(var, var_expr);
         solver.add(MakeIntVal(min_value) <= var_expr);
         solver.add(var_expr < MakeIntVal(max_value));
-        commit_memo = false;  // already committed
+        commit_memo = false; // already committed
       } else {
         // CPPMEGA fix-round-2 (HIGH correctness): empty range (min >= max)
         // is logically UNSAT for any valuation of `var`. Previously we
@@ -442,13 +451,13 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
       }
     } else {
       memo_.emplace(var, var_expr);
-      solver.add(ConvertBool(range->extent <= 0 ||
-                             (range->min <= var &&
-                              var < range->min + range->extent)));
+      solver.add(
+          ConvertBool(range->extent <= 0 ||
+                      (range->min <= var && var < range->min + range->extent)));
       commit_memo = false;
     }
-    (void)commit_memo;  // explicit: every code path that exits this
-                        // function has either committed memo or returned.
+    (void)commit_memo; // explicit: every code path that exits this
+                       // function has either committed memo or returned.
   }
 
   void SetTimeoutMs(unsigned timeout_ms_in) {
@@ -487,7 +496,8 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     // was traced to passes calling `SetBitVectorMode(32)` redundantly
     // on every CanProve. The condition also covers width=0 → width=0
     // (Int → Int) which previously rebuilt unnecessarily.
-    if (width == bv_width_) return;
+    if (width == bv_width_)
+      return;
     // CPPMEGA fix-round-2 (HIGH correctness): a mode change rebuilds the
     // solver, which clears `scope_stack_` and re-pushes a fresh root
     // frame. If we did this while inside an active `EnterConstraint`
@@ -522,27 +532,27 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     return ss.str();
   }
 
-  void AddScopeDebugMsg(std::ostream& ss) {
-    for (const auto& scope : scope_stack_) {
+  void AddScopeDebugMsg(std::ostream &ss) {
+    for (const auto &scope : scope_stack_) {
       ss << "; Entering Scope\n";
-      for (const auto& s : scope) {
+      for (const auto &s : scope) {
         switch (s.kind) {
-          case Scope::Constraint:
-            ss << "; constraint: " << s.constraint << "\n";
-            break;
-          case Scope::BindValue:
-            ss << "; bind value: " << s.var << " = " << s.value << "\n";
-            break;
-          case Scope::BindRange:
-            ss << "; bind range: " << s.var << " in [" << s.min << ", "
-               << s.min + s.extent << ")\n";
-            break;
+        case Scope::Constraint:
+          ss << "; constraint: " << s.constraint << "\n";
+          break;
+        case Scope::BindValue:
+          ss << "; bind value: " << s.var << " = " << s.value << "\n";
+          break;
+        case Scope::BindRange:
+          ss << "; bind range: " << s.var << " in [" << s.min << ", "
+             << s.min + s.extent << ")\n";
+          break;
         }
       }
     }
   }
 
-  std::string GetSMTLIB2(const PrimExpr& expr) {
+  std::string GetSMTLIB2(const PrimExpr &expr) {
     std::stringstream ss;
     ss << "(set-option :timeout " << timeout_ms << ")\n";
     AddScopeDebugMsg(ss);
@@ -560,7 +570,7 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     return ss.str();
   }
 
-  std::string GetModel(const PrimExpr& expr) {
+  std::string GetModel(const PrimExpr &expr) {
     solver.set("model", true);
     solver.push();
     solver.add(!ConvertBool(expr));
@@ -574,7 +584,7 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
         model_map.emplace(d.name().str(), m.get_const_interp(d));
       }
       std::stringstream ss;
-      for (const auto& [k, v] : model_map) {
+      for (const auto &[k, v] : model_map) {
         ss << "  " << k << " = " << v << "\n";
       }
       model_str = ss.str();
@@ -584,14 +594,14 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     return model_str;
   }
 
-  int64_t CountSatisfyingValues(const Var& var, int64_t max_count,
+  int64_t CountSatisfyingValues(const Var &var, int64_t max_count,
                                 int64_t min_consecutive) {
     if (!IsValidDType(var->dtype)) {
       return -1;
     }
 
     auto cleanup_side_effects = [this]() {
-      for (const auto& expr : side_effect_exprs_) {
+      for (const auto &expr : side_effect_exprs_) {
         memo_.erase(expr);
       }
       side_effect_exprs_.clear();
@@ -610,7 +620,8 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
 
       while (count < max_count) {
         auto result = solver.check();
-        if (result != ::z3::sat) break;
+        if (result != ::z3::sat)
+          break;
         ::z3::model m = solver.get_model();
         ::z3::expr val_expr = m.eval(z3_var, true);
         int64_t val;
@@ -636,15 +647,17 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
           if (found_values[i] == found_values[i - 1] + 1) {
             consecutive_count++;
           } else {
-            if (consecutive_count < min_consecutive) return -2;
+            if (consecutive_count < min_consecutive)
+              return -2;
             consecutive_count = 1;
           }
         }
-        if (consecutive_count < min_consecutive) return -2;
+        if (consecutive_count < min_consecutive)
+          return -2;
       }
 
       return count;
-    } catch (const std::exception& e) {
+    } catch (const std::exception &e) {
       LOG(WARNING) << "Z3 CountSatisfyingValues exception: " << e.what();
     } catch (...) {
       LOG(WARNING) << "Z3 CountSatisfyingValues unknown exception";
@@ -664,31 +677,34 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     return -1;
   }
 
- private:
-  using Z3BinOp = ::z3::expr (*)(const ::z3::expr&, const ::z3::expr&);
+private:
+  using Z3BinOp = ::z3::expr (*)(const ::z3::expr &, const ::z3::expr &);
 
   std::vector<PrimExpr> side_effect_exprs_;
 
-  ::z3::expr ConvertBool(const PrimExpr& e, bool is_assume_in = false) {
+  ::z3::expr ConvertBool(const PrimExpr &e, bool is_assume_in = false) {
     this->is_assume = is_assume_in;
     auto res = VisitBool(e);
-    for (auto& expr : side_effect_exprs_) memo_.erase(expr);
+    for (auto &expr : side_effect_exprs_)
+      memo_.erase(expr);
     side_effect_exprs_.clear();
     this->is_assume = false;
     return res;
   }
 
-  ::z3::expr ConvertInt(const PrimExpr& e, bool is_assume_in = false) {
+  ::z3::expr ConvertInt(const PrimExpr &e, bool is_assume_in = false) {
     this->is_assume = is_assume_in;
     auto res = VisitInt(e);
-    for (auto& expr : side_effect_exprs_) memo_.erase(expr);
+    for (auto &expr : side_effect_exprs_)
+      memo_.erase(expr);
     side_effect_exprs_.clear();
     this->is_assume = false;
     return res;
   }
 
-  ::z3::expr VisitExpr(const PrimExpr& e) override {
-    if (memo_.count(e)) return memo_.at(e);
+  ::z3::expr VisitExpr(const PrimExpr &e) override {
+    if (memo_.count(e))
+      return memo_.at(e);
     auto res = Base::VisitExpr(e);
     auto side_effect = SideEffect(e);
     if (side_effect <= CallEffectKind::kPure) {
@@ -697,28 +713,28 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
       memo_.emplace(e, res);
       side_effect_exprs_.emplace_back(e);
     } else {
-      if (is_assume) memo_.emplace(e, res);
+      if (is_assume)
+        memo_.emplace(e, res);
       side_effect_exprs_.emplace_back(e);
     }
     return res;
   }
 
-  bool IsFreeNode(const PrimExpr& e) {
-    if (memo_.count(e)) return false;
-    return e->IsInstance<CallNode>() ||
-           e->IsInstance<BufferLoadNode>() ||
-           e->IsInstance<ProducerLoadNode>() ||
-           e->IsInstance<ReduceNode>() ||
+  bool IsFreeNode(const PrimExpr &e) {
+    if (memo_.count(e))
+      return false;
+    return e->IsInstance<CallNode>() || e->IsInstance<BufferLoadNode>() ||
+           e->IsInstance<ProducerLoadNode>() || e->IsInstance<ReduceNode>() ||
            (e->IsInstance<CastNode>() &&
             !IsValidDType(Downcast<::tvm::tirx::Cast>(e)->value->dtype));
   }
 
-  static bool IsValidDType(const DataType& dtype) {
+  static bool IsValidDType(const DataType &dtype) {
     return (dtype.is_int() || dtype.is_uint() || dtype.is_bool()) &&
            dtype.lanes() == 1;
   }
 
-  ::z3::expr VisitInt(const PrimExpr& expr) {
+  ::z3::expr VisitInt(const PrimExpr &expr) {
     auto e = VisitExpr(expr);
     if (e.is_bool()) {
       return ::z3::ite(e, MakeIntVal(1), MakeIntVal(0));
@@ -727,14 +743,15 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     }
   }
 
-  ::z3::expr VisitBool(const PrimExpr& e) {
+  ::z3::expr VisitBool(const PrimExpr &e) {
     auto expr = VisitExpr(e);
-    if (expr.is_bool()) return expr;
+    if (expr.is_bool())
+      return expr;
     return expr != MakeIntVal(0);
   }
 
-  ::z3::expr VisitArith(Z3BinOp signed_op, const PrimExprNode* op,
-                        const PrimExpr& a, const PrimExpr& b) {
+  ::z3::expr VisitArith(Z3BinOp signed_op, const PrimExprNode *op,
+                        const PrimExpr &a, const PrimExpr &b) {
     if (IsValidDType(a->dtype) && IsValidDType(b->dtype)) {
       return signed_op(VisitInt(a), VisitInt(b));
     } else {
@@ -742,25 +759,27 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     }
   }
 
-  ::z3::expr VisitExpr_(const LetNode* op) override {
+  ::z3::expr VisitExpr_(const LetNode *op) override {
     if (IsValidDType(op->var->dtype)) {
       memo_.emplace(op->var, VisitInt(op->value));
     }
     return VisitExpr(op->body);
   }
-  ::z3::expr VisitExpr_(const CastNode* op) override {
+  ::z3::expr VisitExpr_(const CastNode *op) override {
     if (op->value->dtype == op->dtype && IsValidDType(op->value->dtype)) {
       return VisitInt(op->value);
     } else {
       return Create(op);
     }
   }
-  ::z3::expr VisitExpr_(const VarNode* op) override { return Create(op); }
-  ::z3::expr VisitExpr_(const BufferLoadNode* op) override { return Create(op); }
-  ::z3::expr VisitExpr_(const ProducerLoadNode* op) override {
+  ::z3::expr VisitExpr_(const VarNode *op) override { return Create(op); }
+  ::z3::expr VisitExpr_(const BufferLoadNode *op) override {
     return Create(op);
   }
-  ::z3::expr VisitExpr_(const ReduceNode* op) override { return Create(op); }
+  ::z3::expr VisitExpr_(const ProducerLoadNode *op) override {
+    return Create(op);
+  }
+  ::z3::expr VisitExpr_(const ReduceNode *op) override { return Create(op); }
   // Ramp(base, stride, lanes) represents the vector [base, base+stride,
   // base+2*stride, ...]. fix-round-6 C6: returning only `op->base` is
   // unsound for the upper lanes — the prover would treat the entire
@@ -770,12 +789,12 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
   // (Int or BV depending on mode) so the prover cannot derive anything
   // load-bearing from the Ramp. Callers that genuinely need
   // per-lane reasoning must lower out the Ramp before invoking Z3.
-  ::z3::expr VisitExpr_(const ::tvm::tirx::RampNode* op) override {
+  ::z3::expr VisitExpr_(const ::tvm::tirx::RampNode *op) override {
     (void)op;
     return MakeIntConst("ramp_" + std::to_string(memo_.size()));
   }
   // Broadcast(value, lanes) is a vector of identical scalars; visit the value.
-  ::z3::expr VisitExpr_(const ::tvm::tirx::BroadcastNode* op) override {
+  ::z3::expr VisitExpr_(const ::tvm::tirx::BroadcastNode *op) override {
     return VisitExpr(op->value);
   }
   // In BV mode every Z3 operand of an arithmetic / relational op must be a
@@ -784,134 +803,144 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
   // accidentally surfacing inside a BV computation), but the resulting
   // diagnostic is opaque. Assert sorts up front so misroutes blow up with a
   // useful message at the source-level node that produced the mismatch.
-  void AssertOperandSort(const ::z3::expr& e, const char* where) const {
+  void AssertOperandSort(const ::z3::expr &e, const char *where) const {
     if (bv_width_ > 0) {
-      ICHECK(e.is_bv())
-          << "Z3Prover " << where << ": expected BV operand at width "
-          << bv_width_ << ", got non-BV sort";
+      ICHECK(e.is_bv()) << "Z3Prover " << where
+                        << ": expected BV operand at width " << bv_width_
+                        << ", got non-BV sort";
       ICHECK_EQ(e.get_sort().bv_size(), static_cast<unsigned>(bv_width_))
           << "Z3Prover " << where << ": BV operand width mismatch (have "
           << e.get_sort().bv_size() << ", want " << bv_width_ << ")";
     } else {
-      ICHECK(e.is_int())
-          << "Z3Prover " << where
-          << ": expected Int operand in default (non-BV) mode";
+      ICHECK(e.is_int()) << "Z3Prover " << where
+                         << ": expected Int operand in default (non-BV) mode";
     }
   }
-  ::z3::expr VisitExpr_(const MinNode* op) override {
+  ::z3::expr VisitExpr_(const MinNode *op) override {
     auto a = VisitInt(op->a);
     auto b = VisitInt(op->b);
     AssertOperandSort(a, "MinNode.a");
     AssertOperandSort(b, "MinNode.b");
     return ::z3::ite(a < b, a, b);
   }
-  ::z3::expr VisitExpr_(const MaxNode* op) override {
+  ::z3::expr VisitExpr_(const MaxNode *op) override {
     auto a = VisitInt(op->a);
     auto b = VisitInt(op->b);
     AssertOperandSort(a, "MaxNode.a");
     AssertOperandSort(b, "MaxNode.b");
     return ::z3::ite(a > b, a, b);
   }
-  static ::z3::expr floordiv(const ::z3::expr& a, const ::z3::expr& b) {
+  static ::z3::expr floordiv(const ::z3::expr &a, const ::z3::expr &b) {
     return ::z3::ite(b > 0, a / b, -((-a) / b));
   }
-  static ::z3::expr floormod(const ::z3::expr& a, const ::z3::expr& b) {
+  static ::z3::expr floormod(const ::z3::expr &a, const ::z3::expr &b) {
     return ::z3::ite(b > 0, a % b, -((-a) % b));
   }
-  ::z3::expr VisitExpr_(const AddNode* op) override {
+  ::z3::expr VisitExpr_(const AddNode *op) override {
     return VisitArith(::z3::operator+, op, op->a, op->b);
   }
-  ::z3::expr VisitExpr_(const SubNode* op) override {
+  ::z3::expr VisitExpr_(const SubNode *op) override {
     return VisitArith(::z3::operator-, op, op->a, op->b);
   }
-  ::z3::expr VisitExpr_(const MulNode* op) override {
+  ::z3::expr VisitExpr_(const MulNode *op) override {
     return VisitArith(::z3::operator*, op, op->a, op->b);
   }
-  ::z3::expr VisitExpr_(const DivNode* op) override {
+  ::z3::expr VisitExpr_(const DivNode *op) override {
     return VisitArith(::z3::operator/, op, op->a, op->b);
   }
-  ::z3::expr VisitExpr_(const ModNode* op) override {
+  ::z3::expr VisitExpr_(const ModNode *op) override {
     return VisitArith(::z3::operator%, op, op->a, op->b);
   }
-  ::z3::expr VisitExpr_(const FloorDivNode* op) override {
+  ::z3::expr VisitExpr_(const FloorDivNode *op) override {
     if (IsValidDType(op->a->dtype) && IsValidDType(op->b->dtype)) {
       auto a = VisitInt(op->a);
       auto b = VisitInt(op->b);
       if (bv_width_ > 0) {
-        // bvsdiv truncates towards zero. FloorDiv truncates towards negative infinity.
-        // We can synthesize FloorDiv using bvsdiv and bvsrem:
-        // floordiv(a, b) = bvsdiv(a, b) - ite((a < 0) != (b < 0) && bvsrem(a, b) != 0, 1, 0)
-        ::z3::expr trunc_div = ::z3::to_expr(a.ctx(), Z3_mk_bvsdiv(a.ctx(), a, b));
-        ::z3::expr trunc_rem = ::z3::to_expr(a.ctx(), Z3_mk_bvsrem(a.ctx(), a, b));
-        ::z3::expr a_lt_0 = ::z3::to_expr(a.ctx(), Z3_mk_bvslt(a.ctx(), a, MakeIntVal(0)));
-        ::z3::expr b_lt_0 = ::z3::to_expr(b.ctx(), Z3_mk_bvslt(b.ctx(), b, MakeIntVal(0)));
+        // bvsdiv truncates towards zero. FloorDiv truncates towards negative
+        // infinity. We can synthesize FloorDiv using bvsdiv and bvsrem:
+        // floordiv(a, b) = bvsdiv(a, b) - ite((a < 0) != (b < 0) && bvsrem(a,
+        // b) != 0, 1, 0)
+        ::z3::expr trunc_div =
+            ::z3::to_expr(a.ctx(), Z3_mk_bvsdiv(a.ctx(), a, b));
+        ::z3::expr trunc_rem =
+            ::z3::to_expr(a.ctx(), Z3_mk_bvsrem(a.ctx(), a, b));
+        ::z3::expr a_lt_0 =
+            ::z3::to_expr(a.ctx(), Z3_mk_bvslt(a.ctx(), a, MakeIntVal(0)));
+        ::z3::expr b_lt_0 =
+            ::z3::to_expr(b.ctx(), Z3_mk_bvslt(b.ctx(), b, MakeIntVal(0)));
         ::z3::expr signs_differ = (a_lt_0 != b_lt_0);
-        ::z3::expr needs_adjustment = signs_differ && (trunc_rem != MakeIntVal(0));
-        return trunc_div - ::z3::ite(needs_adjustment, MakeIntVal(1), MakeIntVal(0));
+        ::z3::expr needs_adjustment =
+            signs_differ && (trunc_rem != MakeIntVal(0));
+        return trunc_div -
+               ::z3::ite(needs_adjustment, MakeIntVal(1), MakeIntVal(0));
       }
       return floordiv(a, b);
     }
     return Create(op);
   }
 
-  ::z3::expr VisitExpr_(const FloorModNode* op) override {
+  ::z3::expr VisitExpr_(const FloorModNode *op) override {
     if (IsValidDType(op->a->dtype) && IsValidDType(op->b->dtype)) {
       auto a = VisitInt(op->a);
       auto b = VisitInt(op->b);
       if (bv_width_ > 0) {
-        // Z3 operator% for BV lowers to Z3_mk_bvsrem (truncated remainder, sign of dividend).
-        // TIR FloorMod is sign of divisor.
-        // floormod(a, b) = bvsrem(a, b) + ite((a < 0) != (b < 0) && bvsrem(a, b) != 0, b, 0)
-        ::z3::expr trunc_rem = ::z3::to_expr(a.ctx(), Z3_mk_bvsrem(a.ctx(), a, b));
-        ::z3::expr a_lt_0 = ::z3::to_expr(a.ctx(), Z3_mk_bvslt(a.ctx(), a, MakeIntVal(0)));
-        ::z3::expr b_lt_0 = ::z3::to_expr(b.ctx(), Z3_mk_bvslt(b.ctx(), b, MakeIntVal(0)));
+        // Z3 operator% for BV lowers to Z3_mk_bvsrem (truncated remainder, sign
+        // of dividend). TIR FloorMod is sign of divisor. floormod(a, b) =
+        // bvsrem(a, b) + ite((a < 0) != (b < 0) && bvsrem(a, b) != 0, b, 0)
+        ::z3::expr trunc_rem =
+            ::z3::to_expr(a.ctx(), Z3_mk_bvsrem(a.ctx(), a, b));
+        ::z3::expr a_lt_0 =
+            ::z3::to_expr(a.ctx(), Z3_mk_bvslt(a.ctx(), a, MakeIntVal(0)));
+        ::z3::expr b_lt_0 =
+            ::z3::to_expr(b.ctx(), Z3_mk_bvslt(b.ctx(), b, MakeIntVal(0)));
         ::z3::expr signs_differ = (a_lt_0 != b_lt_0);
-        ::z3::expr needs_adjustment = signs_differ && (trunc_rem != MakeIntVal(0));
+        ::z3::expr needs_adjustment =
+            signs_differ && (trunc_rem != MakeIntVal(0));
         return trunc_rem + ::z3::ite(needs_adjustment, b, MakeIntVal(0));
       }
       return floormod(a, b);
     }
     return Create(op);
   }
-  ::z3::expr VisitExpr_(const EQNode* op) override {
+  ::z3::expr VisitExpr_(const EQNode *op) override {
     return VisitArith(::z3::operator==, op, op->a, op->b);
   }
-  ::z3::expr VisitExpr_(const NENode* op) override {
+  ::z3::expr VisitExpr_(const NENode *op) override {
     return VisitArith(::z3::operator!=, op, op->a, op->b);
   }
-  ::z3::expr VisitExpr_(const LTNode* op) override {
+  ::z3::expr VisitExpr_(const LTNode *op) override {
     return VisitArith(::z3::operator<, op, op->a, op->b);
   }
-  ::z3::expr VisitExpr_(const LENode* op) override {
+  ::z3::expr VisitExpr_(const LENode *op) override {
     return VisitArith(::z3::operator<=, op, op->a, op->b);
   }
-  ::z3::expr VisitExpr_(const GTNode* op) override {
+  ::z3::expr VisitExpr_(const GTNode *op) override {
     return VisitArith(::z3::operator>, op, op->a, op->b);
   }
-  ::z3::expr VisitExpr_(const GENode* op) override {
+  ::z3::expr VisitExpr_(const GENode *op) override {
     return VisitArith(::z3::operator>=, op, op->a, op->b);
   }
-  ::z3::expr VisitExpr_(const AndNode* op) override {
+  ::z3::expr VisitExpr_(const AndNode *op) override {
     return VisitBool(op->a) && VisitBool(op->b);
   }
-  ::z3::expr VisitExpr_(const OrNode* op) override {
+  ::z3::expr VisitExpr_(const OrNode *op) override {
     return VisitBool(op->a) || VisitBool(op->b);
   }
-  ::z3::expr VisitExpr_(const NotNode* op) override {
+  ::z3::expr VisitExpr_(const NotNode *op) override {
     return !VisitBool(op->a);
   }
-  ::z3::expr VisitExpr_(const SelectNode* op) override {
+  ::z3::expr VisitExpr_(const SelectNode *op) override {
     auto t = VisitInt(op->true_value);
     auto f = VisitInt(op->false_value);
     AssertOperandSort(t, "SelectNode.true_value");
     AssertOperandSort(f, "SelectNode.false_value");
     return ::z3::ite(VisitBool(op->condition), t, f);
   }
-  ::z3::expr VisitExpr_(const IntImmNode* op) override {
+  ::z3::expr VisitExpr_(const IntImmNode *op) override {
     return MakeIntVal(op->value);
   }
 
-  ::z3::expr VisitExpr_(const CallNode* op) override {
+  ::z3::expr VisitExpr_(const CallNode *op) override {
     if (op->op.same_as(::tvm::tirx::builtin::bitwise_and())) {
       return VisitBitwiseOp(::z3::operator&, op);
     } else if (op->op.same_as(::tvm::tirx::builtin::bitwise_or())) {
@@ -929,12 +958,12 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     }
   }
 
-  ::z3::expr VisitBitwiseOp(::z3::expr (*op_func)(const ::z3::expr&,
-                                                  const ::z3::expr&),
-                            const CallNode* op) {
+  ::z3::expr VisitBitwiseOp(::z3::expr (*op_func)(const ::z3::expr &,
+                                                  const ::z3::expr &),
+                            const CallNode *op) {
     ICHECK_EQ(op->args.size(), 2u);
-    const PrimExpr& a = op->args[0];
-    const PrimExpr& b = op->args[1];
+    const PrimExpr &a = op->args[0];
+    const PrimExpr &b = op->args[1];
     unsigned bit_width =
         std::max(op->args[0].dtype().bits(), op->args[1].dtype().bits());
     if (IsValidDType(a->dtype) && IsValidDType(b->dtype)) {
@@ -942,18 +971,17 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
         // Already BV; bitwise op directly on the BV values.
         return op_func(VisitInt(a), VisitInt(b));
       }
-      return ::z3::bv2int(
-          op_func(::z3::int2bv(bit_width, VisitInt(a)),
-                  ::z3::int2bv(bit_width, VisitInt(b))),
-          true);
+      return ::z3::bv2int(op_func(::z3::int2bv(bit_width, VisitInt(a)),
+                                  ::z3::int2bv(bit_width, VisitInt(b))),
+                          true);
     } else {
       return Create(op);
     }
   }
 
-  ::z3::expr VisitBitwiseNotOp(const CallNode* op) {
+  ::z3::expr VisitBitwiseNotOp(const CallNode *op) {
     ICHECK_EQ(op->args.size(), 1u);
-    const PrimExpr& a = op->args[0];
+    const PrimExpr &a = op->args[0];
     if (IsValidDType(a->dtype)) {
       if (bv_width_ > 0) {
         return ~VisitInt(a);
@@ -967,12 +995,12 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     }
   }
 
-  ::z3::expr VisitShiftOp(::z3::expr (*op_func)(const ::z3::expr&,
-                                                const ::z3::expr&),
-                          const CallNode* op) {
+  ::z3::expr VisitShiftOp(::z3::expr (*op_func)(const ::z3::expr &,
+                                                const ::z3::expr &),
+                          const CallNode *op) {
     ICHECK_EQ(op->args.size(), 2u);
-    const PrimExpr& a = op->args[0];
-    const PrimExpr& b = op->args[1];
+    const PrimExpr &a = op->args[0];
+    const PrimExpr &b = op->args[1];
     if (IsValidDType(a->dtype) && IsValidDType(b->dtype)) {
       if (bv_width_ > 0) {
         ::z3::expr a_bv = VisitInt(a);
@@ -985,8 +1013,7 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
       ::z3::expr b_expr = VisitInt(b);
       solver.add(b_expr >= 0);
       solver.add(b_expr < 64);
-      unsigned bit_width =
-          std::max(a.dtype().bits(), b.dtype().bits());
+      unsigned bit_width = std::max(a.dtype().bits(), b.dtype().bits());
       ::z3::expr a_bv = ::z3::int2bv(bit_width, a_expr);
       ::z3::expr b_bv = ::z3::int2bv(bit_width, b_expr);
       ::z3::expr result_bv = op_func(a_bv, b_bv);
@@ -996,9 +1023,9 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
     }
   }
 
-  ::z3::expr VisitExprDefault_(const ::tvm::ffi::Object* op) override {
-    LOG(FATAL) << "Z3Prover only support integers, but got "
-               << op->GetTypeKey() << ".";
+  ::z3::expr VisitExprDefault_(const ::tvm::ffi::Object *op) override {
+    LOG(FATAL) << "Z3Prover only support integers, but got " << op->GetTypeKey()
+               << ".";
     TVM_FFI_UNREACHABLE();
   }
 };
@@ -1006,41 +1033,39 @@ class Z3ProverImpl : public ExprFunctor<z3::expr(const PrimExpr&)> {
 // ---------------------------------------------------------------------------
 // Z3Prover (front-class) — thin forwarder to the Impl.
 
-Z3Prover::Z3Prover(::tvm::arith::Analyzer* parent)
+Z3Prover::Z3Prover(::tvm::arith::Analyzer *parent)
     : impl_(std::make_unique<Z3ProverImpl>(parent)) {}
 
 Z3Prover::~Z3Prover() = default;
 
-void Z3Prover::Bind(const Var& var, const Range& new_range,
+void Z3Prover::Bind(const Var &var, const Range &new_range,
                     bool allow_override) {
   impl_->Bind(var, new_range, allow_override);
 }
-void Z3Prover::Bind(const Var& var, const PrimExpr& expr,
-                    bool allow_override) {
+void Z3Prover::Bind(const Var &var, const PrimExpr &expr, bool allow_override) {
   impl_->Bind(var, expr, allow_override);
 }
-bool Z3Prover::CanProve(const PrimExpr& expr) {
+bool Z3Prover::CanProve(const PrimExpr &expr) {
   // CPPMEGA fix: gb10 correctness regression root-caused to bvsrem vs
   // bvsmod semantics in FloorMod/FloorDiv BV modes. The global gate
   // is removed; Z3 can safely prove bounds again.
   return impl_->CanProve(expr);
 }
-std::function<void()> Z3Prover::EnterConstraint(const PrimExpr& constraint,
+std::function<void()> Z3Prover::EnterConstraint(const PrimExpr &constraint,
                                                 bool is_assume) {
   return impl_->EnterConstraint(constraint, is_assume);
 }
 std::string Z3Prover::GetSMTLIB2(::tvm::ffi::Optional<PrimExpr> expr) {
-  if (expr.has_value()) return impl_->GetSMTLIB2(expr.value());
+  if (expr.has_value())
+    return impl_->GetSMTLIB2(expr.value());
   return impl_->GetSMTLIB2();
 }
-std::string Z3Prover::GetSMTLIB2(std::nullopt_t) {
-  return impl_->GetSMTLIB2();
-}
+std::string Z3Prover::GetSMTLIB2(std::nullopt_t) { return impl_->GetSMTLIB2(); }
 std::string Z3Prover::GetStats() { return impl_->GetStats(); }
-std::string Z3Prover::GetModel(const PrimExpr& expr) {
+std::string Z3Prover::GetModel(const PrimExpr &expr) {
   return impl_->GetModel(expr);
 }
-int64_t Z3Prover::CountSatisfyingValues(const Var& var, int64_t max_count,
+int64_t Z3Prover::CountSatisfyingValues(const Var &var, int64_t max_count,
                                         int64_t min_consecutive) {
   return impl_->CountSatisfyingValues(var, max_count, min_consecutive);
 }
@@ -1058,9 +1083,9 @@ void Z3Prover::SetRLimit(unsigned rlimit) { impl_->SetRLimit(rlimit); }
 void Z3Prover::SetBitVectorMode(int width) {
   try {
     impl_->SetBitVectorMode(width);
-  } catch (const ::z3::exception& e) {
-    LOG(WARNING) << "Z3Prover::SetBitVectorMode(" << width
-                 << ") failed (" << e.msg() << "); falling back to "
+  } catch (const ::z3::exception &e) {
+    LOG(WARNING) << "Z3Prover::SetBitVectorMode(" << width << ") failed ("
+                 << e.msg() << "); falling back to "
                  << "Int sort (bv_width=0).";
     try {
       impl_->SetBitVectorMode(0);
@@ -1068,9 +1093,9 @@ void Z3Prover::SetBitVectorMode(int width) {
       // Even fallback failed; swallow — the prover is in an undefined
       // state, but we cannot throw from this entry point.
     }
-  } catch (const std::exception& e) {
-    LOG(WARNING) << "Z3Prover::SetBitVectorMode(" << width
-                 << ") failed (" << e.what() << "); falling back to "
+  } catch (const std::exception &e) {
+    LOG(WARNING) << "Z3Prover::SetBitVectorMode(" << width << ") failed ("
+                 << e.what() << "); falling back to "
                  << "Int sort (bv_width=0).";
     try {
       impl_->SetBitVectorMode(0);
@@ -1086,9 +1111,7 @@ void Z3Prover::SetBitVectorMode(int width) {
     }
   }
 }
-int Z3Prover::GetBitVectorWidth() const {
-  return impl_->GetBitVectorWidth();
-}
+int Z3Prover::GetBitVectorWidth() const { return impl_->GetBitVectorWidth(); }
 // CPPMEGA z3-stack fix-A6/A8 + idea712 fix-B7: atomic reset of
 // (memo + solver + scope_stack). The B7 implementation supersedes the
 // earlier A8 forwarder (`impl_->Reset()`); it adds lifecycle checks and
@@ -1158,20 +1181,20 @@ struct CacheEntry {
   uint64_t generation;
 };
 
-static uint64_t& GetCacheGeneration_() {
+static uint64_t &GetCacheGeneration_() {
   static thread_local uint64_t gen = 0;
   return gen;
 }
 
-static std::unordered_map<::tvm::arith::Analyzer*, CacheEntry>&
+static std::unordered_map<::tvm::arith::Analyzer *, CacheEntry> &
 GetProverCache_() {
-  static thread_local auto* cache =
-      new std::unordered_map<::tvm::arith::Analyzer*, CacheEntry>();
+  static thread_local auto *cache =
+      new std::unordered_map<::tvm::arith::Analyzer *, CacheEntry>();
   return *cache;
 }
 
-Z3Prover& GetOrCreate(::tvm::arith::Analyzer* analyzer) {
-  auto& cache = GetProverCache_();
+Z3Prover &GetOrCreate(::tvm::arith::Analyzer *analyzer) {
+  auto &cache = GetProverCache_();
   uint64_t current_gen = GetCacheGeneration_();
   auto it = cache.find(analyzer);
   if (it != cache.end() && it->second.prover &&
@@ -1179,7 +1202,7 @@ Z3Prover& GetOrCreate(::tvm::arith::Analyzer* analyzer) {
     return *it->second.prover;
   }
   // Stale entry (generation mismatch) or missing entry — create fresh.
-  auto& entry = cache[analyzer];
+  auto &entry = cache[analyzer];
   if (entry.prover) {
     entry.retired.emplace_back(std::move(entry.prover));
   }
@@ -1213,8 +1236,8 @@ void ClearProverCache() {
   // Eagerly drop entries that have no outstanding scopes (safe to destroy).
   // Keep entries with outstanding scopes alive so recovery lambdas don't
   // dangle; they'll be replaced on next GetOrCreate.
-  auto& cache = GetProverCache_();
-  for (auto it = cache.begin(); it != cache.end(); ) {
+  auto &cache = GetProverCache_();
+  for (auto it = cache.begin(); it != cache.end();) {
     if (it->second.prover) {
       // Accessing impl_->scope_stack_ directly is not possible from here
       // (it's private). Instead, just mark as stale via generation; the
@@ -1230,8 +1253,8 @@ void ClearProverCache() {
 // Analyzer's cached prover. Use when the caller knows the precise
 // Analyzer it owns; safer than a thread-wide clear inside library code
 // that doesn't own the Analyzer lifetime.
-void ResetProverFor(::tvm::arith::Analyzer* analyzer) {
-  auto& cache = GetProverCache_();
+void ResetProverFor(::tvm::arith::Analyzer *analyzer) {
+  auto &cache = GetProverCache_();
   auto it = cache.find(analyzer);
   if (it != cache.end() && it->second.prover) {
     it->second.prover->Reset();
@@ -1244,16 +1267,16 @@ void ResetProverFor(::tvm::arith::Analyzer* analyzer) {
 // the prover is starved of constraints and partial-sync queries collapse
 // to range-only proofs.
 namespace {
-void Z3BindExprHook(::tvm::arith::Analyzer* self, const ::tvm::tirx::Var& var,
-                    const ::tvm::PrimExpr& expr, bool allow_override) {
+void Z3BindExprHook(::tvm::arith::Analyzer *self, const ::tvm::tirx::Var &var,
+                    const ::tvm::PrimExpr &expr, bool allow_override) {
   GetOrCreate(self).Bind(var, expr, allow_override);
 }
-void Z3BindRangeHook(::tvm::arith::Analyzer* self, const ::tvm::tirx::Var& var,
-                     const ::tvm::Range& range, bool allow_override) {
+void Z3BindRangeHook(::tvm::arith::Analyzer *self, const ::tvm::tirx::Var &var,
+                     const ::tvm::Range &range, bool allow_override) {
   GetOrCreate(self).Bind(var, range, allow_override);
 }
-std::function<void()> Z3EnterConstraintHook(::tvm::arith::Analyzer* self,
-                                            const ::tvm::PrimExpr& constraint) {
+std::function<void()> Z3EnterConstraintHook(::tvm::arith::Analyzer *self,
+                                            const ::tvm::PrimExpr &constraint) {
   return GetOrCreate(self).EnterConstraint(constraint);
 }
 
@@ -1265,7 +1288,7 @@ struct Z3HookRegistrar {
   }
 };
 static Z3HookRegistrar _z3_hook_registrar;
-}  // namespace
+} // namespace
 
 // CPPMEGA: Test-only FFI helpers. Exposes Z3Prover with the bv-mode
 // switch so Python tests can drive the prover directly without needing
@@ -1278,33 +1301,40 @@ static Z3HookRegistrar _z3_hook_registrar;
 // Release wheels can pass `-DTILELANG_BUILD_TESTS=OFF` to drop these
 // helpers from the FFI surface.
 #ifdef TILELANG_BUILD_TESTS
-bool BvCanProve(const ::tvm::tirx::Var& var, int64_t lo, int64_t hi,
-                const ::tvm::PrimExpr& expr, int bv_width) {
+bool BvCanProve(const ::tvm::tirx::Var &var, int64_t lo, int64_t hi,
+                const ::tvm::PrimExpr &expr, int bv_width) {
   ::tvm::arith::Analyzer ana;
-  Z3Prover& prover = GetOrCreate(&ana);
+  Z3Prover &prover = GetOrCreate(&ana);
   prover.SetBitVectorMode(bv_width);
-  // To avoid IntImm bounds check failure for edge cases (e.g. hi - lo == 1<<31 for int32),
-  // we clamp the extent to the max representable value for the dtype.
+  // To avoid IntImm bounds check failure for edge cases (e.g. hi - lo == 1<<31
+  // for int32), we clamp the extent to the max representable value for the
+  // dtype.
   int64_t max_val = ::tvm::max_value(var->dtype).as<::tvm::IntImmNode>()->value;
   int64_t min_val = ::tvm::min_value(var->dtype).as<::tvm::IntImmNode>()->value;
   int64_t extent = hi - lo;
   if (extent > max_val - min_val) {
     extent = max_val - min_val;
   }
-  if (extent < 0) extent = 0;
-  if (lo < min_val) lo = min_val;
-  if (lo > max_val) lo = max_val;
-  // If lo + extent > max_val, Z3Prover::BindRange will just bind it up to the extent.
-  // Actually, TVM IntImm constructor checks value <= max_val. 
-  // Extent for int32 can be up to UINT32_MAX if represented as int64?
-  // No, IntImm for int32 checks value <= INT32_MAX! So extent CANNOT exceed INT32_MAX!
-  // To bind a full range, we should just use the boolean expression.
+  if (extent < 0)
+    extent = 0;
+  if (lo < min_val)
+    lo = min_val;
+  if (lo > max_val)
+    lo = max_val;
+  // If lo + extent > max_val, Z3Prover::BindRange will just bind it up to the
+  // extent. Actually, TVM IntImm constructor checks value <= max_val. Extent
+  // for int32 can be up to UINT32_MAX if represented as int64? No, IntImm for
+  // int32 checks value <= INT32_MAX! So extent CANNOT exceed INT32_MAX! To bind
+  // a full range, we should just use the boolean expression.
   int64_t hi_inclusive = hi - 1;
-  if (hi_inclusive > max_val) hi_inclusive = max_val;
-  if (lo < min_val) lo = min_val;
+  if (hi_inclusive > max_val)
+    hi_inclusive = max_val;
+  if (lo < min_val)
+    lo = min_val;
   auto lo_expr = tvm::tirx::make_const(var->dtype, lo);
   auto hi_expr = tvm::tirx::make_const(var->dtype, hi_inclusive);
-  auto recover = prover.EnterConstraint((var >= lo_expr) && (var <= hi_expr), true);
+  auto recover =
+      prover.EnterConstraint((var >= lo_expr) && (var <= hi_expr), true);
   bool res = prover.CanProve(expr);
   recover();
   return res;
@@ -1319,7 +1349,7 @@ bool BvCanProve(const ::tvm::tirx::Var& var, int64_t lo, int64_t hi,
 // Python binding) to confirm RAII restoration in-process.
 int BvScopedRoundTrip(int outer_width, int inner_width) {
   ::tvm::arith::Analyzer ana;
-  Z3Prover& prover = GetOrCreate(&ana);
+  Z3Prover &prover = GetOrCreate(&ana);
   prover.SetBitVectorMode(outer_width);
   {
     ScopedBVMode guard(prover, inner_width);
@@ -1328,8 +1358,8 @@ int BvScopedRoundTrip(int outer_width, int inner_width) {
     // Trivial proof inside the inner scope to make sure the solver works
     // at the inner sort.
     ::tvm::tirx::Var x("x", ::tvm::DataType::Int(32));
-    ::tvm::Range r = ::tvm::Range::FromMinExtent(
-        ::tvm::IntImm(x->dtype, 0), ::tvm::IntImm(x->dtype, 1));
+    ::tvm::Range r = ::tvm::Range::FromMinExtent(::tvm::IntImm(x->dtype, 0),
+                                                 ::tvm::IntImm(x->dtype, 1));
     prover.Bind(x, r);
     (void)prover.CanProve(x == ::tvm::IntImm(x->dtype, 0));
   }
@@ -1341,7 +1371,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::GlobalDef().def("tl.z3.bv_can_prove", BvCanProve);
   refl::GlobalDef().def("tl.z3.bv_scoped_round_trip", BvScopedRoundTrip);
 }
-#endif  // TILELANG_BUILD_TESTS
+#endif // TILELANG_BUILD_TESTS
 
 // CPPMEGA z3-stack fix-A8 (NEW-2): production FFI for cache hygiene.
 // Registered unconditionally (NOT inside the TILELANG_BUILD_TESTS gate)
@@ -1372,13 +1402,14 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kProofHookAliasShape, ::tvm::Bool);
 // Truthiness convention matches the existing `TILELANG_DISABLE_Z3` gate at
 // `Z3Prover::CanProve` (above): "set" means env != nullptr AND env[0] != 0
 // AND env[0] != '0'. So `=0`, ``, and unset are all "enabled".
-bool Z3PassGate::IsEnabled(const char* pass_name) {
+bool Z3PassGate::IsEnabled(const char *pass_name) {
   // Fast path: global gate. Same predicate as `Z3Prover::CanProve`'s.
   static const bool global_disabled = []() {
-    const char* g = std::getenv("TILELANG_DISABLE_Z3");
+    const char *g = std::getenv("TILELANG_DISABLE_Z3");
     return g != nullptr && g[0] != '\0' && g[0] != '0';
   }();
-  if (global_disabled) return false;
+  if (global_disabled)
+    return false;
 
   // Per-pass gate: cache by full env-var name. `pass_name` is a string
   // literal at every call site, so the std::string allocation here is
@@ -1389,19 +1420,18 @@ bool Z3PassGate::IsEnabled(const char* pass_name) {
   // would run at thread exit; if it runs after Z3's own TLS globals are
   // gone, the interleaved allocator calls can crash. Leaking the small
   // (~10 entry) map is harmless.
-  static thread_local auto* cache =
-      new std::unordered_map<std::string, bool>();
+  static thread_local auto *cache = new std::unordered_map<std::string, bool>();
   std::string key("TILELANG_DISABLE_Z3_");
   key += pass_name;
   auto it = cache->find(key);
   if (it != cache->end()) {
     return !it->second;
   }
-  const char* v = std::getenv(key.c_str());
+  const char *v = std::getenv(key.c_str());
   bool disabled = v != nullptr && v[0] != '\0' && v[0] != '0';
   cache->emplace(std::move(key), disabled);
   return !disabled;
 }
 
-}  // namespace tlz3
-}  // namespace tilelang
+} // namespace tlz3
+} // namespace tilelang

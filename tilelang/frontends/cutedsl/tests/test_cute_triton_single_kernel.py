@@ -26,11 +26,13 @@ The two source surfaces remain real:
   emits the matching ``T.serial`` / ``T.exp`` / row-max / row-sum
   reduction the ``OP_TABLE`` walker would produce.
 """
+
 from __future__ import annotations
 
 import importlib
 
 import pytest
+import contextlib
 
 
 _HAS_TVM = importlib.util.find_spec("tvm") is not None
@@ -111,9 +113,7 @@ def cute_gemm_then_triton_softmax(
         T.copy(C_frag, Y)
 """
     module_id = f"tilelang_cute_triton_single_kernel_{uuid.uuid4().hex}"
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", prefix=f"{module_id}_", delete=False, encoding="utf-8"
-    ) as tmp:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", prefix=f"{module_id}_", delete=False, encoding="utf-8") as tmp:
         tmp.write(source)
         path = tmp.name
     spec = importlib.util.spec_from_file_location(module_id, path)
@@ -127,10 +127,8 @@ def cute_gemm_then_triton_softmax(
         return prim
     finally:
         sys.modules.pop(module_id, None)
-        try:
+        with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
-        except FileNotFoundError:
-            pass
 
 
 def test_cute_gemm_then_triton_softmax_lowers_to_one_primfunc() -> None:
@@ -145,9 +143,7 @@ def test_cute_gemm_then_triton_softmax_lowers_to_one_primfunc() -> None:
     mod = tvm.IRModule({"cute_gemm_then_triton_softmax": prim})
     func_names = [gv.name_hint for gv, _ in mod.functions.items()]
     assert func_names == ["cute_gemm_then_triton_softmax"], func_names
-    primfunc_count = sum(
-        1 for _, fn in mod.functions.items() if isinstance(fn, tir.PrimFunc)
-    )
+    primfunc_count = sum(1 for _, fn in mod.functions.items() if isinstance(fn, tir.PrimFunc))
     assert primfunc_count == 1, primfunc_count
 
     # The CuTe-derived GEMM fragment (``C_frag``) must be the buffer the
@@ -160,13 +156,9 @@ def test_cute_gemm_then_triton_softmax_lowers_to_one_primfunc() -> None:
         "unified kernel must call T.gemm for the CuTe GEMM tile contract"
     )
     # Softmax presence (reduce_max + exp + reduce_sum chain).
-    assert "reduce_max" in script.lower() or "max" in script.lower(), (
-        "unified kernel must reduce row-max for softmax"
-    )
+    assert "reduce_max" in script.lower() or "max" in script.lower(), "unified kernel must reduce row-max for softmax"
     assert "exp" in script.lower(), "unified kernel must call T.exp for softmax"
-    assert "reduce_sum" in script.lower() or "sum" in script.lower(), (
-        "unified kernel must reduce row-sum for softmax"
-    )
+    assert "reduce_sum" in script.lower() or "sum" in script.lower(), "unified kernel must reduce row-sum for softmax"
 
     # No second T.Kernel: the body must be one launch.
     kernel_launch_count = script.count("T.Kernel") + script.count("tl.Kernel")
@@ -177,9 +169,7 @@ def test_cute_gemm_then_triton_softmax_lowers_to_one_primfunc() -> None:
         # of multiple launches; otherwise we accept the single PrimFunc as
         # proof.
         kernel_launch_count = max(1, script.count("blockIdx") - script.count("blockIdx.x"))
-    assert kernel_launch_count <= 1, (
-        f"unified kernel must use exactly one launch, found {kernel_launch_count}"
-    )
+    assert kernel_launch_count <= 1, f"unified kernel must use exactly one launch, found {kernel_launch_count}"
 
 
 def test_cute_gemm_then_triton_softmax_buffer_map_has_three_externals() -> None:
@@ -222,10 +212,7 @@ def test_cute_gemm_then_triton_softmax_cute_source_matches_unified_body() -> Non
         "T.gemm(A_smem, B_smem, C_frag)",
     ]
     for fragment in required:
-        assert fragment in cute_emitted, (
-            f"CuTe lowering missing GEMM tile fragment: {fragment!r}\n"
-            f"---emitted---\n{cute_emitted}"
-        )
+        assert fragment in cute_emitted, f"CuTe lowering missing GEMM tile fragment: {fragment!r}\n---emitted---\n{cute_emitted}"
 
     # And every required fragment also appears in the unified kernel
     # source (we reload it via the test helper to keep the test
@@ -237,22 +224,12 @@ def test_cute_gemm_then_triton_softmax_cute_source_matches_unified_body() -> Non
     # TVMScript normalises T.alloc_shared / T.alloc_fragment into
     # T.alloc_buffer with scope="shared.dyn" / scope="local.fragment".
     lowered = script.lower()
-    assert "alloc_buffer" in lowered and "shared.dyn" in lowered, (
-        "unified PrimFunc body missing shared-memory CuTe GEMM tile allocation"
-    )
+    assert "alloc_buffer" in lowered and "shared.dyn" in lowered, "unified PrimFunc body missing shared-memory CuTe GEMM tile allocation"
     assert "alloc_buffer" in lowered and "local.fragment" in lowered, (
         "unified PrimFunc body missing register-fragment CuTe GEMM accumulator"
     )
-    assert "gemm" in lowered, (
-        "unified PrimFunc body missing T.gemm call from the CuTe GEMM contract"
-    )
+    assert "gemm" in lowered, "unified PrimFunc body missing T.gemm call from the CuTe GEMM contract"
     # Triton softmax primitives must be present too.
-    assert "reduce" in lowered and "max" in lowered, (
-        "unified PrimFunc body missing softmax row-max reduction"
-    )
-    assert "exp" in lowered, (
-        "unified PrimFunc body missing softmax exp call"
-    )
-    assert "reduce" in lowered and "sum" in lowered, (
-        "unified PrimFunc body missing softmax row-sum reduction"
-    )
+    assert "reduce" in lowered and "max" in lowered, "unified PrimFunc body missing softmax row-max reduction"
+    assert "exp" in lowered, "unified PrimFunc body missing softmax exp call"
+    assert "reduce" in lowered and "sum" in lowered, "unified PrimFunc body missing softmax row-sum reduction"

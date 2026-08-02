@@ -66,5 +66,5 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       });
 }
 
-}  // namespace tl_tir
-}  // namespace tilelang
+} // namespace tl_tir
+} // namespace tilelang

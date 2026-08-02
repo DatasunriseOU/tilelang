@@ -1,4 +1,3 @@
-import tilelang
 from tvm.target import Target
 
 with Target("cuda"):

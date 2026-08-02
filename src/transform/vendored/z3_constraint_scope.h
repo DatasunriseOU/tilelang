@@ -75,22 +75,22 @@ namespace tilelang {
 namespace tlz3 {
 
 class ConstraintScope {
- public:
+public:
   ConstraintScope() = default;
 
   // Push a constraint into `prover`. Records the recover lambda so that
   // destruction (or explicit `Pop`) calls it exactly once.
-  ConstraintScope(::tilelang::tlz3::Z3Prover& prover,
-                  const ::tvm::PrimExpr& constraint, bool is_assume = false) {
+  ConstraintScope(::tilelang::tlz3::Z3Prover &prover,
+                  const ::tvm::PrimExpr &constraint, bool is_assume = false) {
     recover_ = prover.EnterConstraint(constraint, is_assume);
   }
 
-  ConstraintScope(ConstraintScope&& other) noexcept
+  ConstraintScope(ConstraintScope &&other) noexcept
       : recover_(std::move(other.recover_)) {
     other.recover_ = {};
   }
 
-  ConstraintScope& operator=(ConstraintScope&& other) noexcept {
+  ConstraintScope &operator=(ConstraintScope &&other) noexcept {
     if (this != &other) {
       Pop();
       recover_ = std::move(other.recover_);
@@ -99,8 +99,8 @@ class ConstraintScope {
     return *this;
   }
 
-  ConstraintScope(const ConstraintScope&) = delete;
-  ConstraintScope& operator=(const ConstraintScope&) = delete;
+  ConstraintScope(const ConstraintScope &) = delete;
+  ConstraintScope &operator=(const ConstraintScope &) = delete;
 
   ~ConstraintScope() { Pop(); }
 
@@ -120,7 +120,7 @@ class ConstraintScope {
     }
   }
 
- private:
+private:
   std::function<void()> recover_;
 };
 
@@ -145,8 +145,8 @@ class ConstraintScope {
 //
 // Returned as `int64_t` because the entire constraint stack works in
 // int64 PrimExpr constants.
-inline std::optional<std::pair<int64_t, int64_t>> BVBoundsForDtype(
-    const ::tvm::runtime::DataType& dt) {
+inline std::optional<std::pair<int64_t, int64_t>>
+BVBoundsForDtype(const ::tvm::runtime::DataType &dt) {
   if (!dt.is_int() && !dt.is_uint()) {
     return std::nullopt;
   }
@@ -169,7 +169,7 @@ inline std::optional<std::pair<int64_t, int64_t>> BVBoundsForDtype(
                         (int64_t(1) << (bits - 1)) - 1);
 }
 
-}  // namespace tlz3
-}  // namespace tilelang
+} // namespace tlz3
+} // namespace tilelang
 
-#endif  // TILELANG_VENDORED_Z3_CONSTRAINT_SCOPE_H_
+#endif // TILELANG_VENDORED_Z3_CONSTRAINT_SCOPE_H_

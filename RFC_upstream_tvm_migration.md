@@ -43,13 +43,11 @@ Upstream tile-ai/tilelang@main still declares:
 text
 3rdparty/tvm -> https://github.com/TileLang/tvm
 
-
 The submodule commit pinned by tile-ai/tilelang@main is:
 
 text
 0e15b274bce8b46f971abf5ac390e844aa6acee5
 2026-04-16 Fix duplicate __weakref__ declaration in derived_object wrappers (#33)
-
 
 That commit is not on the frozen TileLang/tvm main line. It is on
 TileLang/tvm's default branch, tilelang_main.
@@ -189,7 +187,6 @@ text
  125 src/transform/vendored/z3_proof_hooks.h
   12 src/transform/vendored/z3_prover_stub.h
 1956 total
-
 
 The prover is used by:
 

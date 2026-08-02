@@ -73,16 +73,13 @@ class GemmMetalSimdGroup(GemmBase):
         for name, value in (("M", self.M), ("N", self.N), ("K", self.chunk)):
             if value % 8 != 0:
                 raise ValueError(f"Metal GEMM requires {name} to be a multiple of 8, got {value}")
-        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target,
-                                                            GEMM_INST_METAL_SIMDGROUP)
+        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GEMM_INST_METAL_SIMDGROUP)
         if self.M % m_warp != 0 or self.N % n_warp != 0:
-            raise ValueError(
-                f"Metal GEMM cannot evenly partition {self.M}x{self.N} across {m_warp}x{n_warp} warps")
+            raise ValueError(f"Metal GEMM cannot evenly partition {self.M}x{self.N} across {m_warp}x{n_warp} warps")
         warp_row_tiles = int(self.M // m_warp)
         warp_col_tiles = int(self.N // n_warp)
         if warp_row_tiles % 8 != 0 or warp_col_tiles % 8 != 0:
-            raise ValueError(
-                f"Metal GEMM per-warp tile must be a multiple of 8x8, got {warp_row_tiles}x{warp_col_tiles}")
+            raise ValueError(f"Metal GEMM per-warp tile must be a multiple of 8x8, got {warp_row_tiles}x{warp_col_tiles}")
 
         from tilelang.intrinsics.metal_macro_generator import MPSIntrinEmitter
 
@@ -125,8 +122,7 @@ class GemmMetalSimdGroup(GemmBase):
         if not is_full_region(C_region):
             raise ValueError(f"Metal GEMM requires full output C region, got {C_region}")
         if not c_in_simdgroup_reg and not is_shared(C_buf):
-            raise ValueError(
-                f"Metal GEMM requires C in local.fragment, metal.simdgroup, or shared scope, got {C_buf.scope()}")
+            raise ValueError(f"Metal GEMM requires C in local.fragment, metal.simdgroup, or shared scope, got {C_buf.scope()}")
 
         # The simdgroup ldmatrix_a path issues simdgroup_load against a
         # threadgroup-memory pointer, so A must live in shared memory.  When A
@@ -221,8 +217,7 @@ class GemmMetal(GemmBase):
     def _make_mps_emitter(self, target: Target, thread_nums: int):
         from tilelang.intrinsics.metal_macro_generator import MPSIntrinEmitter
 
-        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target,
-                                                            GEMM_INST_METAL_COOPERATIVE_TENSOR)
+        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GEMM_INST_METAL_COOPERATIVE_TENSOR)
         if self.is_gemm_gg():
             num_warps = int(thread_nums) // 32
             k_n_per_warp = 32
@@ -332,20 +327,17 @@ class GemmMetal(GemmBase):
         assert is_full_region(C_region), "Fragment output C must be a full region"
 
         if not (self.is_gemm_ss() or self.is_gemm_gg()):
-            raise ValueError(
-                f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}")
+            raise ValueError(f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}")
 
         @T.prim_func
         def _gemm_with_c_writeback() -> None:
             A_local = T.alloc_local((warp_rows * a_tile_elems * inner_k_steps), in_dtype)
             B_local = T.alloc_local((warp_cols * b_tile_elems * inner_k_steps), in_dtype)
-            C_ct = T.alloc_local((num_simd_c * c_tile_elems), accum_dtype,
-                                  scope="metal.cooperative_tensor")
+            C_ct = T.alloc_local((num_simd_c * c_tile_elems), accum_dtype, scope="metal.cooperative_tensor")
             if clear_accum:
                 # Python-unroll so each fill targets a constant __pct_cN tile.
                 for _i in range(int(num_simd_c)):
-                    T.cooperative_tensor_fill(C_ct.data, _i, T.cast(0, accum_dtype),
-                                              micro_size_x, micro_size_y)
+                    T.cooperative_tensor_fill(C_ct.data, _i, T.cast(0, accum_dtype), micro_size_x, micro_size_y)
             else:
                 mps_emitter.simd_load(C_ct, C_buf)
             # Python-level (compile-time) unroll over the K reduction so the

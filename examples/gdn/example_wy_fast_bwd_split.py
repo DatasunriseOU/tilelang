@@ -397,7 +397,7 @@ def tilelang_wy_fast_bwd_split(
             for i_s1, i_s2 in T.Parallel(block_S, block_S):
                 dA_A_fragment[i_s1, i_s2] = dA_fragment[i_s1, i_s2] * A_fragment[i_s1, i_s2]
                 dA_A_fragment_transpose[i_s2, i_s1] = dA_A_fragment[i_s1, i_s2]
-            
+
             T.reduce_sum(dA_A_fragment, dA_A_fragment_1, dim=1)
             T.reduce_sum(dA_A_fragment_transpose, dA_A_fragment_2, dim=1)
 

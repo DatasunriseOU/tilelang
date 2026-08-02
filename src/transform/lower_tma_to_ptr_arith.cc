@@ -182,19 +182,23 @@ bool DecodeCUtensorMapDataType(int64_t code, DataType *out) {
 DecodedDesc DecodeTmaDescriptor(const PrimExpr &desc_arg) {
   DecodedDesc d;
   const CallNode *call = desc_arg.as<CallNode>();
-  if (call == nullptr) return d;
+  if (call == nullptr)
+    return d;
   if (!call->op.same_as(create_tma_descriptor()) &&
       !call->op.same_as(create_tma_im2col_descriptor())) {
     return d;
   }
-  if (call->args.size() < 3) return d;
+  if (call->args.size() < 3)
+    return d;
   const auto *rank_imm = call->args[1].as<IntImmNode>();
-  if (rank_imm == nullptr) return d;
+  if (rank_imm == nullptr)
+    return d;
   int rank = static_cast<int>(rank_imm->value);
   // Tiled descriptor: 4*R + 7 args.  Im2col has additional fields but the
   // first 3 + 4*R follow the same shape; we still recover global_addr +
   // strides reliably.
-  if (static_cast<int>(call->args.size()) < 3 + 4 * rank) return d;
+  if (static_cast<int>(call->args.size()) < 3 + 4 * rank)
+    return d;
   d.rank = rank;
   d.global_addr = call->args[2];
   for (int i = 0; i < rank; ++i)
@@ -226,7 +230,8 @@ DecodedDesc DecodeTmaDescriptor(const PrimExpr &desc_arg) {
   // would manifest as a silent OOB on the generated kernel.
   for (const auto &b : d.smem_box) {
     if (const auto *bi = b.as<IntImmNode>()) {
-      if (bi->value <= 0) return DecodedDesc{};
+      if (bi->value <= 0)
+        return DecodedDesc{};
     }
   }
   d.ok = true;
@@ -280,8 +285,7 @@ static constexpr bool kEmitOpaque = false;
 
 Stmt BuildPointerArithCopy(const DecodedDesc &desc,
                            const Array<PrimExpr> &coords,
-                           const PrimExpr &smem_handle,
-                           DataType element_dtype,
+                           const PrimExpr &smem_handle, DataType element_dtype,
                            bool is_load) {
   ICHECK(desc.ok);
   ICHECK_EQ(static_cast<int>(coords.size()), desc.rank);
@@ -343,9 +347,9 @@ Stmt BuildPointerArithCopy(const DecodedDesc &desc,
              {desc.global_addr, global_byte_offset});
     PrimExpr smem_byte_offset =
         smem_elem_offset * IntImm(kIdx, element_dtype.bytes());
-    PrimExpr smem_ptr = Call(DataType::Handle(),
-                             tirx::builtin::handle_add_byte_offset(),
-                             {smem_handle, smem_byte_offset});
+    PrimExpr smem_ptr =
+        Call(DataType::Handle(), tirx::builtin::handle_add_byte_offset(),
+             {smem_handle, smem_byte_offset});
     Array<PrimExpr> copy_args;
     copy_args.push_back(StringImm("__tl_ptr_copy_elem"));
     if (is_load) {
@@ -356,8 +360,8 @@ Stmt BuildPointerArithCopy(const DecodedDesc &desc,
       copy_args.push_back(smem_ptr);
     }
     copy_args.push_back(IntImm(DataType::Int(32), element_dtype.bytes()));
-    body = Evaluate(Call(DataType::Int(32),
-                         tirx::builtin::call_extern(), copy_args));
+    body = Evaluate(
+        Call(DataType::Int(32), tirx::builtin::call_extern(), copy_args));
   } else {
     // Default path: emit `BufferStore(BufferLoad(...))` against synthetic
     // flat Buffers anchored on the handles via Bind-bound data Vars.
@@ -418,12 +422,10 @@ Stmt BuildPointerArithCopy(const DecodedDesc &desc,
                  /*buffer_type=*/BufferType::kDefault);
 
     if (is_load) {
-      body = BufferStore(s_buf,
-                         BufferLoad(g_buf, {global_elem_offset}),
+      body = BufferStore(s_buf, BufferLoad(g_buf, {global_elem_offset}),
                          {smem_elem_offset});
     } else {
-      body = BufferStore(g_buf,
-                         BufferLoad(s_buf, {smem_elem_offset}),
+      body = BufferStore(g_buf, BufferLoad(s_buf, {smem_elem_offset}),
                          {global_elem_offset});
     }
     (void)g_buf;
@@ -482,10 +484,14 @@ Stmt BuildPointerArithCopy(const DecodedDesc &desc,
 bool TargetNeedsRewrite(const Target &target) {
   // NV Hopper+ owns the TMA path natively; everywhere else (Metal, HIP,
   // pre-Hopper CUDA, CPU) we lower to pointer-arith copies.
-  if (!target.defined()) return true; // be conservative: no target -> rewrite
-  if (TargetIsHopper(target)) return false;
-  if (TargetIsSm100(target)) return false;
-  if (TargetIsSM120(target)) return false;
+  if (!target.defined())
+    return true; // be conservative: no target -> rewrite
+  if (TargetIsHopper(target))
+    return false;
+  if (TargetIsSm100(target))
+    return false;
+  if (TargetIsSM120(target))
+    return false;
   // CUDA pre-Hopper: rewrite (no native TMA).
   // Metal / HIP / CPU: rewrite (no native TMA).
   return true;
@@ -493,8 +499,7 @@ bool TargetNeedsRewrite(const Target &target) {
 
 class TMAToPtrArithMutator : public StmtExprMutator {
 public:
-  explicit TMAToPtrArithMutator(Target target)
-      : target_(std::move(target)) {}
+  explicit TMAToPtrArithMutator(Target target) : target_(std::move(target)) {}
 
   // Pass-through dispatch for the vendored `tilelang::tl_tir::AllocateNode`.
   // Without this override the apache `StmtFunctor` vtable rejects the
@@ -589,8 +594,8 @@ public:
       bool is_load = call->op.same_as(tma_load());
       bool is_store = call->op.same_as(tma_store());
       if (is_load || is_store) {
-        return RewriteTmaCall(call, is_load).value_or(
-            StmtExprMutator::VisitStmt_(op));
+        return RewriteTmaCall(call, is_load)
+            .value_or(StmtExprMutator::VisitStmt_(op));
       }
     }
     return StmtExprMutator::VisitStmt_(op);
@@ -621,7 +626,8 @@ private:
   }
 
   Optional<Stmt> RewriteTmaCall(const CallNode *call, bool is_load) {
-    if (call->args.size() < 3) return std::nullopt;
+    if (call->args.size() < 3)
+      return std::nullopt;
     PrimExpr desc_arg = ResolveLetBoundExpr(call->args[0]);
     DecodedDesc desc = DecodeTmaDescriptor(desc_arg);
     if (!desc.ok) {
@@ -634,7 +640,8 @@ private:
       // fix is to register a side-table of decoded descriptors keyed by
       // the Var; tracked separately.
       LOG(WARNING) << "LowerTMAToPtrArith: failed to decode TMA descriptor "
-                   << "for " << tvm::ffi::GetRef<Call>(call) << "; leaving call in "
+                   << "for " << tvm::ffi::GetRef<Call>(call)
+                   << "; leaving call in "
                    << "place — non-NV codegen will reject it.";
       return std::nullopt;
     }
@@ -711,8 +718,7 @@ tvm::transform::Pass LowerTMAToPtrArith() {
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.transform.LowerTMAToPtrArith",
-                        LowerTMAToPtrArith);
+  refl::GlobalDef().def("tl.transform.LowerTMAToPtrArith", LowerTMAToPtrArith);
 }
 
 } // namespace tl

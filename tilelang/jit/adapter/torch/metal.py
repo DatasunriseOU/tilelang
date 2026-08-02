@@ -50,7 +50,7 @@ class MetalKernelAdapter(BaseKernelAdapter):
         func_or_mod: tir.PrimFunc | tvm.IRModule,
         device_kernel_source: str,
         verbose: bool = False,
-    ) -> "MetalKernelAdapter":
+    ) -> MetalKernelAdapter:
         adapter = cls.__new__(cls)
         adapter.kernel_global_source = device_kernel_source
         adapter.kernel_name = cls._get_kernel_name(func_or_mod, device_kernel_source)
@@ -139,7 +139,7 @@ class MetalKernelAdapter(BaseKernelAdapter):
             line = line.strip()
             if not line.startswith(cls._launch_info_prefix):
                 continue
-            return json.loads(line[len(cls._launch_info_prefix):])
+            return json.loads(line[len(cls._launch_info_prefix) :])
         return None
 
     @classmethod

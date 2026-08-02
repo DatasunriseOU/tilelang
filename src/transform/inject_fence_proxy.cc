@@ -418,7 +418,7 @@ private:
       iter_values.push_back(VisitExpr(v));
     }
     return SBlockRealize(iter_values, predicate,
-                        Downcast<SBlock>(block_res.stmt));
+                         Downcast<SBlock>(block_res.stmt));
   }
 
   Stmt VisitStmt_(const IfThenElseNode *op) final {
@@ -547,8 +547,8 @@ tvm::transform::Pass InjectFenceProxy() {
     }
     return ProxyFenceRewriter::Apply(f);
   };
-  return tirx::transform::CreatePrimFuncPass(pass_func, 0, "tl.InjectFenceProxy",
-                                            {});
+  return tirx::transform::CreatePrimFuncPass(pass_func, 0,
+                                             "tl.InjectFenceProxy", {});
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {

@@ -187,7 +187,7 @@ private:
 
 class LoopPartitioner : public StmtExprVisitor {
 public:
-  LoopPartitioner(arith::Analyzer* analyzer = nullptr) : analyzer_(analyzer) {}
+  LoopPartitioner(arith::Analyzer *analyzer = nullptr) : analyzer_(analyzer) {}
 
   Fragment Partition(const For &op, int num_thread, int vectorize_size) {
     this->VisitStmt(op);
@@ -238,13 +238,13 @@ private:
       PrimExpr extent = node->extent;
       if (analyzer_ && !is_const_int(extent)) {
         auto cib = analyzer_->const_int_bound(extent);
-        if (cib->max_value < arith::ConstIntBound::kPosInf && cib->max_value >= 0) {
+        if (cib->max_value < arith::ConstIntBound::kPosInf &&
+            cib->max_value >= 0) {
           extent = make_const(extent->dtype, cib->max_value);
         }
       }
-      loop_vars_.push_back(
-          IterVar(Range::FromMinExtent(node->min, extent), node->loop_var,
-                  IterVarType::kDataPar));
+      loop_vars_.push_back(IterVar(Range::FromMinExtent(node->min, extent),
+                                   node->loop_var, IterVarType::kDataPar));
     }
     StmtExprVisitor::VisitStmt_(node);
   }
@@ -253,17 +253,18 @@ private:
   PrimExpr flattened = 0;
   bool has_fragment_ = false;
   Array<IterVar> loop_vars_;
-  arith::Analyzer* analyzer_ = nullptr;
+  arith::Analyzer *analyzer_ = nullptr;
 };
 
-Fragment PlanLoopPartition(const For &op, size_t num_thread,
-                           int vectorize_size, arith::Analyzer* analyzer) {
+Fragment PlanLoopPartition(const For &op, size_t num_thread, int vectorize_size,
+                           arith::Analyzer *analyzer) {
   LoopPartitioner partitioner(analyzer);
   return partitioner.Partition(op, num_thread, vectorize_size);
 }
 
 Fragment PlanLoopPartition(const For &op, int vectorize_size,
-                           const Range &thread_range, arith::Analyzer* analyzer) {
+                           const Range &thread_range,
+                           arith::Analyzer *analyzer) {
   size_t num_thread = *as_const_int(thread_range->extent);
   LoopPartitioner partitioner(analyzer);
   Fragment fragment = partitioner.Partition(op, num_thread, vectorize_size);

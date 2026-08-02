@@ -21,9 +21,10 @@ state (``OP_TABLE``, ``MLIR_WALKER_AVAILABLE``, MLIR alias bootstrap)
 lives in submodules of :mod:`poc.triton_frontend`, so re-exporting names
 does not duplicate it.
 """
+
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import Any
 
 # Importing the underlying package executes its module-level side
 # effects exactly once (registers MLIR alias, builds OP_TABLE, ...).
@@ -43,18 +44,18 @@ from poc.triton_frontend import (  # noqa: F401
 def compile_ttir(
     ttir: Any,
     *,
-    out_idx: Optional[Any] = None,
-    target: Optional[Any] = None,
+    out_idx: Any | None = None,
+    target: Any | None = None,
     name: str = "main",
-    grid: Optional[Tuple[int, ...]] = None,
-    arg_buffer_shapes: Optional[Any] = None,
-    num_warps: Optional[int] = None,
-    num_stages: Optional[int] = None,
-    execution_backend: Optional[str] = None,
-    target_host: Optional[Any] = None,
-    verbose: Optional[bool] = None,
-    pass_configs: Optional[dict] = None,
-    compile_flags: Optional[Any] = None,
+    grid: tuple[int, ...] | None = None,
+    arg_buffer_shapes: Any | None = None,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
+    execution_backend: str | None = None,
+    target_host: Any | None = None,
+    verbose: bool | None = None,
+    pass_configs: dict | None = None,
+    compile_flags: Any | None = None,
     **from_ttir_kwargs: Any,
 ) -> Any:
     """End-to-end: Triton TTIR -> TileLang ``PrimFunc`` -> ``JITKernel``.

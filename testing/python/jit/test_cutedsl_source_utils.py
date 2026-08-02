@@ -97,9 +97,12 @@ def external_tile(
 
     declaration = extract_python_func_declaration(source, "external_tile")
 
-    assert declaration == """def external_tile(
+    assert (
+        declaration
+        == """def external_tile(
     a: cute.Tensor,
     b: cute.Tensor,
     scale: int = (1 + 2),
     shape: tuple[int, int] = (16, 16),
 )"""
+    )

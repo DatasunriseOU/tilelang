@@ -51,14 +51,12 @@ class _Registry:
         with self._lock:
             if intrinsic.name in self._table:
                 raise KeyError(
-                    f"extern_intrinsic '{intrinsic.name}' already registered "
-                    f"(targets={list(self._table[intrinsic.name].bodies)})"
+                    f"extern_intrinsic '{intrinsic.name}' already registered (targets={list(self._table[intrinsic.name].bodies)})"
                 )
             for target in intrinsic.bodies:
                 if target not in _VALID_TARGETS:
                     raise ValueError(
-                        f"extern_intrinsic '{intrinsic.name}' has unknown target "
-                        f"'{target}'; valid targets: {sorted(_VALID_TARGETS)}"
+                        f"extern_intrinsic '{intrinsic.name}' has unknown target '{target}'; valid targets: {sorted(_VALID_TARGETS)}"
                     )
             self._table[intrinsic.name] = intrinsic
 
@@ -81,8 +79,7 @@ class _Registry:
         for target in intrinsic.bodies:
             if target not in _VALID_TARGETS:
                 raise ValueError(
-                    f"extern_intrinsic '{intrinsic.name}' has unknown target "
-                    f"'{target}'; valid targets: {sorted(_VALID_TARGETS)}"
+                    f"extern_intrinsic '{intrinsic.name}' has unknown target '{target}'; valid targets: {sorted(_VALID_TARGETS)}"
                 )
         with self._lock:
             prev = self._table.get(intrinsic.name)

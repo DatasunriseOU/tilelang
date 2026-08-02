@@ -5,12 +5,12 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/s_tir/utils.h>
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/buffer.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
-#include <tvm/s_tir/utils.h>
 
 #include <optional>
 #include <utility>
@@ -530,7 +530,7 @@ private:
       if (load->buffer->data.same_as(store->buffer->data) &&
           ArrayDeepEqual(load->indices, store->indices) &&
           tirx::ExprDeepEqual()(load->buffer->elem_offset,
-                               store->buffer->elem_offset) &&
+                                store->buffer->elem_offset) &&
           ArrayDeepEqual(load->buffer->shape, store->buffer->shape) &&
           ArrayDeepEqual(load->buffer->strides, store->buffer->strides)) {
         return Evaluate(0);

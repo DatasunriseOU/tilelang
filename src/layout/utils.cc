@@ -201,8 +201,9 @@ struct IterExprPP {
   }
 };
 
-// CPPMEGA: ReprPrinter removed in apache/tvm latest. IterMark/IterSumExpr/IterSplitExpr
-// debug printing falls back to default; use IterExprPP directly when needed.
+// CPPMEGA: ReprPrinter removed in apache/tvm latest.
+// IterMark/IterSumExpr/IterSplitExpr debug printing falls back to default; use
+// IterExprPP directly when needed.
 
 // Heuristic: detect per-iterator gaps ("unused" pieces) even when the iterator
 // appears in fused forms across multiple index expressions. We first normalize

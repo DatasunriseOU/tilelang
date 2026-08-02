@@ -56,14 +56,14 @@ namespace tilelang {
 namespace transform {
 
 using tvm::IRModule;
-using tvm::transform::Pass;
-using tvm::transform::PassContext;
 using tvm::tirx::Bind;
 using tvm::tirx::PrimFunc;
 using tvm::tirx::PrimFuncNode;
 using tvm::tirx::SeqStmt;
 using tvm::tirx::Stmt;
 using tvm::tirx::StmtMutator;
+using tvm::transform::Pass;
+using tvm::transform::PassContext;
 
 namespace {
 
@@ -79,12 +79,12 @@ namespace {
  * dispatch. Recursion into `body` then re-enters the normal mutator path.
  */
 class LowerTileLangLetStmtMutator : public StmtMutator {
- public:
+public:
   bool found_any() const { return found_any_; }
 
- protected:
-  Stmt VisitStmt(const Stmt& stmt) override {
-    if (const auto* let = stmt.as<tl_tir::LetStmtNode>()) {
+protected:
+  Stmt VisitStmt(const Stmt &stmt) override {
+    if (const auto *let = stmt.as<tl_tir::LetStmtNode>()) {
       found_any_ = true;
       // Recurse into value (via VisitExpr) and body first, preserving
       // bottom-up rewriting semantics.
@@ -108,11 +108,11 @@ class LowerTileLangLetStmtMutator : public StmtMutator {
     return StmtMutator::VisitStmt(stmt);
   }
 
- private:
+private:
   bool found_any_{false};
 };
 
-}  // namespace
+} // namespace
 
 Pass LowerTileLangLetStmt() {
   auto pass_func = [](PrimFunc f, IRModule, PassContext) -> PrimFunc {
@@ -122,7 +122,7 @@ Pass LowerTileLangLetStmt() {
       // No-op fast path — leave the function untouched.
       return f;
     }
-    auto* node = f.CopyOnWrite();
+    auto *node = f.CopyOnWrite();
     node->body = std::move(new_body);
     return f;
   };
@@ -136,5 +136,5 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                         LowerTileLangLetStmt);
 }
 
-}  // namespace transform
-}  // namespace tilelang
+} // namespace transform
+} // namespace tilelang

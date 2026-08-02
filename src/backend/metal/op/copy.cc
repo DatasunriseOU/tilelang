@@ -65,8 +65,7 @@ Stmt LowerCooperativeTensorCopy(const CopyNode &op, const LowerArgs &T,
 
   const auto *m_imm = op.src_range[0]->extent.as<IntImmNode>();
   const auto *n_imm = op.src_range[1]->extent.as<IntImmNode>();
-  ICHECK(m_imm && n_imm)
-      << "cooperative_tensor copy requires constant extents";
+  ICHECK(m_imm && n_imm) << "cooperative_tensor copy requires constant extents";
   int M = m_imm->value;
   int N = n_imm->value;
 

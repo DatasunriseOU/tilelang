@@ -141,10 +141,7 @@ class FusionBlockRegistry:
         )
 
     def nodes_from_blocks(self, blocks: Sequence[Any]) -> tuple[FusionNode, ...]:
-        return tuple(
-            self.node_from_block(block, index=index)
-            for index, block in enumerate(blocks)
-        )
+        return tuple(self.node_from_block(block, index=index) for index, block in enumerate(blocks))
 
 
 def _block_attr(block: Any, name: str) -> Any | None:
@@ -189,10 +186,7 @@ def _resolve_block_ports(
     index: int,
     op: str,
 ) -> tuple[str, ...]:
-    return tuple(
-        str(port).format(name=name, index=index, op=op)
-        for port in ports
-    )
+    return tuple(str(port).format(name=name, index=index, op=op) for port in ports)
 
 
 @dataclass(frozen=True)
@@ -240,9 +234,7 @@ class FusionCompilePlan:
     require_single_kernel: bool = False
     schedule_name: str = "manual"
     schedule_status: str = "ready"
-    autograd_plan: FusionAutogradPlan = field(
-        default_factory=lambda: FusionAutogradPlan(mode="none", status="none")
-    )
+    autograd_plan: FusionAutogradPlan = field(default_factory=lambda: FusionAutogradPlan(mode="none", status="none"))
     requires_source_post_fusion: bool = False
 
 
@@ -485,9 +477,7 @@ class FusionOptimizer:
         return plan_fusion_region(
             self.build(),
             pass_configs=pass_configs,
-            require_single_kernel=self._require_single_kernel
-            if require_single_kernel is None
-            else require_single_kernel,
+            require_single_kernel=self._require_single_kernel if require_single_kernel is None else require_single_kernel,
         )
 
     def compile(
@@ -511,9 +501,7 @@ class FusionOptimizer:
             enable_device_compile=enable_device_compile,
             pass_configs=pass_configs,
             lowerer=lowerer,
-            require_single_kernel=self._require_single_kernel
-            if require_single_kernel is None
-            else require_single_kernel,
+            require_single_kernel=self._require_single_kernel if require_single_kernel is None else require_single_kernel,
         )
 
 
@@ -645,10 +633,7 @@ class FusionRegionBuilder:
         node_names = {node.name for node in self._nodes}
         for edge in edges:
             if edge.producer not in node_names or edge.consumer not in node_names:
-                raise ValueError(
-                    f"Fusion edge {edge.producer!r}->{edge.consumer!r}:{edge.buffer!r} "
-                    "references a missing node"
-                )
+                raise ValueError(f"Fusion edge {edge.producer!r}->{edge.consumer!r}:{edge.buffer!r} references a missing node")
 
         producer_by_buffer: dict[str, str] = {}
         ambiguous_producers: dict[str, tuple[str, str]] = {}
@@ -666,10 +651,7 @@ class FusionRegionBuilder:
                     continue
                 ambiguous = ambiguous_producers.get(input_name)
                 if ambiguous is not None:
-                    raise ValueError(
-                        f"ambiguous inferred fusion producer for buffer {input_name!r}: "
-                        f"{ambiguous[0]!r} and {ambiguous[1]!r}"
-                    )
+                    raise ValueError(f"ambiguous inferred fusion producer for buffer {input_name!r}: {ambiguous[0]!r} and {ambiguous[1]!r}")
                 producer = producer_by_buffer.get(input_name)
                 if producer is None or producer == node.name:
                     continue
@@ -695,10 +677,7 @@ class FusionRegionBuilder:
         successors: dict[str, set[str]] = {node.name: set() for node in self._nodes}
         for edge in edges:
             if edge.producer not in nodes_by_name or edge.consumer not in nodes_by_name:
-                raise ValueError(
-                    f"Fusion edge {edge.producer!r}->{edge.consumer!r}:{edge.buffer!r} "
-                    "references a missing node"
-                )
+                raise ValueError(f"Fusion edge {edge.producer!r}->{edge.consumer!r}:{edge.buffer!r} references a missing node")
             if edge.producer == edge.consumer:
                 continue
             if edge.consumer not in successors[edge.producer]:
@@ -729,11 +708,7 @@ class FusionRegionBuilder:
         nodes: Sequence[FusionNode],
     ) -> tuple[FusionEdge, ...]:
         node_order = {node.name: index for index, node in enumerate(nodes)}
-        input_order = {
-            (node.name, input_name): index
-            for node in nodes
-            for index, input_name in enumerate(node.inputs)
-        }
+        input_order = {(node.name, input_name): index for node in nodes for index, input_name in enumerate(node.inputs)}
         return tuple(
             sorted(
                 edges,
@@ -778,10 +753,7 @@ class FusionRegionBuilder:
         nodes, edges = self._normalized_nodes_and_edges()
         if self._schedule_template is None:
             if not nodes or any(node.prim_func is None for node in nodes):
-                raise ValueError(
-                    "FusionRegion without an explicit schedule template requires all nodes "
-                    "to be raw PrimFunc nodes"
-                )
+                raise ValueError("FusionRegion without an explicit schedule template requires all nodes to be raw PrimFunc nodes")
             schedule_template = _auto_prim_func_region_template
             schedule_name = "auto_prim_func_region"
             schedule_status = "auto_prim_func_graph"
@@ -1017,18 +989,12 @@ def build_fusion_regions_from_blocks(
         schedule_entry, end = selected
         region_nodes = normalized_nodes[index:end]
         node_names = {node.name for node in region_nodes}
-        region_edges = tuple(
-            edge
-            for edge in normalized_edges
-            if edge.producer in node_names and edge.consumer in node_names
-        )
+        region_edges = tuple(edge for edge in normalized_edges if edge.producer in node_names and edge.consumer in node_names)
         region_index = len(regions)
         region_suffix = _safe_region_suffix(schedule_entry.name)
         discovered_region_name = f"{region_name}_{region_index}_{region_suffix}"
         entry_symbol = (
-            f"{entry_symbol_prefix}_{region_index}_{region_suffix}"
-            if entry_symbol_prefix is not None
-            else discovered_region_name
+            f"{entry_symbol_prefix}_{region_index}_{region_suffix}" if entry_symbol_prefix is not None else discovered_region_name
         )
         regions.append(
             build_fusion_region(
@@ -1171,10 +1137,7 @@ def _validate_auto_prim_func_edges_match_raw_abi(region: FusionRegion) -> None:
         producer = nodes_by_name.get(edge.producer)
         consumer = nodes_by_name.get(edge.consumer)
         if producer is None or consumer is None:
-            raise ValueError(
-                f"Fusion edge {edge.producer!r}->{edge.consumer!r}:{edge.buffer!r} "
-                "references a missing node"
-            )
+            raise ValueError(f"Fusion edge {edge.producer!r}->{edge.consumer!r}:{edge.buffer!r} references a missing node")
         if producer.prim_func is None or consumer.prim_func is None:
             continue
         producer_buffers = _prim_func_buffer_names(producer.prim_func)
@@ -1194,8 +1157,7 @@ def _auto_prim_func_region_template(region: FusionRegion) -> tvm.IRModule:
     for index, node in enumerate(region.nodes):
         if node.prim_func is None:
             raise ValueError(
-                f"FusionRegion {region.name!r} contains non-PrimFunc node {node.name!r}; "
-                "provide an explicit fused schedule template"
+                f"FusionRegion {region.name!r} contains non-PrimFunc node {node.name!r}; provide an explicit fused schedule template"
             )
         symbol = region.entry_symbol if index == 0 else node.name
         if symbol in functions:
@@ -1219,10 +1181,7 @@ def _validate_internal_edges_do_not_escape_entry_abi(func: tir.PrimFunc, region:
 
     internal_buffers = {edge.buffer for edge in region.edges if edge.lifetime == "internal"}
     scratch_abi_buffers = _internal_scratch_abi_buffer_names(func)
-    escaped = sorted(
-        internal_buffers
-        & (_entry_buffer_names(func) - scratch_abi_buffers)
-    )
+    escaped = sorted(internal_buffers & (_entry_buffer_names(func) - scratch_abi_buffers))
     if not escaped:
         return
 
@@ -1267,11 +1226,7 @@ def _validate_internal_edges_materialized_in_entry_ir(func: tir.PrimFunc, region
         bank = alias.get("bank")
         return isinstance(bank, str) and bank in load_names and bank in store_names
 
-    missing = [
-        buffer
-        for buffer in internal_buffers
-        if not materialized(buffer)
-    ]
+    missing = [buffer for buffer in internal_buffers if not materialized(buffer)]
     if not missing:
         return
     missing_details = [
@@ -1305,11 +1260,7 @@ def _validate_explicit_schedule_covers_region_abi(func: tir.PrimFunc, region: Fu
 
     entry_names = _entry_buffer_names(func)
     missing = sorted(_required_external_region_buffers(region) - entry_names)
-    missing = [
-        buffer
-        for buffer in missing
-        if not _physical_abi_map_covers_buffer(func, buffer, entry_names)
-    ]
+    missing = [buffer for buffer in missing if not _physical_abi_map_covers_buffer(func, buffer, entry_names)]
     if not missing:
         return
 
@@ -1402,8 +1353,7 @@ def _module_from_template(
         if region.entry_symbol not in {global_var.name_hint for global_var in lowered.functions}:
             if len(lowered.functions) != 1:
                 raise ValueError(
-                    f"Fusion IRModule for {region.name!r} must contain entry {region.entry_symbol!r} "
-                    "or exactly one PrimFunc entry"
+                    f"Fusion IRModule for {region.name!r} must contain entry {region.entry_symbol!r} or exactly one PrimFunc entry"
                 )
             global_var, func = next(iter(lowered.functions.items()))
             if not isinstance(func, tir.PrimFunc):
@@ -1441,31 +1391,21 @@ def _cache_key_material(region: FusionRegion, pass_configs: Mapping[str, Any]) -
         "z3:sync_async" if pass_configs.get(PassConfigKey.TL_Z3_PROOF_BARRIER_MINIMIZATION.value) else "z3:off",
         f"schedule:{_schedule_template_key(region.schedule_template)}",
     ]
-    prim_func_digests = [
-        f"{node.name}:{_prim_func_digest(node.prim_func)}"
-        for node in region.nodes
-        if node.prim_func is not None
-    ]
+    prim_func_digests = [f"{node.name}:{_prim_func_digest(node.prim_func)}" for node in region.nodes if node.prim_func is not None]
     if prim_func_digests:
         material.append("prim_funcs:" + ",".join(prim_func_digests))
     return tuple(material)
 
 
 def _autograd_plan_for(region: FusionRegion) -> FusionAutogradPlan:
-    aot_forward_node_names = tuple(
-        node.name for node in region.nodes if node.attrs.get("backward") == "aot_autograd"
-    )
+    aot_forward_node_names = tuple(node.name for node in region.nodes if node.attrs.get("backward") == "aot_autograd")
     provided_backward_nodes = tuple(
-        node.name
-        for node in region.nodes
-        if node.attrs.get("autograd") == "aot_backward" or node.attrs.get("role") == "backward"
+        node.name for node in region.nodes if node.attrs.get("autograd") == "aot_backward" or node.attrs.get("role") == "backward"
     )
     if not aot_forward_node_names and not provided_backward_nodes:
         return FusionAutogradPlan(mode="none", status="none")
 
-    planned_backward_nodes = tuple(
-        f"{node_name}_bwd" for node_name in reversed(aot_forward_node_names)
-    )
+    planned_backward_nodes = tuple(f"{node_name}_bwd" for node_name in reversed(aot_forward_node_names))
     aot_forward_node_set = set(aot_forward_node_names)
     planned_backward_node_set = set(planned_backward_nodes)
     backward_edges = tuple(
@@ -1482,9 +1422,7 @@ def _autograd_plan_for(region: FusionRegion) -> FusionAutogradPlan:
         and f"{edge.consumer}_bwd" in planned_backward_node_set
     )
     missing_backward_nodes = tuple(
-        f"{node_name}_bwd"
-        for node_name in aot_forward_node_names
-        if f"{node_name}_bwd" not in provided_backward_nodes
+        f"{node_name}_bwd" for node_name in aot_forward_node_names if f"{node_name}_bwd" not in provided_backward_nodes
     )
     return FusionAutogradPlan(
         mode="aot_autograd",

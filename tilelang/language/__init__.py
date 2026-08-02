@@ -104,22 +104,24 @@ from .reduce_op import (
     warp_reduce_bitor,  # noqa: F401
 )
 from .print_op import print, device_assert  # noqa: F401
-from .customize import (
+from .atomic import (
     atomic_max,  # noqa: F401
     atomic_min,  # noqa: F401
     atomic_add,  # noqa: F401
     atomic_addx2,  # noqa: F401
     atomic_addx4,  # noqa: F401
-    dp4a,  # noqa: F401
-    clamp,  # noqa: F401
-    reshape,  # noqa: F401
-    view,  # noqa: F401
     atomic_load,  # noqa: F401
     atomic_store,  # noqa: F401
     atomic_xchg,  # noqa: F401
     atomic_and,  # noqa: F401
     atomic_or,  # noqa: F401
     atomic_xor,  # noqa: F401
+)
+from .customize import (
+    dp4a,  # noqa: F401
+    clamp,  # noqa: F401
+    reshape,  # noqa: F401
+    view,  # noqa: F401
     loop_break,  # noqa: F401
 )
 from .logical import any_of, all_of  # noqa: F401
@@ -139,6 +141,7 @@ from .builtin import any_sync as any_sync  # noqa: F401
 from .builtin import all_sync as all_sync  # noqa: F401
 from .builtin import sync_threads_partial as sync_threads_partial  # noqa: F401
 from .fp8_op import fp8_scaled_matmul as fp8_scaled_matmul  # noqa: F401
+
 # CPPMEGA pull from stack-c — blockscaled E8M0 + Metal dot4 DSL surface
 from .blockscaled_layout import BlockScaledLayout, e8m0_to_float  # noqa: F401
 from .fp8_op import metal_fp8_e4m3_dot4 as metal_fp8_e4m3_dot4  # noqa: F401

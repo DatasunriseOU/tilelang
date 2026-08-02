@@ -25,8 +25,8 @@
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/transform.h>
 
-#include <cmath>
 #include <algorithm>
+#include <cmath>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -37,9 +37,9 @@
 // CPPMEGA: apache renamed metal codegen entry header. The new
 // `MetalModuleCreateWithFallback` factory lives in `target/metal/` and
 // accepts `ffi::Map<String, Bytes>` smap + `ffi::Map<String, String>` source.
-#include "target/metal/metal_fallback_module.h"
 #include "runtime/thread_storage_scope.h"
 #include "target/build_common.h"
+#include "target/metal/metal_fallback_module.h"
 
 namespace tvm {
 
@@ -174,52 +174,60 @@ CodeGenTileLangMetal::CodeGenTileLangMetal(Target target) : target_(target) {
   //   - threadgroup -> threadgroup (shared -> shared, defensive)
   // The body is a simple byte loop; MSL's compiler will vectorize when
   // the alignment is statically known.
-  decl_stream << "static inline void __tl_ptr_copy_elem("
-                 "device void* dst, device const void* src, int bytes) {\n"
-              << "  device char* d = (device char*)dst;\n"
-              << "  device const char* s = (device const char*)src;\n"
-              << "  for (int i = 0; i < bytes; ++i) { d[i] = s[i]; }\n"
-              << "}\n"
-              << "static inline void __tl_ptr_copy_elem("
-                 "threadgroup void* dst, device const void* src, int bytes) {\n"
-              << "  threadgroup char* d = (threadgroup char*)dst;\n"
-              << "  device const char* s = (device const char*)src;\n"
-              << "  for (int i = 0; i < bytes; ++i) { d[i] = s[i]; }\n"
-              << "}\n"
-              << "static inline void __tl_ptr_copy_elem("
-                 "device void* dst, threadgroup const void* src, int bytes) {\n"
-              << "  device char* d = (device char*)dst;\n"
-              << "  threadgroup const char* s = (threadgroup const char*)src;\n"
-              << "  for (int i = 0; i < bytes; ++i) { d[i] = s[i]; }\n"
-              << "}\n"
-              << "static inline void __tl_ptr_copy_elem("
-                 "threadgroup void* dst, threadgroup const void* src, int bytes) {\n"
-              << "  threadgroup char* d = (threadgroup char*)dst;\n"
-              << "  threadgroup const char* s = (threadgroup const char*)src;\n"
-              << "  for (int i = 0; i < bytes; ++i) { d[i] = s[i]; }\n"
-              << "}\n\n";
+  decl_stream
+      << "static inline void __tl_ptr_copy_elem("
+         "device void* dst, device const void* src, int bytes) {\n"
+      << "  device char* d = (device char*)dst;\n"
+      << "  device const char* s = (device const char*)src;\n"
+      << "  for (int i = 0; i < bytes; ++i) { d[i] = s[i]; }\n"
+      << "}\n"
+      << "static inline void __tl_ptr_copy_elem("
+         "threadgroup void* dst, device const void* src, int bytes) {\n"
+      << "  threadgroup char* d = (threadgroup char*)dst;\n"
+      << "  device const char* s = (device const char*)src;\n"
+      << "  for (int i = 0; i < bytes; ++i) { d[i] = s[i]; }\n"
+      << "}\n"
+      << "static inline void __tl_ptr_copy_elem("
+         "device void* dst, threadgroup const void* src, int bytes) {\n"
+      << "  device char* d = (device char*)dst;\n"
+      << "  threadgroup const char* s = (threadgroup const char*)src;\n"
+      << "  for (int i = 0; i < bytes; ++i) { d[i] = s[i]; }\n"
+      << "}\n"
+      << "static inline void __tl_ptr_copy_elem("
+         "threadgroup void* dst, threadgroup const void* src, int bytes) {\n"
+      << "  threadgroup char* d = (threadgroup char*)dst;\n"
+      << "  threadgroup const char* s = (threadgroup const char*)src;\n"
+      << "  for (int i = 0; i < bytes; ++i) { d[i] = s[i]; }\n"
+      << "}\n\n";
   decl_stream
       << "namespace tl {\n"
       << "struct SumOp {\n"
-      << "  template <typename T> inline T operator()(T x, T y) const { return x + y; }\n"
+      << "  template <typename T> inline T operator()(T x, T y) const { return "
+         "x + y; }\n"
       << "};\n"
       << "struct MulOp {\n"
-      << "  template <typename T> inline T operator()(T x, T y) const { return x * y; }\n"
+      << "  template <typename T> inline T operator()(T x, T y) const { return "
+         "x * y; }\n"
       << "};\n"
       << "struct MaxOp {\n"
-      << "  template <typename T> inline T operator()(T x, T y) const { return y < x ? x : y; }\n"
+      << "  template <typename T> inline T operator()(T x, T y) const { return "
+         "y < x ? x : y; }\n"
       << "};\n"
       << "struct MinOp {\n"
-      << "  template <typename T> inline T operator()(T x, T y) const { return y > x ? x : y; }\n"
+      << "  template <typename T> inline T operator()(T x, T y) const { return "
+         "y > x ? x : y; }\n"
       << "};\n"
       << "struct BitAndOp {\n"
-      << "  template <typename T> inline T operator()(T x, T y) const { return x & y; }\n"
+      << "  template <typename T> inline T operator()(T x, T y) const { return "
+         "x & y; }\n"
       << "};\n"
       << "struct BitOrOp {\n"
-      << "  template <typename T> inline T operator()(T x, T y) const { return x | y; }\n"
+      << "  template <typename T> inline T operator()(T x, T y) const { return "
+         "x | y; }\n"
       << "};\n"
       << "struct BitXorOp {\n"
-      << "  template <typename T> inline T operator()(T x, T y) const { return x ^ y; }\n"
+      << "  template <typename T> inline T operator()(T x, T y) const { return "
+         "x ^ y; }\n"
       << "};\n"
       << "template <typename T, int rows_per_threadgroup, int cols>\n"
       << "struct RowReduceSumContiguousInnermost {\n"
@@ -227,19 +235,22 @@ CodeGenTileLangMetal::CodeGenTileLangMetal(Target target) : target_(target) {
       << "                \"rows_per_threadgroup must be positive\");\n"
       << "  static_assert(cols > 0, \"cols must be positive\");\n"
       << "  enum { simdgroup_size = 32 };\n"
-      << "  static inline void run(device const T* A, device T* B, uint block_id,\n"
+      << "  static inline void run(device const T* A, device T* B, uint "
+         "block_id,\n"
       << "                         uint tid, uint rows) {\n"
       << "    const uint row_in_group = tid / uint(simdgroup_size);\n"
       << "    const uint lane = tid & uint(simdgroup_size - 1);\n"
       << "    if (row_in_group >= uint(rows_per_threadgroup)) {\n"
       << "      return;\n"
       << "    }\n"
-      << "    const uint row = block_id * uint(rows_per_threadgroup) + row_in_group;\n"
+      << "    const uint row = block_id * uint(rows_per_threadgroup) + "
+         "row_in_group;\n"
       << "    if (row >= rows) {\n"
       << "      return;\n"
       << "    }\n"
       << "    T acc = T(0);\n"
-      << "    for (uint col = lane; col < uint(cols); col += uint(simdgroup_size)) {\n"
+      << "    for (uint col = lane; col < uint(cols); col += "
+         "uint(simdgroup_size)) {\n"
       << "      acc += A[row * uint(cols) + col];\n"
       << "    }\n"
       << "    T total = simd_sum(acc);\n"
@@ -323,7 +334,8 @@ CodeGenTileLangMetal::CodeGenTileLangMetal(Target target) : target_(target) {
       << "    Barrier::template sync<1>();\n"
       << "    T result = red_buf[0];\n"
       << "    if (simdgroup_id == 0) {\n"
-      << "      result = lane < uint(simdgroup_count) ? red_buf[lane] : red_buf[0];\n"
+      << "      result = lane < uint(simdgroup_count) ? red_buf[lane] : "
+         "red_buf[0];\n"
       << "      result = reduce_partials(result, lane);\n"
       << "      if (lane == 0) {\n"
       << "        red_buf[final_slot] = result;\n"
@@ -409,10 +421,12 @@ CodeGenTileLangMetal::CodeGenTileLangMetal(Target target) : target_(target) {
       << "struct AllReduceStep;\n"
       << "template <class Reducer, int threads, int scale, int thread_offset,\n"
       << "          class Barrier, int batch_size, int workspace_stride>\n"
-      << "struct AllReduceStep<Reducer, threads, scale, thread_offset, Barrier,\n"
+      << "struct AllReduceStep<Reducer, threads, scale, thread_offset, "
+         "Barrier,\n"
       << "                     batch_size, workspace_stride, true> {\n"
       << "  template <typename T>\n"
-      << "  static inline T run(T x, uint tid, threadgroup T* red_buf = nullptr) {\n"
+      << "  static inline T run(T x, uint tid, threadgroup T* red_buf = "
+         "nullptr) {\n"
       << "    return x;\n"
       << "  }\n"
       << "  template <typename T>\n"
@@ -424,11 +438,13 @@ CodeGenTileLangMetal::CodeGenTileLangMetal(Target target) : target_(target) {
       << "};\n"
       << "template <class Reducer, int threads, int scale, int thread_offset,\n"
       << "          class Barrier, int batch_size, int workspace_stride>\n"
-      << "struct AllReduceStep<Reducer, threads, scale, thread_offset, Barrier,\n"
+      << "struct AllReduceStep<Reducer, threads, scale, thread_offset, "
+         "Barrier,\n"
       << "                     batch_size, workspace_stride, false> {\n"
       << "  enum { offset = threads / 2 };\n"
       << "  template <typename T>\n"
-      << "  static inline T run(T x, uint tid, threadgroup T* red_buf = nullptr) {\n"
+      << "  static inline T run(T x, uint tid, threadgroup T* red_buf = "
+         "nullptr) {\n"
       << "    const int local_tid = int(tid) - thread_offset;\n"
       << "    if (offset >= 32) {\n"
       << "      Barrier::template sync<1>();\n"
@@ -441,8 +457,10 @@ CodeGenTileLangMetal::CodeGenTileLangMetal(Target target) : target_(target) {
       << "    if (offset == scale) {\n"
       << "      return x;\n"
       << "    }\n"
-      << "    return AllReduce<Reducer, offset, scale, thread_offset, Barrier,\n"
-      << "                     batch_size, workspace_stride>::run(x, tid, red_buf);\n"
+      << "    return AllReduce<Reducer, offset, scale, thread_offset, "
+         "Barrier,\n"
+      << "                     batch_size, workspace_stride>::run(x, tid, "
+         "red_buf);\n"
       << "  }\n"
       << "  template <typename T>\n"
       << "  static inline void run_batch(thread T* x, uint tid,\n"
@@ -457,16 +475,19 @@ CodeGenTileLangMetal::CodeGenTileLangMetal(Target target) : target_(target) {
       << "      Barrier::template sync<2>();\n"
       << "      for (int i = 0; i < batch_size; ++i) {\n"
       << "        const int batch_offset = i * workspace_stride;\n"
-      << "        x[i] = Reducer()(x[i], red_buf[(local_tid ^ offset) + batch_offset]);\n"
+      << "        x[i] = Reducer()(x[i], red_buf[(local_tid ^ offset) + "
+         "batch_offset]);\n"
       << "      }\n"
       << "    } else {\n"
       << "      for (int i = 0; i < batch_size; ++i) {\n"
-      << "        x[i] = Reducer()(x[i], simd_shuffle_xor(x[i], uint(offset)));\n"
+      << "        x[i] = Reducer()(x[i], simd_shuffle_xor(x[i], "
+         "uint(offset)));\n"
       << "      }\n"
       << "    }\n"
       << "    if (offset != scale) {\n"
       << "      AllReduce<Reducer, offset, scale, thread_offset, Barrier,\n"
-      << "                batch_size, workspace_stride>::run_batch(x, tid, red_buf);\n"
+      << "                batch_size, workspace_stride>::run_batch(x, tid, "
+         "red_buf);\n"
       << "    }\n"
       << "  }\n"
       << "  template <typename T>\n"
@@ -482,35 +503,45 @@ CodeGenTileLangMetal::CodeGenTileLangMetal(Target target) : target_(target) {
       << "      Barrier::template sync<2>();\n"
       << "      for (int i = 0; i < batch_size; ++i) {\n"
       << "        const int batch_offset = i * workspace_stride;\n"
-      << "        x[i] = Reducer()(x[i], red_buf[(local_tid ^ offset) + batch_offset]);\n"
+      << "        x[i] = Reducer()(x[i], red_buf[(local_tid ^ offset) + "
+         "batch_offset]);\n"
       << "      }\n"
       << "    } else {\n"
       << "      for (int i = 0; i < batch_size; ++i) {\n"
-      << "        x[i] = Reducer()(x[i], simd_shuffle_xor(x[i], uint(offset)));\n"
+      << "        x[i] = Reducer()(x[i], simd_shuffle_xor(x[i], "
+         "uint(offset)));\n"
       << "      }\n"
       << "    }\n"
       << "    if (offset != scale) {\n"
       << "      AllReduce<Reducer, offset, scale, thread_offset, Barrier,\n"
-      << "                batch_size, workspace_stride>::run_batch(x, tid, red_buf);\n"
+      << "                batch_size, workspace_stride>::run_batch(x, tid, "
+         "red_buf);\n"
       << "    }\n"
       << "  }\n"
       << "};\n"
-      << "template <class Reducer, int threads, int scale, int thread_offset = 0,\n"
+      << "template <class Reducer, int threads, int scale, int thread_offset = "
+         "0,\n"
       << "          class Barrier = SyncThreadsBarrier, int batch_size = 1,\n"
       << "          int workspace_stride = 0>\n"
       << "struct AllReduce {\n"
       << "  static_assert(threads % scale == 0,\n"
-      << "                \"tl::AllReduce<>: threads must be divisible by scale\");\n"
+      << "                \"tl::AllReduce<>: threads must be divisible by "
+         "scale\");\n"
       << "  static_assert((threads & (threads - 1)) == 0,\n"
-      << "                \"tl::AllReduce<>: threads must be a power of two\");\n"
+      << "                \"tl::AllReduce<>: threads must be a power of "
+         "two\");\n"
       << "  template <typename T>\n"
-      << "  static inline T run(T x, uint tid, threadgroup T* red_buf = nullptr) {\n"
+      << "  static inline T run(T x, uint tid, threadgroup T* red_buf = "
+         "nullptr) {\n"
       << "    if (threads > 32 && scale == 1 && (thread_offset % 32) == 0 &&\n"
       << "        workspace_stride >= threads) {\n"
-      << "      return AllReduceSimdgroupCross<Reducer, threads, thread_offset,\n"
-      << "          Barrier, batch_size, workspace_stride>::run(x, tid, red_buf);\n"
+      << "      return AllReduceSimdgroupCross<Reducer, threads, "
+         "thread_offset,\n"
+      << "          Barrier, batch_size, workspace_stride>::run(x, tid, "
+         "red_buf);\n"
       << "    }\n"
-      << "    return AllReduceStep<Reducer, threads, scale, thread_offset, Barrier,\n"
+      << "    return AllReduceStep<Reducer, threads, scale, thread_offset, "
+         "Barrier,\n"
       << "                         batch_size, workspace_stride,\n"
       << "                         (threads == scale)>::run(x, tid, red_buf);\n"
       << "  }\n"
@@ -520,7 +551,8 @@ CodeGenTileLangMetal::CodeGenTileLangMetal(Target target) : target_(target) {
       << "    if (threads > 32 && scale == 1 && (thread_offset % 32) == 0 &&\n"
       << "        workspace_stride >= threads) {\n"
       << "      AllReduceSimdgroupCross<Reducer, threads, thread_offset,\n"
-      << "          Barrier, batch_size, workspace_stride>::run_batch(x, tid, red_buf);\n"
+      << "          Barrier, batch_size, workspace_stride>::run_batch(x, tid, "
+         "red_buf);\n"
       << "      return;\n"
       << "    }\n"
       << "    AllReduceStep<Reducer, threads, scale, thread_offset, Barrier,\n"
@@ -533,7 +565,8 @@ CodeGenTileLangMetal::CodeGenTileLangMetal(Target target) : target_(target) {
       << "    if (threads > 32 && scale == 1 && (thread_offset % 32) == 0 &&\n"
       << "        workspace_stride >= threads) {\n"
       << "      AllReduceSimdgroupCross<Reducer, threads, thread_offset,\n"
-      << "          Barrier, batch_size, workspace_stride>::run_batch(x, tid, red_buf);\n"
+      << "          Barrier, batch_size, workspace_stride>::run_batch(x, tid, "
+         "red_buf);\n"
       << "      return;\n"
       << "    }\n"
       << "    AllReduceStep<Reducer, threads, scale, thread_offset, Barrier,\n"
@@ -555,10 +588,12 @@ void CodeGenTileLangMetal::EmitFp8E3M4Helper() {
               << "  if (abs == 0u) return half(0.0f);\n"
               << "  uint exp = (raw >> 4) & 0x07u;\n"
               << "  uint mant = raw & 0x0fu;\n"
-              << "  if (exp == 0x07u && mant == 0x0fu) return half(as_type<float>(0x7fc00000u));\n"
+              << "  if (exp == 0x07u && mant == 0x0fu) return "
+                 "half(as_type<float>(0x7fc00000u));\n"
               << "  float mag = (exp == 0u)\n"
               << "      ? (float(mant) * 0.0625f * exp2(-2.0f))\n"
-              << "      : ((1.0f + float(mant) * 0.0625f) * exp2(float(int(exp) - 3)));\n"
+              << "      : ((1.0f + float(mant) * 0.0625f) * "
+                 "exp2(float(int(exp) - 3)));\n"
               << "  return half((raw & 0x80u) != 0u ? -mag : mag);\n"
               << "}\n\n";
 }
@@ -570,10 +605,12 @@ void CodeGenTileLangMetal::EmitFp8E4M3Helper() {
               << "  if (abs == 0u) return half(0.0f);\n"
               << "  uint exp = (raw >> 3) & 0x0fu;\n"
               << "  uint mant = raw & 0x07u;\n"
-              << "  if (exp == 0x0fu && mant == 0x07u) return half(as_type<float>(0x7fc00000u));\n"
+              << "  if (exp == 0x0fu && mant == 0x07u) return "
+                 "half(as_type<float>(0x7fc00000u));\n"
               << "  float mag = (exp == 0u)\n"
               << "      ? (float(mant) * 0.125f * exp2(-6.0f))\n"
-              << "      : ((1.0f + float(mant) * 0.125f) * exp2(float(int(exp) - 7)));\n"
+              << "      : ((1.0f + float(mant) * 0.125f) * exp2(float(int(exp) "
+                 "- 7)));\n"
               << "  return half((raw & 0x80u) != 0u ? -mag : mag);\n"
               << "}\n\n";
 }
@@ -591,27 +628,31 @@ void CodeGenTileLangMetal::EmitFp8E4M3FnuzHelper() {
               << "  uint exp = (raw >> 3) & 0x0fu;\n"
               << "  uint mant = raw & 0x07u;\n"
               << "  if (raw == 0u) return half(0.0f);\n"
-              << "  if (exp == 0x0fu && mant == 0x07u) return half(as_type<float>(0x7fc00000u));\n"
+              << "  if (exp == 0x0fu && mant == 0x07u) return "
+                 "half(as_type<float>(0x7fc00000u));\n"
               << "  float mag = (exp == 0u)\n"
               << "      ? (float(mant) * 0.125f * exp2(-6.0f))\n"
-              << "      : ((1.0f + float(mant) * 0.125f) * exp2(float(int(exp) - 7)));\n"
+              << "      : ((1.0f + float(mant) * 0.125f) * exp2(float(int(exp) "
+                 "- 7)));\n"
               << "  return half(mag);\n"
               << "}\n\n";
 }
 
 void CodeGenTileLangMetal::EmitFp8E4M3B11FnuzHelper() {
-  decl_stream << "static inline half __tvm_fp8_e4m3b11fnuz_to_half(uchar x) {\n"
-              << "  uint original = uint(x);\n"
-              << "  uint raw = original & 0x7fu;\n"
-              << "  uint exp = (raw >> 3) & 0x0fu;\n"
-              << "  uint mant = raw & 0x07u;\n"
-              << "  if (original == 0x80u) return half(as_type<float>(0x7fc00000u));\n"
-              << "  if (raw == 0u) return half(0.0f);\n"
-              << "  float mag = (exp == 0u)\n"
-              << "      ? (float(mant) * 0.125f * exp2(-10.0f))\n"
-              << "      : ((1.0f + float(mant) * 0.125f) * exp2(float(int(exp) - 11)));\n"
-              << "  return half(mag);\n"
-              << "}\n\n";
+  decl_stream
+      << "static inline half __tvm_fp8_e4m3b11fnuz_to_half(uchar x) {\n"
+      << "  uint original = uint(x);\n"
+      << "  uint raw = original & 0x7fu;\n"
+      << "  uint exp = (raw >> 3) & 0x0fu;\n"
+      << "  uint mant = raw & 0x07u;\n"
+      << "  if (original == 0x80u) return half(as_type<float>(0x7fc00000u));\n"
+      << "  if (raw == 0u) return half(0.0f);\n"
+      << "  float mag = (exp == 0u)\n"
+      << "      ? (float(mant) * 0.125f * exp2(-10.0f))\n"
+      << "      : ((1.0f + float(mant) * 0.125f) * exp2(float(int(exp) - "
+         "11)));\n"
+      << "  return half(mag);\n"
+      << "}\n\n";
 }
 
 void CodeGenTileLangMetal::EmitFp8E5M2Helper() {
@@ -622,29 +663,33 @@ void CodeGenTileLangMetal::EmitFp8E5M2Helper() {
               << "  uint exp = (raw >> 2) & 0x1fu;\n"
               << "  uint mant = raw & 0x03u;\n"
               << "  if (exp == 0x1fu) {\n"
-              << "    float inf = as_type<float>((raw & 0x80u) != 0u ? 0xff800000u : 0x7f800000u);\n"
+              << "    float inf = as_type<float>((raw & 0x80u) != 0u ? "
+                 "0xff800000u : 0x7f800000u);\n"
               << "    float nan = as_type<float>(0x7fc00000u);\n"
               << "    return half(mant == 0u ? inf : nan);\n"
               << "  }\n"
               << "  float mag = (exp == 0u)\n"
               << "      ? (float(mant) * 0.25f * exp2(-14.0f))\n"
-              << "      : ((1.0f + float(mant) * 0.25f) * exp2(float(int(exp) - 15)));\n"
+              << "      : ((1.0f + float(mant) * 0.25f) * exp2(float(int(exp) "
+                 "- 15)));\n"
               << "  return half((raw & 0x80u) != 0u ? -mag : mag);\n"
               << "}\n\n";
 }
 
 void CodeGenTileLangMetal::EmitFp8E5M2FnuzHelper() {
-  decl_stream << "static inline half __tvm_fp8_e5m2fnuz_to_half(uchar x) {\n"
-              << "  uint raw = uint(x) & 0x7fu;\n"
-              << "  uint exp = (raw >> 2) & 0x1fu;\n"
-              << "  uint mant = raw & 0x03u;\n"
-              << "  if (raw == 0u) return half(0.0f);\n"
-              << "  if (exp == 0x1fu) return half(as_type<float>(0x7fc00000u));\n"
-              << "  float mag = (exp == 0u)\n"
-              << "      ? (float(mant) * 0.25f * exp2(-14.0f))\n"
-              << "      : ((1.0f + float(mant) * 0.25f) * exp2(float(int(exp) - 15)));\n"
-              << "  return half(mag);\n"
-              << "}\n\n";
+  decl_stream
+      << "static inline half __tvm_fp8_e5m2fnuz_to_half(uchar x) {\n"
+      << "  uint raw = uint(x) & 0x7fu;\n"
+      << "  uint exp = (raw >> 2) & 0x1fu;\n"
+      << "  uint mant = raw & 0x03u;\n"
+      << "  if (raw == 0u) return half(0.0f);\n"
+      << "  if (exp == 0x1fu) return half(as_type<float>(0x7fc00000u));\n"
+      << "  float mag = (exp == 0u)\n"
+      << "      ? (float(mant) * 0.25f * exp2(-14.0f))\n"
+      << "      : ((1.0f + float(mant) * 0.25f) * exp2(float(int(exp) - "
+         "15)));\n"
+      << "  return half(mag);\n"
+      << "}\n\n";
 }
 
 void CodeGenTileLangMetal::EmitFp8E8M0FnuHelper() {
@@ -656,91 +701,142 @@ void CodeGenTileLangMetal::EmitFp8E8M0FnuHelper() {
 }
 
 void CodeGenTileLangMetal::EmitFp8Dot4Helpers() {
-  decl_stream << "constant float __tvm_fp8_e4m3fn_lut[256] = {\n"
-              << "  0.0f, 0.001953125f, 0.00390625f, 0.005859375f, 0.0078125f, 0.009765625f, 0.01171875f, 0.013671875f,\n"
-              << "  0.015625f, 0.017578125f, 0.01953125f, 0.021484375f, 0.0234375f, 0.025390625f, 0.02734375f, 0.029296875f,\n"
-              << "  0.03125f, 0.03515625f, 0.0390625f, 0.04296875f, 0.046875f, 0.05078125f, 0.0546875f, 0.05859375f,\n"
-              << "  0.0625f, 0.0703125f, 0.078125f, 0.0859375f, 0.09375f, 0.1015625f, 0.109375f, 0.1171875f,\n"
-              << "  0.125f, 0.140625f, 0.15625f, 0.171875f, 0.1875f, 0.203125f, 0.21875f, 0.234375f,\n"
-              << "  0.25f, 0.28125f, 0.3125f, 0.34375f, 0.375f, 0.40625f, 0.4375f, 0.46875f,\n"
-              << "  0.5f, 0.5625f, 0.625f, 0.6875f, 0.75f, 0.8125f, 0.875f, 0.9375f,\n"
-              << "  1.0f, 1.125f, 1.25f, 1.375f, 1.5f, 1.625f, 1.75f, 1.875f,\n"
-              << "  2.0f, 2.25f, 2.5f, 2.75f, 3.0f, 3.25f, 3.5f, 3.75f,\n"
-              << "  4.0f, 4.5f, 5.0f, 5.5f, 6.0f, 6.5f, 7.0f, 7.5f,\n"
-              << "  8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f,\n"
-              << "  16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f,\n"
-              << "  32.0f, 36.0f, 40.0f, 44.0f, 48.0f, 52.0f, 56.0f, 60.0f,\n"
-              << "  64.0f, 72.0f, 80.0f, 88.0f, 96.0f, 104.0f, 112.0f, 120.0f,\n"
-              << "  128.0f, 144.0f, 160.0f, 176.0f, 192.0f, 208.0f, 224.0f, 240.0f,\n"
-              << "  256.0f, 288.0f, 320.0f, 352.0f, 384.0f, 416.0f, 448.0f, 0.0f,\n"
-              << "  0.0f, -0.001953125f, -0.00390625f, -0.005859375f, -0.0078125f, -0.009765625f, -0.01171875f, -0.013671875f,\n"
-              << "  -0.015625f, -0.017578125f, -0.01953125f, -0.021484375f, -0.0234375f, -0.025390625f, -0.02734375f, -0.029296875f,\n"
-              << "  -0.03125f, -0.03515625f, -0.0390625f, -0.04296875f, -0.046875f, -0.05078125f, -0.0546875f, -0.05859375f,\n"
-              << "  -0.0625f, -0.0703125f, -0.078125f, -0.0859375f, -0.09375f, -0.1015625f, -0.109375f, -0.1171875f,\n"
-              << "  -0.125f, -0.140625f, -0.15625f, -0.171875f, -0.1875f, -0.203125f, -0.21875f, -0.234375f,\n"
-              << "  -0.25f, -0.28125f, -0.3125f, -0.34375f, -0.375f, -0.40625f, -0.4375f, -0.46875f,\n"
-              << "  -0.5f, -0.5625f, -0.625f, -0.6875f, -0.75f, -0.8125f, -0.875f, -0.9375f,\n"
-              << "  -1.0f, -1.125f, -1.25f, -1.375f, -1.5f, -1.625f, -1.75f, -1.875f,\n"
-              << "  -2.0f, -2.25f, -2.5f, -2.75f, -3.0f, -3.25f, -3.5f, -3.75f,\n"
-              << "  -4.0f, -4.5f, -5.0f, -5.5f, -6.0f, -6.5f, -7.0f, -7.5f,\n"
-              << "  -8.0f, -9.0f, -10.0f, -11.0f, -12.0f, -13.0f, -14.0f, -15.0f,\n"
-              << "  -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -28.0f, -30.0f,\n"
-              << "  -32.0f, -36.0f, -40.0f, -44.0f, -48.0f, -52.0f, -56.0f, -60.0f,\n"
-              << "  -64.0f, -72.0f, -80.0f, -88.0f, -96.0f, -104.0f, -112.0f, -120.0f,\n"
-              << "  -128.0f, -144.0f, -160.0f, -176.0f, -192.0f, -208.0f, -224.0f, -240.0f,\n"
-              << "  -256.0f, -288.0f, -320.0f, -352.0f, -384.0f, -416.0f, -448.0f, NAN,\n"
-              << "};\n\n";
-  decl_stream << "static inline float __tvm_fp8_e4m3_dot4_words(uint pa, uint pb) {\n"
-              << "  return __tvm_fp8_e4m3fn_lut[pa & 0xFFu] * __tvm_fp8_e4m3fn_lut[pb & 0xFFu]\n"
-              << "       + __tvm_fp8_e4m3fn_lut[(pa >> 8) & 0xFFu] * __tvm_fp8_e4m3fn_lut[(pb >> 8) & 0xFFu]\n"
-              << "       + __tvm_fp8_e4m3fn_lut[(pa >> 16) & 0xFFu] * __tvm_fp8_e4m3fn_lut[(pb >> 16) & 0xFFu]\n"
-              << "       + __tvm_fp8_e4m3fn_lut[(pa >> 24) & 0xFFu] * __tvm_fp8_e4m3fn_lut[(pb >> 24) & 0xFFu];\n"
-              << "}\n\n";
-  decl_stream << "static inline uint __tvm_fp8_load_u32(device const uchar* p, uint word_idx) {\n"
-              << "  return reinterpret_cast<device const uint*>(p)[word_idx];\n"
-              << "}\n"
-              << "static inline uint __tvm_fp8_load_u32(threadgroup const uchar* p, uint word_idx) {\n"
-              << "  return reinterpret_cast<threadgroup const uint*>(p)[word_idx];\n"
-              << "}\n"
-              << "static inline uint __tvm_fp8_load_u32(constant const uchar* p, uint word_idx) {\n"
-              << "  return reinterpret_cast<constant const uint*>(p)[word_idx];\n"
-              << "}\n"
-              << "static inline uint __tvm_fp8_load_u32(device const uint* p, uint word_idx) {\n"
-              << "  return p[word_idx];\n"
-              << "}\n"
-              << "static inline uint __tvm_fp8_load_u32(threadgroup const uint* p, uint word_idx) {\n"
-              << "  return p[word_idx];\n"
-              << "}\n"
-              << "static inline uint __tvm_fp8_load_u32(constant const uint* p, uint word_idx) {\n"
-              << "  return p[word_idx];\n"
-              << "}\n\n";
-  decl_stream << "static inline float __tvm_fp8_e4m3_dot4_packed(device const uchar* a, device const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
-              << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
-              << "}\n"
-              << "static inline float __tvm_fp8_e4m3_dot4_packed(device const uchar* a, threadgroup const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
-              << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
-              << "}\n"
-              << "static inline float __tvm_fp8_e4m3_dot4_packed(device const uchar* a, constant const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
-              << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
-              << "}\n"
-              << "static inline float __tvm_fp8_e4m3_dot4_packed(threadgroup const uchar* a, device const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
-              << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
-              << "}\n"
-              << "static inline float __tvm_fp8_e4m3_dot4_packed(threadgroup const uchar* a, threadgroup const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
-              << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
-              << "}\n"
-              << "static inline float __tvm_fp8_e4m3_dot4_packed(threadgroup const uchar* a, constant const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
-              << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
-              << "}\n"
-              << "static inline float __tvm_fp8_e4m3_dot4_packed(constant const uchar* a, device const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
-              << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
-              << "}\n"
-              << "static inline float __tvm_fp8_e4m3_dot4_packed(constant const uchar* a, threadgroup const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
-              << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
-              << "}\n"
-              << "static inline float __tvm_fp8_e4m3_dot4_packed(constant const uchar* a, constant const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
-              << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
-	              << "}\n\n";
+  decl_stream
+      << "constant float __tvm_fp8_e4m3fn_lut[256] = {\n"
+      << "  0.0f, 0.001953125f, 0.00390625f, 0.005859375f, 0.0078125f, "
+         "0.009765625f, 0.01171875f, 0.013671875f,\n"
+      << "  0.015625f, 0.017578125f, 0.01953125f, 0.021484375f, 0.0234375f, "
+         "0.025390625f, 0.02734375f, 0.029296875f,\n"
+      << "  0.03125f, 0.03515625f, 0.0390625f, 0.04296875f, 0.046875f, "
+         "0.05078125f, 0.0546875f, 0.05859375f,\n"
+      << "  0.0625f, 0.0703125f, 0.078125f, 0.0859375f, 0.09375f, 0.1015625f, "
+         "0.109375f, 0.1171875f,\n"
+      << "  0.125f, 0.140625f, 0.15625f, 0.171875f, 0.1875f, 0.203125f, "
+         "0.21875f, 0.234375f,\n"
+      << "  0.25f, 0.28125f, 0.3125f, 0.34375f, 0.375f, 0.40625f, 0.4375f, "
+         "0.46875f,\n"
+      << "  0.5f, 0.5625f, 0.625f, 0.6875f, 0.75f, 0.8125f, 0.875f, 0.9375f,\n"
+      << "  1.0f, 1.125f, 1.25f, 1.375f, 1.5f, 1.625f, 1.75f, 1.875f,\n"
+      << "  2.0f, 2.25f, 2.5f, 2.75f, 3.0f, 3.25f, 3.5f, 3.75f,\n"
+      << "  4.0f, 4.5f, 5.0f, 5.5f, 6.0f, 6.5f, 7.0f, 7.5f,\n"
+      << "  8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f,\n"
+      << "  16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f,\n"
+      << "  32.0f, 36.0f, 40.0f, 44.0f, 48.0f, 52.0f, 56.0f, 60.0f,\n"
+      << "  64.0f, 72.0f, 80.0f, 88.0f, 96.0f, 104.0f, 112.0f, 120.0f,\n"
+      << "  128.0f, 144.0f, 160.0f, 176.0f, 192.0f, 208.0f, 224.0f, 240.0f,\n"
+      << "  256.0f, 288.0f, 320.0f, 352.0f, 384.0f, 416.0f, 448.0f, 0.0f,\n"
+      << "  0.0f, -0.001953125f, -0.00390625f, -0.005859375f, -0.0078125f, "
+         "-0.009765625f, -0.01171875f, -0.013671875f,\n"
+      << "  -0.015625f, -0.017578125f, -0.01953125f, -0.021484375f, "
+         "-0.0234375f, -0.025390625f, -0.02734375f, -0.029296875f,\n"
+      << "  -0.03125f, -0.03515625f, -0.0390625f, -0.04296875f, -0.046875f, "
+         "-0.05078125f, -0.0546875f, -0.05859375f,\n"
+      << "  -0.0625f, -0.0703125f, -0.078125f, -0.0859375f, -0.09375f, "
+         "-0.1015625f, -0.109375f, -0.1171875f,\n"
+      << "  -0.125f, -0.140625f, -0.15625f, -0.171875f, -0.1875f, -0.203125f, "
+         "-0.21875f, -0.234375f,\n"
+      << "  -0.25f, -0.28125f, -0.3125f, -0.34375f, -0.375f, -0.40625f, "
+         "-0.4375f, -0.46875f,\n"
+      << "  -0.5f, -0.5625f, -0.625f, -0.6875f, -0.75f, -0.8125f, -0.875f, "
+         "-0.9375f,\n"
+      << "  -1.0f, -1.125f, -1.25f, -1.375f, -1.5f, -1.625f, -1.75f, -1.875f,\n"
+      << "  -2.0f, -2.25f, -2.5f, -2.75f, -3.0f, -3.25f, -3.5f, -3.75f,\n"
+      << "  -4.0f, -4.5f, -5.0f, -5.5f, -6.0f, -6.5f, -7.0f, -7.5f,\n"
+      << "  -8.0f, -9.0f, -10.0f, -11.0f, -12.0f, -13.0f, -14.0f, -15.0f,\n"
+      << "  -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -28.0f, -30.0f,\n"
+      << "  -32.0f, -36.0f, -40.0f, -44.0f, -48.0f, -52.0f, -56.0f, -60.0f,\n"
+      << "  -64.0f, -72.0f, -80.0f, -88.0f, -96.0f, -104.0f, -112.0f, "
+         "-120.0f,\n"
+      << "  -128.0f, -144.0f, -160.0f, -176.0f, -192.0f, -208.0f, -224.0f, "
+         "-240.0f,\n"
+      << "  -256.0f, -288.0f, -320.0f, -352.0f, -384.0f, -416.0f, -448.0f, "
+         "NAN,\n"
+      << "};\n\n";
+  decl_stream
+      << "static inline float __tvm_fp8_e4m3_dot4_words(uint pa, uint pb) {\n"
+      << "  return __tvm_fp8_e4m3fn_lut[pa & 0xFFu] * __tvm_fp8_e4m3fn_lut[pb "
+         "& 0xFFu]\n"
+      << "       + __tvm_fp8_e4m3fn_lut[(pa >> 8) & 0xFFu] * "
+         "__tvm_fp8_e4m3fn_lut[(pb >> 8) & 0xFFu]\n"
+      << "       + __tvm_fp8_e4m3fn_lut[(pa >> 16) & 0xFFu] * "
+         "__tvm_fp8_e4m3fn_lut[(pb >> 16) & 0xFFu]\n"
+      << "       + __tvm_fp8_e4m3fn_lut[(pa >> 24) & 0xFFu] * "
+         "__tvm_fp8_e4m3fn_lut[(pb >> 24) & 0xFFu];\n"
+      << "}\n\n";
+  decl_stream
+      << "static inline uint __tvm_fp8_load_u32(device const uchar* p, uint "
+         "word_idx) {\n"
+      << "  return reinterpret_cast<device const uint*>(p)[word_idx];\n"
+      << "}\n"
+      << "static inline uint __tvm_fp8_load_u32(threadgroup const uchar* p, "
+         "uint word_idx) {\n"
+      << "  return reinterpret_cast<threadgroup const uint*>(p)[word_idx];\n"
+      << "}\n"
+      << "static inline uint __tvm_fp8_load_u32(constant const uchar* p, uint "
+         "word_idx) {\n"
+      << "  return reinterpret_cast<constant const uint*>(p)[word_idx];\n"
+      << "}\n"
+      << "static inline uint __tvm_fp8_load_u32(device const uint* p, uint "
+         "word_idx) {\n"
+      << "  return p[word_idx];\n"
+      << "}\n"
+      << "static inline uint __tvm_fp8_load_u32(threadgroup const uint* p, "
+         "uint word_idx) {\n"
+      << "  return p[word_idx];\n"
+      << "}\n"
+      << "static inline uint __tvm_fp8_load_u32(constant const uint* p, uint "
+         "word_idx) {\n"
+      << "  return p[word_idx];\n"
+      << "}\n\n";
+  decl_stream
+      << "static inline float __tvm_fp8_e4m3_dot4_packed(device const uchar* "
+         "a, device const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
+      << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, "
+         "a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+      << "}\n"
+      << "static inline float __tvm_fp8_e4m3_dot4_packed(device const uchar* "
+         "a, threadgroup const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
+      << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, "
+         "a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+      << "}\n"
+      << "static inline float __tvm_fp8_e4m3_dot4_packed(device const uchar* "
+         "a, constant const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
+      << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, "
+         "a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+      << "}\n"
+      << "static inline float __tvm_fp8_e4m3_dot4_packed(threadgroup const "
+         "uchar* a, device const uchar* b, uint a_word_idx, uint b_word_idx) "
+         "{\n"
+      << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, "
+         "a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+      << "}\n"
+      << "static inline float __tvm_fp8_e4m3_dot4_packed(threadgroup const "
+         "uchar* a, threadgroup const uchar* b, uint a_word_idx, uint "
+         "b_word_idx) {\n"
+      << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, "
+         "a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+      << "}\n"
+      << "static inline float __tvm_fp8_e4m3_dot4_packed(threadgroup const "
+         "uchar* a, constant const uchar* b, uint a_word_idx, uint b_word_idx) "
+         "{\n"
+      << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, "
+         "a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+      << "}\n"
+      << "static inline float __tvm_fp8_e4m3_dot4_packed(constant const uchar* "
+         "a, device const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
+      << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, "
+         "a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+      << "}\n"
+      << "static inline float __tvm_fp8_e4m3_dot4_packed(constant const uchar* "
+         "a, threadgroup const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
+      << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, "
+         "a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+      << "}\n"
+      << "static inline float __tvm_fp8_e4m3_dot4_packed(constant const uchar* "
+         "a, constant const uchar* b, uint a_word_idx, uint b_word_idx) {\n"
+      << "  return __tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32(a, "
+         "a_word_idx), __tvm_fp8_load_u32(b, b_word_idx));\n"
+      << "}\n\n";
 }
 
 void CodeGenTileLangMetal::EmitBFloat16Helper() {
@@ -760,16 +856,20 @@ void CodeGenTileLangMetal::EmitBFloat16Helper() {
               << "    return as_type<float>(uint(bits) << 16);\n"
               << "  }\n"
               << "};\n"
-              << "static inline float __tvm_bfloat16_to_float(thread const tvm_bfloat16& value) {\n"
+              << "static inline float __tvm_bfloat16_to_float(thread const "
+                 "tvm_bfloat16& value) {\n"
               << "  return as_type<float>(uint(value.bits) << 16);\n"
               << "}\n"
-              << "static inline float __tvm_bfloat16_to_float(device const tvm_bfloat16& value) {\n"
+              << "static inline float __tvm_bfloat16_to_float(device const "
+                 "tvm_bfloat16& value) {\n"
               << "  return as_type<float>(uint(value.bits) << 16);\n"
               << "}\n"
-              << "static inline float __tvm_bfloat16_to_float(threadgroup const tvm_bfloat16& value) {\n"
+              << "static inline float __tvm_bfloat16_to_float(threadgroup "
+                 "const tvm_bfloat16& value) {\n"
               << "  return as_type<float>(uint(value.bits) << 16);\n"
               << "}\n"
-              << "static inline float __tvm_bfloat16_to_float(constant const tvm_bfloat16& value) {\n"
+              << "static inline float __tvm_bfloat16_to_float(constant const "
+                 "tvm_bfloat16& value) {\n"
               << "  return as_type<float>(uint(value.bits) << 16);\n"
               << "}\n\n";
 }
@@ -856,12 +956,14 @@ public:
 
   void VisitExpr_(const BufferLoadNode *op) final {
     Note(op->dtype);
-    if (op->buffer.defined()) Note(op->buffer->dtype);
+    if (op->buffer.defined())
+      Note(op->buffer->dtype);
     StmtExprVisitor::VisitExpr_(op);
   }
   void VisitStmt_(const BufferStoreNode *op) final {
     Note(op->value.dtype());
-    if (op->buffer.defined()) Note(op->buffer->dtype);
+    if (op->buffer.defined())
+      Note(op->buffer->dtype);
     StmtExprVisitor::VisitStmt_(op);
   }
   void VisitExpr_(const CastNode *op) final {
@@ -976,13 +1078,17 @@ void CodeGenTileLangMetal::CollectReferencedLowPrecisionDtypes(
   collector(f->body);
   referenced_fp8_codes_.insert(collector.referenced_codes.begin(),
                                collector.referenced_codes.end());
-  if (collector.uses_dot4) uses_fp8_dot4_ = true;
-  if (collector.uses_atomic_add) uses_atomic_add_ = true;
-  if (collector.uses_atomic_cas) uses_atomic_cas_ = true;
+  if (collector.uses_dot4)
+    uses_fp8_dot4_ = true;
+  if (collector.uses_atomic_add)
+    uses_atomic_add_ = true;
+  if (collector.uses_atomic_cas)
+    uses_atomic_cas_ = true;
 }
 
 void CodeGenTileLangMetal::EmitAtomicAddHelperPrelude() {
-  if (!uses_atomic_add_ || emitted_atomic_add_helper_) return;
+  if (!uses_atomic_add_ || emitted_atomic_add_helper_)
+    return;
   emitted_atomic_add_helper_ = true;
   // The bf16 AtomicAdd overloads below reference the `tvm_bfloat16` storage
   // struct. PrintType emits it lazily, but the kernel body that triggers that
@@ -994,7 +1100,8 @@ void CodeGenTileLangMetal::EmitAtomicAddHelperPrelude() {
       << "static inline float AtomicAdd(device float* address, float val,\n"
       << "                              int memory_order = 0) {\n"
       << "  (void)memory_order;\n"
-      << "  device atomic_uint* bits = reinterpret_cast<device atomic_uint*>(address);\n"
+      << "  device atomic_uint* bits = reinterpret_cast<device "
+         "atomic_uint*>(address);\n"
       << "  uint old_bits = atomic_load_explicit(bits, memory_order_relaxed);\n"
       << "  while (true) {\n"
       << "    float old_val = as_type<float>(old_bits);\n"
@@ -1026,7 +1133,8 @@ void CodeGenTileLangMetal::EmitAtomicAddHelperPrelude() {
       // accumulates gradients into dynamic threadgroup scratch (buf_dyn_shmem),
       // which is `threadgroup float*` — the device-only overloads above do not
       // match. These mirror the device variants in threadgroup address space.
-      << "static inline float AtomicAdd(threadgroup float* address, float val,\n"
+      << "static inline float AtomicAdd(threadgroup float* address, float "
+         "val,\n"
       << "                              int memory_order = 0) {\n"
       << "  (void)memory_order;\n"
       << "  threadgroup atomic_uint* bits =\n"
@@ -1059,13 +1167,13 @@ void CodeGenTileLangMetal::EmitAtomicAddHelperPrelude() {
       << "      memory_order_relaxed);\n"
       << "}\n"
       // bfloat16 overloads. Apple GPUs have no native bf16 atomic, so we run a
-      // 32-bit-word CAS loop on the containing aligned word: the bf16 element is
-      // 16-bit (tvm_bfloat16::bits is a ushort), so we align the byte address
-      // down to a 4-byte boundary, pick which 16-bit half holds our element,
-      // decode old bf16 -> float, add val (float), re-encode to bf16 with the
-      // SAME round-to-nearest-even used by tvm_bfloat16(float), splice it back
-      // into the correct half, and CAS the whole word. Returns the pre-add
-      // float value. This is numerically correct for scatter/gradient
+      // 32-bit-word CAS loop on the containing aligned word: the bf16 element
+      // is 16-bit (tvm_bfloat16::bits is a ushort), so we align the byte
+      // address down to a 4-byte boundary, pick which 16-bit half holds our
+      // element, decode old bf16 -> float, add val (float), re-encode to bf16
+      // with the SAME round-to-nearest-even used by tvm_bfloat16(float), splice
+      // it back into the correct half, and CAS the whole word. Returns the
+      // pre-add float value. This is numerically correct for scatter/gradient
       // accumulation (each addend lands at bf16 precision, like a serial bf16
       // sum). Mirrors the float CAS loop above for both address spaces.
       << "static inline ushort __tl_bf16_round(float value) {\n"
@@ -1073,11 +1181,13 @@ void CodeGenTileLangMetal::EmitAtomicAddHelperPrelude() {
       << "  uint lsb = (raw >> 16) & 1u;\n"
       << "  return ushort((raw + 0x7fffu + lsb) >> 16);\n"
       << "}\n"
-      << "static inline float AtomicAdd(device tvm_bfloat16* address, float val,\n"
+      << "static inline float AtomicAdd(device tvm_bfloat16* address, float "
+         "val,\n"
       << "                              int memory_order = 0) {\n"
       << "  (void)memory_order;\n"
       << "  uintptr_t addr = reinterpret_cast<uintptr_t>(address);\n"
-      << "  uint shift = uint(addr & 2u) * 8u;  // 0 for low half, 16 for high\n"
+      << "  uint shift = uint(addr & 2u) * 8u;  // 0 for low half, 16 for "
+         "high\n"
       << "  device atomic_uint* word = reinterpret_cast<device atomic_uint*>(\n"
       << "      addr & ~uintptr_t(3u));\n"
       << "  uint old_word = atomic_load_explicit(word, memory_order_relaxed);\n"
@@ -1102,7 +1212,8 @@ void CodeGenTileLangMetal::EmitAtomicAddHelperPrelude() {
       << "  uintptr_t addr = reinterpret_cast<uintptr_t>(address);\n"
       << "  uint shift = uint(addr & 2u) * 8u;\n"
       << "  threadgroup atomic_uint* word =\n"
-      << "      reinterpret_cast<threadgroup atomic_uint*>(addr & ~uintptr_t(3u));\n"
+      << "      reinterpret_cast<threadgroup atomic_uint*>(addr & "
+         "~uintptr_t(3u));\n"
       << "  uint old_word = atomic_load_explicit(word, memory_order_relaxed);\n"
       << "  while (true) {\n"
       << "    ushort old_bits = ushort((old_word >> shift) & 0xffffu);\n"
@@ -1123,7 +1234,8 @@ void CodeGenTileLangMetal::EmitAtomicAddHelperPrelude() {
 }
 
 void CodeGenTileLangMetal::EmitAtomicCASHelperPrelude() {
-  if (!uses_atomic_cas_ || emitted_atomic_cas_helper_) return;
+  if (!uses_atomic_cas_ || emitted_atomic_cas_helper_)
+    return;
   emitted_atomic_cas_helper_ = true;
   decl_stream
       << "namespace tl {\n"
@@ -1132,8 +1244,10 @@ void CodeGenTileLangMetal::EmitAtomicCASHelperPrelude() {
       << "  (void)memory_order;\n"
       << "  int observed = expected;\n"
       << "  while (!atomic_compare_exchange_weak_explicit(\n"
-      << "             reinterpret_cast<device atomic_int*>(address), &observed,\n"
-      << "             desired, memory_order_relaxed, memory_order_relaxed)) {\n"
+      << "             reinterpret_cast<device atomic_int*>(address), "
+         "&observed,\n"
+      << "             desired, memory_order_relaxed, memory_order_relaxed)) "
+         "{\n"
       << "    if (observed != expected) break;\n"
       << "  }\n"
       << "  return observed;\n"
@@ -1143,8 +1257,10 @@ void CodeGenTileLangMetal::EmitAtomicCASHelperPrelude() {
       << "  (void)memory_order;\n"
       << "  uint observed = expected;\n"
       << "  while (!atomic_compare_exchange_weak_explicit(\n"
-      << "             reinterpret_cast<device atomic_uint*>(address), &observed,\n"
-      << "             desired, memory_order_relaxed, memory_order_relaxed)) {\n"
+      << "             reinterpret_cast<device atomic_uint*>(address), "
+         "&observed,\n"
+      << "             desired, memory_order_relaxed, memory_order_relaxed)) "
+         "{\n"
       << "    if (observed != expected) break;\n"
       << "  }\n"
       << "  return observed;\n"
@@ -1196,7 +1312,8 @@ void CodeGenTileLangMetal::EmitFPHelperPrelude() {
   }
   // The dot4-packed path stores its inputs as e4m3fn but uses the LUT path,
   // so it does not require __tvm_fp8_e4m3_to_half — emit only the LUT helpers.
-  if (uses_fp8_dot4_) EmitFp8Dot4Helpers();
+  if (uses_fp8_dot4_)
+    EmitFp8Dot4Helpers();
 }
 
 void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
@@ -1245,15 +1362,17 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
   size_t num_buffer = 0;
   size_t limit =
       target_->GetAttr<Integer>("max_function_args").value().IntValue();
-  // RULE #1 (cppmega Path-C auto-split, design §6.5): an over-budget kernel must
-  // NEVER silently reach newComputePipelineState. Count only handle (buffer-
-  // binding) params -- the ABI-correct metric the Python auto-split planner uses
+  // RULE #1 (cppmega Path-C auto-split, design §6.5): an over-budget kernel
+  // must NEVER silently reach newComputePipelineState. Count only handle
+  // (buffer- binding) params -- the ABI-correct metric the Python auto-split
+  // planner uses
   // (_kernel_parameter_count_for_target counts buffer_map entries only); scalar
-  // by-value params consume no buffer-argument slot. If the buffer-binding count
-  // exceeds the device buffer-argument limit, FAIL LOUD here instead of emitting
-  // a kernel the Metal driver will crash on. The Python planner is guaranteed to
-  // pre-empt this (it breaks/raises at the accept/reject point), so reaching this
-  // throw means the pre-empt was bypassed -- surface it, do not degrade.
+  // by-value params consume no buffer-argument slot. If the buffer-binding
+  // count exceeds the device buffer-argument limit, FAIL LOUD here instead of
+  // emitting a kernel the Metal driver will crash on. The Python planner is
+  // guaranteed to pre-empt this (it breaks/raises at the accept/reject point),
+  // so reaching this throw means the pre-empt was bypassed -- surface it, do
+  // not degrade.
   size_t num_buffer_binding_params = 0;
   for (size_t i = 0; i < func->params.size(); ++i) {
     if (func->params[i].dtype().is_handle()) {
@@ -1265,7 +1384,8 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
       << " buffer arguments, exceeding the device max_function_args limit of "
       << limit
       << ". This over-budget kernel would crash newComputePipelineState; the "
-         "Path-C auto-split planner must split it before codegen (RULE #1: fail "
+         "Path-C auto-split planner must split it before codegen (RULE #1: "
+         "fail "
          "loud, never emit a kernel that silently fails on the device).";
   std::unordered_map<std::string, const VarNode *> external_buffer_aliases;
   MetalBodyBufferWriteCollector write_collector;
@@ -1437,7 +1557,8 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
     }
   }
   if (needs_simd_lane_id) {
-    stream << "  uint " << simd_lane_id_id << " [[thread_index_in_simdgroup]]\n";
+    stream << "  uint " << simd_lane_id_id
+           << " [[thread_index_in_simdgroup]]\n";
   }
   // Stash the resolved MSL identifiers on the codegen instance via a
   // function-static map keyed by ``this``; the call-site visitor reads them
@@ -1453,7 +1574,8 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
   // the function scope.
   stream << ") {\n";
   int func_scope = this->BeginScope();
-  MetalBodyBufferAliasCollector alias_collector(std::move(external_buffer_aliases));
+  MetalBodyBufferAliasCollector alias_collector(
+      std::move(external_buffer_aliases));
   alias_collector(func->body);
   for (const auto &kv : alias_collector.aliases()) {
     auto param_it = var_idmap_.find(kv.second.param_var);
@@ -1461,11 +1583,12 @@ void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
         << "Metal body buffer alias matched param without a codegen id: "
         << kv.first->name_hint;
     if (!var_idmap_.count(kv.first)) {
-      // FlattenBuffer/PointerValueTypeRewrite may create a body-local Buffer.data
-      // Var that is pointer-distinct from both the ABI param and buffer_map
-      // entry.  Source codegen is pointer-identity based, so register that
-      // external alias to the already emitted Metal parameter before printing
-      // the body.  Scratch/local buffers are excluded by the global-scope check.
+      // FlattenBuffer/PointerValueTypeRewrite may create a body-local
+      // Buffer.data Var that is pointer-distinct from both the ABI param and
+      // buffer_map entry.  Source codegen is pointer-identity based, so
+      // register that external alias to the already emitted Metal parameter
+      // before printing the body.  Scratch/local buffers are excluded by the
+      // global-scope check.
       var_idmap_[kv.first] = param_it->second;
       alloc_storage_scope_[kv.first] = "global";
       RegisterHandleType(kv.first, kv.second.dtype);
@@ -1726,7 +1849,8 @@ void CodeGenTileLangMetal::EmitCooperativeTensorLanePreambleIfNeeded() {
     // the build callback is responsible for selecting that flag when the
     // CT path is active.
     decl_stream
-        << "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n";
+        << "#include "
+           "<MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n";
     emitted_mpp_include_ = true;
   }
   if (!emitted_frag_lane_vars_) {
@@ -1900,7 +2024,8 @@ void CodeGenTileLangMetal::VisitStmt_(const AllocBufferNode *op) {
     stream << "simdgroup_" << dtype_str << "8x8 " << vid << '['
            << scalar_elements / 64 << "];\n";
   } else if (scope == "local.var") {
-    ICHECK(dtype.is_scalar()) << "Vector local.var allocation is not supported.";
+    ICHECK(dtype.is_scalar())
+        << "Vector local.var allocation is not supported.";
     ICHECK_EQ(constant_size, 1)
         << "Only scalar local.var allocation is supported.";
     PrimExpr init = tirx::make_const(dtype, 0);
@@ -1977,8 +2102,8 @@ void CodeGenTileLangMetal::VisitStmt_(const ForNode *op) {
     if (ann != op->annotations.end()) {
       const auto *factor = (*ann).second.as<IntImmNode>();
       ICHECK(factor) << "pragma_unroll_factor expects an IntImm value";
-      stream << "#pragma unroll "
-             << PrintExpr(Downcast<IntImm>((*ann).second)) << "\n";
+      stream << "#pragma unroll " << PrintExpr(Downcast<IntImm>((*ann).second))
+             << "\n";
     } else if (it != unroll_factor_.end()) {
       stream << "#pragma unroll " << PrintExpr(it->second) << "\n";
     } else {
@@ -1989,7 +2114,7 @@ void CodeGenTileLangMetal::VisitStmt_(const ForNode *op) {
 }
 
 void CodeGenTileLangMetal::VisitExpr_(const BufferLoadNode *op,
-                                       std::ostream &os) { // NOLINT(*)
+                                      std::ostream &os) { // NOLINT(*)
   std::string scope;
   auto it = alloc_storage_scope_.find(op->buffer->data.get());
   if (it != alloc_storage_scope_.end()) {
@@ -2027,7 +2152,8 @@ void CodeGenTileLangMetal::VisitExpr_(const VarNode *op,
     ICHECK(it != GetMetalScalarIntrinIdMap().end() &&
            !it->second.simd_lane_id.empty())
         << "canonical Metal SIMD-lane scalar var referenced from a kernel "
-        << "whose signature was not augmented with [[thread_index_in_simdgroup]]";
+        << "whose signature was not augmented with "
+           "[[thread_index_in_simdgroup]]";
     os << it->second.simd_lane_id;
     return;
   }
@@ -2216,9 +2342,8 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
           << "inlined cooperative_tensor C load expects a single 16x32 "
              "destination micro-tile per call, got "
           << mma_tiles_per_load;
-      int buf_base = ct_c_inlined_base_.count(v.get())
-                         ? ct_c_inlined_base_[v.get()]
-                         : 0;
+      int buf_base =
+          ct_c_inlined_base_.count(v.get()) ? ct_c_inlined_base_[v.get()] : 0;
       int base_pct = buf_base + load_idx_imm->value * mma_tiles_per_load;
       // mpp C tile: row-major rows x cols (M x N) -> mpp extents (N, M),
       // strides {1, stride}.
@@ -2296,9 +2421,8 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
           << "inlined cooperative_tensor C store expects a single 16x32 "
              "destination micro-tile per call, got "
           << mma_tiles_per_store;
-      int buf_base = ct_c_inlined_base_.count(v.get())
-                         ? ct_c_inlined_base_[v.get()]
-                         : 0;
+      int buf_base =
+          ct_c_inlined_base_.count(v.get()) ? ct_c_inlined_base_[v.get()] : 0;
       int base_pct = buf_base + store_idx_imm->value * mma_tiles_per_store;
       // mpp C tile: row-major rows x cols (M x N), row stride `stride`.
       // mpp-order extents are (cols, rows) = (N, M), strides {1, stride}.
@@ -2372,9 +2496,8 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
     bool c_inlined = ct_c_inlined_.count(c_v.get()) > 0;
     auto *c_idx_imm = op->args[1].as<IntImmNode>();
     bool c_idx_const = c_inlined && c_idx_imm != nullptr;
-    int c_buf_base = ct_c_inlined_base_.count(c_v.get())
-                         ? ct_c_inlined_base_[c_v.get()]
-                         : 0;
+    int c_buf_base =
+        ct_c_inlined_base_.count(c_v.get()) ? ct_c_inlined_base_[c_v.get()] : 0;
 
     // LAYOUT-CORRECTNESS FIX: fill the mpp input cooperative tensors via mpp's
     // native `cooperative_tensor.load(metal::tensor<...>)`.  This replaces the
@@ -2405,10 +2528,10 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
     // extents are (cols, rows) and strides {1, stride}.  A tile is M(rows) x
     // K(cols); B tile is K(rows) x N(cols).  The descriptor's transpose flags
     // tell mpp how to interpret it.
-    auto emit_src_tensor = [&](const std::string &name,
-                               const std::string &addr, const std::string &dt,
-                               const std::string &ptr, const std::string &strd,
-                               int extent0, int extent1) {
+    auto emit_src_tensor = [&](const std::string &name, const std::string &addr,
+                               const std::string &dt, const std::string &ptr,
+                               const std::string &strd, int extent0,
+                               int extent1) {
       os << "metal::tensor<" << addr << " " << dt
          << ", metal::dextents<int32_t, 2>, metal::tensor_inline> " << name
          << "((" << addr << " " << dt << "*)" << ptr
@@ -2486,11 +2609,9 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
     ICHECK_EQ(op->args.size(), 3U)
         << "tir.atomic_cas expects dst_ptr, expected, and desired.";
     ICHECK(op->dtype.is_int() || op->dtype.is_uint())
-        << "Metal tir.atomic_cas supports int/uint dtypes; got "
-        << op->dtype;
+        << "Metal tir.atomic_cas supports int/uint dtypes; got " << op->dtype;
     ICHECK_EQ(op->dtype.bits(), 32)
-        << "Metal tir.atomic_cas supports 32-bit atomics; got "
-        << op->dtype;
+        << "Metal tir.atomic_cas supports 32-bit atomics; got " << op->dtype;
     os << "tl::AtomicCAS(" << PrintExpr(op->args[0]) << ", "
        << PrintExpr(op->args[1]) << ", " << PrintExpr(op->args[2]) << ")";
   } else if (op->op.same_as(tl::atomic_xchg_elem_op()) ||
@@ -2506,9 +2627,9 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
     // ``atomic_int`` / ``atomic_uint`` storage; for fp dtypes the runtime
     // would need a CAS loop, so we error out cleanly here. The Op enum is
     // statically registered in src/op/builtin.cc.
-    bool is_int_atomic = op->args.size() >= 2 &&
-                         (op->args[1].dtype().is_int() ||
-                          op->args[1].dtype().is_uint());
+    bool is_int_atomic =
+        op->args.size() >= 2 &&
+        (op->args[1].dtype().is_int() || op->args[1].dtype().is_uint());
     ICHECK(is_int_atomic)
         << "Metal atomic xchg/and/or/xor only supports atomic_int / "
         << "atomic_uint dtypes; got value dtype " << op->args[1].dtype()
@@ -2526,8 +2647,8 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
     } else {
       fn = "atomic_fetch_xor_explicit";
     }
-    os << fn << "(" << PrintExpr(op->args[0]) << ", "
-       << PrintExpr(op->args[1]) << ", memory_order_relaxed)";
+    os << fn << "(" << PrintExpr(op->args[0]) << ", " << PrintExpr(op->args[1])
+       << ", memory_order_relaxed)";
   } else if (auto *opn = op->op.as<OpNode>();
              opn != nullptr &&
              MetalFp8DTypeCollector::IsFp8Dot4Intrin(opn->name)) {
@@ -2538,10 +2659,8 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
         << "tir[x].metal.fp8_e4m3_dot4 expects 4 args (a_ptr, b_ptr, "
         << "a_word_idx, b_word_idx), got " << op->args.size();
     os << "__tvm_fp8_e4m3_dot4_words(__tvm_fp8_load_u32("
-       << PrintExpr(op->args[0]) << ", "
-       << PrintExpr(op->args[2]) << "), "
-       << "__tvm_fp8_load_u32("
-       << PrintExpr(op->args[1]) << ", "
+       << PrintExpr(op->args[0]) << ", " << PrintExpr(op->args[2]) << "), "
+       << "__tvm_fp8_load_u32(" << PrintExpr(op->args[1]) << ", "
        << PrintExpr(op->args[3]) << "))";
   } else if (auto *opn = op->op.as<OpNode>();
              opn != nullptr &&
@@ -2561,8 +2680,7 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
     os << "(__tvm_fp8_e4m3fn_lut[" << pa << " & 0xFFu] * __tvm_fp8_e4m3fn_lut["
        << pb << " & 0xFFu]"
        << " + __tvm_fp8_e4m3fn_lut[(" << pa
-       << " >> 8) & 0xFFu] * __tvm_fp8_e4m3fn_lut[(" << pb
-       << " >> 8) & 0xFFu]"
+       << " >> 8) & 0xFFu] * __tvm_fp8_e4m3fn_lut[(" << pb << " >> 8) & 0xFFu]"
        << " + __tvm_fp8_e4m3fn_lut[(" << pa
        << " >> 16) & 0xFFu] * __tvm_fp8_e4m3fn_lut[(" << pb
        << " >> 16) & 0xFFu]"
@@ -2595,7 +2713,8 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
     ICHECK(it != GetMetalScalarIntrinIdMap().end() &&
            !it->second.simd_lane_id.empty())
         << "tir[x].metal.thread_index_in_simdgroup referenced from a kernel "
-        << "whose signature was not augmented with [[thread_index_in_simdgroup]]"
+        << "whose signature was not augmented with "
+           "[[thread_index_in_simdgroup]]"
         << " — body collector missed the call site, file a bug.";
     os << it->second.simd_lane_id;
   } else if (auto *opn = op->op.as<OpNode>();
@@ -2686,8 +2805,8 @@ ffi::Module BuildTileLangMetal(IRModule mod, Target target) {
     return tl::PointerValueTypeRewrite(std::move(f), true);
   };
   mod = tirx::transform::CreatePrimFuncPass(
-            pass_func, 0, "tl.TileLangMetalPointerValueTypeRewrite", {})(
-      std::move(mod));
+      pass_func, 0, "tl.TileLangMetalPointerValueTypeRewrite",
+      {})(std::move(mod));
 
   std::ostringstream source_maker;
   // CPPMEGA: apache's new MetalModuleCreateWithFallback expects

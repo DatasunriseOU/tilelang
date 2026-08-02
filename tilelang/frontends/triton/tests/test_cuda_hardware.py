@@ -14,6 +14,7 @@ On a CUDA Hopper host the tests assert NUMERIC_PASS against the
 production numeric harness and additionally check that the TTIR
 captured upstream carries the expected descriptor / dot ops.
 """
+
 from __future__ import annotations
 
 import importlib
@@ -43,9 +44,7 @@ pytestmark = [
 
 def _run_numeric_one(name: str):
     """Run one kernel through the production numeric smoke harness."""
-    numeric_smoke = importlib.import_module(
-        "poc.triton_frontend._test_harness.numeric_smoke"
-    )
+    numeric_smoke = importlib.import_module("poc.triton_frontend._test_harness.numeric_smoke")
     deps = numeric_smoke._probe_deps()
     if deps.get("triton") is not None:
         pytest.skip(f"triton unavailable: {deps['triton']}")
@@ -67,8 +66,7 @@ def test_fa_v3_real_tma_path_numeric_pass_on_cuda() -> None:
     if result.verdict == "SKIP" and "mlx unavailable" in result.detail:
         pytest.skip(result.detail)
     assert result.verdict == "NUMERIC_PASS", (
-        f"fa_v3 on CUDA must NUMERIC_PASS; got verdict={result.verdict} "
-        f"detail={result.detail!r} max_abs={result.max_abs_err}"
+        f"fa_v3 on CUDA must NUMERIC_PASS; got verdict={result.verdict} detail={result.detail!r} max_abs={result.max_abs_err}"
     )
 
 
@@ -84,8 +82,7 @@ def test_descriptor_store_end_to_end_numeric_pass_on_cuda() -> None:
     if result.verdict == "SKIP" and "mlx unavailable" in result.detail:
         pytest.skip(result.detail)
     assert result.verdict == "NUMERIC_PASS", (
-        f"tma_descriptor_store on CUDA must NUMERIC_PASS; got "
-        f"verdict={result.verdict} detail={result.detail!r}"
+        f"tma_descriptor_store on CUDA must NUMERIC_PASS; got verdict={result.verdict} detail={result.detail!r}"
     )
 
 
@@ -97,23 +94,15 @@ def test_fa_v3_ttir_carries_hopper_tma_and_wgmma_markers() -> None:
     descriptor/WGMMA markers. The check is text-level so it runs on any
     CUDA host even without launching the kernel.
     """
-    jit_to_ttir = importlib.import_module(
-        "poc.triton_frontend._test_harness.jit_to_ttir"
-    )
-    fa_v3 = importlib.import_module(
-        "poc.triton_frontend._test_harness.numeric_kernels.fa_v3"
-    )
+    jit_to_ttir = importlib.import_module("poc.triton_frontend._test_harness.jit_to_ttir")
+    fa_v3 = importlib.import_module("poc.triton_frontend._test_harness.numeric_kernels.fa_v3")
     text = jit_to_ttir.triton_jit_to_ttir(
         fa_v3.TRITON_KERNEL,
         constexprs=fa_v3.META_ARGS,
         signature=fa_v3.TTIR_SIGNATURE,
     )
     assert "tt.make_tensor_descriptor" in text, (
-        "FA-v3 TTIR is missing tt.make_tensor_descriptor; the rewrite to "
-        "the real Hopper kernel did not survive"
+        "FA-v3 TTIR is missing tt.make_tensor_descriptor; the rewrite to the real Hopper kernel did not survive"
     )
-    assert "tt.descriptor_load" in text, (
-        "FA-v3 TTIR is missing tt.descriptor_load; the rewrite to the "
-        "real Hopper kernel did not survive"
-    )
+    assert "tt.descriptor_load" in text, "FA-v3 TTIR is missing tt.descriptor_load; the rewrite to the real Hopper kernel did not survive"
     assert "tt.dot" in text, "FA-v3 TTIR is missing tt.dot"

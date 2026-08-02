@@ -677,8 +677,8 @@ private:
 class SharedMemoryRewriter : public StmtExprMutator {
 public:
   explicit SharedMemoryRewriter(const SharedAllocMap &shmem_allocs,
-                                bool is_dynamic = true,
-                                bool verbose = false, int align_bytes = 0)
+                                bool is_dynamic = true, bool verbose = false,
+                                int align_bytes = 0)
       : is_dynamic_{is_dynamic}, shmem_allocs_{shmem_allocs}, verbose_{verbose},
         align_bytes_{align_bytes} {
     if (!is_dynamic) {
@@ -722,9 +722,8 @@ private:
           auto alloc_it = shmem_allocs_.find(buffer_var_node);
           if (alloc_it != shmem_allocs_.end()) {
             const SharedAllocInfo &alloc = alloc_it->second;
-            PrimExpr buffer_size_bytes = make_const(DataType::Int(64),
-                                                    alloc.dtype.bytes() *
-                                                        alloc.dtype.lanes());
+            PrimExpr buffer_size_bytes = make_const(
+                DataType::Int(64), alloc.dtype.bytes() * alloc.dtype.lanes());
             for (const PrimExpr &extent : alloc.extents) {
               buffer_size_bytes = buffer_size_bytes * extent;
             }
@@ -750,7 +749,8 @@ private:
       // (tilelang.transform.Simplify only intercepts LetStmt, then
       // tir.transform.* and the host/device codegen entry points) would
       // crash with "NodeFunctor calls un-registered function on type
-      // tilelang.Allocate". Mirrors apache's own merge_shared_memory_allocations
+      // tilelang.Allocate". Mirrors apache's own
+      // merge_shared_memory_allocations
       // (3rdparty/tvm/src/s_tir/transform/merge_shared_memory_allocations.cc:341).
       Buffer merged_buf(merged_buf_var_, DataType::UInt(8),
                         {merged_alloc_size_}, {}, PrimExpr(),
@@ -788,9 +788,9 @@ private:
                          /*buffer_type=*/BufferType::kDefault,
                          /*axis_separators=*/{},
                          /*span=*/op->span);
-    Stmt seq = SeqStmt({AllocBuffer(alloc_buf_obj, op->annotations, op->span),
-                        body},
-                       op->span);
+    Stmt seq =
+        SeqStmt({AllocBuffer(alloc_buf_obj, op->annotations, op->span), body},
+                op->span);
     bool trivial = false;
     if (const auto *imm = op->condition.as<IntImmNode>()) {
       trivial = (imm->value != 0);
@@ -992,10 +992,8 @@ private:
         PrimExpr offset = this->VisitExpr(op->args[1]);
         int index_factor = dtype.bytes();
         Array<PrimExpr> cp_async_args = {
-            merged_buf_var_,
-            mul(extra_offset + offset, PrimExpr(index_factor)),
-            op->args[2],
-            op->args[3],
+            merged_buf_var_, mul(extra_offset + offset, PrimExpr(index_factor)),
+            op->args[2],     op->args[3],
             op->args[4],
         };
         if (op->args.size() == 6U) {
@@ -1377,8 +1375,9 @@ private:
     }
 
     // Do not append kill points into event_map_ while iterating it.  In
-    // particular, last_stmt_at_level may be the same statement whose kill vector
-    // is being erased below, and push_back would invalidate the active iterator.
+    // particular, last_stmt_at_level may be the same statement whose kill
+    // vector is being erased below, and push_back would invalidate the active
+    // iterator.
     std::vector<std::pair<const Object *, const VarNode *>> pending_kill_moves;
     for (auto &event_pair : event_map_) {
       const Object *stmt = event_pair.first;
@@ -1607,8 +1606,7 @@ private:
       BufInfo info;
       info.var = var;
       info.name = var->name_hint;
-      info.start =
-          start_it == start_index.end() ? seq_len : start_it->second;
+      info.start = start_it == start_index.end() ? seq_len : start_it->second;
       info.end = std::max(end_index[var], info.start + 1);
       info.alignment = align_bytes_;
       auto align_it = shmem_alignment_map_.find(var);

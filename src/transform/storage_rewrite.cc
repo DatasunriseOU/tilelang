@@ -22,13 +22,13 @@
  * \brief Memory access pattern analysis and optimization.
  *  Re-write data access to enable memory sharing when possible.
  */
+#include "vendored/target_info.h"
+#include "vendored/tl_attr.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/attrs.h>
 #include <tvm/ir/type.h>
-#include "vendored/target_info.h"
-#include "vendored/tl_attr.h"
 #include <tvm/s_tir/stmt.h>
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>
@@ -277,7 +277,8 @@ struct AllocationRef {
       return buf;
     }
     ICHECK(legacy_alloc != nullptr);
-    return Buffer(/*data=*/data, /*dtype=*/alloc_type, /*shape=*/std::move(shape),
+    return Buffer(/*data=*/data, /*dtype=*/alloc_type,
+                  /*shape=*/std::move(shape),
                   /*strides=*/{}, /*elem_offset=*/PrimExpr(),
                   /*name=*/data->name_hint, /*data_alignment=*/0,
                   /*offset_factor=*/0, /*buffer_type=*/BufferType::kDefault,
@@ -675,8 +676,7 @@ public:
   using AllocEntry = LinearAccessPatternFinder::AllocEntry;
 
   Stmt Rewrite(Stmt stmt, bool detect_inplace, bool enable_reuse,
-               bool reuse_require_exact_matched_dtype,
-               bool reuse_shared_memory,
+               bool reuse_require_exact_matched_dtype, bool reuse_shared_memory,
                bool reuse_large_plain_local,
                Map<Var, PrimExpr> local_var_init_map = {}) {
     detect_inplace_ = detect_inplace;
@@ -825,9 +825,7 @@ public:
     }
   }
 
-  Stmt VisitStmt_(const AllocateNode *op) {
-    return this->VisitStmt(op->body);
-  }
+  Stmt VisitStmt_(const AllocateNode *op) { return this->VisitStmt(op->body); }
 
   Stmt VisitStmt_(const AllocBufferNode *op) final {
     // AllocBuffer combines the allocation and its buffer declaration.  The
@@ -948,8 +946,8 @@ private:
     }
     return annotations;
   }
-  Map<String, ffi::Any> MergeAllocAnnotations(
-      const Map<String, ffi::Any> &base, const Var &buffer_var) const {
+  Map<String, ffi::Any> MergeAllocAnnotations(const Map<String, ffi::Any> &base,
+                                              const Var &buffer_var) const {
     Map<String, ffi::Any> annotations;
     for (const auto &kv : base) {
       annotations.Set(kv.first, kv.second);
@@ -1044,9 +1042,8 @@ private:
           // The legacy condition was always `const_true()` here in practice
           // because merge candidates have already been filtered, but if
           // non-trivial we honor it via IfThenElse later in the nest fold.
-          Buffer alloc_buf_obj =
-              e->allocs[0].MakeBuffer(e->alloc_var, alloc_type,
-                                       e->allocs[0].extents());
+          Buffer alloc_buf_obj = e->allocs[0].MakeBuffer(
+              e->alloc_var, alloc_type, e->allocs[0].extents());
           e->alloc_nest.push_back(
               AllocBuffer(alloc_buf_obj, std::move(annotations)));
           if (auto ptr = e->allocs[0].LegacyDeclBuffer()) {
@@ -1169,8 +1166,7 @@ private:
     // `tl_tir::Allocate`. See rationale at line ~895 (NewAlloc).
     Buffer alloc_buf_tag =
         e->allocs[0].MakeBuffer(e->alloc_var, e->elem_type, {alloc_size});
-    e->alloc_nest.push_back(
-        AllocBuffer(alloc_buf_tag, std::move(annotations)));
+    e->alloc_nest.push_back(AllocBuffer(alloc_buf_tag, std::move(annotations)));
     if (info.defined()) {
       ICHECK_LE(total_bits, info->max_num_bits)
           << "Allocation exceed bound of memory tag " << e->scope.to_string();
@@ -1392,13 +1388,13 @@ private:
   }
 
   static bool IsUntaggedNonReusableAlloc(const AllocationRef &op,
-                                          const StorageScope &scope,
-                                          bool reuse_large_plain_local) {
+                                         const StorageScope &scope,
+                                         bool reuse_large_plain_local) {
     uint64_t const_nbits = ConstantAllocationNBits(op);
     bool is_known_size = (const_nbits != 0);
     if (reuse_large_plain_local && scope.rank == StorageRank::kLocal &&
-        scope.tag.empty() && !op.dtype().is_handle() &&
-        is_known_size && const_nbits > 32) {
+        scope.tag.empty() && !op.dtype().is_handle() && is_known_size &&
+        const_nbits > 32) {
       return false;
     }
     return scope.tag.empty() &&
@@ -1407,9 +1403,9 @@ private:
   }
 
   StorageEntry *FindAlloc(const AllocationRef &op, const Object *attach_scope,
-                           const StorageScope &scope,
-                           size_t num_physical_dimensions, bool enable_reuse,
-                           bool reuse_require_exact_matched_dtype) {
+                          const StorageScope &scope,
+                          size_t num_physical_dimensions, bool enable_reuse,
+                          bool reuse_require_exact_matched_dtype) {
     ICHECK(op);
     // skip plan for local variable,
     // compiler can do a better job with register allocation.
@@ -1941,11 +1937,12 @@ public:
     }
 
     ICHECK_EQ(index_lanes * var_info.element_dtype.lanes(), value_dtype.lanes())
-        << "Attempting to retrieve " << value_dtype.lanes() << " lanes of data with "
-        << index_lanes << " indices into an array whose elements have "
+        << "Attempting to retrieve " << value_dtype.lanes()
+        << " lanes of data with " << index_lanes
+        << " indices into an array whose elements have "
         << var_info.element_dtype.lanes() << " lanes.  "
-        << "Expected output with " << index_lanes * var_info.element_dtype.lanes()
-        << " lanes.";
+        << "Expected output with "
+        << index_lanes * var_info.element_dtype.lanes() << " lanes.";
 
     // If the index is a RampNode with stride of 1 and offset
     // divisible by the number of number of lanes, and the predicate
@@ -2273,8 +2270,7 @@ public:
                            /*data_alignment=*/0,
                            /*offset_factor=*/0,
                            /*buffer_type=*/BufferType::kDefault);
-      Stmt seq =
-          SeqStmt({AllocBuffer(alloc_buf_obj, annotations), inner_body});
+      Stmt seq = SeqStmt({AllocBuffer(alloc_buf_obj, annotations), inner_body});
       bool trivial = false;
       if (const auto *imm = condition.as<IntImmNode>()) {
         trivial = (imm->value != 0);
@@ -2383,10 +2379,10 @@ PrimFunc PointerValueTypeRewrite(
                                   rewrite_scalar_read_to_vector_shuffle);
   checker(f->body);
 
-  VectorTypeRewriter rewriter(
-      checker.info_map_, rewrite_params, rewrite_buffer_map,
-      rewrite_alloc_buffer_node, rewrite_indices, rewrite_let_node,
-      rewrite_scalar_read_to_vector_shuffle);
+  VectorTypeRewriter rewriter(checker.info_map_, rewrite_params,
+                              rewrite_buffer_map, rewrite_alloc_buffer_node,
+                              rewrite_indices, rewrite_let_node,
+                              rewrite_scalar_read_to_vector_shuffle);
   PrimFuncNode *n = f.CopyOnWrite();
   n->body = rewriter(std::move(n->body));
   rewriter.Finalize(&f);
@@ -2435,11 +2431,10 @@ Pass StorageRewrite() {
     n->body = plan_rewriter.Rewrite(
         std::move(n->body), detect_inplace, enable_reuse,
         reuse_require_exact_matched_dtype, reuse_shared_memory,
-        reuse_large_plain_local,
-        std::move(local_var_init_map));
+        reuse_large_plain_local, std::move(local_var_init_map));
     // Parameters may not be rewritten, but internal allocations may.
-    return PointerValueTypeRewrite(std::move(f), true, false, false, true,
-                                   true, true, false);
+    return PointerValueTypeRewrite(std::move(f), true, false, false, true, true,
+                                   true, false);
   };
   return CreatePrimFuncPass(pass_func, 0, "tir.StorageRewrite", {});
 }

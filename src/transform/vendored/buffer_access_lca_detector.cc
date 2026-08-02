@@ -51,16 +51,17 @@ namespace tirx {
  * \brief Detect the lowest common ancestor(LCA) position of Buffer access.
  * \note
  * - Only consider SBlockNode and ForNode to be the LCA nodes.
- * - In the LCA locator, we are aware of the buffer scope and CUDA hierarchy so that any buffer in
- * global memory will have its buffer access LCA outside all launch sites of `blockIdx`, in order to
- * prevent conflicts between buffer memory scopes and CUDA hierarchy.
+ * - In the LCA locator, we are aware of the buffer scope and CUDA hierarchy so
+ * that any buffer in global memory will have its buffer access LCA outside all
+ * launch sites of `blockIdx`, in order to prevent conflicts between buffer
+ * memory scopes and CUDA hierarchy.
  */
 class LCADetector : public StmtExprVisitor {
- public:
-  static ffi::Map<Buffer, ffi::Optional<Stmt>> Detect(const PrimFunc& func) {
+public:
+  static ffi::Map<Buffer, ffi::Optional<Stmt>> Detect(const PrimFunc &func) {
     LCADetector detector;
-    for (const auto& kv : func->buffer_map) {
-      const Buffer& buffer = kv.second;
+    for (const auto &kv : func->buffer_map) {
+      const Buffer &buffer = kv.second;
       detector.buffer_var_map_.emplace(buffer->data.get(), buffer.get());
     }
 
@@ -76,19 +77,20 @@ class LCADetector : public StmtExprVisitor {
 
     // Prepare the return
     ffi::Map<Buffer, ffi::Optional<Stmt>> buffer_lca;
-    for (const auto& kv : detector.buffer_lca_) {
-      const Buffer& buffer = ffi::GetRef<Buffer>(kv.first);
+    for (const auto &kv : detector.buffer_lca_) {
+      const Buffer &buffer = ffi::GetRef<Buffer>(kv.first);
       const ffi::Optional<Stmt> stmt =
-          kv.second ? ffi::GetRef<ffi::Optional<Stmt>>(kv.second->stmt) : std::nullopt;
+          kv.second ? ffi::GetRef<ffi::Optional<Stmt>>(kv.second->stmt)
+                    : std::nullopt;
       buffer_lca.Set(buffer, stmt);
     }
     return buffer_lca;
   }
 
-  static ffi::Map<Var, ffi::Optional<Stmt>> DetectVar(const PrimFunc& func) {
+  static ffi::Map<Var, ffi::Optional<Stmt>> DetectVar(const PrimFunc &func) {
     LCADetector detector;
-    for (const auto& kv : func->buffer_map) {
-      const Buffer& buffer = kv.second;
+    for (const auto &kv : func->buffer_map) {
+      const Buffer &buffer = kv.second;
       detector.buffer_var_map_.emplace(buffer->data.get(), buffer.get());
     }
 
@@ -99,39 +101,41 @@ class LCADetector : public StmtExprVisitor {
 
     // Prepare the return
     ffi::Map<Var, ffi::Optional<Stmt>> var_lca;
-    for (const auto& kv : detector.buffer_var_lca_) {
-      const Var& var = ffi::GetRef<Var>(kv.first);
+    for (const auto &kv : detector.buffer_var_lca_) {
+      const Var &var = ffi::GetRef<Var>(kv.first);
       const ffi::Optional<Stmt> stmt =
-          kv.second ? ffi::GetRef<ffi::Optional<Stmt>>(kv.second->stmt) : std::nullopt;
+          kv.second ? ffi::GetRef<ffi::Optional<Stmt>>(kv.second->stmt)
+                    : std::nullopt;
       var_lca.Set(var, stmt);
     }
     return var_lca;
   }
 
- private:
+private:
   /*!
    * \brief The AST node information for querying LCA.
-   * \note Only SBlockNode and ForNode are considered, since they are the only statements whose
-   *       body can be a SeqStmt (the LCA of buffer access) in TensorIR.
+   * \note Only SBlockNode and ForNode are considered, since they are the only
+   * statements whose body can be a SeqStmt (the LCA of buffer access) in
+   * TensorIR.
    */
   struct ScopeInfo {
     // The parent scope info
-    const ScopeInfo* parent_scope_info;
+    const ScopeInfo *parent_scope_info;
     // The parent scope stmt node
-    const StmtNode* stmt;
+    const StmtNode *stmt;
     // The scope depth in the AST
     int depth;
-    ScopeInfo(const ScopeInfo* parent_info, const StmtNode* stmt, int depth)
+    ScopeInfo(const ScopeInfo *parent_info, const StmtNode *stmt, int depth)
         : parent_scope_info(parent_info), stmt(stmt), depth(depth) {}
   };
 
-  void VisitStmt_(const ForNode* op) final {
+  void VisitStmt_(const ForNode *op) final {
     int n = ancestor_scopes_.size();
-    const ScopeInfo* parent_scope = ancestor_scopes_.back();
-    auto* current_scope = arena_.make<ScopeInfo>(parent_scope, op, n);
+    const ScopeInfo *parent_scope = ancestor_scopes_.back();
+    auto *current_scope = arena_.make<ScopeInfo>(parent_scope, op, n);
 
     if (op->thread_binding.defined()) {
-      const runtime::ThreadScope& scope =
+      const runtime::ThreadScope &scope =
           runtime::ThreadScope::Create(op->thread_binding.value()->thread_tag);
       if (scope.rank == 0) {
         blockidx_scopes_.push_back(current_scope);
@@ -145,15 +149,15 @@ class LCADetector : public StmtExprVisitor {
     loop_scope_map_.erase(op->loop_var.get());
   }
 
-  void VisitStmt_(const SBlockRealizeNode* op) final {
-    const SBlockNode* block = op->block.get();
+  void VisitStmt_(const SBlockRealizeNode *op) final {
+    const SBlockNode *block = op->block.get();
     int n = ancestor_scopes_.size();
-    for (const Buffer& buf : block->alloc_buffers) {
+    for (const Buffer &buf : block->alloc_buffers) {
       buffer_var_map_.emplace(buf->data.get(), buf.get());
     }
 
-    const ScopeInfo* parent_scope = ancestor_scopes_.back();
-    auto* current_scope = arena_.make<ScopeInfo>(parent_scope, block, n);
+    const ScopeInfo *parent_scope = ancestor_scopes_.back();
+    auto *current_scope = arena_.make<ScopeInfo>(parent_scope, block, n);
 
     ancestor_scopes_.push_back(current_scope);
 
@@ -166,8 +170,9 @@ class LCADetector : public StmtExprVisitor {
     UpdateDominateScopeOfNonDataParIter(op);
 
     // Update match_buffers
-    for (const MatchBufferRegion& match_buffer : block->match_buffers) {
-      UpdateBufferLCA(match_buffer->source->buffer.get(), ancestor_scopes_.back());
+    for (const MatchBufferRegion &match_buffer : block->match_buffers) {
+      UpdateBufferLCA(match_buffer->source->buffer.get(),
+                      ancestor_scopes_.back());
       match_buffers_.insert(match_buffer->buffer.get());
     }
 
@@ -175,24 +180,28 @@ class LCADetector : public StmtExprVisitor {
     ancestor_scopes_.pop_back();
   }
 
-  void UpdateDominateScopeOfNonDataParIter(const SBlockRealizeNode* block_realize) {
+  void
+  UpdateDominateScopeOfNonDataParIter(const SBlockRealizeNode *block_realize) {
     // map iter var to the scope which dominate all loop carried dependencies.
-    std::unordered_map<const VarNode*, const ScopeInfo*> opaque_var_scope;
-    // maintain highest scope which dominate all reduce loop iters. null denotes non-reduce block.
-    const ScopeInfo* highest_reduce_scope = nullptr;
+    std::unordered_map<const VarNode *, const ScopeInfo *> opaque_var_scope;
+    // maintain highest scope which dominate all reduce loop iters. null denotes
+    // non-reduce block.
+    const ScopeInfo *highest_reduce_scope = nullptr;
 
-    // function to collect `itervar_to_dom_scope`, the result scope for each block
-    // iter var should be above all loop scopes the opaque iter var binding relates to.
-    auto do_collect_itervar_scope = [this](const IterVar& itervar,
-                                           const PrimExpr& binding) -> const ScopeInfo* {
-      const ScopeInfo* highest_scope = nullptr;
-      PostOrderVisit(binding, [this, &highest_scope](const ObjectRef& obj) {
-        if (const VarNode* loop_var = obj.as<VarNode>()) {
+    // function to collect `itervar_to_dom_scope`, the result scope for each
+    // block iter var should be above all loop scopes the opaque iter var
+    // binding relates to.
+    auto do_collect_itervar_scope =
+        [this](const IterVar &itervar,
+               const PrimExpr &binding) -> const ScopeInfo * {
+      const ScopeInfo *highest_scope = nullptr;
+      PostOrderVisit(binding, [this, &highest_scope](const ObjectRef &obj) {
+        if (const VarNode *loop_var = obj.as<VarNode>()) {
           auto it = loop_scope_map_.find(loop_var);
           if (it == loop_scope_map_.end()) {
             return;
           }
-          const ScopeInfo* scope = it->second->parent_scope_info;
+          const ScopeInfo *scope = it->second->parent_scope_info;
           if (highest_scope == nullptr) {
             highest_scope = scope;
           } else if (scope->depth < highest_scope->depth) {
@@ -204,39 +213,45 @@ class LCADetector : public StmtExprVisitor {
     };
 
     // collect non-data-parallel block iteration's dominate scope.
-    // for reduction iter type, we maintain the highest dominate scope for all reduce iters.
-    // for other iter type, we maintain the dict for each individual iter.
-    const SBlock& block = block_realize->block;
+    // for reduction iter type, we maintain the highest dominate scope for all
+    // reduce iters. for other iter type, we maintain the dict for each
+    // individual iter.
+    const SBlock &block = block_realize->block;
     bool is_reduce_block = false;
     for (size_t i = 0; i < block_realize->iter_values.size(); ++i) {
-      const IterVar& iter_var = block->iter_vars[i];
+      const IterVar &iter_var = block->iter_vars[i];
       if (iter_var->iter_type != IterVarType::kDataPar) {
-        const auto* scope = do_collect_itervar_scope(iter_var, block_realize->iter_values[i]);
-        if (scope == nullptr) continue;
+        const auto *scope =
+            do_collect_itervar_scope(iter_var, block_realize->iter_values[i]);
+        if (scope == nullptr)
+          continue;
         if (iter_var->iter_type == IterVarType::kCommReduce) {
           is_reduce_block = true;
-          if (highest_reduce_scope == nullptr || scope->depth < highest_reduce_scope->depth) {
+          if (highest_reduce_scope == nullptr ||
+              scope->depth < highest_reduce_scope->depth) {
             highest_reduce_scope = scope;
           }
         } else {
           opaque_var_scope[iter_var->var.get()] = scope;
-          for (const auto& write : block->writes) {
+          for (const auto &write : block->writes) {
             UpdateBufferLCA(write->buffer.get(), scope);
           }
         }
       }
     }
 
-    // function to update lca scope of the buffer with loop carried dependent buffer accesses.
-    // the result scope should be above all loop scopes the accessed opaque block iter vars
-    // relate to, which is record in `itervar_to_dom_scope`.
-    auto do_update = [this, &opaque_var_scope, highest_reduce_scope](const BufferRegion& region,
-                                                                     bool is_reduce_write = false) {
-      const Buffer& buffer = region->buffer;
-      const ScopeInfo* scope = ancestor_scopes_.back();
+    // function to update lca scope of the buffer with loop carried dependent
+    // buffer accesses. the result scope should be above all loop scopes the
+    // accessed opaque block iter vars relate to, which is record in
+    // `itervar_to_dom_scope`.
+    auto do_update = [this, &opaque_var_scope,
+                      highest_reduce_scope](const BufferRegion &region,
+                                            bool is_reduce_write = false) {
+      const Buffer &buffer = region->buffer;
+      const ScopeInfo *scope = ancestor_scopes_.back();
 
-      auto handle_itervar = [&opaque_var_scope, &scope](const ObjectRef& obj) {
-        if (const VarNode* iter_var = obj.as<VarNode>()) {
+      auto handle_itervar = [&opaque_var_scope, &scope](const ObjectRef &obj) {
+        if (const VarNode *iter_var = obj.as<VarNode>()) {
           auto dom_scope_it = opaque_var_scope.find(iter_var);
           if (dom_scope_it == opaque_var_scope.end()) {
             return;
@@ -250,12 +265,13 @@ class LCADetector : public StmtExprVisitor {
       };
 
       // visit region min and max to find the lowest legal lca scope
-      for (const Range& range : region->region) {
+      for (const Range &range : region->region) {
         PostOrderVisit(range->min, handle_itervar);
         PostOrderVisit(range->min + range->extent - 1, handle_itervar);
       }
 
-      // the scope should be above `highest_reduce_scope` for reduce output buffer.
+      // the scope should be above `highest_reduce_scope` for reduce output
+      // buffer.
       if (is_reduce_write && highest_reduce_scope != nullptr &&
           scope->depth > highest_reduce_scope->depth) {
         scope = highest_reduce_scope;
@@ -264,24 +280,25 @@ class LCADetector : public StmtExprVisitor {
     };
 
     if (!opaque_var_scope.empty()) {
-      for (const auto& read : block->reads) {
+      for (const auto &read : block->reads) {
         do_update(read);
       }
-      for (const auto& write : block->writes) {
+      for (const auto &write : block->writes) {
         do_update(write, /*is_reduce_write=*/is_reduce_block);
       }
     } else if (is_reduce_block && highest_reduce_scope != nullptr) {
-      for (const auto& write : block->writes) {
+      for (const auto &write : block->writes) {
         do_update(write, /*is_reduce_write=*/true);
       }
     }
   }
 
-  void VisitStmt_(const AttrStmtNode* op) final {
+  void VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key == attr::thread_extent) {
-      const auto* iter = op->node.as<IterVarNode>();
+      const auto *iter = op->node.as<IterVarNode>();
       ICHECK_NOTNULL(iter);
-      const runtime::ThreadScope& scope = runtime::ThreadScope::Create(iter->thread_tag);
+      const runtime::ThreadScope &scope =
+          runtime::ThreadScope::Create(iter->thread_tag);
       if (scope.rank == 0) {
         blockidx_scopes_.push_back(ancestor_scopes_.back());
       }
@@ -289,12 +306,12 @@ class LCADetector : public StmtExprVisitor {
     StmtExprVisitor::VisitStmt_(op);
   }
 
-  void VisitExpr_(const BufferLoadNode* op) final {
+  void VisitExpr_(const BufferLoadNode *op) final {
     UpdateBufferLCA(op->buffer.get(), ancestor_scopes_.back());
     StmtExprVisitor::VisitExpr_(op);
   }
 
-  void VisitStmt_(const BufferStoreNode* op) final {
+  void VisitStmt_(const BufferStoreNode *op) final {
     UpdateBufferLCA(op->buffer.get(), ancestor_scopes_.back());
     StmtExprVisitor::VisitStmt_(op);
   }
@@ -302,9 +319,9 @@ class LCADetector : public StmtExprVisitor {
   // Note: BufferRealizeNode visitor removed; tirx has no BufferRealize node.
 
   // Works for Load/Store and opaque access.
-  void VisitExpr_(const VarNode* op) final { VisitBufferVar(op); }
+  void VisitExpr_(const VarNode *op) final { VisitBufferVar(op); }
 
-  void VisitBufferVar(const VarNode* op) {
+  void VisitBufferVar(const VarNode *op) {
     UpdateVarLCA(op, ancestor_scopes_.back());
     auto it = buffer_var_map_.find(op);
     if (it != buffer_var_map_.end()) {
@@ -312,40 +329,44 @@ class LCADetector : public StmtExprVisitor {
     }
   }
 
-  void UpdateBufferLCA(const BufferNode* buffer, const ScopeInfo* scope) {
+  void UpdateBufferLCA(const BufferNode *buffer, const ScopeInfo *scope) {
     buffer_var_map_.emplace(buffer->data.get(), buffer);
-    // Also record LCA for the underlying data var to capture BufferLoad/Store cases.
+    // Also record LCA for the underlying data var to capture BufferLoad/Store
+    // cases.
     UpdateVarLCA(buffer->data.get(), scope);
     if (match_buffers_.find(buffer) == match_buffers_.end()) {
       // Ingore buffer created by block match_buffer
-      const ScopeInfo*& lca = buffer_lca_[buffer];
+      const ScopeInfo *&lca = buffer_lca_[buffer];
       lca = LowestCommonAncestor(lca, scope);
     }
   }
 
-  void UpdateVarLCA(const VarNode* var, const ScopeInfo* scope) {
-    const ScopeInfo*& lca = buffer_var_lca_[var];
+  void UpdateVarLCA(const VarNode *var, const ScopeInfo *scope) {
+    const ScopeInfo *&lca = buffer_var_lca_[var];
     lca = LowestCommonAncestor(lca, scope);
   }
 
   void UpdateWithBlockidx() {
-    for (const auto& it : buffer_lca_) {
-      const runtime::StorageScope& scope =
+    for (const auto &it : buffer_lca_) {
+      const runtime::StorageScope &scope =
           runtime::StorageScope::Create(ffi::GetRef<Buffer>(it.first).scope());
       if (scope.rank == runtime::StorageRank::kGlobal) {
-        const ScopeInfo*& lca = buffer_lca_[it.first];
-        for (const ScopeInfo* blockidx_scope : blockidx_scopes_) {
+        const ScopeInfo *&lca = buffer_lca_[it.first];
+        for (const ScopeInfo *blockidx_scope : blockidx_scopes_) {
           lca = LowestCommonAncestor(lca, blockidx_scope);
         }
       }
     }
   }
 
-  static const ScopeInfo* LowestCommonAncestor(const ScopeInfo* lhs, const ScopeInfo* rhs) {
-    if (lhs == nullptr) return rhs;
-    if (rhs == nullptr) return lhs;
-    while (lhs->parent_scope_info != nullptr &&  //
-           rhs->parent_scope_info != nullptr &&  //
+  static const ScopeInfo *LowestCommonAncestor(const ScopeInfo *lhs,
+                                               const ScopeInfo *rhs) {
+    if (lhs == nullptr)
+      return rhs;
+    if (rhs == nullptr)
+      return lhs;
+    while (lhs->parent_scope_info != nullptr && //
+           rhs->parent_scope_info != nullptr && //
            lhs != rhs) {
       if (lhs->depth == rhs->depth) {
         lhs = lhs->parent_scope_info;
@@ -370,35 +391,40 @@ class LCADetector : public StmtExprVisitor {
    *  first element is initialized in LCADetector::Detect to represent
    *  the root scope.
    */
-  std::vector<const ScopeInfo*> ancestor_scopes_ = {};
+  std::vector<const ScopeInfo *> ancestor_scopes_ = {};
   /*! \brief The map from Buffer to its LCA ForNode/SBlockNode. */
-  std::unordered_map<const BufferNode*, const ScopeInfo*> buffer_lca_ = {};
+  std::unordered_map<const BufferNode *, const ScopeInfo *> buffer_lca_ = {};
   /*! \brief The map from Buffer data to the Buffer. */
-  std::unordered_map<const VarNode*, const BufferNode*> buffer_var_map_ = {};
+  std::unordered_map<const VarNode *, const BufferNode *> buffer_var_map_ = {};
   /*! \brief The map from Buffer data var to its LCA ForNode/SBlockNode. */
-  std::unordered_map<const VarNode*, const ScopeInfo*> buffer_var_lca_ = {};
+  std::unordered_map<const VarNode *, const ScopeInfo *> buffer_var_lca_ = {};
   /*! \brief The match buffers inside blocks. */
-  std::unordered_set<const BufferNode*> match_buffers_ = {};
-  /*! \brief The ForNodes/SBlockNodes which contain immediate `blockIdx` launch. */
-  std::vector<const ScopeInfo*> blockidx_scopes_ = {};
+  std::unordered_set<const BufferNode *> match_buffers_ = {};
+  /*! \brief The ForNodes/SBlockNodes which contain immediate `blockIdx` launch.
+   */
+  std::vector<const ScopeInfo *> blockidx_scopes_ = {};
   /*! \brief The map from loop var to the corresponding scope. */
-  std::unordered_map<const VarNode*, const ScopeInfo*> loop_scope_map_ = {};
+  std::unordered_map<const VarNode *, const ScopeInfo *> loop_scope_map_ = {};
   /*! \brief Internal arena. */
   support::Arena arena_;
 };
 
-ffi::Map<Buffer, ffi::Optional<Stmt>> DetectBufferAccessLCA(const PrimFunc& func) {
+ffi::Map<Buffer, ffi::Optional<Stmt>>
+DetectBufferAccessLCA(const PrimFunc &func) {
   return LCADetector::Detect(func);
 }
 
-ffi::Map<Var, ffi::Optional<Stmt>> DetectBufferVarAccessLCA(const PrimFunc& func) {
+ffi::Map<Var, ffi::Optional<Stmt>>
+DetectBufferVarAccessLCA(const PrimFunc &func) {
   return LCADetector::DetectVar(func);
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tirx.analysis.detect_buffer_access_lca", DetectBufferAccessLCA);
-  refl::GlobalDef().def("tirx.analysis.detect_buffer_var_access_lca", DetectBufferVarAccessLCA);
+  refl::GlobalDef().def("tirx.analysis.detect_buffer_access_lca",
+                        DetectBufferAccessLCA);
+  refl::GlobalDef().def("tirx.analysis.detect_buffer_var_access_lca",
+                        DetectBufferVarAccessLCA);
 }
-}  // namespace tirx
-}  // namespace tvm
+} // namespace tirx
+} // namespace tvm

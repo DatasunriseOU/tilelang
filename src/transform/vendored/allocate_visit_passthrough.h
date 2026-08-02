@@ -147,7 +147,7 @@ inline bool TryVisitAllocateVisitor(tvm::tirx::StmtVisitor *visitor,
   return true;
 }
 
-}  // namespace tl_tir
-}  // namespace tilelang
+} // namespace tl_tir
+} // namespace tilelang
 
-#endif  // TILELANG_TRANSFORM_VENDORED_ALLOCATE_VISIT_PASSTHROUGH_H_
+#endif // TILELANG_TRANSFORM_VENDORED_ALLOCATE_VISIT_PASSTHROUGH_H_

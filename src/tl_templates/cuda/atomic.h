@@ -222,7 +222,8 @@ template <typename T> TL_DEVICE void AtomicAddx2Scalar(T *ref, T x, T y) {
 }
 
 template <typename dst_dtype, typename val_dtype>
-TL_DEVICE void AtomicAddx4Scalar(dst_dtype *ref, val_dtype x, val_dtype y, val_dtype z, val_dtype w) {
+TL_DEVICE void AtomicAddx4Scalar(dst_dtype *ref, val_dtype x, val_dtype y,
+                                 val_dtype z, val_dtype w) {
   atomicAdd(ref + 0, static_cast<dst_dtype>(x));
   atomicAdd(ref + 1, static_cast<dst_dtype>(y));
   atomicAdd(ref + 2, static_cast<dst_dtype>(z));
@@ -239,10 +240,14 @@ TL_DEVICE float2 AtomicAddx2ScalarRet(float *ref, float2 add_val) {
 template <typename dst_dtype>
 TL_DEVICE float4 AtomicAddx4ScalarRet(dst_dtype *ref, float4 add_val) {
   float4 ret;
-  ret.x = static_cast<float>(atomicAdd(ref + 0, static_cast<dst_dtype>(add_val.x)));
-  ret.y = static_cast<float>(atomicAdd(ref + 1, static_cast<dst_dtype>(add_val.y)));
-  ret.z = static_cast<float>(atomicAdd(ref + 2, static_cast<dst_dtype>(add_val.z)));
-  ret.w = static_cast<float>(atomicAdd(ref + 3, static_cast<dst_dtype>(add_val.w)));
+  ret.x =
+      static_cast<float>(atomicAdd(ref + 0, static_cast<dst_dtype>(add_val.x)));
+  ret.y =
+      static_cast<float>(atomicAdd(ref + 1, static_cast<dst_dtype>(add_val.y)));
+  ret.z =
+      static_cast<float>(atomicAdd(ref + 2, static_cast<dst_dtype>(add_val.z)));
+  ret.w =
+      static_cast<float>(atomicAdd(ref + 3, static_cast<dst_dtype>(add_val.w)));
   return ret;
 }
 
@@ -712,9 +717,10 @@ TL_DEVICE void AtomicStore(T1 *ref, T2 value, int memory_order) {
 }
 
 // AtomicXchg / AtomicAnd / AtomicOr / AtomicXor — direct mappings to CUDA
-// device builtins ``atomicExch`` / ``atomicAnd`` / ``atomicOr`` / ``atomicXor``.
-// The bitwise ops require integer (signed/unsigned 32/64 bit) types; CUDA does
-// not provide hardware atomics for fp dtypes so callers should pass ints.
+// device builtins ``atomicExch`` / ``atomicAnd`` / ``atomicOr`` /
+// ``atomicXor``. The bitwise ops require integer (signed/unsigned 32/64 bit)
+// types; CUDA does not provide hardware atomics for fp dtypes so callers should
+// pass ints.
 
 template <typename T1, typename T2>
 TL_DEVICE void AtomicXchg(T1 *ref, T2 val, int memory_order = 0) {

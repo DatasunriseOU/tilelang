@@ -18,9 +18,6 @@ from tilelang.engine.param import KernelParam, CompiledArtifact
 from tilelang.engine.semantic_check import PreLowerSemanticCheck
 from tilelang.utils.target import determine_target, target_get_mcpu
 from tilelang.engine.phase import (
-    PreLowerSemanticCheck,
-    LowerAndLegalize,
-    OptimizeForTarget,
     _maybe_tir_simplify,
     _module_disables_tir_simplify,
     apply_metal_scalar_pipeline,
@@ -312,9 +309,7 @@ def lower_to_host_device_ir(
     mod = func_or_mod
     params = None
     is_prim_func = isinstance(func_or_mod, tir.PrimFunc) or (
-        hasattr(func_or_mod, "params")
-        and hasattr(func_or_mod, "body")
-        and hasattr(func_or_mod, "attrs")
+        hasattr(func_or_mod, "params") and hasattr(func_or_mod, "body") and hasattr(func_or_mod, "attrs")
     )
     if is_prim_func:
         func = func_or_mod

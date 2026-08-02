@@ -49,6 +49,7 @@ from tilelang.jit.adapter._mlx_tvm_ffi import (
     prepared_metal_call as mlx_tvm_ffi_prepared_metal_call,
 )
 from tilelang.analysis.metal_graph_sync import make_tvm_ffi_metal_dependency_metadata
+import contextlib
 
 
 COMPILE_ARGS = {}
@@ -184,11 +185,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         buffer_map = func.buffer_map
         dynamic_symbolic_map = {}
         for i, param in enumerate(params):
-            if (
-                isinstance(param, tir.Var)
-                and param not in buffer_map
-                and param not in dynamic_symbolic_map
-            ):
+            if isinstance(param, tir.Var) and param not in buffer_map and param not in dynamic_symbolic_map:
                 dynamic_symbolic_map[param] = (2, i, -1, 1)
         for i, param in enumerate(params):
             if param in buffer_map:
@@ -244,41 +241,13 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         dynamic_symbolic_map = self._process_dynamic_symbolic()
         executable = self.executable
         target_kind_static = self.target.kind.name
-        metal_zero_init_output_positions = (
-            self._metal_zero_init_output_positions()
-            if target_kind_static == "metal"
-            else []
-        )
-        metal_direct_device_call = (
-            self._metal_direct_device_call()
-            if target_kind_static == "metal"
-            else None
-        )
-        direct_func = (
-            metal_direct_device_call[0]
-            if metal_direct_device_call is not None
-            else None
-        )
-        direct_launch_args = (
-            metal_direct_device_call[1]
-            if metal_direct_device_call is not None
-            else None
-        )
-        direct_module = (
-            metal_direct_device_call[2]
-            if metal_direct_device_call is not None
-            else None
-        )
-        direct_kernel_name = (
-            metal_direct_device_call[3]
-            if metal_direct_device_call is not None
-            else None
-        )
-        direct_param_indices = (
-            metal_direct_device_call[4]
-            if metal_direct_device_call is not None
-            else None
-        )
+        metal_zero_init_output_positions = self._metal_zero_init_output_positions() if target_kind_static == "metal" else []
+        metal_direct_device_call = self._metal_direct_device_call() if target_kind_static == "metal" else None
+        direct_func = metal_direct_device_call[0] if metal_direct_device_call is not None else None
+        direct_launch_args = metal_direct_device_call[1] if metal_direct_device_call is not None else None
+        direct_module = metal_direct_device_call[2] if metal_direct_device_call is not None else None
+        direct_kernel_name = metal_direct_device_call[3] if metal_direct_device_call is not None else None
+        direct_param_indices = metal_direct_device_call[4] if metal_direct_device_call is not None else None
 
         # Prepare helpers for friendly dtype error messages
         prim_func = self.prim_func
@@ -298,12 +267,8 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 expected_dtype_strs.append(None)
                 is_buffer_param.append(False)
                 param_names.append(str(p))
-        input_param_indices = [
-            i for i in range(len(self.params)) if i not in self.result_idx
-        ]
-        native_input_param_indices = [
-            i for i in input_param_indices if is_buffer_param[i]
-        ]
+        input_param_indices = [i for i in range(len(self.params)) if i not in self.result_idx]
+        native_input_param_indices = [i for i in input_param_indices if is_buffer_param[i]]
         default_metal_dependency_metadata = (
             self._metal_dependency_metadata(
                 input_param_indices=native_input_param_indices,
@@ -315,12 +280,8 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         )
         static_native_param_shapes = None
         if not dynamic_symbolic_map:
-            static_native_param_shapes = [
-                [int(dim) for dim in shape] for shape in param_shapes
-            ]
-        native_mlx_bridge_available_static = (
-            target_kind_static == "metal" and mlx_tvm_ffi_is_available()
-        )
+            static_native_param_shapes = [[int(dim) for dim in shape] for shape in param_shapes]
+        native_mlx_bridge_available_static = target_kind_static == "metal" and mlx_tvm_ffi_is_available()
         mlx_array_type_static = None
         if native_mlx_bridge_available_static:
             try:
@@ -333,23 +294,18 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         def is_static_mlx_array(value: Any) -> bool:
             return mlx_array_type_static is not None and isinstance(value, mlx_array_type_static)
 
-        owner_outputs_are_tail_params = bool(self.result_idx) and input_param_indices == list(
-            range(len(input_param_indices))
-        ) and self.result_idx == list(range(len(input_param_indices), len(self.params)))
-
-        all_native_params_are_buffers = (
-            all(is_buffer_param[i] for i in range(len(self.params)) if i not in self.result_idx)
-            and all(is_buffer_param[i] for i in self.result_idx)
+        owner_outputs_are_tail_params = (
+            bool(self.result_idx)
+            and input_param_indices == list(range(len(input_param_indices)))
+            and self.result_idx == list(range(len(input_param_indices), len(self.params)))
         )
-        native_scalar_param_indices = [
-            i for i in input_param_indices if not is_buffer_param[i]
-        ]
-        all_native_params_are_bridge_compatible = (
-            all(is_buffer_param[i] for i in self.result_idx)
-            and all(
-                is_buffer_param[i] or i in native_scalar_param_indices
-                for i in input_param_indices
-            )
+
+        all_native_params_are_buffers = all(is_buffer_param[i] for i in range(len(self.params)) if i not in self.result_idx) and all(
+            is_buffer_param[i] for i in self.result_idx
+        )
+        native_scalar_param_indices = [i for i in input_param_indices if not is_buffer_param[i]]
+        all_native_params_are_bridge_compatible = all(is_buffer_param[i] for i in self.result_idx) and all(
+            is_buffer_param[i] or i in native_scalar_param_indices for i in input_param_indices
         )
         prepared_native_metal_call = None
         if (
@@ -363,12 +319,8 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             try:
                 prepared_native_metal_call = mlx_tvm_ffi_prepare_metal_call(
                     executable["main"],
-                    output_shapes=[
-                        static_native_param_shapes[i] for i in self.result_idx
-                    ],
-                    output_dtypes=[
-                        expected_dtype_strs[i] for i in self.result_idx
-                    ],
+                    output_shapes=[static_native_param_shapes[i] for i in self.result_idx],
+                    output_dtypes=[expected_dtype_strs[i] for i in self.result_idx],
                     result_indices=self.result_idx,
                     num_params=len(self.params),
                     param_dtypes=expected_dtype_strs,
@@ -413,7 +365,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
 
         def _compact_stride(shape: tuple[int, ...], dim: int) -> int:
             stride = 1
-            for extent in reversed(shape[dim + 1:]):
+            for extent in reversed(shape[dim + 1 :]):
                 stride *= int(extent)
             return stride
 
@@ -449,9 +401,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             # owned result buffers.
             expected_inputs = len(self.params) - len(self.result_idx)
             output_overrides = normalize_out_argument(out)
-            using_full_abi_args = (
-                output_overrides is None and bool(self.result_idx) and len(inputs) == len(self.params)
-            )
+            using_full_abi_args = output_overrides is None and bool(self.result_idx) and len(inputs) == len(self.params)
             if (
                 output_overrides is None
                 and using_full_abi_args
@@ -598,15 +548,9 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             target_kind = target_kind_static
             uses_mlx_runtime = has_mlx_arrays(dlpack_args)
             if uses_mlx_runtime and target_kind != "metal":
-                raise DLPackDeviceError(
-                    f"MLX arrays export Metal DLPack buffers, but this kernel targets {target_kind!r}."
-                )
+                raise DLPackDeviceError(f"MLX arrays export Metal DLPack buffers, but this kernel targets {target_kind!r}.")
             owner_outputs_requested = output_overrides is not None or using_full_abi_args
-            native_mlx_bridge_available = (
-                uses_mlx_runtime
-                and target_kind == "metal"
-                and native_mlx_bridge_available_static
-            )
+            native_mlx_bridge_available = uses_mlx_runtime and target_kind == "metal" and native_mlx_bridge_available_static
 
             mlx_compact_graph_candidate = (
                 uses_mlx_runtime
@@ -652,10 +596,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                                 elif ref_id == 0:
                                     shape.append(_shape_dim(tensor_list[ref_tensor_idx], ref_shape_idx))
                                 elif ref_id == 1:
-                                    shape.append(
-                                        _stride_dim(tensor_list[ref_tensor_idx], ref_shape_idx)
-                                        * stride_scale
-                                    )
+                                    shape.append(_stride_dim(tensor_list[ref_tensor_idx], ref_shape_idx) * stride_scale)
                     else:
                         shape.append(int(s))
                 return shape
@@ -723,11 +664,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                     elif native_scalar_values is not None:
                         graph_outputs = mlx_tvm_ffi_metal_call(
                             executable["main"],
-                            inputs=[
-                                tensor_list[i]
-                                for i in input_param_indices
-                                if is_buffer_param[i]
-                            ],
+                            inputs=[tensor_list[i] for i in input_param_indices if is_buffer_param[i]],
                             output_shapes=[tensor_list[i].shape for i in self.result_idx],
                             output_dtypes=[tensor_list[i].dtype for i in self.result_idx],
                             result_indices=self.result_idx,
@@ -799,20 +736,13 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                                 dependency_metadata=dependency_metadata,
                             )
                     else:
-                        owner_output_shapes = [
-                            [int(dim) for dim in getattr(tensor_list[i], "shape", ())]
-                            for i in self.result_idx
-                        ]
+                        owner_output_shapes = [[int(dim) for dim in getattr(tensor_list[i], "shape", ())] for i in self.result_idx]
                         if native_scalar_values is None:
                             owner_aliases = None
                         else:
                             owner_aliases = mlx_tvm_ffi_metal_call(
                                 executable["main"],
-                                inputs=[
-                                    tensor_list[i]
-                                    for i in input_param_indices
-                                    if is_buffer_param[i]
-                                ],
+                                inputs=[tensor_list[i] for i in input_param_indices if is_buffer_param[i]],
                                 owner_outputs=[tensor_list[i] for i in self.result_idx],
                                 output_shapes=owner_output_shapes,
                                 output_dtypes=[expected_dtype_strs[i] for i in self.result_idx],
@@ -879,21 +809,23 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             # never from ``device_mod``, whose param order does not describe the
             # host wrapper's calling convention.
             compiled_param_names = None
-            if target_kind == "metal":
-                if hasattr(self, "device_kernel_source") and self.device_kernel_source:
-                    try:
-                        match = re.search(r"__global__\s+void\s+(?:__launch_bounds__\([^)]*\)\s+)?([a-zA-Z_0-9]+)\s*\(([^)]+)\)", self.device_kernel_source)
-                        if match:
-                            params_str = match.group(2)
-                            names = []
-                            for param in params_str.split(","):
-                                param = param.strip()
-                                param_match = re.search(r"([a-zA-Z_0-9]+)\s*$", param)
-                                if param_match:
-                                    names.append(param_match.group(1))
-                            compiled_param_names = names
-                    except Exception:
-                        pass
+            if target_kind == "metal" and hasattr(self, "device_kernel_source") and self.device_kernel_source:
+                try:
+                    match = re.search(
+                        r"__global__\s+void\s+(?:__launch_bounds__\([^)]*\)\s+)?([a-zA-Z_0-9]+)\s*\(([^)]+)\)",
+                        self.device_kernel_source,
+                    )
+                    if match:
+                        params_str = match.group(2)
+                        names = []
+                        for param in params_str.split(","):
+                            param = param.strip()
+                            param_match = re.search(r"([a-zA-Z_0-9]+)\s*$", param)
+                            if param_match:
+                                names.append(param_match.group(1))
+                        compiled_param_names = names
+                except Exception:
+                    pass
 
             if (
                 target_kind == "metal"
@@ -956,10 +888,14 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                         r"extern\s+__shared__\s+.*buf_dyn_shmem\s*\[\s*\]",
                         self.device_kernel_source,
                     )
-                    if is_dynamic:
-                        if hasattr(self, "prim_func") and self.prim_func:
-                            if self.prim_func.attrs and "dyn_shared_memory_buf" in self.prim_func.attrs:
-                                dyn_shmem_size = int(self.prim_func.attrs["dyn_shared_memory_buf"])
+                    if (
+                        is_dynamic
+                        and hasattr(self, "prim_func")
+                        and self.prim_func
+                        and self.prim_func.attrs
+                        and "dyn_shared_memory_buf" in self.prim_func.attrs
+                    ):
+                        dyn_shmem_size = int(self.prim_func.attrs["dyn_shared_memory_buf"])
 
             if target_kind == "metal" and dyn_shmem_size > 0:
                 exec_tensor_list = list(exec_tensor_list) + [dyn_shmem_size]
@@ -1065,11 +1001,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             host_name_to_idx[name] = idx
         direct_param_indices: list[int] = []
         for param in device_params:
-            name_obj = (
-                getattr(param, "name", None)
-                or getattr(param, "name_hint", None)
-                or param
-            )
+            name_obj = getattr(param, "name", None) or getattr(param, "name_hint", None) or param
             name = str(name_obj)
             if name not in host_name_to_idx:
                 return None
@@ -1126,15 +1058,9 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
         if attrs and "tilelang_metal_zero_init_output_positions" in attrs:
             return [int(idx) for idx in attrs["tilelang_metal_zero_init_output_positions"]]
 
-        source_parts = [
-            source
-            for source in (self.device_kernel_source, self.host_kernel_source)
-            if isinstance(source, str)
-        ]
-        try:
+        source_parts = [source for source in (self.device_kernel_source, self.host_kernel_source) if isinstance(source, str)]
+        with contextlib.suppress(Exception):
             source_parts.append(str(self.prim_func))
-        except Exception:
-            pass
         source = "\n".join(source_parts)
         if "atomic_add" not in source and "atomic_fetch_add" not in source:
             return []
@@ -1315,10 +1241,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             ):
                 values_by_index[int(assign.group("idx"))] = int(assign.group("value"))
 
-            launch_values = [
-                values_by_index.get(i)
-                for i in range(launch_base, launch_base + launch_count)
-            ]
+            launch_values = [values_by_index.get(i) for i in range(launch_base, launch_base + launch_count)]
             if any(value is None for value in launch_values):
                 continue
             values = [int(value) for value in launch_values if value is not None]

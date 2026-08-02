@@ -6,6 +6,7 @@ run them. The compiled PrimFunc is exercised end-to-end through
 ``tilelang.compile`` so the lowering produces a real, executable kernel
 contract.
 """
+
 from __future__ import annotations
 
 import importlib
@@ -90,8 +91,8 @@ def copy_vec(A, B):
         CuTeKernelSignature("B", (16,), "float32"),
     ]
     emitted = from_cute_source(src, signature=sig, emit_only=True)
-    assert "T.Tensor((16,), \"float32\")" in emitted
-    assert "T.alloc_shared((16,), \"float32\")" in emitted
+    assert 'T.Tensor((16,), "float32")' in emitted
+    assert 'T.alloc_shared((16,), "float32")' in emitted
 
     prim = from_cute_source(src, signature=sig)
     assert isinstance(prim, tir.PrimFunc)

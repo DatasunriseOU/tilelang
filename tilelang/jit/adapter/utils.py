@@ -16,10 +16,6 @@ from tilelang.engine.lower import (
     canon_target_host,
     is_cpu_device_backend,
 )
-from tilelang.engine.phase import (
-    LowerAndLegalize,
-    OptimizeForTarget,
-)
 from tilelang.utils.language import is_prim_func_like, make_ir_module_from_prim_func
 from tilelang.backend.pipeline import resolve_pipeline
 from tilelang.engine.semantic_check import PreLowerSemanticCheck

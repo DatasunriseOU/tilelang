@@ -80,11 +80,12 @@ std::string CallKey(const CallNode *op) {
   const auto *op_node = op->op.as<OpNode>();
   ICHECK(op_node != nullptr);
   return op_node->name + ":" + std::to_string(op->dtype.code()) + ":" +
-         std::to_string(op->dtype.bits()) + ":" + std::to_string(op->dtype.lanes());
+         std::to_string(op->dtype.bits()) + ":" +
+         std::to_string(op->dtype.lanes());
 }
 
 class MetalScalarIntrinsicBinder : public StmtExprMutator {
- public:
+public:
   Stmt Rewrite(Stmt body) { return VisitStmt(std::move(body)); }
 
   Stmt VisitStmt_(const BindNode *op) final {
@@ -110,8 +111,9 @@ class MetalScalarIntrinsicBinder : public StmtExprMutator {
       return it->second;
     }
 
-    std::string name =
-        bindings_.empty() ? prefix : prefix + "_" + std::to_string(bindings_.size());
+    std::string name = bindings_.empty()
+                           ? prefix
+                           : prefix + "_" + std::to_string(bindings_.size());
     Var var(name, op->dtype);
     vars_.emplace(std::move(key), var);
     bindings_.push_back(Bind(var, ffi::GetRef<PrimExpr>(op)));
@@ -120,13 +122,13 @@ class MetalScalarIntrinsicBinder : public StmtExprMutator {
 
   const std::vector<Stmt> &bindings() const { return bindings_; }
 
- private:
+private:
   std::unordered_map<std::string, Var> vars_;
   std::vector<Stmt> bindings_;
 };
 
 class PureScalarExprChecker : public ExprVisitor {
- public:
+public:
   static bool Check(const PrimExpr &expr) {
     if (!expr.defined() || !expr.dtype().is_scalar()) {
       return false;
@@ -136,7 +138,7 @@ class PureScalarExprChecker : public ExprVisitor {
     return checker.pure_;
   }
 
- private:
+private:
   void VisitExpr_(const BufferLoadNode *op) final { pure_ = false; }
   void VisitExpr_(const ProducerLoadNode *op) final { pure_ = false; }
   void VisitExpr_(const ReduceNode *op) final { pure_ = false; }
@@ -154,8 +156,8 @@ class PureScalarExprChecker : public ExprVisitor {
 };
 
 bool IsTrivialScalarExpr(const PrimExpr &expr) {
-  return expr.as<VarNode>() || expr.as<IntImmNode>() || expr.as<FloatImmNode>() ||
-         expr.as<StringImmNode>();
+  return expr.as<VarNode>() || expr.as<IntImmNode>() ||
+         expr.as<FloatImmNode>() || expr.as<StringImmNode>();
 }
 
 bool IsMetalThreadIndexVar(const VarNode *op) {
@@ -169,7 +171,7 @@ bool IsMetalThreadIndexVar(const VarNode *op) {
 }
 
 class MetalThreadIndexExprDetector : public ExprVisitor {
- public:
+public:
   static bool Contains(const PrimExpr &expr) {
     if (!expr.defined() || !expr.dtype().is_scalar()) {
       return false;
@@ -179,7 +181,7 @@ class MetalThreadIndexExprDetector : public ExprVisitor {
     return detector.found_;
   }
 
- private:
+private:
   void VisitExpr_(const VarNode *op) final {
     if (IsMetalThreadIndexVar(op)) {
       found_ = true;
@@ -190,11 +192,13 @@ class MetalThreadIndexExprDetector : public ExprVisitor {
 };
 
 bool ShouldInlineMetalThreadIndexExpr(const PrimExpr &expr) {
-  return PureScalarExprChecker::Check(expr) && MetalThreadIndexExprDetector::Contains(expr);
+  return PureScalarExprChecker::Check(expr) &&
+         MetalThreadIndexExprDetector::Contains(expr);
 }
 
 bool IsWideningIntegerIndexCast(const CastNode *op) {
-  if (op == nullptr || !op->dtype.is_scalar() || !op->value.dtype().is_scalar()) {
+  if (op == nullptr || !op->dtype.is_scalar() ||
+      !op->value.dtype().is_scalar()) {
     return false;
   }
   if (!(op->dtype.is_int() || op->dtype.is_uint()) ||
@@ -205,14 +209,15 @@ bool IsWideningIntegerIndexCast(const CastNode *op) {
 }
 
 class MetalIndexCastNormalizer : public ExprMutator {
- public:
+public:
   static PrimExpr Normalize(const PrimExpr &expr) {
     MetalIndexCastNormalizer normalizer;
     return normalizer.VisitExpr(expr);
   }
 
- private:
-  static bool CoerceIntImmTo(const PrimExpr &expr, DataType dtype, PrimExpr *out) {
+private:
+  static bool CoerceIntImmTo(const PrimExpr &expr, DataType dtype,
+                             PrimExpr *out) {
     if (!(dtype.is_int() || dtype.is_uint()) || !dtype.is_scalar()) {
       return false;
     }
@@ -285,8 +290,8 @@ class MetalIndexCastNormalizer : public ExprMutator {
   static bool MetalScalarIntrinsicPrefixFromVarName(const std::string &name) {
     return name == "grid_tid" || name.rfind("grid_tid_", 0) == 0 ||
            name == "threadgroup_tid" ||
-           name.rfind("threadgroup_tid_", 0) == 0 ||
-           name == "simd_lane" || name.rfind("simd_lane_", 0) == 0;
+           name.rfind("threadgroup_tid_", 0) == 0 || name == "simd_lane" ||
+           name.rfind("simd_lane_", 0) == 0;
   }
 
   static DataType CommonIntegerDType(DataType lhs, DataType rhs) {
@@ -415,8 +420,8 @@ class MetalIndexCastNormalizer : public ExprMutator {
   }
 };
 
-ffi::Array<PrimExpr> NormalizeMetalIndexArray(const ffi::Array<PrimExpr> &indices,
-                                              bool *changed) {
+ffi::Array<PrimExpr>
+NormalizeMetalIndexArray(const ffi::Array<PrimExpr> &indices, bool *changed) {
   ffi::Array<PrimExpr> normalized;
   normalized.reserve(indices.size());
   for (const PrimExpr &index : indices) {
@@ -428,10 +433,10 @@ ffi::Array<PrimExpr> NormalizeMetalIndexArray(const ffi::Array<PrimExpr> &indice
 }
 
 class MetalScalarBindCanonicalizer : public StmtExprMutator {
- public:
+public:
   Stmt Rewrite(Stmt body) { return VisitStmt(std::move(body)); }
 
- private:
+private:
   using ExprTable =
       std::unordered_map<PrimExpr, Var, ffi::StructuralHash, ExprDeepEqual>;
 
@@ -447,7 +452,8 @@ class MetalScalarBindCanonicalizer : public StmtExprMutator {
     std::unordered_map<const VarNode *, PrimExpr> saved_var_remap = var_remap_;
 
     PrimExpr value = VisitExpr(op->value);
-    if (CanAliasBind(op->var, value) || ShouldInlineMetalThreadIndexExpr(value)) {
+    if (CanAliasBind(op->var, value) ||
+        ShouldInlineMetalThreadIndexExpr(value)) {
       var_remap_[op->var.get()] = value;
       Stmt body = VisitStmt(op->body);
       expr_to_var_ = std::move(saved_expr_to_var);
@@ -551,11 +557,13 @@ class MetalScalarBindCanonicalizer : public StmtExprMutator {
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     BufferStore store = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
     bool changed = false;
-    ffi::Array<PrimExpr> indices = NormalizeMetalIndexArray(store->indices, &changed);
+    ffi::Array<PrimExpr> indices =
+        NormalizeMetalIndexArray(store->indices, &changed);
     if (!changed) {
       return store;
     }
-    return BufferStore(store->buffer, store->value, indices, std::nullopt, store->span);
+    return BufferStore(store->buffer, store->value, indices, std::nullopt,
+                       store->span);
   }
 
   PrimExpr VisitExpr(const PrimExpr &expr) final {
@@ -576,7 +584,8 @@ class MetalScalarBindCanonicalizer : public StmtExprMutator {
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
     BufferLoad load = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
     bool changed = false;
-    ffi::Array<PrimExpr> indices = NormalizeMetalIndexArray(load->indices, &changed);
+    ffi::Array<PrimExpr> indices =
+        NormalizeMetalIndexArray(load->indices, &changed);
     if (!changed) {
       return load;
     }
@@ -619,7 +628,9 @@ PrimFunc BindMetalScalarIntrinsicsFunc(PrimFunc f) {
   Stmt body = binder.Rewrite(f->body);
   MetalScalarBindCanonicalizer canonicalizer;
 
-  auto canonicalize = [&](Stmt stmt) { return canonicalizer.Rewrite(std::move(stmt)); };
+  auto canonicalize = [&](Stmt stmt) {
+    return canonicalizer.Rewrite(std::move(stmt));
+  };
 
   if (binder.bindings().empty() && body.same_as(f->body)) {
     Stmt canonical_body = canonicalize(f->body);
@@ -643,7 +654,7 @@ PrimFunc BindMetalScalarIntrinsicsFunc(PrimFunc f) {
   return f;
 }
 
-}  // namespace
+} // namespace
 
 using namespace tirx::transform;
 tvm::transform::Pass BindMetalScalarIntrinsics() {
@@ -655,8 +666,9 @@ tvm::transform::Pass BindMetalScalarIntrinsics() {
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.transform.BindMetalScalarIntrinsics", BindMetalScalarIntrinsics);
+  refl::GlobalDef().def("tl.transform.BindMetalScalarIntrinsics",
+                        BindMetalScalarIntrinsics);
 }
 
-}  // namespace tl
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm

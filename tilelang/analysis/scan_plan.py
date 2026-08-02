@@ -159,11 +159,7 @@ def plan_recurrence_scan(
 
     chunk_count = _ceildiv(sequence_length, chunk_size) if sequence_length else 0
     state_elements = _state_elements(state_shape)
-    needs_snapshots = (
-        direction == "reverse"
-        and sequence_length > chunk_size
-        and decay_may_underflow
-    )
+    needs_snapshots = direction == "reverse" and sequence_length > chunk_size and decay_may_underflow
     snapshot_count = chunk_count + 1 if needs_snapshots else 0
     snapshot_plan = RecurrenceSnapshotPlan(
         policy="state-boundary-cache" if needs_snapshots else "none",

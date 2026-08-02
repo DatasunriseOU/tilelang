@@ -160,12 +160,14 @@ private:
             static_extent = b;
           }
           if (static_extent.defined()) {
-            Stmt body = IfThenElse(new_for->loop_var < new_for->extent, new_for->body);
-            return For(new_for->loop_var, new_for->min, static_extent, new_for->kind, body,
-                       new_for->thread_binding, new_for->annotations, new_for->step, new_for->span);
+            Stmt body =
+                IfThenElse(new_for->loop_var < new_for->extent, new_for->body);
+            return For(new_for->loop_var, new_for->min, static_extent,
+                       new_for->kind, body, new_for->thread_binding,
+                       new_for->annotations, new_for->step, new_for->span);
           }
         } else if (const auto *call = new_for->extent.as<CallNode>()) {
-          const auto* op_node = call->op.as<OpNode>();
+          const auto *op_node = call->op.as<OpNode>();
           if (op_node && op_node->name == "tir.min") {
             PrimExpr a = call->args[0];
             PrimExpr b = call->args[1];
@@ -176,9 +178,11 @@ private:
               static_extent = b;
             }
             if (static_extent.defined()) {
-              Stmt body = IfThenElse(new_for->loop_var < new_for->extent, new_for->body);
-              return For(new_for->loop_var, new_for->min, static_extent, new_for->kind, body,
-                         new_for->thread_binding, new_for->annotations, new_for->step, new_for->span);
+              Stmt body = IfThenElse(new_for->loop_var < new_for->extent,
+                                     new_for->body);
+              return For(new_for->loop_var, new_for->min, static_extent,
+                         new_for->kind, body, new_for->thread_binding,
+                         new_for->annotations, new_for->step, new_for->span);
             }
           }
         }
@@ -198,7 +202,8 @@ Pass LegalizeParallelLoop() {
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("tl.transform.LetInline", LetInline);
-  refl::GlobalDef().def("tl.transform.LegalizeParallelLoop", LegalizeParallelLoop);
+  refl::GlobalDef().def("tl.transform.LegalizeParallelLoop",
+                        LegalizeParallelLoop);
 }
 
 } // namespace tl

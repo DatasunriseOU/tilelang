@@ -160,8 +160,8 @@ Var GetVarFromAccessPtr(const PrimExpr &expr);
 TileOperator ParseOperator(Call call);
 TileOperator ParseOperator(Stmt stmt);
 
-using OpBuilderFunc =
-    ffi::TypedFunction<TileOperator(Array<PrimExpr>, Map<String, ffi::ObjectRef>)>;
+using OpBuilderFunc = ffi::TypedFunction<TileOperator(
+    Array<PrimExpr>, Map<String, ffi::ObjectRef>)>;
 
 #define TIR_REGISTER_TL_TILE_OP(Entry, OpName)                                 \
   const Op &Entry::Get() {                                                     \
@@ -172,7 +172,7 @@ using OpBuilderFunc =
       .set_attr<TScriptPrinterName>("TScriptPrinterName", #OpName)             \
       .set_attr<OpBuilderFunc>(                                                \
           "TLOpBuilder",                                                       \
-          [](Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {       \
+          [](Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {  \
             return Entry(args, annotations);                                   \
           })
 

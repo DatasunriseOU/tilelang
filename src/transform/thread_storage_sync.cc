@@ -27,6 +27,7 @@
 #include "runtime/thread_storage_scope.h"
 #include "tirx/transform/ir_utils.h"
 #include "vendored/let_stmt.h"
+#include "vendored/target_info.h"
 #include "vendored/tl_runtime_symbols.h"
 #include "vendored/z3_constraint_scope.h"
 #include "vendored/z3_proof_hooks.h"
@@ -39,7 +40,6 @@
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/attrs.h>
-#include "vendored/target_info.h"
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/expr.h>
@@ -56,10 +56,10 @@ namespace tl {
 using namespace tirx;
 using namespace ffi;
 using arith::IRMutatorWithAnalyzer;
-using ::tilelang::tl_tir::LetStmt;
-using ::tilelang::tl_tir::LetStmtNode;
 using runtime::StorageRank;
 using runtime::StorageScope;
+using ::tilelang::tl_tir::LetStmt;
+using ::tilelang::tl_tir::LetStmtNode;
 
 // Similar to ThreadSyncAfterWaitQueueInserter, but for explicit cp.async
 // synchronization intrinsics (ptx_wait_group).
@@ -706,9 +706,9 @@ private:
 };
 
 struct TileLangThreadSyncPlanner : public ConstrVisitor {
-  explicit TileLangThreadSyncPlanner(
-      StorageScope sync_scope, int warp_size = 32, bool is_metal = false,
-      bool barrier_proof_enabled = false)
+  explicit TileLangThreadSyncPlanner(StorageScope sync_scope,
+                                     int warp_size = 32, bool is_metal = false,
+                                     bool barrier_proof_enabled = false)
       : sync_scope_(std::move(sync_scope)), warp_size_(warp_size),
         is_metal_(is_metal), barrier_proof_enabled_(barrier_proof_enabled) {
     scope_.push_back(std::vector<StmtEntry>());
@@ -1586,7 +1586,6 @@ public:
   mutable int barrier_proof_unproven_fallbacks_{0};
 
 private:
-
   void insert_syncs(const Object *obj) {
     if (syncs_inserted_.count(obj))
       return;
@@ -1732,8 +1731,8 @@ private:
       for (const IterVar &iv : v) {
         std::string tag(iv->thread_tag);
         if (!tag.empty() && !is_canonical_thread_tag(tag)) {
-          LOG(WARNING) << "ProveIntraWarpRAW: non-canonical thread_tag '"
-                       << tag << "' on " << side
+          LOG(WARNING) << "ProveIntraWarpRAW: non-canonical thread_tag '" << tag
+                       << "' on " << side
                        << " — ignored by strict-equality matcher.";
         }
       }
@@ -1772,7 +1771,8 @@ private:
     auto bind_axis = [&](const Optional<IterVar> &p_iv,
                          const Optional<IterVar> &c_iv, const char *name,
                          Var *w_out, Var *r_out) {
-      if (!p_iv.has_value() || !c_iv.has_value()) return;
+      if (!p_iv.has_value() || !c_iv.has_value())
+        return;
       Var old_p = p_iv.value()->var;
       Var old_c = c_iv.value()->var;
       Var fresh_w(std::string(name) + "_w", old_p.dtype());
@@ -1843,7 +1843,8 @@ private:
     //      reach that state).
     //   2) Lets Z3 actually solve floor-div on small finite domains
     //      instead of timing out on the unbounded Int sort.
-    auto extract_extent = [](const Optional<IterVar> &iv) -> Optional<PrimExpr> {
+    auto extract_extent =
+        [](const Optional<IterVar> &iv) -> Optional<PrimExpr> {
       if (!iv.has_value() || !iv.value()->dom.defined() ||
           !iv.value()->dom->extent.defined()) {
         return std::nullopt;
@@ -1903,7 +1904,8 @@ private:
                                const Optional<IterVar> &p_iv,
                                const Optional<IterVar> &c_iv,
                                PrimExpr &constraint) {
-      if (!w_var.defined() || !r_var.defined()) return;
+      if (!w_var.defined() || !r_var.defined())
+        return;
       PrimExpr zero = make_const(w_var.dtype(), 0);
       constraint = tirx::And(
           constraint, tirx::And(tirx::GE(w_var, zero), tirx::GE(r_var, zero)));
@@ -1957,10 +1959,9 @@ private:
     } catch (const std::exception &e) {
       // Audit (gpt-5-5-pro #5): surface UNKNOWN/exception path so flaky
       // CI timeouts are visible. Conservative-by-default: barrier kept.
-      LOG(WARNING)
-          << "ProveIntraWarpRAW: Z3 prover threw '" << e.what()
-          << "' on goal `" << goal
-          << "` (timeout=200ms); keeping barrier (conservative).";
+      LOG(WARNING) << "ProveIntraWarpRAW: Z3 prover threw '" << e.what()
+                   << "' on goal `" << goal
+                   << "` (timeout=200ms); keeping barrier (conservative).";
       proven = false;
     } catch (...) {
       LOG(WARNING) << "ProveIntraWarpRAW: Z3 prover threw unknown exception "
@@ -2392,9 +2393,9 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope,
   }
   auto barrier_status = ::tilelang::tlz3::GetProofHookStatus(
       ctx, ::tilelang::tlz3::ProofHookKind::kBarrierMinimization);
-  TileLangThreadSyncPlanner planner(
-      sync_scope, warp_size, is_metal,
-      /*barrier_proof_enabled=*/is_metal && barrier_status.enabled);
+  TileLangThreadSyncPlanner planner(sync_scope, warp_size, is_metal,
+                                    /*barrier_proof_enabled=*/is_metal &&
+                                        barrier_status.enabled);
   for (const auto &[_, buffer] : func->buffer_map) {
     planner.SetBufferDataToBuffer(buffer->data, buffer);
   }
@@ -2403,17 +2404,16 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope,
       ThreadSyncInserter(sync_scope, planner.syncs_inserted_)(std::move(stmt));
   n->body = ThreadPartialSyncRewriter::Rewrite(std::move(stmt));
   if (planner.apple_intra_warp_elisions_ > 0) {
-    func = WithAttr(std::move(func), "tl.z3_barrier_elisions",
-                    IntImm(DataType::Int(32),
-                           planner.apple_intra_warp_elisions_));
+    func =
+        WithAttr(std::move(func), "tl.z3_barrier_elisions",
+                 IntImm(DataType::Int(32), planner.apple_intra_warp_elisions_));
   }
   if (planner.barrier_proof_disabled_fallbacks_ > 0 ||
       planner.barrier_proof_unproven_fallbacks_ > 0) {
-    const char *fallback_reason =
-        (barrier_status.fallback_reason &&
-         barrier_status.fallback_reason[0] != '\0')
-            ? barrier_status.fallback_reason
-            : "unproven";
+    const char *fallback_reason = (barrier_status.fallback_reason &&
+                                   barrier_status.fallback_reason[0] != '\0')
+                                      ? barrier_status.fallback_reason
+                                      : "unproven";
     std::ostringstream reason;
     reason << "disabled=" << planner.barrier_proof_disabled_fallbacks_
            << ",unproven=" << planner.barrier_proof_unproven_fallbacks_

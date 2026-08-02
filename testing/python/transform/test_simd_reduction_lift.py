@@ -33,13 +33,8 @@ def _load_worktree_module():
     the worktree copy via importlib.
     """
     here = os.path.dirname(os.path.abspath(__file__))
-    candidate = os.path.normpath(
-        os.path.join(here, "..", "..", "..", "tilelang", "transform",
-                     "metal_simd_lift.py")
-    )
-    spec = importlib.util.spec_from_file_location(
-        "_worktree_metal_simd_lift", candidate
-    )
+    candidate = os.path.normpath(os.path.join(here, "..", "..", "..", "tilelang", "transform", "metal_simd_lift.py"))
+    spec = importlib.util.spec_from_file_location("_worktree_metal_simd_lift", candidate)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
@@ -55,6 +50,7 @@ PASS_CONFIG_KEY = metal_simd_lift.PASS_CONFIG_KEY
 # ---------------------------------------------------------------------------
 # Z3 helper
 # ---------------------------------------------------------------------------
+
 
 def test_z3_extent_static_16_proved():
     proved, query = _z3_extent_le_32(16)
@@ -84,20 +80,20 @@ def test_z3_extent_intimm_rejected():
 def test_z3_extent_symbolic_unconstrained_rejected():
     n = tir.Var("N", "int32")
     proved, query = _z3_extent_le_32(n)
-    assert not proved, (
-        f"unconstrained symbolic extent must NOT be proved; query={query}"
-    )
+    assert not proved, f"unconstrained symbolic extent must NOT be proved; query={query}"
 
 
 # ---------------------------------------------------------------------------
 # Detection on actual TIR
 # ---------------------------------------------------------------------------
 
+
 def _build_reduction_func(extent):
     @T.prim_func
     def func(buf: T.Tensor[(64,), T.float32], acc: T.Tensor[(1,), T.float32]):
         for i in T.serial(extent):
             acc[0] = acc[0] + buf[i]
+
     return func
 
 
@@ -127,7 +123,7 @@ def test_unsupported_op_not_a_candidate():
     @T.prim_func
     def func(buf: T.Tensor[(8,), T.float32], acc: T.Tensor[(1,), T.float32]):
         for i in T.serial(8):
-            acc[0] = acc[0] * buf[i]   # multiply is not in the SIMD set
+            acc[0] = acc[0] * buf[i]  # multiply is not in the SIMD set
 
     cands = detect_candidates(func)
     # Multiply must be filtered out by _classify_reduce_op.
@@ -156,13 +152,8 @@ def test_pass_config_key_constant():
 
 def test_worktree_pass_config_exposes_key():
     here = os.path.dirname(os.path.abspath(__file__))
-    pass_config_path = os.path.normpath(
-        os.path.join(here, "..", "..", "..", "tilelang", "transform",
-                     "pass_config.py")
-    )
-    spec = importlib.util.spec_from_file_location(
-        "_worktree_pass_config", pass_config_path
-    )
+    pass_config_path = os.path.normpath(os.path.join(here, "..", "..", "..", "tilelang", "transform", "pass_config.py"))
+    spec = importlib.util.spec_from_file_location("_worktree_pass_config", pass_config_path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)

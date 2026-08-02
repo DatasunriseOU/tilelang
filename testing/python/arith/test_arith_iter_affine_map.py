@@ -166,7 +166,7 @@ def test_split():
 
     # simple symbolic bound
     assert_iter_sum_pattern({fld(x, c0): (c1, 0), flm(x, c0): (c0, 0)}, var_dom([(x, c1 * c0)]))
-    
+
     # more complicated symbolic bound
     assert_iter_sum_pattern({fld(x, c0 * 2): (c1, 0), flm(x, c0 * 2): (c0 * 2, 0)}, var_dom([(x, c1 * c0 * 2)]))
     assert_iter_sum_pattern({fld(x * 2, c0 * 4): (c1, 0, 1), flm(x * 2, c0 * 4): (c0 * 2, 0, 2)}, var_dom([(x, c1 * c0 * 2)]))

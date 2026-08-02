@@ -13,8 +13,8 @@
 #include "transform/vendored/let_stmt.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
-#include <tvm/tirx/script/builder/ir.h>
 #include <tvm/tirx/analysis.h>
+#include <tvm/tirx/script/builder/ir.h>
 
 #include <utility>
 
@@ -203,8 +203,7 @@ ForFrame PersistentFor(const Array<PrimExpr> &domain, const PrimExpr &wave_size,
       outer = ::tilelang::tl_tir::LetStmt(vars[i], idxs[i + 1], outer);
     }
     outer = ::tilelang::tl_tir::LetStmt(
-        vars[vars.size() - 1],
-        idxs[0] * group_size + idxs[vars.size()], outer);
+        vars[vars.size() - 1], idxs[0] * group_size + idxs[vars.size()], outer);
     return outer;
   };
 
@@ -318,7 +317,8 @@ KernelLaunchFrame KernelLaunch(const Array<PrimExpr> &grid_size,
   }
 
   if (attrs.defined()) {
-    auto empty_block = tvm::script::ir_builder::tirx::Block(DeviceMainBlockName);
+    auto empty_block =
+        tvm::script::ir_builder::tirx::Block(DeviceMainBlockName);
     empty_block->annotations = attrs;
     n->frames.push_back(empty_block);
   } else {

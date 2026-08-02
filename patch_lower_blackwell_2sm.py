@@ -1,9 +1,6 @@
-import sys
-
-with open("src/transform/lower_blackwell_2sm.cc", "r") as f:
+with open("src/transform/lower_blackwell_2sm.cc") as f:
     code = f.read()
 
-import re
 
 old_code = """class Tcgen5_2SmLower : public StmtExprMutator {
 public:
@@ -167,4 +164,3 @@ if old_code in code:
     print("Patch applied successfully.")
 else:
     print("Old code not found. Check exact formatting.")
-

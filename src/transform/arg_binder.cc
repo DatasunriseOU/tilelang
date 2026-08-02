@@ -430,8 +430,7 @@ void ArgBinder::BindDLTensors(
 
     if (is_used) {
       init_nest_.emplace_back(
-          AssertStmt(!is_null_var,
-                     tvm::tirx::StringImm("RuntimeError"),
+          AssertStmt(!is_null_var, tvm::tirx::StringImm("RuntimeError"),
                      ffi::Array<tvm::tirx::StringImm>{tvm::tirx::StringImm(
                          arg_name + " is expected to have non-NULL pointer")}));
     }
@@ -511,8 +510,7 @@ void ArgBinder::BindDLTensors(
         Call(DataType::Int(32), builtin::tvm_call_packed(), ndim_args));
     if (!disable_runtime_asserts) {
       init_nest_.emplace_back(
-          SeqStmt({IfThenElse(Not(is_null),
-                              IfThenElse(Not(ndim_ok), ndim_call),
+          SeqStmt({IfThenElse(Not(is_null), IfThenElse(Not(ndim_ok), ndim_call),
                               Evaluate(0)),
                    nop}));
     }
@@ -989,9 +987,8 @@ void ArgBinder::BindDLTensors(
           // Also tolerate any stride when dim size is 1 (torch 2.1 DLPack bug).
           RelaxedStrideCheck(k, buffer->strides[k], stride_val,
                              buffer->shape[k], is_null, stride_element_name(k));
-          stride_from_shape =
-              analyzer_.Simplify(stride_from_shape *
-                                 cast(stride_dtype, buffer->shape[k]));
+          stride_from_shape = analyzer_.Simplify(
+              stride_from_shape * cast(stride_dtype, buffer->shape[k]));
         }
       } else {
         PrimExpr stride_from_shape = 1;
@@ -1011,9 +1008,8 @@ void ArgBinder::BindDLTensors(
           // Also tolerate any stride when dim size is 1 (torch 2.1 DLPack bug).
           RelaxedStrideCheck(k, buffer->strides[k], stride_val,
                              buffer->shape[k], is_null, stride_element_name(k));
-          stride_from_shape =
-              analyzer_.Simplify(stride_from_shape *
-                                 cast(stride_dtype, buffer->shape[k]));
+          stride_from_shape = analyzer_.Simplify(
+              stride_from_shape * cast(stride_dtype, buffer->shape[k]));
         }
       }
     }
@@ -1092,10 +1088,10 @@ void ArgBinder::BindDLTensors(
       pargs2.push_back(cast(DataType::Int(64), actual_dev_type));
       Stmt call_err2 =
           Evaluate(Call(DataType::Int(32), builtin::tvm_call_packed(), pargs2));
-      asserts_.emplace_back(SeqStmt(
-          {IfThenElse(Not(is_null), IfThenElse(Not(ok), call_err2),
-                      Evaluate(0)),
-           Evaluate(0)}));
+      asserts_.emplace_back(
+          SeqStmt({IfThenElse(Not(is_null), IfThenElse(Not(ok), call_err2),
+                              Evaluate(0)),
+                   Evaluate(0)}));
     }
 
     // Data field.  Because the validation of the data field may depend
@@ -1134,14 +1130,14 @@ void ArgBinder::BindDLTensors(
         Stmt call_err3 = Evaluate(
             Call(DataType::Int(32), builtin::tvm_call_packed(), pargs3));
         asserts_.emplace_back(SeqStmt(
-            {IfThenElse(Not(is_null),
-                        IfThenElse(
-                            Not(alloc_size == 0),
+            {IfThenElse(
+                 Not(is_null),
+                 IfThenElse(Not(alloc_size == 0),
                             IfThenElse(Call(DataType::Bool(),
                                             builtin::isnullptr(), {vptr}),
                                        call_err3),
                             Evaluate(0)),
-                        Evaluate(0)),
+                 Evaluate(0)),
              nop}));
       }
 
