@@ -83,5 +83,25 @@ def test_scalar_reduce_accumulator_owner_layout():
     assert "AllReduce" in source
 
 
+def _shared_reduce_output_consumer_layout():
+    @T.prim_func
+    def main(A: T.Tensor((32, 4), T.float32), B: T.Tensor((32,), T.float32)):
+        with T.Kernel(1, threads=256):
+            src = T.alloc_shared((32, 4), T.float32)
+            dst = T.alloc_shared((32,), T.float32)
+            T.copy(A, src)
+            T.reduce_sum(src, dst, dim=-1, clear=True)
+            T.copy(dst, B)
+
+    return main
+
+
+def test_shared_reduce_output_consumer_layout(capfd):
+    artifact = tilelang.lower(_shared_reduce_output_consumer_layout(), target="metal")
+    diagnostics = capfd.readouterr()
+    assert "Layout may conflict with ReduceOp" not in diagnostics.out + diagnostics.err
+    assert "AllReduce" in artifact.kernel_source
+
+
 if __name__ == "__main__":
     tilelang.testing.main()

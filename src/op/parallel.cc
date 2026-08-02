@@ -326,11 +326,15 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
 
   // Collect fragment buffers with const index and all fragment_buffers
   std::vector<Buffer> const_index_fragment_buffer, fragment_buffers;
+  bool has_unmapped_fragment_read = false;
   for (const auto &buffer : access_order_) {
     const auto &access = GetAccessInfo(buffer);
     if (!IsFragmentBuffer(buffer))
       continue;
     fragment_buffers.push_back(buffer);
+    if (!T.layout_map.count(buffer) && access.is_read) {
+      has_unmapped_fragment_read = true;
+    }
 
     bool is_const_index = true;
     for (const auto &index : access.indices) {
@@ -418,6 +422,14 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
              (allow_layout_propgate || source_buffer_is_write)) {
     loop_layout_ = ComputeLoopLayoutFromBuffer(source_buffer, T);
   } else if (!loop_layout_.defined() && level == InferLevel::kFree) {
+    // A consumer cannot choose the layout of an unmapped fragment.  Its
+    // producer may require a non-equivalent layout (notably ReduceOp output),
+    // so defer until a producer or annotation provides an anchor.
+    if (has_unmapped_fragment_read && !source_buffer.defined() &&
+        !read_source_buffer.defined()) {
+      return {};
+    }
+
     // For free layout inference
     // In free inference, try two mechanisms and prefer the one that
     // minimizes replication while remaining compatible:
