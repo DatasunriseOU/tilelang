@@ -1293,9 +1293,6 @@ private:
 
     // For each component, try each op as root, and determine the least
     // replicated one
-    std::deque<int> q;
-    std::vector<bool> in_queue(infer_list_.size(), false);
-
     for (auto &&[root, members] : components) {
       DLOG(INFO) << "======================= processing component " << root
                  << '\n';
@@ -1306,6 +1303,10 @@ private:
 
       // Try each member as the root of inference for this component
       for (int attempt_infer_root : members) {
+        // A failed attempt can leave work queued. Keep queue state local so
+        // retries never inherit pending work or duplicate-suppression bits.
+        std::deque<int> q;
+        std::vector<bool> in_queue(infer_list_.size(), false);
         // Backup the current infer_list_ state
         auto back_infer_list = BackupInferList();
         // Copy the current layout_map for temporary use
