@@ -409,6 +409,12 @@ private:
     StmtExprVisitor::VisitStmt(stmt);
   }
 
+  void VisitStmt_(const BindNode *op) final {
+    VisitExpr(op->value);
+    summary_.def_vars.insert(op->var);
+    bound_vars_.insert(op->var);
+  }
+
   void VisitStmt_(const ForNode *op) final {
     VisitExpr(op->min);
     VisitExpr(op->extent);
@@ -1442,6 +1448,19 @@ private:
 
     std::vector<Array<Stmt>> producer_loop_prefix_stmts(num_producer_groups);
     std::vector<bool> moved_compute_stmts(consumer_compute_stmts.size(), false);
+    std::vector<LocalAccessSummary> consumer_compute_summaries;
+    consumer_compute_summaries.reserve(consumer_compute_stmts.size());
+    for (const auto &stmt : consumer_compute_stmts) {
+      consumer_compute_summaries.push_back(
+          LocalAccessCollector::Collect(stmt, buffer_data_to_buffer_));
+    }
+    LocalLiveSet producer_body_live;
+    for (size_t i = 0; i < flat_stmts.size(); ++i) {
+      if (IsProducer(kinds[i])) {
+        producer_body_live.AddUses(LocalAccessCollector::Collect(
+            flat_stmts[i], buffer_data_to_buffer_));
+      }
+    }
     int compute_cursor = 0;
     for (int ti = 0; ti < num_producer_groups; ++ti) {
       int wait_pos = wait_insert_pos[ti];
@@ -1450,17 +1469,62 @@ private:
         continue;
       }
       bool all_movable = true;
+      LocalLiveSet movable_probe_live = producer_body_live;
       for (int ci = compute_cursor; ci < wait_pos; ++ci) {
+        const LocalAccessSummary &summary = consumer_compute_summaries[ci];
+        if (consumer_compute_stmts[ci].as<BindNode>()) {
+          if (!movable_probe_live.NeedsAnyDef(summary)) {
+            all_movable = false;
+            break;
+          }
+          movable_probe_live.AddUses(summary);
+          continue;
+        }
         if (!IsProducerMovableLoopPrefixStmt(consumer_compute_stmts[ci],
                                              target_)) {
           all_movable = false;
           break;
         }
+        movable_probe_live.AddUses(summary);
       }
       if (all_movable) {
+        std::vector<bool> add_to_producer(consumer_compute_stmts.size(), false);
+        LocalLiveSet producer_live = producer_body_live;
+        LocalLiveSet consumer_live;
+        for (int ci = wait_pos;
+             ci < static_cast<int>(consumer_compute_stmts.size()); ++ci) {
+          if (!moved_compute_stmts[ci]) {
+            consumer_live.AddUses(consumer_compute_summaries[ci]);
+          }
+        }
+        for (int ci = wait_pos - 1; ci >= compute_cursor; --ci) {
+          const LocalAccessSummary &summary = consumer_compute_summaries[ci];
+          const bool is_bind =
+              consumer_compute_stmts[ci].as<BindNode>() != nullptr;
+          if (!is_bind) {
+            add_to_producer[ci] = true;
+            moved_compute_stmts[ci] = true;
+            producer_live.AddUses(summary);
+            continue;
+          }
+
+          bool producer_needs = producer_live.NeedsAnyDef(summary);
+          bool consumer_needs = consumer_live.NeedsAnyDef(summary);
+          if (producer_needs) {
+            add_to_producer[ci] = true;
+            producer_live.AddUses(summary);
+          }
+          if (!producer_needs || consumer_needs) {
+            consumer_live.AddUses(summary);
+          } else {
+            moved_compute_stmts[ci] = true;
+          }
+        }
         for (int ci = compute_cursor; ci < wait_pos; ++ci) {
-          producer_loop_prefix_stmts[ti].push_back(consumer_compute_stmts[ci]);
-          moved_compute_stmts[ci] = true;
+          if (add_to_producer[ci]) {
+            producer_loop_prefix_stmts[ti].push_back(
+                consumer_compute_stmts[ci]);
+          }
         }
       }
       compute_cursor = wait_pos;

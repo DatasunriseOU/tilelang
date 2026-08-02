@@ -32,6 +32,7 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include <functional>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -1006,6 +1007,33 @@ public:
     LOG(FATAL) << "A while loop inside a vectorized loop not supported.";
   }
 
+  // Bind
+  Stmt VisitStmt_(const BindNode *op) final {
+    PrimExpr value = this->VisitExpr(op->value);
+    ICHECK(!let_var_map_.count(op->var))
+        << "SSA violation, a single var is binded twice";
+    if (value.dtype().get_lanes_or_vscale_factor() !=
+        op->value.dtype().get_lanes_or_vscale_factor()) {
+      Var new_var(op->var->name_hint, value.dtype());
+      let_var_map_[op->var] = new_var;
+      let_value_binding_[op->var] = op->value;
+      let_value_binding_[new_var] = value;
+      return Bind(new_var, value, op->span);
+    } else {
+      let_var_map_[op->var] = op->var;
+      // Keep the scalar source expression for a later scalarized
+      // sub-statement.  The vectorized value may contain the loop ramp, while
+      // scalar restoration must substitute the per-lane scalar index.
+      let_value_binding_[op->var] = op->value;
+      if (value.same_as(op->value)) {
+        scalarization_invariant_bindings_.insert(op->var);
+        return tvm::ffi::GetRef<Stmt>(op);
+      } else {
+        return Bind(op->var, value, op->span);
+      }
+    }
+  }
+
   // LetStmt (vendored)
   Stmt VisitStmt_(const LetStmtNode *op) {
     PrimExpr value = this->VisitExpr(op->value);
@@ -1074,38 +1102,102 @@ public:
   // scalarize the statement
   Stmt Scalarize(Stmt stmt) {
     Var idx(var_->name_hint + "_s", var_->dtype);
-    // Find all Vars in stmt that are keys in let_value_binding_
-    std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> used_let_bound_vars;
-    PostOrderVisit(stmt, [this, &used_let_bound_vars](const ObjectRef &node) {
-      if (const auto *v = node.as<VarNode>()) {
-        Var var = GetRef<Var>(v);
-        if (let_value_binding_.count(var)) {
-          used_let_bound_vars.insert(var);
-        }
-      }
-    });
-
-    // Check which vars already have LetStmt definitions inside stmt
+    // Check which vars already have LetStmt or Bind definitions inside stmt
     std::unordered_set<const VarNode *> defined_in_stmt;
     PostOrderVisit(stmt, [&defined_in_stmt](const ObjectRef &node) {
       if (const auto *let = node.as<LetStmtNode>()) {
         defined_in_stmt.insert(let->var.get());
+      } else if (const auto *bind = node.as<BindNode>()) {
+        defined_in_stmt.insert(bind->var.get());
       }
     });
 
-    stmt = Substitute(stmt, {{var_, idx}});
-
-    if (!used_let_bound_vars.empty()) {
-      for (const auto &v : used_let_bound_vars) {
-        if (defined_in_stmt.count(v.get()) > 0) {
-          // Skip: the original stmt already contains a LetStmt definition for
-          // this var
-          continue;
+    // Find bound Vars used directly by stmt in deterministic first-use order.
+    std::vector<Var> root_vars;
+    std::unordered_set<const VarNode *> seen_roots;
+    PostOrderVisit(stmt, [this, &defined_in_stmt, &root_vars,
+                          &seen_roots](const ObjectRef &node) {
+      if (const auto *v = node.as<VarNode>()) {
+        Var var = GetRef<Var>(v);
+        if (let_value_binding_.count(var) &&
+            !scalarization_invariant_bindings_.count(var) &&
+            !defined_in_stmt.count(var.get()) &&
+            seen_roots.insert(var.get()).second) {
+          root_vars.push_back(var);
         }
-        // Bind the existing var v to its value around the stmt scope
-        auto new_value = Substitute(let_value_binding_.at(v), {{var_, idx}});
-        stmt = LetStmt(v, new_value, stmt);
       }
+    });
+
+    // Restore the transitive dependencies of each used binding before its
+    // dependents.  Valid SSA bindings are acyclic, but guard malformed input.
+    enum class BindingVisitState { kVisiting, kDone };
+    std::unordered_map<const VarNode *, BindingVisitState> binding_visit_state;
+    std::vector<Var> binding_order;
+    std::function<void(const Var &)> add_binding = [&](const Var &var) {
+      auto state_it = binding_visit_state.find(var.get());
+      if (state_it != binding_visit_state.end()) {
+        ICHECK(state_it->second != BindingVisitState::kVisiting)
+            << "Cyclic Bind dependencies during loop scalarization";
+        return;
+      }
+      binding_visit_state[var.get()] = BindingVisitState::kVisiting;
+
+      std::vector<Var> dependencies;
+      std::unordered_set<const VarNode *> seen_dependencies;
+      PostOrderVisit(
+          let_value_binding_.at(var),
+          [this, &defined_in_stmt, &dependencies,
+           &seen_dependencies](const ObjectRef &node) {
+            if (const auto *v = node.as<VarNode>()) {
+              Var dependency = GetRef<Var>(v);
+              if (let_value_binding_.count(dependency) &&
+                  !scalarization_invariant_bindings_.count(dependency) &&
+                  !defined_in_stmt.count(dependency.get()) &&
+                  seen_dependencies.insert(dependency.get()).second) {
+                dependencies.push_back(dependency);
+              }
+            }
+          });
+      for (const Var &dependency : dependencies) {
+        add_binding(dependency);
+      }
+
+      binding_visit_state[var.get()] = BindingVisitState::kDone;
+      binding_order.push_back(var);
+    };
+    for (const Var &root : root_vars) {
+      add_binding(root);
+    }
+
+    // A same-lane Bind keeps its original Var in the vectorized outer body.
+    // Restoring that binding inside the scalar loop therefore needs a fresh
+    // Var to preserve SSA.  Bindings whose lane count changed already use a
+    // distinct vector Var outside the scalar loop and can restore the original
+    // scalar Var directly.
+    std::unordered_map<Var, Var, ObjectPtrHash, ObjectPtrEqual>
+        restored_var_map;
+    ffi::Map<Var, PrimExpr> scalar_substitute;
+    scalar_substitute.Set(var_, idx);
+    for (const Var &binding : binding_order) {
+      auto mapped_it = let_var_map_.find(binding);
+      if (mapped_it != let_var_map_.end() &&
+          mapped_it->second.same_as(binding)) {
+        Var restored_var(binding->name_hint, binding->dtype);
+        restored_var_map.emplace(binding, restored_var);
+        scalar_substitute.Set(binding, restored_var);
+      }
+    }
+
+    // Emit native bodyless Bind statements in reverse topological order so
+    // dependencies dominate their uses.
+    stmt = Substitute(stmt, scalar_substitute);
+    for (auto it = binding_order.rbegin(); it != binding_order.rend(); ++it) {
+      auto restored_it = restored_var_map.find(*it);
+      Var restored_var =
+          restored_it == restored_var_map.end() ? *it : restored_it->second;
+      auto new_value =
+          Substitute(let_value_binding_.at(*it), scalar_substitute);
+      stmt = SeqStmt({Bind(restored_var, new_value), stmt});
     }
 
     return For(idx, IntImm(var_->dtype, 0), var_lanes_, ForKind::kSerial, stmt);
@@ -1129,6 +1221,10 @@ private:
   // Let value binding: map new_var -> value
   std::unordered_map<Var, PrimExpr, ObjectPtrHash, ObjectPtrEqual>
       let_value_binding_;
+  // Native Bind values that remain unchanged are loop-invariant and already
+  // dominate any scalarized sub-statement; do not emit a duplicate definition.
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>
+      scalarization_invariant_bindings_;
   // vectorizable property
   OpAttrMap<TVectorizable> op_vectorizable_ =
       Op::GetAttrMap<TVectorizable>("TVectorizable");

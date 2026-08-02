@@ -173,6 +173,28 @@ def explicit_cp_async_wait_position(iters=4, block=16, cp_elems=8, dtype="float1
     return main
 
 
+def producer_bound_tma_index(iters=2, block=32, dtype="float16", threads=256):
+    """A TMA source offset bound from producer-owned shared state."""
+
+    @T.prim_func
+    def main(
+        A: T.Buffer((iters * block,), dtype),
+        B: T.Buffer((iters * block,), dtype),
+    ):
+        with T.Kernel(1, threads=threads):
+            index_shared = T.alloc_shared((1,), "int32")
+            A_shared = T.alloc_shared((block,), dtype)
+
+            for ko in T.Pipelined(iters, num_stages=2):
+                index_shared[0] = ko * block
+                offset = index_shared[0]
+                T.copy(A[offset], A_shared)
+                for i in T.Parallel(block):
+                    B[ko * block + i] = A_shared[i]
+
+    return main
+
+
 def grouped_gemm_padded_pipelined(
     batch_sizes,
     K,
@@ -495,7 +517,7 @@ def test_tiled_ws_explicit_cp_async_wait_precedes_first_consumer_read():
 
     func = explicit_cp_async_wait_position().with_attr("global_symbol", "main")
     mod = tvm.IRModule.from_expr(func)
-    target = determine_target({"kind": "cuda", "arch": "sm_90"}, return_object=True)
+    target = determine_target("cuda -arch=sm_90", return_object=True)
     mod = tvm.tirx.transform.BindTarget(target)(mod)
     mod = tilelang.transform.ProducerConsumerWarpSpecialized()(mod)
     script = mod["main"].script()
@@ -510,6 +532,165 @@ def test_tiled_ws_explicit_cp_async_wait_precedes_first_consumer_read():
     tma_read = _find_after(script, "A_out[ko, i] = A_shared", consumer_branch)
 
     assert wait < cp_async_read < tma_read
+
+
+def test_tiled_ws_bodyless_statements_preserve_roles():
+    """Bodyless setup nodes stay neutral without hiding producer/consumer work."""
+
+    func = explicit_cp_async_wait_position().with_attr("global_symbol", "main")
+    mod = tvm.IRModule.from_expr(func)
+    target = determine_target("cuda -arch=sm_90", return_object=True)
+    mod = tvm.tirx.transform.BindTarget(target)(mod)
+    role_probe = tvm.tirx.decl_buffer(
+        (1,),
+        "float16",
+        name="role_probe",
+        scope="shared.dyn",
+    )
+    input_buffer = next(buffer for buffer in mod["main"].buffer_map.values() if buffer.name == "A")
+    injected = {"pipeline": False, "root_block": False}
+
+    def inject_role_nodes(node):
+        if isinstance(node, tvm.tirx.For) and "num_stages" in node.annotations:
+            role_alloc = tvm.tirx.decl_buffer(
+                (1,),
+                "int32",
+                name="role_alloc",
+                scope="local",
+            )
+            role_decl = tvm.tirx.decl_buffer(
+                (1,),
+                "int32",
+                name="role_decl",
+                scope="local",
+            )
+            setup = [
+                tvm.tirx.Bind(tvm.tirx.Var("role_bind", "float16"), role_probe[0]),
+                tvm.tirx.AssertStmt(
+                    tvm.tirx.const(True, "bool"),
+                    tvm.tirx.StringImm("RuntimeError"),
+                    [tvm.tirx.StringImm("role marker")],
+                ),
+                tvm.tirx.DeclBuffer(role_decl),
+                tvm.tirx.AllocBuffer(role_alloc),
+                tvm.tirx.While(
+                    tvm.tirx.const(False, "bool"),
+                    tvm.tirx.SeqStmt(
+                        [
+                            tvm.tirx.Bind(
+                                tvm.tirx.Var("nested_bind", "int32"),
+                                tvm.tirx.IntImm("int32", 0),
+                            ),
+                            tvm.tirx.Evaluate(0),
+                        ]
+                    ),
+                ),
+                tvm.tirx.BufferStore(
+                    role_probe,
+                    input_buffer[node.loop_var, 0],
+                    [0],
+                ),
+            ]
+            body = list(node.body.seq) if isinstance(node.body, tvm.tirx.SeqStmt) else [node.body]
+            injected["pipeline"] = True
+            return tvm.tirx.For(
+                node.loop_var,
+                node.min,
+                node.extent,
+                node.kind,
+                tvm.tirx.SeqStmt([*setup, *body]),
+                node.thread_binding,
+                node.annotations,
+                node.step,
+            )
+        if isinstance(node, tvm.tirx.SBlock) and node.name_hint == "tilelang_root":
+            injected["root_block"] = True
+            return tvm.tirx.SBlock(
+                node.iter_vars,
+                node.reads,
+                node.writes,
+                node.name_hint,
+                node.body,
+                node.init,
+                [*node.alloc_buffers, role_probe],
+                node.match_buffers,
+                node.annotations,
+            )
+        return None
+
+    body = tvm.tirx.stmt_functor.ir_transform(
+        mod["main"].body,
+        None,
+        inject_role_nodes,
+        ["tirx.For", "tirx.SBlock"],
+    )
+    assert injected == {"pipeline": True, "root_block": True}
+    mod = tvm.IRModule({"main": mod["main"].with_body(body)})
+
+    found = {name: 0 for name in ("bind", "assert", "decl", "alloc", "while")}
+
+    def collect_bodyless_setup_nodes(node):
+        found["bind"] += isinstance(node, tvm.tirx.Bind)
+        found["assert"] += isinstance(node, tvm.tirx.AssertStmt)
+        found["decl"] += isinstance(node, tvm.tirx.stmt.DeclBuffer)
+        found["alloc"] += isinstance(node, tvm.tirx.stmt.AllocBuffer)
+        found["while"] += isinstance(node, tvm.tirx.While)
+
+    tvm.tirx.stmt_functor.post_order_visit(
+        mod["main"].body,
+        collect_bodyless_setup_nodes,
+    )
+    assert found == {"bind": 2, "assert": 1, "decl": 1, "alloc": 1, "while": 1}
+
+    mod = tilelang.transform.ProducerConsumerWarpSpecialized()(mod)
+    script = mod["main"].script()
+    assert "tl_tiled_ws_applied" in script
+
+    alloc_shapes = {}
+
+    def collect_alloc_shapes(node):
+        if isinstance(node, tvm.tirx.SBlock):
+            for buffer in node.alloc_buffers:
+                alloc_shapes[buffer.name] = tuple(int(dim) for dim in buffer.shape)
+
+    tvm.tirx.stmt_functor.post_order_visit(
+        mod["main"].body,
+        collect_alloc_shapes,
+    )
+    assert alloc_shapes["A_shared"] == (2, 16)
+    assert alloc_shapes["role_probe"] == (1,)
+
+    producer_branch = _find_after(script, "if tx >= 128:")
+    consumer_branch = _find_after(script, "else:", producer_branch)
+    probe_store = _find_after(script, "role_probe[0] = A[ko, 0]", producer_branch)
+    neutral_bind = _find_after(script, "role_bind:", consumer_branch)
+    consumer_store = _find_after(script, "B_out[ko] = B_shared[0]", consumer_branch)
+    assert producer_branch < probe_store < consumer_branch
+    assert consumer_branch < neutral_bind < consumer_store
+
+
+def test_tiled_ws_propagates_producer_role_through_bind():
+    """A scalar Bind feeding TMA must be defined in the producer branch."""
+
+    func = producer_bound_tma_index().with_attr("global_symbol", "main")
+    mod = tvm.IRModule.from_expr(func)
+    target = determine_target("cuda -arch=sm_90", return_object=True)
+    mod = tvm.tirx.transform.BindTarget(target)(mod)
+    mod = tilelang.transform.ProducerConsumerWarpSpecialized()(mod)
+    script = mod["main"].script()
+
+    assert "tl_tiled_ws_applied" in script
+    producer_branch = _find_after(script, "if tx >= 256:")
+    offset_bind = _find_after(
+        script,
+        "offset: T.int32 = index_shared",
+        producer_branch,
+    )
+    tma_copy = _find_after(script, "T.tma_copy", producer_branch)
+    consumer_branch = _find_after(script, "else:", producer_branch)
+
+    assert producer_branch < offset_bind < tma_copy < consumer_branch
+    assert "offset: T.int32 = index_shared" not in script[consumer_branch:]
 
 
 @tilelang.testing.requires_cuda

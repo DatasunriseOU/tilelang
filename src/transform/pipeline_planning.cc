@@ -54,6 +54,53 @@ bool MayConflict(const Region &region1, const Region &region2) {
   return true;
 }
 
+/*!
+ * \brief Check whether two regions are provably identical.
+ *
+ * Unlike MayConflict, this is fail-closed when symbolic bounds cannot be
+ * proven equal. It is used for the dependent-RMW exception below so a partial
+ * read cannot justify a larger overlapping write.
+ */
+bool RegionsProvablyEqual(const Region &region1, const Region &region2) {
+  if (region1.size() != region2.size()) {
+    return false;
+  }
+  arith::Analyzer analyzer;
+  for (size_t i = 0; i < region1.size(); i++) {
+    if (!analyzer.CanProveEqual(region1[i]->min, region2[i]->min) ||
+        !analyzer.CanProveEqual(region1[i]->extent, region2[i]->extent)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/*!
+ * \brief Check whether outer provably covers every point in inner.
+ */
+bool RegionProvablyContains(const Region &outer, const Region &inner,
+                            const Stmt &scope) {
+  if (outer.size() != inner.size()) {
+    return false;
+  }
+  arith::Analyzer analyzer;
+  PreOrderVisit(scope, [&](const ObjectRef &node) {
+    if (const auto *loop = node.as<ForNode>()) {
+      analyzer.Bind(loop->loop_var,
+                    Range::FromMinExtent(loop->min, loop->extent));
+    }
+    return true;
+  });
+  for (size_t i = 0; i < outer.size(); i++) {
+    if (!analyzer.CanProve(outer[i]->min <= inner[i]->min) ||
+        !analyzer.CanProve(inner[i]->min + inner[i]->extent <=
+                           outer[i]->min + outer[i]->extent)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 class TmemLoadCollector : public StmtExprVisitor {
 public:
   TmemLoadCollector() {}
@@ -535,6 +582,7 @@ private:
    *   dependencies and maximizing parallelism
    */
   struct PipelineStageInfo {
+    Stmt stmt;
     Array<BufferRegion> reads, writes;
     int original_stmt_index{};
     int order = -1, stage = -1;
@@ -815,12 +863,49 @@ private:
           continue;
         }
 
+        // A dependent read-modify-write is a consumer of this copy, not an
+        // independent second producer. Its read keeps the copy live through
+        // this statement, so async scheduling waits for the copy before the
+        // in-place update. Keep the carve-out exact: the later statement must
+        // be a non-copy RMW, and every region it writes must be provably
+        // identical to a region it reads and be fully covered by an output of
+        // this copy. Pure or only-partially-dependent second writes still
+        // fail.
+        const auto &later = (*pipeline_stage_infos)[i];
+        bool is_dependent_rmw = !later.is_copy_stage() && !later.writes.empty();
+        if (is_dependent_rmw) {
+          for (const BufferRegion &write : later.writes) {
+            bool reads_same_region = std::any_of(
+                later.reads.begin(), later.reads.end(),
+                [&](const BufferRegion &read) {
+                  return read->buffer == write->buffer &&
+                         RegionsProvablyEqual(read->region, write->region);
+                });
+            bool copy_writes_same_region = std::any_of(
+                pinfo.writes.begin(), pinfo.writes.end(),
+                [&](const BufferRegion &copy_write) {
+                  return copy_write->buffer == write->buffer &&
+                         RegionProvablyContains(copy_write->region,
+                                                write->region, later.stmt);
+                });
+            if (!reads_same_region || !copy_writes_same_region) {
+              is_dependent_rmw = false;
+              break;
+            }
+          }
+        }
+
         for (const BufferRegion &write : (*pipeline_stage_infos)[i].writes) {
           if (std::find_if(pinfo.writes.begin(), pinfo.writes.end(),
                            [&](const BufferRegion &r) {
                              return r->buffer == write->buffer &&
                                     MayConflict(r->region, write->region);
                            }) != pinfo.writes.end()) {
+            if (is_dependent_rmw) {
+              pinfo.last_use_stmt_index =
+                  std::max(pinfo.last_use_stmt_index, i);
+              continue;
+            }
             LOG(FATAL) << "Pipeline planning error: Multiple writes to "
                           "overlapping buffer regions detected. "
                        << "Stage " << pinfo.original_stmt_index << " and stage "
@@ -965,6 +1050,7 @@ private:
         BufferRegionCollector(buffer_data_to_buffer_, chain_builder, target_);
     collector(block);
     PipelineStageInfo pinfo;
+    pinfo.stmt = block->body;
     pinfo.reads = std::move(collector.GetReads());
     pinfo.writes = std::move(collector.GetWrites());
     pinfo.original_stmt_index = idx;
