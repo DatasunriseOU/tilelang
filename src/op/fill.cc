@@ -193,17 +193,22 @@ Stmt FillNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 /**
  * @brief Infer memory/layout mapping for the Fill operator.
  *
- * Returns the layout mapping produced by layout inference for this FillNode.
- * Currently no layout inference is performed for Fill and the function returns
- * an empty LayoutMap.
+ * Fragment fills are pure producers, so infer their layout from the same SIMT
+ * loop used by backend lowering. Other memory scopes do not need fragment
+ * layout inference here.
  *
- * @param T Context required for layout inference (unused).
- * @param level The inference level requested (unused).
- * @return LayoutMap Empty map indicating no inferred layouts for this operator.
+ * @param T Context required for layout inference.
+ * @param level The inference level requested.
+ * @return LayoutMap Inferred fragment layout, or an empty map for non-fragment
+ * destinations.
  */
 LayoutMap FillNode::InferLayout(const LayoutInferArgs &T,
                                 InferLevel level) const {
-  return {};
+  if (!IsFragmentBuffer(dst)) {
+    return {};
+  }
+  auto par_op = ParallelOp(MakeSIMTLoop(T.analyzer));
+  return par_op->InferLayout(T, level);
 }
 
 TIR_REGISTER_TL_TILE_OP(Fill, fill)

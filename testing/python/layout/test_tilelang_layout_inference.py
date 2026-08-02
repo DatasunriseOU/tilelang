@@ -103,5 +103,26 @@ def test_shared_reduce_output_consumer_layout(capfd):
     assert "AllReduce" in artifact.kernel_source
 
 
+def _fragment_fill_copy_rmw_chain():
+    @T.prim_func
+    def main(B: T.Tensor((2, 32), T.float32)):
+        with T.Kernel(1, threads=256):
+            acc = T.alloc_fragment((2, 32), T.float32)
+            frag = T.alloc_fragment((2, 32), T.float32)
+            T.clear(acc)
+            T.copy(acc, frag)
+            for r, p in T.Parallel(2, 32):
+                frag[r, p] += T.float32(1.0)
+            T.copy(frag, acc)
+            T.copy(acc, B)
+
+    return main
+
+
+def test_fragment_fill_anchors_copy_rmw_chain():
+    artifact = tilelang.lower(_fragment_fill_copy_rmw_chain(), target="metal")
+    assert artifact.kernel_source
+
+
 if __name__ == "__main__":
     tilelang.testing.main()
