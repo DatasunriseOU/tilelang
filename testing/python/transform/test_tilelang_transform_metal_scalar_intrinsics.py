@@ -23,9 +23,7 @@ def test_metal_index_normalizer_drops_sparse_mla_flat_long_casts():
             tvm.tir.BufferStore(out, tvm.tir.BufferLoad(reduce_buf, [reduce_idx]), [0]),
         ]
     )
-    func = tvm.tir.PrimFunc([kv, reduce_buf, out, kv_row_base, d, tid, stride], body).with_attr(
-        "target", tvm.target.Target("metal")
-    )
+    func = tvm.tir.PrimFunc([kv, reduce_buf, out, kv_row_base, d, tid, stride], body).with_attr("target", tvm.target.Target("metal"))
     before = tvm.IRModule({"main": func})
 
     after = tilelang.transform.BindMetalScalarIntrinsics()(before)
@@ -47,9 +45,7 @@ def test_metal_scalar_binder_covers_threadgroup_tid():
         tvm.tir.BufferLoad(src, [tid0]) + tvm.tir.BufferLoad(src, [tid1]),
         [0],
     )
-    func = tvm.tir.PrimFunc([src, out], body).with_attr(
-        "target", tvm.target.Target("metal")
-    )
+    func = tvm.tir.PrimFunc([src, out], body).with_attr("target", tvm.target.Target("metal"))
 
     after = tilelang.transform.BindMetalScalarIntrinsics()(tvm.IRModule({"main": func}))
     text = str(after["main"])

@@ -39,11 +39,11 @@
 #include "vendored/z3_prover.h"
 #include <iostream>
 #include <optional>
+#include <tuple>
 #include <tvm/arith/iter_affine_map.h>
 #include <tvm/ffi/extra/structural_hash.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/stmt_functor.h>
-#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -99,9 +99,8 @@ struct VectorizeMemoKeyHash {
 // the key shape used by Z3CanProveLoopAligned's `probe` (buffer ptr,
 // vector_size, list of indices structural-hashes).
 struct AlignmentMemoKeyHash {
-  size_t operator()(
-      const std::tuple<const void *, int, std::vector<size_t>> &k) const
-      noexcept {
+  size_t operator()(const std::tuple<const void *, int, std::vector<size_t>> &k)
+      const noexcept {
     size_t seed = std::hash<const void *>{}(std::get<0>(k));
     TupleHashMix(seed, static_cast<size_t>(std::get<1>(k)));
     for (size_t h : std::get<2>(k)) {
@@ -111,7 +110,7 @@ struct AlignmentMemoKeyHash {
   }
 };
 
-}  // namespace
+} // namespace
 
 /*!
  * \brief Check if buffer strides represent a contiguous (row-major) layout.
@@ -690,13 +689,15 @@ private:
   }
 
   void CheckConditionVectorized(const PrimExpr &cond) {
-    if (!inner_for_) return;
-    bool is_dependent = UsesVar(cond, [&](const VarNode* v) {
+    if (!inner_for_)
+      return;
+    bool is_dependent = UsesVar(cond, [&](const VarNode *v) {
       return v == inner_for_->loop_var.get();
     });
     if (is_dependent) {
-      // If the condition depends on the vectorized loop variable, we cannot safely vectorize
-      // because we don't support divergent control flow within a vector.
+      // If the condition depends on the vectorized loop variable, we cannot
+      // safely vectorize because we don't support divergent control flow within
+      // a vector.
       vector_size_ = 1;
     }
   }
@@ -889,8 +890,9 @@ private:
     // 4. Try to find max vectorize size for this buffer
     // CPPMEGA fix-B6 (idea712): memoized halving probe.
     while (buffer_vec_size > 1) {
-      int ret = MemoizedIndicesCanVectorize(elem_offset, inner_for_->loop_var,
-                                            inner_for_->extent, buffer_vec_size);
+      int ret =
+          MemoizedIndicesCanVectorize(elem_offset, inner_for_->loop_var,
+                                      inner_for_->extent, buffer_vec_size);
       if (ret != 0) {
         if (common_stride_ == 0) {
           common_stride_ = ret;
@@ -960,8 +962,8 @@ private:
   // Cache lifetime: per-planner-instance. A new planner is created per
   // `Plan(For)` entry, so the cache is naturally scoped.
   int MemoizedIndicesCanVectorize(const PrimExpr &expr, Var var,
-                                   const PrimExpr &iter_var_size,
-                                   int target_vectorized_size) {
+                                  const PrimExpr &iter_var_size,
+                                  int target_vectorized_size) {
     if (target_vectorized_size <= 1) {
       // IndicesCanVectorize itself returns 1 at size 1; mirror that
       // without touching the analyzer.
@@ -976,10 +978,9 @@ private:
     // collisions are now genuine hash collisions (handled correctly
     // by the bucket chain) instead of memo-table aliasing.
     ::tvm::ffi::StructuralHash hasher;
-    auto key = std::make_tuple(static_cast<size_t>(hasher(expr)),
-                               static_cast<const void *>(var.get()),
-                               static_cast<size_t>(hasher(iter_var_size)),
-                               target_vectorized_size);
+    auto key = std::make_tuple(
+        static_cast<size_t>(hasher(expr)), static_cast<const void *>(var.get()),
+        static_cast<size_t>(hasher(iter_var_size)), target_vectorized_size);
     auto it = indices_can_vectorize_memo_.find(key);
     if (it != indices_can_vectorize_memo_.end()) {
       return it->second;
@@ -1028,10 +1029,11 @@ private:
 //     forall free_vars in BV32:
 //       FloorMod(elem_offset_bytes, vector_size * dtype_bytes) == 0
 //
-// where `elem_offset_bytes = (buffer.elem_offset + index_offset) * dtype_bytes`.
-// `index_offset` is the same `elem_offset` expression that the contiguity
-// path computes (sum of `indices[i] * strides[i]`), but evaluated at the
-// loop variable's *base value* (so that `var % vector_size == 0` is implicit).
+// where `elem_offset_bytes = (buffer.elem_offset + index_offset) *
+// dtype_bytes`. `index_offset` is the same `elem_offset` expression that the
+// contiguity path computes (sum of `indices[i] * strides[i]`), but evaluated at
+// the loop variable's *base value* (so that `var % vector_size == 0` is
+// implicit).
 //
 // Bit-bound free vars to BV32 emulation via EnterConstraint.
 static bool Z3CanProveAlignedAccess(const Buffer &buffer,
@@ -1133,17 +1135,16 @@ static bool Z3CanProveAlignedAccess(const Buffer &buffer,
       // boundary at the START of each vector chunk. Goal: prove the
       // address at lane 0 of every vector chunk is aligned.
       if (v == loop_var.get()) {
-        bound = (var >= make_const(dt, 0)) && (var <= hi) &&
-                (FloorMod(var, make_const(dt, vector_size)) ==
-                 make_const(dt, 0));
+        bound =
+            (var >= make_const(dt, 0)) && (var <= hi) &&
+            (FloorMod(var, make_const(dt, vector_size)) == make_const(dt, 0));
       }
       scopes.emplace_back(z3, bound);
     }
 
-    PrimExpr goal =
-        FloorMod(base_addr_bytes,
-                 make_const(base_addr_bytes.dtype(), alignment)) ==
-        make_const(base_addr_bytes.dtype(), 0);
+    PrimExpr goal = FloorMod(base_addr_bytes,
+                             make_const(base_addr_bytes.dtype(), alignment)) ==
+                    make_const(base_addr_bytes.dtype(), 0);
 
     bool proved = false;
     try {
@@ -1173,8 +1174,7 @@ static bool Z3CanProveAlignedAccess(const Buffer &buffer,
 // is impossible. Within a Plan, the same loop body's repeated accesses
 // dedupe trivially.
 static bool Z3CanProveLoopAligned(const Stmt &body, const Var &loop_var,
-                                  int vector_size,
-                                  arith::Analyzer *analyzer) {
+                                  int vector_size, arith::Analyzer *analyzer) {
   bool saw_memory = false;
   bool all_aligned = true;
 
@@ -1197,15 +1197,17 @@ static bool Z3CanProveLoopAligned(const Stmt &body, const Var &loop_var,
     auto key = std::make_tuple(static_cast<const void *>(buf.get()),
                                vector_size, std::move(idx_hashes));
     auto it = memo.find(key);
-    if (it != memo.end()) return it->second;
-    bool ok = Z3CanProveAlignedAccess(buf, indices, loop_var, vector_size,
-                                      analyzer);
+    if (it != memo.end())
+      return it->second;
+    bool ok =
+        Z3CanProveAlignedAccess(buf, indices, loop_var, vector_size, analyzer);
     memo.emplace(std::move(key), ok);
     return ok;
   };
 
   PostOrderVisit(body, [&](const ObjectRef &obj) {
-    if (!all_aligned) return;
+    if (!all_aligned)
+      return;
     if (const auto *ld = obj.as<BufferLoadNode>()) {
       if (IsLocalBuffer(ld->buffer, /*allow_var=*/true) ||
           IsFragmentBuffer(ld->buffer)) {
@@ -1230,8 +1232,8 @@ static bool Z3CanProveLoopAligned(const Stmt &body, const Var &loop_var,
 }
 
 // Build a new annotation map with `tl.vec_aligned -> True` added.
-static Map<String, ffi::Any> MakeAlignedAnnotations(
-    const Map<String, ffi::Any> &existing) {
+static Map<String, ffi::Any>
+MakeAlignedAnnotations(const Map<String, ffi::Any> &existing) {
   Map<String, ffi::Any> out = existing;
   out.Set("tl.vec_aligned", Bool(true));
   return out;
@@ -1239,7 +1241,8 @@ static Map<String, ffi::Any> MakeAlignedAnnotations(
 
 class VectorizeRewriter : public StmtExprMutator {
 public:
-  VectorizeRewriter(int vector_size, bool negative_ramp = false) : vector_size_(vector_size), negative_ramp_(negative_ramp) {}
+  VectorizeRewriter(int vector_size, bool negative_ramp = false)
+      : vector_size_(vector_size), negative_ramp_(negative_ramp) {}
 
 private:
   Stmt VisitStmt_(const ForNode *node) final {
@@ -1298,8 +1301,7 @@ private:
         Stmt body = Substitute(fnode->body, vmap);
         Map<String, ffi::Any> inner_annotations;
         if (aligned) {
-          inner_annotations =
-              MakeAlignedAnnotations(Map<String, ffi::Any>());
+          inner_annotations = MakeAlignedAnnotations(Map<String, ffi::Any>());
         }
         if (negative_ramp_) {
           inner_annotations.Set("negative_ramp", Bool(true));
@@ -1386,7 +1388,8 @@ bool IsExprInvariantInVectorBoundary(const PrimExpr &expr, Var var,
       auto bounds = ::tilelang::tlz3::BVBoundsForDtype(dt);
       if (bounds.has_value()) {
         auto [lo64, hi64] = *bounds;
-        scopes.emplace_back(z3, (var >= make_const(dt, lo64)) && (var <= make_const(dt, hi64)));
+        scopes.emplace_back(z3, (var >= make_const(dt, lo64)) &&
+                                    (var <= make_const(dt, hi64)));
       }
       if (z3.CanProve(expr == expr_aligned)) {
         return true;
@@ -1420,14 +1423,14 @@ bool IsExprInvariantInVectorBoundary(const PrimExpr &expr, Var var,
 // safety — accesses like `var * stride / N` have stride only when `stride
 // == N` and the simplifier should have already canonicalised that.
 static bool IsAffineInVar(const PrimExpr &expr, const Var &var) {
-  (void)var;  // currently unused; reserved for stricter checks (e.g. var-only).
+  (void)var; // currently unused; reserved for stricter checks (e.g. var-only).
   bool ok = true;
   PostOrderVisit(expr, [&](const ObjectRef &obj) {
     if (!ok) {
       return;
     }
     if (obj.as<BufferLoadNode>()) {
-      ok = false;  // any indirect index → reject
+      ok = false; // any indirect index → reject
       return;
     }
     // Only inspect PrimExpr nodes; ignore Stmt / Buffer / etc.
@@ -1617,9 +1620,8 @@ static bool Z3CanProveUnitStride(const PrimExpr &expr, const Var &var,
 }
 
 int IndicesCanVectorize(const PrimExpr &expr, Var var,
-                         const PrimExpr &iter_var_size,
-                         int target_vectorized_size,
-                         arith::Analyzer *analyzer) {
+                        const PrimExpr &iter_var_size,
+                        int target_vectorized_size, arith::Analyzer *analyzer) {
   ICHECK(target_vectorized_size >= 1);
   if (target_vectorized_size == 1)
     return 1;

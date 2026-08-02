@@ -136,14 +136,9 @@ class Frag:
         if not self.shape or any((not isinstance(d, int)) or d <= 0 for d in self.shape):
             raise ValueError(f"Frag.shape must be a non-empty tuple of positive ints; got {self.shape!r}")
         if self.scope not in _VALID_SCOPES:
-            raise ValueError(
-                f"Frag.scope={self.scope!r} not in {sorted(_VALID_SCOPES)}; "
-                "extend extern.py if you need a new scope kind."
-            )
+            raise ValueError(f"Frag.scope={self.scope!r} not in {sorted(_VALID_SCOPES)}; extend extern.py if you need a new scope kind.")
         if self.layout not in _VALID_LAYOUTS:
-            raise ValueError(
-                f"Frag.layout={self.layout!r} not in {sorted(_VALID_LAYOUTS)}"
-            )
+            raise ValueError(f"Frag.layout={self.layout!r} not in {sorted(_VALID_LAYOUTS)}")
         if self.alignment <= 0 or (self.alignment & (self.alignment - 1)) != 0:
             raise ValueError(f"Frag.alignment must be a positive power of two; got {self.alignment}")
 
@@ -227,10 +222,7 @@ def _cutedsl_kernel_functions(
     try:
         tree = ast.parse(body)
     except SyntaxError as err:
-        raise ValueError(
-            f"extern_intrinsic[{target}] body for '{intrinsic_name}' is not valid "
-            f"Python CuTeDSL source: {err.msg}."
-        ) from err
+        raise ValueError(f"extern_intrinsic[{target}] body for '{intrinsic_name}' is not valid Python CuTeDSL source: {err.msg}.") from err
 
     module_aliases, kernel_aliases = _cutedsl_kernel_decorator_names(tree)
     return [
@@ -533,10 +525,7 @@ def extern_intrinsic(
     valid = _registry.valid_targets()
     for tgt in bodies:
         if tgt not in valid:
-            raise ValueError(
-                f"extern_intrinsic '{name}': unknown target {tgt!r}; "
-                f"valid targets are {sorted(valid)}."
-            )
+            raise ValueError(f"extern_intrinsic '{name}': unknown target {tgt!r}; valid targets are {sorted(valid)}.")
 
     # Eagerly probe the signature with no args if it accepts none, just to
     # surface obvious typos at registration time.
@@ -591,6 +580,7 @@ def extern_intrinsic(
     _emit.__name__ = f"extern_intrinsic_{name}"
     _emit.__doc__ = f"Emit TIR call_extern for registered intrinsic {name!r}."
     _emit.intrinsic = intrinsic  # type: ignore[attr-defined]
+
     # Helper: resolve the signature with shape args and return the
     # ``EXTERN_BLOCK_ATTR`` payload (see :func:`build_meta`). Users wire this
     # into a sibling ``T.block_attr({EXTERN_BLOCK_ATTR: emit.meta(...)})``.
@@ -599,6 +589,7 @@ def extern_intrinsic(
         shape_kwargs, _ = _split_shape_and_buffer_kwargs(runtime_kwargs)
         frags = tuple(intrinsic.signature(*shape_args, **shape_kwargs))
         return build_meta(frags, pipeline_stage=pipeline_stage)
+
     _emit.meta = _meta  # type: ignore[attr-defined]
     return _emit
 
@@ -693,14 +684,12 @@ def _emit_tir_call(
             resolved.append(positional.pop(0))
         else:
             raise ValueError(
-                f"extern_intrinsic '{name}': missing buffer for Frag {frag.name!r} "
-                f"(declared frags: {[f.name for f in frags]!r})."
+                f"extern_intrinsic '{name}': missing buffer for Frag {frag.name!r} (declared frags: {[f.name for f in frags]!r})."
             )
     if positional or by_name:
         leftover = [type(b).__name__ for b in positional] + sorted(by_name)
         raise ValueError(
-            f"extern_intrinsic '{name}': received unexpected buffer arg(s) "
-            f"{leftover!r}; contract declares {[f.name for f in frags]!r}."
+            f"extern_intrinsic '{name}': received unexpected buffer arg(s) {leftover!r}; contract declares {[f.name for f in frags]!r}."
         )
 
     access_ptrs = []
@@ -760,9 +749,7 @@ def _simdgroup_factory(
         is_output: bool = default_is_output,
     ) -> Frag:
         if len(shape) != 2:
-            raise ValueError(
-                f"{layout} expects a 2-D tile shape; got {shape!r}"
-            )
+            raise ValueError(f"{layout} expects a 2-D tile shape; got {shape!r}")
         return Frag(
             name=name,
             shape=tuple(shape),
@@ -773,6 +760,7 @@ def _simdgroup_factory(
             pipeline_stage=pipeline_stage,
             is_output=is_output,
         )
+
     _make.__name__ = layout
     _make.__qualname__ = layout
     return _make
@@ -861,7 +849,9 @@ def _simdgroup_doctest() -> None:
 # ---------------------------------------------------------------------------
 
 simdgroup_a_fp8 = _simdgroup_factory(
-    "simdgroup_a_fp8", default_dtype="float8_e4m3", default_is_output=False,
+    "simdgroup_a_fp8",
+    default_dtype="float8_e4m3",
+    default_is_output=False,
 )
 """Apple Metal SIMDgroup matrix-A operand factory — FP8 forward-compat.
 
@@ -876,7 +866,9 @@ override to ``"float8_e5m2"`` for the unsigned-zero variant.
 """
 
 simdgroup_b_fp8 = _simdgroup_factory(
-    "simdgroup_b_fp8", default_dtype="float8_e4m3", default_is_output=False,
+    "simdgroup_b_fp8",
+    default_dtype="float8_e4m3",
+    default_is_output=False,
 )
 """Apple Metal SIMDgroup matrix-B operand factory — FP8 forward-compat.
 

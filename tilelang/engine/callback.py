@@ -193,6 +193,7 @@ def register_metal_postproc_callback(func: Callable | bool = None, override: boo
 # M5+ hardware should invoke ``register_default_metal_compile_callback()``
 # explicitly to switch the Metal compile pipeline over to MSL4.
 
+
 def _compile_metal4(source: str, target: Target):
     """Compile Metal source to metallib with Metal 4 language support.
 
@@ -206,7 +207,15 @@ def _compile_metal4(source: str, target: Target):
         with open(src_path, "w", encoding="utf-8") as src_file:
             src_file.write(source)
         compile_cmd = [
-            "xcrun", "-sdk", "macosx", "metal", "-std=metal4.0", "-O3", "-c", src_path, "-o",
+            "xcrun",
+            "-sdk",
+            "macosx",
+            "metal",
+            "-std=metal4.0",
+            "-O3",
+            "-c",
+            src_path,
+            "-o",
             air_path,
         ]
         lib_cmd = ["xcrun", "-sdk", "macosx", "metallib", air_path, "-o", lib_path]

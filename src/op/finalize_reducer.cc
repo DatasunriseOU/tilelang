@@ -57,9 +57,10 @@ bool MatchDefaultFinalizeReducerTarget(Target target) {
   return !TargetIsMetal(target);
 }
 
-std::string MakeDefaultFinalizeScalarAllReduce(
-    const FinalizeReducerOpNode &op, const LowerArgs &T,
-    const ReductionPlan &plan, const std::string &op_str) {
+std::string MakeDefaultFinalizeScalarAllReduce(const FinalizeReducerOpNode &op,
+                                               const LowerArgs &T,
+                                               const ReductionPlan &plan,
+                                               const std::string &op_str) {
   (void)op;
   std::stringstream ss;
   if (TargetHasSMVersionGE(T.target, 90)) {
@@ -74,9 +75,11 @@ std::string MakeDefaultFinalizeScalarAllReduce(
   return ss.str();
 }
 
-std::string MakeDefaultFinalizeBatchAllReduce(
-    const FinalizeReducerOpNode &op, const LowerArgs &T,
-    const ReductionPlan &plan, const std::string &op_str, int64_t batch) {
+std::string MakeDefaultFinalizeBatchAllReduce(const FinalizeReducerOpNode &op,
+                                              const LowerArgs &T,
+                                              const ReductionPlan &plan,
+                                              const std::string &op_str,
+                                              int64_t batch) {
   (void)op;
   std::stringstream ss;
   const int workspace_stride = ThreadBlockExtent(T);
@@ -128,8 +131,7 @@ int DefaultFinalizeBatchWorkspaceSize(const LowerArgs &T,
 }
 
 void AppendDefaultFinalizeArgs(Array<PrimExpr> *args, const LowerArgs &T,
-                               bool need_workspace,
-                               const PrimExpr &workspace) {
+                               bool need_workspace, const PrimExpr &workspace) {
   (void)T;
   if (need_workspace) {
     args->push_back(workspace);
@@ -302,12 +304,12 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
     // Batched AllReduce: single butterfly pass for all output elements.
     std::string allreduce = finalize_impl.make_batch_allreduce(
         *this, T, plan, op_str, effective_batch);
-    bool need_workspace = finalize_impl.needs_batch_workspace(
-        T, plan, effective_batch);
+    bool need_workspace =
+        finalize_impl.needs_batch_workspace(T, plan, effective_batch);
     PrimExpr workspace;
     if (need_workspace) {
-      int ws_size = finalize_impl.batch_workspace_size(
-          T, plan, effective_batch);
+      int ws_size =
+          finalize_impl.batch_workspace_size(T, plan, effective_batch);
       workspace = T.AddWorkspace(ws_size, buffer->dtype);
     }
     Array<PrimExpr> args = {StringImm(allreduce), buffer->data};

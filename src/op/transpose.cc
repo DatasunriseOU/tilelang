@@ -53,7 +53,8 @@ void RegisterTransposeImpl(TransposeImpl impl) {
   TransposeImplRegistry().push_back(impl);
 }
 
-Transpose::Transpose(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {
+Transpose::Transpose(Array<PrimExpr> args,
+                     Map<String, ffi::ObjectRef> annotations) {
   ObjectPtr<TransposeNode> node = tvm::ffi::make_object<TransposeNode>();
   auto src_access = NormalizeToAccessRegion(args[0], kAccessRead);
   auto dst_access = NormalizeToAccessRegion(args[1], kAccessWrite);

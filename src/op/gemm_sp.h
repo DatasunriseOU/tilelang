@@ -162,8 +162,8 @@ void RegisterGemmSPImpl(GemmSPImpl impl);
 class GemmSP : public TileOperator {
 public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(GemmSP, TileOperator, GemmSPNode);
-  TVM_DLL GemmSP(Array<PrimExpr> args,
-                 Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
+  TVM_DLL GemmSP(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations =
+                                           Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 

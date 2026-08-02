@@ -128,9 +128,7 @@ def attach_reduction_backend_lowerer_metadata(
     if not diagnostics:
         return func
     attrs = dict(func.attrs) if func.attrs is not None else {}
-    attrs["tl.reduction_backend_lowerers"] = tir.StringImm(
-        serialize_reduction_backend_lowerer_diagnostics(diagnostics)
-    )
+    attrs["tl.reduction_backend_lowerers"] = tir.StringImm(serialize_reduction_backend_lowerer_diagnostics(diagnostics))
     return func.with_attrs(attrs)
 
 

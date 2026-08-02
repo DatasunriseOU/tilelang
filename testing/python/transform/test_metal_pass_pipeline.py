@@ -159,7 +159,7 @@ def test_metal_scalar_bind_canonicalizer_reuses_cse_address_binds():
         def main(A: TX.Buffer(1024, "float32"), B: TX.Buffer(1024, "float32"), i: TX.int32):
             TX.func_attr({"target": TX.target("metal")})
             base: TX.int32 = i * 17 + 3
-            idx0: TX.int32 = base % 1024
+            idx0: TX.int32 = base % 1024  # noqa: F841
             idx1: TX.int32 = base % 1024
             A[i % 1024] = B[base % 1024] + B[idx1]
 
@@ -195,9 +195,7 @@ def test_metal_index_normalizer_keeps_non_immediate_int_operands_same_dtype():
         )
         for n, expr in enumerate(exprs)
     ]
-    func = tvm.tir.PrimFunc([A, B, i, stride64], tvm.tir.SeqStmt(stores)).with_attr(
-        "target", tvm.target.Target("metal")
-    )
+    func = tvm.tir.PrimFunc([A, B, i, stride64], tvm.tir.SeqStmt(stores)).with_attr("target", tvm.target.Target("metal"))
     before = tvm.IRModule({"main": func})
 
     after = tilelang.transform.BindMetalScalarIntrinsics()(before)
@@ -215,9 +213,7 @@ def test_metal_index_normalizer_keeps_non_immediate_int_operands_same_dtype():
 
     def is_scalar_int_dtype(dtype):
         dtype_name = str(dtype)
-        return dtype.lanes == 1 and (
-            dtype_name.startswith("int") or dtype_name.startswith("uint")
-        )
+        return dtype.lanes == 1 and (dtype_name.startswith("int") or dtype_name.startswith("uint"))
 
     def visit(node):
         if isinstance(node, binary_nodes):

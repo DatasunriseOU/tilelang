@@ -102,12 +102,7 @@ def _logical_train_block_with_misleading_internal_buffer_names(
         not_q_scale[0] = 1.0
         not_kv_fp8[0] = packed_post[0]
         not_kv_scale[0] = 1.0
-        train_block_out[0] = (
-            not_q_fp8[0]
-            + not_q_scale[0]
-            + not_kv_fp8[0]
-            + not_kv_scale[0]
-        )
+        train_block_out[0] = not_q_fp8[0] + not_q_scale[0] + not_kv_fp8[0] + not_kv_scale[0]
 
 
 @T.prim_func
@@ -255,9 +250,7 @@ def test_region_compile_uses_one_pre_source_ir_module_with_z3_config():
         "m2rnn_packed_post_bwd",
         "mamba3_scan_bwd",
     )
-    assert result.plan.autograd_plan.backward_edges == (
-        ("m2rnn_packed_post_bwd", "mamba3_scan_bwd", "mamba3_state_grad"),
-    )
+    assert result.plan.autograd_plan.backward_edges == (("m2rnn_packed_post_bwd", "mamba3_scan_bwd", "mamba3_state_grad"),)
     assert result.plan.autograd_plan.missing_backward_node_names == (
         "mamba3_scan_bwd",
         "m2rnn_packed_post_bwd",
@@ -595,9 +588,7 @@ def test_builder_infers_chain_edges_from_buffer_names():
         .build()
     )
 
-    assert [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] == [
-        ("producer", "consumer", "mid")
-    ]
+    assert [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] == [("producer", "consumer", "mid")]
 
 
 def test_builder_adds_data_driven_nodes_and_infers_chain_edges():
@@ -614,9 +605,7 @@ def test_builder_adds_data_driven_nodes_and_infers_chain_edges():
     )
 
     assert [node.name for node in region.nodes] == ["producer", "consumer"]
-    assert [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] == [
-        ("producer", "consumer", "mid")
-    ]
+    assert [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] == [("producer", "consumer", "mid")]
 
 
 def test_builder_orders_data_driven_nodes_by_dependencies():
@@ -633,9 +622,7 @@ def test_builder_orders_data_driven_nodes_by_dependencies():
     )
 
     assert [node.name for node in region.nodes] == ["producer", "consumer"]
-    assert [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] == [
-        ("producer", "consumer", "mid")
-    ]
+    assert [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] == [("producer", "consumer", "mid")]
 
 
 def test_build_fusion_region_adds_dynamic_nodes_and_infers_chain():
@@ -697,9 +684,7 @@ def test_build_fusion_region_from_blocks_resolves_registry_contracts():
     assert [node.op for node in region.nodes] == ["producer", "consumer"]
     assert region.nodes[0].outputs == ("producer_mid",)
     assert region.nodes[0].attrs["role"] == "producer"
-    assert [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] == [
-        ("producer", "consumer", "producer_mid")
-    ]
+    assert [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] == [("producer", "consumer", "producer_mid")]
     assert region.pass_configs[PassConfigKey.TL_Z3_PROOF_ASYNC_ELIGIBILITY.value] is True
 
 
@@ -734,9 +719,7 @@ def test_block_registry_allows_same_op_blocks_with_distinct_contracts():
     assert [node.name for node in region.nodes] == ["first", "second"]
     assert [node.op for node in region.nodes] == ["repeat_op", "repeat_op"]
     assert [node.outputs for node in region.nodes] == [("first_mid",), ("D",)]
-    assert [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] == [
-        ("first", "second", "first_mid")
-    ]
+    assert [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] == [("first", "second", "first_mid")]
 
 
 def test_optimizer_add_blocks_selects_registered_fused_schedule():
@@ -778,9 +761,7 @@ def test_optimizer_add_blocks_selects_registered_fused_schedule():
     assert plan.schedule_name == "producer_consumer_fused"
     assert plan.schedule_status == "ready"
     assert plan.node_names == ("producer", "consumer")
-    assert [(edge.producer, edge.consumer, edge.buffer) for edge in plan.edges] == [
-        ("producer", "consumer", "producer_mid")
-    ]
+    assert [(edge.producer, edge.consumer, edge.buffer) for edge in plan.edges] == [("producer", "consumer", "producer_mid")]
 
 
 def test_build_fusion_regions_from_blocks_discovers_registered_chains():
@@ -829,10 +810,7 @@ def test_build_fusion_regions_from_blocks_discovers_registered_chains():
         ("producer0", "consumer0"),
         ("producer1", "consumer1"),
     ]
-    assert [
-        [(edge.producer, edge.consumer, edge.buffer) for edge in region.edges]
-        for region in regions
-    ] == [
+    assert [[(edge.producer, edge.consumer, edge.buffer) for edge in region.edges] for region in regions] == [
         [("producer0", "consumer0", "producer0_mid")],
         [("producer1", "consumer1", "producer1_mid")],
     ]
@@ -1008,9 +986,7 @@ def test_optimizer_selects_registered_schedule_after_dependency_ordering():
 
     assert plan.schedule_name == "toy_schedule"
     assert plan.node_names == ("producer", "consumer")
-    assert [(edge.producer, edge.consumer, edge.buffer) for edge in plan.edges] == [
-        ("producer", "consumer", "mid")
-    ]
+    assert [(edge.producer, edge.consumer, edge.buffer) for edge in plan.edges] == [("producer", "consumer", "mid")]
 
 
 def test_optimizer_fails_closed_when_no_fused_schedule_is_registered():
@@ -1116,9 +1092,7 @@ def test_region_rejects_lowered_source_kernels():
 def test_region_builder_accepts_pre_source_prim_func_nodes_only():
     builder = FusionRegionBuilder("prim_func_region")
     region = (
-        builder.add_prim_func_node("candidate", _fused_train_block, op="toy")
-        .set_schedule_template(lambda _: _fused_train_block)
-        .build()
+        builder.add_prim_func_node("candidate", _fused_train_block, op="toy").set_schedule_template(lambda _: _fused_train_block).build()
     )
 
     assert region.nodes[0].prim_func is _fused_train_block
@@ -1197,16 +1171,8 @@ def test_cache_key_audit_flags_same_key_recompile():
 
 
 def test_auto_prim_func_graph_cache_key_includes_source_digest():
-    region_a = (
-        FusionRegionBuilder("cache_region")
-        .add_prim_func_node("node", _fused_train_block, op="toy")
-        .build()
-    )
-    region_b = (
-        FusionRegionBuilder("cache_region")
-        .add_prim_func_node("node", _fusion_consumer, op="toy")
-        .build()
-    )
+    region_a = FusionRegionBuilder("cache_region").add_prim_func_node("node", _fused_train_block, op="toy").build()
+    region_b = FusionRegionBuilder("cache_region").add_prim_func_node("node", _fusion_consumer, op="toy").build()
 
     result_a = compile_fusion_region(region_a, target="metal", lowerer=lambda *args, **kwargs: None)
     result_b = compile_fusion_region(region_b, target="metal", lowerer=lambda *args, **kwargs: None)

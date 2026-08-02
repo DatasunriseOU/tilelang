@@ -18,9 +18,11 @@ from __future__ import annotations
 import ast
 import textwrap
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any
+from collections.abc import Sequence
 
 from tvm import tir
+import contextlib
 
 
 class CuTeDSLLoweringError(RuntimeError):
@@ -123,9 +125,7 @@ def _arg_as_value(node: ast.AST) -> Any:
         return [_arg_as_value(e) for e in node.elts]
     if isinstance(node, ast.Name):
         return node.id
-    raise CuTeDSLLoweringError(
-        f"unsupported CuTe argument expression: {ast.dump(node)}"
-    )
+    raise CuTeDSLLoweringError(f"unsupported CuTe argument expression: {ast.dump(node)}")
 
 
 def _kw_dict(call: ast.Call) -> dict[str, Any]:
@@ -166,16 +166,12 @@ def _lower_stmt(
             value = _arg_as_value(call.args[1])
             ctx.emit(f"T.fill({buf}, {value!r})")
             return
-        raise CuTeDSLLoweringError(
-            f"unsupported CuTe call statement at top level: {ast.dump(call)}"
-        )
+        raise CuTeDSLLoweringError(f"unsupported CuTe call statement at top level: {ast.dump(call)}")
 
     if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
         target = stmt.targets[0]
         if not isinstance(target, ast.Name):
-            raise CuTeDSLLoweringError(
-                f"only simple name targets are supported, got {ast.dump(target)}"
-            )
+            raise CuTeDSLLoweringError(f"only simple name targets are supported, got {ast.dump(target)}")
         name = target.id
         value = stmt.value
         if isinstance(value, ast.Call) and _is_cute_call(value, "make_tensor", module_aliases):
@@ -184,18 +180,14 @@ def _lower_stmt(
             dtype = kwargs.get("dtype") or _arg_as_value(value.args[2])
             scope = kwargs.get("scope", "fragment")
             if not isinstance(shape, tuple):
-                raise CuTeDSLLoweringError(
-                    f"cute.make_tensor 'shape' must be a tuple of ints, got {shape!r}"
-                )
+                raise CuTeDSLLoweringError(f"cute.make_tensor 'shape' must be a tuple of ints, got {shape!r}")
             shape_text = _shape_literal(shape)
             if scope == "shared":
-                ctx.emit(f"{name} = T.alloc_shared({shape_text}, \"{dtype}\")")
+                ctx.emit(f'{name} = T.alloc_shared({shape_text}, "{dtype}")')
             elif scope in ("fragment", "register"):
-                ctx.emit(f"{name} = T.alloc_fragment({shape_text}, \"{dtype}\")")
+                ctx.emit(f'{name} = T.alloc_fragment({shape_text}, "{dtype}")')
             else:
-                raise CuTeDSLLoweringError(
-                    f"unsupported cute.make_tensor scope {scope!r}"
-                )
+                raise CuTeDSLLoweringError(f"unsupported cute.make_tensor scope {scope!r}")
             ctx.used_names.add(name)
             return
         if isinstance(value, ast.Call) and _is_cute_call(value, "arange", module_aliases):
@@ -213,13 +205,8 @@ def _lower_stmt(
 
     if isinstance(stmt, ast.For):
         iter_call = stmt.iter
-        if not (
-            isinstance(iter_call, ast.Call)
-            and _is_cute_call(iter_call, "arange", module_aliases)
-        ):
-            raise CuTeDSLLoweringError(
-                f"unsupported loop iterator: {ast.dump(iter_call)}"
-            )
+        if not (isinstance(iter_call, ast.Call) and _is_cute_call(iter_call, "arange", module_aliases)):
+            raise CuTeDSLLoweringError(f"unsupported loop iterator: {ast.dump(iter_call)}")
         args = [_arg_as_value(a) for a in iter_call.args]
         if len(args) == 1:
             start, stop = 0, args[0]
@@ -235,15 +222,11 @@ def _lower_stmt(
         ctx.indent -= 1
         return
 
-    if isinstance(stmt, ast.Pass) or (
-        isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
-    ):
+    if isinstance(stmt, ast.Pass) or (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)):
         # Docstrings and pass: pass through as a comment.
         return
 
-    raise CuTeDSLLoweringError(
-        f"unsupported CuTe statement at this position: {ast.dump(stmt)}"
-    )
+    raise CuTeDSLLoweringError(f"unsupported CuTe statement at this position: {ast.dump(stmt)}")
 
 
 def _emit_tilelang_source(
@@ -266,20 +249,9 @@ def _emit_tilelang_source(
     if not ctx.lines:
         ctx.emit("pass")
 
-    param_decls = ", ".join(
-        (
-            f"{p.name}: T.Tensor("
-            f"{_shape_literal(p.shape)}, \"{p.dtype}\")"
-        )
-        for p in signature
-    )
+    param_decls = ", ".join((f'{p.name}: T.Tensor({_shape_literal(p.shape)}, "{p.dtype}")') for p in signature)
     body_text = "\n".join(ctx.lines)
-    header = (
-        "import tilelang\n"
-        "import tilelang.language as T\n\n\n"
-        "@T.prim_func\n"
-        f"def {func_name}({param_decls}):\n"
-    )
+    header = f"import tilelang\nimport tilelang.language as T\n\n\n@T.prim_func\ndef {func_name}({param_decls}):\n"
     return header + body_text + "\n"
 
 
@@ -315,28 +287,18 @@ def from_cute_source(
     tree = ast.parse(textwrap.dedent(source))
     module_aliases, kernel_aliases = _detect_cute_aliases(tree)
     if not module_aliases and not kernel_aliases:
-        raise CuTeDSLLoweringError(
-            "no recognised CuTe imports (cutlass.cute or cutlass.cute.kernel); "
-            "lowering refuses to guess"
-        )
+        raise CuTeDSLLoweringError("no recognised CuTe imports (cutlass.cute or cutlass.cute.kernel); lowering refuses to guess")
 
     cute_funcs = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and any(
-            _is_cute_decorator(dec, module_aliases, kernel_aliases)
-            for dec in node.decorator_list
-        )
+        if isinstance(node, ast.FunctionDef) and any(_is_cute_decorator(dec, module_aliases, kernel_aliases) for dec in node.decorator_list)
     ]
     if not cute_funcs:
-        raise CuTeDSLLoweringError(
-            "no @cute.kernel (or aliased) function defined in source"
-        )
+        raise CuTeDSLLoweringError("no @cute.kernel (or aliased) function defined in source")
     if len(cute_funcs) != 1:
         raise CuTeDSLLoweringError(
-            f"expected exactly one cute.kernel function, found {len(cute_funcs)}: "
-            + ", ".join(f.name for f in cute_funcs)
+            f"expected exactly one cute.kernel function, found {len(cute_funcs)}: " + ", ".join(f.name for f in cute_funcs)
         )
     cute_func = cute_funcs[0]
     chosen_name = func_name or cute_func.name
@@ -376,9 +338,7 @@ def from_cute_source(
     spec = importlib.util.spec_from_file_location(module_id, emitted_path)
     if spec is None or spec.loader is None:
         os.unlink(emitted_path)
-        raise CuTeDSLLoweringError(
-            f"failed to create importlib spec for emitted DSL at {emitted_path!r}"
-        )
+        raise CuTeDSLLoweringError(f"failed to create importlib spec for emitted DSL at {emitted_path!r}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_id] = module
     try:
@@ -386,21 +346,16 @@ def from_cute_source(
             spec.loader.exec_module(module)
         except Exception as exc:
             raise CuTeDSLLoweringError(
-                f"emitted TileLang DSL failed to import: {type(exc).__name__}: {exc}\n"
-                f"---emitted source ({emitted_path})---\n{emitted}"
+                f"emitted TileLang DSL failed to import: {type(exc).__name__}: {exc}\n---emitted source ({emitted_path})---\n{emitted}"
             ) from exc
         prim_func = getattr(module, chosen_name, None)
         if not isinstance(prim_func, tir.PrimFunc):
-            raise CuTeDSLLoweringError(
-                f"emitted TileLang source did not produce a PrimFunc; got {type(prim_func).__name__}"
-            )
+            raise CuTeDSLLoweringError(f"emitted TileLang source did not produce a PrimFunc; got {type(prim_func).__name__}")
         return prim_func
     finally:
         sys.modules.pop(module_id, None)
-        try:
+        with contextlib.suppress(FileNotFoundError):
             os.unlink(emitted_path)
-        except FileNotFoundError:
-            pass
 
 
 def compile_cute_source(

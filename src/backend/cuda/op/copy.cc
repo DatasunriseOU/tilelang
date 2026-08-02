@@ -710,8 +710,8 @@ Stmt Copy::LowerTmem(const CopyNode &op, const LowerArgs &T,
   if (src.scope() != "shared.tmem" && dst.scope() != "shared.tmem") {
     return Stmt();
   }
-  ICHECK(TargetHasTmem(T.target)) << "Target " << T.target
-                                  << " does not support tensor memory copy";
+  ICHECK(TargetHasTmem(T.target))
+      << "Target " << T.target << " does not support tensor memory copy";
 
   bool is_ld = false;
   bool is_st = false;

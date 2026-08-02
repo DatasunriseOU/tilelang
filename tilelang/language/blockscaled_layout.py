@@ -42,23 +42,16 @@ class BlockScaledLayout:
 
     def __post_init__(self) -> None:
         if self.scale_dtype != "e8m0":
-            raise ValueError(
-                "BlockScaledLayout currently supports only scale_dtype='e8m0'"
-            )
+            raise ValueError("BlockScaledLayout currently supports only scale_dtype='e8m0'")
         if self.axis != CONTRACTED_K_AXIS:
-            raise ValueError(
-                "BlockScaledLayout currently supports only axis='contracted_k'"
-            )
+            raise ValueError("BlockScaledLayout currently supports only axis='contracted_k'")
         if int(self.block_size) != E8M0_BLOCK_SIZE:
             raise ValueError("E8M0 block-scale layout requires block_size=32")
         if self.layout != E8M0_LAYOUT:
-            raise ValueError(
-                "E8M0 block-scale layout must be "
-                "'logical_unswizzled_k_axis_blocks'"
-            )
+            raise ValueError("E8M0 block-scale layout must be 'logical_unswizzled_k_axis_blocks'")
 
     @classmethod
-    def e8m0_k32(cls) -> "BlockScaledLayout":
+    def e8m0_k32(cls) -> BlockScaledLayout:
         """Return the canonical logical unswizzled E8M0 K/32 layout."""
 
         return cls(
@@ -81,9 +74,7 @@ class BlockScaledLayout:
         if k_extent <= 0:
             raise ValueError(f"block-scaled K extent must be positive, got {k_extent}")
         if k_extent % E8M0_BLOCK_SIZE != 0:
-            raise ValueError(
-                f"e8m0_block_k32 requires K divisible by 32, got K={k_extent}"
-            )
+            raise ValueError(f"e8m0_block_k32 requires K divisible by 32, got K={k_extent}")
         return k_extent // E8M0_BLOCK_SIZE
 
     def a_scale_shape(self, k_extent: int) -> tuple[int]:
@@ -116,10 +107,7 @@ class BlockScaledLayout:
     ) -> None:
         blocks = self.scale_blocks(k_extent)
         if tuple(a_scale_shape) != (blocks,):
-            raise ValueError(
-                "A_scale for e8m0_block_k32 must have shape "
-                f"(K / 32,) == ({blocks},), got {a_scale_shape}"
-            )
+            raise ValueError(f"A_scale for e8m0_block_k32 must have shape (K / 32,) == ({blocks},), got {a_scale_shape}")
         if tuple(b_scale_shape) == (blocks,) and self.allow_broadcast_b_scale:
             return
         if n_extent is None:
@@ -131,7 +119,5 @@ class BlockScaledLayout:
         expected = (int(n_extent), blocks)
         if tuple(b_scale_shape) != expected:
             raise ValueError(
-                "B_scale for e8m0_block_k32 must have shape "
-                f"(N, K / 32) == {expected} or broadcast ({blocks},), "
-                f"got {b_scale_shape}"
+                f"B_scale for e8m0_block_k32 must have shape (N, K / 32) == {expected} or broadcast ({blocks},), got {b_scale_shape}"
             )

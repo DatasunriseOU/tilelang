@@ -32,18 +32,19 @@ from tilelang.transform import PassConfigKey
 from tvm.script import tir as T
 
 
-def _run_thread_sync_metal(
-    func: tvm.tir.PrimFunc, *, enable_barrier_proof: bool = True
-) -> tvm.IRModule:
+def _run_thread_sync_metal(func: tvm.tir.PrimFunc, *, enable_barrier_proof: bool = True) -> tvm.IRModule:
     """Apply ThreadSync("shared") under a Metal target so the
     Apple intra-warp elision path is enabled."""
     mod = tvm.IRModule.from_expr(func)
     metal_target = tvm.target.Target("metal", host="llvm")
     mod = tvm.tir.transform.Apply(
-        lambda f: f.with_attr({
-            "global_symbol": "test",
-            "target": metal_target,
-        }))(mod)
+        lambda f: f.with_attr(
+            {
+                "global_symbol": "test",
+                "target": metal_target,
+            }
+        )
+    )(mod)
     mod = tvm.tir.transform.AnnotateDeviceRegions()(mod)
     mod = tvm.tir.transform.SplitHostDevice()(mod)
     config = {}
@@ -90,7 +91,8 @@ def test_2d_launch_intra_simdgroup_elides():
     assert n_sync == 0, (
         "Expected ProveIntraWarpRAW to elide the barrier on a 2-D "
         "launch with tx in [0, 16) (entirely inside one simdgroup); "
-        f"found {n_sync} sync(s):\n{mod.script()}")
+        f"found {n_sync} sync(s):\n{mod.script()}"
+    )
     assert _has_barrier_metadata(mod, "tl.z3_barrier_elisions")
 
 
@@ -116,7 +118,8 @@ def test_barrier_proof_disabled_by_default_keeps_barrier():
     assert n_sync >= 1, (
         "Expected conservative fallback to keep the barrier when the "
         "central proof hook is not enabled; "
-        f"got {n_sync} sync(s):\n{mod.script()}")
+        f"got {n_sync} sync(s):\n{mod.script()}"
+    )
     assert _has_barrier_metadata(mod, "tl.z3_barrier_fallbacks")
 
 
@@ -145,7 +148,8 @@ def test_1d_launch_straddling_simdgroup_keeps_barrier():
     assert n_sync >= 1, (
         "Expected ThreadSync to keep the barrier when reader/writer "
         "can fall in different simdgroups (tx XOR 32 straddles the "
-        f"boundary); got {n_sync} sync(s):\n{mod.script()}")
+        f"boundary); got {n_sync} sync(s):\n{mod.script()}"
+    )
     assert _has_barrier_metadata(mod, "tl.z3_barrier_fallbacks")
 
 
@@ -172,7 +176,8 @@ def test_1d_launch_within_single_simdgroup_elides():
     assert n_sync == 0, (
         "Expected ProveIntraWarpRAW to elide the barrier on a "
         "1-D launch with tx in [0, 16) (single simdgroup); "
-        f"found {n_sync} sync(s):\n{mod.script()}")
+        f"found {n_sync} sync(s):\n{mod.script()}"
+    )
 
 
 @tilelang.testing.requires_metal
@@ -198,7 +203,8 @@ def test_1d_launch_within_single_simdgroup_keeps_barrier_when_z3_disabled(monkey
     assert n_sync >= 1, (
         "Expected central proof gate fallback to keep the barrier "
         "with TILELANG_DISABLE_Z3_BARRIER_ELISION=1; "
-        f"found {n_sync} sync(s):\n{mod.script()}")
+        f"found {n_sync} sync(s):\n{mod.script()}"
+    )
     assert _has_barrier_metadata(mod, "tl.z3_barrier_fallbacks")
 
 
@@ -239,34 +245,27 @@ def test_unusual_thread_tag_keeps_barrier():
     # with substring matching would (incorrectly) match the first one
     # as `threadIdx.x`. With strict equality, neither matches and the
     # function returns false → barrier kept.
-    A = tir.decl_buffer((16,), dtype="float32", scope="shared",
-                        name="A_shared")
-    tx_outer_iv = tir.IterVar(
-        Range(0, 1), tir.Var("tx_outer_iv", "int32"),
-        tir.IterVar.ThreadIndex, thread_tag="threadIdx.x_outer")
-    tx_inner_iv = tir.IterVar(
-        Range(0, 16), tir.Var("tx_inner_iv", "int32"),
-        tir.IterVar.ThreadIndex, thread_tag="threadIdx.x_inner")
-    bx_iv = tir.IterVar(
-        Range(0, 1), tir.Var("bx_iv", "int32"), tir.IterVar.ThreadIndex,
-        thread_tag="blockIdx.x")
+    A = tir.decl_buffer((16,), dtype="float32", scope="shared", name="A_shared")
+    tx_outer_iv = tir.IterVar(Range(0, 1), tir.Var("tx_outer_iv", "int32"), tir.IterVar.ThreadIndex, thread_tag="threadIdx.x_outer")
+    tx_inner_iv = tir.IterVar(Range(0, 16), tir.Var("tx_inner_iv", "int32"), tir.IterVar.ThreadIndex, thread_tag="threadIdx.x_inner")
+    bx_iv = tir.IterVar(Range(0, 1), tir.Var("bx_iv", "int32"), tir.IterVar.ThreadIndex, thread_tag="blockIdx.x")
 
     tx_var = tx_inner_iv.var
-    body = tir.SeqStmt([
-        tir.BufferStore(A, tir.FloatImm("float32", 1.0), [tx_var]),
-        tir.IfThenElse(
-            tx_var > 0,
-            tir.Evaluate(tir.BufferLoad(A, [tx_var - 1])),
-            None,
-        ),
-    ])
+    body = tir.SeqStmt(
+        [
+            tir.BufferStore(A, tir.FloatImm("float32", 1.0), [tx_var]),
+            tir.IfThenElse(
+                tx_var > 0,
+                tir.Evaluate(tir.BufferLoad(A, [tx_var - 1])),
+                None,
+            ),
+        ]
+    )
     body = tir.AttrStmt(tx_inner_iv, "thread_extent", 16, body)
     body = tir.AttrStmt(tx_outer_iv, "thread_extent", 1, body)
     body = tir.AttrStmt(bx_iv, "thread_extent", 1, body)
-    body = tir.Allocate(A.data, "float32", [16], tir.const(1, "bool"),
-                        body, annotations={"storage_scope": "shared"})
-    body = tir.AttrStmt(A.data, "storage_scope",
-                        tvm.runtime.convert("shared"), body)
+    body = tir.Allocate(A.data, "float32", [16], tir.const(1, "bool"), body, annotations={"storage_scope": "shared"})
+    body = tir.AttrStmt(A.data, "storage_scope", tvm.runtime.convert("shared"), body)
 
     func = tir.PrimFunc(params=[], body=body)
 
@@ -276,7 +275,8 @@ def test_unusual_thread_tag_keeps_barrier():
         "Non-canonical thread_tag 'threadIdx.x_inner' / 'threadIdx.x_outer' "
         "must NOT be matched as canonical 'threadIdx.x' by the "
         "strict-equality allowlist; expected barrier kept, got "
-        f"{n_sync} sync(s):\n{mod.script()}")
+        f"{n_sync} sync(s):\n{mod.script()}"
+    )
 
 
 @tilelang.testing.requires_metal
@@ -306,7 +306,8 @@ def test_3d_launch_padded_y_z_intra_simdgroup_elides():
     assert n_sync == 0, (
         "Expected ProveIntraWarpRAW to elide barrier on degenerate "
         "3-D launch (ty=1, tz=1, tx in [0,16)); "
-        f"found {n_sync} sync(s):\n{mod.script()}")
+        f"found {n_sync} sync(s):\n{mod.script()}"
+    )
 
 
 @tilelang.testing.requires_metal
@@ -345,7 +346,8 @@ def test_z3_timeout_keeps_barrier():
     assert n_sync >= 1, (
         "Hostile non-affine index pattern: barrier must be kept "
         "(either by Z3 disproof or by 200 ms timeout fallback); "
-        f"got {n_sync} sync(s):\n{mod.script()}")
+        f"got {n_sync} sync(s):\n{mod.script()}"
+    )
 
 
 if __name__ == "__main__":

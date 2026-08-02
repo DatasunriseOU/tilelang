@@ -156,9 +156,7 @@ def _find_flat_alloc_buffer_with_layout(block):
     for buffer in flat_allocs:
         if buffer.scope() == "shared.dyn" and buffer.data in layout_map:
             return buffer
-    raise AssertionError(
-        "Expected a flat shared.dyn AllocBuffer with layout_map entry"
-    )
+    raise AssertionError("Expected a flat shared.dyn AllocBuffer with layout_map entry")
 
 
 def test_trival_pipeline():

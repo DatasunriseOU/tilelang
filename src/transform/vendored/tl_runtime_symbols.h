@@ -21,7 +21,7 @@
 #ifndef TILELANG_VENDORED_TL_RUNTIME_SYMBOLS_H_
 #define TILELANG_VENDORED_TL_RUNTIME_SYMBOLS_H_
 
-#include <tvm/runtime/device_api.h>  // pulls in `namespace runtime { namespace symbol { ... } }`
+#include <tvm/runtime/device_api.h> // pulls in `namespace runtime { namespace symbol { ... } }`
 
 namespace tvm {
 namespace runtime {
@@ -32,7 +32,7 @@ namespace symbol {
 // /private/tmp/cppmega-mlx-tilelang-stack-c/3rdparty/tvm/include/tvm/runtime/module.h:55
 #ifndef TILELANG_HAVE_TVM_GLOBAL_BARRIER_STATE
 #define TILELANG_HAVE_TVM_GLOBAL_BARRIER_STATE
-constexpr const char* tvm_global_barrier_state = "__tvm_global_barrier_state";
+constexpr const char *tvm_global_barrier_state = "__tvm_global_barrier_state";
 #endif
 
 // Name of the host-side packed function that initialises the device-side
@@ -40,12 +40,13 @@ constexpr const char* tvm_global_barrier_state = "__tvm_global_barrier_state";
 // /private/tmp/cppmega-mlx-tilelang-stack-c/3rdparty/tvm/include/tvm/runtime/module.h:57
 #ifndef TILELANG_HAVE_TVM_PREPARE_GLOBAL_BARRIER
 #define TILELANG_HAVE_TVM_PREPARE_GLOBAL_BARRIER
-constexpr const char* tvm_prepare_global_barrier = "__tvm_prepare_global_barrier";
+constexpr const char *tvm_prepare_global_barrier =
+    "__tvm_prepare_global_barrier";
 #endif
 
-}  // namespace symbol
-}  // namespace runtime
-}  // namespace tvm
+} // namespace symbol
+} // namespace runtime
+} // namespace tvm
 
 namespace tvm {
 namespace tirx {
@@ -60,10 +61,10 @@ namespace builtin {
  * cross-block global barrier. Implemented in
  * `src/transform/vendored/global_barrier_builtin.cc`.
  */
-TVM_DLL const Op& tvm_global_barrier_kinit();
+TVM_DLL const Op &tvm_global_barrier_kinit();
 
-}  // namespace builtin
-}  // namespace tirx
-}  // namespace tvm
+} // namespace builtin
+} // namespace tirx
+} // namespace tvm
 
-#endif  // TILELANG_VENDORED_TL_RUNTIME_SYMBOLS_H_
+#endif // TILELANG_VENDORED_TL_RUNTIME_SYMBOLS_H_

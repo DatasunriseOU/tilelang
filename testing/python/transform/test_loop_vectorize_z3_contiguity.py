@@ -38,6 +38,7 @@ def _stringified_ir(prim_func) -> str:
 # Case 1: static contiguous — default analyzer proves; Z3 not invoked.
 # ---------------------------------------------------------------------------
 
+
 def _static_contiguous_func(N: int = 64):
 
     @T.prim_func

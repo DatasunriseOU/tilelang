@@ -27,7 +27,7 @@ PrimExpr pow_of_int_op(PrimExpr args) {
   String pow_of_int_name =
       "tl::pow_of_int<" + std::to_string(exp_imm->value) + ">";
   return tirx::Call(base.dtype(), tirx::builtin::call_extern(),
-                   {StringImm(pow_of_int_name), base});
+                    {StringImm(pow_of_int_name), base});
 }
 
 TVM_REGISTER_OP("tl.pow_of_int")

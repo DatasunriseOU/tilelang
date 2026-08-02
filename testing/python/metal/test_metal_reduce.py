@@ -32,15 +32,9 @@ _FORBIDDEN_CUDA_REDUCE_TOKENS = (
 )
 
 
-def _same_simdgroup_fast_path_safe(
-    *, target, reducing_threads: int, scale: int, thread_offset: int
-) -> bool:
-    hook = tvm.ffi.get_global_func(
-        "tl.metal.reduce_same_simdgroup_fast_path_safe", allow_missing=True
-    )
-    assert (
-        hook is not None
-    ), "tl.metal.reduce_same_simdgroup_fast_path_safe is not registered"
+def _same_simdgroup_fast_path_safe(*, target, reducing_threads: int, scale: int, thread_offset: int) -> bool:
+    hook = tvm.ffi.get_global_func("tl.metal.reduce_same_simdgroup_fast_path_safe", allow_missing=True)
+    assert hook is not None, "tl.metal.reduce_same_simdgroup_fast_path_safe is not registered"
     return bool(hook(target, reducing_threads, scale, thread_offset))
 
 
@@ -94,9 +88,7 @@ def _assert_metal_reduce_tokens(src: str, *, cross_simdgroup: bool = False) -> N
 
 
 def _assert_body_workspace(src: str, *, expected: bool) -> None:
-    has_workspace = re.search(
-        r"^\s*threadgroup\s+\w+\s+workspace\[\d+\];", src, re.MULTILINE
-    )
+    has_workspace = re.search(r"^\s*threadgroup\s+\w+\s+workspace\[\d+\];", src, re.MULTILINE)
     if expected:
         assert has_workspace is not None, src
         assert "(&(workspace[0]))" in src, src
@@ -122,22 +114,16 @@ def _assert_single_allreduce_call(src: str, reducer: str):
     return calls[0]
 
 
-def _assert_same_simdgroup_allreduce(
-    src: str, reducer: str = "SumOp"
-) -> None:
+def _assert_same_simdgroup_allreduce(src: str, reducer: str = "SumOp") -> None:
     threads, workspace_stride = _assert_single_allreduce_call(src, reducer)
     assert 0 < threads <= 32, f"threads={threads}\n{src}"
     assert workspace_stride == 0, f"workspace_stride={workspace_stride}\n{src}"
 
 
-def _assert_cross_simdgroup_allreduce(
-    src: str, reducer: str = "SumOp"
-) -> None:
+def _assert_cross_simdgroup_allreduce(src: str, reducer: str = "SumOp") -> None:
     threads, workspace_stride = _assert_single_allreduce_call(src, reducer)
     assert threads > 32, f"threads={threads}\n{src}"
-    assert workspace_stride == threads, (
-        f"threads={threads}, workspace_stride={workspace_stride}\n{src}"
-    )
+    assert workspace_stride == threads, f"threads={threads}, workspace_stride={workspace_stride}\n{src}"
 
 
 def _assert_no_cross_cta_reduction_plans(plans) -> None:
@@ -283,9 +269,7 @@ def _make_split_thread_allreduce_kernel(*, reduce_extent=32, groups=4):
     total_threads = reduce_extent * groups
 
     @T.prim_func
-    def split_thread_allreduce(
-        A: T.Tensor((total_threads,), T.float32), B: T.Tensor((groups,), T.float32)
-    ):
+    def split_thread_allreduce(A: T.Tensor((total_threads,), T.float32), B: T.Tensor((groups,), T.float32)):
         with T.Kernel(1, threads=total_threads):
             accum = T.alloc_local((1,), T.float32)
             reduced = T.alloc_local((1,), T.float32)
@@ -314,9 +298,7 @@ def _make_split_thread_allreduce_kernel(*, reduce_extent=32, groups=4):
     return split_thread_allreduce
 
 
-def _make_split_thread_allreduce_parallel_kernel(
-    *, reduce_extent=32, groups=2, rows=3
-):
+def _make_split_thread_allreduce_parallel_kernel(*, reduce_extent=32, groups=2, rows=3):
     row_threads = rows
     reduce_threads = reduce_extent * groups
     total_values = row_threads * reduce_threads
@@ -404,34 +386,16 @@ def test_metal_reduce_same_simdgroup_legality_hook_is_static_and_exact():
     metal = tvm.target.Target("metal")
     llvm = tvm.target.Target("llvm")
 
-    assert _same_simdgroup_fast_path_safe(
-        target=metal, reducing_threads=32, scale=1, thread_offset=0
-    )
-    assert _same_simdgroup_fast_path_safe(
-        target=metal, reducing_threads=16, scale=1, thread_offset=16
-    )
-    assert _same_simdgroup_fast_path_safe(
-        target=metal, reducing_threads=8, scale=1, thread_offset=24
-    )
+    assert _same_simdgroup_fast_path_safe(target=metal, reducing_threads=32, scale=1, thread_offset=0)
+    assert _same_simdgroup_fast_path_safe(target=metal, reducing_threads=16, scale=1, thread_offset=16)
+    assert _same_simdgroup_fast_path_safe(target=metal, reducing_threads=8, scale=1, thread_offset=24)
 
-    assert not _same_simdgroup_fast_path_safe(
-        target=metal, reducing_threads=16, scale=1, thread_offset=8
-    )
-    assert not _same_simdgroup_fast_path_safe(
-        target=metal, reducing_threads=16, scale=1, thread_offset=17
-    )
-    assert not _same_simdgroup_fast_path_safe(
-        target=metal, reducing_threads=64, scale=1, thread_offset=0
-    )
-    assert not _same_simdgroup_fast_path_safe(
-        target=metal, reducing_threads=24, scale=1, thread_offset=0
-    )
-    assert not _same_simdgroup_fast_path_safe(
-        target=metal, reducing_threads=16, scale=2, thread_offset=0
-    )
-    assert not _same_simdgroup_fast_path_safe(
-        target=llvm, reducing_threads=32, scale=1, thread_offset=0
-    )
+    assert not _same_simdgroup_fast_path_safe(target=metal, reducing_threads=16, scale=1, thread_offset=8)
+    assert not _same_simdgroup_fast_path_safe(target=metal, reducing_threads=16, scale=1, thread_offset=17)
+    assert not _same_simdgroup_fast_path_safe(target=metal, reducing_threads=64, scale=1, thread_offset=0)
+    assert not _same_simdgroup_fast_path_safe(target=metal, reducing_threads=24, scale=1, thread_offset=0)
+    assert not _same_simdgroup_fast_path_safe(target=metal, reducing_threads=16, scale=2, thread_offset=0)
+    assert not _same_simdgroup_fast_path_safe(target=llvm, reducing_threads=32, scale=1, thread_offset=0)
 
 
 def test_metal_reduce_same_simdgroup_codegen_elision_is_not_z3_gated():
@@ -477,9 +441,7 @@ def test_metal_reduce_cross_simdgroup_sum_codegen_uses_simd_sum_intra_stage():
         ("bitand", T.int32, "BitAndOp"),
     ],
 )
-def test_metal_reduce_cross_simdgroup_non_sum_keeps_shuffle_intra_stage(
-    op, dtype, reducer
-):
+def test_metal_reduce_cross_simdgroup_non_sum_keeps_shuffle_intra_stage(op, dtype, reducer):
     src = _lower_source(_make_reduce_kernel(op, length=1024, dtype=dtype, threads=1024))
 
     _assert_no_cuda_reduce_leakage(src)
@@ -502,9 +464,7 @@ def test_metal_reduce_1024_codegen_uses_simdgroup_cross_fast_path():
     _assert_body_workspace(src, expected=True)
     _assert_cross_simdgroup_allreduce(src)
 
-    helper_src = src.split("struct AllReduceSimdgroupCross", 1)[1].split(
-        "struct AllReduceStep", 1
-    )[0]
+    helper_src = src.split("struct AllReduceSimdgroupCross", 1)[1].split("struct AllReduceStep", 1)[0]
     assert "workspace_stride >= threads" in src
     assert "enum { final_slot = simdgroup_count };" in helper_src
     assert "red_buf[simdgroup_id] = x;" in helper_src
@@ -521,9 +481,7 @@ def test_metal_reduce_1024_codegen_uses_simdgroup_cross_fast_path():
 def test_metal_reduce_single_threadgroup_corpus_has_no_cross_cta_reduction_plan(
     reduce_extent: int,
 ):
-    plans = extract_reduction_plans(
-        _make_reduce_kernel("sum", length=reduce_extent, threads=reduce_extent)
-    )
+    plans = extract_reduction_plans(_make_reduce_kernel("sum", length=reduce_extent, threads=reduce_extent))
 
     assert len(plans) == 1
     _assert_no_cross_cta_reduction_plans(plans)
@@ -563,12 +521,7 @@ def test_metal_template_row_reduce_runtime_mps_matches_torch_sum():
         _make_metal_template_row_reduce_sum(rows=rows, cols=cols),
         target="metal",
     )
-    values = (
-        torch.arange(rows * cols, dtype=torch.float32, device="mps").reshape(
-            rows, cols
-        )
-        / 1024.0
-    )
+    values = torch.arange(rows * cols, dtype=torch.float32, device="mps").reshape(rows, cols) / 1024.0
     out = torch.empty(rows, dtype=torch.float32, device="mps")
 
     kernel(values, out)
@@ -659,9 +612,7 @@ def test_metal_same_simdgroup_thread_allreduce_keeps_local_buffer_scope():
 
 
 def test_metal_lower_thread_allreduce_split_cross_simdgroup_reuses_staging_result():
-    src = _lower_source(
-        _make_split_thread_allreduce_kernel(reduce_extent=64, groups=2)
-    )
+    src = _lower_source(_make_split_thread_allreduce_kernel(reduce_extent=64, groups=2))
 
     _assert_no_cuda_reduce_leakage(src)
     assert "simd_shuffle_down" in src, src
@@ -673,9 +624,7 @@ def test_metal_lower_thread_allreduce_split_cross_simdgroup_reuses_staging_resul
 def test_metal_thread_allreduce_extent_matrix_keeps_final_outputs_internal(
     reduce_extent: int,
 ):
-    src = _lower_source(
-        _make_split_thread_allreduce_kernel(reduce_extent=reduce_extent, groups=1)
-    )
+    src = _lower_source(_make_split_thread_allreduce_kernel(reduce_extent=reduce_extent, groups=1))
 
     _assert_no_cuda_reduce_leakage(src)
     assert "red_result[" not in src, src
@@ -687,23 +636,14 @@ def test_metal_thread_allreduce_extent_matrix_keeps_final_outputs_internal(
 
 
 def test_metal_lower_thread_allreduce_split_subgroups_broadcast_local_lane():
-    src = _lower_source(
-        _make_split_thread_allreduce_kernel(reduce_extent=16, groups=4)
-    )
+    src = _lower_source(_make_split_thread_allreduce_kernel(reduce_extent=16, groups=4))
 
     _assert_no_cuda_reduce_leakage(src)
     _assert_body_workspace(src, expected=False)
-    shuffle_calls = [
-        line.strip()
-        for line in src.splitlines()
-        if "simd_shuffle(" in line and "red_buf0" in line
-    ]
+    shuffle_calls = [line.strip() for line in src.splitlines() if "simd_shuffle(" in line and "red_buf0" in line]
     assert shuffle_calls, src
     assert "simd_shuffle(red_buf0[0], 0)" not in "\n".join(shuffle_calls)
-    assert any(
-        ("* 16" in line and ("& 31" in line or "% 2" in line))
-        for line in shuffle_calls
-    ), (
+    assert any(("* 16" in line and ("& 31" in line or "% 2" in line)) for line in shuffle_calls), (
         f"expected simdgroup-local 16-lane broadcast source; calls={shuffle_calls}\n{src}"
     )
 
@@ -722,14 +662,10 @@ def test_metal_split_simdgroup_allreduce_parallel_axis_runtime_mps():
     groups = 2
     rows = 3
     kernel = tilelang.compile(
-        _make_split_thread_allreduce_parallel_kernel(
-            reduce_extent=reduce_extent, groups=groups, rows=rows
-        ),
+        _make_split_thread_allreduce_parallel_kernel(reduce_extent=reduce_extent, groups=groups, rows=rows),
         target="metal",
     )
-    values = torch.arange(
-        rows * groups * reduce_extent, dtype=torch.float32, device="mps"
-    )
+    values = torch.arange(rows * groups * reduce_extent, dtype=torch.float32, device="mps")
     out = torch.empty(rows * groups, dtype=torch.float32, device="mps")
 
     kernel(values, out)
@@ -760,9 +696,7 @@ def test_metal_split_subsimdgroup_allreduce_runtime_mps():
     reduce_extent = 16
     groups = 4
     kernel = tilelang.compile(
-        _make_split_thread_allreduce_kernel(
-            reduce_extent=reduce_extent, groups=groups
-        ),
+        _make_split_thread_allreduce_kernel(reduce_extent=reduce_extent, groups=groups),
         target="metal",
     )
     values = torch.arange(reduce_extent * groups, dtype=torch.float32, device="mps")
@@ -772,10 +706,7 @@ def test_metal_split_subsimdgroup_allreduce_runtime_mps():
     torch.mps.synchronize()
 
     expected = torch.tensor(
-        [
-            sum(range(i * reduce_extent, (i + 1) * reduce_extent))
-            for i in range(groups)
-        ],
+        [sum(range(i * reduce_extent, (i + 1) * reduce_extent)) for i in range(groups)],
         dtype=torch.float32,
     )
     torch.testing.assert_close(out.cpu(), expected)
@@ -842,9 +773,7 @@ def test_metal_reduce_runtime_mps_small(op, values, expected):
 
 @tilelang.testing.requires_metal
 def test_metal_reduce_runtime_mps_cross_simdgroup_sum():
-    kernel = tilelang.compile(
-        _make_reduce_kernel("sum", length=256, threads=256), target="metal"
-    )
+    kernel = tilelang.compile(_make_reduce_kernel("sum", length=256, threads=256), target="metal")
     values = torch.arange(256, dtype=torch.float32, device="mps")
     out = torch.empty(1, dtype=torch.float32, device="mps")
 

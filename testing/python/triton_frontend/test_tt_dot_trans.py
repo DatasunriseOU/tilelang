@@ -9,6 +9,7 @@ either a real ``mlir.ir.Operation`` or a dict shape ``{"operands": [...],
 than a single ``tt.dot`` carrying a ``transpose_B`` attribute, so we lock
 down the fold-into-flag behaviour here.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -115,9 +116,7 @@ def test_dot_after_trans_b_emits_gemm_with_transpose_B_true():
     ctx.bind(c_fake, _FakeSharedBuffer())
 
     # tt.trans %b -> %bt
-    om.map_tt_trans(
-        {"operands": [b_fake], "results": [bt_fake], "attrs": {}}, ctx
-    )
+    om.map_tt_trans({"operands": [b_fake], "results": [bt_fake], "attrs": {}}, ctx)
 
     # tt.dot %a, %bt -> %c. No transpose_B in attrs; the trans should fold.
     dot_op = {
@@ -129,9 +128,7 @@ def test_dot_after_trans_b_emits_gemm_with_transpose_B_true():
 
     map_tt_dot(dot_op, ctx, language_module=_FakeT)
     assert "gemm" in captured, "T.gemm should have been called"
-    assert captured["gemm"]["transpose_B"] is True, (
-        "trans_b on %bt should fold into transpose_B=True at gemm time"
-    )
+    assert captured["gemm"]["transpose_B"] is True, "trans_b on %bt should fold into transpose_B=True at gemm time"
     assert captured["gemm"]["transpose_A"] is False
 
 
@@ -158,16 +155,15 @@ def test_dot_with_transpose_B_attr_xors_with_pre_trans_b():
     ctx.bind(a_fake, "A")
     ctx.bind(b_fake, "B")
     ctx.bind(c_fake, _FakeSharedBuffer())
-    om.map_tt_trans(
-        {"operands": [b_fake], "results": [bt_fake], "attrs": {}}, ctx
-    )
-    
+    om.map_tt_trans({"operands": [b_fake], "results": [bt_fake], "attrs": {}}, ctx)
+
     dot_op = {
         "operands": [a_fake, bt_fake, c_fake],
         "results": [_FakeRes((4, 4), "float32")],
         "attrs": {"trans_b": True},
     }
     from poc.triton_frontend.op_emitters.reduction import map_tt_dot
+
     map_tt_dot(dot_op, ctx, language_module=_FakeT)
     # => transpose_B=False reaches T.gemm.
     assert captured["transpose_B"] is False

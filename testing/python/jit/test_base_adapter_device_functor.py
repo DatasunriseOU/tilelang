@@ -6,6 +6,7 @@ though ``torch.cuda.is_available()`` initially returned True). The actual
 CUDA call lives inside the returned closure so callers can catch the
 exception via the closure's own fallback path.
 """
+
 from __future__ import annotations
 
 import pytest

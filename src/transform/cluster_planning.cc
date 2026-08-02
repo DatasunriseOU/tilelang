@@ -15,7 +15,8 @@
 
 namespace tvm {
 namespace tir {
-using namespace ::tvm::tirx;  // CPPMEGA: TileLang-local namespace tir block — alias for unqualified IR names
+using namespace ::tvm::tirx; // CPPMEGA: TileLang-local namespace tir block —
+                             // alias for unqualified IR names
 
 class ClusterPlanner {
 public:
@@ -122,10 +123,12 @@ PrimFunc ClusterPlanning(PrimFunc f) { return ClusterPlanner::Substitute(f); }
 namespace transform {
 
 tvm::transform::Pass ClusterPlanning() {
-  auto pass_func = [=](PrimFunc f, IRModule m, ::tvm::transform::PassContext ctx) {
+  auto pass_func = [=](PrimFunc f, IRModule m,
+                       ::tvm::transform::PassContext ctx) {
     return ::tvm::tir::ClusterPlanning(std::move(f));
   };
-  return tirx::transform::CreatePrimFuncPass(pass_func, 0, "tl.ClusterPlanning", {});
+  return tirx::transform::CreatePrimFuncPass(pass_func, 0, "tl.ClusterPlanning",
+                                             {});
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {

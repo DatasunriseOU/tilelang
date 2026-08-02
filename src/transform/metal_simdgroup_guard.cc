@@ -113,7 +113,7 @@ void Reject(const std::string &func_name, const std::string &op_name,
 }
 
 class MetalSimdgroupGuard final : public StmtExprVisitor {
- public:
+public:
   explicit MetalSimdgroupGuard(std::string func_name)
       : func_name_(std::move(func_name)) {}
 
@@ -131,7 +131,7 @@ class MetalSimdgroupGuard final : public StmtExprVisitor {
     StmtExprVisitor::VisitExpr_(op);
   }
 
- private:
+private:
   void ValidateShflXor(const CallNode *op) const {
     if (op->args.size() != 4U) {
       Reject(func_name_, "tl.shfl_xor_sync",
@@ -169,7 +169,7 @@ class MetalSimdgroupGuard final : public StmtExprVisitor {
   std::string func_name_;
 };
 
-}  // namespace
+} // namespace
 
 tvm::transform::Pass MetalSimdgroupSemanticGuard() {
   auto pass_func = [](PrimFunc f, const IRModule &m, const PassContext &ctx) {
@@ -202,6 +202,6 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                         MetalSimdgroupSemanticGuard);
 }
 
-}  // namespace transform
-}  // namespace tl
-}  // namespace tvm
+} // namespace transform
+} // namespace tl
+} // namespace tvm

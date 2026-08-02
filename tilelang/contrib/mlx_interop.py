@@ -23,7 +23,7 @@ import functools
 import hashlib
 import re
 from collections.abc import Iterable, Mapping
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from typing import Any
 
 from tilelang import tvm
@@ -326,8 +326,7 @@ def _tilelang_msl_body_for_mlx(body_text: str) -> str:
         "    uint3 blockIdx = threadgroup_position_in_grid;\n"
         "    uint3 threadIdx = thread_position_in_threadgroup;\n"
         "    uint3 blockDim = threads_per_threadgroup;\n"
-        "    uint3 gridDim = threadgroups_per_grid;\n"
-        + body
+        "    uint3 gridDim = threadgroups_per_grid;\n" + body
     )
     body = _canonicalize_tilelang_builtin_aliases(body)
     return _canonicalize_metal_surface(body)
@@ -349,20 +348,12 @@ def _cached_mlx_tilelang_metal_kernel(
     expected = set(input_names) | set(output_names)
     missing = expected.difference(buffer_names)
     if missing:
-        raise MLXGraphInteropError(
-            "TileLang Metal source is missing expected MLX buffers: "
-            + ", ".join(sorted(missing))
-        )
+        raise MLXGraphInteropError("TileLang Metal source is missing expected MLX buffers: " + ", ".join(sorted(missing)))
     unsupported = set(buffer_names).difference(expected)
     if unsupported:
-        raise MLXGraphInteropError(
-            "TileLang Metal source has unsupported non-MLX buffers: "
-            + ", ".join(sorted(unsupported))
-        )
+        raise MLXGraphInteropError("TileLang Metal source has unsupported non-MLX buffers: " + ", ".join(sorted(unsupported)))
 
-    abi_fingerprint = "\0".join(
-        (msl_source, *input_names, "\1", *output_names)
-    ).encode()
+    abi_fingerprint = "\0".join((msl_source, *input_names, "\1", *output_names)).encode()
     kernel_digest = hashlib.sha1(abi_fingerprint).hexdigest()[:16]
     header = prelude + ("\n" if prelude and not prelude.endswith("\n") else "")
     source = _tilelang_msl_body_for_mlx(body_text)
@@ -455,22 +446,15 @@ def _get_dlpack_capsule_device(arg: Any) -> tuple[int, int]:
         ptr = _pycapsule_get_pointer(arg, b"dltensor")
         tensor = ctypes.cast(ptr, ctypes.POINTER(_DLManagedTensor)).contents
         return int(tensor.dl_tensor.device.device_type), int(tensor.dl_tensor.device.device_id)
-    if _pycapsule_is_valid(arg, b"used_dltensor") or _pycapsule_is_valid(
-        arg, b"used_dltensor_versioned"
-    ):
+    if _pycapsule_is_valid(arg, b"used_dltensor") or _pycapsule_is_valid(arg, b"used_dltensor_versioned"):
         raise DLPackOwnershipError("DLPack capsule has already been consumed")
     if _pycapsule_is_valid(arg, b"dltensor_versioned"):
-        raise DLPackConversionError(
-            "Versioned DLPack capsules cannot be preflighted for device ownership"
-        )
+        raise DLPackConversionError("Versioned DLPack capsules cannot be preflighted for device ownership")
     raise DLPackConversionError("DLPack capsule is not a valid dltensor capsule")
 
 
 def _is_used_dlpack_capsule(arg: Any) -> bool:
-    return _is_py_capsule(arg) and (
-        _pycapsule_is_valid(arg, b"used_dltensor")
-        or _pycapsule_is_valid(arg, b"used_dltensor_versioned")
-    )
+    return _is_py_capsule(arg) and (_pycapsule_is_valid(arg, b"used_dltensor") or _pycapsule_is_valid(arg, b"used_dltensor_versioned"))
 
 
 def _iter_nested_values(args: Iterable[Any]):
@@ -492,20 +476,13 @@ def _get_dlpack_device(arg: Any) -> tuple[int, int]:
     try:
         device = get_device()
     except Exception as exc:
-        raise DLPackDeviceError(
-            f"{type(arg).__name__}.__dlpack_device__() failed: {type(exc).__name__}: {exc}"
-        ) from exc
+        raise DLPackDeviceError(f"{type(arg).__name__}.__dlpack_device__() failed: {type(exc).__name__}: {exc}") from exc
     if not isinstance(device, tuple) or len(device) != 2:
-        raise DLPackDeviceError(
-            f"{type(arg).__name__}.__dlpack_device__() must return (device_type, device_id), "
-            f"got {device!r}"
-        )
+        raise DLPackDeviceError(f"{type(arg).__name__}.__dlpack_device__() must return (device_type, device_id), got {device!r}")
     try:
         return int(device[0]), int(device[1])
     except Exception as exc:
-        raise DLPackDeviceError(
-            f"{type(arg).__name__}.__dlpack_device__() returned non-integer values: {device!r}"
-        ) from exc
+        raise DLPackDeviceError(f"{type(arg).__name__}.__dlpack_device__() returned non-integer values: {device!r}") from exc
 
 
 def validate_dlpack_device(
@@ -589,29 +566,17 @@ def dlpack_to_tvm_tensor(
     except ValueError as exc:
         msg = str(exc)
         if "consume" in msg or "used_dltensor" in msg or "used_dltensor_versioned" in msg:
-            raise DLPackOwnershipError(
-                f"{owner_name} ownership transfer failed: {msg}"
-            ) from exc
+            raise DLPackOwnershipError(f"{owner_name} ownership transfer failed: {msg}") from exc
         raise DLPackConversionError(f"{owner_name} import failed: {msg}") from exc
     except BufferError as exc:
-        raise DLPackOwnershipError(
-            f"{owner_name} ownership transfer failed: {exc}"
-        ) from exc
+        raise DLPackOwnershipError(f"{owner_name} ownership transfer failed: {exc}") from exc
     except TypeError as exc:
         msg = str(exc)
-        if "PyCapsule" in msg and (
-            "used_dltensor" in repr(arg) or "used_dltensor_versioned" in repr(arg)
-        ):
-            raise DLPackOwnershipError(
-                f"{owner_name} ownership transfer failed: {msg}"
-            ) from exc
-        raise DLPackConversionError(
-            f"{owner_name} import failed: {type(exc).__name__}: {exc}"
-        ) from exc
+        if "PyCapsule" in msg and ("used_dltensor" in repr(arg) or "used_dltensor_versioned" in repr(arg)):
+            raise DLPackOwnershipError(f"{owner_name} ownership transfer failed: {msg}") from exc
+        raise DLPackConversionError(f"{owner_name} import failed: {type(exc).__name__}: {exc}") from exc
     except RuntimeError as exc:
-        raise DLPackConversionError(
-            f"{owner_name} import failed: {type(exc).__name__}: {exc}"
-        ) from exc
+        raise DLPackConversionError(f"{owner_name} import failed: {type(exc).__name__}: {exc}") from exc
 
 
 def _dtype_name(dtype: Any | None) -> str | None:
@@ -635,10 +600,7 @@ def _view_tvm_tensor_for_expected_dtype(tensor: Any, arg: Any, expected_dtype: A
                 f"MLX array import failed: could not view {tensor.dtype} DLPack storage "
                 f"as expected {expected} without copying: {type(exc).__name__}: {exc}"
             ) from exc
-    raise DLPackConversionError(
-        f"MLX array import failed: DLPack dtype {tensor.dtype} does not match "
-        f"expected kernel dtype {expected}"
-    )
+    raise DLPackConversionError(f"MLX array import failed: DLPack dtype {tensor.dtype} does not match expected kernel dtype {expected}")
 
 
 def mlx_array_to_tvm_tensor(arg: Any, *, expected_dtype: Any | None = None):
@@ -673,10 +635,7 @@ def mlx_arrays_to_tvm_tensors(
     else:
         expected_list = list(expected_dtypes)
         if len(expected_list) != len(arg_list):
-            raise DLPackConversionError(
-                f"expected_dtypes length {len(expected_list)} does not match "
-                f"argument length {len(arg_list)}"
-            )
+            raise DLPackConversionError(f"expected_dtypes length {len(expected_list)} does not match argument length {len(arg_list)}")
     converted = []
     for arg, expected_dtype in zip(arg_list, expected_list, strict=True):
         if is_mlx_array(arg):
@@ -754,9 +713,7 @@ def tvm_tensor_to_mlx_array(tensor: Any):
             raise DLPackOwnershipError(f"TVM tensor export failed: {msg}") from exc
         raise DLPackConversionError(f"TVM tensor export failed: {msg}") from exc
     except (BufferError, TypeError, RuntimeError) as exc:
-        raise DLPackConversionError(
-            f"TVM tensor export failed: {type(exc).__name__}: {exc}"
-        ) from exc
+        raise DLPackConversionError(f"TVM tensor export failed: {type(exc).__name__}: {exc}") from exc
 
 
 def _metal_func(name: str):
@@ -772,11 +729,7 @@ def mlx_metal_external_command_buffer(stream: Any | None = None):
     """
 
     mx = _mlx_core()
-    if (
-        mx is None
-        or not hasattr(mx, "metal")
-        or not hasattr(mx.metal, "_current_command_buffer")
-    ):
+    if mx is None or not hasattr(mx, "metal") or not hasattr(mx.metal, "_current_command_buffer"):
         yield
         return
 
@@ -787,11 +740,7 @@ def mlx_metal_external_command_buffer(stream: Any | None = None):
         yield
         return
 
-    ptr = (
-        mx.metal._current_command_buffer()
-        if stream is None
-        else mx.metal._current_command_buffer(stream)
-    )
+    ptr = mx.metal._current_command_buffer() if stream is None else mx.metal._current_command_buffer(stream)
     if not ptr:
         yield
         return
@@ -828,11 +777,7 @@ def mlx_external_command_buffer_available(stream: Any | None = None) -> bool:
     """
 
     mx = _mlx_core()
-    if (
-        mx is None
-        or not hasattr(mx, "metal")
-        or not hasattr(mx.metal, "_current_command_buffer")
-    ):
+    if mx is None or not hasattr(mx, "metal") or not hasattr(mx.metal, "_current_command_buffer"):
         return False
     if (
         _metal_func("metal.GetExternalCommandBuffer") is None
@@ -841,11 +786,7 @@ def mlx_external_command_buffer_available(stream: Any | None = None) -> bool:
     ):
         return False
     try:
-        ptr = (
-            mx.metal._current_command_buffer()
-            if stream is None
-            else mx.metal._current_command_buffer(stream)
-        )
+        ptr = mx.metal._current_command_buffer() if stream is None else mx.metal._current_command_buffer(stream)
     except Exception:
         return False
     return bool(ptr)
@@ -878,7 +819,5 @@ def sync_tvm_metal_internal_command_buffer(args: Iterable[Any]) -> None:
     if not device_ids:
         device_ids.add(0)
     for device_id in device_ids:
-        try:
+        with suppress(Exception):
             tvm.metal(device_id).sync()
-        except Exception:
-            pass

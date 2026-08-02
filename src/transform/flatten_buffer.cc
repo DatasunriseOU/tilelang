@@ -22,12 +22,12 @@
  */
 
 #include "arith/ir_mutator_with_analyzer.h"
+#include "tirx/ir/data_type_rewriter.h"
 #include "tirx/transform/ir_utils.h"
 #include <tvm/arith/iter_affine_map.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/attrs.h>
 #include <tvm/tirx/analysis.h>
-#include "tirx/ir/data_type_rewriter.h"
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 

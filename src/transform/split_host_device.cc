@@ -222,7 +222,8 @@ private:
   // same name. We always perform substitution to ensure ConvertSSA sees
   // consistent variable references.
   Stmt wrapBodyWithHostSideAssumes(
-      Stmt body, const std::unordered_map<std::string, tirx::Var> &name_to_var) {
+      Stmt body,
+      const std::unordered_map<std::string, tirx::Var> &name_to_var) {
     // Build substitution map: assume_var -> body_var
     // Always substitute if we find a matching name, regardless of whether
     // it's the same object. This ensures ConvertSSA treats them as the same
@@ -264,11 +265,11 @@ private:
       }
 
       tirx::VarUseDefAnalyzer use_def(/*defined_vars=*/{},
-                                     /*visit_thread_extent=*/true);
+                                      /*visit_thread_extent=*/true);
       use_def(body);
 
       std::vector<tirx::Var> params{use_def.undefined_.begin(),
-                                   use_def.undefined_.end()};
+                                    use_def.undefined_.end()};
       SortDeviceParams(&params);
       return {Array<tirx::Var>(params.begin(), params.end()),
               use_def.undefined_buffers_};
@@ -302,9 +303,9 @@ private:
                           ? Downcast<tirx::Var>(var_remap[buf->data])
                           : buf->data;
       tirx::Buffer new_buf(new_data, buf->dtype, new_shape, new_strides,
-                          new_elem_offset, buf->name, buf->data_alignment,
-                          buf->offset_factor, buf->buffer_type,
-                          buf->axis_separators, buf->span);
+                           new_elem_offset, buf->name, buf->data_alignment,
+                           buf->offset_factor, buf->buffer_type,
+                           buf->axis_separators, buf->span);
       new_buffers_to_declare.push_back(new_buf);
     }
     buffers_to_declare = new_buffers_to_declare;
@@ -378,8 +379,7 @@ private:
       tirx::Var kernel_error_code("kernel_error_code", success->dtype);
       tirx::Call kernel_call(success->dtype, kernel_symbol_global, args);
       tirx::AssertStmt assert_success(
-          kernel_error_code == success,
-          tirx::StringImm("RuntimeError"),
+          kernel_error_code == success, tirx::StringImm("RuntimeError"),
           ffi::Array<tirx::StringImm>{
               tirx::StringImm("Error executing compute kernel")});
       // CPPMEGA: Avoid emitting a vendored `tilelang::tl_tir::LetStmt` here:
@@ -407,11 +407,12 @@ private:
 };
 
 tirx::PrimFunc SplitHostDevice(tirx::PrimFunc func, IRModule *device_mod,
-                              std::function<GlobalVar()> var_supply) {
+                               std::function<GlobalVar()> var_supply) {
   HostDeviceSplitter splitter(device_mod, std::move(var_supply));
   splitter.SetHostFuncSignature(func);
   // Propagate non-restrict parameter list from host func to device kernels
-  if (auto opt = func->GetAttr<Array<tirx::Var>>(tl::attr::kNonRestrictParams)) {
+  if (auto opt =
+          func->GetAttr<Array<tirx::Var>>(tl::attr::kNonRestrictParams)) {
     splitter.SetNonRestrictParams(opt.value());
     // Remove the attribute from host-side PrimFunc; it only matters for device
     // codegen.

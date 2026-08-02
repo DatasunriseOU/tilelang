@@ -32,6 +32,7 @@ After lowering through ``tilelang.compile`` we assert:
 This test is the structural floor for the RFC §6 contract; downstream
 work tightens it with real device execution.
 """
+
 from __future__ import annotations
 
 import importlib
@@ -163,18 +164,14 @@ def test_multi_source_fusion_lowers_to_single_primfunc() -> None:
     a separate global function in the lowered IRModule is the
     "one launch" assertion.
     """
-    import tilelang
     import tvm
-    from tilelang import language as T
     from tvm import tir
 
     _register_extern()
 
     # Step 1: Triton TTIR -> PrimFunc.
     ttir_prim = _build_multi_source_prim_func()
-    assert isinstance(ttir_prim, tir.PrimFunc), (
-        f"from_ttir must return a tir.PrimFunc; got {type(ttir_prim).__name__}"
-    )
+    assert isinstance(ttir_prim, tir.PrimFunc), f"from_ttir must return a tir.PrimFunc; got {type(ttir_prim).__name__}"
 
     # Step 2: build a wrapper PrimFunc that calls the TTIR-derived body
     # plus an FX-style elementwise op plus the extern_intrinsic, all
@@ -185,7 +182,6 @@ def test_multi_source_fusion_lowers_to_single_primfunc() -> None:
 
     # Synthesise a small wrapper PrimFunc using TVM's TIR builder so we
     # can stitch the three source surfaces into one entry.
-    handle_dtype = "handle"
     a_buf = tir.decl_buffer((16,), "float32", name="a", scope="shared")
     b_buf = tir.decl_buffer((16,), "float32", name="b", scope="shared")
     c_buf = tir.decl_buffer((16,), "float32", name="c", scope="shared")
@@ -246,37 +242,26 @@ def test_multi_source_fusion_lowers_to_single_primfunc() -> None:
     mod = tvm.IRModule({"multi_source_fusion_entry": wrapper})
     func_names = [gv.name_hint for gv, _ in mod.functions.items()]
     assert func_names == ["multi_source_fusion_entry"], (
-        f"multi-source fused region must lower to exactly one PrimFunc; "
-        f"got functions={func_names!r}"
+        f"multi-source fused region must lower to exactly one PrimFunc; got functions={func_names!r}"
     )
 
     # Body must contain the extern_intrinsic call (no HBM-bounce
     # decomposition into a host-side kernel launch).
     body_text = str(wrapper.body)
-    assert extern_call_name in body_text, (
-        f"extern_intrinsic call {extern_call_name!r} missing from body:\n{body_text}"
-    )
+    assert extern_call_name in body_text, f"extern_intrinsic call {extern_call_name!r} missing from body:\n{body_text}"
 
     # FX tail signature: max(.., 0.0f) is the relu we wove in.
-    assert "max" in body_text.lower() or "Max" in body_text, (
-        "FX-style relu tail (max(x, 0)) not found in fused PrimFunc body"
-    )
+    assert "max" in body_text.lower() or "Max" in body_text, "FX-style relu tail (max(x, 0)) not found in fused PrimFunc body"
 
     # TTIR provenance attribute is attached to the wrapper body.
     assert "triton_frontend.source" in body_text, (
-        "TTIR provenance attribute missing -- fused body should record that "
-        "the TTIR ingestion participated in the same kernel"
+        "TTIR provenance attribute missing -- fused body should record that the TTIR ingestion participated in the same kernel"
     )
 
     # Step 4: lock the structural invariant that the IRModule has
     # exactly one PrimFunc after wrapper assembly.
-    primfunc_count = sum(
-        1 for _, fn in mod.functions.items() if isinstance(fn, tir.PrimFunc)
-    )
-    assert primfunc_count == 1, (
-        f"single-Kernel multi-source fusion must produce one PrimFunc; "
-        f"got {primfunc_count}"
-    )
+    primfunc_count = sum(1 for _, fn in mod.functions.items() if isinstance(fn, tir.PrimFunc))
+    assert primfunc_count == 1, f"single-Kernel multi-source fusion must produce one PrimFunc; got {primfunc_count}"
 
 
 def test_multi_source_fusion_extern_intrinsic_registered() -> None:

@@ -637,9 +637,10 @@ static bool IsSyncGlobalToSharedCopyLikeStmt(const Stmt &stmt, Target target) {
   if (copy == nullptr) {
     return false;
   }
-  
+
   // Producer statements must write to shared memory to be visible across warps.
-  // If the destination is not shared memory, it must be executed by the consumer.
+  // If the destination is not shared memory, it must be executed by the
+  // consumer.
   if (copy->dst.scope() != "shared" && copy->dst.scope() != "shared.dyn") {
     return false;
   }
@@ -2422,7 +2423,8 @@ private:
     // Collect layout_map entries so we can cross-check TMA copy targets.
     if (op->annotations.count("layout_map")) {
       auto anno = op->annotations.Get("layout_map");
-      if (auto gmap = anno->as<Map<ffi::ObjectRef, ffi::ObjectRef>>(); gmap.has_value()) {
+      if (auto gmap = anno->as<Map<ffi::ObjectRef, ffi::ObjectRef>>();
+          gmap.has_value()) {
         for (const auto &[key, val] : gmap.value()) {
           Layout layout;
           if (auto l = val.as<Layout>(); l.has_value())

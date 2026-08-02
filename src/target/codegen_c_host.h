@@ -113,8 +113,7 @@ private:
   void PrintPackedCallIntoResult(const tvm::tirx::CallNode *op,
                                  const std::string &packed_func_name,
                                  const std::string &args_stack,
-                                 int64_t num_args,
-                                 const std::string &result,
+                                 int64_t num_args, const std::string &result,
                                  const std::string &failure_stmt);
   /*!
    * \brief Print ternary conditional operator implementing binary `op`

@@ -94,18 +94,16 @@ def test_layout_inference_picks_up_extern_meta():
     pytest.importorskip("tilelang.language.extern")
 
     @T.prim_func
-    def kernel(A: T.Buffer((8, 8), "float16"),  # noqa: N803
-               B: T.Buffer((8, 8), "float16"),
-               C: T.Buffer((8, 8), "float32")) -> None:
+    def kernel(
+        A: T.Buffer((8, 8), "float16"),  # noqa: N803
+        B: T.Buffer((8, 8), "float16"),
+        C: T.Buffer((8, 8), "float32"),
+    ) -> None:
         with T.sblock("root"):
-            T.sblock_attr({EXTERN_BLOCK_ATTR: {"layouts": ["simdgroup_a",
-                                                           "simdgroup_b",
-                                                           "simdgroup_c"]}})
-            T.evaluate(T.call_extern("handle",
-                                     EXTERN_CALL_PREFIX + "simdgroup_mma_8x8",
-                                     A.access_ptr("r"),
-                                     B.access_ptr("r"),
-                                     C.access_ptr("rw")))
+            T.sblock_attr({EXTERN_BLOCK_ATTR: {"layouts": ["simdgroup_a", "simdgroup_b", "simdgroup_c"]}})
+            T.evaluate(
+                T.call_extern("handle", EXTERN_CALL_PREFIX + "simdgroup_mma_8x8", A.access_ptr("r"), B.access_ptr("r"), C.access_ptr("rw"))
+            )
 
     mod = _bind_layout_target(tvm.IRModule({"main": kernel}))
     LayoutInference = tvm.get_global_func("tl.transform.LayoutInference")
@@ -128,16 +126,16 @@ def test_inject_pipeline_picks_up_extern_meta():
     IR (same machinery as ``T.Pipelined(num_stages=3)``)."""
 
     @T.prim_func
-    def kernel(A: T.Buffer((8, 8), "float16"),  # noqa: N803
-               B: T.Buffer((8, 8), "float16"),
-               C: T.Buffer((8, 8), "float32")) -> None:
+    def kernel(
+        A: T.Buffer((8, 8), "float16"),  # noqa: N803
+        B: T.Buffer((8, 8), "float16"),
+        C: T.Buffer((8, 8), "float32"),
+    ) -> None:
         with T.sblock("root"):
             T.sblock_attr({EXTERN_BLOCK_ATTR: {"pipeline_stage": 2}})
-            T.evaluate(T.call_extern("handle",
-                                     EXTERN_CALL_PREFIX + "simdgroup_mma_8x8",
-                                     A.access_ptr("r"),
-                                     B.access_ptr("r"),
-                                     C.access_ptr("rw")))
+            T.evaluate(
+                T.call_extern("handle", EXTERN_CALL_PREFIX + "simdgroup_mma_8x8", A.access_ptr("r"), B.access_ptr("r"), C.access_ptr("rw"))
+            )
 
     mod = _bind_layout_target(tvm.IRModule({"main": kernel}))
     InjectPipeline = tvm.get_global_func("tl.transform.InjectSoftwarePipeline")
@@ -163,17 +161,13 @@ def test_inject_pipeline_passthrough_for_unset_stage():
     def kernel(A: T.Buffer((8, 8), "float16")) -> None:  # noqa: N803
         with T.sblock("root"):
             T.sblock_attr({EXTERN_BLOCK_ATTR: {"pipeline_stage": -1}})
-            T.evaluate(T.call_extern("handle",
-                                     EXTERN_CALL_PREFIX + "noop",
-                                     A.access_ptr("r")))
+            T.evaluate(T.call_extern("handle", EXTERN_CALL_PREFIX + "noop", A.access_ptr("r")))
 
     mod = _bind_layout_target(tvm.IRModule({"main": kernel}))
     InjectPipeline = tvm.get_global_func("tl.transform.InjectSoftwarePipeline")
     out = InjectPipeline()(mod)
     body = out["main"].body
-    assert not _has_attr_stmt(body, "tl.pipeline_context_num_stages"), (
-        "pipeline_stage=-1 should be a passthrough — no AttrStmt expected."
-    )
+    assert not _has_attr_stmt(body, "tl.pipeline_context_num_stages"), "pipeline_stage=-1 should be a passthrough — no AttrStmt expected."
 
 
 # ---------------------------------------------------------------------------
@@ -213,11 +207,8 @@ def test_layout_inference_dispatches_mma_tile_size():
     @T.prim_func
     def kernel(C: T.Buffer((16, 16), "float32")) -> None:  # noqa: N803
         with T.sblock("root"):
-            T.sblock_attr({EXTERN_BLOCK_ATTR: {"layouts": ["mma_C"],
-                                               "tile_size": [16, 16, 16]}})
-            T.evaluate(T.call_extern("handle",
-                                     EXTERN_CALL_PREFIX + "fake_mma_16x16",
-                                     C.access_ptr("rw")))
+            T.sblock_attr({EXTERN_BLOCK_ATTR: {"layouts": ["mma_C"], "tile_size": [16, 16, 16]}})
+            T.evaluate(T.call_extern("handle", EXTERN_CALL_PREFIX + "fake_mma_16x16", C.access_ptr("rw")))
 
     mod = _bind_layout_target(tvm.IRModule({"main": kernel}))
     LayoutInference = tvm.get_global_func("tl.transform.LayoutInference")
@@ -237,9 +228,7 @@ def test_layout_inference_unknown_layout_falls_through():
     def kernel(A: T.Buffer((8, 8), "float16")) -> None:  # noqa: N803
         with T.sblock("root"):
             T.sblock_attr({EXTERN_BLOCK_ATTR: {"layouts": ["totally_made_up"]}})
-            T.evaluate(T.call_extern("handle",
-                                     EXTERN_CALL_PREFIX + "noop",
-                                     A.access_ptr("r")))
+            T.evaluate(T.call_extern("handle", EXTERN_CALL_PREFIX + "noop", A.access_ptr("r")))
 
     mod = _bind_layout_target(tvm.IRModule({"main": kernel}))
     LayoutInference = tvm.get_global_func("tl.transform.LayoutInference")
@@ -249,6 +238,7 @@ def test_layout_inference_unknown_layout_falls_through():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
 
 def test_lower_extern_intrinsic_per_target_dispatch():
     """Verify that LowerExternIntrinsic injects the correct body string for the target."""
@@ -265,9 +255,9 @@ def test_lower_extern_intrinsic_per_target_dispatch():
             name=name,
             signature=lambda: (Frag("c", (16, 16), "local", "float32", is_output=True),),
             bodies={
-                "cuda": '__device__ void test_dispatch(float* c) { c[0] = 1.0f; }',
-                "metal": 'void test_dispatch(threadgroup float* c) { c[0] = 1.0f; }'
-            }
+                "cuda": "__device__ void test_dispatch(float* c) { c[0] = 1.0f; }",
+                "metal": "void test_dispatch(threadgroup float* c) { c[0] = 1.0f; }",
+            },
         )
 
         @T.prim_func
@@ -401,7 +391,7 @@ def test_lower_extern_intrinsic_missing_target_body_fails_closed():
         extern_intrinsic(
             name=name,
             signature=lambda: (Frag("c", (16, 16), "local", "float32", is_output=True),),
-            bodies={"cuda": '__device__ void test_dispatch_cuda_only(float* c) { c[0] = 1.0f; }'},
+            bodies={"cuda": "__device__ void test_dispatch_cuda_only(float* c) { c[0] = 1.0f; }"},
         )
 
         @T.prim_func

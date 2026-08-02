@@ -37,23 +37,28 @@ static constexpr const char *kExternBlockAttr = "tl.extern_intrinsic_meta";
 /*!
  * \brief Test whether a TIR ``CallNode`` is a ``tl.extern_intrinsic`` call.
  *
- * The Python decorator emits ``tir.call_extern("handle", "tl.extern_intrinsic.<name>", ...)``;
- * we recognise it via the call_extern op and the symbol prefix on the first
- * string argument.
+ * The Python decorator emits ``tir.call_extern("handle",
+ * "tl.extern_intrinsic.<name>", ...)``; we recognise it via the call_extern op
+ * and the symbol prefix on the first string argument.
  */
 inline bool IsExternIntrinsicCall(const tirx::CallNode *call) {
-  if (call == nullptr) return false;
-  if (!call->op.same_as(tvm::tirx::builtin::call_extern())) return false;
-  if (call->args.empty()) return false;
+  if (call == nullptr)
+    return false;
+  if (!call->op.same_as(tvm::tirx::builtin::call_extern()))
+    return false;
+  if (call->args.empty())
+    return false;
   const auto *name_imm = call->args[0].as<tvm::tirx::StringImmNode>();
-  if (name_imm == nullptr) return false;
+  if (name_imm == nullptr)
+    return false;
   // Zero-copy prefix check: ``ffi::String`` exposes ``data()``/``size()``;
   // we compare the first ``prefix_len`` bytes via ``strncmp`` instead of
   // materialising a ``std::string`` copy on every call (perf review #2).
-  const ffi::String& s = name_imm->value;
+  const ffi::String &s = name_imm->value;
   static constexpr size_t kPrefixLen =
-      sizeof("tl.extern_intrinsic.") - 1;  // matches kExternCallPrefix
-  if (s.size() < kPrefixLen) return false;
+      sizeof("tl.extern_intrinsic.") - 1; // matches kExternCallPrefix
+  if (s.size() < kPrefixLen)
+    return false;
   return std::strncmp(s.data(), kExternCallPrefix, kPrefixLen) == 0;
 }
 
@@ -64,10 +69,11 @@ inline bool IsExternIntrinsicCall(const tirx::CallNode *call) {
  * intentionally return ``Map<String, Any>`` (the annotation type used by
  * ``SBlockNode``) so callers don't have to redo the downcast.
  */
-inline Optional<ffi::Map<ffi::String, ffi::Any>> GetExternBlockMeta(
-    const tirx::SBlockNode *block) {
+inline Optional<ffi::Map<ffi::String, ffi::Any>>
+GetExternBlockMeta(const tirx::SBlockNode *block) {
   using ResultMap = ffi::Map<ffi::String, ffi::Any>;
-  if (block == nullptr) return Optional<ResultMap>();
+  if (block == nullptr)
+    return Optional<ResultMap>();
   auto it = block->annotations.find(kExternBlockAttr);
   if (it == block->annotations.end()) {
     return Optional<ResultMap>();
@@ -81,7 +87,7 @@ inline Optional<ffi::Map<ffi::String, ffi::Any>> GetExternBlockMeta(
   return Optional<ResultMap>();
 }
 
-}  // namespace tl
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm
 
-#endif  // TVM_TL_TRANSFORM_EXTERN_INTRINSIC_META_H_
+#endif // TVM_TL_TRANSFORM_EXTERN_INTRINSIC_META_H_

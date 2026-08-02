@@ -44,9 +44,9 @@ namespace tl {
 using namespace tirx;
 using namespace tirx::transform;
 
-// CPPMEGA: Collect buffer-data Vars that have a backing definition (AllocBuffer,
-// SBlock alloc_buffers/match_buffers) and the ghost buffers that are referenced
-// via BufferLoad/BufferStore without ever being defined. The
+// CPPMEGA: Collect buffer-data Vars that have a backing definition
+// (AllocBuffer, SBlock alloc_buffers/match_buffers) and the ghost buffers that
+// are referenced via BufferLoad/BufferStore without ever being defined. The
 // latter occurs when LayoutInference / LowerTileOp rewrites a fragment buffer
 // (e.g. ``C_local``) into a smaller per-thread "local" buffer at the *outer*
 // "root" SBlock via a layout_map annotation but never adds a corresponding
@@ -94,8 +94,8 @@ public:
       return;
     }
     if (const auto *data = op->args[1].as<VarNode>()) {
-      DataType elem_dtype = op->args[0].defined() ? op->args[0].dtype()
-                                                  : DataType::Void();
+      DataType elem_dtype =
+          op->args[0].defined() ? op->args[0].dtype() : DataType::Void();
       RecordAccessPtrUse(ffi::GetRef<Var>(data), elem_dtype);
     }
   }
@@ -109,7 +109,8 @@ public:
 
 private:
   void RecordBufferUse(const Buffer &buf) {
-    if (!buf.defined()) return;
+    if (!buf.defined())
+      return;
     used_buffers_.emplace(buf->data, buf);
   }
 
@@ -211,7 +212,7 @@ Buffer FindCanonicalInputBuffer(const Buffer &buffer,
 }
 
 bool MatchesCanonicalInputDataVar(const Var &data, DataType elem_dtype,
-                                   const Buffer &canonical) {
+                                  const Buffer &canonical) {
   if (!canonical.defined() || !IsGlobalBuffer(canonical)) {
     return false;
   }
@@ -225,9 +226,9 @@ bool MatchesCanonicalInputDataVar(const Var &data, DataType elem_dtype,
   return true;
 }
 
-Buffer FindCanonicalInputBufferForDataVar(
-    const Var &data, DataType elem_dtype,
-    const ffi::Map<Var, Buffer> &buffer_map) {
+Buffer
+FindCanonicalInputBufferForDataVar(const Var &data, DataType elem_dtype,
+                                   const ffi::Map<Var, Buffer> &buffer_map) {
   Buffer match;
   for (const auto &kv : buffer_map) {
     const Buffer &candidate = kv.second;
@@ -296,7 +297,8 @@ private:
 
 class GhostBufferPlacementPlanner : public StmtExprVisitor {
 public:
-  explicit GhostBufferPlacementPlanner(const ffi::Array<Buffer> &ghost_buffers) {
+  explicit GhostBufferPlacementPlanner(
+      const ffi::Array<Buffer> &ghost_buffers) {
     for (const Buffer &buf : ghost_buffers) {
       ghost_buffers_.emplace(buf->data, buf);
     }
@@ -351,7 +353,8 @@ public:
       // restoring the SBlock::alloc_buffers definition that SplitHostDevice
       // expects for shared/local scratch storage.
       if (IsHostMainBlock(owner)) {
-        if (!IsDeviceScratchBuffer(buffer) || ambiguous_device_owners_.count(kv.first)) {
+        if (!IsDeviceScratchBuffer(buffer) ||
+            ambiguous_device_owners_.count(kv.first)) {
           continue;
         }
         auto owner_it = unique_device_owners_.find(kv.first);
@@ -369,7 +372,8 @@ public:
 
 private:
   void RecordBufferUse(const Buffer &buf) {
-    if (!buf.defined()) return;
+    if (!buf.defined())
+      return;
     RecordBufferVarUse(buf->data);
   }
 
@@ -422,7 +426,7 @@ private:
 
   std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> ghost_buffers_;
   std::unordered_map<Var, std::vector<const SBlockNode *>, ObjectPtrHash,
-                      ObjectPtrEqual>
+                     ObjectPtrEqual>
       owner_paths_;
   std::unordered_map<Var, const SBlockNode *, ObjectPtrHash, ObjectPtrEqual>
       unique_device_owners_;
@@ -499,7 +503,8 @@ PrimFunc HoistGlobalBufferAllocations(PrimFunc func) {
   for (const auto &kv : collector.used_buffers_) {
     const Var &v = kv.first;
     const Buffer &buf = kv.second;
-    if (collector.defined_vars_.count(v) || param_vars.count(v)) continue;
+    if (collector.defined_vars_.count(v) || param_vars.count(v))
+      continue;
 
     Buffer canonical = FindCanonicalInputBuffer(buf, fptr->buffer_map);
     if (canonical.defined()) {
@@ -509,8 +514,10 @@ PrimFunc HoistGlobalBufferAllocations(PrimFunc func) {
   for (const auto &kv : collector.used_access_ptr_vars_) {
     const Var &v = kv.first;
     DataType elem_dtype = kv.second;
-    if (collector.defined_vars_.count(v) || param_vars.count(v)) continue;
-    if (canonical_buffers.count(v)) continue;
+    if (collector.defined_vars_.count(v) || param_vars.count(v))
+      continue;
+    if (canonical_buffers.count(v))
+      continue;
 
     Buffer canonical =
         FindCanonicalInputBufferForDataVar(v, elem_dtype, fptr->buffer_map);
@@ -528,11 +535,14 @@ PrimFunc HoistGlobalBufferAllocations(PrimFunc func) {
   for (const auto &kv : collector.used_buffers_) {
     const Var &v = kv.first;
     const Buffer &buf = kv.second;
-    if (collector.defined_vars_.count(v)) continue;
-    if (param_vars.count(v)) continue;
+    if (collector.defined_vars_.count(v))
+      continue;
+    if (param_vars.count(v))
+      continue;
     // Only hoist non-global, statically-shaped buffers. Global buffers are
     // expected to be match-bound from function parameters.
-    if (IsGlobalBuffer(buf)) continue;
+    if (IsGlobalBuffer(buf))
+      continue;
     bool all_static = true;
     for (const auto &dim : buf->shape) {
       if (!dim.as<IntImmNode>()) {
@@ -540,7 +550,8 @@ PrimFunc HoistGlobalBufferAllocations(PrimFunc func) {
         break;
       }
     }
-    if (!all_static) continue;
+    if (!all_static)
+      continue;
     ghost_buffers.push_back(buf);
   }
 

@@ -199,9 +199,7 @@ def _target_from_string(target: str) -> Target:
 
 
 def _is_target_object(target) -> bool:
-    return isinstance(target, Target) or (
-        hasattr(target, "kind") and hasattr(target, "keys")
-    )
+    return isinstance(target, Target) or (hasattr(target, "kind") and hasattr(target, "keys"))
 
 
 def _target_export_dict(target) -> dict:
@@ -274,11 +272,7 @@ def determine_target(target: str | Target | Literal["auto"] = "auto", return_obj
 
             # Determine the target based on availability
             if is_cuda_available:
-                if (
-                    torch is not None
-                    and torch.cuda.is_available()
-                    and (cap := torch.cuda.get_device_capability(0))
-                ):
+                if torch is not None and torch.cuda.is_available() and (cap := torch.cuda.get_device_capability(0)):
                     return_var = Target({"kind": "cuda", "arch": f"sm_{nvcc.get_target_arch(cap)}"})
                 else:
                     return_var = "cuda"

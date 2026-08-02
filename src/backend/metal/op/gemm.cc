@@ -167,8 +167,7 @@ struct Gemm {
   static std::pair<int, int>
   ComputeWarpPartition(const GemmWarpPolicyNode &policy, int M, int N,
                        int block_size, Target target, String gemm_inst) {
-    ICHECK(gemm_inst == kMetalSIMDGroup ||
-           gemm_inst == kMetalCooperativeTensor)
+    ICHECK(gemm_inst == kMetalSIMDGroup || gemm_inst == kMetalCooperativeTensor)
         << "Unsupported Metal GEMM instruction: " << gemm_inst;
     int num_warps = block_size / TargetGetWarpSize(target);
     return ComputeSIMDGroupWarpPartition(policy, M, N, num_warps, gemm_inst);

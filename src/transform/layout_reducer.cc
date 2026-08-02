@@ -249,60 +249,73 @@ private:
     if (inside_reducer_range_.count(var)) {
       auto info = inside_reducer_range_.Get(var).value();
       auto value = op->value;
-      
+
       bool is_valid = false;
       if (info->op == ReducerOpType::SUM) {
         if (auto add = value.as<AddNode>()) {
           if (auto load_a = add->a.as<BufferLoadNode>()) {
-            if (load_a->buffer->data.same_as(var)) is_valid = true;
+            if (load_a->buffer->data.same_as(var))
+              is_valid = true;
           }
           if (auto load_b = add->b.as<BufferLoadNode>()) {
-            if (load_b->buffer->data.same_as(var)) is_valid = true;
+            if (load_b->buffer->data.same_as(var))
+              is_valid = true;
           }
         }
       } else if (info->op == ReducerOpType::MUL) {
         if (auto mul = value.as<MulNode>()) {
           if (auto load_a = mul->a.as<BufferLoadNode>()) {
-            if (load_a->buffer->data.same_as(var)) is_valid = true;
+            if (load_a->buffer->data.same_as(var))
+              is_valid = true;
           }
           if (auto load_b = mul->b.as<BufferLoadNode>()) {
-            if (load_b->buffer->data.same_as(var)) is_valid = true;
+            if (load_b->buffer->data.same_as(var))
+              is_valid = true;
           }
         }
       } else if (info->op == ReducerOpType::MAX) {
         if (auto max_node = value.as<MaxNode>()) {
           if (auto load_a = max_node->a.as<BufferLoadNode>()) {
-            if (load_a->buffer->data.same_as(var)) is_valid = true;
+            if (load_a->buffer->data.same_as(var))
+              is_valid = true;
           }
           if (auto load_b = max_node->b.as<BufferLoadNode>()) {
-            if (load_b->buffer->data.same_as(var)) is_valid = true;
+            if (load_b->buffer->data.same_as(var))
+              is_valid = true;
           }
         } else if (auto call_node = value.as<CallNode>()) {
           // Some targets lower Max to Call
-          for (const auto& arg : call_node->args) {
+          for (const auto &arg : call_node->args) {
             if (auto load_arg = arg.as<BufferLoadNode>()) {
-              if (load_arg->buffer->data.same_as(var)) is_valid = true;
+              if (load_arg->buffer->data.same_as(var))
+                is_valid = true;
             }
           }
         }
       } else if (info->op == ReducerOpType::MIN) {
         if (auto min_node = value.as<MinNode>()) {
           if (auto load_a = min_node->a.as<BufferLoadNode>()) {
-            if (load_a->buffer->data.same_as(var)) is_valid = true;
+            if (load_a->buffer->data.same_as(var))
+              is_valid = true;
           }
           if (auto load_b = min_node->b.as<BufferLoadNode>()) {
-            if (load_b->buffer->data.same_as(var)) is_valid = true;
+            if (load_b->buffer->data.same_as(var))
+              is_valid = true;
           }
         } else if (auto call_node = value.as<CallNode>()) {
-          for (const auto& arg : call_node->args) {
+          for (const auto &arg : call_node->args) {
             if (auto load_arg = arg.as<BufferLoadNode>()) {
-              if (load_arg->buffer->data.same_as(var)) is_valid = true;
+              if (load_arg->buffer->data.same_as(var))
+                is_valid = true;
             }
           }
         }
       }
-      
-      ICHECK(is_valid) << "Reducer buffer store validation failed: RHS does not contain a valid reduction operation matching the reducer type for buffer " << op->buffer->name;
+
+      ICHECK(is_valid)
+          << "Reducer buffer store validation failed: RHS does not contain a "
+             "valid reduction operation matching the reducer type for buffer "
+          << op->buffer->name;
     }
     return IRMutatorWithAnalyzer::VisitStmt_(op);
   }

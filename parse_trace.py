@@ -19,8 +19,7 @@ import csv
 import json
 import sys
 import xml.etree.ElementTree as ET
-from collections import Counter, defaultdict
-from typing import Any
+from collections import Counter
 
 
 def build_ref_map(root: ET.Element) -> dict[str, ET.Element]:
@@ -123,9 +122,7 @@ def print_json(headers: list[str], rows: list[dict[str, str]], limit: int) -> No
         print(f"// ... ({len(rows) - limit} more rows)", file=sys.stderr)
 
 
-def print_csv_output(
-    headers: list[str], rows: list[dict[str, str]], limit: int
-) -> None:
+def print_csv_output(headers: list[str], rows: list[dict[str, str]], limit: int) -> None:
     """Print as CSV."""
     writer = csv.DictWriter(sys.stdout, fieldnames=headers)
     writer.writeheader()
@@ -136,9 +133,7 @@ def print_csv_output(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Parse xctrace XML exports into structured data"
-    )
+    parser = argparse.ArgumentParser(description="Parse xctrace XML exports into structured data")
     parser.add_argument("xml_file", help="Path to exported XML file")
     parser.add_argument(
         "--format",
@@ -146,12 +141,8 @@ def main():
         default="tsv",
         help="Output format (default: tsv)",
     )
-    parser.add_argument(
-        "--limit", type=int, default=100, help="Max rows to output (default: 100)"
-    )
-    parser.add_argument(
-        "--summary", action="store_true", help="Print summary statistics"
-    )
+    parser.add_argument("--limit", type=int, default=100, help="Max rows to output (default: 100)")
+    parser.add_argument("--summary", action="store_true", help="Print summary statistics")
     args = parser.parse_args()
 
     try:

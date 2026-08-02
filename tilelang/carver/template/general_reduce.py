@@ -35,42 +35,24 @@ class GeneralReductionTemplate(BaseTemplate):
         """
         if self.structure != "SR":
             raise ValueError(
-                "Metal row-reduce sum fast path requires structure='SR' "
-                f"for contiguous innermost reduction, got {self.structure!r}."
+                f"Metal row-reduce sum fast path requires structure='SR' for contiguous innermost reduction, got {self.structure!r}."
             )
         if self.shape is None or len(self.shape) != 2:
-            raise ValueError(
-                "Metal row-reduce sum fast path requires a static 2-D shape."
-            )
+            raise ValueError("Metal row-reduce sum fast path requires a static 2-D shape.")
         if self.dtype not in {"float16", "float32"}:
-            raise ValueError(
-                "Metal row-reduce sum fast path currently supports float16 "
-                f"and float32, got {self.dtype!r}."
-            )
+            raise ValueError(f"Metal row-reduce sum fast path currently supports float16 and float32, got {self.dtype!r}.")
         if rows_per_threadgroup <= 0:
-            raise ValueError(
-                "rows_per_threadgroup must be positive, got "
-                f"{rows_per_threadgroup}."
-            )
+            raise ValueError(f"rows_per_threadgroup must be positive, got {rows_per_threadgroup}.")
         if simdgroup_size != 32:
-            raise ValueError(
-                "Metal row-reduce sum fast path assumes 32-lane simdgroups, "
-                f"got {simdgroup_size}."
-            )
+            raise ValueError(f"Metal row-reduce sum fast path assumes 32-lane simdgroups, got {simdgroup_size}.")
 
         rows, cols = self.shape
         if not all(isinstance(s, int) and s > 0 for s in (rows, cols)):
-            raise ValueError(
-                "Metal row-reduce sum fast path requires positive static rows "
-                f"and cols, got {self.shape!r}."
-            )
+            raise ValueError(f"Metal row-reduce sum fast path requires positive static rows and cols, got {self.shape!r}.")
 
         metal_dtype = {"float16": "half", "float32": "float"}[self.dtype]
         threads = rows_per_threadgroup * simdgroup_size
-        helper = (
-            "tl::RowReduceSumContiguousInnermost<"
-            f"{metal_dtype}, {rows_per_threadgroup}, {cols}>::run"
-        )
+        helper = f"tl::RowReduceSumContiguousInnermost<{metal_dtype}, {rows_per_threadgroup}, {cols}>::run"
 
         def metal_row_reduce_sum(
             A,

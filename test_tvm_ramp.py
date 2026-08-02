@@ -1,5 +1,6 @@
 import tvm
 from tvm import tir
+
 k = tir.Var("k", "int32")
 outer = tir.Var("outer", "int32")
 vec = 4

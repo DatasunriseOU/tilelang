@@ -61,8 +61,8 @@ struct Reduce {
     return WorkspaceStride(plan);
   }
 
-  static bool NeedsBatchWorkspace(const LowerArgs &T,
-                                  const ReductionPlan &plan, int batch) {
+  static bool NeedsBatchWorkspace(const LowerArgs &T, const ReductionPlan &plan,
+                                  int batch) {
     (void)T;
     (void)batch;
     return !plan.same_simdgroup_metal_fast_path_safe;

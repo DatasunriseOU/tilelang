@@ -108,8 +108,8 @@ private:
       SBlock block = realize->block;
       SBlockNode *n = block.CopyOnWrite();
       // Set block attr: {use_2cta: 1}
-      // lower_shared_tmem.cc will depend on this to allocate/deallocate tmem with
-      // 2cta.
+      // lower_shared_tmem.cc will depend on this to allocate/deallocate tmem
+      // with 2cta.
       n->annotations.Set(attr::kUse2Cta, IntImm(DataType::Int(32), 1));
       return SBlockRealize(realize->iter_values, realize->predicate, block);
     }

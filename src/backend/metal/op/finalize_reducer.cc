@@ -71,8 +71,8 @@ struct FinalizeReducer {
     return ScalarWorkspaceStride(plan);
   }
 
-  static bool NeedsBatchWorkspace(const LowerArgs &T,
-                                  const ReductionPlan &plan, int64_t batch) {
+  static bool NeedsBatchWorkspace(const LowerArgs &T, const ReductionPlan &plan,
+                                  int64_t batch) {
     (void)T;
     (void)batch;
     return !plan.same_simdgroup_metal_fast_path_safe;
@@ -117,8 +117,7 @@ bool RegisterMetalFinalizeReducer() {
   return true;
 }
 
-const bool metal_finalize_reducer_registered =
-    RegisterMetalFinalizeReducer();
+const bool metal_finalize_reducer_registered = RegisterMetalFinalizeReducer();
 
 } // namespace
 

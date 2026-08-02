@@ -42,7 +42,6 @@ ml-explore/mlx main
 8f4099d8243dfbc814b07ca6b4606196f0c490ce
 2026-05-12 [CUDA] Guard qmm_naive scale and bias loads at tile boundaries (#3509)
 
-
 Downstream PoC:
 
 text
@@ -50,25 +49,21 @@ DatasunriseOU/mlx main
 3a6039d776fb2d331d8d8575f9f2af533a3b1680
 2026-05-13 Add Python array bridge dylib
 
-
 Merge-base:
 
 text
 b08ec310f1506487a32d8fdeb71cc8465c242eae
 2026-05-11 Fix scatter_prod GPU hang on NaN with contention (#3492)
 
-
 Ahead/behind after fetching both remotes:
 
 text
 upstream/main...origin/main = 5 behind / 4 ahead
 
-
 Net downstream delta from the merge-base:
 
 text
 25 files changed, 1282 insertions(+), 24 deletions(-)
-
 
 That is the measured diff for the current downstream branch; the count should
 be refreshed before opening PRs because ml-explore/mlx@main is moving.

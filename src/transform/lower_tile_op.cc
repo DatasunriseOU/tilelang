@@ -4,11 +4,11 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/s_tir/utils.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
-#include <tvm/s_tir/utils.h>
 #include <unordered_map>
 #include <vector>
 
@@ -251,7 +251,7 @@ public:
 
       Array<PrimExpr> counts;
       counts.reserve(substituter.mbarrier_count_);
-      for (const auto& c : substituter.mbarrier_arrive_counts_)
+      for (const auto &c : substituter.mbarrier_arrive_counts_)
         counts.push_back(IntImm(DataType::Int(32), c));
 
       // Walk the body to find the inner "tilelang_root" BlockRealize
@@ -302,13 +302,13 @@ private:
 
   Stmt VisitStmt_(const SBlockNode *op) final {
     // Record the mapping from buffer data var to buffer for later lookup
-    for (const auto& buffer : op->alloc_buffers) {
+    for (const auto &buffer : op->alloc_buffers) {
       buffer_map_.insert({buffer->data, buffer});
     }
-    for (const auto& match_buffer : op->match_buffers) {
+    for (const auto &match_buffer : op->match_buffers) {
       buffer_map_.insert({match_buffer->buffer->data, match_buffer->buffer});
     }
-    for (const auto& buffer : op->alloc_buffers) {
+    for (const auto &buffer : op->alloc_buffers) {
       buffer_data_to_buffer_.Set(buffer->data, buffer);
     }
     Map<Var, Layout> vmap;
@@ -327,14 +327,15 @@ private:
       // Var) while this inner block's alloc_buffers still hold the PRE-remap
       // Buffer (the user's original `T.alloc_fragment`, with its own data
       // Var). Without aliasing the two together BEFORE the body is visited,
-      // `T.ptx_mma(..., C_l.data, ...)` resolves through `buffer_data_to_buffer_`
-      // to the PRE-remap buffer (no `buffer_remap_` entry) and is left as
-      // the (32, 32) `local.fragment`, while the final copy reads the
-      // post-remap (8,) `local` alias — producing CUDA `T.gemm` zero-output.
-      // Match each alloc_buffer to a layout_map key by name (the canonical
-      // identity preserved across `makeBufferWithLayout`), and propagate
-      // var_remap_ / buffer_remap_ / layout_map_ entries for the alias so
-      // downstream VarNode and Buffer{Load,Store} visits resolve correctly.
+      // `T.ptx_mma(..., C_l.data, ...)` resolves through
+      // `buffer_data_to_buffer_` to the PRE-remap buffer (no `buffer_remap_`
+      // entry) and is left as the (32, 32) `local.fragment`, while the final
+      // copy reads the post-remap (8,) `local` alias — producing CUDA `T.gemm`
+      // zero-output. Match each alloc_buffer to a layout_map key by name (the
+      // canonical identity preserved across `makeBufferWithLayout`), and
+      // propagate var_remap_ / buffer_remap_ / layout_map_ entries for the
+      // alias so downstream VarNode and Buffer{Load,Store} visits resolve
+      // correctly.
     }
     // Extract cluster_size from cluster_dims annotation
     if (op->annotations.count("cluster_dims")) {

@@ -27,7 +27,8 @@ public:
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
 
   /// Override InferLayout to add TMA layout inference
-  LayoutMap InferLayout(const LayoutInferArgs &T, InferLevel level) const override;
+  LayoutMap InferLayout(const LayoutInferArgs &T,
+                        InferLevel level) const override;
 
   static const Op &Get();
   const Op &GetElemOp() const override;
@@ -66,8 +67,8 @@ public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(AtomicAdd, TileOperator,
                                              AtomicAddNode);
   TVM_DLL
-  AtomicAdd(Array<PrimExpr> args,
-            Map<String, ffi::ObjectRef> annotations = Map<String, ffi::ObjectRef>());
+  AtomicAdd(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations =
+                                      Map<String, ffi::ObjectRef>());
   static const Op &Get();
 };
 

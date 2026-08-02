@@ -21,10 +21,10 @@
  * \file lower_device_storage_access.cc
  * \brief Lower the special device storage access.
  */
+#include "vendored/target_info.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
-#include "vendored/target_info.h"
 #include <tvm/tirx/buffer.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/stmt_functor.h>

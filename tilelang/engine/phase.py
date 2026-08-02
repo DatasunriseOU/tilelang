@@ -95,9 +95,7 @@ def allow_tir_simplify(
     mod: IRModule | None = None,
     pass_ctx: PassContext | None = None,
 ) -> bool:
-    if mod is not None and _module_disables_tir_simplify(mod):
-        return False
-    return True
+    return not (mod is not None and _module_disables_tir_simplify(mod))
 
 
 def _maybe_simplify(
@@ -141,9 +139,7 @@ def _apply_metal_hoist_expression(mod: IRModule, pass_ctx: PassContext | None = 
         return tir.transform.HoistExpression()(mod)
 
 
-def apply_metal_scalar_pipeline(
-    mod: IRModule, target: Target, pass_ctx: PassContext | None = None
-) -> IRModule:
+def apply_metal_scalar_pipeline(mod: IRModule, target: Target, pass_ctx: PassContext | None = None) -> IRModule:
     if target.kind.name != "metal" or not allow_tir_cse(pass_ctx):
         return mod
     mod = tilelang.transform.BindMetalScalarIntrinsics()(mod)
@@ -294,8 +290,7 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     # CPPMEGA fix-round-2 (MED perf): record the clear so the matching
     # call in OptimizeForTarget is a no-op when both phases run back-to-
     # back (the common compile path).
-    _z3_clear = tvm.ffi.get_global_func("tl.z3.clear_prover_cache",
-                                        allow_missing=True)
+    _z3_clear = tvm.ffi.get_global_func("tl.z3.clear_prover_cache", allow_missing=True)
     if _z3_clear is not None:
         _z3_clear()
         _mark_z3_cleared_for_compile(mod)
@@ -421,8 +416,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # marker is consumed so a re-entrant compile of the same module id
     # post-GC does not skip its own clear.
     if not _consume_z3_cleared_for_compile(mod):
-        _z3_clear = tvm.ffi.get_global_func("tl.z3.clear_prover_cache",
-                                            allow_missing=True)
+        _z3_clear = tvm.ffi.get_global_func("tl.z3.clear_prover_cache", allow_missing=True)
         if _z3_clear is not None:
             _z3_clear()
     # CPPMEGA: Defensive re-run of vendored-IR converters in case any TileLang
@@ -466,9 +460,9 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.DropProvableBoundChecks()(mod)
     mod = tilelang.transform.VectorizeLoop(enable_vectorize=allow_vectorize(pass_ctx=pass_ctx))(mod)
 
-    disable_storage_rewrite = bool(
-        pass_ctx.config.get("tirx.disable_storage_rewrite", False)
-    ) or bool(pass_ctx.config.get(tilelang.PassConfigKey.TIR_DISABLE_STORAGE_REWRITE, False))
+    disable_storage_rewrite = bool(pass_ctx.config.get("tirx.disable_storage_rewrite", False)) or bool(
+        pass_ctx.config.get(tilelang.PassConfigKey.TIR_DISABLE_STORAGE_REWRITE, False)
+    )
     if not disable_storage_rewrite:
         mod = tilelang.transform.StorageRewrite()(mod)
     mod = tilelang.transform.LoopUnswitching()(mod)
@@ -526,9 +520,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # The pass always needs to merge dynamic shared allocations; the
     # tirx.merge_static_smem PassContext option only controls static shared
     # buffers inside the pass.
-    mod = tilelang.transform.MergeSharedMemoryAllocations(
-        enable_aggressive_merge=enable_aggressive_merge
-    )(mod)
+    mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge)(mod)
     # InjectFenceProxy is a no-op on targets that lack the TMA / async-proxy
     # programming model; the pass itself checks the PrimFunc's target.
     mod = tilelang.transform.InjectFenceProxy()(mod)

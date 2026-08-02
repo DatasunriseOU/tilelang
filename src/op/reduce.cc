@@ -5,8 +5,8 @@
 
 #include "reduce.h"
 
-#include <cstdint>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <sstream>
 #include <vector>
@@ -66,35 +66,34 @@ int64_t ConstIntAfterSimplify(const PrimExpr &expr, arith::Analyzer *analyzer,
                               const char *name) {
   PrimExpr simplified = analyzer != nullptr ? analyzer->Simplify(expr) : expr;
   const int64_t *value = as_const_int(simplified);
-  ICHECK(value != nullptr)
-      << "ReduceOp: " << name
-      << " must be a compile-time constant after arith::Analyzer simplification; got "
-      << simplified;
+  ICHECK(value != nullptr) << "ReduceOp: " << name
+                           << " must be a compile-time constant after "
+                              "arith::Analyzer simplification; got "
+                           << simplified;
   return *value;
 }
 
 ReductionPlan MakeReductionPlan(const PrimExpr &extent_expr,
-                                 const PrimExpr &scale_expr,
-                                 const PrimExpr &thread_offset_expr,
-                                 const Target &target,
-                                 arith::Analyzer *analyzer,
-                                 const char *context,
-                                 int reduce_type) {
+                                const PrimExpr &scale_expr,
+                                const PrimExpr &thread_offset_expr,
+                                const Target &target, arith::Analyzer *analyzer,
+                                const char *context, int reduce_type) {
   int64_t extent = ConstIntAfterSimplify(extent_expr, analyzer, "extent");
   int64_t scale = ConstIntAfterSimplify(scale_expr, analyzer, "scale");
   ICHECK_GT(extent, 0) << "ReduceOp" << context
-                      << ": extent must be positive; got " << extent;
+                       << ": extent must be positive; got " << extent;
   ICHECK_GT(scale, 0) << "ReduceOp" << context
-                     << ": scale must be positive; got " << scale;
+                      << ": scale must be positive; got " << scale;
   ICHECK_LE(extent, std::numeric_limits<int>::max() / scale)
-      << "ReduceOp" << context << ": reducing_threads overflows int: extent="
-      << extent << ", scale=" << scale;
+      << "ReduceOp" << context
+      << ": reducing_threads overflows int: extent=" << extent
+      << ", scale=" << scale;
 
   int64_t reducing_threads = extent * scale;
 
-  PrimExpr thread_offset =
-      analyzer != nullptr ? analyzer->Simplify(thread_offset_expr)
-                          : thread_offset_expr;
+  PrimExpr thread_offset = analyzer != nullptr
+                               ? analyzer->Simplify(thread_offset_expr)
+                               : thread_offset_expr;
   const int64_t *thread_offset_value = as_const_int(thread_offset);
   ICHECK(thread_offset_value != nullptr)
       << "ReduceOp" << context
@@ -112,17 +111,16 @@ ReductionPlan MakeReductionPlan(const PrimExpr &extent_expr,
   }
 
   bool same_simdgroup_metal_fast_path_safe =
-      extent != 1 &&
-      IsSameSimdgroupMetalReductionSafe(
-          target, static_cast<int>(reducing_threads), static_cast<int>(scale),
-          thread_offset, analyzer);
+      extent != 1 && IsSameSimdgroupMetalReductionSafe(
+                         target, static_cast<int>(reducing_threads),
+                         static_cast<int>(scale), thread_offset, analyzer);
 
   return ReductionPlan{static_cast<int>(reducing_threads),
                        static_cast<int>(scale), thread_offset,
                        same_simdgroup_metal_fast_path_safe};
 }
 
-}  // namespace
+} // namespace
 
 void RegisterReduceImpl(ReduceImpl impl) {
   ICHECK(impl.name != nullptr);
@@ -191,14 +189,13 @@ bool DefaultNeedsScalarWorkspace(const LowerArgs &T,
   return plan.reducing_threads > 32;
 }
 
-int DefaultScalarWorkspaceSize(const LowerArgs &T,
-                               const ReductionPlan &plan) {
+int DefaultScalarWorkspaceSize(const LowerArgs &T, const ReductionPlan &plan) {
   (void)plan;
   return static_cast<int>(*as_const_int(T.thread_bounds->extent));
 }
 
-bool DefaultNeedsBatchWorkspace(const LowerArgs &T,
-                                const ReductionPlan &plan, int batch) {
+bool DefaultNeedsBatchWorkspace(const LowerArgs &T, const ReductionPlan &plan,
+                                int batch) {
   (void)T;
   (void)batch;
   return plan.reducing_threads > 32;
@@ -211,8 +208,7 @@ int DefaultBatchWorkspaceSize(const LowerArgs &T, const ReductionPlan &plan,
 }
 
 void AppendDefaultReduceArgs(Array<PrimExpr> *args, const LowerArgs &T,
-                             bool need_workspace,
-                             const PrimExpr &workspace) {
+                             bool need_workspace, const PrimExpr &workspace) {
   (void)T;
   if (need_workspace) {
     args->push_back(workspace);
@@ -255,9 +251,9 @@ bool IsSameSimdgroupMetalReductionSafe(const Target &target,
   // is constant, the exact condition is modular arithmetic over the 32-wide
   // Metal simdgroup lane id: every xor partner used by the butterfly must stay
   // inside the same contiguous reduce group.
-  PrimExpr thread_offset =
-      analyzer != nullptr ? analyzer->Simplify(thread_offset_expr)
-                          : thread_offset_expr;
+  PrimExpr thread_offset = analyzer != nullptr
+                               ? analyzer->Simplify(thread_offset_expr)
+                               : thread_offset_expr;
   const int64_t *thread_offset_value = as_const_int(thread_offset);
   if (thread_offset_value == nullptr || *thread_offset_value < 0) {
     return false;
@@ -272,7 +268,8 @@ bool IsSameSimdgroupMetalReductionSafe(const Target &target,
 
 // MakeAccessPtrFromRegion moved to src/op/utils.{h,cc}
 
-ReduceOp::ReduceOp(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {
+ReduceOp::ReduceOp(Array<PrimExpr> args,
+                   Map<String, ffi::ObjectRef> annotations) {
   ObjectPtr<ReduceOpNode> node = tvm::ffi::make_object<ReduceOpNode>();
   // Accept BufferRegion/BufferLoad for src/dst
   auto src_access = NormalizeToAccessRegion(args[0], kAccessRead);
@@ -773,8 +770,7 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         // Workspace is only needed for cross-warp reduce (> 32 threads), or for
         // Metal reductions that cannot be proven to stay inside one simdgroup.
         PrimExpr workspace;
-        bool need_workspace =
-            reduce_impl.needs_batch_workspace(T, plan, batch);
+        bool need_workspace = reduce_impl.needs_batch_workspace(T, plan, batch);
         if (need_workspace) {
           int ws_size = reduce_impl.batch_workspace_size(T, plan, batch);
           workspace = T.AddWorkspace(ws_size, clear_buffer->dtype);
@@ -865,8 +861,9 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
       Stmt body = phases.size() > 1 ? SeqStmt(phases) : phases[0];
       if (need_duplicate) {
-        // CPPMEGA: apache/tvm latest replaced Allocate(buffer_var, dtype, shape, cond, body)
-        // with AllocBuffer(buffer) as a standalone scope-introducing stmt in SeqStmt context.
+        // CPPMEGA: apache/tvm latest replaced Allocate(buffer_var, dtype,
+        // shape, cond, body) with AllocBuffer(buffer) as a standalone
+        // scope-introducing stmt in SeqStmt context.
         body = SeqStmt({AllocBuffer(clear_buffer), body});
       }
       return body;
@@ -903,16 +900,14 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
               reduce_impl.make_scalar_allreduce(*this, T, plan);
           Array<PrimExpr> thread_reduce_args = {
               StringImm(allreduce), BufferLoad(clear_buffer, red_indices)};
-          bool need_workspace =
-              reduce_impl.needs_scalar_workspace(T, plan);
+          bool need_workspace = reduce_impl.needs_scalar_workspace(T, plan);
           PrimExpr workspace;
           if (need_workspace) {
-            int workspace_size =
-                reduce_impl.scalar_workspace_size(T, plan);
+            int workspace_size = reduce_impl.scalar_workspace_size(T, plan);
             workspace = T.AddWorkspace(workspace_size, clear_buffer->dtype);
           }
-          reduce_impl.append_scalar_args(&thread_reduce_args, T,
-                                         need_workspace, workspace);
+          reduce_impl.append_scalar_args(&thread_reduce_args, T, need_workspace,
+                                         workspace);
           auto call = Call(clear_buffer->dtype, builtin::call_extern(),
                            thread_reduce_args);
           stmts.push_back(BufferStore(clear_buffer, call, red_indices));
@@ -1043,7 +1038,8 @@ static BufferRegion ConvertBufferToBufferRegion(const Buffer &buf) {
   return BufferRegion(buf, ranges);
 }
 
-CumSumOp::CumSumOp(Array<PrimExpr> args, Map<String, ffi::ObjectRef> annotations) {
+CumSumOp::CumSumOp(Array<PrimExpr> args,
+                   Map<String, ffi::ObjectRef> annotations) {
   /// CumSum constructor arguments:
   /// - src: input buffer
   /// - dst: output buffer
@@ -1155,12 +1151,14 @@ TIR_REGISTER_TL_TILE_OP(CumSumOp, cumsum)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-bool MetalReductionSameSimdgroupFastPathSafeForTest(
-    Target target, int reducing_threads, int scale, int64_t thread_offset) {
+bool MetalReductionSameSimdgroupFastPathSafeForTest(Target target,
+                                                    int reducing_threads,
+                                                    int scale,
+                                                    int64_t thread_offset) {
   arith::Analyzer analyzer;
   return IsSameSimdgroupMetalReductionSafe(
-      target, reducing_threads, scale,
-      IntImm(DataType::Int(64), thread_offset), &analyzer);
+      target, reducing_threads, scale, IntImm(DataType::Int(64), thread_offset),
+      &analyzer);
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {

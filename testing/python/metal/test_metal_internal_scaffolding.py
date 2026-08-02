@@ -101,7 +101,7 @@ def _time_synced_ms(fn, sync, *, warmup: int, iterations: int) -> _Timing:
     kept = samples[: max(1, int(len(samples) * 0.9))]
     mean = sum(kept) / len(kept)
     variance = sum((x - mean) ** 2 for x in kept) / max(1, len(kept) - 1)
-    return _Timing(mean, variance ** 0.5)
+    return _Timing(mean, variance**0.5)
 
 
 def _bench_metal_profiler_ms(
@@ -594,19 +594,13 @@ def _run_native_dtype_probe(tmp_path: Path, dtype_name: str) -> subprocess.Compl
     repo_root_path = Path(__file__).resolve().parents[3]
     repo_root = str(repo_root_path)
     build_root = repo_root_path / "build"
-    build_lib_paths = [
-        str(path) for path in (build_root / "lib", build_root / "tvm") if path.exists()
-    ]
-    env["PYTHONPATH"] = repo_root + (
-        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
-    )
+    build_lib_paths = [str(path) for path in (build_root / "lib", build_root / "tvm") if path.exists()]
+    env["PYTHONPATH"] = repo_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     env["TILELANG_DEV_BUILD_ROOT"] = str(build_root)
     if build_lib_paths:
         env["TVM_LIBRARY_PATH"] = os.pathsep.join(build_lib_paths)
         for loader_var in ("DYLD_LIBRARY_PATH", "LD_LIBRARY_PATH"):
-            env[loader_var] = os.pathsep.join(
-                build_lib_paths + ([env[loader_var]] if env.get(loader_var) else [])
-            )
+            env[loader_var] = os.pathsep.join(build_lib_paths + ([env[loader_var]] if env.get(loader_var) else []))
     return subprocess.run(
         [sys.executable, str(script)],
         cwd=repo_root,

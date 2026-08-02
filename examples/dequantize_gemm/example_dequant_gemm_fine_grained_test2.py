@@ -248,7 +248,7 @@ def tl_matmul_with_ladder_weight_only_transform_block_reduce_int4(
             B_dequantize_local = T.alloc_local((warp_cols * local_size), in_dtype)
             C_local = T.alloc_local((warp_rows * warp_cols * local_size), accum_dtype)
             reduced_accum_res = T.alloc_local(0, accum_dtype)
-            thread_binding = T.get_thread_binding(0)
+            thread_binding = T.get_thread_binding(0)  # noqa: F841
             rk = T.get_thread_binding(1)
 
             T.annotate_layout(
@@ -268,12 +268,15 @@ def tl_matmul_with_ladder_weight_only_transform_block_reduce_int4(
                     A_shared[i, vk] = A[by * block_M + i, ko * block_K + vk]
                 # TODO(lei): Layout Inference Pass is not efficient to handle the four dims int8 load
                 # Replacing with T.copy
-                T.copy(B[bx * (block_N // micro_size_y) : bx * (block_N // micro_size_y) + block_N // micro_size_y,
-                         ko * (block_K // micro_size_k) : ko * (block_K // micro_size_k) + block_K // micro_size_k,
-                         0 : micro_size_y,
-                         0 : micro_size_k // num_elems_per_byte],
-                       B_shared)
-
+                T.copy(
+                    B[
+                        bx * (block_N // micro_size_y) : bx * (block_N // micro_size_y) + block_N // micro_size_y,
+                        ko * (block_K // micro_size_k) : ko * (block_K // micro_size_k) + block_K // micro_size_k,
+                        0:micro_size_y,
+                        0 : micro_size_k // num_elems_per_byte,
+                    ],
+                    B_shared,
+                )
 
                 for ki in T.serial(0, (block_K // (micro_size_k * reduce_k))):
                     # Load A into fragment

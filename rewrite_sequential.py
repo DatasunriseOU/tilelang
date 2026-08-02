@@ -1,23 +1,19 @@
-import re
-
 def rewrite():
-    with open('poc/torch_dynamo/fx_to_tilelang.py', 'r') as f:
+    with open("poc/torch_dynamo/fx_to_tilelang.py") as f:
         content = f.read()
 
     # Find the start of _emit_sequential_region
-    start_str = '    def _emit_sequential_region('
+    start_str = "    def _emit_sequential_region("
     start_idx = content.find(start_str)
-    
+
     # Find the end (next def)
-    end_str = '    def _emit_sequential_reduction('
+    end_str = "    def _emit_sequential_reduction("
     end_idx = content.find(end_str)
-    
+
     if start_idx == -1 or end_idx == -1:
         print("Could not find start or end")
         return
-        
-    old_method = content[start_idx:end_idx]
-    
+
     new_method = """    def _emit_sequential_region(
         self, T: Any,
         region: List[Tuple[str, Tuple[Any, ...]]],
@@ -65,10 +61,10 @@ def rewrite():
         # Dataflow analysis
         node_map = {n.name: n for n in self.gm.graph.nodes}
         internal_nodes = {payload[0] for _, payload in compute_ops}
-        
+
         external_inputs: List[str] = []
         external_names_set = set()
-        
+
         for op_name, payload in compute_ops:
             node_name = payload[0]
             if node_name not in node_map:
@@ -85,11 +81,11 @@ def rewrite():
                                     f"({arg_spec.shape}|{arg_spec.dtype} vs {shape}|{dtype})")
                         external_inputs.append(arg.name)
                         external_names_set.add(arg.name)
-                        
+
         if len(external_inputs) > 6:
             raise FxToTileLangUnsupported(
                 f"sequential region: too many external inputs ({len(external_inputs)})")
-                
+
         def _apply_unary_local(T_mod: Any, op_name: str, v: Any) -> Any:
             if op_name == "relu":
                 return T_mod.max(v, T_mod.cast(0, dtype))
@@ -252,8 +248,9 @@ def rewrite():
                 f"sequential region: unsupported number of external inputs ({len(ext_names)})")
 
 """
-    
-    with open('poc/torch_dynamo/fx_to_tilelang.py', 'w') as f:
+
+    with open("poc/torch_dynamo/fx_to_tilelang.py", "w") as f:
         f.write(content[:start_idx] + new_method + content[end_idx:])
+
 
 rewrite()

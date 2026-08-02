@@ -46,7 +46,6 @@ audit recommends.
 from __future__ import annotations
 
 import os
-from typing import Union
 
 from tvm import tir
 
@@ -65,6 +64,7 @@ def _z3_pass_disabled(name: str) -> bool:
         if v and v != "0":
             return True
     return False
+
 
 # ---------------------------------------------------------------------------
 # Z3 import is optional. When z3-solver isn't installed, the symbolic branch
@@ -98,7 +98,7 @@ _Z3_INT24_TIMEOUT_MS = 50
 _Z3_INT24_K_UPPER_BOUND = 1 << 16
 
 
-def _coerce_int(value) -> Union[int, None]:
+def _coerce_int(value) -> int | None:
     """Coerce ``value`` to a Python int when it's a constant, else ``None``."""
     if isinstance(value, bool):
         return None
@@ -115,7 +115,7 @@ def _coerce_int(value) -> Union[int, None]:
 
 
 def prove_dot4_int24_safe(
-    K: Union[int, tir.PrimExpr],
+    K: int | tir.PrimExpr,
     x_max: int = 127,
     y_max: int = 127,
 ) -> bool:

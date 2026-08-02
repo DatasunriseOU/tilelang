@@ -85,10 +85,7 @@ def _static_simdgroup_eligible(shape, dtype) -> bool:
     return True
 
 
-def _z3_simdgroup_eligible(shape, dtype,
-                           addr_align_bytes: int = _SIMDGROUP_ALIGN,
-                           addr_value: int | None = None
-                           ) -> tuple[bool, str]:
+def _z3_simdgroup_eligible(shape, dtype, addr_align_bytes: int = _SIMDGROUP_ALIGN, addr_value: int | None = None) -> tuple[bool, str]:
     """Z3 fallback for symbolic shapes (detection-only).
 
     Returns a (proved, query) pair. ``proved`` is True only if Z3 can
@@ -122,21 +119,12 @@ def _z3_simdgroup_eligible(shape, dtype,
     if s0_val <= 0 or s1_val <= 0:
         return False, f"non-positive shape ({s0_val},{s1_val}); reject"
     if s0_val % _SIMDGROUP_TILE != 0 or s1_val % _SIMDGROUP_TILE != 0:
-        return False, (
-            f"static-reject shape0={s0_val} shape1={s1_val} "
-            f"both must be multiples of {_SIMDGROUP_TILE}"
-        )
+        return False, (f"static-reject shape0={s0_val} shape1={s1_val} both must be multiples of {_SIMDGROUP_TILE}")
     if addr_value is not None and int(addr_value) % addr_align_bytes != 0:
         return False, f"static-reject addr({addr_value})%{addr_align_bytes}!=0"
 
-    addr_clause = (
-        f" /\\ addr({addr_value})%{addr_align_bytes}==0"
-        if addr_value is not None else " /\\ addr-skipped"
-    )
-    return True, (
-        f"static-prove shape0={s0_val} shape1={s1_val}"
-        f"{addr_clause} (no z3 needed)"
-    )
+    addr_clause = f" /\\ addr({addr_value})%{addr_align_bytes}==0" if addr_value is not None else " /\\ addr-skipped"
+    return True, (f"static-prove shape0={s0_val} shape1={s1_val}{addr_clause} (no z3 needed)")
 
 
 def _log_simdgroup_decision(buf, decided_static: bool, decided_z3: bool, query: str):
@@ -153,8 +141,7 @@ def _log_simdgroup_decision(buf, decided_static: bool, decided_z3: bool, query: 
         )
 
 
-def is_simdgroup_eligible(buffer_like, *, use_z3: bool = True
-                          ) -> tuple[bool, str]:
+def is_simdgroup_eligible(buffer_like, *, use_z3: bool = True) -> tuple[bool, str]:
     """Public detection helper — returns (eligible, reason).
 
     ``buffer_like`` may be a ``tir.Buffer`` or any object exposing
@@ -220,10 +207,11 @@ def _collect_fragment_gemm_accum_vars(body: tir.Stmt) -> set:
                         # Idea #8: log Z3 detection result for downstream tooling.
                         # Try to reconstruct the BufferLoad to expose shape/dtype.
                         if os.environ.get("TL_LOG_SIMDGROUP"):
-                            buf_load = call.args[2].args[0] if (
-                                len(call.args[2].args) > 0
-                                and isinstance(call.args[2].args[0], tir.BufferLoad)
-                            ) else None
+                            buf_load = (
+                                call.args[2].args[0]
+                                if (len(call.args[2].args) > 0 and isinstance(call.args[2].args[0], tir.BufferLoad))
+                                else None
+                            )
                             if buf_load is not None:
                                 is_simdgroup_eligible(buf_load.buffer)
 
@@ -257,9 +245,7 @@ def _collect_fragment_gemm_accum_buffers(body: tir.Stmt) -> dict:
                     return
                 # Recover Buffer from the region's BufferLoad arg.
                 buf = None
-                if (isinstance(region_call, tir.Call)
-                        and len(region_call.args) > 0
-                        and isinstance(region_call.args[0], tir.BufferLoad)):
+                if isinstance(region_call, tir.Call) and len(region_call.args) > 0 and isinstance(region_call.args[0], tir.BufferLoad):
                     buf = region_call.args[0].buffer
                 if buf is not None and var not in accum:
                     accum[var] = buf
@@ -386,22 +372,12 @@ def _rewrite_scope(body, var_map):
                     changed = True
             new_reads = [_rewrite_region(region) for region in node.reads]
             new_writes = [_rewrite_region(region) for region in node.writes]
-            new_match_buffers = [
-                _rewrite_match_buffer_region(match) for match in node.match_buffers
-            ]
+            new_match_buffers = [_rewrite_match_buffer_region(match) for match in node.match_buffers]
             changed = (
                 changed
-                or not all(
-                    not _buffer_was_remapped(old.buffer, new.buffer)
-                    for new, old in zip(new_reads, node.reads)
-                )
-                or not all(
-                    not _buffer_was_remapped(old.buffer, new.buffer)
-                    for new, old in zip(new_writes, node.writes)
-                )
-                or not all(
-                    new.same_as(old) for new, old in zip(new_match_buffers, node.match_buffers)
-                )
+                or not all(not _buffer_was_remapped(old.buffer, new.buffer) for new, old in zip(new_reads, node.reads))
+                or not all(not _buffer_was_remapped(old.buffer, new.buffer) for new, old in zip(new_writes, node.writes))
+                or not all(new.same_as(old) for new, old in zip(new_match_buffers, node.match_buffers))
             )
             if changed:
                 new_block = tir.Block(
@@ -446,6 +422,7 @@ def _is_rewrite_enabled() -> bool:
     """
     try:
         from tvm import transform as tvm_transform
+
         cfg = tvm_transform.PassContext.current().config
         if cfg is None:
             return False
@@ -525,9 +502,7 @@ def _metal_fragment_to_simdgroup(func: tir.PrimFunc, mod: IRModule, ctx) -> tir.
         new_attrs = dict(new_func.attrs) if new_func.attrs is not None else {}
         new_attrs[EMITTED_ATTR_KEY] = tir.StringImm(",".join(sorted(rewritten_names)))
         if rejection_log:
-            new_attrs["tl.simdgroup_matrix_rewrite_rejected"] = tir.StringImm(
-                ";".join(rejection_log)
-            )
+            new_attrs["tl.simdgroup_matrix_rewrite_rejected"] = tir.StringImm(";".join(rejection_log))
         new_func = new_func.with_attrs(new_attrs)
     except Exception:
         pass
@@ -542,10 +517,8 @@ MetalFragmentToSimdgroup = prim_func_pass(_metal_fragment_to_simdgroup, opt_leve
 # Public testing helper (Idea #8 rewrite path)
 # ---------------------------------------------------------------------------
 
-def apply_simdgroup_matrix_rewrite(func: tir.PrimFunc,
-                                    *,
-                                    force_enable: bool = True
-                                    ) -> tir.PrimFunc:
+
+def apply_simdgroup_matrix_rewrite(func: tir.PrimFunc, *, force_enable: bool = True) -> tir.PrimFunc:
     """Run the eligibility-gated rewrite on ``func`` outside a PassContext.
 
     Tests use this to drive the rewrite directly without setting up a
@@ -586,9 +559,7 @@ def apply_simdgroup_matrix_rewrite(func: tir.PrimFunc,
         new_attrs = dict(new_func.attrs) if new_func.attrs is not None else {}
         new_attrs[EMITTED_ATTR_KEY] = tir.StringImm(",".join(sorted(rewritten_names)))
         if rejection_log:
-            new_attrs["tl.simdgroup_matrix_rewrite_rejected"] = tir.StringImm(
-                ";".join(rejection_log)
-            )
+            new_attrs["tl.simdgroup_matrix_rewrite_rejected"] = tir.StringImm(";".join(rejection_log))
         new_func = new_func.with_attrs(new_attrs)
     except Exception:
         pass

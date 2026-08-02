@@ -20,7 +20,6 @@ import struct
 import subprocess
 import sys
 import json
-from pathlib import Path
 
 
 def parse_metadata(gputrace_path: str) -> dict:
@@ -28,10 +27,7 @@ def parse_metadata(gputrace_path: str) -> dict:
     meta_path = os.path.join(gputrace_path, "metadata")
     if not os.path.exists(meta_path):
         return {}
-    result = subprocess.run(
-        ["plutil", "-convert", "json", "-o", "-", meta_path],
-        capture_output=True, text=True
-    )
+    result = subprocess.run(["plutil", "-convert", "json", "-o", "-", meta_path], capture_output=True, text=True)
     if result.returncode == 0:
         return json.loads(result.stdout)
     return {}
@@ -69,15 +65,11 @@ def extract_buffer_labels(gputrace_path: str) -> dict[str, str]:
                 start = None
 
         # Find MTLBuffer/MTLTexture references
-        resource_refs = [(off, s) for off, s in strings
-                         if re.match(r"MTL(Buffer|Texture)-\d+-\d+", s)]
+        resource_refs = [(off, s) for off, s in strings if re.match(r"MTL(Buffer|Texture)-\d+-\d+", s)]
 
         # Labels contain spaces (e.g., "Particle Buffer", "Color Output Buffer")
         # and appear after the resource filename in the record
-        label_strings = [(off, s) for off, s in strings
-                         if " " in s and len(s) >= 5
-                         and not s.startswith("MTL")
-                         and not s.startswith("/")]
+        label_strings = [(off, s) for off, s in strings if " " in s and len(s) >= 5 and not s.startswith("MTL") and not s.startswith("/")]
 
         # Match each resource to its nearest following label
         for roff, rname in resource_refs:
@@ -131,12 +123,13 @@ def extract_shader_info(gputrace_path: str) -> dict:
             if s == "pipeline-libraries":
                 in_functions = False
                 continue
-            if (in_functions
-                    and re.match(r"^[a-z_][a-z0-9_]*$", s)
-                    and len(s) > 3
-                    and s not in ("function", "functions", "buffer", "buffers")):
-                if s not in info["functions"]:
-                    info["functions"].append(s)
+            if (
+                in_functions
+                and re.match(r"^[a-z_][a-z0-9_]*$", s)
+                and len(s) > 3
+                and s not in ("function", "functions", "buffer", "buffers")
+            ) and s not in info["functions"]:
+                info["functions"].append(s)
 
     return info
 
@@ -201,13 +194,13 @@ def read_buffer(gputrace_path: str, filename: str, layout: str, start: int = 0, 
                 entry[f"field{ci}"] = values[vi]
                 vi += 1
             elif comp == "float2":
-                entry[f"field{ci}"] = list(values[vi:vi + 2])
+                entry[f"field{ci}"] = list(values[vi : vi + 2])
                 vi += 2
             elif comp == "float3":
-                entry[f"field{ci}"] = list(values[vi:vi + 3])
+                entry[f"field{ci}"] = list(values[vi : vi + 3])
                 vi += 3
             elif comp == "float4":
-                entry[f"field{ci}"] = list(values[vi:vi + 4])
+                entry[f"field{ci}"] = list(values[vi : vi + 4])
                 vi += 4
             elif comp in ("uint32", "int32"):
                 entry[f"field{ci}"] = values[vi]
@@ -269,10 +262,8 @@ def main():
     parser = argparse.ArgumentParser(description="Parse .gputrace captures")
     parser.add_argument("gputrace", help="Path to .gputrace bundle")
     parser.add_argument("--buffer", "-b", help="Buffer label or filename to inspect")
-    parser.add_argument("--layout", "-l", default="float4",
-                        help="Buffer element layout (e.g., 'float4', 'float', 'float4,float4,float4')")
-    parser.add_argument("--index", "-i", default="0-10",
-                        help="Element index or range (e.g., '100', '0-10', '5000-5005')")
+    parser.add_argument("--layout", "-l", default="float4", help="Buffer element layout (e.g., 'float4', 'float', 'float4,float4,float4')")
+    parser.add_argument("--index", "-i", default="0-10", help="Element index or range (e.g., '100', '0-10', '5000-5005')")
     parser.add_argument("--dump-all", action="store_true", help="Dump all buffer summaries")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     args = parser.parse_args()
@@ -302,7 +293,7 @@ def main():
 
         if not filename:
             print(f"ERROR: Buffer '{args.buffer}' not found.", file=sys.stderr)
-            print(f"Available buffers:", file=sys.stderr)
+            print("Available buffers:", file=sys.stderr)
             for fname, label in labels.items():
                 print(f"  {fname} → {label}", file=sys.stderr)
             sys.exit(1)
@@ -327,7 +318,7 @@ def main():
                 idx = row["index"]
                 fields = {k: v for k, v in row.items() if k != "index"}
                 parts = []
-                for k, v in fields.items():
+                for _k, v in fields.items():
                     if isinstance(v, list):
                         parts.append(f"({', '.join(f'{x:.4f}' for x in v)})")
                     elif isinstance(v, float):
@@ -338,6 +329,7 @@ def main():
 
     elif args.dump_all:
         import numpy as np
+
         labels = extract_buffer_labels(args.gputrace)
         for fname in sorted(os.listdir(args.gputrace)):
             if not re.match(r"MTL(Buffer|Texture)-\d+-\d+", fname):
@@ -346,7 +338,7 @@ def main():
             size = os.path.getsize(filepath)
             label = labels.get(fname, "(no label)")
             data = np.fromfile(filepath, dtype=np.float32)
-            print(f"{fname} → \"{label}\" ({size:,} bytes, {len(data)} floats)")
+            print(f'{fname} → "{label}" ({size:,} bytes, {len(data)} floats)')
             if len(data) > 0:
                 print(f"  Range: [{data.min():.4f}, {data.max():.4f}]")
                 print(f"  Mean:  {data.mean():.4f}")

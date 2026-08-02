@@ -44,9 +44,7 @@ class _ProductionMonkeypatchVisitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         chain = _attribute_chain(node.func)
-        if chain is not None and (
-            chain[0] == "monkeypatch" or chain in {("mock", "patch"), ("unittest", "mock", "patch")}
-        ):
+        if chain is not None and (chain[0] == "monkeypatch" or chain in {("mock", "patch"), ("unittest", "mock", "patch")}):
             self.findings.append(f"{self.path}:{node.lineno}: call {'.'.join(chain)}")
         self.generic_visit(node)
 

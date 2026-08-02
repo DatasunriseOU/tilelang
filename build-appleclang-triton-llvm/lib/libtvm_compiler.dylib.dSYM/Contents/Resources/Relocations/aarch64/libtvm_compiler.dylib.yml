@@ -1,5 +1,0 @@
----
-triple:          'arm64-apple-darwin'
-binary-path:     '/Volumes/external/sources/tilelang/build-appleclang-triton-llvm/lib/libtvm_compiler.dylib'
-relocations:     []
-...

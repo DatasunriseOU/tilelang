@@ -9,6 +9,7 @@ The pass is gated by PassConfig `tl.drop_provable_bound_checks` (default
 OFF) so the default-OFF test is structurally important: the pass must be a
 no-op without the flag.
 """
+
 from tilelang import tvm as tvm
 import tilelang as tl
 import tilelang.language as T
@@ -58,14 +59,13 @@ def test_static_bound_check_dropped():
                 B[i] = A[i]
 
     after = _run(before, enable=True)
-    assert not _has_if_with_lt(after.body), (
-        "Static `i < 64` guard should have been dropped:\n" + str(after))
+    assert not _has_if_with_lt(after.body), "Static `i < 64` guard should have been dropped:\n" + str(after)
 
 
 def test_symbolic_bound_check_dropped_via_z3():
     """Symbolic `for i in range(N): if i < N: ...` — default analyzer with
     kSymbolicBound (or Z3 fallback) proves; check dropped."""
-    N = T.symbolic("N", "int32")
+    N = T.symbolic("N", "int32")  # noqa: F841
 
     @T.prim_func
     def before(A: T.handle, B: T.handle, N_: T.int32):
@@ -76,8 +76,7 @@ def test_symbolic_bound_check_dropped_via_z3():
                 Bb[i] = Ab[i]
 
     after = _run(before, enable=True)
-    assert not _has_if_with_lt(after.body), (
-        "Symbolic `i < N` guard should have been dropped:\n" + str(after))
+    assert not _has_if_with_lt(after.body), "Symbolic `i < N` guard should have been dropped:\n" + str(after)
 
 
 def test_uncertain_bound_keeps_guard():
@@ -95,9 +94,7 @@ def test_uncertain_bound_keeps_guard():
                 Bb[i] = Ab[i]
 
     after = _run(before, enable=True)
-    assert _has_if_with_lt(after.body), (
-        "`i < N - 1` is NOT provable for the last iteration — guard must be"
-        " kept:\n" + str(after))
+    assert _has_if_with_lt(after.body), "`i < N - 1` is NOT provable for the last iteration — guard must be kept:\n" + str(after)
 
 
 def test_default_off_preserves_behavior():
@@ -110,9 +107,7 @@ def test_default_off_preserves_behavior():
                 B[i] = A[i]
 
     after = _run(before, enable=False)
-    assert _has_if_with_lt(after.body), (
-        "With pass config OFF, the bound-check guard must be preserved:\n"
-        + str(after))
+    assert _has_if_with_lt(after.body), "With pass config OFF, the bound-check guard must be preserved:\n" + str(after)
 
 
 def test_overflow_near_intmax_keeps_guard():
@@ -142,10 +137,10 @@ def test_overflow_near_intmax_keeps_guard():
     # Conservative: the BV32-emulated Z3 should not prove this tautology
     # because of overflow risk at the upper end of int32. The guard MUST
     # remain in the IR.
-    assert _has_if_with_lt(after.body), (
-        "Near-INT_MAX overflow risk — guard must be kept:\n" + str(after))
+    assert _has_if_with_lt(after.body), "Near-INT_MAX overflow risk — guard must be kept:\n" + str(after)
 
 
 if __name__ == "__main__":
     import tilelang.testing
+
     tilelang.testing.main()

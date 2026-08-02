@@ -91,9 +91,7 @@ def test_large_reduction_requires_internal_two_pass_device_event():
 
 
 def test_illegal_alias_plan_is_rejected_before_codegen():
-    decisions = build_reduction_sync_event_plan(
-        _make_thread_allreduce_func(32, alias_output=True)
-    )
+    decisions = build_reduction_sync_event_plan(_make_thread_allreduce_func(32, alias_output=True))
     assert decisions[0].action == "reject"
     assert decisions[0].reason == "input_output_alias_without_in_place_plan"
     assert decisions[0].host_sync_required is False

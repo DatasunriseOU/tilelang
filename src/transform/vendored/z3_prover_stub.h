@@ -9,4 +9,4 @@
 
 #include "z3_prover.h"
 
-#endif  // TILELANG_VENDORED_Z3_PROVER_STUB_H_
+#endif // TILELANG_VENDORED_Z3_PROVER_STUB_H_

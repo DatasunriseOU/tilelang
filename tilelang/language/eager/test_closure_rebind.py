@@ -1,11 +1,11 @@
-import sys
 import types
-from typing import Callable
-import tilelang as tl
 import tilelang.language as T
 
+
 def my_macro(x: T.int32) -> T.int32:
-    return x * N
+    # ``rebind_macro`` supplies this global before the function is called.
+    return x * N  # noqa: F821
+
 
 # Rebind closure
 def rebind_macro(func, extra_globals):
@@ -19,11 +19,13 @@ def rebind_macro(func, extra_globals):
         func.__closure__,
     )
 
+
 new_macro = rebind_macro(my_macro, {"N": 2})
 
 try:
     wrapped = T.macro(new_macro)
     print("Success!")
-except Exception as e:
+except Exception:
     import traceback
+
     traceback.print_exc()
