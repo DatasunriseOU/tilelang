@@ -6,7 +6,10 @@ ci:
   autoupdate_commit_msg: "[CI] [pre-commit.ci] autoupdate"
   autoupdate_schedule: monthly
 default_stages: [pre-commit, pre-push, manual]
-exclude: '^(build|3rdparty)/.*$'  # exclude build and 3rdparty directories
+# Fork-only PoC sources and generated review transcripts are not production
+# lint surfaces. Production code, tests, examples, and documentation remain
+# covered by every hook below.
+exclude: '^(?:build|3rdparty|poc|reports/(?:grok|meta))/.*$|^poc_test(?:_.*)?\.py$'
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0 # May not sync with requirements-lint.txt, but it's OK for now
