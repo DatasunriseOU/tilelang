@@ -12,6 +12,8 @@ import shutil
 import threading
 import uuid
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from hashlib import sha256
 from typing import Callable, Literal
 
@@ -25,6 +27,25 @@ from tilelang import env
 from tilelang.jit import JITKernel
 from tilelang import __version__
 import platform
+
+
+@contextmanager
+def _exclusive_file_lock(path: str) -> Iterator[None]:
+    """Serialize one cache-key compilation across local processes."""
+    if sys.platform == "win32":
+        yield
+        return
+
+    import fcntl
+
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 class KernelCache:
@@ -49,6 +70,7 @@ class KernelCache:
     params_path = "params.pkl"
     cache_root_dir = "kernels"
     staging_root_dir = ".staging"
+    lock_root_dir = ".locks"
 
     @staticmethod
     @functools.cache
@@ -190,6 +212,7 @@ class KernelCache:
         os.makedirs(KernelCache._get_namespace_root(), exist_ok=True)
         os.makedirs(KernelCache._get_cache_root(), exist_ok=True)
         os.makedirs(KernelCache._get_staging_root(), exist_ok=True)
+        os.makedirs(KernelCache._get_lock_root(), exist_ok=True)
 
         staging_root = KernelCache._get_staging_root()
         with KernelCache._staging_cleanup_lock:
@@ -208,6 +231,10 @@ class KernelCache:
     @staticmethod
     def _get_staging_root() -> str:
         return os.path.join(KernelCache._get_namespace_root(), KernelCache.staging_root_dir)
+
+    @staticmethod
+    def _get_lock_root() -> str:
+        return os.path.join(KernelCache._get_namespace_root(), KernelCache.lock_root_dir)
 
     @staticmethod
     def _cleanup_stale_staging_dirs(max_age_seconds: int = 3600):
@@ -353,43 +380,44 @@ class KernelCache:
                 )
                 return self._memory_cache[key]
 
-            if verbose:
-                self.logger.debug(f"Checking disk cache for kernel {get_prim_func_name(func, '<unknown>')}")
-
-            # Then check disk cache
-            kernel = self._load_kernel_from_disk(
-                key, target, target_host, out_idx, execution_backend, pass_configs, compile_flags, func, verbose
-            )
-            if kernel is not None:
+        KernelCache._create_dirs()
+        lock_path = os.path.join(self._get_lock_root(), f"{key}.lock")
+        with _exclusive_file_lock(lock_path):
+            # Another process may have populated the cache while this process
+            # waited for the per-key lock, so disk must be checked again here.
+            with self._lock:
+                if key in self._memory_cache:
+                    return self._memory_cache[key]
                 if verbose:
-                    self.logger.debug(f"Found kernel in disk cache for {get_prim_func_name(func, '<unknown>')}")
-                # Populate memory cache with disk result
-                self._memory_cache[key] = kernel
-                return kernel
+                    self.logger.debug(f"Checking disk cache for kernel {get_prim_func_name(func, '<unknown>')}")
+                kernel = self._load_kernel_from_disk(
+                    key, target, target_host, out_idx, execution_backend, pass_configs, compile_flags, func, verbose
+                )
+                if kernel is not None:
+                    if verbose:
+                        self.logger.debug(f"Found kernel in disk cache for {get_prim_func_name(func, '<unknown>')}")
+                    self._memory_cache[key] = kernel
+                    return kernel
 
-        if verbose:
-            self.logger.debug(f"No cached kernel for {get_prim_func_name(func, '<unknown>')}")
-        # Compile kernel if cache miss; leave critical section
-        kernel = JITKernel(
-            func,
-            out_idx=out_idx,
-            execution_backend=execution_backend,
-            target=target,
-            target_host=target_host,
-            verbose=verbose,
-            pass_configs=pass_configs,
-            compile_flags=compile_flags,
-        )
-        with self._lock:
-            if env.is_cache_enabled():
+            if verbose:
+                self.logger.debug(f"No cached kernel for {get_prim_func_name(func, '<unknown>')}")
+            kernel = JITKernel(
+                func,
+                out_idx=out_idx,
+                execution_backend=execution_backend,
+                target=target,
+                target_host=target_host,
+                verbose=verbose,
+                pass_configs=pass_configs,
+                compile_flags=compile_flags,
+            )
+            with self._lock:
                 cache_path = self._get_cache_path(key)
                 self._save_kernel_to_disk(key, kernel, func, verbose)
                 # Set cache path on adapter so it can save cubin after first execution
                 self._set_adapter_cache_path(kernel, cache_path)
-
-        # Store in memory cache after compilation
-        self._memory_cache[key] = kernel
-        return kernel
+                self._memory_cache[key] = kernel
+            return kernel
 
     def clear_cache(self):
         """
