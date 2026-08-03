@@ -673,8 +673,8 @@ bool ParallelOpNode::ValidateCandidateAgainstFragments(
 
 bool ParallelOpNode::ProveFragmentContainsCached(
     const Fragment &small, const Fragment &large,
-    const Array<PrimExpr> &small_indices,
-    const Array<PrimExpr> &large_indices, bool check_forward_index) const {
+    const Array<PrimExpr> &small_indices, const Array<PrimExpr> &large_indices,
+    bool check_forward_index) const {
   StructuralEqual equal;
   for (const auto &entry : *fragment_contains_cache_) {
     if (entry.check_forward_index == check_forward_index &&
@@ -685,10 +685,12 @@ bool ParallelOpNode::ProveFragmentContainsCached(
     }
   }
 
-  bool result = ProveFragmentContains(small, large, small_indices, large_indices,
-                                      analyzer_, check_forward_index);
-  fragment_contains_cache_->push_back({small, large, small_indices, large_indices,
-                                       check_forward_index, result});
+  bool result =
+      ProveFragmentContains(small, large, small_indices, large_indices,
+                            analyzer_, check_forward_index);
+  fragment_contains_cache_->push_back({small, large, small_indices,
+                                       large_indices, check_forward_index,
+                                       result});
   return result;
 }
 

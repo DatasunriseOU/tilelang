@@ -141,10 +141,10 @@ private:
       const Fragment &candidate, const LayoutInferArgs &T,
       bool throw_on_error = false, bool check_forward_index = false,
       const Buffer &source_buffer = Buffer()) const;
-  bool ProveFragmentContainsCached(
-      const Fragment &small, const Fragment &large,
-      const Array<PrimExpr> &small_indices,
-      const Array<PrimExpr> &large_indices, bool check_forward_index) const;
+  bool ProveFragmentContainsCached(const Fragment &small, const Fragment &large,
+                                   const Array<PrimExpr> &small_indices,
+                                   const Array<PrimExpr> &large_indices,
+                                   bool check_forward_index) const;
   // Choose the better loop layout from two candidates using validation,
   // containment and replication heuristic.
   Fragment ChooseBestCandidate(const Fragment &candidate_from_buffer,
