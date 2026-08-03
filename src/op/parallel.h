@@ -9,6 +9,7 @@
 #include <tvm/target/target.h>
 #include <tvm/tirx/stmt_functor.h>
 
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -102,6 +103,7 @@ public:
     loop_layout_inferred_ = other.loop_layout_inferred_;
     annotated_layout_unbound_ = other.annotated_layout_unbound_;
     annotated_predicate_ = other.annotated_predicate_;
+    fragment_contains_cache_ = other.fragment_contains_cache_;
   }
 
   // Get the inferred loop layout.
@@ -139,6 +141,10 @@ private:
       const Fragment &candidate, const LayoutInferArgs &T,
       bool throw_on_error = false, bool check_forward_index = false,
       const Buffer &source_buffer = Buffer()) const;
+  bool ProveFragmentContainsCached(
+      const Fragment &small, const Fragment &large,
+      const Array<PrimExpr> &small_indices,
+      const Array<PrimExpr> &large_indices, bool check_forward_index) const;
   // Choose the better loop layout from two candidates using validation,
   // containment and replication heuristic.
   Fragment ChooseBestCandidate(const Fragment &candidate_from_buffer,
@@ -192,6 +198,23 @@ private:
   std::vector<Buffer> store_shared_global_buffers_;
   // Fragment buffers that are stored to in the loop body.
   std::vector<Buffer> store_fragment_buffers_;
+
+  struct FragmentContainsCacheEntry {
+    Fragment small;
+    Fragment large;
+    Array<PrimExpr> small_indices;
+    Array<PrimExpr> large_indices;
+    bool check_forward_index;
+    bool result;
+  };
+  // Retry clones repeat the same expensive containment proofs. Keep the cache
+  // local to one source ParallelOp and share it only with that op's serial
+  // clones, which reuse the same root, loop ranges, and let bindings.
+  // ponytail: linear lookup is intentional while per-op proof sets stay tiny;
+  // switch to structural-hash buckets only if profiling shows otherwise.
+  mutable std::shared_ptr<std::vector<FragmentContainsCacheEntry>>
+      fragment_contains_cache_ =
+          std::make_shared<std::vector<FragmentContainsCacheEntry>>();
 };
 
 class ParallelOp : public TileOperator {

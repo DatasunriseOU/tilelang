@@ -631,8 +631,8 @@ bool ParallelOpNode::ValidateCandidateAgainstFragments(
     std::ostringstream oss;
     bool success = true;
     if (access.is_read &&
-        !ProveFragmentContains(candidate, fragment, vars, access.indices,
-                               analyzer_, check_forward_index)) {
+        !ProveFragmentContainsCached(candidate, fragment, vars, access.indices,
+                                     check_forward_index)) {
       oss << "Layout infer conflict between " << buffer << " and "
           << source_buffer << " in T.Parallel loop:" << '\n'
           << "    loop " << candidate->DebugOutput() << '\n'
@@ -647,10 +647,10 @@ bool ParallelOpNode::ValidateCandidateAgainstFragments(
     // allows extra loop threads to write local slots that belong to different
     // logical fragment elements under the buffer layout.
     if (access.is_write &&
-        (!ProveFragmentContains(fragment, candidate, access.indices, vars,
-                                analyzer_, check_forward_index) ||
-         !ProveFragmentContains(candidate, fragment, vars, access.indices,
-                                analyzer_, check_forward_index))) {
+        (!ProveFragmentContainsCached(fragment, candidate, access.indices, vars,
+                                      check_forward_index) ||
+         !ProveFragmentContainsCached(candidate, fragment, vars, access.indices,
+                                      check_forward_index))) {
       oss << "Layout infer conflict between " << buffer << " and "
           << source_buffer << " in T.Parallel loop:" << '\n'
           << "    loop " << candidate->DebugOutput() << '\n'
@@ -669,6 +669,27 @@ bool ParallelOpNode::ValidateCandidateAgainstFragments(
     }
   }
   return true;
+}
+
+bool ParallelOpNode::ProveFragmentContainsCached(
+    const Fragment &small, const Fragment &large,
+    const Array<PrimExpr> &small_indices,
+    const Array<PrimExpr> &large_indices, bool check_forward_index) const {
+  StructuralEqual equal;
+  for (const auto &entry : *fragment_contains_cache_) {
+    if (entry.check_forward_index == check_forward_index &&
+        equal(entry.small, small) && equal(entry.large, large) &&
+        equal(entry.small_indices, small_indices) &&
+        equal(entry.large_indices, large_indices)) {
+      return entry.result;
+    }
+  }
+
+  bool result = ProveFragmentContains(small, large, small_indices, large_indices,
+                                      analyzer_, check_forward_index);
+  fragment_contains_cache_->push_back({small, large, small_indices, large_indices,
+                                       check_forward_index, result});
+  return result;
 }
 
 Fragment
@@ -843,7 +864,8 @@ ParallelOpNode::ChooseBestCandidate(const Fragment &candidate_from_buffer,
   auto contains = [&](const Fragment &big, const Fragment &small) {
     // contains(A, B) means: for any loop index, the threads that access
     // B's elements are a subset of those that access A's elements.
-    return ProveFragmentContains(small, big, vars, vars, analyzer_);
+    return ProveFragmentContainsCached(small, big, vars, vars,
+                                       /*check_forward_index=*/false);
   };
 
   bool buf_ok = ValidateCandidateAgainstFragments(candidate_from_buffer, T);
